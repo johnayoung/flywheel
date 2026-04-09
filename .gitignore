@@ -1,0 +1,23 @@
+# Flywheel runtime state
+.flywheel/
+
+# Go build artifacts
+/flywheel
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.html
+coverage.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

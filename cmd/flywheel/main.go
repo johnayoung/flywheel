@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -33,10 +34,25 @@ func main() {
 	}
 }
 
+// version is set at build time via -ldflags.
+// When installed with `go install`, Go embeds the module version automatically.
+var version = ""
+
+func resolveVersion() string {
+	if version != "" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
+}
+
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "flywheel",
-		Short: "Flywheel orchestrates parallel AI-driven task execution",
+		Use:     "flywheel",
+		Short:   "Flywheel orchestrates parallel AI-driven task execution",
+		Version: resolveVersion(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

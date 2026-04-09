@@ -120,10 +120,10 @@ func buildConflictPrompt(req ResolveRequest, conflictContents map[string]string)
 	var b strings.Builder
 
 	b.WriteString("Resolve the following git merge conflicts.\n\n")
-	b.WriteString(fmt.Sprintf("Branch being merged: %s\n", req.Branch))
-	b.WriteString(fmt.Sprintf("Target ref: %s\n", req.TargetRef))
-	b.WriteString(fmt.Sprintf("Task description (incoming branch): %s\n", req.TaskDesc))
-	b.WriteString(fmt.Sprintf("Target description: %s\n\n", req.TargetDesc))
+	fmt.Fprintf(&b, "Branch being merged: %s\n", req.Branch)
+	fmt.Fprintf(&b, "Target ref: %s\n", req.TargetRef)
+	fmt.Fprintf(&b, "Task description (incoming branch): %s\n", req.TaskDesc)
+	fmt.Fprintf(&b, "Target description: %s\n\n", req.TargetDesc)
 
 	b.WriteString("Each file below contains conflict markers (<<<<<<< / ======= / >>>>>>>).\n")
 	b.WriteString("Resolve every conflict and output the complete resolved file contents.\n\n")
@@ -138,12 +138,12 @@ func buildConflictPrompt(req ResolveRequest, conflictContents map[string]string)
 		if !ok {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("=== CONFLICT FILE: %s ===\n", f))
+		fmt.Fprintf(&b, "=== CONFLICT FILE: %s ===\n", f)
 		b.WriteString(content)
 		if !strings.HasSuffix(content, "\n") {
 			b.WriteByte('\n')
 		}
-		b.WriteString(fmt.Sprintf("=== END CONFLICT FILE: %s ===\n\n", f))
+		fmt.Fprintf(&b, "=== END CONFLICT FILE: %s ===\n\n", f)
 	}
 
 	return b.String()

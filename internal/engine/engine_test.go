@@ -232,16 +232,6 @@ func (a *testAgent) Execute(ctx context.Context, req agent.ExecutionRequest) (*a
 }
 
 // ---------------------------------------------------------------------------
-// testFailingValidator: fails N times then passes
-// ---------------------------------------------------------------------------
-
-type testFailingValidator struct {
-	failCount    int
-	currentCount atomic.Int32
-	inner        *validate.Validator
-}
-
-// ---------------------------------------------------------------------------
 // testReviewer: always approves
 // ---------------------------------------------------------------------------
 

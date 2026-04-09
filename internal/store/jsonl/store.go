@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/gofrs/flock"
 	"github.com/johnayoung/flywheel/internal/lifecycle"
@@ -23,7 +22,6 @@ type Store struct {
 	tasks         []task.Task
 	taskIndex     map[string]*task.Task
 	lifecyclePath string
-	mu            sync.RWMutex
 }
 
 var _ store.TaskStore = (*Store)(nil)

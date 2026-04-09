@@ -1,0 +1,3 @@
+module github.com/johnayoung/flywheel
+
+go 1.22.3

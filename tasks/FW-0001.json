@@ -1,0 +1,21 @@
+{
+  "id": "FW-0001",
+  "description": "Initialize the Go module and create the full directory structure for the Flywheel project. Run `go mod init github.com/johnayoung/flywheel`. Create all directories under cmd/flywheel/ and internal/ (config, task, lifecycle, store/jsonl, dag, worktree, agent/claudecode, validate, review, merge, conflict, engine). Create cmd/flywheel/main.go with a minimal main function that prints 'flywheel' and exits. Do NOT create any other .go files -- only directories and main.go. Reference docs/implementation-plan.md for the full directory layout.",
+  "category": "chore",
+  "priority": 1,
+  "prerequisites": [],
+  "commit": "chore: initialize go module and project directory structure",
+  "steps": [
+    "Run go mod init github.com/johnayoung/flywheel",
+    "Create all directories: cmd/flywheel/, internal/config/, internal/task/, internal/lifecycle/, internal/store/, internal/store/jsonl/, internal/dag/, internal/worktree/, internal/agent/, internal/agent/claudecode/, internal/validate/, internal/review/, internal/merge/, internal/conflict/, internal/engine/",
+    "Create cmd/flywheel/main.go with package main, a main() that prints 'flywheel'",
+    "Verify go build ./cmd/flywheel/ succeeds"
+  ],
+  "acceptance_criteria": [
+    "go.mod exists with module path github.com/johnayoung/flywheel and go 1.23+",
+    "All directories from the implementation plan exist",
+    "cmd/flywheel/main.go compiles and runs",
+    "go build ./cmd/flywheel/ exits 0"
+  ],
+  "review": "none"
+}

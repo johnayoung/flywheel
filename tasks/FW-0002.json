@@ -1,0 +1,23 @@
+{
+  "id": "FW-0002",
+  "description": "Implement the Task model and parsers in internal/task/. The Task struct is the immutable, human-authored work definition. Include a Validate() method and three parsers: ParseFile (single JSON), ParseDir (directory of .json files), ParseJSONL (one task per line). All parsers call Validate() and return errors with task ID and file path context. Reference docs/implementation-plan.md Milestone 1b and 1c for the full struct definition, validation rules, and parser specifications.",
+  "category": "feat",
+  "priority": 2,
+  "prerequisites": ["FW-0001"],
+  "commit": "feat(task): add task model, validation, and JSON/JSONL parsers",
+  "steps": [
+    "Create internal/task/task.go with the Task struct matching the schema in docs/design.md (ID, Description, Category, Priority, Prerequisites, Commit, Steps, AcceptanceCriteria, Review)",
+    "Implement Validate() method: ID non-empty no whitespace, Description non-empty, Category in allowed set (feat/fix/refactor/test/docs/chore), Commit non-empty, Steps has >= 1 entry, Review if set must be agent/human/none, no self-referencing prerequisites",
+    "Create internal/task/parser.go with ParseFile(path) (*Task, error), ParseDir(dir) ([]Task, error), ParseJSONL(path) ([]Task, error)",
+    "Create internal/task/parser_test.go: test each format parses correctly, test validation catches each invalid case, test valid complex task round-trips"
+  ],
+  "acceptance_criteria": [
+    "Task struct fields match the schema in docs/design.md exactly",
+    "Validate() rejects: empty ID, whitespace in ID, empty description, invalid category, empty commit, empty steps, invalid review value, self-referencing prerequisite",
+    "ParseFile reads a single JSON task file",
+    "ParseDir reads all .json files in a directory",
+    "ParseJSONL reads one task per line from a .jsonl file",
+    "All parsers call Validate() and wrap errors with task ID + file path",
+    "All tests pass"
+  ]
+}

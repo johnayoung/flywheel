@@ -1,0 +1,27 @@
+{
+  "id": "FW-0004",
+  "description": "Implement the lifecycle state machine in internal/lifecycle/machine.go. This encodes all valid state transitions from the design doc, including crash recovery paths. Implement Transition(), CanTransition(), IsTerminal(), and CanRetry(). Transition must handle side effects: incrementing retries on retry, requiring error messages on failure transitions, setting timestamps. Reference docs/implementation-plan.md Milestone 1e for the full transition map and side effect rules.",
+  "category": "feat",
+  "priority": 2,
+  "prerequisites": ["FW-0003"],
+  "commit": "feat(lifecycle): add state machine with transitions and crash recovery",
+  "steps": [
+    "Create internal/lifecycle/machine.go with the validTransitions map exactly matching docs/implementation-plan.md Milestone 1e",
+    "Implement CanTransition(from, to Status) bool",
+    "Implement IsTerminal(s Status) bool -- true for merged and failed",
+    "Implement CanRetry(lc *Lifecycle, maxRetries int) bool -- true if retries < maxRetries and status is failed_validation or rejected",
+    "Implement Transition(lc *Lifecycle, to Status) error with side effects: increment Retries and clear Error on retry (failed_validation/rejected -> ready), require Error non-empty when transitioning to failed/failed_validation, set appropriate timestamps (ReadyAt, StartedAt, CompletedAt, ReviewedAt, MergedAt, FailedAt)",
+    "Create internal/lifecycle/machine_test.go: test every valid transition, test every invalid transition is rejected, test full happy path (pending -> merged), test retry logic, test crash recovery transitions (running/validating/reviewing/merging/resolving -> ready), test side effects"
+  ],
+  "acceptance_criteria": [
+    "validTransitions map matches the state machine diagram in docs/design.md exactly",
+    "CanTransition returns true for all valid transitions and false for invalid ones",
+    "IsTerminal returns true only for merged and failed",
+    "CanRetry returns false for failed (terminal), true for failed_validation/rejected when under max",
+    "Transition rejects invalid transitions with descriptive error",
+    "Transition increments Retries when retrying from failed_validation or rejected",
+    "Transition requires Error field set when transitioning to failed or failed_validation",
+    "Transition sets appropriate timestamps on each transition",
+    "All tests pass"
+  ]
+}

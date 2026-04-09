@@ -1,0 +1,21 @@
+{
+  "id": "FW-0003",
+  "description": "Implement the Lifecycle model in internal/lifecycle/lifecycle.go. This is the mutable execution state owned by Flywheel. Define all Status constants, the Lifecycle struct, the Timestamps struct, and a NewLifecycle constructor. Reference docs/implementation-plan.md Milestone 1d for the complete struct definition and all status constants.",
+  "category": "feat",
+  "priority": 2,
+  "prerequisites": ["FW-0001"],
+  "commit": "feat(lifecycle): add lifecycle model and status constants",
+  "steps": [
+    "Create internal/lifecycle/lifecycle.go with the Status type and all 12 status constants (pending, ready, running, validating, failed_validation, reviewing, rejected, merging, conflict, resolving, merged, failed)",
+    "Define the Timestamps struct with all 7 timestamp fields (CreatedAt, ReadyAt, StartedAt, CompletedAt, ReviewedAt, MergedAt, FailedAt) as *time.Time",
+    "Define the Lifecycle struct with all fields matching docs/implementation-plan.md Milestone 1d exactly (TaskID, RunID, WorkerID, Status, Branch, WorktreePath, BaseRef, BaseSHA, CurrentStep, StepsCompleted, Timestamps, Version, Retries, ResolveAttempts, Error, AgentOutput, ImplNotes, ReviewResult, MergeCommitSHA, ConflictDetails)",
+    "Implement NewLifecycle(taskID, runID, baseRef string) *Lifecycle that initializes with StatusPending and sets CreatedAt to time.Now()"
+  ],
+  "acceptance_criteria": [
+    "All 12 status constants are defined and match the state machine in docs/design.md",
+    "Lifecycle struct has all fields from the design doc with correct JSON tags",
+    "Timestamps struct uses *time.Time for all fields",
+    "NewLifecycle returns a lifecycle in pending status with CreatedAt set",
+    "Package compiles cleanly"
+  ]
+}

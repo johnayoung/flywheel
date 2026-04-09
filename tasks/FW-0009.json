@@ -1,0 +1,34 @@
+{
+  "id": "FW-0009",
+  "description": "Implement the main orchestration engine in internal/engine/. This is the core loop that ties everything together: loads tasks, builds DAG, initializes lifecycles, runs worker goroutines that claim tasks, execute agents, validate, review, merge, and handle conflicts. Includes crash recovery (reset stale in-progress tasks to ready on startup) and DAG-reactive scheduling (re-evaluate readiness after every merge). Use sync.Cond or channels to wake workers when new tasks become ready. Reference docs/implementation-plan.md Milestone 9 for the Engine struct, Run() algorithm, resume support, and retry vs crash recovery semantics.",
+  "category": "feat",
+  "priority": 5,
+  "prerequisites": ["FW-0005", "FW-0006", "FW-0007", "FW-0008", "FW-0011", "FW-0013", "FW-0014", "FW-0015", "FW-0016"],
+  "commit": "feat(engine): add orchestration engine with DAG-reactive scheduling and crash recovery",
+  "steps": [
+    "Create internal/engine/engine.go with the Engine struct holding config, store, dag, worktree manager, agent factory, validator, reviewer factory, merger, resolver, maxParallel, and sync primitives",
+    "Implement New() constructor wiring all dependencies",
+    "Implement Run(ctx): load tasks, generate run ID (run-{YYYYMMDD}-{HHmmss}-{4hex}), build DAG, initialize lifecycles, run crash recovery, evaluate initial readiness, start worker goroutines",
+    "Implement the worker loop: ClaimNextReady -> create worktree -> running -> execute agent -> validating -> validate -> reviewing -> review -> merging -> merge -> merged (with retry and conflict resolution paths at each stage)",
+    "Implement crash recovery: on startup, reset stale running/validating/reviewing/merging/resolving tasks back to ready, clean up orphan worktrees",
+    "Implement DAG-reactive readiness: after every merge, re-evaluate all pending tasks and transition newly-ready ones, signal waiting workers via sync.Cond or channel",
+    "Implement retry logic: on failed_validation or rejected, check CanRetry, if yes transition to ready with ResumeFrom context and feedback from Error field; if no transition to failed",
+    "Implement conflict handling: on merge conflict, transition to conflict -> resolving, run resolver, retry merge; respect MaxResolveAttempts",
+    "Create internal/engine/engine_test.go: test 3 independent tasks run in parallel, test dependency chain A->B->C executes in order, test diamond dependency, test agent failure + retry, test validation failure + retry, test resume from partially-completed state"
+  ],
+  "acceptance_criteria": [
+    "Engine runs up to maxParallel workers concurrently",
+    "Workers claim tasks atomically via ClaimNextReady",
+    "Full happy path works: pending -> ready -> running -> validating -> reviewing -> merging -> merged",
+    "DAG dependencies are respected: dependent tasks only start after prerequisites merge",
+    "After each merge, pending tasks are re-evaluated for readiness",
+    "Crash recovery resets stale in-progress tasks to ready on startup",
+    "Retry preserves worktree and passes ResumeFrom + feedback to agent",
+    "Crash recovery destroys worktree and starts fresh",
+    "Conflict resolution respects MaxResolveAttempts before failing",
+    "Context cancellation gracefully stops workers",
+    "Run returns a summary of results (merged/failed counts, timing)",
+    "All tests pass"
+  ],
+  "review": "human"
+}

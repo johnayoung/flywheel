@@ -1,0 +1,29 @@
+{
+  "id": "FW-0008",
+  "description": "Implement git worktree lifecycle management in internal/worktree/. All operations shell out to git via os/exec. Create, remove, list worktrees. Check cleanliness and get commits. All git commands must capture stderr for error reporting and use exec.CommandContext for timeout support. Reference docs/implementation-plan.md Milestone 4 for all method signatures and the Worktree/Commit structs.",
+  "category": "feat",
+  "priority": 3,
+  "prerequisites": ["FW-0001"],
+  "commit": "feat(worktree): add git worktree lifecycle management",
+  "steps": [
+    "Create internal/worktree/worktree.go with Manager struct (repoRoot, worktreeBase, branchPrefix) and Worktree/Commit structs",
+    "Implement NewManager constructor",
+    "Implement Create(ctx, taskID, baseRef) creating branch {prefix}{taskID} at {worktreeBase}/{taskID} via git worktree add, returning Worktree with BaseSHA from git rev-parse",
+    "Implement Remove(ctx, taskID) running git worktree remove --force then git branch -D",
+    "Implement List(ctx) parsing git worktree list --porcelain output",
+    "Implement IsClean(ctx, path) checking git status --porcelain is empty",
+    "Implement GetCommits(ctx, path, baseSHA) parsing git log --oneline {baseSHA}..HEAD",
+    "Create internal/worktree/worktree_test.go using t.TempDir() with real git repos: test create verifies directory+branch exist, test two independent worktrees, test remove cleans up, test List, test IsClean on clean and dirty worktrees, test GetCommits"
+  ],
+  "acceptance_criteria": [
+    "Create produces a worktree at the expected path with correct branch name",
+    "Create returns the base SHA from git rev-parse",
+    "Remove deletes both the worktree directory and the branch",
+    "List returns all flywheel-managed worktrees",
+    "IsClean returns true for clean worktrees, false when files are modified or untracked",
+    "GetCommits returns commits between base SHA and HEAD",
+    "All git errors include stderr output in the error message",
+    "All commands use exec.CommandContext for timeout support",
+    "All tests pass with real git operations (no mocks)"
+  ]
+}

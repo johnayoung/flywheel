@@ -1,0 +1,33 @@
+{
+  "id": "FW-0010",
+  "description": "Implement the Cobra-based CLI in cmd/flywheel/. Commands: init (load+validate+preview), run (execute engine), status (show task states), review (list/approve/reject), clean (remove worktrees+state), validate (check tasks+DAG). Handle SIGINT/SIGTERM gracefully. Reference docs/implementation-plan.md Milestone 10 for all commands, flags, and signal handling requirements.",
+  "category": "feat",
+  "priority": 6,
+  "prerequisites": ["FW-0009"],
+  "commit": "feat(cli): add Cobra CLI with init, run, status, review, clean, and validate commands",
+  "steps": [
+    "Add github.com/spf13/cobra dependency",
+    "Refactor cmd/flywheel/main.go to use cobra root command with --config flag (default: flywheel.json)",
+    "Implement 'init' command: load tasks, build DAG, validate, print execution plan with waves and estimated parallelism, create .flywheel/ directory",
+    "Implement 'run' command: load config, build engine, call engine.Run(). Flags: --max-parallel, --verbose, --dry-run. Stream progress to stdout.",
+    "Implement 'status' command: print table of all tasks with lifecycle status. 'status {task_id}' for detail. --lifecycle flag for full timeline.",
+    "Implement 'review' subcommands: 'review list' shows tasks awaiting human review, 'review approve {id}' approves, 'review reject {id} --reason' rejects",
+    "Implement 'clean' command: remove all worktrees, delete flywheel branches, clean .flywheel/ state. --worktrees-only flag.",
+    "Implement 'validate' subcommands: 'validate tasks' checks task definitions, 'validate dag' builds DAG and reports cycles/warnings",
+    "Add SIGINT/SIGTERM handlers: cancel engine context, wait for workers with timeout, save state, print summary"
+  ],
+  "acceptance_criteria": [
+    "flywheel init loads tasks, validates DAG, prints wave-based execution plan",
+    "flywheel run executes the engine with configurable parallelism",
+    "flywheel run --dry-run prints plan without executing",
+    "flywheel status shows a table of all tasks and their states",
+    "flywheel status {id} shows detailed lifecycle for one task",
+    "flywheel review list/approve/reject work for HITL workflow",
+    "flywheel clean removes worktrees and state",
+    "flywheel validate tasks/dag check definitions without executing",
+    "SIGINT triggers graceful shutdown: cancel context, wait for workers, save state",
+    "--config flag overrides default config path",
+    "go build ./cmd/flywheel/ produces a working binary"
+  ],
+  "review": "human"
+}

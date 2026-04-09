@@ -6,7 +6,7 @@ Flywheel is a worktree-based parallel agent orchestrator with dependency resolut
 
 **Read `docs/design.md` first** — it contains the full architecture, data models, state machine, and design decisions. This document is the step-by-step build plan.
 
-**Language:** Go 1.23+
+**Language:** Go 1.26+
 **CLI framework:** Cobra
 **Module path:** `github.com/johnayoung/flywheel`
 

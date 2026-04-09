@@ -12,7 +12,7 @@
     "Verify go build ./cmd/flywheel/ succeeds"
   ],
   "acceptance_criteria": [
-    "go.mod exists with module path github.com/johnayoung/flywheel and go 1.23+",
+    "go.mod exists with module path github.com/johnayoung/flywheel and go 1.26+",
     "All directories from the implementation plan exist",
     "cmd/flywheel/main.go compiles and runs",
     "go build ./cmd/flywheel/ exits 0"

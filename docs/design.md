@@ -4,7 +4,7 @@
 
 Worktree-based parallel agent orchestrator with dependency resolution, merge conflict handling, and a review pipeline. Agents execute coding tasks in isolated git worktrees, coordinated by a DAG scheduler that understands task dependencies, merge ordering, and failure recovery.
 
-**Language:** Go 1.23+
+**Language:** Go 1.26+
 **Interface:** CLI (primary), Web UI (future)
 **Agent:** Claude Code (MVP), pluggable via `Agent` interface
 **Scope:** Local-only to start

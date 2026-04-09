@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 
-.PHONY: build test lint vet clean
+.PHONY: build test fmt vet clean
 
 build:
 	go build $(LDFLAGS) -o flywheel ./cmd/flywheel
@@ -16,8 +16,8 @@ cover:
 vet:
 	go vet ./...
 
-lint:
-	golangci-lint run
+fmt:
+	gofmt -w .
 
 clean:
 	rm -f flywheel coverage.out coverage.html

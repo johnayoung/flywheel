@@ -64,13 +64,13 @@ func buildReviewPrompt(req ReviewRequest) string {
 	b.WriteString("You are reviewing code changes for a task.\n\n")
 
 	b.WriteString("## Task\n")
-	b.WriteString(fmt.Sprintf("ID: %s\n", req.Task.ID))
-	b.WriteString(fmt.Sprintf("Description: %s\n\n", req.Task.Description))
+	fmt.Fprintf(&b, "ID: %s\n", req.Task.ID)
+	fmt.Fprintf(&b, "Description: %s\n\n", req.Task.Description)
 
 	if len(req.Task.AcceptanceCriteria) > 0 {
 		b.WriteString("## Acceptance Criteria\n")
 		for _, ac := range req.Task.AcceptanceCriteria {
-			b.WriteString(fmt.Sprintf("- %s\n", ac))
+			fmt.Fprintf(&b, "- %s\n", ac)
 		}
 		b.WriteString("\n")
 	}

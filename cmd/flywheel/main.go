@@ -50,9 +50,9 @@ func resolveVersion() string {
 
 func rootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "flywheel",
-		Short:   "Flywheel orchestrates parallel AI-driven task execution",
-		Version: resolveVersion(),
+		Use:           "flywheel",
+		Short:         "Flywheel orchestrates parallel AI-driven task execution",
+		Version:       resolveVersion(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

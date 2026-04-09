@@ -35,7 +35,7 @@ func TestBuildConflictPrompt(t *testing.T) {
 		ConflictFiles:  []string{"app.go", "config.go"},
 	}
 	contents := map[string]string{
-		"app.go": "<<<<<<< HEAD\nold code\n=======\nnew code\n>>>>>>> feature-x\n",
+		"app.go":    "<<<<<<< HEAD\nold code\n=======\nnew code\n>>>>>>> feature-x\n",
 		"config.go": "<<<<<<< HEAD\nold config\n=======\nnew config\n>>>>>>> feature-x\n",
 	}
 

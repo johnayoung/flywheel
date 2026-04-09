@@ -159,11 +159,11 @@ func (s *testStore) ClaimNextReady(_ context.Context, workerID string) (*lifecyc
 // ---------------------------------------------------------------------------
 
 type testAgent struct {
-	failTaskIDs   map[string]bool
-	callCounts    map[string]*atomic.Int32
-	mu            sync.Mutex
-	executionLog  []string // records task IDs in execution order
-	executionCh   chan string
+	failTaskIDs  map[string]bool
+	callCounts   map[string]*atomic.Int32
+	mu           sync.Mutex
+	executionLog []string // records task IDs in execution order
+	executionCh  chan string
 }
 
 func newTestAgent() *testAgent {
@@ -606,9 +606,9 @@ func TestValidationFailureRetry(t *testing.T) {
 
 	// Wrap the validator to fail on first call.
 	wrappedValidator := &countingValidator{
-		inner:      v,
-		failUntil:  1, // fail on call #1, pass on call #2+
-		callCount:  &validationCalls,
+		inner:     v,
+		failUntil: 1, // fail on call #1, pass on call #2+
+		callCount: &validationCalls,
 	}
 
 	// We need to create the engine manually to inject the wrapped validator.

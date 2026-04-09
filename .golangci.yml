@@ -4,12 +4,10 @@ linters:
   default: standard
   disable:
     - depguard
-
-issues:
-  exclude-rules:
-    - linters:
-        - errcheck
-      source: "fmt\\.Fprint"
-    - linters:
-        - errcheck
-      source: "\\.Unlock\\(\\)"
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+        source: "\\.Unlock\\(\\)"

@@ -265,8 +265,15 @@ func (s *Store) writeLifecycle(path string, lc *lifecycle.Lifecycle) error {
 	if err != nil {
 		return fmt.Errorf("encoding lifecycle: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return fmt.Errorf("writing lifecycle %s: %w", path, err)
+	data = append(data, '\n')
+
+	// Atomic write: write to temp file then rename to avoid partial reads.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("writing lifecycle %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("renaming lifecycle %s: %w", path, err)
 	}
 	return nil
 }

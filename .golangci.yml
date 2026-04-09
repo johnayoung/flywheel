@@ -1,0 +1,15 @@
+version: "2"
+
+linters:
+  default: standard
+  disable:
+    - depguard
+
+issues:
+  exclude-rules:
+    - linters:
+        - errcheck
+      source: "fmt\\.Fprint"
+    - linters:
+        - errcheck
+      source: "\\.Unlock\\(\\)"

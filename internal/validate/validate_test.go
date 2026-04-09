@@ -16,7 +16,7 @@ import (
 func initRepo(t *testing.T, dir string) string {
 	t.Helper()
 	cmds := [][]string{
-		{"git", "init"},
+		{"git", "init", "-b", "main"},
 		{"git", "config", "user.email", "test@test.com"},
 		{"git", "config", "user.name", "Test"},
 		{"git", "config", "commit.gpgsign", "false"},

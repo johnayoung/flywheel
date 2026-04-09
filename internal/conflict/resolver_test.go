@@ -102,7 +102,7 @@ func setupConflictRepo(t *testing.T) (repoPath string, conflictFile string) {
 		return string(out)
 	}
 
-	run("git", "init")
+	run("git", "init", "-b", "main")
 	run("git", "config", "user.email", "test@test.com")
 	run("git", "config", "user.name", "Test")
 

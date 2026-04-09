@@ -24,7 +24,7 @@ func setupTestRepo(t *testing.T) string {
 		}
 	}
 
-	run("git", "init")
+	run("git", "init", "-b", "main")
 	run("git", "config", "user.name", "test")
 	run("git", "config", "user.email", "test@test.com")
 

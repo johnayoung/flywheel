@@ -44,7 +44,7 @@ go install github.com/johnayoung/flywheel/cmd/flywheel@latest
 ```
 git clone https://github.com/johnayoung/flywheel.git
 cd flywheel
-make build
+make build        # produces ./bin/flywheel
 ```
 
 ## Quick Start

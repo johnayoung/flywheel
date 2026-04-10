@@ -4,7 +4,8 @@ LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
 .PHONY: build test fmt vet clean
 
 build:
-	go build $(LDFLAGS) -o flywheel ./cmd/flywheel
+	@mkdir -p bin
+	go build $(LDFLAGS) -o bin/flywheel ./cmd/flywheel
 
 test:
 	go test -race ./...
@@ -20,4 +21,5 @@ fmt:
 	gofmt -w .
 
 clean:
-	rm -f flywheel coverage.out coverage.html
+	rm -rf bin
+	rm -f coverage.out coverage.html

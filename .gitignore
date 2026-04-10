@@ -2,7 +2,7 @@
 .flywheel/
 
 # Go build artifacts
-/flywheel
+/bin/
 *.exe
 *.test
 *.out

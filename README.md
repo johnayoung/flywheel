@@ -15,45 +15,9 @@
 
 Flywheel coordinates multiple AI coding agents executing tasks concurrently in isolated git worktrees. Define your work as a dependency graph, and Flywheel handles scheduling, execution, validation, review, merge, conflict resolution, and crash recovery -- fully automated.
 
-```
-                    +-------------------+
-                    |   Task Definitions |
-                    |   (JSON files)     |
-                    +---------+---------+
-                              |
-                              v
-                    +---------+---------+
-                    |   DAG Scheduler    |
-                    |   (dependency-     |
-                    |    aware waves)    |
-                    +---------+---------+
-                              |
-               +--------------+--------------+
-               |              |              |
-               v              v              v
-         +-----+----+  +-----+----+  +-----+----+
-         | Worktree  |  | Worktree  |  | Worktree  |
-         | Agent 1   |  | Agent 2   |  | Agent 3   |
-         +-----+----+  +-----+----+  +-----+----+
-               |              |              |
-               v              v              v
-         +-----+----+  +-----+----+  +-----+----+
-         | Validate  |  | Validate  |  | Validate  |
-         +-----+----+  +-----+----+  +-----+----+
-               |              |              |
-               +-------+------+------+-------+
-                       |             |
-                       v             v
-                 +-----+----+ +-----+----+
-                 |  Review   | |  Review   |
-                 +-----+----+ +-----+----+
-                       |             |
-                       v             v
-                 +-----+-------------+----+
-                 |   Sequential Merge      |
-                 |   (conflict resolution) |
-                 +-------------------------+
-```
+<p align="center">
+  <img src="docs/images/architecture.png" alt="Flywheel architecture" width="640">
+</p>
 
 ## Why Flywheel
 

@@ -49,6 +49,8 @@ make build        # produces ./bin/flywheel
 
 ## Quick Start
 
+Flywheel runs with zero configuration. In any git repository:
+
 **1. Define tasks** as JSON files in `tasks/`:
 
 ```json
@@ -90,7 +92,7 @@ flywheel review reject <id> --reason "needs tests"
 
 ## Configuration
 
-Create `flywheel.json` in your repo root:
+Flywheel works without a config file -- it defaults to the current directory as the repo, `main` as the base branch, `./tasks` for tasks, `claude-code` as the agent, and `max_parallel: 3`. Create `flywheel.json` only when you need to override these:
 
 ```json
 {

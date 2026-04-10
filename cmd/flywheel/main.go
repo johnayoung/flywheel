@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -30,6 +31,7 @@ import (
 
 func main() {
 	if err := rootCmd().Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 }
@@ -76,7 +78,16 @@ func loadConfig(cmd *cobra.Command) (*config.Config, error) {
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return nil, err
+		// If the user didn't explicitly pass --config and the default file is
+		// simply absent, fall back to built-in defaults so flywheel runs with
+		// zero configuration. Any other error (including an explicit
+		// --config path that doesn't exist) is still fatal.
+		if errors.Is(err, os.ErrNotExist) && !cmd.Flags().Changed("config") {
+			cfg = config.LoadWithDefaults()
+			fmt.Fprintf(cmd.ErrOrStderr(), "no %s found; using built-in defaults\n", cfgPath)
+		} else {
+			return nil, err
+		}
 	}
 	if err := config.Validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)

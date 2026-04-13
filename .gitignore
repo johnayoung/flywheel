@@ -1,5 +1,7 @@
-# Flywheel runtime state
-.flywheel/
+# Flywheel runtime state — ignore everything under .flywheel/ except the
+# user-authored task definitions in .flywheel/tasks/.
+.flywheel/*
+!.flywheel/tasks/
 
 # Go build artifacts
 /bin/

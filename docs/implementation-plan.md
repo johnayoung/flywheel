@@ -249,10 +249,8 @@ type Config struct {
 }
 
 type StoreConfig struct {
-    Backend       string `json:"backend"`        // "jsonl", "sqlite", "postgres"
-    TasksPath     string `json:"tasks_path"`     // for file-based backends
-    LifecyclePath string `json:"lifecycle_path"` // for file-based backends
-    DSN           string `json:"dsn"`            // for database backends
+    Backend string          `json:"backend"` // "jsonl", "sqlite", "postgres"
+    Options json.RawMessage `json:"options"` // backend-specific; parsed by the backend
 }
 ```
 

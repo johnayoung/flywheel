@@ -23,7 +23,7 @@ import (
 	"github.com/johnayoung/flywheel/internal/merge"
 	"github.com/johnayoung/flywheel/internal/review"
 	"github.com/johnayoung/flywheel/internal/store"
-	"github.com/johnayoung/flywheel/internal/store/jsonl"
+	"github.com/johnayoung/flywheel/internal/storeopen"
 	"github.com/johnayoung/flywheel/internal/task"
 	"github.com/johnayoung/flywheel/internal/validate"
 	"github.com/johnayoung/flywheel/internal/worktree"
@@ -107,12 +107,17 @@ func initCmd() *cobra.Command {
 				return err
 			}
 
-			tasks, err := task.ParseDir(cfg.Store.TasksPath)
+			st, err := storeopen.Open(cfg.Store)
+			if err != nil {
+				return fmt.Errorf("opening store: %w", err)
+			}
+
+			tasks, err := st.ListTasks(cmd.Context(), store.TaskFilter{})
 			if err != nil {
 				return fmt.Errorf("loading tasks: %w", err)
 			}
 			if len(tasks) == 0 {
-				return fmt.Errorf("no tasks found in %s", cfg.Store.TasksPath)
+				return fmt.Errorf("no tasks found")
 			}
 
 			d, err := dag.Build(tasks)
@@ -140,14 +145,6 @@ func initCmd() *cobra.Command {
 					}
 					fmt.Fprintf(cmd.OutOrStdout(), "  - %s: %s\n", id, desc)
 				}
-			}
-
-			lcDir := cfg.Store.LifecyclePath
-			if err := os.MkdirAll(lcDir, 0o755); err != nil {
-				return fmt.Errorf("creating lifecycle directory: %w", err)
-			}
-			if err := os.MkdirAll(".flywheel", 0o755); err != nil {
-				return fmt.Errorf("creating .flywheel directory: %w", err)
 			}
 
 			fmt.Fprintln(cmd.OutOrStdout(), "\nInitialization complete. Run 'flywheel run' to start execution.")
@@ -187,9 +184,9 @@ func runCmd() *cobra.Command {
 				cancel()
 			}()
 
-			st, err := jsonl.New(cfg.Store.TasksPath, cfg.Store.LifecyclePath)
+			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
-				return fmt.Errorf("creating store: %w", err)
+				return fmt.Errorf("opening store: %w", err)
 			}
 
 			wm := worktree.NewManager(cfg.Repo, filepath.Join(".flywheel", "worktrees"), cfg.BranchPrefix)
@@ -240,7 +237,11 @@ func runCmd() *cobra.Command {
 }
 
 func runDryRun(cmd *cobra.Command, cfg *config.Config) error {
-	tasks, err := task.ParseDir(cfg.Store.TasksPath)
+	st, err := storeopen.Open(cfg.Store)
+	if err != nil {
+		return fmt.Errorf("opening store: %w", err)
+	}
+	tasks, err := st.ListTasks(cmd.Context(), store.TaskFilter{})
 	if err != nil {
 		return fmt.Errorf("loading tasks: %w", err)
 	}
@@ -285,9 +286,9 @@ func statusCmd() *cobra.Command {
 				return err
 			}
 
-			st, err := jsonl.New(cfg.Store.TasksPath, cfg.Store.LifecyclePath)
+			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
-				return fmt.Errorf("creating store: %w", err)
+				return fmt.Errorf("opening store: %w", err)
 			}
 
 			ctx := context.Background()
@@ -419,9 +420,9 @@ func reviewListCmd() *cobra.Command {
 				return err
 			}
 
-			st, err := jsonl.New(cfg.Store.TasksPath, cfg.Store.LifecyclePath)
+			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
-				return fmt.Errorf("creating store: %w", err)
+				return fmt.Errorf("opening store: %w", err)
 			}
 
 			ctx := context.Background()
@@ -460,9 +461,9 @@ func reviewApproveCmd() *cobra.Command {
 				return err
 			}
 
-			st, err := jsonl.New(cfg.Store.TasksPath, cfg.Store.LifecyclePath)
+			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
-				return fmt.Errorf("creating store: %w", err)
+				return fmt.Errorf("opening store: %w", err)
 			}
 
 			ctx := context.Background()
@@ -507,9 +508,9 @@ func reviewRejectCmd() *cobra.Command {
 				return fmt.Errorf("--reason is required")
 			}
 
-			st, err := jsonl.New(cfg.Store.TasksPath, cfg.Store.LifecyclePath)
+			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
-				return fmt.Errorf("creating store: %w", err)
+				return fmt.Errorf("opening store: %w", err)
 			}
 
 			ctx := context.Background()
@@ -616,7 +617,11 @@ func validateTasksCmd() *cobra.Command {
 				return err
 			}
 
-			tasks, err := task.ParseDir(cfg.Store.TasksPath)
+			st, err := storeopen.Open(cfg.Store)
+			if err != nil {
+				return fmt.Errorf("task validation failed: %w", err)
+			}
+			tasks, err := st.ListTasks(cmd.Context(), store.TaskFilter{})
 			if err != nil {
 				return fmt.Errorf("task validation failed: %w", err)
 			}
@@ -637,7 +642,11 @@ func validateDagCmd() *cobra.Command {
 				return err
 			}
 
-			tasks, err := task.ParseDir(cfg.Store.TasksPath)
+			st, err := storeopen.Open(cfg.Store)
+			if err != nil {
+				return fmt.Errorf("loading tasks: %w", err)
+			}
+			tasks, err := st.ListTasks(cmd.Context(), store.TaskFilter{})
 			if err != nil {
 				return fmt.Errorf("loading tasks: %w", err)
 			}

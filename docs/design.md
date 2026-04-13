@@ -239,8 +239,7 @@ Tasks don't merge immediately. All tasks in a group/wave complete, then they're 
   "build_command": "go build ./...",
   "store": {
     "backend": "jsonl",
-    "tasks_path": "./tasks",
-    "lifecycle_path": "./.flywheel/lifecycle"
+    "options": { "root": ".flywheel" }
   },
   "merge_strategy": "sequential",
   "review": "agent",

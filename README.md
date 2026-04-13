@@ -51,7 +51,7 @@ make build        # produces ./bin/flywheel
 
 Flywheel runs with zero configuration. In any git repository:
 
-**1. Define tasks** as JSON files in `tasks/`:
+**1. Define tasks** as JSON files in `.flywheel/tasks/`:
 
 ```json
 {
@@ -92,7 +92,7 @@ flywheel review reject <id> --reason "needs tests"
 
 ## Configuration
 
-Flywheel works without a config file -- it defaults to the current directory as the repo, `main` as the base branch, `./tasks` for tasks, `claude-code` as the agent, and `max_parallel: 3`. Create `flywheel.json` only when you need to override these:
+Flywheel works without a config file -- it defaults to the current directory as the repo, `main` as the base branch, `.flywheel/tasks` for task definitions, `claude-code` as the agent, and `max_parallel: 3`. Create `flywheel.json` only when you need to override these:
 
 ```json
 {
@@ -102,11 +102,6 @@ Flywheel works without a config file -- it defaults to the current directory as 
   "branch_prefix": "flywheel/",
   "max_parallel": 3,
   "build_command": "go build ./...",
-  "store": {
-    "backend": "jsonl",
-    "tasks_path": "./tasks",
-    "lifecycle_path": "./.flywheel/lifecycle"
-  },
   "merge_strategy": "sequential",
   "review": "agent",
   "agent": "claude-code",
@@ -115,6 +110,19 @@ Flywheel works without a config file -- it defaults to the current directory as 
   "max_resolve_attempts": 2
 }
 ```
+
+### Store backend
+
+All flywheel state lives under `.flywheel/` by default: task definitions in `.flywheel/tasks/` and execution state in `.flywheel/lifecycle/`. The store is pluggable via `store.backend` with backend-specific `store.options`:
+
+```json
+"store": {
+  "backend": "jsonl",
+  "options": { "root": ".flywheel" }
+}
+```
+
+Only the `jsonl` backend ships today. Its single option is `root` (default `.flywheel`), from which `tasks/` and `lifecycle/` are derived.
 
 | Field | Default | Description |
 |---|---|---|

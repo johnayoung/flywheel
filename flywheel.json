@@ -5,11 +5,6 @@
   "branch_prefix": "flywheel/",
   "max_parallel": 3,
   "build_command": "go build ./...",
-  "store": {
-    "backend": "jsonl",
-    "tasks_path": "./tasks",
-    "lifecycle_path": "./.flywheel/lifecycle"
-  },
   "merge_strategy": "sequential",
   "review": "agent",
   "agent": "claude-code",

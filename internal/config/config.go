@@ -24,12 +24,12 @@ type Config struct {
 	MaxResolveAttempts int         `json:"max_resolve_attempts"`
 }
 
-// StoreConfig holds configuration for the task/lifecycle store backend.
+// StoreConfig selects a store backend and carries its backend-specific
+// options as raw JSON. Each backend defines its own options schema and is
+// responsible for parsing Options into its concrete type.
 type StoreConfig struct {
-	Backend       string `json:"backend"`
-	TasksPath     string `json:"tasks_path"`
-	LifecyclePath string `json:"lifecycle_path"`
-	DSN           string `json:"dsn,omitempty"`
+	Backend string          `json:"backend"`
+	Options json.RawMessage `json:"options,omitempty"`
 }
 
 // LoadWithDefaults returns a Config populated with sensible defaults.
@@ -41,9 +41,7 @@ func LoadWithDefaults() *Config {
 		BranchPrefix: "flywheel/",
 		MaxParallel:  3,
 		Store: StoreConfig{
-			Backend:       "jsonl",
-			TasksPath:     "./tasks",
-			LifecyclePath: "./.flywheel/lifecycle",
+			Backend: "jsonl",
 		},
 		MergeStrategy:      "sequential",
 		Review:             "agent",

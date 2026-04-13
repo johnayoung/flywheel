@@ -20,8 +20,6 @@ func TestLoadWithDefaults(t *testing.T) {
 		{"BranchPrefix", cfg.BranchPrefix, "flywheel/"},
 		{"MaxParallel", cfg.MaxParallel, 3},
 		{"Store.Backend", cfg.Store.Backend, "jsonl"},
-		{"Store.TasksPath", cfg.Store.TasksPath, "./tasks"},
-		{"Store.LifecyclePath", cfg.Store.LifecyclePath, "./.flywheel/lifecycle"},
 		{"MergeStrategy", cfg.MergeStrategy, "sequential"},
 		{"Review", cfg.Review, "agent"},
 		{"Agent", cfg.Agent, "claude-code"},

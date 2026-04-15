@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os/exec"
 	"strings"
 	"sync"
@@ -215,10 +214,15 @@ func (c *ClaudeCode) executeStreaming(ctx context.Context, req agent.ExecutionRe
 		// scanner.Err is intentionally ignored; we surface errors via cmd.Wait.
 	}()
 
-	waitErr := cmd.Wait()
+	// Per os/exec docs: "Wait will close the pipe after seeing the command
+	// exit, so most callers need not close it themselves; it is thus
+	// incorrect to call Wait before all reads from the pipe have completed."
+	// Drain the scanner first, then reap the process. Calling Wait before
+	// scanDone can close the read end while the scanner is still consuming
+	// buffered output, losing trailing events (notably the terminal
+	// "result" event, which makes the call appear to fail).
 	<-scanDone
-	// Drain any residual data from the pipe (best-effort).
-	_, _ = io.Copy(io.Discard, stdoutPipe)
+	waitErr := cmd.Wait()
 
 	if ctx.Err() != nil {
 		return nil, fmt.Errorf("execution cancelled: %w", ctx.Err())

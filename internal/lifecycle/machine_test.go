@@ -357,6 +357,44 @@ func TestTransition_DoesNotModifyVersion(t *testing.T) {
 	}
 }
 
+func TestTransition_InterruptedDoesNotConsumeRetryBudget(t *testing.T) {
+	lc := NewLifecycle("t1", "r1", "main")
+	_ = Transition(lc, StatusReady)
+	_ = Transition(lc, StatusRunning)
+
+	// Operator interrupt mid-run.
+	if err := Transition(lc, StatusInterrupted); err != nil {
+		t.Fatalf("Transition Running -> Interrupted: %v", err)
+	}
+	if lc.Retries != 0 {
+		t.Errorf("Interrupted must not bump Retries, got %d", lc.Retries)
+	}
+
+	// Resume on the next run.
+	if err := Transition(lc, StatusReady); err != nil {
+		t.Fatalf("Transition Interrupted -> Ready: %v", err)
+	}
+	if lc.Retries != 0 {
+		t.Errorf("Resuming from Interrupted must not bump Retries, got %d", lc.Retries)
+	}
+	if lc.Error != "" {
+		t.Errorf("expected Error cleared on resume, got %q", lc.Error)
+	}
+}
+
+func TestTransition_RetryFromValidationStillConsumesBudget(t *testing.T) {
+	lc := NewLifecycle("t1", "r1", "main")
+	_ = Transition(lc, StatusReady)
+	_ = Transition(lc, StatusRunning)
+	_ = Transition(lc, StatusValidating)
+	lc.Error = "build failed"
+	_ = Transition(lc, StatusFailedValidation)
+	_ = Transition(lc, StatusReady)
+	if lc.Retries != 1 {
+		t.Errorf("FailedValidation -> Ready must bump Retries to 1, got %d", lc.Retries)
+	}
+}
+
 func TestTransition_ConflictResolutionPath(t *testing.T) {
 	lc := NewLifecycle("t1", "r1", "main")
 	_ = Transition(lc, StatusReady)

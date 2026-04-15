@@ -99,6 +99,64 @@ func (rc *ReadinessChecker) ComputeWaves(statuses map[string]lifecycle.Status) [
 	return waves
 }
 
+// PlanSummaryData is a snapshot of status counts used for the startup
+// plan_summary event.
+type PlanSummaryData struct {
+	Total   int
+	Ready   int
+	Blocked int
+	Failed  int
+	Merged  int
+}
+
+// BlockedByFailed returns true if any transitive prerequisite of taskID is
+// in StatusFailed. A task is considered blocked when there is no plausible
+// path to readiness without operator intervention. Cycle-safe via a visited
+// set.
+func (rc *ReadinessChecker) BlockedByFailed(taskID string, statuses map[string]lifecycle.Status) bool {
+	visited := make(map[string]bool, len(rc.dag.nodes))
+	var walk func(id string) bool
+	walk = func(id string) bool {
+		if visited[id] {
+			return false
+		}
+		visited[id] = true
+		for _, prereq := range rc.dag.deps[id] {
+			if statuses[prereq] == lifecycle.StatusFailed {
+				return true
+			}
+			if walk(prereq) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(taskID)
+}
+
+// PlanSummary returns counts suitable for a startup plan_summary event.
+// "Ready" means StatusReady; "Blocked" means non-terminal + transitively
+// blocked by a failed prereq; "Failed" / "Merged" are literal status counts.
+func (rc *ReadinessChecker) PlanSummary(statuses map[string]lifecycle.Status) PlanSummaryData {
+	var out PlanSummaryData
+	for id := range rc.dag.nodes {
+		out.Total++
+		s := statuses[id]
+		switch s {
+		case lifecycle.StatusMerged:
+			out.Merged++
+		case lifecycle.StatusFailed:
+			out.Failed++
+		case lifecycle.StatusReady:
+			out.Ready++
+		}
+		if !lifecycle.IsTerminal(s) && rc.BlockedByFailed(id, statuses) {
+			out.Blocked++
+		}
+	}
+	return out
+}
+
 // sortByPriority sorts task IDs by their node priority (ascending), breaking
 // ties with lexicographic order on the task ID.
 func (rc *ReadinessChecker) sortByPriority(ids []string) {

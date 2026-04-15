@@ -17,6 +17,7 @@ import (
 	"github.com/johnayoung/flywheel/internal/agent"
 	"github.com/johnayoung/flywheel/internal/config"
 	"github.com/johnayoung/flywheel/internal/conflict"
+	"github.com/johnayoung/flywheel/internal/events"
 	"github.com/johnayoung/flywheel/internal/lifecycle"
 	"github.com/johnayoung/flywheel/internal/merge"
 	"github.com/johnayoung/flywheel/internal/review"
@@ -806,4 +807,422 @@ func (a *slowAgent) Execute(ctx context.Context, req agent.ExecutionRequest) (*a
 		Success: false,
 		Error:   "context cancelled",
 	}, nil
+}
+
+// TestContextCancellation_LeavesTaskInterruptedNotFailed asserts that when
+// the operator interrupts mid-execution, the in-flight task lands in
+// StatusInterrupted (resumable) rather than StatusFailed, and the retry
+// budget is preserved. Regression test for the false-failure scenario
+// where ctx.Canceled was treated as a terminal agent error.
+func TestContextCancellation_LeavesTaskInterruptedNotFailed(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "task-a", priority: 1})
+
+	slowAg := &slowAgent{started: make(chan struct{})}
+
+	repoRoot := initTestRepo(t)
+	worktreeBase := filepath.Join(repoRoot, ".worktrees")
+	if err := os.MkdirAll(worktreeBase, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
+	st := newTestStore(tasks)
+	tm := &testMerger{repoRoot: repoRoot}
+	v := validate.New(nil, "")
+
+	cfg := config.Config{
+		BaseRef:            "main",
+		BranchPrefix:       "flywheel/",
+		MaxParallel:        1,
+		MaxRetries:         2,
+		MaxResolveAttempts: 2,
+	}
+
+	e := New(cfg, st, wm,
+		func() agent.Agent { return slowAg },
+		v,
+		func(_ task.Task) review.Reviewer { return &testReviewer{} },
+		tm,
+		conflict.New(slowAg),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = e.Run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-slowAg.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent did not start")
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("engine did not return after cancel")
+	}
+
+	lc, err := st.GetLifecycle(context.Background(), "task-a")
+	if err != nil {
+		t.Fatalf("GetLifecycle: %v", err)
+	}
+	if lc.Status != lifecycle.StatusInterrupted {
+		t.Errorf("status = %s, want interrupted", lc.Status)
+	}
+	if lc.Retries != 0 {
+		t.Errorf("Retries = %d after cancel, want 0 (cancellation must not consume budget)", lc.Retries)
+	}
+	if len(lc.Attempts) != 1 {
+		t.Fatalf("Attempts = %d, want 1", len(lc.Attempts))
+	}
+	att := lc.Attempts[0]
+	if att.Outcome != lifecycle.OutcomeCancelled {
+		t.Errorf("attempt outcome = %q, want %q", att.Outcome, lifecycle.OutcomeCancelled)
+	}
+	if att.EndedAt == nil {
+		t.Error("attempt EndedAt should be set")
+	}
+}
+
+// alwaysFailAgent returns Success=false on every call (no commit, no error).
+type alwaysFailAgent struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (a *alwaysFailAgent) Execute(_ context.Context, _ agent.ExecutionRequest) (*agent.ExecutionResult, error) {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	return &agent.ExecutionResult{Success: false, Error: "always fails"}, nil
+}
+
+// TestAgentError_RetriesUpToMaxThenFails asserts that a non-cancellation
+// agent error consumes the retry budget (instead of being instant-terminal)
+// and only lands in StatusFailed after retries are exhausted.
+func TestAgentError_RetriesUpToMaxThenFails(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "task-fail", priority: 1})
+
+	ag := &alwaysFailAgent{}
+	repoRoot := initTestRepo(t)
+	worktreeBase := filepath.Join(repoRoot, ".worktrees")
+	if err := os.MkdirAll(worktreeBase, 0755); err != nil {
+		t.Fatal(err)
+	}
+	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
+	st := newTestStore(tasks)
+	tm := &testMerger{repoRoot: repoRoot}
+	v := validate.New(nil, "")
+
+	cfg := config.Config{
+		BaseRef:            "main",
+		BranchPrefix:       "flywheel/",
+		MaxParallel:        1,
+		MaxRetries:         2,
+		MaxResolveAttempts: 2,
+	}
+
+	e := New(cfg, st, wm,
+		func() agent.Agent { return ag },
+		v,
+		func(_ task.Task) review.Reviewer { return &testReviewer{} },
+		tm,
+		conflict.New(ag),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := e.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	lc, err := st.GetLifecycle(ctx, "task-fail")
+	if err != nil {
+		t.Fatalf("GetLifecycle: %v", err)
+	}
+	if lc.Status != lifecycle.StatusFailed {
+		t.Errorf("status = %s, want failed", lc.Status)
+	}
+	// MaxRetries=2 means the initial attempt + 2 retries = 3 attempts total.
+	if lc.Retries != cfg.MaxRetries {
+		t.Errorf("Retries = %d, want %d", lc.Retries, cfg.MaxRetries)
+	}
+	if len(lc.Attempts) != cfg.MaxRetries+1 {
+		t.Errorf("Attempts = %d, want %d", len(lc.Attempts), cfg.MaxRetries+1)
+	}
+	for i, att := range lc.Attempts {
+		if att.Outcome != lifecycle.OutcomeAgentError {
+			t.Errorf("attempt %d outcome = %q, want %q", i, att.Outcome, lifecycle.OutcomeAgentError)
+		}
+	}
+}
+
+// captureBus records every event for assertions.
+type captureBus struct {
+	mu     sync.Mutex
+	events []events.Event
+}
+
+func (c *captureBus) Publish(e events.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
+
+func (c *captureBus) types() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, len(c.events))
+	for i, e := range c.events {
+		out[i] = e.Type
+	}
+	return out
+}
+
+// TestEngine_EmitsEvents asserts the engine publishes the expected event
+// sequence for a happy-path single-task run.
+func TestEngine_EmitsEvents(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "task-x", priority: 1})
+
+	ag := newTestAgent()
+	e, _, _ := buildEngine(t, tasks, ag, 1)
+
+	bus := &captureBus{}
+	e.bus = bus
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := e.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := bus.types()
+	// Must contain at least these in order.
+	required := []string{
+		events.TypeRunStarted,
+		events.TypeTaskClaimed,
+		events.TypeTaskAttemptStarted,
+		events.TypeTaskPhaseChanged, // running -> validating
+		events.TypeTaskPhaseChanged, // validating -> reviewing
+		events.TypeTaskPhaseChanged, // reviewing -> merging
+		events.TypeTaskAttemptEnded,
+		events.TypeRunCompleted,
+	}
+
+	if !containsSubsequence(got, required) {
+		t.Errorf("event sequence missing required subsequence.\n got: %v\nwant subsequence: %v", got, required)
+	}
+}
+
+// TestPlanSummary_EmittedAtStartup asserts the engine publishes a plan_summary
+// event right after run_started so operators see the shape of the run.
+func TestPlanSummary_EmittedAtStartup(t *testing.T) {
+	tasks := makeTasks(
+		taskDef{id: "a", priority: 1},
+		taskDef{id: "b", priority: 2, deps: []string{"a"}},
+	)
+	ag := newTestAgent()
+	e, _, _ := buildEngine(t, tasks, ag, 1)
+	bus := &captureBus{}
+	e.bus = bus
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := e.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	types := bus.types()
+	// plan_summary must appear and follow run_started.
+	startedIdx, summaryIdx := -1, -1
+	for i, ty := range types {
+		if ty == events.TypeRunStarted && startedIdx == -1 {
+			startedIdx = i
+		}
+		if ty == events.TypePlanSummary && summaryIdx == -1 {
+			summaryIdx = i
+		}
+	}
+	if startedIdx == -1 || summaryIdx == -1 || summaryIdx < startedIdx {
+		t.Fatalf("expected plan_summary after run_started; got: %v", types)
+	}
+}
+
+// TestAttempt_StampsRunID asserts that attempts created during a run carry
+// the engine's runID so ConsecutiveFailedRuns can reason across runs.
+func TestAttempt_StampsRunID(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "only", priority: 1})
+	ag := newTestAgent()
+	e, st, _ := buildEngine(t, tasks, ag, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := e.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	lc, err := st.GetLifecycle(ctx, "only")
+	if err != nil {
+		t.Fatalf("GetLifecycle: %v", err)
+	}
+	if len(lc.Attempts) == 0 {
+		t.Fatal("expected at least one attempt")
+	}
+	if lc.Attempts[0].RunID == "" {
+		t.Error("attempt RunID is empty; engine did not stamp runID")
+	}
+}
+
+// TestAutoReset_ResetsPriorRunFailureBelowCap asserts that a task left in
+// StatusFailed by a prior run (with cross-run failure count below cap) is
+// revived on the next Run() and a task_auto_reset event is emitted.
+func TestAutoReset_ResetsPriorRunFailureBelowCap(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "stale", priority: 1})
+	ag := newTestAgent()
+	e, st, _ := buildEngine(t, tasks, ag, 1)
+	e.cfg.ConsecutiveFailureCap = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Seed a prior-run failure.
+	prior := lifecycle.NewLifecycle("stale", "prior-run-123", "main")
+	prior.Status = lifecycle.StatusFailed
+	endedAt := time.Now()
+	prior.Attempts = []lifecycle.Attempt{{
+		Number:    1,
+		StartedAt: time.Now().Add(-time.Hour),
+		EndedAt:   &endedAt,
+		Outcome:   lifecycle.OutcomeAgentError,
+		RunID:     "prior-run-123",
+	}}
+	if err := st.CreateLifecycle(ctx, prior); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	bus := &captureBus{}
+	e.bus = bus
+	if _, err := e.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// Should see auto_reset event.
+	sawAutoReset := false
+	for _, ev := range bus.events {
+		if ev.Type == events.TypeTaskAutoReset && ev.TaskID == "stale" {
+			sawAutoReset = true
+		}
+	}
+	if !sawAutoReset {
+		t.Error("expected task_auto_reset for 'stale'")
+	}
+	// Task should have progressed past StatusFailed.
+	lc, _ := st.GetLifecycle(ctx, "stale")
+	if lc.Status == lifecycle.StatusFailed {
+		t.Errorf("task still StatusFailed; auto-reset did not take effect")
+	}
+}
+
+// TestAutoReset_StopsAtCap asserts tasks that have already consumed the
+// consecutive-run failure cap are NOT auto-reset.
+func TestAutoReset_StopsAtCap(t *testing.T) {
+	tasks := makeTasks(taskDef{id: "capped", priority: 1})
+	ag := newTestAgent()
+	e, st, _ := buildEngine(t, tasks, ag, 1)
+	e.cfg.ConsecutiveFailureCap = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Seed 2 prior-run failures.
+	prior := lifecycle.NewLifecycle("capped", "seed", "main")
+	prior.Status = lifecycle.StatusFailed
+	now := time.Now()
+	prior.Attempts = []lifecycle.Attempt{
+		{Number: 1, StartedAt: now, EndedAt: &now, Outcome: lifecycle.OutcomeAgentError, RunID: "run-1"},
+		{Number: 2, StartedAt: now, EndedAt: &now, Outcome: lifecycle.OutcomeAgentError, RunID: "run-2"},
+	}
+	if err := st.CreateLifecycle(ctx, prior); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	bus := &captureBus{}
+	e.bus = bus
+	// Engine will deadlock (single capped failed task, no other work).
+	_, err := e.Run(ctx)
+	if err != nil && !errors.Is(err, ErrDeadlocked) {
+		t.Fatalf("Run: unexpected error: %v", err)
+	}
+
+	// No auto_reset event for capped task.
+	for _, ev := range bus.events {
+		if ev.Type == events.TypeTaskAutoReset && ev.TaskID == "capped" {
+			t.Error("capped task was auto-reset; expected it to stay failed")
+		}
+	}
+	lc, _ := st.GetLifecycle(ctx, "capped")
+	if lc.Status != lifecycle.StatusFailed {
+		t.Errorf("capped task status=%s, want failed", lc.Status)
+	}
+}
+
+// TestDeadlock_EmitsAndReturnsErr asserts that when all non-terminal tasks
+// are blocked by a capped failure, the engine emits run_deadlocked and
+// returns ErrDeadlocked.
+func TestDeadlock_EmitsAndReturnsErr(t *testing.T) {
+	tasks := makeTasks(
+		taskDef{id: "root", priority: 1},
+		taskDef{id: "child", priority: 2, deps: []string{"root"}},
+	)
+	ag := newTestAgent()
+	e, st, _ := buildEngine(t, tasks, ag, 1)
+	e.cfg.ConsecutiveFailureCap = 1
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Seed root as a capped failure.
+	now := time.Now()
+	root := lifecycle.NewLifecycle("root", "seed", "main")
+	root.Status = lifecycle.StatusFailed
+	root.Attempts = []lifecycle.Attempt{
+		{Number: 1, StartedAt: now, EndedAt: &now, Outcome: lifecycle.OutcomeAgentError, RunID: "run-1"},
+	}
+	if err := st.CreateLifecycle(ctx, root); err != nil {
+		t.Fatalf("seed root: %v", err)
+	}
+	// child is auto-created as StatusPending.
+
+	bus := &captureBus{}
+	e.bus = bus
+	_, err := e.Run(ctx)
+	if !errors.Is(err, ErrDeadlocked) {
+		t.Fatalf("Run: want ErrDeadlocked, got %v", err)
+	}
+
+	sawDeadlock := false
+	for _, ev := range bus.events {
+		if ev.Type == events.TypeRunDeadlocked {
+			sawDeadlock = true
+		}
+	}
+	if !sawDeadlock {
+		t.Error("expected run_deadlocked event")
+	}
+}
+
+// containsSubsequence reports whether want occurs in seq in order (not
+// necessarily contiguously).
+func containsSubsequence(seq, want []string) bool {
+	i := 0
+	for _, s := range seq {
+		if i < len(want) && s == want[i] {
+			i++
+		}
+	}
+	return i == len(want)
 }

@@ -1,12 +1,15 @@
 package claudecode
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/johnayoung/flywheel/internal/agent"
 )
@@ -14,6 +17,8 @@ import (
 // ClaudeCode implements agent.Agent using the Claude Code CLI.
 type ClaudeCode struct {
 	claudePath string
+	streaming  bool
+	onChunk    func(string)
 }
 
 // Option configures a ClaudeCode instance.
@@ -23,6 +28,25 @@ type Option func(*ClaudeCode)
 func WithClaudePath(path string) Option {
 	return func(c *ClaudeCode) {
 		c.claudePath = path
+	}
+}
+
+// WithStreaming enables stream-json output parsing. When true, the agent
+// invokes claude with `--output-format stream-json --verbose` and reads
+// one JSON event per line. When false (default), behavior is identical
+// to the original buffered `--output-format json` mode.
+func WithStreaming(enabled bool) Option {
+	return func(c *ClaudeCode) {
+		c.streaming = enabled
+	}
+}
+
+// WithOnChunk registers a callback invoked for every interim assistant or
+// tool event when streaming is enabled. The callback runs synchronously
+// on the goroutine reading the agent's stdout; it must not block.
+func WithOnChunk(fn func(string)) Option {
+	return func(c *ClaudeCode) {
+		c.onChunk = fn
 	}
 }
 
@@ -37,7 +61,8 @@ func New(opts ...Option) *ClaudeCode {
 	return c
 }
 
-// claudeOutput represents the JSON output from claude --output-format json.
+// claudeOutput represents the JSON output from claude --output-format json
+// (and the terminal `result` event in stream-json mode).
 type claudeOutput struct {
 	Result  string `json:"result"`
 	IsError bool   `json:"is_error"`
@@ -71,6 +96,15 @@ func BuildPrompt(req agent.ExecutionRequest) string {
 func (c *ClaudeCode) Execute(ctx context.Context, req agent.ExecutionRequest) (*agent.ExecutionResult, error) {
 	prompt := BuildPrompt(req)
 
+	if c.streaming {
+		return c.executeStreaming(ctx, req, prompt)
+	}
+	return c.executeBuffered(ctx, req, prompt)
+}
+
+// executeBuffered runs claude with `--output-format json` and parses the
+// single JSON document on stdout. Preserves legacy behavior.
+func (c *ClaudeCode) executeBuffered(ctx context.Context, req agent.ExecutionRequest, prompt string) (*agent.ExecutionResult, error) {
 	cmd := exec.CommandContext(ctx, c.claudePath, "--dangerously-skip-permissions", "-p", prompt, "--output-format", "json")
 	cmd.Dir = req.WorktreePath
 
@@ -137,4 +171,158 @@ func (c *ClaudeCode) Execute(ctx context.Context, req agent.ExecutionRequest) (*
 		Output:              out.Result,
 		ImplementationNotes: out.Result,
 	}, nil
+}
+
+// executeStreaming runs claude with `--output-format stream-json --verbose`
+// and parses NDJSON events as they arrive. Interim assistant text and
+// tool_use names are forwarded to OnChunk; the terminal `result` event
+// produces the final ExecutionResult.
+func (c *ClaudeCode) executeStreaming(ctx context.Context, req agent.ExecutionRequest, prompt string) (*agent.ExecutionResult, error) {
+	cmd := exec.CommandContext(ctx, c.claudePath, "--dangerously-skip-permissions", "-p", prompt, "--output-format", "stream-json", "--verbose")
+	cmd.Dir = req.WorktreePath
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting claude: %w", err)
+	}
+
+	var (
+		mu        sync.Mutex
+		finalOut  claudeOutput
+		gotResult bool
+		parseErrs int
+	)
+
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		scanner := bufio.NewScanner(stdoutPipe)
+		// Allow large lines: assistant messages can carry sizable text.
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			c.handleStreamLine(line, &mu, &finalOut, &gotResult, &parseErrs)
+		}
+		// scanner.Err is intentionally ignored; we surface errors via cmd.Wait.
+	}()
+
+	waitErr := cmd.Wait()
+	<-scanDone
+	// Drain any residual data from the pipe (best-effort).
+	_, _ = io.Copy(io.Discard, stdoutPipe)
+
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("execution cancelled: %w", ctx.Err())
+	}
+
+	mu.Lock()
+	got := gotResult
+	out := finalOut
+	mu.Unlock()
+
+	if waitErr != nil {
+		exitErr := stderr.String()
+		if exitErr == "" {
+			exitErr = waitErr.Error()
+		}
+		if got && out.Result != "" {
+			return &agent.ExecutionResult{
+				Success:             false,
+				Output:              out.Result,
+				ImplementationNotes: out.Result,
+				Error:               exitErr,
+			}, nil
+		}
+		return &agent.ExecutionResult{
+			Success: false,
+			Error:   exitErr,
+		}, nil
+	}
+
+	if !got {
+		return &agent.ExecutionResult{
+			Success: false,
+			Error:   "stream-json terminated without a result event",
+		}, nil
+	}
+
+	if out.IsError {
+		return &agent.ExecutionResult{
+			Success:             false,
+			Output:              out.Result,
+			ImplementationNotes: out.Result,
+			Error:               out.Result,
+		}, nil
+	}
+
+	return &agent.ExecutionResult{
+		Success:             true,
+		StepsCompleted:      len(req.Steps),
+		Output:              out.Result,
+		ImplementationNotes: out.Result,
+	}, nil
+}
+
+// handleStreamLine parses a single NDJSON line. Recognized event types:
+//   - {"type":"result","result":"...","is_error":bool} -> terminal result
+//   - {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+//   - {"type":"assistant","message":{"content":[{"type":"tool_use","name":"..."}]}}
+//
+// All other types are silently dropped.
+func (c *ClaudeCode) handleStreamLine(line []byte, mu *sync.Mutex, finalOut *claudeOutput, gotResult *bool, parseErrs *int) {
+	var env struct {
+		Type    string          `json:"type"`
+		Result  string          `json:"result"`
+		IsError bool            `json:"is_error"`
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(line, &env); err != nil {
+		mu.Lock()
+		*parseErrs++
+		mu.Unlock()
+		return
+	}
+	switch env.Type {
+	case "result":
+		mu.Lock()
+		finalOut.Result = env.Result
+		finalOut.IsError = env.IsError
+		*gotResult = true
+		mu.Unlock()
+	case "assistant":
+		if c.onChunk == nil || len(env.Message) == 0 {
+			return
+		}
+		var msg struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+				Name string `json:"name"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(env.Message, &msg); err != nil {
+			return
+		}
+		for _, part := range msg.Content {
+			switch part.Type {
+			case "text":
+				if part.Text != "" {
+					c.onChunk(part.Text)
+				}
+			case "tool_use":
+				if part.Name != "" {
+					c.onChunk("[tool_use] " + part.Name)
+				}
+			}
+		}
+	}
 }

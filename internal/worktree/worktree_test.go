@@ -104,7 +104,7 @@ func TestRemoveWorktree(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := mgr.Remove(ctx, "task-rm"); err != nil {
+	if err := mgr.Remove(ctx, "task-rm", ""); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 
@@ -120,6 +120,90 @@ func TestRemoveWorktree(t *testing.T) {
 	if strings.TrimSpace(string(out)) != "" {
 		t.Fatalf("branch %s still exists after Remove", wt.Branch)
 	}
+}
+
+func TestRemoveWorktree_ArchivesBranchWithCommits(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	ctx := context.Background()
+	wt, err := mgr.Create(ctx, "task-keep", "HEAD")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Commit something on the branch so it's ahead of baseRef.
+	if err := os.WriteFile(filepath.Join(wt.Path, "new.txt"), []byte("work"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"git", "-C", wt.Path, "add", "."},
+		{"git", "-C", wt.Path, "commit", "-m", "add work"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%v: %v: %s", args, err, out)
+		}
+	}
+
+	if err := mgr.Remove(ctx, "task-keep", "HEAD"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	// Original branch gone.
+	cmd := exec.Command("git", "branch", "--list", wt.Branch)
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("original branch %s still exists", wt.Branch)
+	}
+
+	// Archive branch exists.
+	cmd = exec.Command("git", "branch", "--list", "flywheel/archive/task-keep-*")
+	cmd.Dir = repo
+	out, _ = cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatalf("archive branch not found. branches:\n%s", listAllBranches(t, repo))
+	}
+}
+
+func TestRemoveWorktree_DeletesEmptyBranch(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	ctx := context.Background()
+	wt, err := mgr.Create(ctx, "task-empty", "HEAD")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// No commits — branch is at baseRef.
+	if err := mgr.Remove(ctx, "task-empty", "HEAD"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	// No archive branch should be created; the original branch is gone.
+	cmd := exec.Command("git", "branch", "--list", "flywheel/archive/task-empty-*")
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("unexpected archive branch: %s", string(out))
+	}
+	cmd = exec.Command("git", "branch", "--list", wt.Branch)
+	cmd.Dir = repo
+	out, _ = cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("branch %s still exists", wt.Branch)
+	}
+}
+
+func listAllBranches(t *testing.T, repo string) string {
+	t.Helper()
+	cmd := exec.Command("git", "branch", "-a")
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	return string(out)
 }
 
 func TestListWorktrees(t *testing.T) {
@@ -203,6 +287,155 @@ func TestIsCleanFalse(t *testing.T) {
 	}
 	if clean {
 		t.Fatal("expected dirty worktree")
+	}
+}
+
+func TestCreate_CleansStaleBranchWithNoCommits(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	// Pre-create a stale branch with the same name that Create would pick.
+	run := func(args ...string) {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", args, err, out)
+		}
+	}
+	run("git", "branch", "flywheel/stale-task", "HEAD")
+
+	ctx := context.Background()
+	wt, err := mgr.Create(ctx, "stale-task", "HEAD")
+	if err != nil {
+		t.Fatalf("Create should succeed despite stale branch: %v", err)
+	}
+	if _, err := os.Stat(wt.Path); os.IsNotExist(err) {
+		t.Fatal("worktree directory not created")
+	}
+
+	// No archive branch should be created for an empty stale branch.
+	cmd := exec.Command("git", "branch", "--list", "flywheel/archive/stale-task-*")
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("unexpected archive branch for empty stale: %s", out)
+	}
+}
+
+func TestCreate_ArchivesStaleBranchWithCommits(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	// Build a stale branch with a commit ahead of HEAD via a throwaway worktree.
+	staging := t.TempDir() + "/staging"
+	for _, args := range [][]string{
+		{"git", "-C", repo, "worktree", "add", "-b", "flywheel/stale-commits", staging, "HEAD"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(staging, "work.txt"), []byte("prior"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"git", "-C", staging, "add", "."},
+		{"git", "-C", staging, "commit", "-m", "prior work"},
+		{"git", "-C", repo, "worktree", "remove", "--force", staging},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", args, err, out)
+		}
+	}
+	// Branch flywheel/stale-commits now exists with 1 commit ahead of HEAD.
+
+	ctx := context.Background()
+	wt, err := mgr.Create(ctx, "stale-commits", "HEAD")
+	if err != nil {
+		t.Fatalf("Create should succeed, archiving stale branch: %v", err)
+	}
+	if _, err := os.Stat(wt.Path); os.IsNotExist(err) {
+		t.Fatal("worktree directory not created")
+	}
+
+	// Archive branch should exist, preserving the prior commit.
+	cmd := exec.Command("git", "branch", "--list", "flywheel/archive/stale-commits-*")
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) == "" {
+		t.Fatalf("expected archive branch. branches:\n%s", listAllBranches(t, repo))
+	}
+}
+
+func TestCreate_CleansStaleWorktreeDir(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	// Leave a bare directory where Create will try to put a worktree.
+	stalePath := filepath.Join(wtBase, "dir-clash")
+	if err := os.MkdirAll(stalePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stalePath, "junk"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if _, err := mgr.Create(ctx, "dir-clash", "HEAD"); err != nil {
+		t.Fatalf("Create should succeed despite stale dir: %v", err)
+	}
+}
+
+func TestPruneStale_ArchivesOrphanBranches(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	ctx := context.Background()
+	// Create a worktree then blow away its directory to simulate a crashed run.
+	wt, err := mgr.Create(ctx, "crashed", "HEAD")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	// Active is empty => everything is orphan.
+	if err := mgr.PruneStale(ctx, map[string]bool{}, "HEAD"); err != nil {
+		t.Fatalf("PruneStale: %v", err)
+	}
+
+	// Branch should be gone.
+	cmd := exec.Command("git", "branch", "--list", wt.Branch)
+	cmd.Dir = repo
+	out, _ := cmd.CombinedOutput()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("orphan branch %s still present", wt.Branch)
+	}
+}
+
+func TestPruneStale_KeepsActive(t *testing.T) {
+	repo := setupTestRepo(t)
+	wtBase := t.TempDir()
+	mgr := NewManager(repo, wtBase, "flywheel/")
+
+	ctx := context.Background()
+	wt, err := mgr.Create(ctx, "keep-me", "HEAD")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := mgr.PruneStale(ctx, map[string]bool{"keep-me": true}, "HEAD"); err != nil {
+		t.Fatalf("PruneStale: %v", err)
+	}
+	if _, err := os.Stat(wt.Path); os.IsNotExist(err) {
+		t.Fatal("active worktree was incorrectly pruned")
 	}
 }
 

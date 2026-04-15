@@ -8,14 +8,15 @@ import (
 var validTransitions = map[Status][]Status{
 	StatusPending:          {StatusReady},
 	StatusReady:            {StatusRunning},
-	StatusRunning:          {StatusValidating, StatusFailed, StatusReady},
-	StatusValidating:       {StatusReviewing, StatusFailedValidation, StatusReady},
+	StatusRunning:          {StatusValidating, StatusFailedValidation, StatusFailed, StatusReady, StatusInterrupted},
+	StatusValidating:       {StatusReviewing, StatusFailedValidation, StatusReady, StatusInterrupted},
 	StatusFailedValidation: {StatusReady, StatusFailed},
-	StatusReviewing:        {StatusMerging, StatusRejected, StatusReady},
+	StatusReviewing:        {StatusMerging, StatusRejected, StatusReady, StatusInterrupted},
 	StatusRejected:         {StatusReady, StatusFailed},
-	StatusMerging:          {StatusMerged, StatusConflict, StatusReady},
-	StatusConflict:         {StatusResolving},
-	StatusResolving:        {StatusMerging, StatusFailed, StatusReady},
+	StatusMerging:          {StatusMerged, StatusConflict, StatusReady, StatusInterrupted},
+	StatusConflict:         {StatusResolving, StatusInterrupted},
+	StatusResolving:        {StatusMerging, StatusFailed, StatusReady, StatusInterrupted},
+	StatusInterrupted:      {StatusReady},
 	StatusMerged:           {},
 	StatusFailed:           {},
 }
@@ -65,6 +66,11 @@ func Transition(lc *Lifecycle, to Status) error {
 	// Retry side effects: moving from a retryable state back to ready.
 	if to == StatusReady && (from == StatusFailedValidation || from == StatusRejected) {
 		lc.Retries++
+		lc.Error = ""
+	}
+	// Resume side effect: returning from interrupted does NOT consume the
+	// retry budget (the prior attempt was cancelled, not failed).
+	if to == StatusReady && from == StatusInterrupted {
 		lc.Error = ""
 	}
 

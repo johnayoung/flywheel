@@ -19,6 +19,7 @@ import (
 	"github.com/johnayoung/flywheel/internal/conflict"
 	"github.com/johnayoung/flywheel/internal/dag"
 	"github.com/johnayoung/flywheel/internal/engine"
+	"github.com/johnayoung/flywheel/internal/events"
 	"github.com/johnayoung/flywheel/internal/lifecycle"
 	"github.com/johnayoung/flywheel/internal/merge"
 	"github.com/johnayoung/flywheel/internal/review"
@@ -68,6 +69,7 @@ func rootCmd() *cobra.Command {
 	cmd.AddCommand(cleanCmd())
 	cmd.AddCommand(validateCmd())
 	cmd.AddCommand(updateCmd())
+	cmd.AddCommand(retryCmd())
 
 	return cmd
 }
@@ -192,15 +194,41 @@ func runCmd() *cobra.Command {
 				cancel()
 			}()
 
+			verbose, _ := cmd.Flags().GetBool("verbose")
+
 			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
 				return fmt.Errorf("opening store: %w", err)
 			}
 
+			// Wire the event bus: stdout reporter (human-readable) plus a
+			// JSONL writer at .flywheel/events.jsonl that future tools can tail.
+			bus := events.NewBus()
+			bus.Subscribe(events.NewStdoutReporter(cmd.OutOrStdout(), verbose))
+			eventsPath := filepath.Join(".flywheel", "events.jsonl")
+			jsonlWriter, err := events.NewJSONLWriter(eventsPath)
+			if err != nil {
+				return fmt.Errorf("opening events log: %w", err)
+			}
+			defer jsonlWriter.Close()
+			bus.Subscribe(jsonlWriter)
+
 			wm := worktree.NewManager(cfg.Repo, filepath.Join(".flywheel", "worktrees"), cfg.BranchPrefix)
 
+			// Primary executing agent streams chunks to the bus when verbose.
 			agentFn := func() agent.Agent {
-				return claudecode.New()
+				opts := []claudecode.Option{
+					claudecode.WithStreaming(true),
+				}
+				if verbose {
+					opts = append(opts, claudecode.WithOnChunk(func(text string) {
+						bus.Publish(events.Event{
+							Type: events.TypeAgentOutputChunk,
+							Data: map[string]any{"text": text},
+						})
+					}))
+				}
+				return claudecode.New(opts...)
 			}
 
 			validator := validate.New(claudecode.New(), cfg.BuildCommand)
@@ -221,8 +249,12 @@ func runCmd() *cobra.Command {
 
 			resolver := conflict.New(claudecode.New())
 
-			eng := engine.New(*cfg, st, wm, agentFn, validator, reviewerFn, merger, resolver)
+			eng := engine.New(*cfg, st, wm, agentFn, validator, reviewerFn, merger, resolver, engine.WithEventBus(bus))
 			summary, err := eng.Run(ctx)
+			if errors.Is(err, engine.ErrDeadlocked) {
+				fmt.Fprintln(cmd.ErrOrStderr(), "run deadlocked; use 'flywheel retry --all-failed --force' to reset capped tasks")
+				os.Exit(2)
+			}
 			if err != nil {
 				return fmt.Errorf("engine run failed: %w", err)
 			}
@@ -240,6 +272,7 @@ func runCmd() *cobra.Command {
 
 	cmd.Flags().Int("max-parallel", 0, "override max parallel workers from config")
 	cmd.Flags().Bool("dry-run", false, "print execution plan without running")
+	cmd.Flags().Bool("verbose", false, "stream agent output chunks to stdout")
 
 	return cmd
 }
@@ -301,7 +334,11 @@ func statusCmd() *cobra.Command {
 
 			ctx := context.Background()
 			showLifecycle, _ := cmd.Flags().GetBool("lifecycle")
+			blocked, _ := cmd.Flags().GetBool("blocked")
 
+			if blocked {
+				return showBlocked(cmd, ctx, st)
+			}
 			if len(args) == 1 {
 				return showTaskStatus(cmd, ctx, st, args[0], showLifecycle)
 			}
@@ -310,8 +347,74 @@ func statusCmd() *cobra.Command {
 	}
 
 	cmd.Flags().Bool("lifecycle", false, "show detailed lifecycle timestamps")
+	cmd.Flags().Bool("blocked", false, "list tasks transitively blocked by a failed prerequisite")
 
 	return cmd
+}
+
+func showBlocked(cmd *cobra.Command, ctx context.Context, st store.TaskStore) error {
+	tasks, err := st.ListTasks(ctx, store.TaskFilter{})
+	if err != nil {
+		return fmt.Errorf("listing tasks: %w", err)
+	}
+	lcs, err := st.ListLifecycles(ctx, store.LifecycleFilter{})
+	if err != nil {
+		return fmt.Errorf("listing lifecycles: %w", err)
+	}
+	d, err := dag.Build(tasks)
+	if err != nil {
+		return fmt.Errorf("building DAG: %w", err)
+	}
+	checker := dag.NewReadinessChecker(d)
+
+	statuses := make(map[string]lifecycle.Status, len(lcs))
+	for _, lc := range lcs {
+		statuses[lc.TaskID] = lc.Status
+	}
+
+	// Precompute failed ancestor for each blocked task.
+	var any bool
+	fmt.Fprintf(cmd.OutOrStdout(), "%-30s %-20s %s\n", "ID", "STATUS", "BLOCKED BY")
+	fmt.Fprintf(cmd.OutOrStdout(), "%-30s %-20s %s\n", strings.Repeat("-", 30), strings.Repeat("-", 20), strings.Repeat("-", 40))
+	for _, t := range tasks {
+		s := statuses[t.ID]
+		if lifecycle.IsTerminal(s) {
+			continue
+		}
+		if !checker.BlockedByFailed(t.ID, statuses) {
+			continue
+		}
+		any = true
+		// Walk prereqs to find the first failed ancestor.
+		cause := findFailedAncestor(d, t.ID, statuses)
+		fmt.Fprintf(cmd.OutOrStdout(), "%-30s %-20s %s\n", t.ID, s, cause)
+	}
+	if !any {
+		fmt.Fprintln(cmd.OutOrStdout(), "No tasks blocked by failed prerequisites.")
+	}
+	return nil
+}
+
+// findFailedAncestor returns the task ID of the nearest transitive prerequisite
+// of taskID that is in StatusFailed, or "" if none is found.
+func findFailedAncestor(d *dag.DAG, taskID string, statuses map[string]lifecycle.Status) string {
+	visited := make(map[string]bool)
+	queue := []string{taskID}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, p := range d.Prerequisites(cur) {
+			if visited[p] {
+				continue
+			}
+			visited[p] = true
+			if statuses[p] == lifecycle.StatusFailed {
+				return p
+			}
+			queue = append(queue, p)
+		}
+	}
+	return ""
 }
 
 func showTaskStatus(cmd *cobra.Command, ctx context.Context, st store.TaskStore, taskID string, showLifecycle bool) error {
@@ -339,6 +442,23 @@ func showTaskStatus(cmd *cobra.Command, ctx context.Context, st store.TaskStore,
 	}
 	if lc.Error != "" {
 		fmt.Fprintf(cmd.OutOrStdout(), "Error: %s\n", lc.Error)
+	}
+
+	if len(lc.Attempts) > 0 {
+		fmt.Fprintln(cmd.OutOrStdout(), "\nAttempts:")
+		for _, a := range lc.Attempts {
+			runID := a.RunID
+			if runID == "" {
+				runID = "(legacy)"
+			} else if len(runID) > 18 {
+				runID = runID[:18]
+			}
+			outcome := a.Outcome
+			if outcome == "" {
+				outcome = "in-progress"
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "  #%d %s run=%s\n", a.Number, outcome, runID)
+		}
 	}
 
 	if showLifecycle {
@@ -574,7 +694,7 @@ func cleanCmd() *cobra.Command {
 				fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not list worktrees: %v\n", err)
 			} else {
 				for _, wt := range wts {
-					if err := wm.Remove(ctx, wt.TaskID); err != nil {
+					if err := wm.Remove(ctx, wt.TaskID, cfg.BaseRef); err != nil {
 						fmt.Fprintf(cmd.ErrOrStderr(), "Warning: could not remove worktree for %s: %v\n", wt.TaskID, err)
 					} else {
 						fmt.Fprintf(cmd.OutOrStdout(), "Removed worktree: %s (%s)\n", wt.TaskID, wt.Path)
@@ -669,4 +789,81 @@ func validateDagCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// --- retry ---
+
+func retryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "retry [task_id...]",
+		Short: "Reset failed tasks back to pending so the next run can retry them",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig(cmd)
+			if err != nil {
+				return err
+			}
+			force, _ := cmd.Flags().GetBool("force")
+			allFailed, _ := cmd.Flags().GetBool("all-failed")
+
+			if !allFailed && len(args) == 0 {
+				return fmt.Errorf("specify at least one task_id or use --all-failed")
+			}
+
+			st, err := storeopen.Open(cfg.Store)
+			if err != nil {
+				return fmt.Errorf("opening store: %w", err)
+			}
+
+			ctx := context.Background()
+
+			var targets []*lifecycle.Lifecycle
+			if allFailed {
+				lcs, err := st.ListLifecycles(ctx, store.LifecycleFilter{
+					Statuses: []lifecycle.Status{lifecycle.StatusFailed},
+				})
+				if err != nil {
+					return fmt.Errorf("listing failed lifecycles: %w", err)
+				}
+				for i := range lcs {
+					targets = append(targets, &lcs[i])
+				}
+			} else {
+				for _, id := range args {
+					lc, err := st.GetLifecycle(ctx, id)
+					if err != nil {
+						return fmt.Errorf("getting lifecycle for %q: %w", id, err)
+					}
+					if lc.Status != lifecycle.StatusFailed {
+						return fmt.Errorf("task %q is %q, not failed; retry refuses non-failed tasks", id, lc.Status)
+					}
+					targets = append(targets, lc)
+				}
+			}
+
+			cap := cfg.ConsecutiveFailureCap
+			reset, skipped := 0, 0
+			for _, lc := range targets {
+				if !force && cap > 0 && lifecycle.ConsecutiveFailedRuns(lc) >= cap {
+					fmt.Fprintf(cmd.ErrOrStderr(), "skipping %s: hit consecutive failure cap (%d); re-run with --force to override\n", lc.TaskID, cap)
+					skipped++
+					continue
+				}
+				lifecycle.ResetForRetry(lc)
+				lc.Status = lifecycle.StatusPending
+				lc.Timestamps.FailedAt = nil
+				if err := st.UpdateLifecycle(ctx, lc); err != nil {
+					return fmt.Errorf("updating lifecycle %s: %w", lc.TaskID, err)
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "reset %s -> pending\n", lc.TaskID)
+				reset++
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "\n%d reset, %d skipped\n", reset, skipped)
+			return nil
+		},
+	}
+
+	cmd.Flags().Bool("force", false, "reset even if consecutive failure cap is reached")
+	cmd.Flags().Bool("all-failed", false, "reset every lifecycle in status=failed")
+
+	return cmd
 }

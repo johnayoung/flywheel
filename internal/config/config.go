@@ -22,6 +22,14 @@ type Config struct {
 	Timeout            string      `json:"timeout"`
 	MaxRetries         int         `json:"max_retries"`
 	MaxResolveAttempts int         `json:"max_resolve_attempts"`
+	// HeartbeatInterval is how often the engine emits a run_heartbeat event
+	// while workers are active. Suppressed when a phase transition occurred
+	// within the last 2 seconds.
+	HeartbeatInterval string `json:"heartbeat_interval"`
+	// ConsecutiveFailureCap bounds the number of consecutive failed runs
+	// (distinct RunIDs) a task can accumulate before auto-reset refuses to
+	// revive it. Operators must use `flywheel retry --force` once this is hit.
+	ConsecutiveFailureCap int `json:"consecutive_failure_cap"`
 }
 
 // StoreConfig selects a store backend and carries its backend-specific
@@ -47,8 +55,10 @@ func LoadWithDefaults() *Config {
 		Review:             "agent",
 		Agent:              "claude-code",
 		Timeout:            "30m",
-		MaxRetries:         2,
-		MaxResolveAttempts: 2,
+		MaxRetries:            2,
+		MaxResolveAttempts:    2,
+		HeartbeatInterval:     "30s",
+		ConsecutiveFailureCap: 2,
 	}
 }
 
@@ -95,6 +105,14 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.MaxResolveAttempts < 0 {
 		return fmt.Errorf("max_resolve_attempts must be >= 0, got %d", cfg.MaxResolveAttempts)
+	}
+	if cfg.HeartbeatInterval != "" {
+		if _, err := time.ParseDuration(cfg.HeartbeatInterval); err != nil {
+			return fmt.Errorf("invalid heartbeat_interval %q: %w", cfg.HeartbeatInterval, err)
+		}
+	}
+	if cfg.ConsecutiveFailureCap < 0 {
+		return fmt.Errorf("consecutive_failure_cap must be >= 0, got %d", cfg.ConsecutiveFailureCap)
 	}
 	return nil
 }

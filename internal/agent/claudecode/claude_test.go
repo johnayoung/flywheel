@@ -216,6 +216,74 @@ exit 1
 	}
 }
 
+func TestExecute_Streaming_ParsesNDJSONAndCallsOnChunk(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Emit two assistant text chunks, one tool_use, then a result event.
+	scriptPath := writeScript(t, tmpDir, "claude", `#!/bin/sh
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"world"}]}}'
+printf '%s\n' '{"type":"result","result":"all done","is_error":false}'
+`)
+
+	var chunks []string
+	c := New(
+		WithClaudePath(scriptPath),
+		WithStreaming(true),
+		WithOnChunk(func(s string) { chunks = append(chunks, s) }),
+	)
+	req := agent.ExecutionRequest{
+		WorktreePath: tmpDir,
+		TaskID:       "TASK-S",
+		Description:  "stream test",
+		Steps:        []string{"a", "b"},
+	}
+
+	result, err := c.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("expected Success, got Error=%q", result.Error)
+	}
+	if result.Output != "all done" {
+		t.Errorf("Output=%q, want 'all done'", result.Output)
+	}
+	want := []string{"hello", "[tool_use] Bash", "world"}
+	if len(chunks) != len(want) {
+		t.Fatalf("got %d chunks (%v), want %d (%v)", len(chunks), chunks, len(want), want)
+	}
+	for i, c := range chunks {
+		if c != want[i] {
+			t.Errorf("chunk %d = %q, want %q", i, c, want[i])
+		}
+	}
+}
+
+func TestExecute_Streaming_NoResultEventIsError(t *testing.T) {
+	tmpDir := t.TempDir()
+	scriptPath := writeScript(t, tmpDir, "claude", `#!/bin/sh
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"oops"}]}}'
+`)
+
+	c := New(WithClaudePath(scriptPath), WithStreaming(true))
+	req := agent.ExecutionRequest{
+		WorktreePath: tmpDir,
+		TaskID:       "TASK-S2",
+		Description:  "no result",
+	}
+	result, err := c.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Success {
+		t.Error("expected Success=false when no result event arrives")
+	}
+	if !strings.Contains(result.Error, "result event") {
+		t.Errorf("expected 'result event' in error, got: %q", result.Error)
+	}
+}
+
 func TestNew_DefaultClaudePath(t *testing.T) {
 	c := New()
 	if c.claudePath != "claude" {

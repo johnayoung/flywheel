@@ -67,6 +67,7 @@ func rootCmd() *cobra.Command {
 	cmd.AddCommand(reviewCmd())
 	cmd.AddCommand(cleanCmd())
 	cmd.AddCommand(validateCmd())
+	cmd.AddCommand(updateCmd())
 
 	return cmd
 }

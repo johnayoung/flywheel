@@ -47,6 +47,15 @@ cd flywheel
 make build        # produces ./bin/flywheel
 ```
 
+**Update an existing install** (pre-built binary):
+
+```
+flywheel update           # download and replace with the latest release
+flywheel update --check   # report whether a newer version exists
+```
+
+Checksums are verified against each release's `checksums.txt`. If flywheel was installed with `go install`, `flywheel update` prints the `go install ...@latest` command to use instead.
+
 ## Quick Start
 
 Flywheel runs with zero configuration. In any git repository:
@@ -124,33 +133,33 @@ All flywheel state lives under `.flywheel/` by default: task definitions in `.fl
 
 Only the `jsonl` backend ships today. Its single option is `root` (default `.flywheel`), from which `tasks/` and `lifecycle/` are derived.
 
-| Field | Default | Description |
-|---|---|---|
-| `repo` | `.` | Path to the git repository |
-| `base_ref` | `main` | Branch to create worktrees from and merge into |
-| `branch_prefix` | `flywheel/` | Prefix for task branches |
-| `max_parallel` | `3` | Maximum concurrent agent workers |
-| `build_command` | | Command to validate builds (e.g. `go build ./...`) |
-| `merge_strategy` | `sequential` | How completed work is merged |
-| `review` | `agent` | Default review mode: `agent`, `human`, or `none` |
-| `agent` | `claude-code` | Agent backend for task execution |
-| `timeout` | `30m` | Per-task execution timeout |
-| `max_retries` | `2` | Retry count on task failure |
-| `max_resolve_attempts` | `2` | Retry count for merge conflict resolution |
+| Field                  | Default       | Description                                        |
+| ---------------------- | ------------- | -------------------------------------------------- |
+| `repo`                 | `.`           | Path to the git repository                         |
+| `base_ref`             | `main`        | Branch to create worktrees from and merge into     |
+| `branch_prefix`        | `flywheel/`   | Prefix for task branches                           |
+| `max_parallel`         | `3`           | Maximum concurrent agent workers                   |
+| `build_command`        |               | Command to validate builds (e.g. `go build ./...`) |
+| `merge_strategy`       | `sequential`  | How completed work is merged                       |
+| `review`               | `agent`       | Default review mode: `agent`, `human`, or `none`   |
+| `agent`                | `claude-code` | Agent backend for task execution                   |
+| `timeout`              | `30m`         | Per-task execution timeout                         |
+| `max_retries`          | `2`           | Retry count on task failure                        |
+| `max_resolve_attempts` | `2`           | Retry count for merge conflict resolution          |
 
 ## Task Schema
 
-| Field | Required | Description |
-|---|---|---|
-| `id` | yes | Unique identifier (no whitespace) |
-| `description` | yes | What the task accomplishes |
-| `category` | yes | One of: `feat`, `fix`, `refactor`, `test`, `docs`, `chore` |
-| `priority` | no | Numeric priority (lower = higher priority) |
-| `prerequisites` | no | Task IDs that must merge before this task starts |
-| `commit` | yes | Commit message template |
-| `steps` | yes | Ordered implementation steps for the agent |
-| `acceptance_criteria` | no | Conditions that must be true when complete |
-| `review` | no | Per-task override: `agent`, `human`, or `none` |
+| Field                 | Required | Description                                                |
+| --------------------- | -------- | ---------------------------------------------------------- |
+| `id`                  | yes      | Unique identifier (no whitespace)                          |
+| `description`         | yes      | What the task accomplishes                                 |
+| `category`            | yes      | One of: `feat`, `fix`, `refactor`, `test`, `docs`, `chore` |
+| `priority`            | no       | Numeric priority (lower = higher priority)                 |
+| `prerequisites`       | no       | Task IDs that must merge before this task starts           |
+| `commit`              | yes      | Commit message template                                    |
+| `steps`               | yes      | Ordered implementation steps for the agent                 |
+| `acceptance_criteria` | no       | Conditions that must be true when complete                 |
+| `review`              | no       | Per-task override: `agent`, `human`, or `none`             |
 
 ## CLI Reference
 
@@ -169,6 +178,8 @@ flywheel validate tasks             Validate task definitions
 flywheel validate dag               Validate dependency graph (cycle detection)
 flywheel clean                      Remove worktrees and .flywheel/ state
 flywheel clean --worktrees-only     Keep state, remove only worktrees
+flywheel update                     Replace the binary with the latest release
+flywheel update --check             Check for a newer release without installing
 ```
 
 ## Architecture

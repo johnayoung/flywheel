@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/johnayoung/flywheel/compare/v0.3.0...v0.4.0) (2026-04-15)
+
+
+### Features
+
+* **engine:** self-healing orchestration and defensive worktree lifecycle ([e47896a](https://github.com/johnayoung/flywheel/commit/e47896a7bf549fb3cf50d120eec4d22fc9b83e88))
+
 ## [0.3.0](https://github.com/johnayoung/flywheel/compare/v0.2.0...v0.3.0) (2026-04-15)
 
 

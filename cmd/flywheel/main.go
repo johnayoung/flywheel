@@ -231,7 +231,7 @@ func runCmd() *cobra.Command {
 				return claudecode.New(opts...)
 			}
 
-			validator := validate.New(claudecode.New(), cfg.BuildCommand)
+			validator := validate.New(cfg.BuildCommand)
 
 			reviewerFn := func(t task.Task) review.Reviewer {
 				mode := config.ReviewModeForTask(*cfg, t.Review)

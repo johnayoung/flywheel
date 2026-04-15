@@ -359,7 +359,7 @@ func buildEngine(t *testing.T, tasks []task.Task, ag *testAgent, maxParallel int
 	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
 	st := newTestStore(tasks)
 	tm := &testMerger{repoRoot: repoRoot}
-	v := validate.New(nil, "") // no build command, no agent -- all checks that need git will pass
+	v := validate.New("") // no build command -- all checks that need git will pass
 
 	cfg := config.Config{
 		BaseRef:            "main",
@@ -570,14 +570,14 @@ func TestAgentFailure(t *testing.T) {
 
 func TestValidationFailureRetry(t *testing.T) {
 	// Use a single task. The agent creates a commit, but validation will fail
-	// the first time (commit message check fails because we sabotage the commit prefix).
-	// On retry, the agent creates a correct commit.
+	// the first time (commit message check fails because the first commit is
+	// not a conventional commit). On retry, the agent creates a correct commit.
 	tasks := []task.Task{{
 		ID:          "task-retry",
 		Description: "implement task-retry",
 		Category:    "feat",
 		Priority:    1,
-		Commit:      "task-retry",
+		Commit:      "feat: implement task-retry",
 		Steps:       []string{"task-retry"},
 	}}
 
@@ -591,11 +591,7 @@ func TestValidationFailureRetry(t *testing.T) {
 	st := newTestStore(tasks)
 	tm := &testMerger{repoRoot: repoRoot}
 
-	// Create a validator that tracks calls and fails the first time.
-	var validationCalls atomic.Int32
-	// We use a custom agent for validation that always says PASS.
-	validatorAgent := &passAgent{}
-	v := validate.New(validatorAgent, "")
+	v := validate.New("")
 
 	cfg := config.Config{
 		BaseRef:            "main",
@@ -605,25 +601,12 @@ func TestValidationFailureRetry(t *testing.T) {
 		MaxResolveAttempts: 2,
 	}
 
-	// Wrap the validator to fail on first call.
-	wrappedValidator := &countingValidator{
-		inner:     v,
-		failUntil: 1, // fail on call #1, pass on call #2+
-		callCount: &validationCalls,
-	}
-
-	// We need to create the engine manually to inject the wrapped validator.
-	// Since Validator is a concrete type, we'll use a different approach:
-	// Make the agent produce a bad commit message on the first call.
-	// The testAgent already creates commits with the task ID prefix, but we can
-	// make the first call use a wrong prefix.
+	// First call: agent makes commit with a non-conventional subject -> validation fails.
+	// Second call: agent makes commit with a "feat:" subject -> validation passes.
 	badAgent := &retryTestAgent{
 		callCounts: make(map[string]*atomic.Int32),
 	}
 
-	// Use the real validator (it checks commit messages).
-	// First call: agent makes commit with wrong prefix -> validation fails.
-	// Second call: agent makes commit with correct prefix -> validation passes.
 	e := New(
 		cfg,
 		st,
@@ -634,9 +617,6 @@ func TestValidationFailureRetry(t *testing.T) {
 		tm,
 		conflict.New(badAgent),
 	)
-
-	// Ignore wrappedValidator (it was a dead-end approach), use badAgent instead.
-	_ = wrappedValidator
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -687,14 +667,14 @@ func (a *retryTestAgent) Execute(ctx context.Context, req agent.ExecutionRequest
 		return nil, fmt.Errorf("git add: %s: %w", string(out), err)
 	}
 
-	// First call: use wrong commit prefix to trigger validation failure.
-	// Subsequent calls: use correct prefix.
-	prefix := req.TaskID
+	// First call: non-conventional subject (no "<type>:" prefix) -> validation fails.
+	// Subsequent calls: valid conventional "feat:" subject -> validation passes.
+	subject := "feat: implement " + req.TaskID
 	if callNum == 1 {
-		prefix = "WRONG-PREFIX"
+		subject = "implement " + req.TaskID + " (no conventional prefix)"
 	}
 
-	cmd = exec.CommandContext(ctx, "git", "-C", req.WorktreePath, "commit", "-m", prefix+": implement "+req.TaskID)
+	cmd = exec.CommandContext(ctx, "git", "-C", req.WorktreePath, "commit", "-m", subject)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("git commit: %s: %w", string(out), err)
 	}
@@ -705,23 +685,6 @@ func (a *retryTestAgent) Execute(ctx context.Context, req agent.ExecutionRequest
 		Output:              "done",
 		ImplementationNotes: "implemented " + req.TaskID,
 	}, nil
-}
-
-// passAgent is a minimal agent that always returns success with PASS.
-type passAgent struct{}
-
-func (a *passAgent) Execute(_ context.Context, _ agent.ExecutionRequest) (*agent.ExecutionResult, error) {
-	return &agent.ExecutionResult{
-		Success: true,
-		Output:  "PASS",
-	}, nil
-}
-
-// countingValidator wraps a real validator and forces failure for the first N calls.
-type countingValidator struct {
-	inner     *validate.Validator
-	failUntil int32
-	callCount *atomic.Int32
 }
 
 func TestContextCancellation(t *testing.T) {
@@ -745,7 +708,7 @@ func TestContextCancellation(t *testing.T) {
 	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
 	st := newTestStore(tasks)
 	tm := &testMerger{repoRoot: repoRoot}
-	v := validate.New(nil, "")
+	v := validate.New("")
 
 	cfg := config.Config{
 		BaseRef:            "main",
@@ -828,7 +791,7 @@ func TestContextCancellation_LeavesTaskInterruptedNotFailed(t *testing.T) {
 	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
 	st := newTestStore(tasks)
 	tm := &testMerger{repoRoot: repoRoot}
-	v := validate.New(nil, "")
+	v := validate.New("")
 
 	cfg := config.Config{
 		BaseRef:            "main",
@@ -916,7 +879,7 @@ func TestAgentError_RetriesUpToMaxThenFails(t *testing.T) {
 	wm := worktree.NewManager(repoRoot, worktreeBase, "flywheel/")
 	st := newTestStore(tasks)
 	tm := &testMerger{repoRoot: repoRoot}
-	v := validate.New(nil, "")
+	v := validate.New("")
 
 	cfg := config.Config{
 		BaseRef:            "main",

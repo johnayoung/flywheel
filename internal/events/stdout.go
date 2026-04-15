@@ -50,7 +50,19 @@ func (r *StdoutReporter) format(e Event) string {
 		return fmt.Sprintf("%s task=%s attempt=%d started", prefix(e), e.TaskID, e.Attempt)
 	case TypeTaskAttemptEnded:
 		outcome, _ := e.Data["outcome"].(string)
-		return fmt.Sprintf("%s task=%s attempt=%d ended outcome=%s", prefix(e), e.TaskID, e.Attempt, outcome)
+		base := fmt.Sprintf("%s task=%s attempt=%d ended outcome=%s", prefix(e), e.TaskID, e.Attempt, outcome)
+		if detail, _ := e.Data["detail"].(string); detail != "" {
+			// Collapse multi-line details to a single line so each event stays
+			// on one log line. Trim to keep the terminal readable; the full
+			// text is still on the lifecycle record.
+			detail = strings.ReplaceAll(strings.TrimSpace(detail), "\n", " \u21b5 ")
+			const max = 500
+			if len(detail) > max {
+				detail = detail[:max] + "..."
+			}
+			return base + " detail=" + detail
+		}
+		return base
 	case TypePlanSummary:
 		total, _ := asInt(e.Data["total"])
 		ready, _ := asInt(e.Data["ready"])

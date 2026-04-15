@@ -636,12 +636,22 @@ func (e *Engine) endAttempt(ctx context.Context, lc *lifecycle.Lifecycle, worker
 		mutate(att)
 	}
 	_ = e.store.UpdateLifecycle(ctx, lc)
+	data := map[string]any{"outcome": outcome}
+	// Surface the failure reason so operators can see *why* an attempt ended,
+	// not just the outcome category. Prefer the most specific field available.
+	if att.ValidationFailures != "" {
+		data["detail"] = att.ValidationFailures
+	} else if att.ReviewFeedback != "" {
+		data["detail"] = att.ReviewFeedback
+	} else if att.Error != "" {
+		data["detail"] = att.Error
+	}
 	e.publish(events.Event{
 		Type:     events.TypeTaskAttemptEnded,
 		TaskID:   lc.TaskID,
 		WorkerID: workerID,
 		Attempt:  att.Number,
-		Data:     map[string]any{"outcome": outcome},
+		Data:     data,
 	})
 }
 

@@ -88,7 +88,7 @@ func TestAllChecksPass(t *testing.T) {
 		BaseSHA:      baseSHA,
 	}
 
-	v := New(nil, "true")
+	v := New("true")
 	result, err := v.Validate(context.Background(), tk, lc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -128,7 +128,7 @@ func TestDirtyWorktreeFails(t *testing.T) {
 		BaseSHA:      baseSHA,
 	}
 
-	v := New(nil, "")
+	v := New("")
 	result, err := v.Validate(context.Background(), tk, lc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -166,7 +166,7 @@ func TestNoCommitsFails(t *testing.T) {
 		BaseSHA:      baseSHA,
 	}
 
-	v := New(nil, "")
+	v := New("")
 	result, err := v.Validate(context.Background(), tk, lc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -207,7 +207,7 @@ func TestWrongCommitMessage(t *testing.T) {
 		BaseSHA:      baseSHA,
 	}
 
-	v := New(nil, "")
+	v := New("")
 	result, err := v.Validate(context.Background(), tk, lc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -248,7 +248,7 @@ func TestBuildFailure(t *testing.T) {
 		BaseSHA:      baseSHA,
 	}
 
-	v := New(nil, "false")
+	v := New("false")
 	result, err := v.Validate(context.Background(), tk, lc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

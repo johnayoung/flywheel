@@ -5,23 +5,26 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 
-	"github.com/johnayoung/flywheel/internal/agent"
 	"github.com/johnayoung/flywheel/internal/lifecycle"
 	"github.com/johnayoung/flywheel/internal/task"
 )
 
-// Validator runs post-agent validation checks against a worktree.
+// Validator runs post-agent mechanical checks against a worktree.
+//
+// Validation is intentionally a cheap, deterministic gate: clean worktree, a
+// commit exists, its conventional-commit type matches the task, and the build
+// passes. Correctness and acceptance-criteria judgements belong to the review
+// phase (internal/review), which runs a separate agent over the diff.
 type Validator struct {
-	agent        agent.Agent
 	buildCommand string
 }
 
-// New creates a Validator. agent may be nil (skips acceptance criteria check).
-// buildCommand may be empty (skips build check).
-func New(ag agent.Agent, buildCommand string) *Validator {
-	return &Validator{agent: ag, buildCommand: buildCommand}
+// New creates a Validator. buildCommand may be empty (skips build check).
+func New(buildCommand string) *Validator {
+	return &Validator{buildCommand: buildCommand}
 }
 
 // ValidationResult is the aggregate outcome of all validation checks.
@@ -38,8 +41,9 @@ type CheckResult struct {
 	Detail string
 }
 
-// Validate runs all post-agent checks in order against the given task and lifecycle.
-// All checks run regardless of earlier failures. Passed is true only if every check passes.
+// Validate runs all post-agent mechanical checks in order against the given
+// task and lifecycle. All checks run regardless of earlier failures. Passed
+// is true only if every check passes.
 func (v *Validator) Validate(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) (*ValidationResult, error) {
 	var checks []CheckResult
 
@@ -47,7 +51,6 @@ func (v *Validator) Validate(ctx context.Context, t task.Task, lc lifecycle.Life
 	checks = append(checks, v.checkCommitExists(ctx, lc))
 	checks = append(checks, v.checkCommitMessage(ctx, t, lc))
 	checks = append(checks, v.checkBuild(ctx, lc)...)
-	checks = append(checks, v.checkAcceptanceCriteria(ctx, t, lc)...)
 
 	passed := true
 	for _, c := range checks {
@@ -86,6 +89,37 @@ func (v *Validator) checkCommitExists(ctx context.Context, lc lifecycle.Lifecycl
 	return CheckResult{Name: "commit_exists", Passed: true, Detail: fmt.Sprintf("%d commit(s) found", count)}
 }
 
+// commitSubjectType matches the leading type of a conventional-commit subject,
+// which REQUIRES a trailing colon: "feat:", "fix(scope):", "refactor!:" etc.
+// Used on actual commit subjects produced by the agent.
+var commitSubjectType = regexp.MustCompile(`^([a-zA-Z]+)(?:\([^)]*\))?!?:`)
+
+// taskCommitType matches the leading type declared in task.Commit. Task
+// specs sometimes give a bare prefix like "feat(scope)" without a subject, so
+// the trailing colon is optional and we also accept end-of-string.
+var taskCommitType = regexp.MustCompile(`^([a-zA-Z]+)(?:\([^)]*\))?!?(?::|$)`)
+
+// extractCommitSubjectType returns the conventional-commit type (lowercased)
+// from an actual commit subject, or "" if the subject is not a conventional
+// commit (missing "<type>:" prefix).
+func extractCommitSubjectType(subject string) string {
+	m := commitSubjectType.FindStringSubmatch(subject)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.ToLower(m[1])
+}
+
+// extractTaskCommitType returns the conventional-commit type (lowercased)
+// declared in a task.Commit field, or "" if none is present.
+func extractTaskCommitType(s string) string {
+	m := taskCommitType.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.ToLower(m[1])
+}
+
 func (v *Validator) checkCommitMessage(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) CheckResult {
 	cmd := exec.CommandContext(ctx, "git", "-C", lc.WorktreePath, "log", "--reverse", "--format=%s", lc.BaseSHA+"..HEAD")
 	out, err := cmd.Output()
@@ -97,10 +131,25 @@ func (v *Validator) checkCommitMessage(ctx context.Context, t task.Task, lc life
 		return CheckResult{Name: "commit_message", Passed: false, Detail: "no commits to check"}
 	}
 	firstLine := strings.SplitN(lines, "\n", 2)[0]
-	if !strings.HasPrefix(firstLine, t.Commit) {
-		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("first commit %q does not start with %q", firstLine, t.Commit)}
+
+	// Match conventional-commit type only; the agent can paraphrase the
+	// subject freely as long as the category (feat/fix/refactor/...) agrees
+	// with the task definition.
+	wantType := extractTaskCommitType(t.Commit)
+	gotType := extractCommitSubjectType(firstLine)
+
+	if wantType == "" {
+		// Task didn't specify a conventional-commit type; accept whatever the
+		// agent produced as long as *something* was committed.
+		return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("task.commit %q has no conventional-commit type; skipping type check", t.Commit)}
 	}
-	return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("first commit starts with %q", t.Commit)}
+	if gotType == "" {
+		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("first commit %q is not a conventional commit (expected type %q)", firstLine, wantType)}
+	}
+	if gotType != wantType {
+		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("first commit type %q does not match task type %q (subject: %q)", gotType, wantType, firstLine)}
+	}
+	return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("first commit type %q matches task", gotType)}
 }
 
 func (v *Validator) checkBuild(ctx context.Context, lc lifecycle.Lifecycle) []CheckResult {
@@ -114,42 +163,4 @@ func (v *Validator) checkBuild(ctx context.Context, lc lifecycle.Lifecycle) []Ch
 		return []CheckResult{{Name: "build", Passed: false, Detail: fmt.Sprintf("build failed: %v\n%s", err, string(out))}}
 	}
 	return []CheckResult{{Name: "build", Passed: true, Detail: "build succeeded"}}
-}
-
-func (v *Validator) checkAcceptanceCriteria(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) []CheckResult {
-	if v.agent == nil || len(t.AcceptanceCriteria) == 0 {
-		return nil
-	}
-
-	cmd := exec.CommandContext(ctx, "git", "-C", lc.WorktreePath, "diff", lc.BaseSHA+"..HEAD")
-	diffOut, err := cmd.Output()
-	if err != nil {
-		return []CheckResult{{Name: "acceptance_criteria", Passed: false, Detail: fmt.Sprintf("git diff failed: %v", err)}}
-	}
-
-	var prompt strings.Builder
-	prompt.WriteString("Review the following diff and determine whether ALL acceptance criteria are met.\n\n")
-	prompt.WriteString("## Diff\n```\n")
-	prompt.WriteString(string(diffOut))
-	prompt.WriteString("\n```\n\n## Acceptance Criteria\n")
-	for i, ac := range t.AcceptanceCriteria {
-		fmt.Fprintf(&prompt, "%d. %s\n", i+1, ac)
-	}
-	prompt.WriteString("\nRespond with PASS if all criteria are met, or FAIL followed by an explanation if any are not.")
-
-	result, err := v.agent.Execute(ctx, agent.ExecutionRequest{
-		WorktreePath: lc.WorktreePath,
-		TaskID:       t.ID,
-		Description:  prompt.String(),
-	})
-	if err != nil {
-		return []CheckResult{{Name: "acceptance_criteria", Passed: false, Detail: fmt.Sprintf("agent execution failed: %v", err)}}
-	}
-
-	passed := result.Success && strings.Contains(strings.ToUpper(result.Output), "PASS")
-	detail := result.Output
-	if detail == "" {
-		detail = result.ImplementationNotes
-	}
-	return []CheckResult{{Name: "acceptance_criteria", Passed: passed, Detail: detail}}
 }

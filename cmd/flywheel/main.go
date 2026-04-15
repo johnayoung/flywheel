@@ -107,6 +107,9 @@ func initCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := preflightGit(cmd.Context(), cfg); err != nil {
+				return err
+			}
 
 			st, err := storeopen.Open(cfg.Store)
 			if err != nil {
@@ -174,6 +177,10 @@ func runCmd() *cobra.Command {
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			if dryRun {
 				return runDryRun(cmd, cfg)
+			}
+
+			if err := preflightGit(cmd.Context(), cfg); err != nil {
+				return err
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())

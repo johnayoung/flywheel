@@ -124,8 +124,9 @@ func TestTransition_HappyPath(t *testing.T) {
 		}
 	}
 
-	if lc.Version != len(steps) {
-		t.Errorf("expected version %d, got %d", len(steps), lc.Version)
+	// Version is persistence state owned by the store, not by Transition.
+	if lc.Version != 0 {
+		t.Errorf("expected Transition to leave Version untouched, got %d", lc.Version)
 	}
 }
 
@@ -336,18 +337,23 @@ func TestTransition_FailedValidationRequiresError(t *testing.T) {
 	}
 }
 
-func TestTransition_VersionIncrements(t *testing.T) {
+// TestTransition_DoesNotModifyVersion asserts that Transition is a pure logical
+// state change. Version is optimistic-concurrency state owned by the store and
+// is incremented only on successful persistence via UpdateLifecycle. Bumping
+// Version here would cause UpdateLifecycle's version check to falsely fire
+// ErrStaleWrite on the very next persist.
+func TestTransition_DoesNotModifyVersion(t *testing.T) {
 	lc := NewLifecycle("t1", "r1", "main")
 	if lc.Version != 0 {
 		t.Fatalf("expected initial version 0, got %d", lc.Version)
 	}
 	_ = Transition(lc, StatusReady)
-	if lc.Version != 1 {
-		t.Errorf("expected version 1, got %d", lc.Version)
+	if lc.Version != 0 {
+		t.Errorf("Transition must not touch Version, got %d", lc.Version)
 	}
 	_ = Transition(lc, StatusRunning)
-	if lc.Version != 2 {
-		t.Errorf("expected version 2, got %d", lc.Version)
+	if lc.Version != 0 {
+		t.Errorf("Transition must not touch Version, got %d", lc.Version)
 	}
 }
 

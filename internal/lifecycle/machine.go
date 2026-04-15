@@ -85,7 +85,6 @@ func Transition(lc *Lifecycle, to Status) error {
 	}
 
 	lc.Status = to
-	lc.Version++
 
 	return nil
 }

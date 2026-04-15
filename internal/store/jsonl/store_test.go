@@ -64,7 +64,7 @@ func createReadyLifecycle(t *testing.T, s *Store, taskID string) {
 	if err := s.CreateLifecycle(ctx, lc); err != nil {
 		t.Fatal(err)
 	}
-	// Transition pending -> ready
+	// Transition pending -> ready, then persist via UpdateLifecycle which owns the version bump.
 	lc, err := s.GetLifecycle(ctx, taskID)
 	if err != nil {
 		t.Fatal(err)
@@ -72,18 +72,7 @@ func createReadyLifecycle(t *testing.T, s *Store, taskID string) {
 	if err := lifecycle.Transition(lc, lifecycle.StatusReady); err != nil {
 		t.Fatal(err)
 	}
-	// Write back without going through UpdateLifecycle (which increments version again).
-	// We need to use UpdateLifecycle but account for the version bump from Transition.
-	// Transition already incremented Version, so we need the pre-transition version for the
-	// optimistic concurrency check. Re-read to get current disk version, then apply.
-	diskLC, err := s.GetLifecycle(ctx, taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	diskLC.Status = lifecycle.StatusReady
-	diskLC.Timestamps = lc.Timestamps
-	// UpdateLifecycle will check diskLC.Version matches disk, then increment.
-	if err := s.UpdateLifecycle(ctx, diskLC); err != nil {
+	if err := s.UpdateLifecycle(ctx, lc); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -206,6 +195,43 @@ func TestUpdateLifecycle(t *testing.T) {
 	err = s.UpdateLifecycle(ctx, got)
 	if err != store.ErrStaleWrite {
 		t.Fatalf("expected ErrStaleWrite, got %v", err)
+	}
+}
+
+// TestTransitionThenUpdate is a regression test for the bug where Transition
+// and UpdateLifecycle both bumped Version, causing every post-Create
+// UpdateLifecycle to falsely fail with ErrStaleWrite.
+func TestTransitionThenUpdate(t *testing.T) {
+	s := newTestStore(t, []taskDef{
+		{ID: "task-1", Category: "feat", Priority: 1},
+	})
+
+	ctx := context.Background()
+	lc := lifecycle.NewLifecycle("task-1", "run-1", "main")
+	if err := s.CreateLifecycle(ctx, lc); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetLifecycle(ctx, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.Transition(got, lifecycle.StatusReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateLifecycle(ctx, got); err != nil {
+		t.Fatalf("Transition followed by UpdateLifecycle must succeed: %v", err)
+	}
+
+	updated, err := s.GetLifecycle(ctx, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != lifecycle.StatusReady {
+		t.Errorf("expected status ready, got %s", updated.Status)
+	}
+	if updated.Version != 1 {
+		t.Errorf("expected version 1 after one UpdateLifecycle, got %d", updated.Version)
 	}
 }
 

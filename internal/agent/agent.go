@@ -13,7 +13,8 @@ type ExecutionRequest struct {
 	TaskID       string
 	Description  string
 	Steps        []string
-	ResumeFrom   int // 0 = start from beginning, N = resume from step N (used on retry)
+	Commit       string // conventional-commit prefix from task definition, e.g. "feat(scope)"
+	ResumeFrom   int    // 0 = start from beginning, N = resume from step N (used on retry)
 }
 
 // ExecutionResult captures the outcome of an agent execution.

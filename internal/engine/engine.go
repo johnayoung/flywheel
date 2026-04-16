@@ -699,6 +699,7 @@ func (e *Engine) processTask(ctx context.Context, workerID string, lc *lifecycle
 		TaskID:       t.ID,
 		Description:  t.Description,
 		Steps:        t.Steps,
+		Commit:       t.Commit,
 		ResumeFrom:   lc.CurrentStep,
 	}
 	result, err := e.agentFn().Execute(ctx, req)

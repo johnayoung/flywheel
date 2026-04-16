@@ -568,17 +568,16 @@ func TestAgentFailure(t *testing.T) {
 	}
 }
 
-func TestValidationFailureRetry(t *testing.T) {
-	// Use a single task. The agent creates a commit, but validation will fail
-	// the first time (commit message check fails because the first commit is
-	// not a conventional commit). On retry, the agent creates a correct commit.
+func TestCommitMessageAutoFixed(t *testing.T) {
+	// Agent creates a commit with the wrong conventional-commit type.
+	// Validation should auto-fix it and the task should succeed without retry.
 	tasks := []task.Task{{
-		ID:          "task-retry",
-		Description: "implement task-retry",
+		ID:          "task-autofix",
+		Description: "implement task-autofix",
 		Category:    "feat",
 		Priority:    1,
-		Commit:      "feat: implement task-retry",
-		Steps:       []string{"task-retry"},
+		Commit:      "feat(autofix)",
+		Steps:       []string{"task-autofix"},
 	}}
 
 	repoRoot := initTestRepo(t)
@@ -601,21 +600,18 @@ func TestValidationFailureRetry(t *testing.T) {
 		MaxResolveAttempts: 2,
 	}
 
-	// First call: agent makes commit with a non-conventional subject -> validation fails.
-	// Second call: agent makes commit with a "feat:" subject -> validation passes.
-	badAgent := &retryTestAgent{
-		callCounts: make(map[string]*atomic.Int32),
-	}
+	// Agent always commits with wrong type "task(id):" -- validation auto-fixes it.
+	wrongTypeAgent := &wrongCommitTypeAgent{}
 
 	e := New(
 		cfg,
 		st,
 		wm,
-		func() agent.Agent { return badAgent },
+		func() agent.Agent { return wrongTypeAgent },
 		v,
 		func(_ task.Task) review.Reviewer { return &testReviewer{} },
 		tm,
-		conflict.New(badAgent),
+		conflict.New(wrongTypeAgent),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -630,35 +626,24 @@ func TestValidationFailureRetry(t *testing.T) {
 		t.Errorf("Merged = %d, want 1", summary.Merged)
 	}
 
-	lc, _ := st.GetLifecycle(ctx, "task-retry")
+	lc, _ := st.GetLifecycle(ctx, "task-autofix")
 	if lc.Status != lifecycle.StatusMerged {
 		t.Errorf("status = %s, want merged", lc.Status)
 	}
-	if lc.Retries < 1 {
-		t.Errorf("retries = %d, want >= 1", lc.Retries)
+	// No retries should be needed -- commit type is auto-fixed.
+	if lc.Retries != 0 {
+		t.Errorf("retries = %d, want 0 (commit should be auto-fixed)", lc.Retries)
 	}
 }
 
-// retryTestAgent produces a bad commit message on the first call and a good one
-// on subsequent calls, triggering a validation failure and retry.
-type retryTestAgent struct {
-	mu         sync.Mutex
-	callCounts map[string]*atomic.Int32
-}
+// wrongCommitTypeAgent always commits with the wrong conventional-commit type
+// ("task(id):" instead of whatever the task specifies), exercising the
+// validation auto-fix path.
+type wrongCommitTypeAgent struct{}
 
-func (a *retryTestAgent) Execute(ctx context.Context, req agent.ExecutionRequest) (*agent.ExecutionResult, error) {
-	a.mu.Lock()
-	if _, ok := a.callCounts[req.TaskID]; !ok {
-		a.callCounts[req.TaskID] = &atomic.Int32{}
-	}
-	counter := a.callCounts[req.TaskID]
-	a.mu.Unlock()
-
-	callNum := counter.Add(1)
-
+func (a *wrongCommitTypeAgent) Execute(ctx context.Context, req agent.ExecutionRequest) (*agent.ExecutionResult, error) {
 	filePath := filepath.Join(req.WorktreePath, req.TaskID+".txt")
-	content := fmt.Sprintf("implemented %s (call %d)\n", req.TaskID, callNum)
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(filePath, []byte("implemented "+req.TaskID+"\n"), 0644); err != nil {
 		return nil, err
 	}
 
@@ -667,13 +652,8 @@ func (a *retryTestAgent) Execute(ctx context.Context, req agent.ExecutionRequest
 		return nil, fmt.Errorf("git add: %s: %w", string(out), err)
 	}
 
-	// First call: non-conventional subject (no "<type>:" prefix) -> validation fails.
-	// Subsequent calls: valid conventional "feat:" subject -> validation passes.
-	subject := "feat: implement " + req.TaskID
-	if callNum == 1 {
-		subject = "implement " + req.TaskID + " (no conventional prefix)"
-	}
-
+	// Deliberately wrong type: "task" instead of whatever task.Commit says.
+	subject := "task(" + req.TaskID + "): implement changes"
 	cmd = exec.CommandContext(ctx, "git", "-C", req.WorktreePath, "commit", "-m", subject)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("git commit: %s: %w", string(out), err)

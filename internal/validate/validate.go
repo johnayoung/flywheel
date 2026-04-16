@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -44,12 +45,23 @@ type CheckResult struct {
 // Validate runs all post-agent mechanical checks in order against the given
 // task and lifecycle. All checks run regardless of earlier failures. Passed
 // is true only if every check passes.
+//
+// The commit message type is auto-fixed rather than rejected: if the agent
+// used the wrong conventional-commit type, the first commit is amended to
+// match the task definition. This avoids burning retries on a mechanical
+// issue the engine can correct.
 func (v *Validator) Validate(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) (*ValidationResult, error) {
 	var checks []CheckResult
 
 	checks = append(checks, v.checkCleanWorktree(ctx, lc))
 	checks = append(checks, v.checkCommitExists(ctx, lc))
-	checks = append(checks, v.checkCommitMessage(ctx, t, lc))
+
+	fixResult, err := v.fixCommitMessage(ctx, t, lc)
+	if err != nil {
+		return nil, fmt.Errorf("fix commit message: %w", err)
+	}
+	checks = append(checks, fixResult)
+
 	checks = append(checks, v.checkBuild(ctx, lc)...)
 
 	passed := true
@@ -120,36 +132,105 @@ func extractTaskCommitType(s string) string {
 	return strings.ToLower(m[1])
 }
 
-func (v *Validator) checkCommitMessage(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) CheckResult {
+// fixCommitMessage checks the first commit's conventional-commit type and, if
+// it doesn't match the task definition, amends it to use the correct type.
+// This always passes (unless there are no commits or git fails), since any
+// mismatch is corrected in-place rather than rejected.
+func (v *Validator) fixCommitMessage(ctx context.Context, t task.Task, lc lifecycle.Lifecycle) (CheckResult, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", lc.WorktreePath, "log", "--reverse", "--format=%s", lc.BaseSHA+"..HEAD")
 	out, err := cmd.Output()
 	if err != nil {
-		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("git log failed: %v", err)}
+		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("git log failed: %v", err)}, nil
 	}
 	lines := strings.TrimSpace(string(out))
 	if lines == "" {
-		return CheckResult{Name: "commit_message", Passed: false, Detail: "no commits to check"}
+		return CheckResult{Name: "commit_message", Passed: false, Detail: "no commits to check"}, nil
 	}
 	firstLine := strings.SplitN(lines, "\n", 2)[0]
 
-	// Match conventional-commit type only; the agent can paraphrase the
-	// subject freely as long as the category (feat/fix/refactor/...) agrees
-	// with the task definition.
 	wantType := extractTaskCommitType(t.Commit)
+	if wantType == "" {
+		return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("task.commit %q has no conventional-commit type; skipping", t.Commit)}, nil
+	}
+
 	gotType := extractCommitSubjectType(firstLine)
 
-	if wantType == "" {
-		// Task didn't specify a conventional-commit type; accept whatever the
-		// agent produced as long as *something* was committed.
-		return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("task.commit %q has no conventional-commit type; skipping type check", t.Commit)}
+	if gotType == wantType {
+		return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("commit type %q matches task", gotType)}, nil
 	}
+
+	// Need to rewrite. Build the corrected subject.
+	newSubject := rewriteSubject(firstLine, t.Commit, gotType)
+
+	// Count commits to decide between amend (single) and rebase (multiple).
+	commitLines := strings.Split(lines, "\n")
+	if len(commitLines) == 1 {
+		// Single commit: simple amend.
+		amend := exec.CommandContext(ctx, "git", "-C", lc.WorktreePath, "commit", "--amend", "-m", newSubject)
+		if out, err := amend.CombinedOutput(); err != nil {
+			return CheckResult{}, fmt.Errorf("git commit --amend: %w: %s", err, string(out))
+		}
+	} else {
+		// Multiple commits: rewrite the first one via rebase.
+		if err := rebaseRewriteFirst(ctx, lc.WorktreePath, lc.BaseSHA, newSubject); err != nil {
+			return CheckResult{}, fmt.Errorf("rebase rewrite first commit: %w", err)
+		}
+	}
+
+	detail := fmt.Sprintf("rewrote commit type %q -> %q (subject: %q)", gotType, wantType, newSubject)
 	if gotType == "" {
-		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("first commit %q is not a conventional commit (expected type %q)", firstLine, wantType)}
+		detail = fmt.Sprintf("rewrote non-conventional commit to %q (subject: %q)", wantType, newSubject)
 	}
-	if gotType != wantType {
-		return CheckResult{Name: "commit_message", Passed: false, Detail: fmt.Sprintf("first commit type %q does not match task type %q (subject: %q)", gotType, wantType, firstLine)}
+	return CheckResult{Name: "commit_message", Passed: true, Detail: detail}, nil
+}
+
+// rewriteSubject builds a corrected commit subject. If the original had a
+// conventional-commit type, it is replaced. If it didn't, the task's commit
+// prefix is prepended.
+func rewriteSubject(original, taskCommit, gotType string) string {
+	if gotType != "" {
+		// Replace existing type (and optional scope/bang) with task commit prefix.
+		loc := commitSubjectType.FindStringIndex(original)
+		if loc != nil {
+			return taskCommit + ": " + strings.TrimSpace(original[loc[1]:])
+		}
 	}
-	return CheckResult{Name: "commit_message", Passed: true, Detail: fmt.Sprintf("first commit type %q matches task", gotType)}
+	// Not a conventional commit at all; prepend the task prefix.
+	return taskCommit + ": " + original
+}
+
+// rebaseRewriteFirst rewrites only the first commit's message after baseSHA
+// using a non-interactive rebase with GIT_SEQUENCE_EDITOR to mark the first
+// commit for reword, and GIT_EDITOR to supply the new message.
+func rebaseRewriteFirst(ctx context.Context, worktreePath, baseSHA, newSubject string) error {
+	// Write the new message to a temp file so the editor script can read it
+	// without shell-escaping issues.
+	msgFile, err := os.CreateTemp("", "flywheel-commit-msg-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer os.Remove(msgFile.Name())
+	if _, err := msgFile.WriteString(newSubject); err != nil {
+		msgFile.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	msgFile.Close()
+
+	seqEditor := `sed -i '1s/^pick /reword /' "$1"`
+	// The editor script copies the prepared message into the commit message file.
+	// Must be a sh -c wrapper so $1 is the file argument from git, not from the
+	// parent shell context.
+	editor := fmt.Sprintf(`sh -c 'cp "%s" "$1"' --`, msgFile.Name())
+
+	cmd := exec.CommandContext(ctx, "git", "-C", worktreePath, "rebase", "-i", baseSHA)
+	cmd.Env = append(cmd.Environ(),
+		"GIT_SEQUENCE_EDITOR="+seqEditor,
+		"GIT_EDITOR="+editor,
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, string(out))
+	}
+	return nil
 }
 
 func (v *Validator) checkBuild(ctx context.Context, lc lifecycle.Lifecycle) []CheckResult {

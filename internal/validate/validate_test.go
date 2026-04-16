@@ -70,6 +70,12 @@ func newTask(commitPrefix string) task.Task {
 	}
 }
 
+// firstCommitSubject returns the subject of the first commit after baseSHA.
+func firstCommitSubject(t *testing.T, dir, baseSHA string) string {
+	t.Helper()
+	return strings.TrimSpace(runOutput(t, dir, "git", "log", "--reverse", "--format=%s", baseSHA+"..HEAD"))
+}
+
 func TestAllChecksPass(t *testing.T) {
 	dir := t.TempDir()
 	baseSHA := initRepo(t, dir)
@@ -190,7 +196,7 @@ func TestNoCommitsFails(t *testing.T) {
 	}
 }
 
-func TestWrongCommitMessage(t *testing.T) {
+func TestWrongCommitType_AutoFixed(t *testing.T) {
 	dir := t.TempDir()
 	baseSHA := initRepo(t, dir)
 
@@ -212,22 +218,116 @@ func TestWrongCommitMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Passed {
-		t.Fatal("expected validation to fail due to wrong commit message")
+	if !result.Passed {
+		for _, c := range result.Checks {
+			t.Logf("check %s: passed=%v detail=%s", c.Name, c.Passed, c.Detail)
+		}
+		t.Fatal("expected validation to pass after auto-fix")
 	}
 
 	checkMap := make(map[string]CheckResult)
 	for _, c := range result.Checks {
 		checkMap[c.Name] = c
 	}
-	if !checkMap["clean_worktree"].Passed {
-		t.Error("expected clean_worktree to pass")
+	if !checkMap["commit_message"].Passed {
+		t.Error("expected commit_message to pass after auto-fix")
 	}
-	if !checkMap["commit_exists"].Passed {
-		t.Error("expected commit_exists to pass")
+	if !strings.Contains(checkMap["commit_message"].Detail, "rewrote") {
+		t.Errorf("expected detail to mention rewrite, got: %s", checkMap["commit_message"].Detail)
 	}
-	if checkMap["commit_message"].Passed {
-		t.Error("expected commit_message to fail")
+
+	// Verify the commit was actually amended
+	subject := firstCommitSubject(t, dir, baseSHA)
+	if !strings.HasPrefix(subject, "feat(expected):") {
+		t.Errorf("expected commit subject to start with 'feat(expected):', got: %q", subject)
+	}
+}
+
+func TestNonConventionalCommit_AutoFixed(t *testing.T) {
+	dir := t.TempDir()
+	baseSHA := initRepo(t, dir)
+
+	run(t, dir, "git", "checkout", "-b", "work")
+	if err := os.WriteFile(filepath.Join(dir, "f.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "git", "add", "f.go")
+	run(t, dir, "git", "commit", "-m", "implement the thing")
+
+	tk := newTask("chore(setup)")
+	lc := lifecycle.Lifecycle{
+		WorktreePath: dir,
+		BaseSHA:      baseSHA,
+	}
+
+	v := New("")
+	result, err := v.Validate(context.Background(), tk, lc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Passed {
+		for _, c := range result.Checks {
+			t.Logf("check %s: passed=%v detail=%s", c.Name, c.Passed, c.Detail)
+		}
+		t.Fatal("expected validation to pass after auto-fix")
+	}
+
+	subject := firstCommitSubject(t, dir, baseSHA)
+	if subject != "chore(setup): implement the thing" {
+		t.Errorf("expected 'chore(setup): implement the thing', got: %q", subject)
+	}
+}
+
+func TestMultipleCommits_FirstRewritten(t *testing.T) {
+	dir := t.TempDir()
+	baseSHA := initRepo(t, dir)
+
+	run(t, dir, "git", "checkout", "-b", "work")
+
+	// First commit with wrong type
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "git", "add", "a.go")
+	run(t, dir, "git", "commit", "-m", "fix(wrong): first change")
+
+	// Second commit (should be untouched)
+	if err := os.WriteFile(filepath.Join(dir, "b.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir, "git", "add", "b.go")
+	run(t, dir, "git", "commit", "-m", "fix(wrong): second change")
+
+	tk := newTask("feat(correct)")
+	lc := lifecycle.Lifecycle{
+		WorktreePath: dir,
+		BaseSHA:      baseSHA,
+	}
+
+	v := New("")
+	result, err := v.Validate(context.Background(), tk, lc)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Passed {
+		for _, c := range result.Checks {
+			t.Logf("check %s: passed=%v detail=%s", c.Name, c.Passed, c.Detail)
+		}
+		t.Fatal("expected validation to pass after auto-fix")
+	}
+
+	// Verify first commit was rewritten
+	subjects := strings.TrimSpace(runOutput(t, dir, "git", "log", "--reverse", "--format=%s", baseSHA+"..HEAD"))
+	lines := strings.Split(subjects, "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 commits, got %d", len(lines))
+	}
+	if !strings.HasPrefix(lines[0], "feat(correct):") {
+		t.Errorf("expected first commit to start with 'feat(correct):', got: %q", lines[0])
+	}
+	// Second commit should be unchanged
+	if lines[1] != "fix(wrong): second change" {
+		t.Errorf("expected second commit unchanged, got: %q", lines[1])
 	}
 }
 
@@ -272,5 +372,53 @@ func TestBuildFailure(t *testing.T) {
 	}
 	if checkMap["build"].Passed {
 		t.Error("expected build to fail")
+	}
+}
+
+func TestRewriteSubject(t *testing.T) {
+	tests := []struct {
+		name       string
+		original   string
+		taskCommit string
+		gotType    string
+		want       string
+	}{
+		{
+			name:       "replace wrong type",
+			original:   "fix(scope): do thing",
+			taskCommit: "feat(scope)",
+			gotType:    "fix",
+			want:       "feat(scope): do thing",
+		},
+		{
+			name:       "replace type with different scope",
+			original:   "task(old-scope): implement changes",
+			taskCommit: "chore(new-scope)",
+			gotType:    "task",
+			want:       "chore(new-scope): implement changes",
+		},
+		{
+			name:       "non-conventional gets prefix prepended",
+			original:   "implement the feature",
+			taskCommit: "feat(api)",
+			gotType:    "",
+			want:       "feat(api): implement the feature",
+		},
+		{
+			name:       "bare type replaced",
+			original:   "fix: quick patch",
+			taskCommit: "refactor",
+			gotType:    "fix",
+			want:       "refactor: quick patch",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewriteSubject(tt.original, tt.taskCommit, tt.gotType)
+			if got != tt.want {
+				t.Errorf("rewriteSubject(%q, %q, %q) = %q, want %q", tt.original, tt.taskCommit, tt.gotType, got, tt.want)
+			}
+		})
 	}
 }

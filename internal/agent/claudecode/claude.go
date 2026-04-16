@@ -85,7 +85,11 @@ func BuildPrompt(req agent.ExecutionRequest) string {
 		fmt.Fprintf(&b, "Resume from step %d. Steps 1 through %d are already completed.\n\n", req.ResumeFrom, req.ResumeFrom-1)
 	}
 
-	fmt.Fprintf(&b, "When finished, commit your work with the message: \"task(%s): implement changes\"\n\n", req.TaskID)
+	if req.Commit != "" {
+		fmt.Fprintf(&b, "When finished, commit your work with the message: \"%s: implement changes\"\n\n", req.Commit)
+	} else {
+		fmt.Fprintf(&b, "When finished, commit your work.\n\n")
+	}
 	b.WriteString("Stay within scope: only modify files directly related to this task. Do not refactor unrelated code or make changes outside the task requirements.\n")
 
 	return b.String()

@@ -15,6 +15,7 @@ func TestBuildPrompt_Basic(t *testing.T) {
 		TaskID:      "TASK-42",
 		Description: "Add logging to the server",
 		Steps:       []string{"Create logger package", "Integrate with HTTP handler"},
+		Commit:      "feat(logging)",
 	}
 
 	prompt := BuildPrompt(req)
@@ -28,11 +29,25 @@ func TestBuildPrompt_Basic(t *testing.T) {
 	if !strings.Contains(prompt, "2. Integrate with HTTP handler") {
 		t.Error("prompt should contain numbered step 2")
 	}
-	if !strings.Contains(prompt, "task(TASK-42): implement changes") {
-		t.Error("prompt should contain commit message with task ID")
+	if !strings.Contains(prompt, "feat(logging): implement changes") {
+		t.Error("prompt should contain commit message with task commit prefix")
 	}
 	if strings.Contains(prompt, "Resume from step") {
 		t.Error("prompt should not contain resume instruction when ResumeFrom is 0")
+	}
+}
+
+func TestBuildPrompt_NoCommit(t *testing.T) {
+	req := agent.ExecutionRequest{
+		TaskID:      "TASK-1",
+		Description: "Fix the bug",
+		Steps:       []string{"Find and fix"},
+	}
+
+	prompt := BuildPrompt(req)
+
+	if !strings.Contains(prompt, "When finished, commit your work.") {
+		t.Error("prompt should contain generic commit instruction when no Commit prefix")
 	}
 }
 

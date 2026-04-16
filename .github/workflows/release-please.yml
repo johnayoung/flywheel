@@ -17,6 +17,8 @@ jobs:
     steps:
       - id: release
         uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
   goreleaser:
     # Chained into the same workflow because tag pushes made by GITHUB_TOKEN

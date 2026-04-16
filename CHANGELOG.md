@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/johnayoung/flywheel/compare/v0.4.0...v0.4.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* **claudecode:** drain streaming scanner before cmd.Wait ([aed3cfe](https://github.com/johnayoung/flywheel/commit/aed3cfe5a6c51012a136898898fc5eadd6b787b5))
+
+
+### Refactoring
+
+* **validate:** mechanical-only gate; surface attempt failure detail ([c0ca2e2](https://github.com/johnayoung/flywheel/commit/c0ca2e240ab9faba7f6d7812d7e36b983ad8ca82))
+
 ## [0.4.0](https://github.com/johnayoung/flywheel/compare/v0.3.0...v0.4.0) (2026-04-15)
 
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/johnayoung/flywheel/compare/v0.4.1...v0.4.2) (2026-04-16)
+
+
+### Bug Fixes
+
+* **validate:** auto-fix commit message type instead of failing validation ([85c81b5](https://github.com/johnayoung/flywheel/commit/85c81b5f16e7547694d3d2a809b9793fd3378c94))
+
 ## [0.4.1](https://github.com/johnayoung/flywheel/compare/v0.4.0...v0.4.1) (2026-04-16)
 
 

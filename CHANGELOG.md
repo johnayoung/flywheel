@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/johnayoung/flywheel/compare/v0.4.2...v0.5.0) (2026-04-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* strip orchestration layer in preparation for redesign
+
+### Refactoring
+
+* strip orchestration layer in preparation for redesign ([81343e7](https://github.com/johnayoung/flywheel/commit/81343e795808636b057a93f97ebcc38d9c244a01))
+
 ## [0.4.2](https://github.com/johnayoung/flywheel/compare/v0.4.1...v0.4.2) (2026-04-16)
 
 

@@ -2,6 +2,8 @@
 
 Worktree-based parallel agent orchestrator for AI-driven coding tasks.
 
+**Status:** mid-rewrite. The old DAG scheduler + 11-state orchestration engine has been stripped. What remains are the domain primitives (task schema, lifecycle state machine, git worktree plumbing, merge, store) awaiting a new orchestration layer.
+
 ## Build & Test
 
 ```bash
@@ -11,18 +13,17 @@ go test -race -coverprofile=coverage.out ./...  # with race detection + coverage
 go vet ./...                            # static analysis
 ```
 
-Entry point: `cmd/flywheel/main.go`
+No CLI entry point exists in this state; `cmd/` is empty.
 
 ## Architecture
 
 - **Task** (`internal/task/`): Immutable work definitions (JSON). Never modified at runtime.
-- **Lifecycle** (`internal/lifecycle/`): Mutable execution state. 11-state machine with explicit transitions in `machine.go`.
-- **Store** (`internal/store/`): Interface for persistence. JSONL file implementation in `store/jsonl/`.
-- **DAG** (`internal/dag/`): Dependency graph built from task prerequisites. Readiness re-evaluated after each merge.
-- **Engine** (`internal/engine/`): Orchestration loop. Workers claim ready tasks, execute via agent, validate, review, merge.
-- **Agent** (`internal/agent/`): Interface for code execution backends. Claude Code subprocess implementation in `agent/claudecode/`.
+- **Lifecycle** (`internal/lifecycle/`): Mutable execution state. State machine with explicit transitions in `machine.go`.
+- **Worktree** (`internal/worktree/`): Git worktree lifecycle management.
+- **Merge** (`internal/merge/`): Merger interface + sequential file-locked git merge.
+- **Store** (`internal/store/`): Persistence interface + JSONL backend.
 
-Key design: tasks (what to do) and lifecycles (execution state) are separate records. The engine coordinates them through the state machine.
+Key design: tasks (what to do) and lifecycles (execution state) are separate records, coordinated through a formal state machine.
 
 ## Conventions
 

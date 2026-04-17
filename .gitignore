@@ -23,3 +23,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Temp
+*.tmp
+*.log
+tmp/

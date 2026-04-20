@@ -20,12 +20,12 @@ func TestCanTransition_Invalid(t *testing.T) {
 	}{
 		{StatusPending, StatusRunning},
 		{StatusPending, StatusFailed},
-		{StatusMerged, StatusReady},
-		{StatusMerged, StatusFailed},
+		{StatusDone, StatusReady},
+		{StatusDone, StatusFailed},
 		{StatusFailed, StatusReady},
 		{StatusFailed, StatusPending},
 		{StatusReady, StatusValidating},
-		{StatusRunning, StatusMerging},
+		{StatusRunning, StatusDone},
 	}
 	for _, tc := range invalid {
 		if CanTransition(tc.from, tc.to) {
@@ -41,7 +41,7 @@ func TestCanTransition_UnknownStatus(t *testing.T) {
 }
 
 func TestIsTerminal(t *testing.T) {
-	terminals := []Status{StatusMerged, StatusFailed}
+	terminals := []Status{StatusDone, StatusFailed}
 	for _, s := range terminals {
 		if !IsTerminal(s) {
 			t.Errorf("expected IsTerminal(%s) to be true", s)
@@ -50,8 +50,7 @@ func TestIsTerminal(t *testing.T) {
 
 	nonTerminals := []Status{
 		StatusPending, StatusReady, StatusRunning, StatusValidating,
-		StatusFailedValidation, StatusReviewing, StatusRejected,
-		StatusMerging, StatusConflict, StatusResolving,
+		StatusFailedValidation, StatusInterrupted,
 	}
 	for _, s := range nonTerminals {
 		if IsTerminal(s) {
@@ -62,7 +61,7 @@ func TestIsTerminal(t *testing.T) {
 
 func TestCanRetry(t *testing.T) {
 	t.Run("failed_validation with retries remaining", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		lc.Status = StatusFailedValidation
 		lc.Retries = 0
 		if !CanRetry(lc, 3) {
@@ -70,17 +69,8 @@ func TestCanRetry(t *testing.T) {
 		}
 	})
 
-	t.Run("rejected with retries remaining", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
-		lc.Status = StatusRejected
-		lc.Retries = 1
-		if !CanRetry(lc, 3) {
-			t.Error("expected CanRetry to be true")
-		}
-	})
-
 	t.Run("failed_validation at max retries", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		lc.Status = StatusFailedValidation
 		lc.Retries = 3
 		if CanRetry(lc, 3) {
@@ -89,7 +79,7 @@ func TestCanRetry(t *testing.T) {
 	})
 
 	t.Run("failed is not retryable", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		lc.Status = StatusFailed
 		lc.Retries = 0
 		if CanRetry(lc, 3) {
@@ -98,7 +88,7 @@ func TestCanRetry(t *testing.T) {
 	})
 
 	t.Run("running is not retryable", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		lc.Status = StatusRunning
 		lc.Retries = 0
 		if CanRetry(lc, 3) {
@@ -108,11 +98,10 @@ func TestCanRetry(t *testing.T) {
 }
 
 func TestTransition_HappyPath(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 
 	steps := []Status{
-		StatusReady, StatusRunning, StatusValidating,
-		StatusReviewing, StatusMerging, StatusMerged,
+		StatusReady, StatusRunning, StatusValidating, StatusDone,
 	}
 
 	for _, to := range steps {
@@ -130,7 +119,7 @@ func TestTransition_HappyPath(t *testing.T) {
 }
 
 func TestTransition_InvalidTransition(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 
 	if err := Transition(lc, StatusRunning); err == nil {
 		t.Error("expected error for invalid transition pending -> running")
@@ -146,13 +135,12 @@ func TestTransition_InvalidTransition(t *testing.T) {
 func TestTransition_TerminalStatesRejectAll(t *testing.T) {
 	allStatuses := []Status{
 		StatusPending, StatusReady, StatusRunning, StatusValidating,
-		StatusFailedValidation, StatusReviewing, StatusRejected,
-		StatusMerging, StatusConflict, StatusResolving, StatusMerged, StatusFailed,
+		StatusFailedValidation, StatusDone, StatusFailed, StatusInterrupted,
 	}
 
-	for _, terminal := range []Status{StatusMerged, StatusFailed} {
+	for _, terminal := range []Status{StatusDone, StatusFailed} {
 		for _, to := range allStatuses {
-			lc := NewLifecycle("t1", "r1", "main")
+			lc := NewLifecycle("t1", "r1")
 			lc.Status = terminal
 			if err := Transition(lc, to); err == nil {
 				t.Errorf("expected error transitioning from terminal %s to %s", terminal, to)
@@ -162,7 +150,7 @@ func TestTransition_TerminalStatesRejectAll(t *testing.T) {
 }
 
 func TestTransition_RetryFromFailedValidation(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	lc.Status = StatusFailedValidation
 	lc.Error = "validation failed"
 	lc.Retries = 0
@@ -181,42 +169,9 @@ func TestTransition_RetryFromFailedValidation(t *testing.T) {
 	}
 }
 
-func TestTransition_RetryFromRejected(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
-	lc.Status = StatusRejected
-	lc.Error = "review rejected"
-	lc.Retries = 2
-
-	if err := Transition(lc, StatusReady); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if lc.Retries != 3 {
-		t.Errorf("expected retries 3, got %d", lc.Retries)
-	}
-	if lc.Error != "" {
-		t.Errorf("expected error to be cleared, got %q", lc.Error)
-	}
-}
-
-func TestTransition_CrashRecovery(t *testing.T) {
-	recoverable := []Status{
-		StatusRunning, StatusValidating, StatusReviewing, StatusMerging, StatusResolving,
-	}
-	for _, from := range recoverable {
-		lc := NewLifecycle("t1", "r1", "main")
-		lc.Status = from
-		if err := Transition(lc, StatusReady); err != nil {
-			t.Errorf("expected crash recovery %s -> ready to succeed, got: %v", from, err)
-		}
-		if lc.Status != StatusReady {
-			t.Errorf("expected status ready after recovery from %s, got %s", from, lc.Status)
-		}
-	}
-}
-
 func TestTransition_Timestamps(t *testing.T) {
 	t.Run("ready sets ReadyAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		if lc.Timestamps.ReadyAt == nil {
 			t.Error("expected ReadyAt to be set")
@@ -224,7 +179,7 @@ func TestTransition_Timestamps(t *testing.T) {
 	})
 
 	t.Run("running sets StartedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		_ = Transition(lc, StatusRunning)
 		if lc.Timestamps.StartedAt == nil {
@@ -233,7 +188,7 @@ func TestTransition_Timestamps(t *testing.T) {
 	})
 
 	t.Run("validating sets CompletedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		_ = Transition(lc, StatusRunning)
 		_ = Transition(lc, StatusValidating)
@@ -242,32 +197,19 @@ func TestTransition_Timestamps(t *testing.T) {
 		}
 	})
 
-	t.Run("reviewing sets ReviewedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+	t.Run("done sets CompletedAt", func(t *testing.T) {
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		_ = Transition(lc, StatusRunning)
 		_ = Transition(lc, StatusValidating)
-		_ = Transition(lc, StatusReviewing)
-		if lc.Timestamps.ReviewedAt == nil {
-			t.Error("expected ReviewedAt to be set")
-		}
-	})
-
-	t.Run("merged sets MergedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
-		_ = Transition(lc, StatusReady)
-		_ = Transition(lc, StatusRunning)
-		_ = Transition(lc, StatusValidating)
-		_ = Transition(lc, StatusReviewing)
-		_ = Transition(lc, StatusMerging)
-		_ = Transition(lc, StatusMerged)
-		if lc.Timestamps.MergedAt == nil {
-			t.Error("expected MergedAt to be set")
+		_ = Transition(lc, StatusDone)
+		if lc.Timestamps.CompletedAt == nil {
+			t.Error("expected CompletedAt to be set")
 		}
 	})
 
 	t.Run("failed sets FailedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		_ = Transition(lc, StatusRunning)
 		lc.Error = "something broke"
@@ -278,7 +220,7 @@ func TestTransition_Timestamps(t *testing.T) {
 	})
 
 	t.Run("failed_validation sets FailedAt", func(t *testing.T) {
-		lc := NewLifecycle("t1", "r1", "main")
+		lc := NewLifecycle("t1", "r1")
 		_ = Transition(lc, StatusReady)
 		_ = Transition(lc, StatusRunning)
 		_ = Transition(lc, StatusValidating)
@@ -291,7 +233,7 @@ func TestTransition_Timestamps(t *testing.T) {
 }
 
 func TestTransition_FailedRequiresError(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	_ = Transition(lc, StatusReady)
 	_ = Transition(lc, StatusRunning)
 
@@ -313,7 +255,7 @@ func TestTransition_FailedRequiresError(t *testing.T) {
 }
 
 func TestTransition_FailedValidationRequiresError(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	_ = Transition(lc, StatusReady)
 	_ = Transition(lc, StatusRunning)
 	_ = Transition(lc, StatusValidating)
@@ -336,7 +278,7 @@ func TestTransition_FailedValidationRequiresError(t *testing.T) {
 }
 
 func TestTransition_DoesNotModifyVersion(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	if lc.Version != 0 {
 		t.Fatalf("expected initial version 0, got %d", lc.Version)
 	}
@@ -351,7 +293,7 @@ func TestTransition_DoesNotModifyVersion(t *testing.T) {
 }
 
 func TestTransition_InterruptedDoesNotConsumeRetryBudget(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	_ = Transition(lc, StatusReady)
 	_ = Transition(lc, StatusRunning)
 
@@ -374,7 +316,7 @@ func TestTransition_InterruptedDoesNotConsumeRetryBudget(t *testing.T) {
 }
 
 func TestTransition_RetryFromValidationStillConsumesBudget(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
+	lc := NewLifecycle("t1", "r1")
 	_ = Transition(lc, StatusReady)
 	_ = Transition(lc, StatusRunning)
 	_ = Transition(lc, StatusValidating)
@@ -383,22 +325,5 @@ func TestTransition_RetryFromValidationStillConsumesBudget(t *testing.T) {
 	_ = Transition(lc, StatusReady)
 	if lc.Retries != 1 {
 		t.Errorf("FailedValidation -> Ready must bump Retries to 1, got %d", lc.Retries)
-	}
-}
-
-func TestTransition_ConflictResolutionPath(t *testing.T) {
-	lc := NewLifecycle("t1", "r1", "main")
-	_ = Transition(lc, StatusReady)
-	_ = Transition(lc, StatusRunning)
-	_ = Transition(lc, StatusValidating)
-	_ = Transition(lc, StatusReviewing)
-	_ = Transition(lc, StatusMerging)
-	_ = Transition(lc, StatusConflict)
-	_ = Transition(lc, StatusResolving)
-	_ = Transition(lc, StatusMerging)
-	_ = Transition(lc, StatusMerged)
-
-	if lc.Status != StatusMerged {
-		t.Errorf("expected merged, got %s", lc.Status)
 	}
 }

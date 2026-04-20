@@ -28,7 +28,7 @@ func TestConsecutiveFailedRuns_MultipleRuns(t *testing.T) {
 	lc := &Lifecycle{Attempts: []Attempt{
 		{Number: 1, Outcome: OutcomeAgentError, RunID: "run-A"},
 		{Number: 2, Outcome: OutcomeValidationFailed, RunID: "run-B"},
-		{Number: 3, Outcome: OutcomeRejected, RunID: "run-C"},
+		{Number: 3, Outcome: OutcomeAgentError, RunID: "run-C"},
 	}}
 	if got := ConsecutiveFailedRuns(lc); got != 3 {
 		t.Errorf("got %d, want 3", got)
@@ -70,7 +70,7 @@ func TestConsecutiveFailedRuns_LegacyCollapse(t *testing.T) {
 	lc := &Lifecycle{Attempts: []Attempt{
 		{Number: 1, Outcome: OutcomeAgentError},
 		{Number: 2, Outcome: OutcomeValidationFailed},
-		{Number: 3, Outcome: OutcomeRejected},
+		{Number: 3, Outcome: OutcomeAgentError},
 	}}
 	if got := ConsecutiveFailedRuns(lc); got != 1 {
 		t.Errorf("got %d, want 1 (legacy collapses)", got)
@@ -89,8 +89,7 @@ func TestConsecutiveFailedRuns_LegacyThenModern(t *testing.T) {
 
 func TestIsFailureOutcome(t *testing.T) {
 	failing := []string{
-		OutcomeAgentError, OutcomeValidationFailed, OutcomeRejected,
-		OutcomeMergeConflictFail, OutcomeMergeError, OutcomeInternalError,
+		OutcomeAgentError, OutcomeValidationFailed, OutcomeInternalError,
 	}
 	for _, o := range failing {
 		if !IsFailureOutcome(o) {
@@ -152,7 +151,7 @@ func TestAttemptDir(t *testing.T) {
 }
 
 func TestInterruptedToReadyPreservesSessionID(t *testing.T) {
-	lc := NewLifecycle("T-001", "run-1", "main")
+	lc := NewLifecycle("T-001", "run-1")
 	lc.SessionID = "sess-xyz"
 	lc.Status = StatusRunning
 	if err := Transition(lc, StatusInterrupted); err != nil {
@@ -168,9 +167,8 @@ func TestInterruptedToReadyPreservesSessionID(t *testing.T) {
 
 func TestResetForRetryPreservesSessionID(t *testing.T) {
 	lc := &Lifecycle{
-		SessionID:    "sess-abc",
-		Error:        "some error",
-		ReviewResult: "rejected",
+		SessionID: "sess-abc",
+		Error:     "some error",
 	}
 	ResetForRetry(lc)
 	if lc.SessionID != "sess-abc" {
@@ -180,10 +178,7 @@ func TestResetForRetryPreservesSessionID(t *testing.T) {
 
 func TestResetForRetry_ClearsMutableFieldsPreservesAttempts(t *testing.T) {
 	lc := &Lifecycle{
-		Error:           "boom",
-		ReviewResult:    "rejected",
-		ConflictDetails: "file.go",
-		ResolveAttempts: 2,
+		Error: "boom",
 		Attempts: []Attempt{
 			{Number: 1, Outcome: OutcomeAgentError, RunID: "run-A"},
 		},
@@ -191,15 +186,6 @@ func TestResetForRetry_ClearsMutableFieldsPreservesAttempts(t *testing.T) {
 	ResetForRetry(lc)
 	if lc.Error != "" {
 		t.Errorf("Error not cleared: %q", lc.Error)
-	}
-	if lc.ReviewResult != "" {
-		t.Errorf("ReviewResult not cleared: %q", lc.ReviewResult)
-	}
-	if lc.ConflictDetails != "" {
-		t.Errorf("ConflictDetails not cleared: %q", lc.ConflictDetails)
-	}
-	if lc.ResolveAttempts != 0 {
-		t.Errorf("ResolveAttempts not cleared: %d", lc.ResolveAttempts)
 	}
 	if len(lc.Attempts) != 1 {
 		t.Errorf("Attempts history lost: %d entries", len(lc.Attempts))

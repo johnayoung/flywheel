@@ -8,16 +8,11 @@ import (
 var validTransitions = map[Status][]Status{
 	StatusPending:          {StatusReady},
 	StatusReady:            {StatusRunning},
-	StatusRunning:          {StatusValidating, StatusFailedValidation, StatusFailed, StatusReady, StatusInterrupted},
-	StatusValidating:       {StatusReviewing, StatusFailedValidation, StatusReady, StatusInterrupted},
+	StatusRunning:          {StatusValidating, StatusFailedValidation, StatusFailed, StatusInterrupted},
+	StatusValidating:       {StatusDone, StatusFailedValidation, StatusFailed, StatusInterrupted},
 	StatusFailedValidation: {StatusReady, StatusFailed},
-	StatusReviewing:        {StatusMerging, StatusRejected, StatusReady, StatusInterrupted},
-	StatusRejected:         {StatusReady, StatusFailed},
-	StatusMerging:          {StatusMerged, StatusConflict, StatusRejected, StatusReady, StatusInterrupted},
-	StatusConflict:         {StatusResolving, StatusInterrupted},
-	StatusResolving:        {StatusMerging, StatusFailed, StatusReady, StatusInterrupted},
 	StatusInterrupted:      {StatusReady},
-	StatusMerged:           {},
+	StatusDone:             {},
 	StatusFailed:           {},
 }
 
@@ -37,7 +32,7 @@ func CanTransition(from, to Status) bool {
 
 // IsTerminal reports whether the given status is a terminal state.
 func IsTerminal(s Status) bool {
-	return s == StatusMerged || s == StatusFailed
+	return s == StatusDone || s == StatusFailed
 }
 
 // CanRetry reports whether the lifecycle is eligible for retry.
@@ -45,7 +40,7 @@ func CanRetry(lc *Lifecycle, maxRetries int) bool {
 	if lc.Retries >= maxRetries {
 		return false
 	}
-	return lc.Status == StatusFailedValidation || lc.Status == StatusRejected
+	return lc.Status == StatusFailedValidation
 }
 
 // Transition moves the lifecycle to a new status, applying side effects.
@@ -61,7 +56,7 @@ func Transition(lc *Lifecycle, to Status) error {
 	now := time.Now()
 	from := lc.Status
 
-	if to == StatusReady && (from == StatusFailedValidation || from == StatusRejected) {
+	if to == StatusReady && from == StatusFailedValidation {
 		lc.Retries++
 		lc.Error = ""
 	}
@@ -74,14 +69,12 @@ func Transition(lc *Lifecycle, to Status) error {
 		lc.Timestamps.ReadyAt = &now
 	case StatusRunning:
 		lc.Timestamps.StartedAt = &now
-	case StatusReviewing:
-		lc.Timestamps.ReviewedAt = &now
-	case StatusMerged:
-		lc.Timestamps.MergedAt = &now
-	case StatusFailed, StatusFailedValidation:
-		lc.Timestamps.FailedAt = &now
 	case StatusValidating:
 		lc.Timestamps.CompletedAt = &now
+	case StatusDone:
+		lc.Timestamps.CompletedAt = &now
+	case StatusFailed, StatusFailedValidation:
+		lc.Timestamps.FailedAt = &now
 	}
 
 	lc.Status = to

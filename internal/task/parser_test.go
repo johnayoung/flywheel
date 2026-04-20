@@ -14,10 +14,8 @@ func validTask() Task {
 		Category:           "feat",
 		Priority:           1,
 		Prerequisites:      []string{"task-000"},
-		Commit:             "feat: add user login",
 		Steps:              []string{"Create handler", "Add route"},
-		AcceptanceCriteria: []string{"Returns 200 on success"},
-		Review:             "human",
+		AcceptanceCriteria: AcceptanceCriteria{Conditions: []string{"Returns 200 on success"}},
 	}
 }
 
@@ -65,7 +63,6 @@ func TestParseDir(t *testing.T) {
 
 	writeJSON(t, filepath.Join(dir, "a.json"), t1)
 	writeJSON(t, filepath.Join(dir, "b.json"), t2)
-	// Non-json file should be ignored.
 	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("ignore"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -142,27 +139,12 @@ func TestValidate_InvalidCategory(t *testing.T) {
 	}
 }
 
-func TestValidate_EmptyCommit(t *testing.T) {
-	tk := validTask()
-	tk.Commit = ""
-	if err := tk.Validate(); err == nil {
-		t.Error("expected error for empty commit")
-	}
-}
 
 func TestValidate_EmptySteps(t *testing.T) {
 	tk := validTask()
 	tk.Steps = nil
 	if err := tk.Validate(); err == nil {
 		t.Error("expected error for empty steps")
-	}
-}
-
-func TestValidate_InvalidReview(t *testing.T) {
-	tk := validTask()
-	tk.Review = "auto"
-	if err := tk.Validate(); err == nil {
-		t.Error("expected error for invalid review value")
 	}
 }
 
@@ -174,27 +156,18 @@ func TestValidate_SelfReferencingPrerequisite(t *testing.T) {
 	}
 }
 
-func TestValidate_ValidReviewValues(t *testing.T) {
-	for _, rv := range []string{"agent", "human", "none", ""} {
-		tk := validTask()
-		tk.Review = rv
-		if err := tk.Validate(); err != nil {
-			t.Errorf("unexpected error for review=%q: %v", rv, err)
-		}
-	}
-}
-
 func TestRoundTrip(t *testing.T) {
 	original := Task{
-		ID:                 "complex-task-99",
-		Description:        "A complex task with all fields populated",
-		Category:           "refactor",
-		Priority:           5,
-		Prerequisites:      []string{"task-a", "task-b", "task-c"},
-		Commit:             "refactor: restructure module layout",
-		Steps:              []string{"Step one", "Step two", "Step three"},
-		AcceptanceCriteria: []string{"Criterion A", "Criterion B"},
-		Review:             "agent",
+		ID:            "complex-task-99",
+		Description:   "A complex task with all fields populated",
+		Category:      "refactor",
+		Priority:      5,
+		Prerequisites: []string{"task-a", "task-b", "task-c"},
+		Steps:         []string{"Step one", "Step two", "Step three"},
+		AcceptanceCriteria: AcceptanceCriteria{
+			Commands:   []string{"go test ./..."},
+			Conditions: []string{"Criterion A", "Criterion B"},
+		},
 	}
 
 	data, err := json.Marshal(original)
@@ -228,10 +201,10 @@ func TestRoundTrip(t *testing.T) {
 	if len(got.Steps) != len(original.Steps) {
 		t.Errorf("Steps: got %d, want %d", len(got.Steps), len(original.Steps))
 	}
-	if len(got.AcceptanceCriteria) != len(original.AcceptanceCriteria) {
-		t.Errorf("AcceptanceCriteria: got %d, want %d", len(got.AcceptanceCriteria), len(original.AcceptanceCriteria))
+	if len(got.AcceptanceCriteria.Commands) != len(original.AcceptanceCriteria.Commands) {
+		t.Errorf("AcceptanceCriteria.Commands: got %d, want %d", len(got.AcceptanceCriteria.Commands), len(original.AcceptanceCriteria.Commands))
 	}
-	if got.Review != original.Review {
-		t.Errorf("Review: got %q, want %q", got.Review, original.Review)
+	if len(got.AcceptanceCriteria.Conditions) != len(original.AcceptanceCriteria.Conditions) {
+		t.Errorf("AcceptanceCriteria.Conditions: got %d, want %d", len(got.AcceptanceCriteria.Conditions), len(original.AcceptanceCriteria.Conditions))
 	}
 }

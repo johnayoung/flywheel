@@ -3,7 +3,7 @@
 -- Four tables mirror the conceptual model: lifecycles is the row that mutates
 -- (with a Version column for optimistic concurrency), attempts is the
 -- per-execution history, events is the timeline of harness-emitted events,
--- and verifications is the per-command receipt log produced by Tier-1.
+-- and grader_results is the per-grader receipt log produced during validation.
 --
 -- Pragmas: WAL gives readers concurrent visibility while a writer is active;
 -- foreign_keys is off-by-default in SQLite and we want it on.
@@ -53,22 +53,26 @@ CREATE TABLE IF NOT EXISTS events (
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
 
-CREATE TABLE IF NOT EXISTS verifications (
+-- One row per grader execution. grader_type is the discriminator
+-- (`command`, `transcript`, `rubric`, `manual`); per-type detail (stdout
+-- tails, LLM rationale, operator notes, observed counter values) lives in
+-- payload_json so new grader types can be added without schema churn.
+CREATE TABLE IF NOT EXISTS grader_results (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id          TEXT NOT NULL,
   attempt_number  INTEGER NOT NULL,
   ordinal         INTEGER NOT NULL,
-  command         TEXT NOT NULL,
-  exit_code       INTEGER NOT NULL,
+  grader_type     TEXT NOT NULL,
+  grader_name     TEXT,
+  passed          INTEGER NOT NULL,
   duration_ms     INTEGER NOT NULL,
-  stdout_tail     TEXT,
-  stderr_tail     TEXT,
+  payload_json    TEXT NOT NULL,
   ts              DATETIME NOT NULL,
   FOREIGN KEY (run_id, attempt_number) REFERENCES attempts(run_id, number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, ts);
-CREATE INDEX IF NOT EXISTS idx_verifications_run_attempt ON verifications(run_id, attempt_number, ordinal);
+CREATE INDEX IF NOT EXISTS idx_grader_results_run_attempt ON grader_results(run_id, attempt_number, ordinal);
 
 -- claude_session_store: Claude Code agent transcript persistence.
 -- One row per transcript entry; seq orders entries within a

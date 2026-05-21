@@ -27,7 +27,7 @@ Higher-level systems may still decide which tasks to run, what budgets to apply,
 
 ### Task-based
 
-The unit of work is a [task](task-schema.md): a structured definition containing a goal, steps, and acceptance criteria. The loop operates on one task at a time.
+The unit of work is a [task](task-schema.md): a structured definition containing a goal, steps, and graders. The loop operates on one task at a time.
 
 The original task definition is treated as immutable once created. If execution reveals new constraints, clarifications, or human directives, those are recorded in lifecycle data rather than mutating the task itself. This preserves a clean separation between the definition of work and the history of execution.
 
@@ -103,112 +103,52 @@ Completion is a claim that gets tested, not a promise that gets trusted. The age
 
 ## Iteration signaling
 
-At the end of every iteration, the agent emits a structured JSON envelope. This happens every iteration, not only when the agent believes the task is complete.
+At the end of every iteration, the agent emits a structured envelope. The envelope replaces fragile string matching in free-form stdout and serves a dual role: a control input the harness reads to decide what to do next, and an observability event recorded for telemetry.
 
-This replaces fragile string matching in free-form stdout, where signals can be confused with code output, logs, markdown, or generated files. The envelope is an explicit protocol artifact as well as an observability event. 
+The harness treats the envelope as untrusted protocol input. It validates the envelope before acting on it and must handle malformed, missing, duplicate, partial, or contradictory cases as first-class outcomes. The agent never directly mutates lifecycle state — the harness translates iteration signals into lifecycle transitions.
 
-The envelope is delimited by a `<!-- LOOP_STATUS -->` fence:
+The envelope schema, the agent-reported status enum, and the per-status harness behavior live in [loop.md](loop.md).
 
-```html
-<!-- LOOP_STATUS -->
-{
-  "status": "completed",
-  "summary": "Migrated all handlers to new router pattern",
-  "artifacts": ["api/router.go", "api/handlers_test.go"],
-  "evidence": {
-    "tests_passed": true,
-    "acceptance_criteria_met": ["AC-1", "AC-2", "AC-3"],
-    "remaining": []
-  },
-  "confidence": 0.95
-}
-<!-- /LOOP_STATUS -->
-```
+## Graders
 
-The harness treats this envelope as protocol input, not as a trusted command. It must handle malformed JSON, missing fences, duplicate envelopes, partial output, and contradictory claims as first-class cases.
+When the agent claims `completed`, the loop does not trust the claim. It runs the task's `graders`, defined in the [task schema](task-schema.md). A `validation_failed` outcome records that verification disproved the completion claim. It does not, by itself, decide what happens next. The controller applies policy to decide whether to retry, escalate, or terminate. That distinction matters: verification outcome and retry policy are not the same thing.
 
-At minimum, the protocol should define:
+Each grader is a typed object: `command`, `rubric`, `manual`, or `transcript`. All graders must pass for the task to reach `done`. The harness runs them cost-cheapest-first so deterministic failures abort before any LLM or human cost is incurred.
 
-* which envelope is authoritative for an iteration
-* how malformed or missing envelopes are recorded
-* whether duplicate envelopes are allowed
-* how truncated output is handled
-* what recovery behavior applies when protocol expectations are not met
+### `command`
 
-Each iteration produces a typed **iteration status**, distinct from the task lifecycle status:
+Deterministic shell checks — tests, build, lint, typecheck, custom scripts, filesystem state checks. Pass = exit 0.
 
-| Iteration status | Meaning                                                                 |
-| ---------------- | ----------------------------------------------------------------------- |
-| `running`        | Work is in progress and the agent is not yet claiming completion        |
-| `completed`      | The agent believes the task is complete                                 |
-| `blocked`        | The agent cannot proceed without external input or intervention         |
-| `failed`         | The agent encountered an unrecoverable failure in the current iteration |
+If any command grader fails, the validation result is recorded and the failure output is attached as context. For MVP, command failures are retryable by default: the task transitions back to `ready` so the agent can address the failure on the next attempt.
 
-A `blocked` status with a reason is far more useful than silent spinning. A `running` status with a summary provides visibility into claimed progress without requiring completion. 
+### `transcript`
 
-## Harness state machine
+Path-level constraints such as `max_turns`, `max_total_tokens`, and `max_wall_seconds`. The harness also enforces these as hard limits during the run, not only at grade time — a runaway loop is aborted as soon as the limit is crossed, before grading begins. For MVP, transcript-grader failures are treated the same as command failures: retryable.
 
-The harness reads the envelope after each iteration, validates it as protocol input, interprets the reported status, and decides what happens next.
+### `rubric`
 
-Its behavior is straightforward:
+A separate LLM call, distinct from the working agent, evaluates natural-language assertions against the original goal, the diff, and other execution artifacts. Useful for catching the class of failure where deterministic checks pass but the implementation still does not match intent. It should be treated as semantic review assistance, not as a perfectly reliable judge, especially for broad or context-heavy tasks.
 
-* `running` means re-invoke the agent and carry context forward
-* `completed` means transition to verification, not termination
-* `blocked` means surface the stated reason and enter a blocked or paused path
-* `failed` means record the failure and apply retry or escalation policy
+For MVP, a rubric failure does not auto-retry. The task pauses and surfaces the verifier's assessment for operator review.
 
-The agent never directly mutates lifecycle state. The harness owns the lifecycle. It translates iteration status into lifecycle transitions and decides when verification, retry, pause, interruption, or termination should occur. 
+### `manual`
 
-Each envelope is both a structured observability event and a control input to the harness. That dual role is important: the loop uses the envelope to drive execution, but still treats it as untrusted until validated. 
+For checks where automated verification is insufficient, the loop pauses and surfaces a summary, relevant artifacts, and change context for human approval. This is the escape hatch for work that is risky, ambiguous, or too dependent on product and architectural judgment to verify safely in a fully automated way.
 
-## Verification tiers
-
-When the agent claims `completed`, the loop does not trust the claim. It verifies that claim in tiers, generally from cheapest to most expensive.
-
-These tiers are driven by the task’s `acceptance_criteria` field in the [task schema](task-schema.md). A `validation_failed` outcome records that verification disproved the completion claim. It does not, by itself, decide what happens next. The controller applies policy to decide whether to retry, escalate, or terminate. That distinction matters: verification outcome and retry policy are not the same thing. 
-
-### Tier 1 — Commands
-
-The harness executes `acceptance_criteria.commands` in order.
-
-These are deterministic checks such as:
-
-* tests pass
-* code compiles
-* linter is clean
-* build artifacts are produced successfully
-
-If any command fails, the validation result is recorded and the failure output is attached as context. For MVP, Tier 1 command failures are retryable by default: the task transitions back to `ready` so the agent can address the failure on the next attempt. More expensive checks may be skipped after deterministic failure. 
-
-### Tier 2 — Conditions
-
-A separate LLM call, distinct from the working agent, evaluates semantic acceptance criteria.
-
-This verifier receives the original goal, the task’s `acceptance_criteria.conditions`, and a representation of what changed, such as a diff plus other relevant execution artifacts. Its job is to assess whether the observed changes appear to satisfy the stated conditions and to identify what may still be missing.
-
-This tier is useful for catching the class of failure where deterministic commands pass but the implementation still does not match intent. It should be treated as semantic review assistance, not as a perfectly reliable judge, especially for broad or context-heavy tasks.
-
-For MVP, a Tier 2 failure does not auto-retry. The task pauses and surfaces the verifier’s assessment for operator review. 
-
-### Tier 3 — Human-in-the-loop
-
-For tasks where automated verification is insufficient, the loop pauses and surfaces a summary, relevant artifacts, and change context for human approval.
-
-This is the escape hatch for work that is risky, ambiguous, or too dependent on product and architectural judgment to verify safely in a fully automated way.
-
-For MVP, a Tier 3 rejection does not auto-retry. The task remains paused until an operator decides whether to retry, revise, or terminate. 
+For MVP, a manual rejection does not auto-retry. The task remains paused until an operator decides whether to retry, revise, or terminate.
 
 ### Execution order
 
-The default order is:
+Within an attempt, graders run in cost order:
 
-1. deterministic commands
-2. semantic conditions, if defined
-3. human review, if required by task risk or policy
+1. `command`
+2. `transcript`
+3. `rubric`
+4. `manual`
 
-Any tier can fail. A failed tier records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, only Tier 1 deterministic command failures are retried automatically. Tier 2 and Tier 3 failures pause the task for operator intervention.
+Within a type, list order is respected. The first failure inside a type skips the remainder of that type and all later types. A failed grader records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, only `command` and `transcript` failures retry automatically — `rubric` and `manual` failures pause for operator intervention.
 
-Future versions may add richer validation-failure categories, smarter retry policy, stuck detection, and structured repair hints. For MVP, the policy stays intentionally narrow. 
+Future versions may add richer validation-failure categories, smarter retry policy, stuck detection, and structured repair hints. For MVP, the policy stays intentionally narrow.
 
 ## Intervention points
 
@@ -260,16 +200,16 @@ The building blocks that follow, including task decomposition, multi-task orches
 
 | Term                 | Layer         | Definition                                                                                                                                                                                                                                         |
 | -------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Task**             | Schema        | The unit of work: a structured definition with goal, steps, and acceptance criteria. The original task definition is immutable once created. Execution-time clarifications and directives live in lifecycle records rather than mutating the task. |
+| **Task**             | Schema        | The unit of work: a structured definition with goal, steps, and graders. The original task definition is immutable once created. Execution-time clarifications and directives live in lifecycle records rather than mutating the task. |
 | **Lifecycle**        | State         | The mutable execution record for a task. It tracks status, attempts, timestamps, outcomes, and associated errors. One lifecycle exists per task execution.                                                                                         |
 | **Lifecycle status** | State         | The system-controlled state of a task’s execution, such as `pending`, `ready`, `running`, `validating`, `blocked`, `interrupted`, `done`, or `failed`. Transitions are governed by the harness, not by the agent.                                  |
-| **Envelope**         | Signal        | The structured JSON payload emitted by the agent at the end of each iteration. It contains an iteration status, summary, artifacts, and evidence. It is treated as both protocol input and observability data, not as a trusted command.           |
-| **Iteration status** | Signal        | The agent-reported status inside an envelope: `running`, `completed`, `blocked`, or `failed`. This is the agent’s claim about progress. It never directly changes lifecycle state.                                                                 |
+| **Envelope**         | Signal        | The structured payload emitted by the agent at the end of each iteration. Treated as both protocol input and observability data, not as a trusted command. Schema lives in [loop.md](loop.md).                                                     |
+| **Iteration status** | Signal        | The agent-reported status carried inside an envelope. Represents the agent's claim about progress and never directly changes lifecycle state. Defined values live in [loop.md](loop.md).                                                          |
 | **Iteration**        | Execution     | A single invocation of the agent within an active execution path. The agent runs, produces output, and emits an envelope.                                                                                                                          |
 | **Attempt**          | State         | A recorded unit of execution with start and end times, outcome, output, and associated errors. An attempt may span one or more iterations and ends when the harness leaves the active execution path.                                              |
 | **Run**              | State         | A logical grouping of attempts identified by `run_id`. If run-level counters are tracked, they should be defined separately from iteration- and attempt-level counters to avoid ambiguity in telemetry and policy.                                 |
 | **Harness**          | Control       | The loop controller that invokes the agent, validates envelopes, owns lifecycle transitions, triggers verification, and manages retries, pauses, and termination.                                                                                  |
-| **Verification**     | Control       | The process of testing a completion claim. It runs during `validating` and may include deterministic commands, semantic review, and human approval.                                                                                                |
+| **Verification**     | Control       | The process of testing a completion claim. It runs during `validating` and executes the task's graders — `command`, `transcript`, `rubric`, and `manual` — in cost order.                                                                            |
 | **Brain**            | Execution     | The AI coding agent that performs the actual work, such as Claude Code or Codex. The loop is designed to support different brains through a backend interface.                                                                                     |
 | **Agent contract**   | Signal        | The prompt- and protocol-level expectation that the agent emits valid envelopes and reports its state honestly. The system still treats those reports as untrusted claims.                                                                         |
 | **Context pressure** | Observability | The operational risk that reliability degrades as context accumulates. The loop monitors proxies such as utilization and growth rate, but does not treat them as a complete measurement of semantic degradation.                                   |

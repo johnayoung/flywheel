@@ -32,7 +32,7 @@ Detection combines SDK-native signals (`StopReason`, hooks, typed messages) with
 
 | State | Description | SDK surface | Loop service |
 |---|---|---|---|
-| `done` | Agent's turn ended cleanly and it believes the work is complete. Candidate for verification, not final. | `AssistantMessage.StopReason == "end_turn"` with no pending `ToolUseBlock`; `ResultMessage` with `IsError: false` | Orchestrate verification tiers and promote to lifecycle `done` only on all-pass. **TODO — tier implementations themselves:** command runner is trivial, but the LLM condition-verifier and human approval surface are their own subsystems requiring separate research phases. |
+| `done` | Agent's turn ended cleanly and it believes the work is complete. Candidate for verification, not final. | `AssistantMessage.StopReason == "end_turn"` with no pending `ToolUseBlock`; `ResultMessage` with `IsError: false` | Run the task's graders in cost order and promote to lifecycle `done` only on all-pass. **TODO — grader implementations:** the `command` runner is trivial, but the `rubric` LLM verifier and `manual` approval surface are their own subsystems requiring separate research phases. |
 | `working` | Agent is making productive progress — tool calls succeeding, novel actions, diff growing. Default healthy state. | `PostToolUse` hook fires; `ToolResultBlock.IsError == false`; `TaskProgressMessage` arriving | **Simple:** reset watchdog timer, append event to progress window, continue. Pure bookkeeping. |
 | `blocked_explicit` | Agent has declared it needs external input to proceed. | Text content in `AssistantMessage`; `NotificationArrived` hook; simplified intent envelope | **Simple** if the intent envelope is a closed enum (`blocked`, `verify`, `continue`, `abort`) — trivial parse and pause. **Open question:** how the `reason` field is handled without it becoming free-form conditional logic inside the loop. |
 | `blocked_implicit` | Agent is stuck but doesn't know it — same tool failing repeatedly, same permission denied, same question re-asked. | `PostToolUseFailure` hook; `ToolResultBlock.IsError == true`; `ResultMessage.PermissionDenials` | **Simple for the mechanical case:** counter keyed on `(tool_name, sha256(input))`, tripped after repeated consecutive failures. Same shape for permission denials on `(tool_name, resource)`. **TODO — "same question re-asked":** requires semantic similarity between assistant text blocks; not deterministic. Research options include embedding-model similarity with a threshold study; each requires its own research phase. |
@@ -62,15 +62,16 @@ The envelope is untrusted protocol input. The harness must handle malformed JSON
 
 Per-state dispatch is specified by the **Loop service** column of the detection map above. Each detected state maps to a concrete loop action — bookkeeping, watchdog reset, verification orchestration, pause-for-intervention, retry policy, or fail-loud. Complex cases (thrash detection, crash classification, context-recovery policy) are flagged as TODO subsystems in that column.
 
-## Verification tiers
+## Graders
 
-Triggered when the agent claims `completed`. Driven by the task's `acceptance_criteria`.
+Triggered when the agent claims `completed`. Driven by the task's `graders` list. Run in cost order; first failure inside a type skips the rest of that type and later types.
 
-1. **Commands** — deterministic checks (`acceptance_criteria.commands`): tests, build, lint. MVP: failures retry automatically.
-2. **Conditions** — separate LLM verifier evaluates `acceptance_criteria.conditions` against diff + artifacts. MVP: failures pause for operator review.
-3. **Human** — surfaces summary + artifacts for approval. MVP: rejections pause for operator decision.
+1. **`command`** — deterministic shell check (tests, build, lint, typecheck, state assertions). MVP: failures retry automatically.
+2. **`transcript`** — path-level constraints (`max_turns`, `max_total_tokens`, `max_wall_seconds`). Also enforced as hard limits during the run, not only at grade time. MVP: failures retry automatically.
+3. **`rubric`** — separate LLM verifier evaluates natural-language assertions against the goal, diff, and artifacts. MVP: failures pause for operator review.
+4. **`manual`** — surfaces summary + artifacts for human approval. MVP: rejections pause for operator decision.
 
-A failed tier records `failed_validation`. What happens next is policy.
+A failed grader records `failed_validation`. What happens next is policy.
 
 ## Intervention
 
@@ -92,7 +93,7 @@ Recorded distinctly even when lifecycle states overlap:
 | Class              | Cause                                                               |
 | ------------------ | ------------------------------------------------------------------- |
 | Task failure       | Agent could not complete                                            |
-| Validation failure | Completion claim disproved by commands, conditions, or human review |
+| Validation failure | Completion claim disproved by any grader (command, transcript, rubric, manual) |
 | Protocol failure   | Malformed, missing, duplicate, or truncated envelope                |
 | Infrastructure     | SDK, subprocess, verifier, or storage failure                       |
 
@@ -108,7 +109,7 @@ Each detected state maps to a primary class. Notes capture classification shifts
 | `budget_exceeded`           | Task failure       | —                                                                     |
 | `crashed`                   | Infrastructure     | Refine to Protocol on malformed envelope, Task on clean non-zero exit |
 | Malformed envelope          | Protocol failure   | —                                                                     |
-| Verification tier rejection | Validation failure | —                                                                     |
+| Grader rejection            | Validation failure | —                                                                     |
 
 `rate_limited` is transient and not a failure class. `working` and pre-verification `done` are not failures either.
 

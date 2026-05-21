@@ -1,3 +1,9 @@
+from flywheel.loaders import (
+    TaskLoadError,
+    load_task_directory,
+    load_task_file,
+    load_tasks_jsonl,
+)
 from flywheel.task import (
     KNOWN_GRADER_TYPES,
     Context,
@@ -16,6 +22,10 @@ __all__ = [
     "Grader",
     "KNOWN_GRADER_TYPES",
     "Task",
+    "TaskLoadError",
     "ValidationError",
     "hello",
+    "load_task_directory",
+    "load_task_file",
+    "load_tasks_jsonl",
 ]

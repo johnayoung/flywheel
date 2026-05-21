@@ -20,7 +20,6 @@ The loop is responsible for:
 * verifying completion claims
 * preserving attempt history and failure context
 * emitting structured events for telemetry and downstream control
-* coordinating with pluggable workflow integrations such as git strategy hooks
 
 Higher-level systems may still decide which tasks to run, what budgets to apply, when to escalate, and how to coordinate many tasks at once. But for one task at a time, the loop is the execution controller. 
 
@@ -32,13 +31,11 @@ The unit of work is a [task](task-schema.md): a structured definition containing
 
 The original task definition is treated as immutable once created. If execution reveals new constraints, clarifications, or human directives, those are recorded in lifecycle data rather than mutating the task itself. This preserves a clean separation between the definition of work and the history of execution.
 
-Git workflow concerns such as branching, committing, merging, conflict resolution, and submission are handled by a pluggable [strategy](strategy.md), not by the loop itself. 
-
 ### Observable
 
 Observability is a first-class property of the loop.
 
-Every meaningful event in execution is emitted as structured data: lifecycle transitions, agent invocations, iteration envelopes, verification results, interruptions, protocol errors, infrastructure failures, and strategy outcomes. This creates a durable execution record that can power logs, dashboards, alerts, automation, and postmortems.
+Every meaningful event in execution is emitted as structured data: lifecycle transitions, agent invocations, iteration envelopes, verification results, interruptions, protocol errors, and infrastructure failures. This creates a durable execution record that can power logs, dashboards, alerts, automation, and postmortems.
 
 The loop is not merely a reporter. It is the controller for a single task’s execution lifecycle. Business policy such as queueing, prioritization, retry budgets, and escalation thresholds can live above it, but the loop still owns the state transitions and local operational behavior required to run safely. 
 
@@ -63,11 +60,9 @@ These signals are surfaced through the same observability pipeline as other loop
 
 ### Programmatic
 
-The loop is both a Go library and a CLI.
+The loop is a Python library.
 
-As a library, it can be embedded into larger systems such as CI pipelines, task queues, orchestration services, and review workflows. As a CLI, it is immediately useful on its own: point it at a task, provide the necessary execution inputs, and run it with structured output and lifecycle visibility.
-
-One implementation, two surfaces. 
+It is designed to be embedded into larger systems such as CI pipelines, task queues, orchestration services, and review workflows. Operational surfaces on top of the library are left to consumers. 
 
 ### Brain-agnostic
 
@@ -81,7 +76,7 @@ It is not a task queue. It does not prioritize, schedule, or coordinate many tas
 
 It is not a planner. It does not decompose broad goals into subtasks or choose the implementation strategy for the agent. The brain does that internally, and broader orchestration systems may do that externally.
 
-It is not a full UI. The CLI is a thin operational interface for running tasks, checking status, and injecting directives. Richer interfaces can consume the structured event stream and present more advanced views. 
+It is not a UI. Operational surfaces are intentionally minimal — richer interfaces can consume the structured event stream and present more advanced views. 
 
 ## The loop
 
@@ -100,7 +95,7 @@ pending -> ready -> running -> validating -> done
 
 The brain executes. The loop controls execution, records the lifecycle, and verifies claims.
 
-A task typically begins in `pending`, becomes `ready` when it can be executed, moves to `running` when the agent is invoked, and transitions to `validating` only after the agent claims completion. If verification succeeds, the task reaches `done`. If verification fails, the failure is recorded and the controller decides whether the task should retry from `ready` or terminate as `failed`. Agent-declared inability to proceed can move the task into `blocked`. External pause or stop signals move it into `interrupted`. Terminal states produce structured outcome records. 
+A task typically begins in `pending`, becomes `ready` when it can be executed, moves to `running` when the agent is invoked, and transitions to `validating` only after the agent claims completion. If verification succeeds, the task reaches `done`. If verification fails, the loop enters `validation_failed`, which is a factual outcome — verification disproved the completion claim — not a retry decision. The controller then applies policy to decide whether the task returns to `ready` for another attempt or terminates as `failed`. Agent-declared inability to proceed can move the task into `blocked`. External pause or stop signals move it into `interrupted`. Terminal states produce structured outcome records. 
 
 Every attempt is recorded with timing, outcome, agent output, and associated error context. Sequential failures are tracked explicitly so that higher-level systems can decide whether to continue, pause, or terminate. The data model must clearly distinguish iteration-level, attempt-level, and run-level counters to avoid ambiguity in implementation and telemetry. 
 
@@ -170,7 +165,7 @@ Each envelope is both a structured observability event and a control input to th
 
 When the agent claims `completed`, the loop does not trust the claim. It verifies that claim in tiers, generally from cheapest to most expensive.
 
-These tiers are driven by the task’s `acceptance_criteria` field in the [task schema](task-schema.md). Verification failure records a factual result. The controller then decides whether to retry, escalate, or terminate. That distinction matters: verification outcome and retry policy are not the same thing. 
+These tiers are driven by the task’s `acceptance_criteria` field in the [task schema](task-schema.md). A `validation_failed` outcome records that verification disproved the completion claim. It does not, by itself, decide what happens next. The controller applies policy to decide whether to retry, escalate, or terminate. That distinction matters: verification outcome and retry policy are not the same thing. 
 
 ### Tier 1 — Commands
 
@@ -183,7 +178,7 @@ These are deterministic checks such as:
 * linter is clean
 * build artifacts are produced successfully
 
-If any command fails, the validation result is recorded. If retry policy allows another attempt, the task transitions back to `ready` and the failure output is attached as context. More expensive checks may be skipped after deterministic failure. 
+If any command fails, the validation result is recorded and the failure output is attached as context. For MVP, Tier 1 command failures are retryable by default: the task transitions back to `ready` so the agent can address the failure on the next attempt. More expensive checks may be skipped after deterministic failure. 
 
 ### Tier 2 — Conditions
 
@@ -191,13 +186,17 @@ A separate LLM call, distinct from the working agent, evaluates semantic accepta
 
 This verifier receives the original goal, the task’s `acceptance_criteria.conditions`, and a representation of what changed, such as a diff plus other relevant execution artifacts. Its job is to assess whether the observed changes appear to satisfy the stated conditions and to identify what may still be missing.
 
-This tier is useful for catching the class of failure where deterministic commands pass but the implementation still does not match intent. It should be treated as semantic review assistance, not as a perfectly reliable judge, especially for broad or context-heavy tasks. 
+This tier is useful for catching the class of failure where deterministic commands pass but the implementation still does not match intent. It should be treated as semantic review assistance, not as a perfectly reliable judge, especially for broad or context-heavy tasks.
+
+For MVP, a Tier 2 failure does not auto-retry. The task pauses and surfaces the verifier’s assessment for operator review. 
 
 ### Tier 3 — Human-in-the-loop
 
 For tasks where automated verification is insufficient, the loop pauses and surfaces a summary, relevant artifacts, and change context for human approval.
 
-This is the escape hatch for work that is risky, ambiguous, or too dependent on product and architectural judgment to verify safely in a fully automated way. 
+This is the escape hatch for work that is risky, ambiguous, or too dependent on product and architectural judgment to verify safely in a fully automated way.
+
+For MVP, a Tier 3 rejection does not auto-retry. The task remains paused until an operator decides whether to retry, revise, or terminate. 
 
 ### Execution order
 
@@ -207,7 +206,9 @@ The default order is:
 2. semantic conditions, if defined
 3. human review, if required by task risk or policy
 
-Any tier can fail. A failed tier does not automatically imply the same next step in every case. The loop records the verification outcome, then applies retry or termination policy. 
+Any tier can fail. A failed tier records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, only Tier 1 deterministic command failures are retried automatically. Tier 2 and Tier 3 failures pause the task for operator intervention.
+
+Future versions may add richer validation-failure categories, smarter retry policy, stuck detection, and structured repair hints. For MVP, the policy stays intentionally narrow. 
 
 ## Intervention points
 
@@ -222,12 +223,6 @@ When the agent reports `blocked`, the loop records the reason, transitions the t
 External systems can halt a running task. This moves the task into `interrupted`.
 
 Interruption is an exogenous pause: a human or system stops the run, independent of whether the agent believed it could continue. The loop records the interruption, preserves execution history as configured, and allows the task to resume through `ready` when released. 
-
-### Strategy hooks
-
-Workflow concerns such as repository setup, review gates, merge conflict handling, and submission logic live in the strategy layer, not in the loop.
-
-The loop calls `Strategy.Setup()` before execution begins and invokes submission-related hooks after successful task completion. Strategy failures should be recorded distinctly from core task-completion outcomes. A task can be correctly completed and verified while still failing a downstream integration step such as submission or merge. Those are different facts and should remain distinguishable in the system. 
 
 ## Failure classes
 
@@ -249,23 +244,15 @@ The agent emitted malformed, missing, duplicate, truncated, or contradictory ite
 
 The agent subprocess, SDK layer, verifier infrastructure, storage system, or other execution dependency failed.
 
-### Strategy failure
-
-A setup, merge, submit, or other workflow integration step failed before, during, or after otherwise valid task execution.
-
 These distinctions matter for telemetry, retry policy, escalation, and operator understanding. Even if the externally visible lifecycle remains compact, the internal outcome model should preserve these categories. 
-
-## What we've built so far
-
-The first primitive is [`claude-agent-sdk-go`](https://github.com/johnayoung/claude-agent-sdk-go): a Go SDK for programmatically driving Claude Code as a subprocess. It provides the initial execution substrate that this loop will sit on top of. 
 
 ## What comes next
 
 The orchestration loop is the next building block.
 
-It sits on top of `claude-agent-sdk-go` and implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, preserve execution history, and coordinate with review and submission layers. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth. Everything in the loop exists to move a task through those states correctly, observably, and reliably. 
+It sits on top of the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python) Python package and implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, preserve execution history, and coordinate with review and submission layers. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth. Everything in the loop exists to move a task through those states correctly, observably, and reliably. 
 
-This is flywheel’s first deliverable: usable both as a `flywheel run` CLI command and as an embeddable Go package. One core artifact, two operational surfaces.
+This is flywheel’s first deliverable: an embeddable Python package implementing the loop.
 
 The building blocks that follow, including task decomposition, multi-task orchestration, persistent knowledge, and richer intervention policy, all depend on this loop being correct and trustworthy. That is why it comes next. 
 
@@ -283,7 +270,6 @@ The building blocks that follow, including task decomposition, multi-task orches
 | **Run**              | State         | A logical grouping of attempts identified by `run_id`. If run-level counters are tracked, they should be defined separately from iteration- and attempt-level counters to avoid ambiguity in telemetry and policy.                                 |
 | **Harness**          | Control       | The loop controller that invokes the agent, validates envelopes, owns lifecycle transitions, triggers verification, and manages retries, pauses, and termination.                                                                                  |
 | **Verification**     | Control       | The process of testing a completion claim. It runs during `validating` and may include deterministic commands, semantic review, and human approval.                                                                                                |
-| **Strategy**         | Integration   | The pluggable interface for workflow concerns such as repository setup, merge handling, and submission. Strategy outcomes are tracked distinctly from core task-completion outcomes.                                                               |
 | **Brain**            | Execution     | The AI coding agent that performs the actual work, such as Claude Code or Codex. The loop is designed to support different brains through a backend interface.                                                                                     |
 | **Agent contract**   | Signal        | The prompt- and protocol-level expectation that the agent emits valid envelopes and reports its state honestly. The system still treats those reports as untrusted claims.                                                                         |
 | **Context pressure** | Observability | The operational risk that reliability degrades as context accumulates. The loop monitors proxies such as utilization and growth rate, but does not treat them as a complete measurement of semantic degradation.                                   |

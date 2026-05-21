@@ -1,15 +1,36 @@
-# Binaries
-*.exe
-*.exe~
-*.dll
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 *.so
-*.dylib
-/bin/
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
 
-# Test
-*.test
-*.out
-coverage.out
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# Type checkers / linters / test caches
+.mypy_cache/
+.pyright/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # IDE
 .idea/
@@ -21,6 +42,6 @@ coverage.out
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs / scratch
 /logs/
 /tmp/

@@ -70,7 +70,3 @@ A task is eligible for retry when:
 On retry, the lifecycle transitions back to `ready`, increments `retries`, and clears transient error state. The full attempt history is preserved.
 
 `ConsecutiveFailedRuns` counts sequential failed runs (grouped by `run_id`) from the tail of the attempts list. This drives circuit-breaker logic.
-
-## Strategy
-
-Git workflow concerns (branching, merging, conflict resolution, worktrees) live outside the lifecycle in a pluggable `Strategy` interface. The loop calls `Strategy.Setup()` before running and `Strategy.Submit()` as a side-effect of transitioning to `done`. The lifecycle does not model or track git state.

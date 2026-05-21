@@ -14,17 +14,7 @@ A task is the unit of work in flywheel. It describes what the agent should do an
 | `steps`               | []string | yes      | Ordered instructions for the agent (min 1)                      |
 | `acceptance_criteria` | object   | yes      | What "done" means — must have at least one command or condition |
 
-Git workflow concerns (commit messages, branch naming) are owned by the [Strategy](strategy.md) layer, not the task.
-
-## Input formats
-
-Tasks can be loaded from:
-
-- **Single JSON file** — one task object per file
-- **Directory of JSON files** — each `.json` file in the directory is one task
-- **JSONL** — one task JSON object per line
-
-All formats validate on parse. Invalid tasks fail loudly with the specific constraint that was violated.
+Git workflow concerns (commit messages, branch naming) are owned by the [Strategy](strategy.md) layer, not the task. How tasks are loaded (files, queues, APIs) is a concern of the caller, not the schema.
 
 ## Acceptance criteria
 
@@ -49,14 +39,14 @@ At least one command or condition must be present. Both may be present.
   "priority": 1,
   "prerequisites": ["setup-http-client"],
   "steps": [
-    "Add retry middleware to internal/http/client.go",
+    "Add retry middleware to flywheel/http/client.py",
     "Implement exponential backoff with jitter",
     "Add max_retries and base_delay to ClientConfig"
   ],
   "acceptance_criteria": {
     "commands": [
-      "go test ./internal/http/...",
-      "go vet ./..."
+      "uv run pytest tests/http",
+      "uv run ruff check ."
     ],
     "conditions": [
       "Retries on 5xx and timeout errors only",

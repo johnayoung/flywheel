@@ -45,3 +45,6 @@ Thumbs.db
 # Logs / scratch
 /logs/
 /tmp/
+
+# Claude Code local config
+.claude/

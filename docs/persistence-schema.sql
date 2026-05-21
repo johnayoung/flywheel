@@ -5,6 +5,10 @@
 -- per-execution history, events is the timeline of harness-emitted events,
 -- and grader_results is the per-grader receipt log produced during validation.
 --
+-- grader_results is append-only by contract: rows are written once when a
+-- grader finishes and must not be updated or deleted. Treat the table as an
+-- audit log — corrections go in new rows or compensating events.
+--
 -- Pragmas: WAL gives readers concurrent visibility while a writer is active;
 -- foreign_keys is off-by-default in SQLite and we want it on.
 
@@ -29,6 +33,11 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   updated_at           DATETIME NOT NULL
 );
 
+-- agent_context_json captures the agent identity for this attempt so the run
+-- is interpretable across model, SDK, and prompt changes. Suggested keys:
+-- model_id, model_version, agent_sdk_version, prompt_template_hash.
+-- Per-grader failures are not denormalized here — query grader_results with
+-- (run_id, attempt_number) and passed = 0 instead.
 CREATE TABLE IF NOT EXISTS attempts (
   run_id              TEXT NOT NULL,
   number              INTEGER NOT NULL,
@@ -38,7 +47,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   outcome             TEXT,
   agent_output        TEXT,
   error               TEXT,
-  validation_failures TEXT,
+  agent_context_json  TEXT,
   PRIMARY KEY (run_id, number),
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
@@ -53,21 +62,33 @@ CREATE TABLE IF NOT EXISTS events (
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
 
--- One row per grader execution. grader_type is the discriminator
--- (`command`, `transcript`, `rubric`, `manual`); per-type detail (stdout
--- tails, LLM rationale, operator notes, observed counter values) lives in
--- payload_json so new grader types can be added without schema churn.
+-- One row per grader execution. Append-only — see header.
+--
+-- grader_type is the discriminator (`command`, `transcript`, `rubric`,
+-- `manual`). grader_spec_json snapshots the exact grader object as it
+-- appeared in the task at run time, so historical truth survives later
+-- edits to the task definition. payload_json holds per-type execution
+-- detail; the expected shape by grader_type is:
+--   command:    {run, exit_code, stdout_tail, stderr_tail,
+--                stdout_path?, stderr_path?}
+--   transcript: {observed: {turns, total_tokens, wall_seconds},
+--                breached: "max_turns" | "max_total_tokens" | "max_wall_seconds"}
+--   rubric:     {judge_model, judge_model_version, prompt_path,
+--                artifacts: [...], per_assertion: [{text, verdict, rationale}],
+--                usage: {input_tokens, output_tokens}}
+--   manual:     {operator_id, decision, notes, decided_at}
 CREATE TABLE IF NOT EXISTS grader_results (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id          TEXT NOT NULL,
-  attempt_number  INTEGER NOT NULL,
-  ordinal         INTEGER NOT NULL,
-  grader_type     TEXT NOT NULL,
-  grader_name     TEXT,
-  passed          INTEGER NOT NULL,
-  duration_ms     INTEGER NOT NULL,
-  payload_json    TEXT NOT NULL,
-  ts              DATETIME NOT NULL,
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id            TEXT NOT NULL,
+  attempt_number    INTEGER NOT NULL,
+  ordinal           INTEGER NOT NULL,
+  grader_type       TEXT NOT NULL,
+  grader_name       TEXT,
+  grader_spec_json  TEXT NOT NULL,
+  passed            INTEGER NOT NULL,
+  duration_ms       INTEGER NOT NULL,
+  payload_json      TEXT NOT NULL,
+  ts                DATETIME NOT NULL,
   FOREIGN KEY (run_id, attempt_number) REFERENCES attempts(run_id, number)
 );
 

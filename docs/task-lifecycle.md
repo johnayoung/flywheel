@@ -58,8 +58,11 @@ Each execution attempt is recorded as an `Attempt` with:
 - `number` — sequential attempt index
 - `started_at` / `ended_at` — wall clock duration
 - `outcome` — one of: `succeeded`, `validation_failed`, `agent_error`, `cancelled`, `internal_error`
-- `agent_output`, `error`, `validation_failures` — context for debugging
+- `agent_output`, `error` — context for debugging
+- `agent_context` — model id, model version, agent-SDK version, prompt-template hash; lets later analysis distinguish model swaps from regressions
 - `run_id` — groups attempts within the same run
+
+Per-grader pass/fail detail lives in `grader_results`, keyed by `(run_id, attempt_number)`. Each row snapshots the grader's spec at run time and records its result, so the audit trail survives later task edits.
 
 ## Retries
 

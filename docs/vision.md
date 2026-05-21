@@ -27,7 +27,7 @@ Higher-level systems may still decide which tasks to run, what budgets to apply,
 
 ### Task-based
 
-The unit of work is a [task](task-schema.md): a structured definition containing a goal, steps, and graders. The loop operates on one task at a time.
+The unit of work is a [task](task-schema.md): a structured definition containing a goal, graders, and optional briefing context. The loop operates on one task at a time.
 
 The original task definition is treated as immutable once created. If execution reveals new constraints, clarifications, or human directives, those are recorded in lifecycle data rather than mutating the task itself. This preserves a clean separation between the definition of work and the history of execution.
 
@@ -200,7 +200,7 @@ The building blocks that follow, including task decomposition, multi-task orches
 
 | Term                 | Layer         | Definition                                                                                                                                                                                                                                         |
 | -------------------- | ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Task**             | Schema        | The unit of work: a structured definition with goal, steps, and graders. The original task definition is immutable once created. Execution-time clarifications and directives live in lifecycle records rather than mutating the task. |
+| **Task**             | Schema        | The unit of work: a structured definition with goal, graders, and optional briefing context. The original task definition is immutable once created. Execution-time clarifications and directives live in lifecycle records rather than mutating the task. |
 | **Lifecycle**        | State         | The mutable execution record for a task. It tracks status, attempts, timestamps, outcomes, and associated errors. One lifecycle exists per task execution.                                                                                         |
 | **Lifecycle status** | State         | The system-controlled state of a task’s execution, such as `pending`, `ready`, `running`, `validating`, `blocked`, `interrupted`, `done`, or `failed`. Transitions are governed by the harness, not by the agent.                                  |
 | **Envelope**         | Signal        | The structured payload emitted by the agent at the end of each iteration. Treated as both protocol input and observability data, not as a trusted command. Schema lives in [loop.md](loop.md).                                                     |

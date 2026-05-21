@@ -4,7 +4,7 @@ The Strategy interface owns everything between "the agent finished the work" and
 
 ## Responsibilities
 
-- Branch creation and naming (e.g., deriving a slug from the task's category + description)
+- Branch creation and naming (e.g., deriving a slug from the task's `goal` and `tags`)
 - Commit message generation
 - Worktree setup and teardown
 - Merge conflict detection and resolution

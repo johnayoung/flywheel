@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   status               TEXT NOT NULL,
   version              INTEGER NOT NULL,
   retries              INTEGER NOT NULL,
-  current_step         INTEGER NOT NULL,
   error                TEXT,
   agent_output         TEXT,
   implementation_notes TEXT,
@@ -29,7 +28,6 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   artifacts_dir        TEXT,
   worker_id            TEXT,
   timestamps_json      TEXT NOT NULL,
-  steps_completed_json TEXT,
   updated_at           DATETIME NOT NULL
 );
 

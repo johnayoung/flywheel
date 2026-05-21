@@ -40,8 +40,6 @@ Key rules:
 | `run_id`          | Identifies this execution run             |
 | `worker_id`       | Which worker is executing                 |
 | `status`          | Current state                             |
-| `current_step`    | Index into the task's steps array         |
-| `steps_completed` | Steps the agent has finished              |
 | `timestamps`      | When each major transition occurred       |
 | `version`         | Optimistic concurrency control            |
 | `retries`         | How many times this task has been retried |

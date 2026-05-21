@@ -1,0 +1,42 @@
+{
+    "id": "roadmap-01-task-dataclass",
+    "goal": "Expose a `Task` dataclass (with grader and `Context` types) from the `flywheel` package whose `validate()` enforces every rule defined in `docs/task-schema.md`.",
+    "prerequisites": [],
+    "tags": ["roadmap-01", "schema", "dataclass"],
+    "context": {
+        "relevant": [
+            "docs/task-schema.md",
+            "src/flywheel/__init__.py",
+            "pyproject.toml"
+        ],
+        "constraints": [
+            "Direct dataclass construction must remain a first-class API; no loader/parser may become the sole construction path.",
+            "The dataclass and its nested types must not couple to any input format (JSON, file paths, streams) — the type is a pure data shape.",
+            "`validate()` is a method on the struct, not gated on a serialized form."
+        ],
+        "non_goals": [
+            "Single-file, directory, and JSONL loaders (handled by `roadmap-01-task-loaders`)."
+        ],
+        "edge_cases": [
+            "`graders` must contain at least one entry.",
+            "`prerequisites` must not contain the task's own id.",
+            "A `transcript` grader requires at least one of `max_turns`, `max_total_tokens`, or `max_wall_seconds`.",
+            "`id` defaults to a uuid4-derived value when absent and must contain no whitespace.",
+            "Unknown grader `type` values are rejected by `validate()`.",
+            "A `rubric` grader must have a non-empty `assertions` list; a `manual` grader must have an `instruction`; a `command` grader must have a `run`."
+        ],
+        "notes": "Memory note `feedback_task_schema_input_agnostic.md` is the governing constraint on input-source agnosticism."
+    },
+    "graders": [
+        { "type": "command", "run": "uv run pytest", "name": "tests" },
+        {
+            "type": "rubric",
+            "assertions": [
+                "The Task dataclass module does not import `json`, `pathlib`, `io`, or any file/stream API, and no constructor argument accepts a file path or raw serialized payload.",
+                "Tests demonstrate constructing a Task directly via the dataclass (no loader helper) and calling `validate()` on it.",
+                "`validate()` rejects each violation enumerated in `docs/task-schema.md`: missing `goal`, empty `graders`, self-referential `prerequisites`, whitespace in `id`, a `transcript` grader with no limit set, and an unknown grader `type`."
+            ],
+            "name": "schema-fidelity"
+        }
+    ]
+}

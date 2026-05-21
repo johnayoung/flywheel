@@ -1,0 +1,40 @@
+{
+    "id": "roadmap-01-task-loaders",
+    "goal": "Provide convenience loaders that build validated `Task` instances from a single JSON file, a directory of JSON files, and a JSONL stream.",
+    "prerequisites": ["roadmap-01-task-dataclass"],
+    "tags": ["roadmap-01", "schema", "loaders"],
+    "context": {
+        "relevant": [
+            "docs/task-schema.md",
+            "src/flywheel/__init__.py",
+            "tasks/roadmap-01/roadmap-01-task-dataclass.json"
+        ],
+        "constraints": [
+            "Loaders are optional conveniences — direct dataclass construction must remain unchanged and equally supported.",
+            "Each loader must call `Task.validate()` on every produced instance before returning it; loaders must never yield un-validated Tasks.",
+            "Loaders must not extend the `Task` schema with input-format-specific fields."
+        ],
+        "non_goals": [
+            "Persistence/store interfaces (later roadmap items).",
+            "Auto-discovery beyond the three loader entry points (no recursion into subdirectories unless trivially free)."
+        ],
+        "edge_cases": [
+            "Directory loader encounters non-`.json` entries alongside valid files.",
+            "JSONL loader handles blank lines, trailing newlines, and comment-like junk without producing empty Tasks.",
+            "Malformed JSON in one file/line must produce an actionable error identifying the offending source rather than a bare parser traceback.",
+            "Empty directory and empty JSONL stream are valid inputs that produce zero Tasks."
+        ]
+    },
+    "graders": [
+        { "type": "command", "run": "uv run pytest", "name": "tests" },
+        {
+            "type": "rubric",
+            "assertions": [
+                "Direct `Task(...)` construction still works without invoking any loader, and the dataclass module remains free of file/stream imports.",
+                "Each of the three loaders (single JSON file, directory of JSONs, JSONL) is exercised by tests against both well-formed and malformed inputs.",
+                "Malformed inputs surface errors that name the offending file path or JSONL line number, not just the raw exception."
+            ],
+            "name": "loader-contract"
+        }
+    ]
+}

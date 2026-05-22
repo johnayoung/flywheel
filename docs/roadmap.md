@@ -8,7 +8,7 @@ Path to parity with the prior Go implementation. Each task says what, not how �
 4. **SQLite store.** _Done._ Same contracts, backed by [persistence-schema.sql](persistence-schema.sql). WAL, foreign keys on, optimistic concurrency on `version`.
 5. **Iteration envelope parser.** _Done._ Extract and validate `<!-- LOOP_STATUS -->` JSON; treat malformed / missing / duplicate / truncated as first-class outcomes. Spec: [loop.md](loop.md).
 6. **Claude invoker.** _Done._ Thin adapter over `claude-agent-sdk` that drives one iteration and returns transcript, envelope, and SDK signals.
-7. **Prompt builder.** Per-iteration prompt from task + lifecycle state + envelope contract.
+7. **Prompt builder.** _Done._ Per-iteration prompt from task + lifecycle state + envelope contract.
 8. **Command grader runner.** Run `command` graders in list order; persist each execution to `grader_results` with a `grader_spec_json` snapshot and a structured `payload_json` per the schema contract.
 9. **Transcript grader enforcement.** Apply `transcript` graders (`max_turns`, `max_total_tokens`, `max_wall_seconds`) as hard limits during the run and as graders at validation time; persist to `grader_results` with observed-vs-breached payload.
 10. **Harness.** Wire it together: invoke → envelope → intent → run graders on-completed → record attempt (with `agent_context`) → apply retry policy → transition. Owns all lifecycle transitions and per-attempt artifact dirs. Spec: [loop.md](loop.md).

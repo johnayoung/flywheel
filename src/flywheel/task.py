@@ -1,24 +1,73 @@
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import uuid4
-
-KNOWN_GRADER_TYPES: tuple[str, ...] = ("command", "rubric", "manual", "transcript")
 
 
 class ValidationError(ValueError):
-    """Raised by Task.validate() when a task violates docs/task-schema.md."""
+    """Raised when a task or grader violates docs/task-schema.md."""
 
 
-@dataclass
-class Grader:
-    type: str
+@dataclass(kw_only=True)
+class CommandGrader:
+    run: str
     name: str | None = None
-    run: str | None = None
-    assertions: list[str] | None = None
+    type: Literal["command"] = "command"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run, str) or not self.run:
+            raise ValidationError("command grader requires a non-empty 'run'")
+
+
+@dataclass(kw_only=True)
+class RubricGrader:
+    assertions: list[str]
     rubric: str | None = None
-    instruction: str | None = None
+    name: str | None = None
+    type: Literal["rubric"] = "rubric"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.assertions, list) or len(self.assertions) == 0:
+            raise ValidationError(
+                "rubric grader requires a non-empty 'assertions' list"
+            )
+
+
+@dataclass(kw_only=True)
+class ManualGrader:
+    instruction: str
+    name: str | None = None
+    type: Literal["manual"] = "manual"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instruction, str) or not self.instruction:
+            raise ValidationError(
+                "manual grader requires a non-empty 'instruction'"
+            )
+
+
+@dataclass(kw_only=True)
+class TranscriptGrader:
     max_turns: int | None = None
     max_total_tokens: int | None = None
     max_wall_seconds: float | None = None
+    name: str | None = None
+    type: Literal["transcript"] = "transcript"
+
+    def __post_init__(self) -> None:
+        if (
+            self.max_turns is None
+            and self.max_total_tokens is None
+            and self.max_wall_seconds is None
+        ):
+            raise ValidationError(
+                "transcript grader requires at least one of "
+                "max_turns, max_total_tokens, max_wall_seconds"
+            )
+
+
+Grader = CommandGrader | RubricGrader | ManualGrader | TranscriptGrader
+
+KNOWN_GRADER_TYPES: tuple[str, ...] = ("command", "rubric", "manual", "transcript")
 
 
 @dataclass
@@ -59,41 +108,4 @@ class Task:
         if self.id in self.prerequisites:
             raise ValidationError(
                 f"prerequisites must not reference the task's own id {self.id!r}"
-            )
-
-        for idx, grader in enumerate(self.graders):
-            _validate_grader(grader, idx)
-
-
-def _validate_grader(grader: Grader, idx: int) -> None:
-    if grader.type not in KNOWN_GRADER_TYPES:
-        raise ValidationError(
-            f"graders[{idx}] has unknown type {grader.type!r}; "
-            f"expected one of {KNOWN_GRADER_TYPES}"
-        )
-
-    if grader.type == "command":
-        if not grader.run:
-            raise ValidationError(
-                f"graders[{idx}] (command) requires a non-empty 'run'"
-            )
-    elif grader.type == "rubric":
-        if not grader.assertions:
-            raise ValidationError(
-                f"graders[{idx}] (rubric) requires a non-empty 'assertions' list"
-            )
-    elif grader.type == "manual":
-        if not grader.instruction:
-            raise ValidationError(
-                f"graders[{idx}] (manual) requires a non-empty 'instruction'"
-            )
-    elif grader.type == "transcript":
-        if (
-            grader.max_turns is None
-            and grader.max_total_tokens is None
-            and grader.max_wall_seconds is None
-        ):
-            raise ValidationError(
-                f"graders[{idx}] (transcript) requires at least one of "
-                f"max_turns, max_total_tokens, max_wall_seconds"
             )

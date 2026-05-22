@@ -5,8 +5,12 @@ from pathlib import Path
 import pytest
 
 from flywheel import (
+    CommandGrader,
+    ManualGrader,
+    RubricGrader,
     Task,
     TaskLoadError,
+    TranscriptGrader,
     load_task_directory,
     load_task_file,
     load_tasks_jsonl,
@@ -54,7 +58,44 @@ def test_load_task_file_returns_validated_task(tmp_path: Path) -> None:
     assert isinstance(task, Task)
     assert task.id == "demo"
     assert task.goal == "Demo goal."
+    assert isinstance(task.graders[0], CommandGrader)
     assert task.graders[0].type == "command"
+
+
+def test_load_task_file_dispatches_each_grader_variant(tmp_path: Path) -> None:
+    p = tmp_path / "full.json"
+    p.write_text(json.dumps(_fully_briefed()))
+    task = load_task_file(p)
+    assert isinstance(task.graders[0], CommandGrader)
+    assert isinstance(task.graders[1], RubricGrader)
+    assert isinstance(task.graders[2], TranscriptGrader)
+    assert isinstance(task.graders[3], ManualGrader)
+    assert task.graders[0].run == "true"
+    assert task.graders[1].assertions == ["does the thing"]
+    assert task.graders[2].max_turns == 5
+    assert task.graders[3].instruction == "check it"
+
+
+def test_load_task_file_unknown_grader_type_names_index(tmp_path: Path) -> None:
+    payload = {**_well_formed(), "graders": [{"type": "bogus", "run": "x"}]}
+    p = tmp_path / "bad-type.json"
+    p.write_text(json.dumps(payload))
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_file(p)
+    msg = str(exc.value)
+    assert "graders[0]" in msg
+    assert "unknown type" in msg
+
+
+def test_load_task_file_grader_field_violation_names_index(tmp_path: Path) -> None:
+    payload = {**_well_formed(), "graders": [{"type": "command"}]}
+    p = tmp_path / "bad-grader.json"
+    p.write_text(json.dumps(payload))
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_file(p)
+    msg = str(exc.value)
+    assert "graders[0]" in msg
+    assert "command" in msg
 
 
 def test_load_task_file_handles_fully_briefed_task(tmp_path: Path) -> None:
@@ -252,11 +293,11 @@ def test_load_tasks_jsonl_stream_without_name_uses_stream_label() -> None:
 
 def test_direct_task_construction_remains_unchanged() -> None:
     # No loader involvement; identical to roadmap-01-task-dataclass behavior.
-    from flywheel import Context, Grader
+    from flywheel import Context
 
     task = Task(
         goal="Direct.",
-        graders=[Grader(type="command", run="true")],
+        graders=[CommandGrader(run="true")],
         context=Context(relevant=["src/foo.py"]),
     )
     task.validate()

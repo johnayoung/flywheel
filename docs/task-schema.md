@@ -41,6 +41,8 @@ A bundle of optional briefing fields. Provide none, one, or all. Use these to gi
 
 Each entry in `graders` is a typed object. The `type` field selects which other fields apply. A task is `done` only when every grader passes. Graders are binary — no partial credit, no weights.
 
+In Python, `Grader` is a discriminated union of `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at construction, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON shape is unchanged: loaders dispatch on `type` to build the right variant.
+
 The harness runs graders cost-cheapest-first: `command` → `transcript` → `rubric` → `manual`. Within a type, list order is respected. A failure inside one type aborts the rest of that type and skips later (more expensive) types.
 
 ### `command` — deterministic shell check

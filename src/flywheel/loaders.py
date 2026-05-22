@@ -5,7 +5,16 @@ import os
 from pathlib import Path
 from typing import IO, Any
 
-from flywheel.task import Context, Grader, Task, ValidationError
+from flywheel.task import (
+    CommandGrader,
+    Context,
+    Grader,
+    ManualGrader,
+    RubricGrader,
+    Task,
+    TranscriptGrader,
+    ValidationError,
+)
 
 
 class TaskLoadError(ValueError):
@@ -80,6 +89,43 @@ def load_tasks_jsonl(source: str | os.PathLike[str] | IO[str]) -> list[Task]:
     return tasks
 
 
+def _build_grader(entry: dict[str, Any], source: str, idx: int) -> Grader:
+    grader_type = entry.get("type")
+    common = {"name": entry.get("name")}
+    try:
+        if grader_type == "command":
+            return CommandGrader(run=entry.get("run", ""), **common)
+        if grader_type == "rubric":
+            return RubricGrader(
+                assertions=entry.get("assertions") or [],
+                rubric=entry.get("rubric"),
+                **common,
+            )
+        if grader_type == "manual":
+            return ManualGrader(
+                instruction=entry.get("instruction", ""),
+                **common,
+            )
+        if grader_type == "transcript":
+            return TranscriptGrader(
+                max_turns=entry.get("max_turns"),
+                max_total_tokens=entry.get("max_total_tokens"),
+                max_wall_seconds=entry.get("max_wall_seconds"),
+                **common,
+            )
+    except ValidationError as exc:
+        raise TaskLoadError(f"{source}: graders[{idx}] {exc}") from exc
+    except TypeError as exc:
+        raise TaskLoadError(
+            f"{source}: graders[{idx}] cannot construct grader: {exc}"
+        ) from exc
+
+    raise TaskLoadError(
+        f"{source}: graders[{idx}] has unknown type {grader_type!r}; "
+        f"expected one of ('command', 'rubric', 'manual', 'transcript')"
+    )
+
+
 def _task_from_dict(data: Any, source: str) -> Task:
     if not isinstance(data, dict):
         raise TaskLoadError(
@@ -112,19 +158,7 @@ def _task_from_dict(data: Any, source: str) -> Task:
                 f"{source}: graders[{idx}] must be an object, "
                 f"got {type(entry).__name__}"
             )
-        graders.append(
-            Grader(
-                type=entry.get("type"),  # type: ignore[arg-type]
-                name=entry.get("name"),
-                run=entry.get("run"),
-                assertions=entry.get("assertions"),
-                rubric=entry.get("rubric"),
-                instruction=entry.get("instruction"),
-                max_turns=entry.get("max_turns"),
-                max_total_tokens=entry.get("max_total_tokens"),
-                max_wall_seconds=entry.get("max_wall_seconds"),
-            )
-        )
+        graders.append(_build_grader(entry, source, idx))
 
     kwargs: dict[str, Any] = {
         "goal": data.get("goal", ""),

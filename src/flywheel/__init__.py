@@ -11,6 +11,7 @@ from flywheel.loaders import (
     load_task_file,
     load_tasks_jsonl,
 )
+from flywheel.store_memory import InMemoryStore
 from flywheel.store_protocols import (
     AgentSessionStore,
     AttemptStore,
@@ -56,6 +57,7 @@ __all__ = [
     "GraderResultRecord",
     "GraderResultStore",
     "GraderType",
+    "InMemoryStore",
     "KNOWN_GRADER_TYPES",
     "Lifecycle",
     "LifecycleAlreadyExistsError",

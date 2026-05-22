@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from uuid import uuid4
 
@@ -25,6 +25,32 @@ class Outcome(str, Enum):
 
 class LifecycleTransitionError(ValueError):
     """Raised when a Lifecycle transition violates docs/task-lifecycle.md."""
+
+
+_VALID_EDGES: dict[Status, frozenset[Status]] = {
+    Status.PENDING: frozenset({Status.READY}),
+    Status.READY: frozenset({Status.RUNNING}),
+    Status.RUNNING: frozenset(
+        {Status.VALIDATING, Status.FAILED, Status.INTERRUPTED}
+    ),
+    Status.VALIDATING: frozenset({Status.DONE, Status.FAILED_VALIDATION}),
+    Status.FAILED_VALIDATION: frozenset({Status.READY, Status.FAILED}),
+    Status.INTERRUPTED: frozenset({Status.READY}),
+    Status.DONE: frozenset(),
+    Status.FAILED: frozenset(),
+}
+
+_REQUIRES_ERROR: frozenset[Status] = frozenset(
+    {Status.FAILED, Status.FAILED_VALIDATION}
+)
+
+_FAILED_OUTCOMES: frozenset[Outcome] = frozenset(
+    {Outcome.VALIDATION_FAILED, Outcome.AGENT_ERROR, Outcome.INTERNAL_ERROR}
+)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _default_run_id() -> str:
@@ -57,3 +83,53 @@ class Lifecycle:
     attempts: list[Attempt] = field(default_factory=list)
     session_id: str = ""
     artifacts_dir: str = ""
+
+    def transition_to(
+        self,
+        target: Status,
+        *,
+        error: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        allowed = _VALID_EDGES.get(self.status, frozenset())
+        if target not in allowed:
+            raise LifecycleTransitionError(
+                f"illegal transition {self.status.value} -> {target.value}"
+            )
+        if target in _REQUIRES_ERROR and not error:
+            raise LifecycleTransitionError(
+                f"transition to {target.value} requires a non-empty error"
+            )
+        is_retry_edge = (
+            self.status == Status.FAILED_VALIDATION and target == Status.READY
+        )
+        self.status = target
+        self.timestamps[target] = now if now is not None else _utcnow()
+        self.version += 1
+        if is_retry_edge:
+            self.retries += 1
+            self.error = ""
+        elif error:
+            self.error = error
+
+    def is_retry_eligible(self, max_retries: int) -> bool:
+        return (
+            self.status == Status.FAILED_VALIDATION
+            and self.retries < max_retries
+        )
+
+    def consecutive_failed_runs(self) -> int:
+        if not self.attempts:
+            return 0
+        tail = self.attempts[-1]
+        if tail.outcome not in _FAILED_OUTCOMES:
+            return 0
+        target_run_id = tail.run_id
+        count = 0
+        for attempt in reversed(self.attempts):
+            if attempt.run_id != target_run_id:
+                break
+            if attempt.outcome not in _FAILED_OUTCOMES:
+                break
+            count += 1
+        return count

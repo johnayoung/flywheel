@@ -24,6 +24,14 @@ from flywheel.grader_transcript import (
     run_transcript_graders,
     total_tokens_from_usage,
 )
+from flywheel.harness import (
+    HarnessConfig,
+    HarnessOutcome,
+    HarnessStore,
+    InvocationRequest,
+    InvokeFunc,
+    run_task,
+)
 from flywheel.invoker import (
     InvocationFailure,
     InvocationSignals,
@@ -98,10 +106,15 @@ __all__ = [
     "GraderResultRecord",
     "GraderResultStore",
     "GraderType",
+    "HarnessConfig",
+    "HarnessOutcome",
+    "HarnessStore",
     "InMemoryStore",
     "Intent",
     "InvocationFailure",
+    "InvocationRequest",
     "InvocationSignals",
+    "InvokeFunc",
     "IterationInputs",
     "IterationResult",
     "KNOWN_GRADER_TYPES",
@@ -141,6 +154,7 @@ __all__ = [
     "load_tasks_jsonl",
     "parse_envelope",
     "run_command_graders",
+    "run_task",
     "run_transcript_graders",
     "total_tokens_from_usage",
 ]

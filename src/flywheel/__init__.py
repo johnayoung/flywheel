@@ -32,6 +32,7 @@ from flywheel.loaders import (
     load_task_file,
     load_tasks_jsonl,
 )
+from flywheel.prompt import IterationInputs, build_iteration_prompt
 from flywheel.store_memory import InMemoryStore
 from flywheel.store_sqlite import SqliteStore
 from flywheel.store_protocols import (
@@ -86,6 +87,7 @@ __all__ = [
     "Intent",
     "InvocationFailure",
     "InvocationSignals",
+    "IterationInputs",
     "IterationResult",
     "KNOWN_GRADER_TYPES",
     "Lifecycle",
@@ -112,6 +114,7 @@ __all__ = [
     "VALID_INTENTS",
     "ValidEnvelope",
     "ValidationError",
+    "build_iteration_prompt",
     "hello",
     "invoke_iteration",
     "load_task_directory",

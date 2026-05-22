@@ -12,6 +12,7 @@ from flywheel.loaders import (
     load_tasks_jsonl,
 )
 from flywheel.store_memory import InMemoryStore
+from flywheel.store_sqlite import SqliteStore
 from flywheel.store_protocols import (
     AgentSessionStore,
     AttemptStore,
@@ -68,6 +69,7 @@ __all__ = [
     "OptimisticConcurrencyError",
     "Outcome",
     "RubricGrader",
+    "SqliteStore",
     "Status",
     "StoreConflictError",
     "Task",

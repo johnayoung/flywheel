@@ -146,12 +146,6 @@ class SqliteStore:
     def close(self) -> None:
         self._connection.close()
 
-    def __enter__(self) -> SqliteStore:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
     # --- LifecycleStore ---------------------------------------------------
 
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:

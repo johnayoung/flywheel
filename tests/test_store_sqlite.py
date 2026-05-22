@@ -340,7 +340,10 @@ def test_session_entries_listed_in_seq_order_for_tuple_keying(
                 )
             )
         listed = store.list_session_entries("p", "s")
-        seqs = [e.seq for e in listed]
+        seqs: list[int] = []
+        for e in listed:
+            assert e.seq is not None
+            seqs.append(e.seq)
         assert seqs == sorted(seqs)
         assert [e.entry for e in listed] == ["e0", "e1", "e2", "e3", "e4"]
     finally:

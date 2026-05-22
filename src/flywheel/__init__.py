@@ -11,6 +11,10 @@ from flywheel.envelope import (
     ValidEnvelope,
     parse_envelope,
 )
+from flywheel.grader_command import (
+    DEFAULT_TAIL_BYTES,
+    run_command_graders,
+)
 from flywheel.invoker import (
     InvocationFailure,
     InvocationSignals,
@@ -75,6 +79,7 @@ __all__ = [
     "ClaudeSessionEntry",
     "CommandGrader",
     "Context",
+    "DEFAULT_TAIL_BYTES",
     "DuplicateEnvelope",
     "EnvelopeResult",
     "EventRecord",
@@ -121,4 +126,5 @@ __all__ = [
     "load_task_file",
     "load_tasks_jsonl",
     "parse_envelope",
+    "run_command_graders",
 ]

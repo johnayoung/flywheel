@@ -91,27 +91,27 @@ def load_tasks_jsonl(source: str | os.PathLike[str] | IO[str]) -> list[Task]:
 
 def _build_grader(entry: dict[str, Any], source: str, idx: int) -> Grader:
     grader_type = entry.get("type")
-    common = {"name": entry.get("name")}
+    name = entry.get("name")
     try:
         if grader_type == "command":
-            return CommandGrader(run=entry.get("run", ""), **common)
+            return CommandGrader(run=entry.get("run", ""), name=name)
         if grader_type == "rubric":
             return RubricGrader(
                 assertions=entry.get("assertions") or [],
                 rubric=entry.get("rubric"),
-                **common,
+                name=name,
             )
         if grader_type == "manual":
             return ManualGrader(
                 instruction=entry.get("instruction", ""),
-                **common,
+                name=name,
             )
         if grader_type == "transcript":
             return TranscriptGrader(
                 max_turns=entry.get("max_turns"),
                 max_total_tokens=entry.get("max_total_tokens"),
                 max_wall_seconds=entry.get("max_wall_seconds"),
-                **common,
+                name=name,
             )
     except ValidationError as exc:
         raise TaskLoadError(f"{source}: graders[{idx}] {exc}") from exc

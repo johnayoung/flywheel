@@ -3,7 +3,7 @@
 Path to parity with the prior Go implementation. Each task says what, not how — implementation is the agent's call. Order is dependency-driven; each item can be done with only prior items complete.
 
 1. **Task schema + loaders.** _Done._ `Task` dataclass with `validate()`; `load_task_file` / `load_task_directory` / `load_tasks_jsonl` exported from `flywheel`. Spec: [task-schema.md](task-schema.md).
-2. **Lifecycle state machine.** `Lifecycle`, `Attempt`, status enum, transition rules, retry eligibility, consecutive-failed-runs counter. Spec: [task-lifecycle.md](task-lifecycle.md).
+2. **Lifecycle state machine.** _Done._ `Lifecycle`, `Attempt`, status enum, transition rules, retry eligibility, consecutive-failed-runs counter. Spec: [task-lifecycle.md](task-lifecycle.md).
 3. **Store interfaces + in-memory impl.** Persistence contracts for lifecycle / attempt / event / grader-result / agent-session, with an in-memory implementation for tests.
 4. **SQLite store.** Same contracts, backed by [persistence-schema.sql](persistence-schema.sql). WAL, foreign keys on, optimistic concurrency on `version`.
 5. **Iteration envelope parser.** Extract and validate `<!-- LOOP_STATUS -->` JSON; treat malformed / missing / duplicate / truncated as first-class outcomes. Spec: [loop.md](loop.md).

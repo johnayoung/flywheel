@@ -15,6 +15,15 @@ from flywheel.grader_command import (
     DEFAULT_TAIL_BYTES,
     run_command_graders,
 )
+from flywheel.grader_transcript import (
+    BreachedField,
+    TranscriptCounter,
+    TranscriptObservation,
+    enforce_transcript_limits,
+    first_breach,
+    run_transcript_graders,
+    total_tokens_from_usage,
+)
 from flywheel.invoker import (
     InvocationFailure,
     InvocationSignals,
@@ -75,6 +84,7 @@ __all__ = [
     "AgentSessionStore",
     "Attempt",
     "AttemptStore",
+    "BreachedField",
     "CLOSING_FENCE",
     "ClaudeSessionEntry",
     "CommandGrader",
@@ -114,12 +124,16 @@ __all__ = [
     "TaskLoadError",
     "ToolInteraction",
     "ToolResultObservation",
+    "TranscriptCounter",
     "TranscriptGrader",
+    "TranscriptObservation",
     "TruncatedEnvelope",
     "VALID_INTENTS",
     "ValidEnvelope",
     "ValidationError",
     "build_iteration_prompt",
+    "enforce_transcript_limits",
+    "first_breach",
     "hello",
     "invoke_iteration",
     "load_task_directory",
@@ -127,4 +141,6 @@ __all__ = [
     "load_tasks_jsonl",
     "parse_envelope",
     "run_command_graders",
+    "run_transcript_graders",
+    "total_tokens_from_usage",
 ]

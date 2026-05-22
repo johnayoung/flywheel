@@ -1,0 +1,437 @@
+"""Contract tests for the Claude invoker.
+
+The invoker is a thin adapter over ``claude-agent-sdk`` — these tests
+inject a fake message stream rather than spawning a live subprocess, so
+they exercise the invoker's return shape and signal-extraction behavior
+without depending on the CLI being installed or authenticated.
+"""
+
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    Message,
+    ProcessError,
+    RateLimitEvent,
+    RateLimitInfo,
+    ResultMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+
+from flywheel.envelope import (
+    CLOSING_FENCE,
+    OPENING_FENCE,
+    Intent,
+    MissingEnvelope,
+    TruncatedEnvelope,
+    ValidEnvelope,
+)
+from flywheel.invoker import (
+    InvocationSignals,
+    IterationResult,
+    ToolInteraction,
+    ToolResultObservation,
+    invoke_iteration,
+)
+
+
+def _wrap_envelope(payload: str) -> str:
+    return f"{OPENING_FENCE}\n{payload}\n{CLOSING_FENCE}"
+
+
+async def _stream(*items: Message) -> AsyncIterator[Message]:
+    for item in items:
+        yield item
+
+
+def _run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+def _result(
+    *,
+    is_error: bool = False,
+    num_turns: int = 1,
+    total_cost_usd: float | None = 0.01,
+    stop_reason: str | None = "end_turn",
+    permission_denials: list[Any] | None = None,
+    api_error_status: int | None = None,
+    result_text: str | None = None,
+    subtype: str = "success",
+    session_id: str = "sess-1",
+) -> ResultMessage:
+    return ResultMessage(
+        subtype=subtype,
+        duration_ms=10,
+        duration_api_ms=8,
+        is_error=is_error,
+        num_turns=num_turns,
+        session_id=session_id,
+        stop_reason=stop_reason,
+        total_cost_usd=total_cost_usd,
+        permission_denials=permission_denials,
+        api_error_status=api_error_status,
+        result=result_text,
+    )
+
+
+def _assistant(
+    *blocks: TextBlock | ToolUseBlock | ThinkingBlock,
+    stop_reason: str | None = "end_turn",
+    session_id: str = "sess-1",
+    model: str = "claude-test",
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=list(blocks),
+        model=model,
+        stop_reason=stop_reason,
+        session_id=session_id,
+    )
+
+
+def _user_with_tool_result(
+    tool_use_id: str,
+    *,
+    is_error: bool | None = False,
+    content: str | list[dict[str, Any]] | None = "ok",
+) -> UserMessage:
+    block = ToolResultBlock(
+        tool_use_id=tool_use_id,
+        content=content,
+        is_error=is_error,
+    )
+    return UserMessage(content=[block])
+
+
+class TestValidEnvelopeAndSignals:
+    def test_valid_envelope_and_basic_signals_surface(self) -> None:
+        transcript = _wrap_envelope('{"intent": "verify", "reason": "ready"}')
+        stream = _stream(
+            _assistant(TextBlock(text=transcript)),
+            _result(num_turns=3, total_cost_usd=0.12),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+
+        assert isinstance(result, IterationResult)
+        assert isinstance(result.envelope, ValidEnvelope)
+        assert result.envelope.intent is Intent.VERIFY
+        assert result.transcript == transcript
+        assert result.failure is None
+        assert result.signals.num_turns == 3
+        assert result.signals.total_cost_usd == 0.12
+        assert result.signals.result_is_error is False
+        assert result.signals.stop_reason == "end_turn"
+        assert result.signals.session_id == "sess-1"
+        assert result.signals.pending_tool_use_at_stop is False
+
+    def test_transcript_falls_back_to_result_text_when_no_text_blocks(
+        self,
+    ) -> None:
+        transcript = _wrap_envelope('{"intent": "continue"}')
+        stream = _stream(_result(result_text=transcript))
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert result.transcript == transcript
+        assert isinstance(result.envelope, ValidEnvelope)
+        assert result.envelope.intent is Intent.CONTINUE
+
+
+class TestEnvelopeOutcomes:
+    def test_missing_envelope_when_no_text_emitted(self) -> None:
+        stream = _stream(_result())
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert isinstance(result.envelope, MissingEnvelope)
+        assert result.transcript == ""
+
+    def test_truncated_envelope_surfaced(self) -> None:
+        transcript = f'{OPENING_FENCE}\n{{"intent": "continue"'
+        stream = _stream(
+            _assistant(TextBlock(text=transcript)),
+            _result(),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert isinstance(result.envelope, TruncatedEnvelope)
+
+
+class TestToolInteractions:
+    def test_tool_use_paired_with_tool_result(self) -> None:
+        transcript = _wrap_envelope('{"intent": "verify"}')
+        tool_use = ToolUseBlock(
+            id="tu-1", name="Bash", input={"command": "ls"}
+        )
+        stream = _stream(
+            _assistant(tool_use, stop_reason="tool_use"),
+            _user_with_tool_result("tu-1", is_error=False, content="ok"),
+            _assistant(TextBlock(text=transcript)),
+            _result(num_turns=2),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+
+        assert result.signals.tool_interactions == (
+            ToolInteraction(
+                tool_use_id="tu-1",
+                tool_name="Bash",
+                tool_input={"command": "ls"},
+                result=ToolResultObservation(
+                    tool_use_id="tu-1", is_error=False, content="ok"
+                ),
+            ),
+        )
+        assert len(result.signals.tool_result_blocks) == 1
+        assert result.signals.tool_result_blocks[0].is_error is False
+        assert result.signals.pending_tool_use_at_stop is False
+
+    def test_pending_tool_use_when_no_matching_result(self) -> None:
+        tool_use = ToolUseBlock(
+            id="tu-orphan", name="Bash", input={"command": "noop"}
+        )
+        stream = _stream(
+            _assistant(tool_use, stop_reason="end_turn"),
+            _result(stop_reason="end_turn"),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert result.signals.pending_tool_use_at_stop is True
+        interaction = result.signals.tool_interactions[0]
+        assert interaction.tool_use_id == "tu-orphan"
+        assert interaction.result is None
+
+    def test_tool_result_is_error_repeats_observable(self) -> None:
+        stream = _stream(
+            _assistant(
+                ToolUseBlock(id="tu-1", name="Bash", input={"command": "x"}),
+                stop_reason="tool_use",
+            ),
+            _user_with_tool_result("tu-1", is_error=True, content="boom"),
+            _assistant(
+                ToolUseBlock(id="tu-2", name="Bash", input={"command": "x"}),
+                stop_reason="tool_use",
+            ),
+            _user_with_tool_result("tu-2", is_error=True, content="boom"),
+            _result(num_turns=4),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        errored = [
+            obs for obs in result.signals.tool_result_blocks if obs.is_error
+        ]
+        assert len(errored) == 2
+
+
+class TestRateLimitSignals:
+    def test_rate_limit_event_surfaced_without_internal_retry(self) -> None:
+        info = RateLimitInfo(
+            status="allowed_warning",
+            resets_at=1_700_000_000,
+            rate_limit_type="five_hour",
+            utilization=0.92,
+        )
+        event = RateLimitEvent(
+            rate_limit_info=info, uuid="rl-1", session_id="sess-1"
+        )
+        transcript = _wrap_envelope('{"intent": "continue"}')
+        stream = _stream(
+            event,
+            _assistant(TextBlock(text=transcript)),
+            _result(),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert result.signals.rate_limit_events == (event,)
+        assert (
+            result.signals.rate_limit_events[0].rate_limit_info.resets_at
+            == 1_700_000_000
+        )
+        assert result.failure is None
+
+
+class TestPermissionDenials:
+    def test_permission_denials_surfaced_as_structured_signal(self) -> None:
+        denials = [
+            {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
+            {"tool_name": "WebFetch", "tool_input": {"url": "http://x"}},
+        ]
+        stream = _stream(
+            _assistant(TextBlock(text=_wrap_envelope('{"intent": "abort"}'))),
+            _result(permission_denials=denials),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        assert result.signals.permission_denials == tuple(denials)
+
+
+class TestFailureSurfacing:
+    def test_process_error_surfaces_exit_code_and_stderr(self) -> None:
+        async def stream() -> AsyncIterator[Message]:
+            yield _assistant(TextBlock(text="partial output"))
+            raise ProcessError(
+                "claude exited non-zero", exit_code=137, stderr="oom"
+            )
+
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream())
+        )
+        assert result.failure is not None
+        assert result.failure.error_type == "ProcessError"
+        assert result.failure.exit_code == 137
+        assert result.failure.stderr == "oom"
+        assert isinstance(result.envelope, MissingEnvelope)
+        assert result.transcript == "partial output"
+
+    def test_non_zero_exit_with_partial_envelope_keeps_parser_verdict(
+        self,
+    ) -> None:
+        partial = f'{OPENING_FENCE}\n{{"intent": "continue"'
+
+        async def stream() -> AsyncIterator[Message]:
+            yield _assistant(TextBlock(text=partial))
+            raise ProcessError("died mid-envelope", exit_code=1)
+
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream())
+        )
+        assert isinstance(result.envelope, TruncatedEnvelope)
+        assert result.failure is not None
+        assert result.failure.exit_code == 1
+
+    def test_generic_iterator_error_surfaced_without_classification(
+        self,
+    ) -> None:
+        async def stream() -> AsyncIterator[Message]:
+            yield _assistant(TextBlock(text="before crash"))
+            raise RuntimeError("transport died")
+
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream())
+        )
+        assert result.failure is not None
+        assert result.failure.error_type == "RuntimeError"
+        assert result.failure.message == "transport died"
+        assert result.failure.exit_code is None
+        assert result.failure.stderr is None
+
+
+class TestSdkSignalCoverage:
+    """Every SDK surface in the docs/loop.md detection map must be reachable."""
+
+    def test_all_detection_map_signals_surface_in_one_iteration(self) -> None:
+        rate_event = RateLimitEvent(
+            rate_limit_info=RateLimitInfo(status="allowed"),
+            uuid="rl-1",
+            session_id="sess-1",
+        )
+        denials: list[Any] = [{"tool_name": "Bash"}]
+        transcript = _wrap_envelope('{"intent": "verify"}')
+
+        stream = _stream(
+            rate_event,
+            _assistant(
+                ToolUseBlock(id="tu-1", name="Read", input={"path": "a"}),
+                stop_reason="tool_use",
+            ),
+            _user_with_tool_result("tu-1", is_error=False, content="ok"),
+            _assistant(TextBlock(text=transcript), stop_reason="end_turn"),
+            _result(
+                num_turns=2,
+                total_cost_usd=0.05,
+                permission_denials=denials,
+                api_error_status=None,
+            ),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=stream)
+        )
+        signals = result.signals
+
+        assert isinstance(signals, InvocationSignals)
+        # StopReason
+        assert signals.stop_reason == "end_turn"
+        # PostToolUse-equivalent (paired tool use + result)
+        assert signals.tool_interactions
+        assert signals.tool_interactions[0].tool_name == "Read"
+        # ToolResultBlock.IsError
+        assert signals.tool_result_blocks
+        assert signals.tool_result_blocks[0].is_error is False
+        # ResultMessage.IsError
+        assert signals.result_is_error is False
+        # NumTurns
+        assert signals.num_turns == 2
+        # TotalCostUSD
+        assert signals.total_cost_usd == 0.05
+        # RateLimitEvent
+        assert signals.rate_limit_events == (rate_event,)
+        # PermissionDenials
+        assert signals.permission_denials == tuple(denials)
+
+
+class TestInvokerScope:
+    def test_invoker_does_not_import_retry_lifecycle_or_grader_logic(self) -> None:
+        import ast
+        import inspect
+
+        import flywheel.invoker as invoker_module
+
+        source_path = inspect.getsourcefile(invoker_module)
+        assert source_path is not None
+        with open(source_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+
+        tree = ast.parse(source)
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+
+        # The invoker is a thin adapter — it must not reach into lifecycle
+        # transitions, persistence, prompt construction, grader runners, or
+        # task definitions. Those concerns are deferred to later roadmap
+        # items.
+        forbidden = {
+            "flywheel.lifecycle",
+            "flywheel.loaders",
+            "flywheel.store_memory",
+            "flywheel.store_sqlite",
+            "flywheel.store_protocols",
+            "flywheel.task",
+        }
+        leaked = imported & forbidden
+        assert not leaked, f"invoker leaked imports: {leaked}"
+
+    def test_invoker_delegates_envelope_parsing_to_parser_module(self) -> None:
+        import ast
+        import inspect
+
+        import flywheel.invoker as invoker_module
+
+        source_path = inspect.getsourcefile(invoker_module)
+        assert source_path is not None
+        with open(source_path, "r", encoding="utf-8") as fh:
+            source = fh.read()
+
+        tree = ast.parse(source)
+        delegates = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "flywheel.envelope":
+                for alias in node.names:
+                    if alias.name == "parse_envelope":
+                        delegates = True
+        assert delegates, "invoker must import parse_envelope from flywheel.envelope"

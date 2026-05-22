@@ -1,0 +1,307 @@
+"""Thin adapter over ``claude-agent-sdk`` that drives one agent iteration.
+
+The invoker owns nothing else. It does not enforce retry policy, mutate
+lifecycle state, run graders, or construct prompts — each of those belongs
+to a separate roadmap item. Its single responsibility is to turn one call
+into one iteration and surface every SDK signal enumerated in
+``docs/loop.md``'s state-detection map so the harness never has to re-parse
+raw messages.
+
+Envelope extraction delegates entirely to :func:`flywheel.envelope.parse_envelope`.
+"""
+
+from collections.abc import AsyncIterable
+from dataclasses import dataclass, field
+from typing import Any
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKError,
+    HookEventMessage,
+    Message,
+    ProcessError,
+    RateLimitEvent,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
+from claude_agent_sdk import query as _sdk_query
+
+from flywheel.envelope import EnvelopeResult, parse_envelope
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolResultObservation:
+    """One ``ToolResultBlock`` observed in the stream.
+
+    Surfaced raw because the ``blocked_implicit`` counter in
+    ``docs/loop.md`` keys on ``ToolResultBlock.is_error == True`` repeats.
+    """
+
+    tool_use_id: str
+    is_error: bool | None
+    content: str | list[dict[str, Any]] | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class ToolInteraction:
+    """A ``ToolUseBlock`` paired with its matching ``ToolResultBlock``.
+
+    The harness keys ``blocked_implicit`` on ``(tool_name, sha256(input))``
+    and feeds thrash detection the same ``(tool, input)`` tuple — both need
+    name + input + outcome together, which this dataclass surfaces directly
+    without depending on the SDK's optional hook event stream.
+    """
+
+    tool_use_id: str
+    tool_name: str
+    tool_input: dict[str, Any]
+    result: ToolResultObservation | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class InvocationFailure:
+    """Iterator / subprocess failure captured without classification.
+
+    The harness — not the invoker — decides whether a given failure is
+    infrastructure, task, or protocol. The invoker surfaces the raw
+    evidence (exception type, message, exit code, stderr).
+    """
+
+    error_type: str
+    message: str
+    exit_code: int | None = None
+    stderr: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class InvocationSignals:
+    """Structured projection of one iteration's SDK signals.
+
+    Every surface listed in the ``docs/loop.md`` detection map is reachable
+    from here:
+
+    - ``StopReason`` -> :attr:`stop_reason`
+    - ``PostToolUse`` -> :attr:`tool_interactions` (and :attr:`hook_events`
+      when the caller enabled ``include_hook_events`` on the SDK options)
+    - ``ToolResultBlock.is_error`` -> :attr:`tool_result_blocks`
+    - ``ResultMessage.is_error`` -> :attr:`result_is_error`
+    - ``NumTurns`` -> :attr:`num_turns`
+    - ``TotalCostUSD`` -> :attr:`total_cost_usd`
+    - ``RateLimitEvent`` -> :attr:`rate_limit_events`
+    - ``ResultMessage.permission_denials`` -> :attr:`permission_denials`
+    """
+
+    stop_reason: str | None
+    num_turns: int | None
+    total_cost_usd: float | None
+    result_is_error: bool | None
+    result_subtype: str | None
+    api_error_status: int | None
+    session_id: str | None
+    permission_denials: tuple[Any, ...] = field(default_factory=tuple)
+    rate_limit_events: tuple[RateLimitEvent, ...] = field(default_factory=tuple)
+    tool_interactions: tuple[ToolInteraction, ...] = field(default_factory=tuple)
+    tool_result_blocks: tuple[ToolResultObservation, ...] = field(
+        default_factory=tuple
+    )
+    hook_events: tuple[HookEventMessage, ...] = field(default_factory=tuple)
+    pending_tool_use_at_stop: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class IterationResult:
+    """One iteration's transcript, envelope verdict, and structured signals.
+
+    ``failure`` is set when the SDK raised — non-zero exit, iterator error,
+    cancellation propagated as a regular exception. Even on failure the
+    other fields reflect whatever was observed before the failure,
+    including a ``parse_envelope`` verdict (typically
+    :class:`~flywheel.envelope.MissingEnvelope` or
+    :class:`~flywheel.envelope.TruncatedEnvelope`).
+    """
+
+    transcript: str
+    messages: tuple[Message, ...]
+    envelope: EnvelopeResult
+    signals: InvocationSignals
+    failure: InvocationFailure | None = None
+
+
+async def invoke_iteration(
+    *,
+    prompt: str,
+    options: ClaudeAgentOptions | None = None,
+    message_stream: AsyncIterable[Message] | None = None,
+) -> IterationResult:
+    """Drive exactly one agent iteration and return its structured result.
+
+    ``message_stream`` is the seam tests use to exercise the contract
+    without spawning a Claude subprocess — supply an ``AsyncIterable`` of
+    pre-built SDK messages and the invoker consumes it directly. When
+    omitted, the invoker delegates to :func:`claude_agent_sdk.query`.
+
+    The invoker drives exactly one iteration per call. Multi-iteration
+    orchestration belongs to the harness.
+    """
+
+    messages: list[Message] = []
+    transcript_chunks: list[str] = []
+    result_text: str | None = None
+
+    tool_uses: dict[str, ToolUseBlock] = {}
+    tool_use_order: list[str] = []
+    tool_results: dict[str, ToolResultObservation] = {}
+    tool_result_observations: list[ToolResultObservation] = []
+    rate_limit_events: list[RateLimitEvent] = []
+    hook_events: list[HookEventMessage] = []
+
+    last_assistant_stop_reason: str | None = None
+    result_stop_reason: str | None = None
+    num_turns: int | None = None
+    total_cost_usd: float | None = None
+    result_is_error: bool | None = None
+    result_subtype: str | None = None
+    api_error_status: int | None = None
+    session_id: str | None = None
+    permission_denials: list[Any] = []
+
+    failure: InvocationFailure | None = None
+
+    source: AsyncIterable[Message]
+    if message_stream is not None:
+        source = message_stream
+    else:
+        source = _sdk_query(prompt=prompt, options=options)
+
+    try:
+        async for msg in source:
+            messages.append(msg)
+
+            if isinstance(msg, AssistantMessage):
+                if msg.session_id is not None:
+                    session_id = msg.session_id
+                if msg.stop_reason is not None:
+                    last_assistant_stop_reason = msg.stop_reason
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        transcript_chunks.append(block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        if block.id not in tool_uses:
+                            tool_use_order.append(block.id)
+                        tool_uses[block.id] = block
+
+            elif isinstance(msg, UserMessage):
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if isinstance(block, ToolResultBlock):
+                            observation = ToolResultObservation(
+                                tool_use_id=block.tool_use_id,
+                                is_error=block.is_error,
+                                content=block.content,
+                            )
+                            tool_result_observations.append(observation)
+                            tool_results[block.tool_use_id] = observation
+
+            elif isinstance(msg, ResultMessage):
+                if msg.session_id:
+                    session_id = msg.session_id
+                num_turns = msg.num_turns
+                total_cost_usd = msg.total_cost_usd
+                result_is_error = msg.is_error
+                result_subtype = msg.subtype
+                api_error_status = msg.api_error_status
+                if msg.stop_reason is not None:
+                    result_stop_reason = msg.stop_reason
+                if msg.permission_denials:
+                    permission_denials.extend(msg.permission_denials)
+                if msg.result and not transcript_chunks:
+                    result_text = msg.result
+
+            elif isinstance(msg, RateLimitEvent):
+                rate_limit_events.append(msg)
+                if msg.session_id:
+                    session_id = msg.session_id
+
+            elif isinstance(msg, HookEventMessage):
+                hook_events.append(msg)
+                if msg.session_id:
+                    session_id = msg.session_id
+
+    except ProcessError as exc:
+        failure = InvocationFailure(
+            error_type=type(exc).__name__,
+            message=str(exc),
+            exit_code=exc.exit_code,
+            stderr=exc.stderr,
+        )
+    except ClaudeSDKError as exc:
+        failure = InvocationFailure(
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+    except Exception as exc:
+        failure = InvocationFailure(
+            error_type=type(exc).__name__,
+            message=str(exc),
+        )
+
+    if transcript_chunks:
+        transcript = "".join(transcript_chunks)
+    else:
+        transcript = result_text or ""
+
+    envelope = parse_envelope(transcript)
+
+    tool_interactions: list[ToolInteraction] = []
+    for tool_use_id in tool_use_order:
+        block = tool_uses[tool_use_id]
+        tool_interactions.append(
+            ToolInteraction(
+                tool_use_id=tool_use_id,
+                tool_name=block.name,
+                tool_input=block.input,
+                result=tool_results.get(tool_use_id),
+            )
+        )
+
+    pending_tool_use_at_stop = any(
+        tool_use_id not in tool_results for tool_use_id in tool_use_order
+    )
+
+    signals = InvocationSignals(
+        stop_reason=last_assistant_stop_reason or result_stop_reason,
+        num_turns=num_turns,
+        total_cost_usd=total_cost_usd,
+        result_is_error=result_is_error,
+        result_subtype=result_subtype,
+        api_error_status=api_error_status,
+        session_id=session_id,
+        permission_denials=tuple(permission_denials),
+        rate_limit_events=tuple(rate_limit_events),
+        tool_interactions=tuple(tool_interactions),
+        tool_result_blocks=tuple(tool_result_observations),
+        hook_events=tuple(hook_events),
+        pending_tool_use_at_stop=pending_tool_use_at_stop,
+    )
+
+    return IterationResult(
+        transcript=transcript,
+        messages=tuple(messages),
+        envelope=envelope,
+        signals=signals,
+        failure=failure,
+    )
+
+
+__all__ = [
+    "InvocationFailure",
+    "InvocationSignals",
+    "IterationResult",
+    "ToolInteraction",
+    "ToolResultObservation",
+    "invoke_iteration",
+]

@@ -138,7 +138,7 @@ class _EventStreamingStore:
         return self._wrapped.list_grader_results(run_id, attempt_number)
 
 
-async def _offline_invoke(request: InvocationRequest) -> IterationResult:
+async def _offline_invoke(_request: InvocationRequest) -> IterationResult:
     """Deterministic in-process ``InvokeFunc`` for the smoke example.
 
     Returns a complete :class:`IterationResult` carrying:
@@ -221,7 +221,7 @@ async def run_hello_example(db_path: str | os.PathLike[str]) -> HarnessOutcome:
     """
     task = build_task()
     lifecycle = Lifecycle(task_id=task.id)
-    backend = SqliteStore(db_path)
+    backend = SqliteStore(Path(os.fspath(db_path)))
     try:
         store = _EventStreamingStore(backend)
         outcome = await run_task(

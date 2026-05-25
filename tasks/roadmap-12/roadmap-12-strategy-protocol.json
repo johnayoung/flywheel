@@ -1,0 +1,42 @@
+{
+    "id": "roadmap-12-strategy-protocol",
+    "goal": "Expose the `Strategy` Protocol from `docs/strategy.md` plus a no-op default implementation, leaving concrete branch/PR strategies deferred.",
+    "prerequisites": [],
+    "tags": ["roadmap-12", "strategy", "protocol"],
+    "context": {
+        "relevant": [
+            "docs/strategy.md",
+            "src/flywheel/task.py",
+            "src/flywheel/__init__.py"
+        ],
+        "constraints": [
+            "Protocol shape matches `docs/strategy.md` exactly: `setup(task) -> StrategyContext`, `submit(ctx) -> StrategyResult`, `cleanup(ctx) -> None`.",
+            "The no-op default must satisfy the Protocol without performing any git, filesystem, or network side effects — it returns the typed context/result shells and exits.",
+            "The strategy module remains pure data + Protocol: no `subprocess`, no `git`, no network. Concrete implementations land in later, dedicated work.",
+            "`StrategyContext` and `StrategyResult` are typed (dataclasses or equivalent) so concrete implementations cannot diverge on the wire shape later."
+        ],
+        "non_goals": [
+            "Concrete branch/PR/merge strategies (deferred per `docs/strategy.md` Status section).",
+            "Branch slug derivation beyond exposing the `derive_slug(commit)` helper hook described in `docs/strategy.md` — the implementation can be a minimal stable function, but rich conventional-commit parsing is out of scope.",
+            "Wiring the strategy into the harness flow (harness already runs without it in `roadmap-10-harness`)."
+        ],
+        "edge_cases": [
+            "Calling `cleanup` after a `setup` that no-op'd must be safe — it does not assume any state was created.",
+            "A `submit` on the no-op default returns a deterministic, typed result (e.g. with an empty `ref`) so callers do not need to special-case `None`.",
+            "`derive_slug` on an empty or whitespace-only commit message produces a stable fallback rather than raising — its contract is total."
+        ]
+    },
+    "graders": [
+        { "type": "command", "run": "uv run pytest", "name": "tests" },
+        {
+            "type": "rubric",
+            "assertions": [
+                "The Strategy Protocol, StrategyContext, StrategyResult, and a no-op default implementation are exposed from `flywheel`, matching `docs/strategy.md`.",
+                "The no-op default satisfies the Protocol without git, filesystem, or network side effects, and tests demonstrate this directly.",
+                "`derive_slug(commit)` is exposed as documented and has total behavior — empty/whitespace input does not raise.",
+                "The strategy module imports no `subprocess`, `git`, or network APIs."
+            ],
+            "name": "strategy-protocol-contract"
+        }
+    ]
+}

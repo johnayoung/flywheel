@@ -56,6 +56,13 @@ from flywheel.loaders import (
 from flywheel.prompt import IterationInputs, build_iteration_prompt
 from flywheel.store_memory import InMemoryStore
 from flywheel.store_sqlite import SqliteStore
+from flywheel.strategy import (
+    NoOpStrategy,
+    Strategy,
+    StrategyContext,
+    StrategyResult,
+    derive_slug,
+)
 from flywheel.store_protocols import (
     AgentSessionStore,
     AttemptStore,
@@ -126,6 +133,7 @@ __all__ = [
     "MalformedEnvelope",
     "ManualGrader",
     "MissingEnvelope",
+    "NoOpStrategy",
     "OPENING_FENCE",
     "OptimisticConcurrencyError",
     "Outcome",
@@ -133,6 +141,9 @@ __all__ = [
     "SqliteStore",
     "Status",
     "StoreConflictError",
+    "Strategy",
+    "StrategyContext",
+    "StrategyResult",
     "Task",
     "TaskLoadError",
     "ToolInteraction",
@@ -145,6 +156,7 @@ __all__ = [
     "ValidEnvelope",
     "ValidationError",
     "build_iteration_prompt",
+    "derive_slug",
     "enforce_transcript_limits",
     "first_breach",
     "hello",

@@ -11,8 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable, Coroutine
 from pathlib import Path
 from typing import Any
 
@@ -126,7 +125,7 @@ def _wrap(payload: str) -> str:
     return f"{OPENING_FENCE}\n{payload}\n{CLOSING_FENCE}"
 
 
-def _run(coro: Awaitable[HarnessOutcome]) -> HarnessOutcome:
+def _run(coro: Coroutine[Any, Any, HarnessOutcome]) -> HarnessOutcome:
     return asyncio.run(coro)
 
 

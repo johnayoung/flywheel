@@ -13,4 +13,4 @@ Path to parity with the prior Go implementation. Each task says what, not how �
 9. **Transcript grader enforcement.** _Done._ Apply `transcript` graders (`max_turns`, `max_total_tokens`, `max_wall_seconds`) as hard limits during the run and as graders at validation time; persist to `grader_results` with observed-vs-breached payload.
 10. **Harness.** _Done._ Wire it together: invoke → envelope → intent → run graders on-completed → record attempt (with `agent_context`) → apply retry policy → transition. Owns all lifecycle transitions and per-attempt artifact dirs. Spec: [loop.md](loop.md).
 11. **Hello example.** _Done._ End-to-end smoke: one trivial task, SQLite store, run harness, stream events to stdout.
-12. **Strategy stub.** `Protocol` from [strategy.md](strategy.md) with a no-op default; concrete branch/PR impls deferred.
+12. **Strategy stub.** _Done._ `Protocol` from [strategy.md](strategy.md) with a no-op default; concrete branch/PR impls deferred.

@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   retries              INTEGER NOT NULL,
   error                TEXT,
   agent_output         TEXT,
-  implementation_notes TEXT,
   session_id           TEXT,
   artifacts_dir        TEXT,
   worker_id            TEXT,

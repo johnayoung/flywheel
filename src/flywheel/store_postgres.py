@@ -213,12 +213,11 @@ class PostgresStore:
                         """
                         INSERT INTO lifecycles (
                             run_id, task_id, status, version, retries,
-                            error, agent_output, implementation_notes,
-                            session_id, artifacts_dir, worker_id,
-                            timestamps_json, updated_at
+                            error, agent_output, session_id, artifacts_dir,
+                            worker_id, timestamps_json, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s
+                            %s
                         )
                         """,
                         (
@@ -229,7 +228,6 @@ class PostgresStore:
                             lifecycle.retries,
                             lifecycle.error or None,
                             lifecycle.agent_output or None,
-                            None,
                             lifecycle.session_id or None,
                             lifecycle.artifacts_dir or None,
                             lifecycle.worker_id or None,

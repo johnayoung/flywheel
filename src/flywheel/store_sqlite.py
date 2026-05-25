@@ -154,9 +154,9 @@ class SqliteStore:
                 """
                 INSERT INTO lifecycles (
                     run_id, task_id, status, version, retries, error,
-                    agent_output, implementation_notes, session_id,
-                    artifacts_dir, worker_id, timestamps_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    agent_output, session_id, artifacts_dir, worker_id,
+                    timestamps_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lifecycle.run_id,
@@ -166,7 +166,6 @@ class SqliteStore:
                     lifecycle.retries,
                     lifecycle.error,
                     lifecycle.agent_output,
-                    None,
                     lifecycle.session_id,
                     lifecycle.artifacts_dir,
                     lifecycle.worker_id,

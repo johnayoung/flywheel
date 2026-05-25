@@ -1,0 +1,677 @@
+"""Workflow CLI — drive a directory of flywheel tasks against a real agent.
+
+This module is the dogfooding bridge between the ``.workflow/`` task layout
+on disk and :func:`flywheel.harness.run_task`. It owns no execution logic
+of its own — task selection and persistence-status queries live here, but
+running a task delegates to the harness with the production Claude Code
+invoker.
+
+Layout assumed on disk::
+
+    .workflow/
+        flywheel.sqlite                       # store; created on first run
+        tasks/
+            active/
+                01-phase-name/
+                    <task-id>.json            # one flywheel Task per file
+                    <task-id>.json
+                02-other/
+                    ...
+            archive/
+                01-finished-phase/
+                    ...
+
+Task files conform to ``docs/task-schema.md`` and are loaded via
+:func:`flywheel.loaders.load_task_file`. Their on-disk JSON is immutable;
+all execution state lives in SQLite. Phase ordering is purely the directory
+name's numeric prefix; cross-task dependencies use the ``prerequisites``
+field on each task.
+
+Subcommands::
+
+    python -m flywheel.workflow next [--tasks-dir DIR] [--db PATH]
+    python -m flywheel.workflow run  TASK_FILE [--db PATH] [--sandbox DIR]
+                                     [--model MODEL] [--max-retries N]
+                                     [--max-turns N]
+    python -m flywheel.workflow status [--tasks-dir DIR] [--db PATH]
+    python -m flywheel.workflow is-done TASK_FILE [--db PATH]
+    python -m flywheel.workflow archive [--tasks-dir DIR] [--db PATH]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import shutil
+import sys
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import TextIO
+
+from claude_agent_sdk import ClaudeAgentOptions
+
+from flywheel.harness import (
+    HarnessConfig,
+    HarnessOutcome,
+    InvocationRequest,
+    InvokeFunc,
+    run_task,
+)
+from flywheel.invoker import IterationResult, invoke_iteration
+from flywheel.lifecycle import Lifecycle, Status
+from flywheel.loaders import TaskLoadError, load_task_file
+from flywheel.store_sqlite import SqliteStore
+from flywheel.task import Task
+
+
+DEFAULT_TASKS_DIR = Path(".workflow/tasks")
+DEFAULT_DB_PATH = Path(".workflow/flywheel.sqlite")
+DEFAULT_LOG_DIR = Path("logs/worker")
+DEFAULT_MAX_TURNS = 40
+DEFAULT_MAX_RETRIES = 1
+
+# Allow Claude Code the surface it needs to actually do engineering work
+# in this repo. The agent runs in the project root with full permissions
+# bypassed because the worker is the trust boundary.
+_AGENT_ALLOWED_TOOLS: tuple[str, ...] = (
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Glob",
+    "Grep",
+)
+
+
+class TaskState(str, Enum):
+    """Task-level status derived from the latest lifecycle, if any."""
+
+    FRESH = "fresh"  # never attempted
+    IN_PROGRESS = "in_progress"  # active lifecycle exists
+    RETRYABLE = "retryable"  # last lifecycle failed
+    INTERRUPTED = "interrupted"  # last lifecycle paused for operator
+    DONE = "done"  # at least one lifecycle reached DONE
+
+
+@dataclass(frozen=True, kw_only=True)
+class TaskStatusRow:
+    """Per-task status snapshot used by ``status`` and ``next`` reporting."""
+
+    task_file: Path
+    task: Task
+    state: TaskState
+    latest_run_id: str | None
+    latest_status: Status | None
+    latest_error: str
+
+
+# --- Filesystem walking -----------------------------------------------------
+
+
+def iter_active_phase_dirs(tasks_dir: Path) -> Iterator[Path]:
+    """Yield ``active/<phase>`` subdirectories in deterministic order.
+
+    Filename prefix (``NN-...``) sorts the phases. Hidden directories and
+    files are skipped.
+    """
+    active = tasks_dir / "active"
+    if not active.is_dir():
+        return
+    for entry in sorted(active.iterdir()):
+        if entry.is_dir() and not entry.name.startswith("."):
+            yield entry
+
+
+def iter_active_task_files(tasks_dir: Path) -> Iterator[Path]:
+    """Yield every ``active/<phase>/<task>.json`` in deterministic order."""
+    for phase in iter_active_phase_dirs(tasks_dir):
+        for entry in sorted(phase.iterdir()):
+            if (
+                entry.is_file()
+                and entry.suffix == ".json"
+                and not entry.name.startswith("_")
+                and not entry.name.startswith(".")
+            ):
+                yield entry
+
+
+def load_active_tasks(tasks_dir: Path) -> list[tuple[Path, Task]]:
+    """Load every active task; raise ``TaskLoadError`` on the first bad file.
+
+    The list is in deterministic walk order so ``next`` ties break by
+    filename.
+    """
+    out: list[tuple[Path, Task]] = []
+    for path in iter_active_task_files(tasks_dir):
+        out.append((path, load_task_file(path)))
+    return out
+
+
+# --- Status queries ---------------------------------------------------------
+
+
+_ACTIVE_STATUSES: frozenset[Status] = frozenset(
+    {Status.READY, Status.RUNNING, Status.VALIDATING}
+)
+
+
+def _latest_lifecycle_row(
+    store: SqliteStore, task_id: str
+) -> tuple[str, Status, str] | None:
+    """Return ``(run_id, status, error)`` of the most recent lifecycle for
+    ``task_id``, or ``None`` if no lifecycle exists.
+
+    Uses the SQLite connection directly because no Protocol method exposes
+    a by-task-id lookup — and adding one would leak workflow concerns into
+    the store contract.
+    """
+    cursor = store._connection.execute(  # noqa: SLF001 — intentional
+        """
+        SELECT run_id, status, error
+        FROM lifecycles
+        WHERE task_id = ?
+        ORDER BY updated_at DESC, run_id DESC
+        LIMIT 1
+        """,
+        (task_id,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return row["run_id"], Status(row["status"]), row["error"] or ""
+
+
+def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
+    cursor = store._connection.execute(  # noqa: SLF001
+        "SELECT 1 FROM lifecycles WHERE task_id = ? AND status = ? LIMIT 1",
+        (task_id, Status.DONE.value),
+    )
+    return cursor.fetchone() is not None
+
+
+def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
+    """Classify ``task`` based on its lifecycle history in ``store``."""
+    latest = _latest_lifecycle_row(store, task.id)
+    if latest is None:
+        return TaskStatusRow(
+            task_file=Path(),
+            task=task,
+            state=TaskState.FRESH,
+            latest_run_id=None,
+            latest_status=None,
+            latest_error="",
+        )
+    run_id, status, error = latest
+
+    if _has_done_lifecycle(store, task.id):
+        state = TaskState.DONE
+    elif status in _ACTIVE_STATUSES:
+        state = TaskState.IN_PROGRESS
+    elif status == Status.INTERRUPTED:
+        state = TaskState.INTERRUPTED
+    elif status in (Status.FAILED, Status.FAILED_VALIDATION):
+        state = TaskState.RETRYABLE
+    elif status == Status.PENDING:
+        state = TaskState.IN_PROGRESS
+    else:
+        # DONE is handled above; anything else is a defensive fallback.
+        state = TaskState.IN_PROGRESS
+    return TaskStatusRow(
+        task_file=Path(),
+        task=task,
+        state=state,
+        latest_run_id=run_id,
+        latest_status=status,
+        latest_error=error,
+    )
+
+
+def build_status_rows(
+    tasks_dir: Path, store: SqliteStore
+) -> list[TaskStatusRow]:
+    """Walk active tasks and return their classified status, in walk order."""
+    rows: list[TaskStatusRow] = []
+    for path, task in load_active_tasks(tasks_dir):
+        snapshot = task_state(store, task)
+        rows.append(
+            TaskStatusRow(
+                task_file=path,
+                task=snapshot.task,
+                state=snapshot.state,
+                latest_run_id=snapshot.latest_run_id,
+                latest_status=snapshot.latest_status,
+                latest_error=snapshot.latest_error,
+            )
+        )
+    return rows
+
+
+# --- Next-task selection ----------------------------------------------------
+
+
+def select_next_task(rows: Iterable[TaskStatusRow]) -> TaskStatusRow | None:
+    """Pick the first eligible task from ``rows``.
+
+    A task is eligible when:
+
+    * its state is :attr:`TaskState.FRESH` or :attr:`TaskState.RETRYABLE`,
+      AND
+    * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`.
+
+    Tasks whose prerequisites are missing from the workspace are treated
+    as ineligible so a dangling reference never silently runs.
+    """
+    by_id: dict[str, TaskStatusRow] = {row.task.id: row for row in rows}
+    eligible_states = (TaskState.FRESH, TaskState.RETRYABLE)
+    for row in by_id.values():
+        if row.state not in eligible_states:
+            continue
+        if not all(
+            (dep := by_id.get(prereq_id)) is not None
+            and dep.state == TaskState.DONE
+            for prereq_id in row.task.prerequisites
+        ):
+            continue
+        return row
+    return None
+
+
+# --- Run subcommand ---------------------------------------------------------
+
+
+def _make_claude_code_invoke(
+    sandbox: Path,
+    *,
+    model: str | None,
+    max_turns: int,
+) -> InvokeFunc:
+    """Production invoker: real Claude Code spawned in ``sandbox``.
+
+    Mirrors :func:`flywheel.examples.hello.example.make_claude_code_invoke`
+    but with the broader tool surface a real engineering task needs.
+    """
+    options = ClaudeAgentOptions(
+        cwd=str(sandbox),
+        add_dirs=[str(sandbox)],
+        allowed_tools=list(_AGENT_ALLOWED_TOOLS),
+        permission_mode="bypassPermissions",
+        max_turns=max_turns,
+        model=model,
+    )
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        return await invoke_iteration(prompt=request.prompt, options=options)
+
+    return _invoke
+
+
+async def run_task_file(
+    task_file: Path,
+    *,
+    db_path: Path,
+    sandbox: Path,
+    model: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    invoke: InvokeFunc | None = None,
+    stream: TextIO | None = None,
+) -> HarnessOutcome:
+    """Load ``task_file``, persist a lifecycle, and drive it via ``run_task``.
+
+    ``invoke`` defaults to a real Claude Code invoker. Tests inject a fake
+    callable instead — same seam, different transport.
+    """
+    out = stream if stream is not None else sys.stderr
+    task = load_task_file(task_file)
+    lifecycle = Lifecycle(task_id=task.id)
+
+    invoker = invoke or _make_claude_code_invoke(
+        sandbox, model=model, max_turns=max_turns
+    )
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    sandbox.mkdir(parents=True, exist_ok=True)
+
+    backend = SqliteStore(db_path)
+    try:
+        print(
+            f"[workflow] task    : {task.id}",
+            file=out,
+            flush=True,
+        )
+        print(
+            f"[workflow] file    : {task_file}",
+            file=out,
+            flush=True,
+        )
+        print(
+            f"[workflow] run_id  : {lifecycle.run_id}",
+            file=out,
+            flush=True,
+        )
+        outcome = await run_task(
+            task,
+            lifecycle,
+            backend,
+            config=HarnessConfig(
+                max_retries=max_retries,
+                agent_context={
+                    "model_id": model or "claude-code-default",
+                    "agent_sdk": "claude_agent_sdk",
+                    "sandbox": str(sandbox),
+                },
+            ),
+            invoke=invoker,
+        )
+        print(
+            f"[workflow] status  : {outcome.lifecycle.status.value}",
+            file=out,
+            flush=True,
+        )
+        if outcome.lifecycle.error:
+            print(
+                f"[workflow] error   : {outcome.lifecycle.error}",
+                file=out,
+                flush=True,
+            )
+    finally:
+        backend.close()
+    return outcome
+
+
+# --- Archive subcommand -----------------------------------------------------
+
+
+def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
+    """Move ``active/<phase>`` dirs to ``archive/`` when every task is done.
+
+    Returns the list of moved phase directories (post-move paths). Idempotent:
+    safe to call repeatedly. Phases with any non-done task are left in place.
+    """
+    moved: list[Path] = []
+    archive_root = tasks_dir / "archive"
+    archive_root.mkdir(parents=True, exist_ok=True)
+
+    for phase_dir in iter_active_phase_dirs(tasks_dir):
+        task_files = [
+            entry
+            for entry in sorted(phase_dir.iterdir())
+            if entry.is_file()
+            and entry.suffix == ".json"
+            and not entry.name.startswith("_")
+            and not entry.name.startswith(".")
+        ]
+        if not task_files:
+            continue
+        if not all(
+            _has_done_lifecycle(store, load_task_file(p).id) for p in task_files
+        ):
+            continue
+        dest = archive_root / phase_dir.name
+        # If a same-named archive exists, leave the active dir alone rather
+        # than clobber prior history — operator can resolve manually.
+        if dest.exists():
+            continue
+        shutil.move(str(phase_dir), str(dest))
+        moved.append(dest)
+    return moved
+
+
+# --- CLI plumbing -----------------------------------------------------------
+
+
+def _resolve_tasks_dir(arg: str | None) -> Path:
+    return Path(arg) if arg else DEFAULT_TASKS_DIR
+
+
+def _resolve_db(arg: str | None) -> Path:
+    return Path(arg) if arg else DEFAULT_DB_PATH
+
+
+def _cmd_next(args: argparse.Namespace) -> int:
+    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        rows = build_status_rows(tasks_dir, store)
+        pick = select_next_task(rows)
+    finally:
+        store.close()
+    if pick is None:
+        return 1
+    print(pick.task_file)
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    task_file = Path(args.task_file)
+    db_path = _resolve_db(args.db)
+    sandbox = Path(args.sandbox) if args.sandbox else Path.cwd()
+    outcome = asyncio.run(
+        run_task_file(
+            task_file,
+            db_path=db_path,
+            sandbox=sandbox,
+            model=args.model,
+            max_turns=args.max_turns,
+            max_retries=args.max_retries,
+        )
+    )
+    return 0 if outcome.lifecycle.status == Status.DONE else 1
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        rows = build_status_rows(tasks_dir, store)
+    finally:
+        store.close()
+    if args.json:
+        out = [
+            {
+                "task_id": row.task.id,
+                "task_file": str(row.task_file),
+                "state": row.state.value,
+                "latest_run_id": row.latest_run_id,
+                "latest_status": (
+                    row.latest_status.value if row.latest_status else None
+                ),
+                "latest_error": row.latest_error,
+                "prerequisites": list(row.task.prerequisites),
+            }
+            for row in rows
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+    if not rows:
+        print("(no active tasks)")
+        return 0
+    width = max(len(row.task.id) for row in rows)
+    for row in rows:
+        phase = row.task_file.parent.name
+        suffix = ""
+        if row.latest_error:
+            suffix = f"  -- {row.latest_error}"
+        print(
+            f"  {phase}/{row.task.id:<{width}}  "
+            f"{row.state.value:<12}{suffix}"
+        )
+    return 0
+
+
+def _cmd_is_done(args: argparse.Namespace) -> int:
+    task_file = Path(args.task_file)
+    task = load_task_file(task_file)
+    db_path = _resolve_db(args.db)
+    store = SqliteStore(db_path)
+    try:
+        done = _has_done_lifecycle(store, task.id)
+    finally:
+        store.close()
+    return 0 if done else 1
+
+
+def _cmd_archive(args: argparse.Namespace) -> int:
+    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        moved = archive_completed_phases(tasks_dir, store)
+    finally:
+        store.close()
+    for dest in moved:
+        print(str(dest))
+    return 0
+
+
+def _add_common_db(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--db",
+        default=None,
+        help=f"SQLite database path (default: {DEFAULT_DB_PATH}).",
+    )
+
+
+def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tasks-dir",
+        default=None,
+        help=f"Tasks root directory (default: {DEFAULT_TASKS_DIR}).",
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m flywheel.workflow",
+        description=(
+            "Pick, run, and audit flywheel tasks laid out under "
+            ".workflow/tasks/active/<phase>/."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_next = sub.add_parser(
+        "next",
+        help=(
+            "Print path to the next eligible task and exit 0; exit 1 if "
+            "nothing is eligible."
+        ),
+    )
+    _add_common_tasks_dir(p_next)
+    _add_common_db(p_next)
+    p_next.set_defaults(func=_cmd_next)
+
+    p_run = sub.add_parser(
+        "run",
+        help=(
+            "Execute one task via flywheel.run_task; exit 0 only on DONE."
+        ),
+    )
+    p_run.add_argument("task_file", help="Path to a flywheel task JSON file.")
+    _add_common_db(p_run)
+    p_run.add_argument(
+        "--sandbox",
+        default=None,
+        help="Directory the agent operates in (default: current dir).",
+    )
+    p_run.add_argument(
+        "--model",
+        default=None,
+        help="Override the Claude model passed to the SDK.",
+    )
+    p_run.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help=f"Max agent turns per iteration (default: {DEFAULT_MAX_TURNS}).",
+    )
+    p_run.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=(
+            f"Harness retry budget after failed_validation "
+            f"(default: {DEFAULT_MAX_RETRIES})."
+        ),
+    )
+    p_run.set_defaults(func=_cmd_run)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Print the state of every active task.",
+    )
+    _add_common_tasks_dir(p_status)
+    _add_common_db(p_status)
+    p_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a text table.",
+    )
+    p_status.set_defaults(func=_cmd_status)
+
+    p_is_done = sub.add_parser(
+        "is-done",
+        help="Exit 0 if the named task has at least one done lifecycle.",
+    )
+    p_is_done.add_argument("task_file")
+    _add_common_db(p_is_done)
+    p_is_done.set_defaults(func=_cmd_is_done)
+
+    p_archive = sub.add_parser(
+        "archive",
+        help=(
+            "Move active phase directories whose tasks are all done into "
+            "archive/."
+        ),
+    )
+    _add_common_tasks_dir(p_archive)
+    _add_common_db(p_archive)
+    p_archive.set_defaults(func=_cmd_archive)
+
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        return int(args.func(args))
+    except TaskLoadError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+__all__ = [
+    "DEFAULT_DB_PATH",
+    "DEFAULT_LOG_DIR",
+    "DEFAULT_MAX_RETRIES",
+    "DEFAULT_MAX_TURNS",
+    "DEFAULT_TASKS_DIR",
+    "TaskState",
+    "TaskStatusRow",
+    "archive_completed_phases",
+    "build_status_rows",
+    "iter_active_phase_dirs",
+    "iter_active_task_files",
+    "load_active_tasks",
+    "main",
+    "run_task_file",
+    "select_next_task",
+    "task_state",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

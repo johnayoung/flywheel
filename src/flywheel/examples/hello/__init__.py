@@ -4,8 +4,10 @@ See :mod:`flywheel.examples.hello.example` for the implementation.
 """
 
 from flywheel.examples.hello.example import (
+    DEFAULT_DB_PATH,
     DEFAULT_MAX_TURNS,
     DEFAULT_MAX_WALL_SECONDS,
+    DEFAULT_SANDBOX,
     TARGET_CONTENT,
     TARGET_FILENAME,
     build_task,
@@ -17,8 +19,10 @@ from flywheel.examples.hello.example import (
 
 
 __all__ = [
+    "DEFAULT_DB_PATH",
     "DEFAULT_MAX_TURNS",
     "DEFAULT_MAX_WALL_SECONDS",
+    "DEFAULT_SANDBOX",
     "TARGET_CONTENT",
     "TARGET_FILENAME",
     "build_task",

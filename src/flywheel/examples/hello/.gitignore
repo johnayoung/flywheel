@@ -1,0 +1,3 @@
+# Default runtime artifacts produced by `python -m flywheel.examples.hello`.
+# SQLite db + WAL/SHM sidecars + agent sandbox all land under runs/.
+runs/

@@ -27,7 +27,6 @@ import json
 import os
 import shlex
 import sys
-import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TextIO
@@ -60,6 +59,14 @@ TARGET_CONTENT = "hello from flywheel"
 
 DEFAULT_MAX_TURNS = 6
 DEFAULT_MAX_WALL_SECONDS = 120.0
+
+# Default artifact location: <hello pkg>/runs/. Reused across invocations
+# so the audit trail accumulates in one place. The whole directory is
+# gitignored via .gitignore next to this module.
+_PACKAGE_DIR: Path = Path(__file__).resolve().parent
+_DEFAULT_RUNS_DIR: Path = _PACKAGE_DIR / "runs"
+DEFAULT_DB_PATH: Path = _DEFAULT_RUNS_DIR / "hello.sqlite"
+DEFAULT_SANDBOX: Path = _DEFAULT_RUNS_DIR / "sandbox"
 
 
 def build_task(sandbox: Path) -> Task:
@@ -344,15 +351,15 @@ async def run_hello_example(
 def _resolve_db_path(arg: str | None) -> Path:
     if arg:
         return Path(arg)
-    handle, name = tempfile.mkstemp(prefix="flywheel-hello-", suffix=".sqlite")
-    os.close(handle)
-    return Path(name)
+    DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_DB_PATH
 
 
 def _resolve_sandbox(arg: str | None) -> Path:
     if arg:
         return Path(arg)
-    return Path(tempfile.mkdtemp(prefix="flywheel-hello-sandbox-"))
+    DEFAULT_SANDBOX.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_SANDBOX
 
 
 def main(argv: Iterable[str] | None = None) -> int:
@@ -368,14 +375,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument(
         "--db",
         default=None,
-        help="SQLite database path. Omit for a fresh temp file per run.",
+        help=(
+            f"SQLite database path. Default: {DEFAULT_DB_PATH} "
+            f"(reused across runs; each run gets its own run_id)."
+        ),
     )
     parser.add_argument(
         "--sandbox",
         default=None,
         help=(
-            "Directory the agent operates in. Omit for a fresh temp dir "
-            "per run."
+            f"Directory the agent operates in. Default: {DEFAULT_SANDBOX} "
+            f"(reused across runs)."
         ),
     )
     parser.add_argument(
@@ -410,8 +420,10 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 __all__ = [
+    "DEFAULT_DB_PATH",
     "DEFAULT_MAX_TURNS",
     "DEFAULT_MAX_WALL_SECONDS",
+    "DEFAULT_SANDBOX",
     "TARGET_CONTENT",
     "TARGET_FILENAME",
     "build_task",

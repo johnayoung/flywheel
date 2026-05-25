@@ -11,6 +11,7 @@ The lifecycle tracks a task's execution state from creation to terminal outcome.
 | `running`           | Agent is actively working                           |
 | `validating`        | Agent finished, validation checks running           |
 | `failed_validation` | Validation failed (retryable)                       |
+| `internal_error`    | Agent invocation crashed (retryable)                |
 | `done`              | Terminal: work completed successfully               |
 | `failed`            | Terminal: unrecoverable failure                     |
 | `interrupted`       | Execution halted externally (resumable)             |
@@ -22,15 +23,16 @@ pending -> ready -> running -> validating -> done
                       |           |
                       |      failed_validation -> ready (retry) or failed
                       |
+                      +-> internal_error -> ready (retry) or failed
                       +-> failed
                       +-> interrupted -> ready
 ```
 
 Key rules:
 - `done` and `failed` are terminal — no transitions out
-- `failed_validation` can transition back to `ready` (consuming retry budget)
+- `failed_validation` and `internal_error` can transition back to `ready` (consuming retry budget)
 - `interrupted` always resumes via `ready`
-- Transitioning to `failed` or `failed_validation` requires the `Error` field to be set
+- Transitioning to `failed`, `failed_validation`, or `internal_error` requires the `Error` field to be set
 
 ## Lifecycle struct
 
@@ -65,9 +67,9 @@ Per-grader pass/fail detail lives in `grader_results`, keyed by `(run_id, attemp
 ## Retries
 
 A task is eligible for retry when:
-1. Status is `failed_validation`
+1. Status is `failed_validation` or `internal_error`
 2. `retries < max_retries` (configurable)
 
-On retry, the lifecycle transitions back to `ready`, increments `retries`, and clears transient error state. The full attempt history is preserved.
+On retry, the lifecycle transitions back to `ready`, increments `retries`, and clears transient error state. The full attempt history is preserved. Agent-invocation crashes (`internal_error`) and validation failures share the same retry budget — crashes do not get a separate budget.
 
 `ConsecutiveFailedRuns` counts sequential failed runs (grouped by `run_id`) from the tail of the attempts list. This drives circuit-breaker logic.

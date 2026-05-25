@@ -1,0 +1,45 @@
+{
+  "id": "drop-default-transcript-grader",
+  "goal": "Remove the default transcript-grader recommendation from the /task skill template so generated tasks no longer auto-suggest a per-task turn budget.",
+  "tags": ["skill", "docs"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00002-FEATURE-harness-resilience.md",
+      ".claude/commands/task.md"
+    ],
+    "constraints": [
+      "Drop the `{ \"type\": \"transcript\", \"max_turns\": 30, \"name\": \"budget\" }` line from the 'Fully briefed task' example block in .claude/commands/task.md.",
+      "Keep the transcript row in the 'Grader types' table as an opt-in option; only the example/recommendation should change.",
+      "If any narrative copy elsewhere in the file frames transcript as a recommended default, soften it to opt-in language; do not invent new prose.",
+      "Do not change the example task JSON structure beyond removing the transcript grader line (and adjusting a trailing comma if JSON-in-fenced-block syntax requires it).",
+      "Commit the change with a Conventional Commits message (e.g. 'docs:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not edit any other slash-command template.",
+      "Do not change docs/task-schema.md.",
+      "Do not retroactively rewrite tasks already in .workflow/tasks/active/ or .workflow/tasks/archive/."
+    ]
+  },
+  "graders": [
+    {
+      "type": "command",
+      "run": "! awk '/### Fully briefed/,/### Grader types/' .claude/commands/task.md | grep -q '\"type\": \"transcript\"'",
+      "name": "example-block-clean"
+    },
+    {
+      "type": "command",
+      "run": "awk '/### Grader types/,/### Authoring discipline/' .claude/commands/task.md | grep -q 'transcript'",
+      "name": "table-still-documents-transcript"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest",
+      "name": "full-suite"
+    },
+    {
+      "type": "command",
+      "run": "git log -1 --format=%s | grep -qE '^(docs|chore|refactor):'",
+      "name": "commit-landed"
+    }
+  ]
+}

@@ -394,7 +394,9 @@ async def run_task(
           ``config.max_iterations_per_attempt``.
        c. Classify the terminal iteration:
 
-          * crash -> ``running -> failed`` (``INTERNAL_ERROR`` outcome).
+          * crash -> ``running -> internal_error`` (``INTERNAL_ERROR``
+            outcome; retry-eligible under the same budget as
+            ``failed_validation``).
           * ``intent=blocked`` -> ``running -> interrupted``
             (``CANCELLED`` outcome; no retry consumed).
           * ``intent=abort`` -> ``running -> failed`` (``AGENT_ERROR``).
@@ -402,10 +404,10 @@ async def run_task(
             past cap) -> ``running -> validating``, then either
             ``validating -> done`` on full grader pass or
             ``validating -> failed_validation`` with a typed error.
-       d. On ``failed_validation``, consult
-          :meth:`Lifecycle.is_retry_eligible`:
-          ``failed_validation -> ready`` when retries remain, otherwise
-          ``failed_validation -> failed``.
+       d. On ``failed_validation`` or ``internal_error``, consult
+          :meth:`Lifecycle.is_retry_eligible`: transition to ``ready``
+          when retries remain (emitting ``harness.retry_scheduled``),
+          otherwise transition to ``failed`` with the inherited error.
     3. Return the lifecycle and the full Attempt history.
 
     ``invoke`` defaults to :func:`invoke_iteration` (via
@@ -451,7 +453,10 @@ async def run_task(
             )
             continue
 
-        if lifecycle.status == Status.FAILED_VALIDATION:
+        if lifecycle.status in (
+            Status.FAILED_VALIDATION,
+            Status.INTERNAL_ERROR,
+        ):
             if lifecycle.is_retry_eligible(config.max_retries):
                 _emit(
                     store,
@@ -593,7 +598,7 @@ async def _run_attempt(
         )
         _transition(
             lifecycle,
-            Status.FAILED,
+            Status.INTERNAL_ERROR,
             store=store,
             error=crash_error,
             now=clock,

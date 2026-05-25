@@ -1,0 +1,61 @@
+{
+  "id": "drop-implementation-notes",
+  "goal": "Drop the unused implementation_notes column from both persistence schemas and both store INSERT statements.",
+  "tags": ["schema", "store", "cleanup"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00002-FEATURE-harness-resilience.md",
+      "docs/persistence-schema.sql",
+      "docs/persistence-schema-postgres.sql",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/store_postgres.py",
+      "tests/test_store_contract.py",
+      "tests/test_store_sqlite.py",
+      "tests/test_store_postgres.py"
+    ],
+    "references": [
+      "src/flywheel/store_sqlite.py:151-176 -- create_lifecycle INSERT that currently passes None for implementation_notes; column reference must be removed from the SQL and the value tuple",
+      "src/flywheel/store_postgres.py:208-239 -- same pattern in the Postgres store"
+    ],
+    "constraints": [
+      "Remove `implementation_notes TEXT,` from docs/persistence-schema.sql and docs/persistence-schema-postgres.sql.",
+      "Remove the `implementation_notes` column name and its corresponding `None` placeholder from the INSERT in both store_sqlite.py and store_postgres.py; keep parameter ordering consistent with the remaining columns.",
+      "After the edit, `grep -rn implementation_notes src/ docs/ tests/` must return zero matches.",
+      "Do not add a migration shim, deprecation comment, or backfill helper; this is a non-additive schema change (per the spec, existing dev DBs are wiped or manually ALTERed).",
+      "Do not change any other column, FK, trigger, or index.",
+      "Run `mcp__ide__getDiagnostics` on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (e.g. 'refactor:' or 'chore:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not introduce a Lifecycle field, dataclass change, or test that asserts the column is gone via DESCRIBE/information_schema.",
+      "Do not touch flywheel.lifecycle, flywheel.task, or flywheel.harness.",
+      "Do not modify claude_session_store or any other table."
+    ],
+    "edge_cases": [
+      "If a dev SQLite DB already exists at .workflow/flywheel.sqlite with the old column, the new INSERT must still succeed -- removing a column from the INSERT list does not require dropping the column from the live DB.",
+      "Postgres store: ensure the Jsonb wrapping and the column count match the new INSERT shape; the parameter tuple must shrink by exactly one slot."
+    ]
+  },
+  "graders": [
+    {
+      "type": "command",
+      "run": "! grep -rn implementation_notes src/ docs/ tests/",
+      "name": "no-references"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest",
+      "name": "full-suite-sqlite-memory"
+    },
+    {
+      "type": "command",
+      "run": "uv run --extra postgres pytest tests/test_store_contract.py tests/test_store_sqlite.py tests/test_store_postgres.py -v",
+      "name": "store-suites-with-postgres"
+    },
+    {
+      "type": "command",
+      "run": "git log -1 --format=%s | grep -qE '^(refactor|chore|fix|feat):'",
+      "name": "commit-landed"
+    }
+  ]
+}

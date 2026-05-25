@@ -10,6 +10,7 @@ class Status(str, Enum):
     RUNNING = "running"
     VALIDATING = "validating"
     FAILED_VALIDATION = "failed_validation"
+    INTERNAL_ERROR = "internal_error"
     DONE = "done"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
@@ -31,17 +32,27 @@ _VALID_EDGES: dict[Status, frozenset[Status]] = {
     Status.PENDING: frozenset({Status.READY}),
     Status.READY: frozenset({Status.RUNNING}),
     Status.RUNNING: frozenset(
-        {Status.VALIDATING, Status.FAILED, Status.INTERRUPTED}
+        {
+            Status.VALIDATING,
+            Status.FAILED,
+            Status.INTERRUPTED,
+            Status.INTERNAL_ERROR,
+        }
     ),
     Status.VALIDATING: frozenset({Status.DONE, Status.FAILED_VALIDATION}),
     Status.FAILED_VALIDATION: frozenset({Status.READY, Status.FAILED}),
+    Status.INTERNAL_ERROR: frozenset({Status.READY, Status.FAILED}),
     Status.INTERRUPTED: frozenset({Status.READY}),
     Status.DONE: frozenset(),
     Status.FAILED: frozenset(),
 }
 
 _REQUIRES_ERROR: frozenset[Status] = frozenset(
-    {Status.FAILED, Status.FAILED_VALIDATION}
+    {Status.FAILED, Status.FAILED_VALIDATION, Status.INTERNAL_ERROR}
+)
+
+_RETRY_SOURCE_STATUSES: frozenset[Status] = frozenset(
+    {Status.FAILED_VALIDATION, Status.INTERNAL_ERROR}
 )
 
 _FAILED_OUTCOMES: frozenset[Outcome] = frozenset(
@@ -101,7 +112,7 @@ class Lifecycle:
                 f"transition to {target.value} requires a non-empty error"
             )
         is_retry_edge = (
-            self.status == Status.FAILED_VALIDATION and target == Status.READY
+            self.status in _RETRY_SOURCE_STATUSES and target == Status.READY
         )
         self.status = target
         self.timestamps[target] = now if now is not None else _utcnow()
@@ -114,7 +125,7 @@ class Lifecycle:
 
     def is_retry_eligible(self, max_retries: int) -> bool:
         return (
-            self.status == Status.FAILED_VALIDATION
+            self.status in _RETRY_SOURCE_STATUSES
             and self.retries < max_retries
         )
 

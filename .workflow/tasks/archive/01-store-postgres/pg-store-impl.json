@@ -1,0 +1,74 @@
+{
+  "id": "pg-store-impl",
+  "goal": "Add flywheel.store_postgres.PostgresStore satisfying every store Protocol against Postgres with a connection pool, schema-name isolation, append-only triggers, and a clear ImportError when the postgres extra is missing, re-exported from flywheel and covered by the extended contract suite plus Postgres-specific tests.",
+  "prerequisites": ["pg-schema-file", "pg-packaging"],
+  "tags": ["postgres", "store"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00001-FEATURE-store-postgres.md",
+      "src/flywheel/store_protocols.py",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/store_memory.py",
+      "src/flywheel/__init__.py",
+      "docs/persistence-schema-postgres.sql",
+      "docs/persistence-schema.sql",
+      "tests/test_store_contract.py",
+      "tests/test_store_sqlite.py"
+    ],
+    "references": [
+      "src/flywheel/store_sqlite.py -- mirror structure: bootstrap from canonical SQL file, optimistic concurrency on lifecycles.version, dataclass<->row converters, append-only enforcement, defensive copies",
+      "tests/test_store_sqlite.py -- pattern for backend-specific tests (schema bootstrap, trigger enforcement, FK enforcement, durability)",
+      "tests/test_store_contract.py -- _STORE_FACTORIES extension point for parametrizing the third backend"
+    ],
+    "constraints": [
+      "Constructor signature: PostgresStore(dsn: str, *, pool_min: int = 1, pool_max: int = 10, schema: str = 'public'). Owns the internal psycopg_pool.ConnectionPool; close() drains it.",
+      "Bootstrap by executing docs/persistence-schema-postgres.sql via a pool connection; idempotent against an already-bootstrapped DB.",
+      "Optimistic concurrency via WHERE version = :expected, raising OptimisticConcurrencyError(run_id, expected_version, actual_version) on mismatch and LifecycleNotFoundError(run_id) on missing row -- mirror SqliteStore's disambiguation.",
+      "grader_results stays append-only at the DB level via BEFORE UPDATE / BEFORE DELETE triggers; raw UPDATE/DELETE bubbles up the psycopg exception unchanged.",
+      "All SQL uses parameterized queries; do not concatenate caller input. The schema name is the one exception -- validate it (identifier-safe) before substituting; never log the DSN.",
+      "Importing flywheel.store_postgres without the postgres extra installed raises ImportError whose message names the extra (e.g. \"install with: uv add 'flywheel[postgres]'\"). The guard fires at import time, before construction.",
+      "Re-export PostgresStore from src/flywheel/__init__.py (import + __all__).",
+      "Extend tests/test_store_contract.py: add a 'postgres' entry to _STORE_FACTORIES whose factory spins up (or reuses) a session-scoped testcontainers Postgres container and yields a PostgresStore against a per-test schema; skip the postgres-parametrized cases with a clear reason when Docker is unavailable.",
+      "Add tests/test_store_postgres.py covering: import-guard message when psycopg is absent (monkeypatch sys.modules), JSONB column types via information_schema, trigger enforcement via raw UPDATE/DELETE, FK violation via orphan insert, pool sizing + parallel reads, schema-name isolation across two stores against the same DB, optimistic-concurrency conflict via two pool connections, and close() releasing pool resources.",
+      "Run `mcp__ide__getDiagnostics` on every .py file you touch and fix all Pylance errors before reporting verify -- treat them as build failures.",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not add async API surface; the store is sync.",
+      "Do not add migration tooling, read replicas, multi-DB routing, or a bootstrap CLI.",
+      "Do not modify the SQLite or in-memory stores, store_protocols, lifecycle, or task modules.",
+      "Do not weaken module-purity tests for flywheel.task or flywheel.lifecycle."
+    ],
+    "edge_cases": [
+      "Schema-name substitution: implementer's call between a ${schema} placeholder rewritten at bootstrap or unqualified names with `SET search_path TO :schema` per connection. Whichever is chosen, the schema name must round-trip through identifier validation -- never f-string user input directly into DDL.",
+      "Timezone-naive datetimes from callers store as UTC TIMESTAMPTZ and read back tz-aware (mirror SqliteStore practice).",
+      "claude_session_store has no FK to lifecycles in the SQLite schema; preserve that.",
+      "Docker unavailable in CI: every Postgres-backed test must skip with a clear reason; the memory + sqlite contract suite must still pass.",
+      "Pool exhaustion surfaces psycopg_pool.PoolTimeout; do not silently retry.",
+      "DSN unreachable: bubble psycopg.OperationalError unchanged from the constructor."
+    ]
+  },
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run --extra postgres python -c \"from flywheel.store_postgres import PostgresStore as A; from flywheel import PostgresStore as B; assert A is B\"",
+      "name": "reexport"
+    },
+    {
+      "type": "command",
+      "run": "uv run --extra postgres pytest tests/test_store_contract.py tests/test_store_postgres.py -v",
+      "name": "postgres-tests"
+    },
+    {
+      "type": "command",
+      "run": "uv run --extra postgres pytest",
+      "name": "full-suite"
+    },
+    {
+      "type": "command",
+      "run": "uv run ruff check src/flywheel/store_postgres.py tests/test_store_postgres.py tests/test_store_contract.py src/flywheel/__init__.py 2>/dev/null || true",
+      "name": "lint-touched"
+    },
+    { "type": "transcript", "max_turns": 80, "name": "budget" }
+  ]
+}

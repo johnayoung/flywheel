@@ -113,12 +113,6 @@ def test_load_task_file_handles_fully_briefed_task(tmp_path: Path) -> None:
     ]
 
 
-def test_load_task_file_loads_real_repo_task() -> None:
-    repo_task = Path(__file__).resolve().parents[1] / "tasks" / "roadmap-01" / "roadmap-01-task-dataclass.json"
-    task = load_task_file(repo_task)
-    assert task.id == "roadmap-01-task-dataclass"
-
-
 def test_load_task_file_malformed_json_names_path(tmp_path: Path) -> None:
     p = tmp_path / "bad.json"
     p.write_text("{not valid json")

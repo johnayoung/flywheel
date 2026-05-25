@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from flywheel.envelope import (
     CLOSING_FENCE,
     OPENING_FENCE,
@@ -90,6 +92,29 @@ from flywheel.task import (
     ValidationError,
 )
 
+if TYPE_CHECKING:
+    # Surfaces ``PostgresStore`` to type-checkers without triggering the
+    # ``flywheel[postgres]`` import guard at package import time. The
+    # runtime hook is ``__getattr__`` below; it only loads psycopg when a
+    # caller actually asks for ``PostgresStore``.
+    from flywheel.store_postgres import PostgresStore as PostgresStore
+
+
+def __getattr__(name: str) -> object:
+    """Lazy re-export hook.
+
+    Resolves attribute lookups that aren't bound at module import time.
+    Currently only ``PostgresStore`` uses this path so the ``postgres``
+    extra stays optional: ``from flywheel import PostgresStore`` triggers
+    the import of ``flywheel.store_postgres``, which raises its own
+    ``ImportError`` (naming the extra) when ``psycopg`` is absent.
+    """
+    if name == "PostgresStore":
+        from flywheel.store_postgres import PostgresStore as _PG
+
+        return _PG
+    raise AttributeError(f"module 'flywheel' has no attribute {name!r}")
+
 
 def hello() -> str:
     return "Hello from flywheel!"
@@ -137,6 +162,7 @@ __all__ = [
     "OPENING_FENCE",
     "OptimisticConcurrencyError",
     "Outcome",
+    "PostgresStore",
     "RubricGrader",
     "SqliteStore",
     "Status",

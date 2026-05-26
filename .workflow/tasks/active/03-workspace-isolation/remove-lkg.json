@@ -1,0 +1,49 @@
+{
+  "id": "remove-lkg",
+  "goal": "Delete .workflow/lkg/, .workflow/promote-lkg.sh, and docs/lkg.md, and update docs/strategy.md and CLAUDE.md so the LKG layer no longer appears anywhere in the strategy-layer surface.",
+  "prerequisites": ["add-worktree-isolation"],
+  "tags": ["docs", "cleanup", "strategy"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00003-FEATURE-per-task-workspace-isolation.md",
+      ".workflow/lkg",
+      ".workflow/promote-lkg.sh",
+      "docs/lkg.md",
+      "docs/strategy.md",
+      "CLAUDE.md"
+    ],
+    "references": [
+      "docs/strategy.md:17-19 -- 'Reference implementation' paragraph; rewrite to name per-task worktrees and drop the LKG sentence. Keep the paragraph's brevity and tone.",
+      "CLAUDE.md:7-16 -- 'Authoritative specs in docs/' list; drop the `docs/lkg.md` bullet."
+    ],
+    "constraints": [
+      "Delete the directory `.workflow/lkg/` and all its contents.",
+      "Delete the file `.workflow/promote-lkg.sh`.",
+      "Delete the file `docs/lkg.md`.",
+      "Remove the `- docs/lkg.md -- dogfooding loop: ...` bullet from CLAUDE.md's authoritative-specs list. Do not reorder the remaining bullets.",
+      "Rewrite the 'Reference implementation' paragraph in docs/strategy.md so it names the per-task worktree mechanism (path `.workflow/worktrees/<task-id>/`, branch `flywheel/<phase>/<task-id>`, FF-only merge on done) and removes any mention of `.workflow/lkg/` or `lkg.md`. Keep the paragraph 2-3 sentences and the surrounding section structure intact.",
+      "Do not touch `.workflow/task-worker.sh` -- the prerequisite task already removed the LKG plumbing from the worker.",
+      "Do not edit any file under src/flywheel/. The 'LKG snapshot' comments at src/flywheel/store_sqlite.py:55 and store_postgres.py:69 are out of scope per the spec's zero-changes-to-src/flywheel guarantee.",
+      "Commit the change with a Conventional Commits message (chore: or refactor:) before reporting verify."
+    ],
+    "non_goals": [
+      "Do not touch task-worker.sh or any other strategy-layer script beyond the deletions listed above.",
+      "Do not update src/flywheel/store_sqlite.py or store_postgres.py code comments referencing the LKG snapshot.",
+      "Do not regenerate, reformat, or reorder unrelated content in docs/strategy.md or CLAUDE.md."
+    ],
+    "edge_cases": [
+      ".workflow/lkg/.venv may contain a uv-managed virtualenv with read-only files; rm -rf still works but the command must not silently skip dotfiles.",
+      "docs/strategy.md may have a markdown link `[lkg.md](lkg.md)` inside the rewritten paragraph; remove the link, do not leave a dangling reference."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "test ! -e .workflow/lkg",                                          "name": "lkg-dir-gone" },
+    { "type": "command", "run": "test ! -e .workflow/promote-lkg.sh",                               "name": "promote-script-gone" },
+    { "type": "command", "run": "test ! -e docs/lkg.md",                                            "name": "lkg-doc-gone" },
+    { "type": "command", "run": "! grep -q 'lkg.md' CLAUDE.md",                                     "name": "claude-md-clean" },
+    { "type": "command", "run": "! grep -qiE 'lkg|last known good' docs/strategy.md",               "name": "strategy-md-clean" },
+    { "type": "command", "run": "grep -qiE 'worktree' docs/strategy.md",                            "name": "strategy-md-names-worktrees" },
+    { "type": "command", "run": "uv run pytest",                                                    "name": "full-suite" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(chore|refactor|docs|feat):'", "name": "commit-landed" }
+  ]
+}

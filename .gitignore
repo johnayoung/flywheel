@@ -46,5 +46,8 @@ Thumbs.db
 /logs/
 /tmp/
 
+# Per-task worktrees managed by .workflow/task-worker.sh
+.workflow/worktrees/
+
 # Claude Code local config
 .claude/

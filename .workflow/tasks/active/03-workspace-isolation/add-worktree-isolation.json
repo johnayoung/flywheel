@@ -1,0 +1,68 @@
+{
+  "id": "add-worktree-isolation",
+  "goal": "task-worker.sh runs each task in its own .workflow/worktrees/<task-id>/ git worktree on branch flywheel/<phase>/<task-id>, FF-only-merges to the worker's starting branch on lifecycle.status=done, parks the worktree on failed/interrupted/uncommitted-changes-at-DONE, and runs a 7-day retention sweep at startup -- replacing the LKG-routed invocation inside the worker.",
+  "tags": ["workflow", "worker", "strategy", "worktree"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00003-FEATURE-per-task-workspace-isolation.md",
+      ".workflow/task-worker.sh",
+      ".workflow/promote-lkg.sh",
+      ".gitignore",
+      "docs/strategy.md",
+      "src/flywheel/workflow.py",
+      ".workflow/audits/02-harness-resilience.md"
+    ],
+    "references": [
+      ".workflow/task-worker.sh:99-106 -- LKG bootstrap block to delete",
+      ".workflow/task-worker.sh:116-122 -- run_workflow helper that routes through .workflow/lkg/; rewrite to invoke flywheel from the live tree and pass --sandbox <worktree-path>",
+      ".workflow/task-worker.sh:184-194 -- current --sandbox $REPO_ROOT line; replace with per-task worktree path",
+      "src/flywheel/workflow.py:529 -- --sandbox argument plumbing (unchanged)",
+      "src/flywheel/workflow.py:433-444 -- existing SIGINT handler that finalizes interrupted lifecycles (relied on, unchanged)"
+    ],
+    "constraints": [
+      "Worktree path is .workflow/worktrees/<task-id>/ and branch name is flywheel/<phase>/<task-id>, where <phase> is the task file's parent directory name under .workflow/tasks/active/. If the task file lives directly under .workflow/tasks/active/ with no phase subdir, fall back to flywheel/_root/<task-id>.",
+      "Phase base is the branch the worker started on (typically main); record it once at startup. Each new worktree branches off the live tip of phase base at creation time (post-merge of any prior task).",
+      "On lifecycle.status=done with a clean worktree (`git status --porcelain` empty) and >0 commits on the task branch: `git merge --ff-only flywheel/<phase>/<task-id>` from phase base. On FF failure, `git rebase <base>` the task branch once and retry FF. On rebase failure, `git rebase --abort`, leave the worktree intact, log the path, continue the worker loop.",
+      "On lifecycle.status=done with uncommitted changes (any porcelain output, including untracked files) in the worktree: do not auto-commit, do not merge, leave the worktree on its branch, log a clear line naming the worktree path. Treat as a per-iteration failure that does not block the worker.",
+      "On lifecycle.status=done with zero commits on the task branch (`git rev-list --count <base>..<branch>` == 0): no-op merge -- remove the worktree via `git worktree remove`, delete the branch via `git branch -d`, leave phase base unchanged, log `no commits to merge`.",
+      "On lifecycle.status in (failed, interrupted): preserve the worktree and the branch. No merge attempt. Worker proceeds to next iteration.",
+      "Worker startup runs a retention sweep before entering the main loop: `git worktree prune` first to clean dangling entries, then remove `.workflow/worktrees/*` directories whose mtime is older than `--worktree-retention-days` days (default 7) and `git branch -D` the matching `flywheel/<phase>/<id>` branch. mkdir -p .workflow/worktrees/ if missing.",
+      "Worktree-creation failure (disk full, branch collision, dirty index, path already exists, etc.) exits the wrapper non-zero BEFORE invoking `python -m flywheel.workflow run`. No lifecycle row, no harness.* event. The worker's eligibility loop reselects the same task next iteration.",
+      "The wrapper reads the terminal lifecycle.status for the just-finished run from .workflow/flywheel.sqlite via the `sqlite3` CLI (most recent lifecycle row for the task_id). Use the same DB_PATH variable the worker already exposes.",
+      "Remove the LKG bootstrap block (lines 99-106), the LKG_DIR and PROMOTE_SCRIPT variables, the `[worker] LKG : ...` log line, and the `uv run --project \"$LKG_DIR\"` invocation in run_workflow. Route flywheel through `uv run python -m flywheel.workflow ...` from the repo root.",
+      "Add `.workflow/worktrees/` to .gitignore.",
+      "Document --worktree-retention-days in `task-worker.sh --help` and reframe --sandbox documentation: it is now overridden per-task by the worktree, so the --sandbox flag is effectively unused. Remove --sandbox from the worker's CLI surface, or leave it as a no-op with a note; choose whichever keeps the diff smaller.",
+      "Helper structure is an authoring choice: one helper or several (e.g. .workflow/worktree-create.sh, worktree-merge.sh, worktree-sweep.sh). All helpers live in `.workflow/`. No new Python module. `set -euo pipefail` and `bash -n` clean.",
+      "Commit the change with a Conventional Commits message (feat:) before reporting verify."
+    ],
+    "non_goals": [
+      "Do not edit any file under src/flywheel/ -- strategy-layer work only per docs/strategy.md and the spec's 'Zero changes to src/flywheel/' guarantee.",
+      "Do not delete .workflow/lkg/, .workflow/promote-lkg.sh, or docs/lkg.md, and do not update LKG references in docs/strategy.md or CLAUDE.md. The follow-up task `remove-lkg` does that mop-up.",
+      "Do not update the 'LKG snapshot' code comments at src/flywheel/store_sqlite.py:55 and src/flywheel/store_postgres.py:69 -- they sit inside src/flywheel/ which is out of scope.",
+      "Do not add multi-worker locking, remote push, PR creation, or harness.blocked auto-unblock logic.",
+      "Do not introduce a Python helper for any of this work; bash + sqlite3 CLI + git only.",
+      "Do not add a verify-precheck grader or any change to grader execution order -- that is parked future work."
+    ],
+    "edge_cases": [
+      "Stale worktree directory from a prior worker death blocks `git worktree add` for the same task id. The startup sweep + `git worktree prune` clears it; until then, worktree-creation fails fast (FR-10 path) and the operator sees the path in the log.",
+      "Operator manually deleted the worktree dir but kept the branch: `git worktree prune` during sweep cleans the dangling worktree entry; next `git worktree add` succeeds.",
+      "Two tasks across different phases share the same task id: branch names differ (`flywheel/<phaseA>/<id>` vs `flywheel/<phaseB>/<id>`) but `.workflow/worktrees/<task-id>/` collides -- treat the second as worktree-creation failure; operator resolves.",
+      "SIGINT mid-task: src/flywheel/workflow.py:433-444 already finalizes the lifecycle as `interrupted`; the wrapper observes that status on next read and parks the worktree. No new SIGINT handling needed in the wrapper.",
+      "Untracked files in the worktree at DONE count as uncommitted state (FR-8 fail-loud). `git status --porcelain` reports them; do not filter.",
+      "Phase base advanced between worktree creation and DONE (e.g. an earlier task merged): FF would fail; the wrapper rebases the task branch onto current base once, then retries FF.",
+      "Task whose agent reaches DONE without committing: no-op merge path. Worktree removed, branch deleted, phase base unchanged, log notes 'no commits to merge'."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "bash -n .workflow/task-worker.sh",                                                "name": "worker-syntax" },
+    { "type": "command", "run": "grep -qE '\\.workflow/worktrees/?' .gitignore",                                   "name": "gitignore-entry" },
+    { "type": "command", "run": "grep -qE 'git worktree add' .workflow/task-worker.sh .workflow/*.sh",             "name": "worktree-create-wired" },
+    { "type": "command", "run": "grep -qE 'merge --ff-only' .workflow/task-worker.sh .workflow/*.sh",              "name": "ff-merge-wired" },
+    { "type": "command", "run": "grep -qE -- '--worktree-retention-days' .workflow/task-worker.sh",                "name": "retention-knob" },
+    { "type": "command", "run": "bash .workflow/task-worker.sh --help | grep -qE 'worktree-retention-days'",       "name": "help-mentions-retention" },
+    { "type": "command", "run": "! grep -qE 'uv run --project [^ ]*lkg' .workflow/task-worker.sh",                 "name": "lkg-invocation-gone" },
+    { "type": "command", "run": "! grep -qE 'LKG_DIR|PROMOTE_SCRIPT' .workflow/task-worker.sh",                    "name": "lkg-vars-gone" },
+    { "type": "command", "run": "uv run pytest",                                                                   "name": "full-suite" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|chore|refactor):'",                     "name": "commit-landed" }
+  ]
+}

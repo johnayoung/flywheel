@@ -34,10 +34,6 @@ Python 3.13 required. `uv` is the package manager and task runner — do not inv
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.
 
-## Working from the roadmap
-
-`docs/roadmap.md` is the build order. Each item is decomposed into JSON task definitions under `tasks/roadmap-NN/` that conform to `docs/task-schema.md` — these are the unit of agentic work. Before implementing a roadmap item, read its task JSON(s) and the spec doc they reference; the `graders` block defines "done."
-
 ## Conventions
 
 - Commits use Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`) — matches existing history.

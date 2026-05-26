@@ -22,7 +22,7 @@ DB_PATH="$REPO_ROOT/.workflow/flywheel.sqlite"
 LOG_DIR="$REPO_ROOT/logs/worker"
 SANDBOX="$REPO_ROOT"
 MODEL=""
-MAX_TURNS=40
+MAX_TURNS=500
 MAX_RETRIES=1
 SHUTDOWN=0
 
@@ -58,7 +58,7 @@ Options:
   --db <path>            SQLite database             (default: .workflow/flywheel.sqlite)
   --sandbox <path>       Agent working directory     (default: repo root)
   --model <name>         Override Claude model       (default: SDK default)
-  --max-turns <N>        Max agent turns per attempt (default: 40)
+  --max-turns <N>        SDK runaway backstop, not a per-task budget (default: 500)
   --max-retries <N>      Harness retry budget        (default: 1)
   -h, --help             Show this help
 EOF

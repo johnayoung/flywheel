@@ -71,7 +71,7 @@ from flywheel.task import Task
 DEFAULT_TASKS_DIR = Path(".workflow/tasks")
 DEFAULT_DB_PATH = Path(".workflow/flywheel.sqlite")
 DEFAULT_LOG_DIR = Path("logs/worker")
-DEFAULT_MAX_TURNS = 40
+DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_RETRIES = 1
 
 # Allow Claude Code the surface it needs to actually do engineering work

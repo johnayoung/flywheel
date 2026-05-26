@@ -16,7 +16,7 @@ flywheel exposes three contract points the consumer wraps around. No `Strategy` 
 
 ## Reference implementation
 
-`.workflow/task-worker.sh` is the current dogfooding strategy. It pins flywheel itself to `.workflow/lkg/` (see [lkg.md](lkg.md)) and hands the live repo root as the sandbox — there is no per-task isolation yet, so concurrent edits within a phase share one working tree. Adding per-task isolation is the next strategy-layer upgrade; it does not require any change to `src/flywheel/`.
+`.workflow/task-worker.sh` is the current dogfooding strategy. It runs each task in its own git worktree at `.workflow/worktrees/<task-id>/` on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `lifecycle.status=done` the wrapper fast-forward-merges the task branch back into that base and removes the worktree. No change to `src/flywheel/` was required.
 
 ## Future strategies
 

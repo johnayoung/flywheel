@@ -39,7 +39,9 @@ _VALID_EDGES: dict[Status, frozenset[Status]] = {
             Status.INTERNAL_ERROR,
         }
     ),
-    Status.VALIDATING: frozenset({Status.DONE, Status.FAILED_VALIDATION}),
+    Status.VALIDATING: frozenset(
+        {Status.DONE, Status.FAILED_VALIDATION, Status.INTERRUPTED}
+    ),
     Status.FAILED_VALIDATION: frozenset({Status.READY, Status.FAILED}),
     Status.INTERNAL_ERROR: frozenset({Status.READY, Status.FAILED}),
     Status.INTERRUPTED: frozenset({Status.READY}),

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.lifecycle import Lifecycle, Status
+from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_sqlite import SqliteStore
 from flywheel.workflow import (
     TaskState,
@@ -24,6 +24,7 @@ from flywheel.workflow import (
     iter_active_phase_dirs,
     iter_active_task_files,
     main,
+    recover_stranded_lifecycles,
     select_next_task,
 )
 
@@ -372,3 +373,123 @@ def test_main_status_json_emits_machine_readable(
     assert len(payload) == 1
     assert payload[0]["task_id"] == "a"
     assert payload[0]["state"] == "fresh"
+
+
+# ---------- Stranded-lifecycle recovery ----------
+
+
+def _seed_validating(store: SqliteStore, task_id: str) -> Lifecycle:
+    """Persist a lifecycle wedged in VALIDATING with an open attempt."""
+    now = datetime.now(timezone.utc)
+    lc = Lifecycle(task_id=task_id, run_id=f"run-{task_id}-validating")
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.VALIDATING, now=now)
+    store.create_lifecycle(lc)
+    store.save_attempt(
+        lc.run_id,
+        Attempt(number=1, started_at=now, run_id=lc.run_id),
+    )
+    return lc
+
+
+def test_recover_finalizes_running_lifecycle(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-a")
+        # A task already done in the store must be left untouched.
+        done = _seed_done(store, "task-b")
+        finalized = recover_stranded_lifecycles(store)
+        assert finalized == [running.run_id]
+        reloaded_running = store.load_lifecycle(running.run_id)
+        assert reloaded_running is not None
+        assert reloaded_running.status == Status.INTERRUPTED
+        reloaded_done = store.load_lifecycle(done.run_id)
+        assert reloaded_done is not None
+        assert reloaded_done.status == Status.DONE
+    finally:
+        store.close()
+
+
+def test_recover_finalizes_validating_and_closes_open_attempt(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        validating = _seed_validating(store, "task-v")
+        finalized = recover_stranded_lifecycles(store)
+        assert finalized == [validating.run_id]
+        reloaded = store.load_lifecycle(validating.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        attempts = store.list_attempts(validating.run_id)
+        assert len(attempts) == 1
+        assert attempts[0].ended_at is not None
+        assert attempts[0].outcome == Outcome.INTERNAL_ERROR
+        events = store.list_events(validating.run_id)
+        kinds = [e.kind for e in events]
+        assert "harness.crash" in kinds
+        crash = next(e for e in events if e.kind == "harness.crash")
+        assert crash.payload["classification"] == "worker_interrupted"
+    finally:
+        store.close()
+
+
+def test_recover_filters_by_task_id(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        a = _seed_running(store, "task-a")
+        b = _seed_running(store, "task-b")
+        finalized = recover_stranded_lifecycles(store, task_id="task-a")
+        assert finalized == [a.run_id]
+        # task-b's stranded lifecycle stays stranded until its own
+        # worker-start sweep runs.
+        reloaded_b = store.load_lifecycle(b.run_id)
+        assert reloaded_b is not None
+        assert reloaded_b.status == Status.RUNNING
+    finally:
+        store.close()
+
+
+def test_recover_does_not_consume_retry_budget(tmp_path: Path) -> None:
+    """INTERRUPTED is not a retry-source state — retries must stay put."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        lc = _seed_validating(store, "task-r")
+        assert lc.retries == 0
+        recover_stranded_lifecycles(store)
+        reloaded = store.load_lifecycle(lc.run_id)
+        assert reloaded is not None
+        assert reloaded.retries == 0
+    finally:
+        store.close()
+
+
+def test_main_recover_prints_run_ids(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        seeded = _seed_running(store, "task-x")
+    finally:
+        store.close()
+    rc = main(["recover", "--db", str(db)])
+    assert rc == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out == [seeded.run_id]
+
+
+def test_main_recover_empty_prints_placeholder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "db.sqlite"
+    # Touch the store so it exists with no lifecycles.
+    SqliteStore(db).close()
+    rc = main(["recover", "--db", str(db)])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "(no stranded lifecycles)"

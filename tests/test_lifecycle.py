@@ -138,6 +138,12 @@ def test_validating_to_failed_validation_requires_error() -> None:
     assert lc.error == "assert failed"
 
 
+def test_validating_to_interrupted_no_error_required() -> None:
+    lc = Lifecycle(task_id="t", status=Status.VALIDATING)
+    lc.transition_to(Status.INTERRUPTED)
+    assert lc.status is Status.INTERRUPTED
+
+
 def test_failed_validation_to_failed_terminates() -> None:
     lc = Lifecycle(
         task_id="t",

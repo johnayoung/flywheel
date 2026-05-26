@@ -130,6 +130,7 @@ Prefer `command` graders. A grader fails on non-zero exit; that is "done" for it
 - **Commits are the agent's job.** Flywheel does not own git. Add a constraint to `context.constraints` telling the agent to commit (with a Conventional Commits message) before emitting `intent=verify`. Verify the commit landed with a `command` grader like `git log -1 --format=%s | grep -q '^feat'` if needed.
 - **No `passing`, `steps`, `acceptance_criteria`, `category`, `commit`, `parallel_group`, `priority`, `github_item_id` fields.** Those came from the old schema and are gone. The schema enforces a tight surface — extra fields are silently ignored on load, but they pollute the file and confuse readers.
 - **`prerequisites` is the only ordering mechanism.** Files within a phase run alphabetically when no prerequisite forces order.
+- **Enumerate the dependents of a shared invariant.** When a task adds a new enum value, a new schema column, a new required field, or otherwise changes a shape that other tests/graders assert against, list every test and grader that pins down the old shape in `context.constraints` and require the agent to update them in the same commit. Otherwise the next task in the phase inherits a red suite and is forced to either block or ship `verify` against a known-failing grader (see `.workflow/audits/02-harness-resilience.md`).
 
 ## STEP 5: PRESENT THE PROPOSAL
 

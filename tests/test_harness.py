@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from claude_agent_sdk import (
 )
 
 from flywheel import (
+    Attempt,
     CommandGrader,
     HarnessConfig,
     HarnessOutcome,
@@ -41,6 +43,7 @@ from flywheel import (
     TranscriptGrader,
     run_task,
 )
+from flywheel.harness import finalize_stranded_lifecycle
 from flywheel.envelope import (
     CLOSING_FENCE,
     DuplicateEnvelope,
@@ -915,6 +918,198 @@ class TestRateLimitSurface:
             if e.kind == "harness.iteration_completed"
         ]
         assert completed_events[0].payload["rate_limited"] is True
+
+
+# --- Operator interruption ------------------------------------------------
+
+
+class TestOperatorInterruption:
+    def _signal_killed_grader_invocation(self, signal_no: int) -> Task:
+        # run_command_graders uses shell=True, so the immediate child is
+        # bash, which would normally exit with 128+signal_no when its
+        # own child dies by signal. `exec` lets the python child replace
+        # the shell, so Popen's returncode reflects the signal directly
+        # (negative). SIG_DFL bypasses Python's SIGINT->KeyboardInterrupt
+        # conversion so signal 2 terminates like SIGTERM.
+        run = (
+            f"exec {sys.executable} -c "
+            f"\"import os, signal; "
+            f"signal.signal({signal_no}, signal.SIG_DFL); "
+            f"os.kill(os.getpid(), {signal_no})\""
+        )
+        return Task(
+            goal="g",
+            graders=[CommandGrader(run=run, name="signaled")],
+        )
+
+    def test_sigint_killed_command_grader_routes_to_interrupted(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = self._signal_killed_grader_invocation(2)
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sigint-grader")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(max_retries=1)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # INTERRUPTED is not a retry-source: the harness must break out
+        # of the loop without consuming the retry budget.
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.lifecycle.retries == 0
+        assert len(outcome.attempts) == 1
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "operator interrupted" in attempt.error
+        assert "signal 2" in attempt.error
+        # A single harness.crash event with classification grader_signaled
+        # must record the kill — that is the audit-visible distinguisher
+        # from a real grader failure.
+        events = store.list_events(lifecycle.run_id)
+        crash = [e for e in events if e.kind == "harness.crash"]
+        assert len(crash) == 1
+        assert crash[0].payload["classification"] == "grader_signaled"
+        assert crash[0].payload["signal"] == 2
+
+    def test_sigterm_killed_command_grader_routes_to_interrupted(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = self._signal_killed_grader_invocation(15)
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sigterm-grader")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        crash = [
+            e for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert len(crash) == 1
+        assert crash[0].payload["signal"] == 15
+
+    def test_non_operator_signal_still_routes_to_failed_validation(
+        self,
+    ) -> None:
+        """A grader that segfaults (signal 11) is a real failure, not
+        operator interruption — must consume retry budget like any other
+        validation failure."""
+        store = InMemoryStore()
+        task = self._signal_killed_grader_invocation(11)
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sigsegv-grader")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(max_retries=0)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.VALIDATION_FAILED
+
+
+class TestFinalizeStranded:
+    def _seed_running(self, store: InMemoryStore, run_id: str) -> Lifecycle:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id=run_id)
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        store.create_lifecycle(lc)
+        store.save_attempt(
+            run_id,
+            Attempt(number=1, started_at=now, run_id=run_id),
+        )
+        return lc
+
+    def _seed_validating(
+        self, store: InMemoryStore, run_id: str
+    ) -> Lifecycle:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id=run_id)
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        store.create_lifecycle(lc)
+        store.save_attempt(
+            run_id,
+            Attempt(number=1, started_at=now, run_id=run_id),
+        )
+        return lc
+
+    def test_finalize_running_transitions_to_interrupted(self) -> None:
+        store = InMemoryStore()
+        lc = self._seed_running(store, "run-strand-r")
+        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        assert ok is True
+        reloaded = store.load_lifecycle(lc.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        attempts = store.list_attempts(lc.run_id)
+        assert attempts[0].ended_at is not None
+        assert attempts[0].outcome == Outcome.INTERNAL_ERROR
+        crash = [
+            e for e in store.list_events(lc.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert len(crash) == 1
+        assert crash[0].payload["classification"] == "worker_interrupted"
+        assert crash[0].payload["from_status"] == "running"
+
+    def test_finalize_validating_transitions_to_interrupted(self) -> None:
+        store = InMemoryStore()
+        lc = self._seed_validating(store, "run-strand-v")
+        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        assert ok is True
+        reloaded = store.load_lifecycle(lc.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+
+    def test_finalize_done_lifecycle_is_noop(self) -> None:
+        store = InMemoryStore()
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id="run-strand-done")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        lc.transition_to(Status.DONE, now=now)
+        store.create_lifecycle(lc)
+        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        assert ok is False
+        reloaded = store.load_lifecycle(lc.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.DONE
+
+    def test_finalize_missing_lifecycle_is_noop(self) -> None:
+        store = InMemoryStore()
+        ok = finalize_stranded_lifecycle(store, "run-does-not-exist")
+        assert ok is False
 
 
 # --- TODO subsystems remain deferred --------------------------------------

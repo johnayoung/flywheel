@@ -36,6 +36,7 @@ Subcommands::
     python -m flywheel.workflow status [--tasks-dir DIR] [--db PATH]
     python -m flywheel.workflow is-done TASK_FILE [--db PATH]
     python -m flywheel.workflow archive [--tasks-dir DIR] [--db PATH]
+    python -m flywheel.workflow recover [--db PATH]
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from flywheel.harness import (
     HarnessOutcome,
     InvocationRequest,
     InvokeFunc,
+    finalize_stranded_lifecycle,
     run_task,
 )
 from flywheel.invoker import IterationResult, invoke_iteration
@@ -280,6 +282,52 @@ def select_next_task(rows: Iterable[TaskStatusRow]) -> TaskStatusRow | None:
     return None
 
 
+# --- Stranded-lifecycle recovery -------------------------------------------
+
+
+_STRANDED_STATUSES: frozenset[Status] = frozenset(
+    {Status.RUNNING, Status.VALIDATING}
+)
+
+
+def _stranded_run_ids(store: SqliteStore, task_id: str | None = None) -> list[str]:
+    """Return run_ids whose lifecycle is mid-attempt with no live worker.
+
+    A run is considered stranded when its status sits in ``running`` or
+    ``validating`` after the worker that owned it exited — there is no
+    process-level liveness check available here, so the caller uses this
+    only at boundaries where it knows no harness is currently running
+    that lifecycle (worker start, post-interrupt cleanup, ``recover``).
+    """
+    placeholders = ", ".join("?" for _ in _STRANDED_STATUSES)
+    params: list[str] = [s.value for s in _STRANDED_STATUSES]
+    sql = (
+        f"SELECT run_id FROM lifecycles WHERE status IN ({placeholders})"
+    )
+    if task_id is not None:
+        sql += " AND task_id = ?"
+        params.append(task_id)
+    sql += " ORDER BY updated_at"
+    cursor = store._connection.execute(sql, params)  # noqa: SLF001
+    return [row["run_id"] for row in cursor.fetchall()]
+
+
+def recover_stranded_lifecycles(
+    store: SqliteStore, *, task_id: str | None = None
+) -> list[str]:
+    """Finalize every stranded lifecycle, optionally filtered by ``task_id``.
+
+    Delegates to :func:`flywheel.harness.finalize_stranded_lifecycle` for
+    each match; returns the run_ids that were actually finalized (i.e.
+    were in ``running``/``validating`` at the time of the call).
+    """
+    finalized: list[str] = []
+    for run_id in _stranded_run_ids(store, task_id):
+        if finalize_stranded_lifecycle(store, run_id):
+            finalized.append(run_id)
+    return finalized
+
+
 # --- Run subcommand ---------------------------------------------------------
 
 
@@ -338,6 +386,20 @@ async def run_task_file(
 
     backend = SqliteStore(db_path)
     try:
+        # Recover any prior lifecycle for this task that was killed
+        # mid-attempt before we create a new one. Keeps the audit trail
+        # honest (no lifecycles stuck in `running` forever) and frees
+        # the retry budget — INTERRUPTED is not a retry-source state.
+        for stranded_run_id in recover_stranded_lifecycles(
+            backend, task_id=task.id
+        ):
+            print(
+                f"[workflow] recovered: stranded run {stranded_run_id} "
+                f"-> interrupted",
+                file=out,
+                flush=True,
+            )
+
         print(
             f"[workflow] task    : {task.id}",
             file=out,
@@ -353,20 +415,33 @@ async def run_task_file(
             file=out,
             flush=True,
         )
-        outcome = await run_task(
-            task,
-            lifecycle,
-            backend,
-            config=HarnessConfig(
-                max_retries=max_retries,
-                agent_context={
-                    "model_id": model or "claude-code-default",
-                    "agent_sdk": "claude_agent_sdk",
-                    "sandbox": str(sandbox),
-                },
-            ),
-            invoke=invoker,
-        )
+        try:
+            outcome = await run_task(
+                task,
+                lifecycle,
+                backend,
+                config=HarnessConfig(
+                    max_retries=max_retries,
+                    agent_context={
+                        "model_id": model or "claude-code-default",
+                        "agent_sdk": "claude_agent_sdk",
+                        "sandbox": str(sandbox),
+                    },
+                ),
+                invoke=invoker,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # Operator killed the worker mid-attempt. Finalize the open
+            # attempt as INTERNAL_ERROR and transition the lifecycle to
+            # INTERRUPTED so the next worker start sees a clean slate
+            # rather than a lifecycle wedged in `running`.
+            finalize_stranded_lifecycle(backend, lifecycle.run_id)
+            print(
+                f"[workflow] status  : interrupted (worker received signal)",
+                file=out,
+                flush=True,
+            )
+            raise
         print(
             f"[workflow] status  : {outcome.lifecycle.status.value}",
             file=out,
@@ -519,6 +594,22 @@ def _cmd_is_done(args: argparse.Namespace) -> int:
     return 0 if done else 1
 
 
+def _cmd_recover(args: argparse.Namespace) -> int:
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        finalized = recover_stranded_lifecycles(store)
+    finally:
+        store.close()
+    if not finalized:
+        print("(no stranded lifecycles)")
+        return 0
+    for run_id in finalized:
+        print(run_id)
+    return 0
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)
@@ -637,6 +728,16 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_db(p_archive)
     p_archive.set_defaults(func=_cmd_archive)
 
+    p_recover = sub.add_parser(
+        "recover",
+        help=(
+            "Finalize lifecycles stuck in running/validating "
+            "(prints run_ids transitioned to interrupted)."
+        ),
+    )
+    _add_common_db(p_recover)
+    p_recover.set_defaults(func=_cmd_recover)
+
     return parser
 
 
@@ -667,6 +768,7 @@ __all__ = [
     "iter_active_task_files",
     "load_active_tasks",
     "main",
+    "recover_stranded_lifecycles",
     "run_task_file",
     "select_next_task",
     "task_state",

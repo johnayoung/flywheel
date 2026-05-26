@@ -369,6 +369,37 @@ def _grader_failure_error(
     return "grader failure"
 
 
+# SIGINT (Ctrl+C from operator) and SIGTERM (typical process shutdown)
+# indicate the grader subprocess was killed externally, not that the
+# code under test asserted false. The audit pattern these signals fit
+# is "operator interrupted", so the harness must not record them as a
+# validation failure that consumes the retry budget.
+_OPERATOR_SIGNAL_NUMBERS: frozenset[int] = frozenset({2, 15})
+
+
+def _signal_killed_grader(
+    results: Sequence[GraderResultRecord],
+) -> GraderResultRecord | None:
+    """Return the first failing command grader killed by SIGINT/SIGTERM.
+
+    Distinguishes operator-induced interruption (which must route to
+    ``INTERRUPTED`` so the retry budget is preserved) from a grader that
+    legitimately exited non-zero (``VALIDATION_FAILED``).
+    """
+    for result in results:
+        if result.passed:
+            continue
+        if result.grader_type != "command":
+            continue
+        payload = result.payload
+        if payload.get("termination") != "signal":
+            continue
+        signal_no = payload.get("signal")
+        if isinstance(signal_no, int) and signal_no in _OPERATOR_SIGNAL_NUMBERS:
+            return result
+    return None
+
+
 async def run_task(
     task: Task,
     lifecycle: Lifecycle,
@@ -906,6 +937,44 @@ async def _validate(
         return
 
     if not command_passed:
+        signaled = _signal_killed_grader(command_results)
+        if signaled is not None:
+            grader_label = signaled.grader_name or signaled.grader_type
+            signal_no = int(signaled.payload.get("signal", 0))
+            error = (
+                f"operator interrupted command grader {grader_label!r} "
+                f"(signal {signal_no})"
+            )
+            _emit(
+                store,
+                run_id=lifecycle.run_id,
+                kind="harness.crash",
+                payload={
+                    "classification": "grader_signaled",
+                    "signal": signal_no,
+                    "grader_name": signaled.grader_name,
+                    "grader_ordinal": signaled.ordinal,
+                    "message": error,
+                },
+                attempt_number=attempt.number,
+                now=clock,
+            )
+            _finalize_attempt(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.INTERNAL_ERROR,
+                error=error,
+                agent_output=agent_output,
+                clock=clock,
+            )
+            _transition(
+                lifecycle,
+                Status.INTERRUPTED,
+                store=store,
+                now=clock,
+            )
+            return
         error = _grader_failure_error(command_results)
     else:
         error = _grader_failure_error(transcript_results)
@@ -958,11 +1027,82 @@ def _finalize_attempt(
     )
 
 
+def finalize_stranded_lifecycle(
+    store: HarnessStore,
+    run_id: str,
+    *,
+    reason: str = "worker interrupted before finalization",
+    classification: str = "worker_interrupted",
+    now: Callable[[], datetime] | None = None,
+) -> bool:
+    """Drain a lifecycle stranded in ``RUNNING`` or ``VALIDATING`` to
+    ``INTERRUPTED``.
+
+    Used when the worker process is killed mid-attempt (SIGINT, SIGTERM,
+    machine reboot) and the in-flight attempt never reached
+    :func:`_finalize_attempt`. Closes any open attempt as
+    :attr:`Outcome.INTERNAL_ERROR`, emits a single ``harness.crash``
+    event, and transitions the lifecycle to :attr:`Status.INTERRUPTED`
+    so the retry budget is preserved and the next worker start can pick
+    up a fresh lifecycle.
+
+    No-op (returns ``False``) when the lifecycle is missing or already
+    in a status the harness considers final or quiescent.
+    """
+    clock = now or _utcnow
+    lifecycle = store.load_lifecycle(run_id)
+    if lifecycle is None:
+        return False
+    if lifecycle.status not in (Status.RUNNING, Status.VALIDATING):
+        return False
+
+    attempts = store.list_attempts(run_id)
+    open_attempts = [a for a in attempts if a.ended_at is None]
+    last_attempt_number = (
+        open_attempts[-1].number
+        if open_attempts
+        else (attempts[-1].number if attempts else None)
+    )
+    for attempt in open_attempts:
+        attempt.ended_at = clock()
+        attempt.outcome = Outcome.INTERNAL_ERROR
+        attempt.error = reason
+        store.save_attempt(run_id, attempt)
+        _emit(
+            store,
+            run_id=run_id,
+            kind="harness.attempt_finalized",
+            payload={
+                "number": attempt.number,
+                "outcome": Outcome.INTERNAL_ERROR.value,
+                "error": reason,
+            },
+            attempt_number=attempt.number,
+            now=clock,
+        )
+
+    _emit(
+        store,
+        run_id=run_id,
+        kind="harness.crash",
+        payload={
+            "classification": classification,
+            "message": reason,
+            "from_status": lifecycle.status.value,
+        },
+        attempt_number=last_attempt_number,
+        now=clock,
+    )
+    _transition(lifecycle, Status.INTERRUPTED, store=store, now=clock)
+    return True
+
+
 __all__ = [
     "HarnessConfig",
     "HarnessOutcome",
     "HarnessStore",
     "InvocationRequest",
     "InvokeFunc",
+    "finalize_stranded_lifecycle",
     "run_task",
 ]

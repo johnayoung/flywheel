@@ -22,6 +22,8 @@ The lifecycle tracks a task's execution state from creation to terminal outcome.
 pending -> ready -> running -> validating -> done
                       |           |
                       |      failed_validation -> ready (retry) or failed
+                      |           |
+                      |           +-> interrupted -> ready
                       |
                       +-> internal_error -> ready (retry) or failed
                       +-> failed
@@ -31,8 +33,9 @@ pending -> ready -> running -> validating -> done
 Key rules:
 - `done` and `failed` are terminal — no transitions out
 - `failed_validation` and `internal_error` can transition back to `ready` (consuming retry budget)
-- `interrupted` always resumes via `ready`
+- `interrupted` always resumes via `ready` and does **not** consume retry budget
 - Transitioning to `failed`, `failed_validation`, or `internal_error` requires the `Error` field to be set
+- Operator interruption (worker SIGINT/SIGTERM, command-grader SIGINT/SIGTERM) routes through `interrupted` so the retry budget is preserved; the attempt's `Outcome` is `internal_error` and a `harness.crash` event records the classification (`worker_interrupted` or `grader_signaled`)
 
 ## Lifecycle struct
 

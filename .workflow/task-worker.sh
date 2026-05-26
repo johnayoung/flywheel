@@ -21,6 +21,8 @@ TASKS_DIR="$REPO_ROOT/.workflow/tasks"
 DB_PATH="$REPO_ROOT/.workflow/flywheel.sqlite"
 LOG_DIR="$REPO_ROOT/logs/worker"
 SANDBOX="$REPO_ROOT"
+LKG_DIR="$REPO_ROOT/.workflow/lkg"
+PROMOTE_SCRIPT="$REPO_ROOT/.workflow/promote-lkg.sh"
 MODEL=""
 MAX_TURNS=500
 MAX_RETRIES=1
@@ -88,6 +90,22 @@ fi
 mkdir -p "$(dirname "$DB_PATH")"
 
 # ---------------------------------------------------------------------------
+# LKG bootstrap
+# ---------------------------------------------------------------------------
+# The worker runs flywheel against a pinned snapshot at .workflow/lkg/ so that
+# an in-flight task editing src/flywheel/ cannot break the next iteration.
+# Promotion of live -> LKG is an explicit, named step (promote-lkg.sh). On
+# first run we bootstrap from the live tree so existing checkouts keep working.
+if [[ ! -f "$LKG_DIR/SOURCE_SHA" ]]; then
+  if [[ ! -x "$PROMOTE_SCRIPT" ]]; then
+    echo "ERROR: LKG snapshot missing and promote script not found at $PROMOTE_SCRIPT" >&2
+    exit 1
+  fi
+  echo "[worker] No LKG snapshot found; bootstrapping from live tree." >&2
+  "$PROMOTE_SCRIPT" --bootstrap
+fi
+
+# ---------------------------------------------------------------------------
 # Signal handling
 # ---------------------------------------------------------------------------
 trap 'SHUTDOWN=1; echo "[worker] Shutdown requested, waiting for current task..." >&2' SIGINT SIGTERM
@@ -97,7 +115,10 @@ trap 'SHUTDOWN=1; echo "[worker] Shutdown requested, waiting for current task...
 # ---------------------------------------------------------------------------
 run_workflow() {
   # Wrap `python -m flywheel.workflow` so we route through uv consistently.
-  uv run --project "$REPO_ROOT" python -m flywheel.workflow "$@"
+  # Routed through the pinned LKG snapshot so a mid-task edit to flywheel's
+  # own source cannot break the next iteration; the live tree is what the
+  # agent edits, the LKG is what the worker runs.
+  uv run --project "$LKG_DIR" python -m flywheel.workflow "$@"
 }
 
 next_task_file() {
@@ -124,11 +145,13 @@ archive_completed() {
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+LKG_SHA="$(cat "$LKG_DIR/SOURCE_SHA" 2>/dev/null || echo unknown)"
 echo "[worker] Task worker started"      >&2
 echo "[worker] Tasks dir : $TASKS_DIR"    >&2
 echo "[worker] DB        : $DB_PATH"      >&2
 echo "[worker] Log dir   : $LOG_DIR"      >&2
 echo "[worker] Sandbox   : $SANDBOX"      >&2
+echo "[worker] LKG       : $LKG_DIR ($LKG_SHA)" >&2
 echo "[worker] PID       : $$"            >&2
 echo ""                                    >&2
 

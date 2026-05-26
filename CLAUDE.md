@@ -10,9 +10,10 @@ Authoritative specs in `docs/` override any inferred behavior:
 - `docs/task-schema.md` — `Task`/`Grader`/`Context` shape and validation rules
 - `docs/task-lifecycle.md` — `Lifecycle`/`Attempt`/`Status`/`Outcome` and transition rules
 - `docs/loop.md` — iteration envelope (`<!-- LOOP_STATUS -->`) and harness behavior
-- `docs/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`)
+- `src/flywheel/_schema/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`); Postgres mirror lives alongside it
 - `docs/strategy.md` — submission strategy (deferred)
 - `docs/roadmap.md` — ordered build plan; each item depends only on prior items
+- `docs/lkg.md` — dogfooding loop: the worker runs `.workflow/lkg/`, not the live tree; promote explicitly
 
 ## Commands
 

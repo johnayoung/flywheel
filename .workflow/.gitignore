@@ -2,3 +2,7 @@
 flywheel.sqlite
 flywheel.sqlite-shm
 flywheel.sqlite-wal
+
+# LKG snapshot of flywheel that the worker actually executes. Local-only,
+# managed by promote-lkg.sh; never committed.
+lkg/

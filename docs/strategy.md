@@ -1,38 +1,23 @@
 # Strategy
 
-The Strategy interface owns everything between "the agent finished the work" and "the result is committed/merged/submitted." It is the pluggable boundary where git workflow lives — the loop calls into it, but does not know or care what it does internally.
+Strategy is the work between "agent finished" and "result committed / merged / submitted" — branches, worktrees, commits, merges, submissions, review gates.
 
-## Responsibilities
+**Strategy lives in the consumer of the loop, not inside the loop.** `flywheel.harness` owns the lifecycle, envelopes, graders, attempts, and events. Strategy lives one layer up because it is task-class-specific (code tasks need commits; research / config / non-code tasks don't) and the loop is task-agnostic by design (see [vision.md](vision.md), "What it is not").
 
-- Branch creation and naming (e.g., deriving a slug from the task's `goal` and `tags`)
-- Commit message generation
-- Worktree setup and teardown
-- Merge conflict detection and resolution
-- Submission (push, PR creation, merge)
-- Review gates (if applicable)
+## The seam
 
-## Interface
+flywheel exposes three contract points the consumer wraps around. No `Strategy` Protocol, no hooks the loop calls into, no default no-op to maintain.
 
-```python
-from typing import Protocol
-from flywheel.task import Task
+| Direction      | Surface                          | What it carries                                                                                              |
+| -------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| In             | `flywheel run --sandbox <dir>`   | The working environment for this attempt. The consumer provisions it (worktree, branch, snapshot, container, plain dir). |
+| Out, streaming | `events` table (`harness.*`)     | Recorded in real time during the run; consumers can tail or query.                                           |
+| Out, terminal  | `lifecycle.status`               | `done` / `failed` / `interrupted` — what to do next is the consumer's call.                                  |
 
-class Strategy(Protocol):
-    def setup(self, task: Task) -> "StrategyContext": ...
-    def submit(self, ctx: "StrategyContext") -> "StrategyResult": ...
-    def cleanup(self, ctx: "StrategyContext") -> None: ...
-```
+## Reference implementation
 
-**setup** is called before the agent runs. It prepares the working environment — creates a branch, sets up a worktree, configures env vars. Returns a `StrategyContext` the loop threads through subsequent calls.
+`.workflow/task-worker.sh` is the current dogfooding strategy. It pins flywheel itself to `.workflow/lkg/` (see [lkg.md](lkg.md)) and hands the live repo root as the sandbox — there is no per-task isolation yet, so concurrent edits within a phase share one working tree. Adding per-task isolation is the next strategy-layer upgrade; it does not require any change to `src/flywheel/`.
 
-**submit** is called as a side-effect of the lifecycle reaching `done`. It commits changes, pushes, creates PRs — whatever the strategy defines as "submission." Returns a `StrategyResult` with a ref (commit hash, PR URL, etc.).
+## Future strategies
 
-**cleanup** is called on teardown regardless of outcome. Removes worktrees, deletes temporary branches, releases resources.
-
-## Utilities
-
-`derive_slug(commit: str) -> str` — extracts a branch-name slug from a conventional commit message. Lives in the strategy module as a helper for implementations that use conventional commits for branch naming.
-
-## Status
-
-Specified here; not yet implemented. First concrete strategy will likely be a simple "branch + commit + push" flow for single-task execution.
+Per-task worktrees, branch-per-task with auto-merge on `done`, PR-creation on `done`, multi-worker scheduling, container-based isolation, non-git submission flows — all live above the loop. Each reads the events stream and the terminal `lifecycle.status` row and acts accordingly. flywheel does not need to know they exist.

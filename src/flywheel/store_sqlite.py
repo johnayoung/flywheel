@@ -2,10 +2,10 @@
 ``flywheel.store_protocols``.
 
 Durable persistence backend. Bootstraps schema by executing
-``docs/persistence-schema.sql`` verbatim (including the
+``flywheel/_schema/persistence-schema.sql`` verbatim (including the
 ``PRAGMA journal_mode = WAL`` and ``PRAGMA foreign_keys = ON``
 directives). The DDL is not re-derived inline — the canonical SQL file
-is the single source of truth.
+is the single source of truth and travels with the package.
 
 Per-connection invariants enforced on every open:
 
@@ -34,6 +34,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timezone
+from importlib.resources.abc import Traversable
+from importlib.resources import files
 from pathlib import Path
 from typing import cast
 
@@ -48,10 +50,11 @@ from flywheel.store_protocols import (
     OptimisticConcurrencyError,
 )
 
-# Resolved at import time so the schema file is found via the editable
-# package layout (``src/flywheel`` -> repo root contains ``docs/``).
-_SCHEMA_PATH: Path = (
-    Path(__file__).resolve().parents[2] / "docs" / "persistence-schema.sql"
+# Bundled as package data so the DDL travels with the install — no
+# reliance on a repo-relative ``docs/`` path that breaks under wheel
+# installs or the LKG snapshot.
+_SCHEMA_PATH: Traversable = (
+    files("flywheel") / "_schema" / "persistence-schema.sql"
 )
 
 # Append-only enforcement on grader_results. Applied post-bootstrap so

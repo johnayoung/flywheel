@@ -31,10 +31,10 @@ from flywheel.store_sqlite import _SCHEMA_PATH
 # --- Schema bootstrap ------------------------------------------------------
 
 
-def test_schema_path_points_at_canonical_docs_file() -> None:
-    """The bootstrap path is the canonical schema file under docs/."""
+def test_schema_path_points_at_canonical_package_file() -> None:
+    """The bootstrap path is the canonical schema file bundled in the package."""
     assert _SCHEMA_PATH.name == "persistence-schema.sql"
-    assert _SCHEMA_PATH.exists()
+    assert _SCHEMA_PATH.is_file()
     text = _SCHEMA_PATH.read_text(encoding="utf-8")
     # Two non-negotiable pragmas from the constraint list.
     assert "PRAGMA journal_mode = WAL" in text

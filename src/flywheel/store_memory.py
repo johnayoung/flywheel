@@ -7,7 +7,7 @@ no ``sqlite3``, file, or network IO — durable persistence lives in the
 SQLite store (a sibling task).
 
 Storage layout follows the table boundaries in
-``docs/persistence-schema.sql``:
+``flywheel/_schema/persistence-schema.sql``:
 
 * ``_lifecycles`` is keyed by ``run_id`` and holds the row state with no
   attempts attached; ``attempts`` are populated on read by joining the

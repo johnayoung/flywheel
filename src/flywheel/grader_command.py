@@ -4,7 +4,7 @@ Executes the ``command`` graders declared on a :class:`flywheel.task.Task` in
 list order, persisting one row per execution to a :class:`GraderResultStore`
 in the documented append-only shape.
 
-Contract surface (see ``docs/task-schema.md`` and ``docs/persistence-schema.sql``):
+Contract surface (see ``docs/task-schema.md`` and ``flywheel/_schema/persistence-schema.sql``):
 
 * Graders are run in the order they appear on ``task.graders``. On the first
   failure, later command graders are skipped (matches the cost-order

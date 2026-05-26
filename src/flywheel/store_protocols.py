@@ -2,7 +2,7 @@
 
 Pure type module: defines the wire-level shape every concrete store must
 satisfy (in-memory, SQLite, future backends). Keying mirrors
-`docs/persistence-schema.sql` column-level definitions exactly so concrete
+`flywheel/_schema/persistence-schema.sql` column-level definitions exactly so concrete
 stores converge on the same surface.
 
 This module deliberately imports no IO, persistence, SQLite, JSON, file,
@@ -80,7 +80,7 @@ GraderType = Literal["command", "transcript", "rubric", "manual"]
 class EventRecord:
     """A single timeline event emitted by the harness.
 
-    Mirrors the ``events`` table in ``docs/persistence-schema.sql``. ``id``
+    Mirrors the ``events`` table in ``flywheel/_schema/persistence-schema.sql``. ``id``
     is assigned by the store on append; callers leave it ``None``.
     """
 
@@ -96,7 +96,7 @@ class EventRecord:
 class GraderResultRecord:
     """A single grader execution receipt; append-only by contract.
 
-    Mirrors the ``grader_results`` table in ``docs/persistence-schema.sql``.
+    Mirrors the ``grader_results`` table in ``flywheel/_schema/persistence-schema.sql``.
     ``grader_spec`` snapshots the exact grader object as it appeared in the
     task at run time so historical truth survives later edits.
     ``payload`` carries per-type execution detail (shape defined by

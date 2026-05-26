@@ -15,7 +15,7 @@ Schema isolation lets multiple flywheel deployments share one database
 under separate Postgres schemas. The schema name is validated against
 an identifier-safe regex and applied per-connection via ``SET
 search_path TO <schema>, public`` in a pool ``configure`` callback;
-unqualified DDL in ``docs/persistence-schema-postgres.sql`` therefore
+unqualified DDL in ``flywheel/_schema/persistence-schema-postgres.sql`` therefore
 creates tables under the requested schema without f-stringing caller
 input into the SQL.
 
@@ -37,7 +37,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from pathlib import Path
+from importlib.resources.abc import Traversable
+from importlib.resources import files
 from typing import Any, cast
 
 try:
@@ -63,12 +64,11 @@ from flywheel.store_protocols import (
     OptimisticConcurrencyError,
 )
 
-# Resolved at import time so the schema file is found via the editable
-# package layout (``src/flywheel`` -> repo root contains ``docs/``).
-_SCHEMA_PATH: Path = (
-    Path(__file__).resolve().parents[2]
-    / "docs"
-    / "persistence-schema-postgres.sql"
+# Bundled as package data so the DDL travels with the install — no
+# reliance on a repo-relative ``docs/`` path that breaks under wheel
+# installs or the LKG snapshot.
+_SCHEMA_PATH: Traversable = (
+    files("flywheel") / "_schema" / "persistence-schema-postgres.sql"
 )
 
 # Identifier-safe schema name: ASCII letter/underscore start, then
@@ -133,7 +133,7 @@ class PostgresStore:
     The constructor opens the pool, validates connectivity by probing
     the DSN (raises ``psycopg.OperationalError`` unchanged on unreachable
     server / auth failure), ensures the schema exists, and bootstraps
-    the schema by executing ``docs/persistence-schema-postgres.sql``.
+    the schema by executing ``flywheel/_schema/persistence-schema-postgres.sql``.
     Bootstrap is idempotent against an already-initialised database.
     """
 

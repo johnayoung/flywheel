@@ -15,13 +15,14 @@ from flywheel import (
 # --- Type fidelity ---------------------------------------------------------
 
 
-def test_status_enumerates_exactly_the_eight_spec_states() -> None:
+def test_status_enumerates_exactly_the_nine_spec_states() -> None:
     expected = {
         "pending",
         "ready",
         "running",
         "validating",
         "failed_validation",
+        "internal_error",
         "done",
         "failed",
         "interrupted",

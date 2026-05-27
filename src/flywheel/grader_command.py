@@ -28,6 +28,7 @@ which graders come after ``command`` — those are the harness's concern.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -138,6 +139,7 @@ def run_command_graders(
             env=dict(env) if env is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
 
         timed_out = False
@@ -147,7 +149,14 @@ def run_command_graders(
             )
         except subprocess.TimeoutExpired:
             timed_out = True
-            proc.kill()
+            # SIGKILL the whole process group, not just the /bin/sh wrapper.
+            # Otherwise grandchildren (the actual command behind shell=True)
+            # are reparented to init, keep stdout/stderr open, and the
+            # follow-up communicate() blocks until they exit on their own.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             stdout, stderr = proc.communicate()
 
         end_ns = time.monotonic_ns()

@@ -76,18 +76,6 @@ DEFAULT_LOG_DIR = Path("logs/worker")
 DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_RETRIES = 1
 
-# Allow Claude Code the surface it needs to actually do engineering work
-# in this repo. The agent runs in the project root with full permissions
-# bypassed because the worker is the trust boundary.
-_AGENT_ALLOWED_TOOLS: tuple[str, ...] = (
-    "Read",
-    "Write",
-    "Edit",
-    "Bash",
-    "Glob",
-    "Grep",
-)
-
 
 class TaskState(str, Enum):
     """Task-level status derived from the latest lifecycle, if any."""
@@ -345,8 +333,8 @@ def _make_claude_code_invoke(
     options = ClaudeAgentOptions(
         cwd=str(sandbox),
         add_dirs=[str(sandbox)],
-        allowed_tools=list(_AGENT_ALLOWED_TOOLS),
         permission_mode="bypassPermissions",
+        skills="all",
         max_turns=max_turns,
         model=model,
     )

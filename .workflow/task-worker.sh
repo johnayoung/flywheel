@@ -27,6 +27,14 @@
 
 set -euo pipefail
 
+# Job-control mode: every `&` subshell runs in its own process group, so a
+# terminal-driven SIGINT (Ctrl-C) is delivered to the worker's foreground PG
+# only. In-flight task subshells stay alive on first Ctrl-C and the worker
+# forwards signals to them deliberately as shutdown escalates -- otherwise the
+# Python harness dies mid-attempt with KeyboardInterrupt and strands the
+# lifecycle in `running` (see .workflow/audits/02-harness-resilience.md).
+set -m
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 TASKS_DIR="$REPO_ROOT/.workflow/tasks"
 DB_PATH="$REPO_ROOT/.workflow/flywheel.sqlite"
@@ -38,7 +46,10 @@ MAX_TURNS=500
 MAX_RETRIES=1
 MAX_PARALLEL=1
 RETENTION_DAYS=7
-SHUTDOWN=0
+# Escalating shutdown level driven by SIGINT/SIGTERM:
+#   0 = running, 1 = graceful drain (stop spawning, let children finish),
+#   2 = SIGTERM children's process groups, 3+ = SIGKILL them.
+SHUTDOWN_LEVEL=0
 
 # Circuit breaker: skip a task after this many consecutive worktree-creation
 # failures so one broken task can't starve the loop. Keyed by task_id.
@@ -179,12 +190,70 @@ release_lock() {
 }
 
 acquire_lock
-trap 'release_lock' EXIT
 
 # ---------------------------------------------------------------------------
 # Signal handling
 # ---------------------------------------------------------------------------
-trap 'SHUTDOWN=1; echo "[worker] Shutdown requested, waiting for current task..." >&2' SIGINT SIGTERM
+# Escalating Ctrl-C / SIGTERM:
+#   1st  graceful drain -- stop spawning new tasks, let in-flight ones finish.
+#   2nd  SIGTERM each child's process group (the bash subshell + the python
+#        harness it spawned) so the harness can catch the signal and finalize.
+#   3rd+ SIGKILL -- last resort; lifecycles will remain in `running` until a
+#        recovery sweep reconciles them.
+handle_shutdown() {
+  SHUTDOWN_LEVEL=$(( SHUTDOWN_LEVEL + 1 ))
+  case "$SHUTDOWN_LEVEL" in
+    1)
+      echo "[worker] Shutdown requested -- draining ${#RUNNING_PIDS[@]} in-flight task(s). Ctrl-C again to terminate them." >&2
+      ;;
+    2)
+      echo "[worker] Terminating ${#RUNNING_PIDS[@]} in-flight task(s) with SIGTERM. Ctrl-C again to force-kill." >&2
+      local pid
+      for pid in "${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}"; do
+        # `-pid` targets the process group; with `set -m` the PG ID equals the
+        # subshell PID, so this hits the python harness too. Fall back to
+        # signalling the subshell directly if the PG lookup fails.
+        kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      done
+      ;;
+    *)
+      echo "[worker] Force-killing ${#RUNNING_PIDS[@]} in-flight task(s) with SIGKILL." >&2
+      local pid
+      for pid in "${RUNNING_PIDS[@]+"${RUNNING_PIDS[@]}"}"; do
+        kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      done
+      ;;
+  esac
+}
+
+# EXIT trap: always reap remaining children and release the lock, even on
+# abnormal exit (set -e failure, SIGKILL to a descendant, etc.). Without this,
+# orphaned subshells stay running and `remove_finished` is skipped -- meaning
+# the parked-worktree / merge logic never gets a chance to record final state.
+on_exit() {
+  local rc=$?
+  # Don't let `set -e` short-circuit cleanup if a git/sqlite call hiccups.
+  set +e
+  # Clear only the EXIT trap to avoid recursion; SIGINT/SIGTERM stay armed so
+  # operators can still escalate (SIGTERM -> SIGKILL) during the drain below.
+  trap - EXIT
+  if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
+    echo "[worker] Cleanup: draining ${#RUNNING_PIDS[@]} in-flight task(s)..." >&2
+    while [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; do
+      # `wait -n` returns when any tracked child exits OR when a signal trap
+      # fires (e.g., escalating SIGTERM/SIGKILL during drain). Either way,
+      # remove_finished sweeps up whatever finished and we re-evaluate.
+      wait -n "${RUNNING_PIDS[@]}" 2>/dev/null
+      remove_finished
+    done
+  fi
+  release_lock
+  echo "[worker] Shutting down." >&2
+  exit "$rc"
+}
+
+trap on_exit EXIT
+trap handle_shutdown SIGINT SIGTERM
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -263,6 +332,68 @@ read_lifecycle_status() {
     2>/dev/null || true
 }
 
+reconcile_to_interrupted() {
+  # Direct DB write to transition the most recent lifecycle for $task_id out
+  # of `running`/`validating` and into `interrupted`. Workaround for the
+  # python harness not catching SIGTERM/SIGKILL -- without this the row sits
+  # in `running`, `flywheel.workflow next` won't pick the task up again, and
+  # the parked worktree dangles until the retention sweep deletes it
+  # (see audit recommendation #3 in .workflow/audits/02-harness-resilience.md).
+  # Both `running -> interrupted` and `validating -> interrupted` are valid
+  # transitions per src/flywheel/lifecycle.py:_VALID_EDGES; INTERRUPTED is not
+  # in _REQUIRES_ERROR, so we omit the error field.
+  local task_id="$1"
+  local now_iso
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00)
+  sqlite3 "$DB_PATH" <<SQL 2>/dev/null || true
+UPDATE lifecycles
+SET status = 'interrupted',
+    version = version + 1,
+    updated_at = '${now_iso}',
+    timestamps_json = json_set(timestamps_json, '\$.interrupted', '${now_iso}')
+WHERE run_id = (
+        SELECT run_id FROM lifecycles
+        WHERE task_id = '${task_id}'
+        ORDER BY updated_at DESC LIMIT 1
+      )
+  AND status IN ('running', 'validating');
+SQL
+}
+
+scrub_worktree_locks() {
+  # Clear stale git operation state left behind by a SIGKILL'd python.
+  # `.git/index.lock` and similar block the next git call in the worktree;
+  # an interrupted rebase/merge leaves the worktree mid-operation and any
+  # fresh attempt's first git command fails with confusing errors. Linked
+  # worktrees keep their per-worktree state under <main-git>/worktrees/<id>/,
+  # so we look both there and in the linked worktree's .git pointer file.
+  local worktree="$1"
+  local branch="$2"
+  local worktree_git_dir
+  worktree_git_dir=$(git -C "$worktree" rev-parse --git-dir 2>/dev/null) || return 0
+  local main_git_dir
+  main_git_dir=$(git -C "$REPO_ROOT" rev-parse --git-dir 2>/dev/null) || main_git_dir=""
+
+  rm -f "$worktree_git_dir/index.lock" 2>/dev/null || true
+  rm -f "$worktree_git_dir/HEAD.lock" 2>/dev/null || true
+  if [[ -n "$main_git_dir" ]]; then
+    rm -f "$main_git_dir/refs/heads/${branch}.lock" 2>/dev/null || true
+  fi
+
+  if [[ -d "$worktree_git_dir/rebase-merge" ]] || [[ -d "$worktree_git_dir/rebase-apply" ]]; then
+    echo "[worker] Scrub: aborting in-progress rebase in $worktree" >&2
+    git -C "$worktree" rebase --abort 2>/dev/null || true
+  fi
+  if [[ -f "$worktree_git_dir/MERGE_HEAD" ]]; then
+    echo "[worker] Scrub: aborting in-progress merge in $worktree" >&2
+    git -C "$worktree" merge --abort 2>/dev/null || true
+  fi
+  if [[ -f "$worktree_git_dir/CHERRY_PICK_HEAD" ]]; then
+    echo "[worker] Scrub: aborting in-progress cherry-pick in $worktree" >&2
+    git -C "$worktree" cherry-pick --abort 2>/dev/null || true
+  fi
+}
+
 create_worktree() {
   # Reuse a parked worktree+branch when both exist (retry of a prior
   # failed/interrupted attempt on the same task -- per-task workspace
@@ -285,6 +416,7 @@ create_worktree() {
   if [[ $worktree_present -eq 1 && $branch_present -eq 1 ]]; then
     if git -C "$REPO_ROOT" worktree list --porcelain \
          | grep -q "^worktree $worktree$"; then
+      scrub_worktree_locks "$worktree" "$branch"
       echo "[worker] Reusing parked worktree on $branch; prior commits carry forward." >&2
       return 0
     fi
@@ -444,6 +576,15 @@ remove_finished() {
       failed|interrupted)
         echo "[worker] Lifecycle $status; worktree preserved at $worktree" >&2
         ;;
+      running|validating)
+        # Python subshell exited (we just `wait`ed on it) but the lifecycle
+        # row is still in a live state -- the harness was killed before it
+        # could finalize (SIGTERM/SIGKILL on shutdown, OS OOM, etc.).
+        # Reconcile to `interrupted` so the task is retry-eligible and the
+        # parked worktree gets reused on the next attempt.
+        echo "[worker] Lifecycle stranded at '$status' (exit=$exit_code); reconciling to interrupted; worktree preserved at $worktree" >&2
+        reconcile_to_interrupted "$task_id"
+        ;;
       *)
         echo "[worker] Unexpected lifecycle status '${status:-unknown}'; worktree preserved at $worktree" >&2
         ;;
@@ -463,7 +604,7 @@ spawn_eligible() {
   # set, applies the spawn-failure circuit breaker, creates the worktree,
   # and launches a subshell.
   while [[ ${#RUNNING_PIDS[@]} -lt $MAX_PARALLEL ]]; do
-    [[ "$SHUTDOWN" -eq 1 ]] && break
+    [[ "$SHUTDOWN_LEVEL" -ge 1 ]] && break
 
     local task_file
     task_file=$(next_task_file || true)
@@ -512,6 +653,32 @@ spawn_eligible() {
   done
 }
 
+startup_recovery_sweep() {
+  # Reconcile lifecycles stranded by a previous worker that died ungracefully
+  # (SIGKILL, OS reboot, runaway crash). The single-instance lock guarantees
+  # only one worker runs at a time -- we just acquired it -- so any
+  # `running`/`validating` row currently in the DB is, by definition, not
+  # being driven by anyone. Mark them all `interrupted` so they become
+  # retry-eligible and their parked worktrees can be reused by a fresh
+  # attempt. Pairs with reconcile_to_interrupted() in remove_finished.
+  local count
+  count=$(sqlite3 "$DB_PATH" \
+    "SELECT COUNT(*) FROM lifecycles WHERE status IN ('running','validating');" \
+    2>/dev/null || echo 0)
+  [[ "$count" -eq 0 ]] && return 0
+  echo "[worker] Recovery: reconciling $count stranded lifecycle(s) to interrupted" >&2
+  local now_iso
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00)
+  sqlite3 "$DB_PATH" <<SQL 2>/dev/null || true
+UPDATE lifecycles
+SET status = 'interrupted',
+    version = version + 1,
+    updated_at = '${now_iso}',
+    timestamps_json = json_set(timestamps_json, '\$.interrupted', '${now_iso}')
+WHERE status IN ('running', 'validating');
+SQL
+}
+
 retention_sweep() {
   # Clean dangling worktree entries first so directories an operator
   # removed by hand stop blocking future `git worktree add` calls.
@@ -551,6 +718,7 @@ echo "[worker] Parallel  : $MAX_PARALLEL"       >&2
 echo "[worker] PID       : $$"                  >&2
 echo ""                                         >&2
 
+startup_recovery_sweep
 retention_sweep
 
 # ---------------------------------------------------------------------------
@@ -559,7 +727,7 @@ retention_sweep
 # Outer iteration does the expensive things (commit_task_files, archive,
 # spawn). Inner poll loop reaps finished subshells at 1s granularity so
 # slots refill quickly without spawning a Python process every second.
-while [[ "$SHUTDOWN" -eq 0 ]]; do
+while [[ "$SHUTDOWN_LEVEL" -eq 0 ]]; do
   commit_task_files
   archive_completed
   remove_finished
@@ -570,7 +738,7 @@ while [[ "$SHUTDOWN" -eq 0 ]]; do
   [[ "$prior_count" -eq 0 ]] && poll_budget=60
 
   for (( i=0; i<poll_budget; i++ )); do
-    [[ "$SHUTDOWN" -eq 1 ]] && break
+    [[ "$SHUTDOWN_LEVEL" -ge 1 ]] && break
     sleep 1
     if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
       remove_finished
@@ -580,16 +748,6 @@ while [[ "$SHUTDOWN" -eq 0 ]]; do
   done
 done
 
-# ---------------------------------------------------------------------------
-# Shutdown: stop spawning, let in-flight tasks drain naturally so their
-# worktrees end up in the same parked-on-disk state as a normal interrupt.
-# Operators wanting faster shutdown can SIGKILL the worker.
-# ---------------------------------------------------------------------------
-if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
-  echo "[worker] Shutdown requested -- waiting for ${#RUNNING_PIDS[@]} in-flight task(s) to finish..." >&2
-  for pid in "${RUNNING_PIDS[@]}"; do
-    wait "$pid" 2>/dev/null || true
-  done
-  remove_finished
-fi
-echo "[worker] Shutting down." >&2
+# Drain is handled by the EXIT trap (on_exit): it waits on remaining children,
+# escalates with the shutdown handler if more Ctrl-Cs arrive, and releases the
+# lock. Falling off the bottom here triggers EXIT.

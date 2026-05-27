@@ -394,10 +394,39 @@ scrub_worktree_locks() {
   fi
 }
 
+_rebase_parked_branch() {
+  # Rebase a parked task branch onto current PHASE_BASE so its flywheel
+  # source matches the schema main writes against. Without this, a
+  # worktree parked across a main advance runs stale flywheel code via
+  # its own .venv; workflow.py then opens main's DB and writes events
+  # using the stale schema -- e.g. IntegrityError on events.sequence
+  # NOT NULL when main has migrated and the parked tree hasn't.
+  # Returns 0 on success (up to date OR rebased cleanly).
+  # Returns 1 on rebase conflict so caller can discard the parked work.
+  local worktree="$1"
+  local branch="$2"
+  local behind
+  behind=$(git -C "$REPO_ROOT" rev-list --count "${branch}..${PHASE_BASE}" 2>/dev/null || echo 0)
+  if [[ "$behind" -eq 0 ]]; then
+    echo "[worker] Reusing parked worktree on $branch; prior commits carry forward." >&2
+    return 0
+  fi
+  echo "[worker] Parked $branch is $behind commit(s) behind $PHASE_BASE; rebasing..." >&2
+  if git -C "$worktree" rebase "$PHASE_BASE" 2>&1 | tail -3 >&2; then
+    echo "[worker] Rebase clean; prior commits carry forward." >&2
+    return 0
+  fi
+  git -C "$worktree" rebase --abort 2>/dev/null || true
+  echo "[worker] Rebase failed against $PHASE_BASE; discarding parked worktree+branch and starting fresh." >&2
+  return 1
+}
+
 create_worktree() {
   # Reuse a parked worktree+branch when both exist (retry of a prior
   # failed/interrupted attempt on the same task -- per-task workspace
-  # isolation is the spec, so prior commits carry forward).
+  # isolation is the spec, so prior commits carry forward), rebasing
+  # the parked branch onto current PHASE_BASE first so its flywheel
+  # source matches main's DB schema.
   # Recreate the worktree on an existing branch when only the branch
   # survives (retention sweep cleaned the directory but left the ref).
   # Bail when only the directory exists (no branch) -- that's an
@@ -417,7 +446,16 @@ create_worktree() {
     if git -C "$REPO_ROOT" worktree list --porcelain \
          | grep -q "^worktree $worktree$"; then
       scrub_worktree_locks "$worktree" "$branch"
-      echo "[worker] Reusing parked worktree on $branch; prior commits carry forward." >&2
+      if ! _rebase_parked_branch "$worktree" "$branch"; then
+        # Rebase conflict: parked branch can't move forward onto PHASE_BASE.
+        # Discard the parked worktree+branch and fall through to fresh
+        # creation -- the agent will redo any in-flight work, which is
+        # correct since the env it was working against has changed.
+        git -C "$REPO_ROOT" worktree remove --force "$worktree" 2>/dev/null || true
+        git -C "$REPO_ROOT" branch -D "$branch" 2>/dev/null || true
+        git -C "$REPO_ROOT" worktree add "$worktree" -b "$branch" "$PHASE_BASE"
+        return $?
+      fi
       return 0
     fi
     echo "[worker] ERROR: $worktree exists but is not a registered worktree; refusing to clobber." >&2
@@ -426,8 +464,16 @@ create_worktree() {
 
   if [[ $worktree_present -eq 0 && $branch_present -eq 1 ]]; then
     echo "[worker] Recreating worktree on existing branch $branch (directory was removed; ref survived)." >&2
-    git -C "$REPO_ROOT" worktree add "$worktree" "$branch"
-    return $?
+    if ! git -C "$REPO_ROOT" worktree add "$worktree" "$branch"; then
+      return 1
+    fi
+    if ! _rebase_parked_branch "$worktree" "$branch"; then
+      git -C "$REPO_ROOT" worktree remove --force "$worktree" 2>/dev/null || true
+      git -C "$REPO_ROOT" branch -D "$branch" 2>/dev/null || true
+      git -C "$REPO_ROOT" worktree add "$worktree" -b "$branch" "$PHASE_BASE"
+      return $?
+    fi
+    return 0
   fi
 
   if [[ $worktree_present -eq 1 && $branch_present -eq 0 ]]; then

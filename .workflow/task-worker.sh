@@ -524,6 +524,12 @@ spawn_task() {
 
   (
     set +e
+    # cd into the worktree so subprocess.Popen for command graders inherits
+    # cwd=$worktree -- otherwise graders run against the main repo and see
+    # none of the agent's changes (e.g. `from flywheel.X import NewClass`
+    # ImportErrors even when the worktree has the class). $DB_PATH, $worktree,
+    # $task_file, and $logfile are all absolute, so cd here is safe.
+    cd "$worktree" || exit 1
     run_workflow "${run_args[@]}" &> "$logfile"
     exit $?
   ) &

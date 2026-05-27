@@ -264,10 +264,45 @@ read_lifecycle_status() {
 }
 
 create_worktree() {
+  # Reuse a parked worktree+branch when both exist (retry of a prior
+  # failed/interrupted attempt on the same task -- per-task workspace
+  # isolation is the spec, so prior commits carry forward).
+  # Recreate the worktree on an existing branch when only the branch
+  # survives (retention sweep cleaned the directory but left the ref).
+  # Bail when only the directory exists (no branch) -- that's an
+  # operator-cleanup state, not something to clobber.
   local task_id="$1"
   local phase="$2"
   local worktree="$WORKTREES_DIR/$task_id"
   local branch="flywheel/$phase/$task_id"
+
+  local worktree_present=0 branch_present=0
+  [[ -d "$worktree" ]] && worktree_present=1
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    branch_present=1
+  fi
+
+  if [[ $worktree_present -eq 1 && $branch_present -eq 1 ]]; then
+    if git -C "$REPO_ROOT" worktree list --porcelain \
+         | grep -q "^worktree $worktree$"; then
+      echo "[worker] Reusing parked worktree on $branch; prior commits carry forward." >&2
+      return 0
+    fi
+    echo "[worker] ERROR: $worktree exists but is not a registered worktree; refusing to clobber." >&2
+    return 1
+  fi
+
+  if [[ $worktree_present -eq 0 && $branch_present -eq 1 ]]; then
+    echo "[worker] Recreating worktree on existing branch $branch (directory was removed; ref survived)." >&2
+    git -C "$REPO_ROOT" worktree add "$worktree" "$branch"
+    return $?
+  fi
+
+  if [[ $worktree_present -eq 1 && $branch_present -eq 0 ]]; then
+    echo "[worker] ERROR: $worktree exists but no branch $branch; refusing to clobber. Remove the directory manually." >&2
+    return 1
+  fi
+
   git -C "$REPO_ROOT" worktree add "$worktree" -b "$branch" "$PHASE_BASE"
 }
 

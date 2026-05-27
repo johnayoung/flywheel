@@ -12,10 +12,10 @@ the protocol traffics in typed dataclasses and ``Mapping`` payloads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, Union, runtime_checkable
 
 from flywheel.lifecycle import Attempt, Lifecycle
 
@@ -70,6 +70,40 @@ class LifecycleNotFoundError(StoreConflictError):
         self.run_id = run_id
 
 
+# --- Schema-version mismatch signal ----------------------------------------
+
+
+# Bumped whenever the persistence schema gains a backwards-incompatible
+# change. Stores compare their on-disk row against this constant and
+# raise :class:`StoreSchemaError` when it does not match.
+CURRENT_SCHEMA_VERSION: int = 2
+
+
+class StoreSchemaError(Exception):
+    """Raised when a concrete store opens a database whose
+    ``schema_version`` row does not match
+    :data:`CURRENT_SCHEMA_VERSION`.
+
+    The message is fixed-prefix ("store must be re-created") and the
+    instance carries both the observed and expected versions so callers
+    can distinguish a legacy database from generic operational errors.
+    """
+
+    def __init__(
+        self,
+        *,
+        observed_version: int | None,
+        expected_version: int,
+    ) -> None:
+        super().__init__(
+            "store must be re-created: "
+            f"observed schema_version={observed_version!r}, "
+            f"expected {expected_version}"
+        )
+        self.observed_version = observed_version
+        self.expected_version = expected_version
+
+
 # --- Record types -----------------------------------------------------------
 
 
@@ -82,6 +116,11 @@ class EventRecord:
 
     Mirrors the ``events`` table in ``flywheel/_schema/persistence-schema.sql``. ``id``
     is assigned by the store on append; callers leave it ``None``.
+
+    ``sequence`` is the per-run monotonic counter shared with
+    :class:`SdkMessageRecord` so events and SDK messages form a single
+    totally-ordered audit stream. Stores assign ``sequence`` on
+    ``append_event``; callers leave it ``None``.
     """
 
     run_id: str
@@ -90,6 +129,40 @@ class EventRecord:
     payload: Mapping[str, Any] = field(default_factory=dict)
     attempt_number: int | None = None
     id: int | None = None
+    sequence: int | None = None
+
+
+@dataclass(kw_only=True)
+class SdkMessageRecord:
+    """A single SDK message captured from the agent transport.
+
+    Mirrors the ``sdk_messages`` table in
+    ``flywheel/_schema/persistence-schema.sql``. ``id`` is assigned by
+    the store on insert. ``sequence`` is the per-run monotonic counter
+    shared with :class:`EventRecord` so audit consumers see a single
+    totally-ordered stream regardless of which write path produced a
+    record; the store assigns it atomically with persistence and
+    callers leave it ``None``.
+
+    ``payload`` is an opaque JSON-compatible mapping (no typed coupling
+    to ``claude-agent-sdk`` dataclasses): stores persist it verbatim,
+    the same way :attr:`EventRecord.payload` is handled.
+    """
+
+    run_id: str
+    attempt_number: int
+    iteration_number: int
+    message_type: str
+    payload: Mapping[str, Any]
+    ts: datetime
+    sequence: int | None = None
+    id: int | None = None
+
+
+# Typed union returned by :meth:`AuditStore.read_audit_since`. Consumers
+# discriminate on ``isinstance``; both arms expose the shared per-run
+# ``sequence`` field that defines the audit ordering.
+AuditRecord = Union[EventRecord, SdkMessageRecord]
 
 
 @dataclass(kw_only=True)
@@ -195,14 +268,60 @@ class EventStore(Protocol):
 
     Append-only chronological log keyed by an autoincrement ``id`` and
     foreign-keyed to ``lifecycles(run_id)`` per the schema. ``append_event``
-    assigns the ``id`` and returns the persisted record. ``list_events``
-    returns events for a ``run_id`` in ``(ts, id)`` order, matching the
-    ``idx_events_run`` ordering implied by the schema.
+    assigns both ``id`` and the per-run monotonic ``sequence`` value (the
+    same counter feeds :meth:`SdkMessageStore.save_sdk_messages` so events
+    and SDK messages share one strict ordering) and returns the persisted
+    record. ``list_events`` returns events for a ``run_id`` in ``(ts, id)``
+    order, matching the ``idx_events_run`` ordering implied by the schema.
     """
 
     def append_event(self, event: EventRecord) -> EventRecord: ...
 
     def list_events(self, run_id: str) -> list[EventRecord]: ...
+
+
+@runtime_checkable
+class SdkMessageStore(Protocol):
+    """Persistence contract for captured agent SDK messages.
+
+    Append-only per ``(run_id, attempt_number, iteration_number)`` batch.
+    ``save_sdk_messages`` assigns each row a per-run monotonic
+    ``sequence`` value drawn from the same counter as
+    :meth:`EventStore.append_event`, so interleaved event and SDK-message
+    writes against the same ``run_id`` produce strictly ascending sequence
+    numbers across both record types. The store returns the persisted
+    records (with ``id`` and ``sequence`` populated) in the same order
+    the payloads were supplied. ``list_sdk_messages`` returns every
+    persisted record for ``run_id`` in ascending ``sequence`` order.
+    """
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[SdkMessageRecord]: ...
+
+    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]: ...
+
+
+@runtime_checkable
+class AuditStore(Protocol):
+    """Unified read contract over the per-run audit stream.
+
+    The audit stream merges :class:`EventRecord` and
+    :class:`SdkMessageRecord` rows for one ``run_id`` into a single
+    totally-ordered sequence keyed by the shared per-run ``sequence``
+    counter. ``read_audit_since(run_id, cursor)`` returns every record
+    with ``sequence > cursor`` in ascending ``sequence`` order, capped
+    at an internal page size so callers can drive cursor-based polling
+    without blowing the result set on a long-lived run.
+    """
+
+    def read_audit_since(
+        self, run_id: str, cursor: int
+    ) -> list[AuditRecord]: ...
 
 
 @runtime_checkable
@@ -252,6 +371,9 @@ class AgentSessionStore(Protocol):
 __all__ = [
     "AgentSessionStore",
     "AttemptStore",
+    "AuditRecord",
+    "AuditStore",
+    "CURRENT_SCHEMA_VERSION",
     "ClaudeSessionEntry",
     "EventRecord",
     "EventStore",
@@ -262,5 +384,8 @@ __all__ = [
     "LifecycleNotFoundError",
     "LifecycleStore",
     "OptimisticConcurrencyError",
+    "SdkMessageRecord",
+    "SdkMessageStore",
     "StoreConflictError",
+    "StoreSchemaError",
 ]

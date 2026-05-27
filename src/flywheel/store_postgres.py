@@ -36,6 +36,7 @@ mapped from the ``ERRCODE = 'check_violation'`` clause on the trigger's
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
@@ -55,6 +56,8 @@ except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
 
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_protocols import (
+    CURRENT_SCHEMA_VERSION,
+    AuditRecord,
     ClaudeSessionEntry,
     EventRecord,
     GraderResultRecord,
@@ -62,7 +65,13 @@ from flywheel.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
+    SdkMessageRecord,
+    StoreSchemaError,
 )
+
+# Page size for ``read_audit_since``; matches the SQLite and in-memory
+# stores so the audit-stream contract behaves identically across backends.
+_AUDIT_PAGE_SIZE: int = 500
 
 # Bundled as package data so the DDL travels with the install — no
 # reliance on a repo-relative ``docs/`` path that breaks under wheel
@@ -197,7 +206,70 @@ class PostgresStore:
                         self._schema_ident
                     )
                 )
+                # Pre-feature detection: a legacy schema has an ``events``
+                # table without a ``sequence`` column. The new schema
+                # script's ``CREATE TABLE IF NOT EXISTS`` would no-op and
+                # silently leave the legacy shape in place, so we check
+                # explicitly before bootstrap and refuse with a clear
+                # StoreSchemaError.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = %s AND table_name = 'events'
+                    """,
+                    (self._schema,),
+                )
+                events_exists = cur.fetchone() is not None
+                if events_exists:
+                    cur.execute(
+                        """
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = %s
+                          AND table_name = 'events'
+                          AND column_name = 'sequence'
+                        """,
+                        (self._schema,),
+                    )
+                    if cur.fetchone() is None:
+                        raise StoreSchemaError(
+                            observed_version=None,
+                            expected_version=CURRENT_SCHEMA_VERSION,
+                        )
                 cur.execute(_read_schema_sql())
+                cur.execute(
+                    "SELECT version FROM schema_version WHERE id = 1"
+                )
+                row = cur.fetchone()
+        observed = int(row[0]) if row is not None else None
+        if observed != CURRENT_SCHEMA_VERSION:
+            raise StoreSchemaError(
+                observed_version=observed,
+                expected_version=CURRENT_SCHEMA_VERSION,
+            )
+
+    def _next_run_sequence(
+        self, cur: Any, run_id: str
+    ) -> int:
+        """Allocate the next per-run audit sequence number atomically.
+
+        Issued through ``cur`` so the increment and the row it gates
+        share one transaction; the ``ON CONFLICT … RETURNING`` clause
+        returns the freshly-stored value in the same statement.
+        """
+        cur.execute(
+            """
+            INSERT INTO run_sequence (run_id, next_seq) VALUES (%s, 1)
+            ON CONFLICT (run_id) DO UPDATE
+                SET next_seq = run_sequence.next_seq + 1
+            RETURNING next_seq
+            """,
+            (run_id,),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        return int(row[0])
 
     def close(self) -> None:
         """Drain and close the internal pool. Idempotent."""
@@ -399,11 +471,13 @@ class PostgresStore:
     def append_event(self, event: EventRecord) -> EventRecord:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                sequence = self._next_run_sequence(cur, event.run_id)
                 cur.execute(
                     """
                     INSERT INTO events (
-                        run_id, attempt_number, ts, kind, payload_json
-                    ) VALUES (%s, %s, %s, %s, %s)
+                        run_id, attempt_number, ts, kind, payload_json,
+                        sequence
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -412,6 +486,7 @@ class PostgresStore:
                         event.ts,
                         event.kind,
                         Jsonb(dict(event.payload)),
+                        sequence,
                     ),
                 )
                 row = cur.fetchone()
@@ -423,6 +498,7 @@ class PostgresStore:
             payload=dict(event.payload),
             attempt_number=event.attempt_number,
             id=int(row[0]),
+            sequence=sequence,
         )
 
     def list_events(self, run_id: str) -> list[EventRecord]:
@@ -430,7 +506,8 @@ class PostgresStore:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
                     """
-                    SELECT id, run_id, attempt_number, ts, kind, payload_json
+                    SELECT id, run_id, attempt_number, ts, kind,
+                           payload_json, sequence
                     FROM events
                     WHERE run_id = %s
                     ORDER BY ts, id
@@ -439,6 +516,111 @@ class PostgresStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_event(r) for r in rows]
+
+    # --- SdkMessageStore --------------------------------------------------
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[SdkMessageRecord]:
+        persisted: list[SdkMessageRecord] = []
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                for msg in messages:
+                    payload = dict(msg)
+                    message_type = str(payload.get("type", ""))
+                    ts = datetime.now(timezone.utc)
+                    sequence = self._next_run_sequence(cur, run_id)
+                    cur.execute(
+                        """
+                        INSERT INTO sdk_messages (
+                            run_id, attempt_number, iteration_number,
+                            sequence, message_type, payload_json, ts
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            run_id,
+                            attempt_number,
+                            iteration_number,
+                            sequence,
+                            message_type,
+                            Jsonb(payload),
+                            ts,
+                        ),
+                    )
+                    row = cur.fetchone()
+                    assert row is not None
+                    persisted.append(
+                        SdkMessageRecord(
+                            run_id=run_id,
+                            attempt_number=attempt_number,
+                            iteration_number=iteration_number,
+                            message_type=message_type,
+                            payload=payload,
+                            ts=ts,
+                            sequence=sequence,
+                            id=int(row[0]),
+                        )
+                    )
+        return persisted
+
+    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_id, attempt_number, iteration_number,
+                           sequence, message_type, payload_json, ts
+                    FROM sdk_messages
+                    WHERE run_id = %s
+                    ORDER BY sequence
+                    """,
+                    (run_id,),
+                )
+                rows = cur.fetchall()
+        return [_row_to_sdk_message(r) for r in rows]
+
+    # --- AuditStore -------------------------------------------------------
+
+    def read_audit_since(
+        self, run_id: str, cursor: int
+    ) -> list[AuditRecord]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_id, attempt_number, ts, kind,
+                           payload_json, sequence
+                    FROM events
+                    WHERE run_id = %s AND sequence > %s
+                    ORDER BY sequence
+                    LIMIT %s
+                    """,
+                    (run_id, cursor, _AUDIT_PAGE_SIZE),
+                )
+                event_rows = cur.fetchall()
+                cur.execute(
+                    """
+                    SELECT id, run_id, attempt_number, iteration_number,
+                           sequence, message_type, payload_json, ts
+                    FROM sdk_messages
+                    WHERE run_id = %s AND sequence > %s
+                    ORDER BY sequence
+                    LIMIT %s
+                    """,
+                    (run_id, cursor, _AUDIT_PAGE_SIZE),
+                )
+                sdk_rows = cur.fetchall()
+        merged: list[AuditRecord] = [_row_to_event(r) for r in event_rows]
+        merged.extend(_row_to_sdk_message(r) for r in sdk_rows)
+        merged.sort(
+            key=lambda r: r.sequence if r.sequence is not None else 0
+        )
+        return merged[:_AUDIT_PAGE_SIZE]
 
     # --- GraderResultStore ------------------------------------------------
 
@@ -582,12 +764,27 @@ def _row_to_attempt(row: dict[str, Any]) -> Attempt:
 
 
 def _row_to_event(row: dict[str, Any]) -> EventRecord:
+    sequence_raw = row.get("sequence")
     return EventRecord(
         run_id=row["run_id"],
         ts=row["ts"],
         kind=row["kind"],
         payload=dict(row["payload_json"]),
         attempt_number=row["attempt_number"],
+        id=int(row["id"]),
+        sequence=int(sequence_raw) if sequence_raw is not None else None,
+    )
+
+
+def _row_to_sdk_message(row: dict[str, Any]) -> SdkMessageRecord:
+    return SdkMessageRecord(
+        run_id=row["run_id"],
+        attempt_number=int(row["attempt_number"]),
+        iteration_number=int(row["iteration_number"]),
+        message_type=row["message_type"],
+        payload=dict(row["payload_json"]),
+        ts=row["ts"],
+        sequence=int(row["sequence"]),
         id=int(row["id"]),
     )
 

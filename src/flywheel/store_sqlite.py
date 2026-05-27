@@ -33,14 +33,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_protocols import (
+    CURRENT_SCHEMA_VERSION,
+    AuditRecord,
     ClaudeSessionEntry,
     EventRecord,
     GraderResultRecord,
@@ -48,7 +51,13 @@ from flywheel.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
+    SdkMessageRecord,
+    StoreSchemaError,
 )
+
+# Page size for ``read_audit_since``: a cursor-based reader can keep
+# polling, but a single call's result set is bounded.
+_AUDIT_PAGE_SIZE: int = 500
 
 # Bundled as package data so the DDL travels with the install — no
 # reliance on a repo-relative ``docs/`` path that breaks under wheel
@@ -136,6 +145,16 @@ class SqliteStore:
 
     def _bootstrap(self) -> None:
         conn = self._connection
+        # Pre-feature detection: a legacy database has an ``events`` table
+        # without a ``sequence`` column. Re-running the new schema script
+        # against it would silently no-op the ``CREATE TABLE IF NOT EXISTS``
+        # and leave the legacy shape in place, so we check explicitly
+        # before bootstrap and refuse with a clear error.
+        if _has_table(conn, "events") and not _events_has_sequence(conn):
+            raise StoreSchemaError(
+                observed_version=None,
+                expected_version=CURRENT_SCHEMA_VERSION,
+            )
         # The canonical schema script applies the pragmas (WAL +
         # foreign_keys) and creates every table. Executed verbatim so
         # the DDL is not re-derived here.
@@ -145,6 +164,39 @@ class SqliteStore:
         conn.execute("PRAGMA foreign_keys = ON;")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
+        # Final version pin: any row mismatch is fatal regardless of how
+        # the database got here. The schema_version table has a CHECK
+        # (id = 1) so there is at most one row to read.
+        row = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        observed = int(row["version"]) if row is not None else None
+        if observed != CURRENT_SCHEMA_VERSION:
+            raise StoreSchemaError(
+                observed_version=observed,
+                expected_version=CURRENT_SCHEMA_VERSION,
+            )
+
+    def _next_run_sequence(self, run_id: str) -> int:
+        """Allocate the next per-run audit sequence number.
+
+        Atomic with respect to other writers on the same connection because
+        SQLite in autocommit mode serializes statements; the
+        ``ON CONFLICT … RETURNING`` clause yields the newly-stored value
+        in the same statement so events and SDK messages cannot race past
+        each other on the same run_id.
+        """
+        row = self._connection.execute(
+            """
+            INSERT INTO run_sequence (run_id, next_seq) VALUES (?, 1)
+            ON CONFLICT(run_id) DO UPDATE
+                SET next_seq = next_seq + 1
+            RETURNING next_seq
+            """,
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        return int(row["next_seq"])
 
     def close(self) -> None:
         self._connection.close()
@@ -319,10 +371,12 @@ class SqliteStore:
     # --- EventStore -------------------------------------------------------
 
     def append_event(self, event: EventRecord) -> EventRecord:
+        sequence = self._next_run_sequence(event.run_id)
         cursor = self._connection.execute(
             """
-            INSERT INTO events (run_id, attempt_number, ts, kind, payload_json)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO events (
+                run_id, attempt_number, ts, kind, payload_json, sequence
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 event.run_id,
@@ -330,6 +384,7 @@ class SqliteStore:
                 _iso(event.ts),
                 event.kind,
                 json.dumps(dict(event.payload)),
+                sequence,
             ),
         )
         return EventRecord(
@@ -339,12 +394,14 @@ class SqliteStore:
             payload=dict(event.payload),
             attempt_number=event.attempt_number,
             id=cursor.lastrowid,
+            sequence=sequence,
         )
 
     def list_events(self, run_id: str) -> list[EventRecord]:
         rows = self._connection.execute(
             """
-            SELECT id, run_id, attempt_number, ts, kind, payload_json
+            SELECT id, run_id, attempt_number, ts, kind, payload_json,
+                   sequence
             FROM events
             WHERE run_id = ?
             ORDER BY ts, id
@@ -352,6 +409,99 @@ class SqliteStore:
             (run_id,),
         ).fetchall()
         return [_row_to_event(r) for r in rows]
+
+    # --- SdkMessageStore --------------------------------------------------
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[SdkMessageRecord]:
+        persisted: list[SdkMessageRecord] = []
+        for msg in messages:
+            payload = dict(msg)
+            message_type = str(payload.get("type", ""))
+            ts = datetime.now(timezone.utc)
+            sequence = self._next_run_sequence(run_id)
+            cursor = self._connection.execute(
+                """
+                INSERT INTO sdk_messages (
+                    run_id, attempt_number, iteration_number, sequence,
+                    message_type, payload_json, ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    attempt_number,
+                    iteration_number,
+                    sequence,
+                    message_type,
+                    json.dumps(payload),
+                    _iso(ts),
+                ),
+            )
+            persisted.append(
+                SdkMessageRecord(
+                    run_id=run_id,
+                    attempt_number=attempt_number,
+                    iteration_number=iteration_number,
+                    message_type=message_type,
+                    payload=payload,
+                    ts=ts,
+                    sequence=sequence,
+                    id=cursor.lastrowid,
+                )
+            )
+        return persisted
+
+    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT id, run_id, attempt_number, iteration_number, sequence,
+                   message_type, payload_json, ts
+            FROM sdk_messages
+            WHERE run_id = ?
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        return [_row_to_sdk_message(r) for r in rows]
+
+    # --- AuditStore -------------------------------------------------------
+
+    def read_audit_since(
+        self, run_id: str, cursor: int
+    ) -> list[AuditRecord]:
+        event_rows = self._connection.execute(
+            """
+            SELECT id, run_id, attempt_number, ts, kind, payload_json,
+                   sequence
+            FROM events
+            WHERE run_id = ? AND sequence > ?
+            ORDER BY sequence
+            LIMIT ?
+            """,
+            (run_id, cursor, _AUDIT_PAGE_SIZE),
+        ).fetchall()
+        sdk_rows = self._connection.execute(
+            """
+            SELECT id, run_id, attempt_number, iteration_number, sequence,
+                   message_type, payload_json, ts
+            FROM sdk_messages
+            WHERE run_id = ? AND sequence > ?
+            ORDER BY sequence
+            LIMIT ?
+            """,
+            (run_id, cursor, _AUDIT_PAGE_SIZE),
+        ).fetchall()
+        merged: list[AuditRecord] = [_row_to_event(r) for r in event_rows]
+        merged.extend(_row_to_sdk_message(r) for r in sdk_rows)
+        merged.sort(
+            key=lambda r: r.sequence if r.sequence is not None else 0
+        )
+        return merged[:_AUDIT_PAGE_SIZE]
 
     # --- GraderResultStore ------------------------------------------------
 
@@ -478,6 +628,7 @@ def _row_to_attempt(row: sqlite3.Row) -> Attempt:
 def _row_to_event(row: sqlite3.Row) -> EventRecord:
     ts = _parse_iso(row["ts"])
     assert ts is not None
+    sequence_raw = row["sequence"]
     return EventRecord(
         run_id=row["run_id"],
         ts=ts,
@@ -485,7 +636,39 @@ def _row_to_event(row: sqlite3.Row) -> EventRecord:
         payload=json.loads(row["payload_json"]),
         attempt_number=row["attempt_number"],
         id=int(row["id"]),
+        sequence=int(sequence_raw) if sequence_raw is not None else None,
     )
+
+
+def _row_to_sdk_message(row: sqlite3.Row) -> SdkMessageRecord:
+    ts = _parse_iso(row["ts"])
+    assert ts is not None
+    return SdkMessageRecord(
+        run_id=row["run_id"],
+        attempt_number=int(row["attempt_number"]),
+        iteration_number=int(row["iteration_number"]),
+        message_type=row["message_type"],
+        payload=json.loads(row["payload_json"]),
+        ts=ts,
+        sequence=int(row["sequence"]),
+        id=int(row["id"]),
+    )
+
+
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _events_has_sequence(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute("PRAGMA table_info(events)").fetchall()
+    return any(r["name"] == "sequence" for r in rows)
 
 
 def _row_to_grader_result(row: sqlite3.Row) -> GraderResultRecord:

@@ -27,11 +27,13 @@ from uuid import uuid4
 import pytest
 
 from flywheel import (
+    CURRENT_SCHEMA_VERSION,
     Attempt,
     GraderResultRecord,
     Lifecycle,
     OptimisticConcurrencyError,
     Status,
+    StoreSchemaError,
 )
 
 
@@ -277,10 +279,10 @@ def test_foreign_key_rejects_orphan_event(pg_store: Any) -> None:
                 cur.execute(
                     """
                     INSERT INTO events
-                        (run_id, ts, kind, payload_json)
-                    VALUES (%s, %s, %s, %s::jsonb)
+                        (run_id, ts, kind, payload_json, sequence)
+                    VALUES (%s, %s, %s, %s::jsonb, %s)
                     """,
-                    ("nope", datetime.now(timezone.utc), "x", "{}"),
+                    ("nope", datetime.now(timezone.utc), "x", "{}", 1),
                 )
 
 
@@ -436,3 +438,111 @@ def test_timestamptz_round_trips_as_aware_utc(pg_store: Any) -> None:
     ts = loaded.timestamps[Status.READY]
     assert ts.tzinfo is not None
     assert ts.utcoffset() == timezone.utc.utcoffset(ts)
+
+
+# ---------------------------------------------------------------------------
+# Schema-version pin: refuse pre-feature stores.
+# ---------------------------------------------------------------------------
+
+
+def _make_legacy_pg_schema(dsn: str, schema: str) -> None:
+    """Bootstrap a Postgres schema with the pre-audit shape (no ``sequence``
+    column on ``events``, no ``sdk_messages``/``run_sequence``/
+    ``schema_version`` tables). Mirrors the layout PostgresStore expected
+    before this feature so the store-version check has a legacy fixture
+    to refuse."""
+    import psycopg
+    from psycopg import sql
+
+    schema_ident = sql.Identifier(schema)
+    with psycopg.connect(dsn) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(schema_ident)
+            )
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(schema_ident)
+            )
+            cur.execute(
+                """
+                CREATE TABLE lifecycles (
+                    run_id          TEXT PRIMARY KEY,
+                    task_id         TEXT NOT NULL,
+                    status          TEXT NOT NULL,
+                    version         INTEGER NOT NULL,
+                    retries         INTEGER NOT NULL,
+                    error           TEXT,
+                    agent_output    TEXT,
+                    session_id      TEXT,
+                    artifacts_dir   TEXT,
+                    worker_id       TEXT,
+                    timestamps_json JSONB NOT NULL,
+                    updated_at      TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE events (
+                    id              BIGSERIAL PRIMARY KEY,
+                    run_id          TEXT NOT NULL,
+                    attempt_number  INTEGER,
+                    ts              TIMESTAMPTZ NOT NULL,
+                    kind            TEXT NOT NULL,
+                    payload_json    JSONB NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+                );
+                """
+            )
+
+
+def test_opening_legacy_postgres_schema_raises_store_schema_error(
+    fresh_schema: str,
+) -> None:
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    _make_legacy_pg_schema(dsn, fresh_schema)
+    with pytest.raises(StoreSchemaError) as exc:
+        PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
+    assert "store must be re-created" in str(exc.value)
+    assert exc.value.expected_version == CURRENT_SCHEMA_VERSION
+    assert exc.value.observed_version is None
+
+
+def test_opening_postgres_with_mismatched_schema_version_raises(
+    fresh_schema: str,
+) -> None:
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    store = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
+    store.close()
+
+    import psycopg
+    from psycopg import sql
+
+    schema_ident = sql.Identifier(fresh_schema)
+    with psycopg.connect(dsn) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(schema_ident)
+            )
+            cur.execute(
+                "UPDATE schema_version SET version = %s WHERE id = 1",
+                (CURRENT_SCHEMA_VERSION + 99,),
+            )
+
+    with pytest.raises(StoreSchemaError) as exc:
+        PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
+    assert "store must be re-created" in str(exc.value)
+    assert exc.value.observed_version == CURRENT_SCHEMA_VERSION + 99
+    assert exc.value.expected_version == CURRENT_SCHEMA_VERSION
+
+
+def test_fresh_postgres_records_current_schema_version(
+    pg_store: Any,
+) -> None:
+    rows = _query(
+        pg_store, "SELECT version FROM schema_version WHERE id = 1"
+    )
+    assert len(rows) == 1
+    assert int(rows[0][0]) == CURRENT_SCHEMA_VERSION

@@ -31,6 +31,7 @@ from flywheel import (
     AgentSessionStore,
     Attempt,
     AttemptStore,
+    AuditStore,
     ClaudeSessionEntry,
     EventRecord,
     EventStore,
@@ -43,6 +44,8 @@ from flywheel import (
     LifecycleStore,
     OptimisticConcurrencyError,
     Outcome,
+    SdkMessageRecord,
+    SdkMessageStore,
     SqliteStore,
     Status,
 )
@@ -169,6 +172,8 @@ def test_store_satisfies_every_protocol(store: object) -> None:
     assert isinstance(store, EventStore)
     assert isinstance(store, GraderResultStore)
     assert isinstance(store, AgentSessionStore)
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, AuditStore)
 
 
 def test_store_exposes_no_grader_result_mutators(store: object) -> None:
@@ -636,3 +641,268 @@ def test_list_session_entries_scoped_by_project_and_session(
     assert [e.entry for e in store.list_session_entries("p1", "s1")] == ["x"]
     assert [e.entry for e in store.list_session_entries("p2", "s1")] == ["y"]
     assert [e.entry for e in store.list_session_entries("p1", "s2")] == ["z"]
+
+
+# --- SDK message persistence -----------------------------------------------
+
+
+def test_save_sdk_messages_persists_payloads_byte_for_byte(
+    store: object,
+) -> None:
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    payloads: list[dict[str, object]] = [
+        {
+            "type": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 12, "output_tokens": 34},
+        },
+        {
+            "type": "tool_use",
+            "id": "call-1",
+            "name": "Bash",
+            "input": {"command": "echo hello"},
+        },
+        {
+            "type": "result",
+            "is_error": False,
+            "stop_reason": "end_turn",
+        },
+    ]
+    saved = store.save_sdk_messages(
+        run_id="r1",
+        attempt_number=1,
+        iteration_number=1,
+        messages=payloads,
+    )
+    assert len(saved) == len(payloads)
+    # Sequences are per-run monotonic and start from the next run-counter
+    # value; we check strict ascending across the batch only.
+    seqs = [s.sequence for s in saved]
+    assert all(s is not None for s in seqs)
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+    for got, original in zip(saved, payloads):
+        assert dict(got.payload) == original
+        assert got.message_type == original["type"]
+        assert got.attempt_number == 1
+        assert got.iteration_number == 1
+        assert got.id is not None
+
+
+def test_list_sdk_messages_returns_in_sequence_order(store: object) -> None:
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    store.save_sdk_messages(
+        "r1", 1, 1, [{"type": "assistant", "n": 1}]
+    )
+    store.save_sdk_messages(
+        "r1", 1, 2, [{"type": "assistant", "n": 2}, {"type": "result", "n": 3}]
+    )
+    store.save_sdk_messages(
+        "r1", 2, 1, [{"type": "assistant", "n": 4}]
+    )
+
+    listed = store.list_sdk_messages("r1")
+    assert [m.payload["n"] for m in listed] == [1, 2, 3, 4]
+    seqs = [m.sequence for m in listed]
+    assert all(s is not None for s in seqs)
+    assert seqs == sorted(seqs)
+
+
+def test_sdk_messages_scoped_by_run_id(store: object) -> None:
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    _ensure_lifecycle(store, "r2")
+    store.save_sdk_messages("r1", 1, 1, [{"type": "assistant", "tag": "a"}])
+    store.save_sdk_messages("r2", 1, 1, [{"type": "assistant", "tag": "b"}])
+    assert [m.payload["tag"] for m in store.list_sdk_messages("r1")] == ["a"]
+    assert [m.payload["tag"] for m in store.list_sdk_messages("r2")] == ["b"]
+
+
+def test_sdk_message_payload_isolated_from_caller_mutations(
+    store: object,
+) -> None:
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    payload: dict[str, object] = {"type": "assistant", "k": "v"}
+    saved = store.save_sdk_messages("r1", 1, 1, [payload])
+    payload["k"] = "MUTATED"
+    payload["new"] = "field"
+    # The persisted record snapshots the caller's payload at save time.
+    listed = store.list_sdk_messages("r1")
+    assert dict(listed[0].payload) == {"type": "assistant", "k": "v"}
+    # The returned record from save is similarly insulated.
+    assert dict(saved[0].payload) == {"type": "assistant", "k": "v"}
+    # And mutating the returned record's payload does not corrupt the
+    # store's row.
+    cast_payload = dict(saved[0].payload)
+    cast_payload["k"] = "ALSO_MUTATED"
+    again = store.list_sdk_messages("r1")
+    assert dict(again[0].payload) == {"type": "assistant", "k": "v"}
+
+
+def test_save_sdk_messages_with_empty_batch_is_noop(store: object) -> None:
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    saved = store.save_sdk_messages("r1", 1, 1, [])
+    assert saved == []
+    assert store.list_sdk_messages("r1") == []
+
+
+# --- Per-run monotonic sequence shared across events + SDK messages --------
+
+
+def test_interleaved_events_and_sdk_messages_have_ascending_per_run_sequence(
+    store: object,
+) -> None:
+    """Events and SDK messages share one per-run monotonic counter so a
+    single audit ordering exists across both write paths."""
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    e1 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
+    m1 = store.save_sdk_messages("r1", 1, 1, [{"type": "assistant", "n": 1}])
+    e2 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="progress"))
+    m2 = store.save_sdk_messages(
+        "r1", 1, 2, [{"type": "tool_use", "n": 2}, {"type": "result", "n": 3}]
+    )
+    e3 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
+
+    seqs: list[int] = []
+    for rec in (e1, *m1, e2, *m2, e3):
+        assert rec.sequence is not None
+        seqs.append(rec.sequence)
+    # Strict ascending across both record types within one run.
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+
+
+def test_run_sequences_are_independent_per_run_id(store: object) -> None:
+    """The shared per-run counter is scoped to ``run_id``: two runs may
+    independently start at 1 without colliding."""
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    _ensure_lifecycle(store, "r2")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    a = store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
+    b = store.append_event(EventRecord(run_id="r2", ts=ts, kind="started"))
+    assert a.sequence == 1
+    assert b.sequence == 1
+    a2 = store.save_sdk_messages("r1", 1, 1, [{"type": "assistant"}])
+    b2 = store.save_sdk_messages("r2", 1, 1, [{"type": "assistant"}])
+    assert a2[0].sequence == 2
+    assert b2[0].sequence == 2
+
+
+# --- Audit-stream merged read ----------------------------------------------
+
+
+def test_read_audit_since_cursor_zero_returns_every_record(
+    store: object,
+) -> None:
+    assert isinstance(store, AuditStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
+    store.save_sdk_messages(
+        "r1", 1, 1, [{"type": "assistant"}, {"type": "tool_use"}]
+    )
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
+
+    records = store.read_audit_since("r1", 0)
+    assert len(records) == 4
+    seqs = [r.sequence for r in records]
+    assert all(s is not None for s in seqs)
+    assert seqs == sorted(seqs)
+
+
+def test_read_audit_since_cursor_n_skips_first_n_records(
+    store: object,
+) -> None:
+    assert isinstance(store, AuditStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
+    store.save_sdk_messages(
+        "r1", 1, 1, [{"type": "assistant"}, {"type": "tool_use"}]
+    )
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
+
+    all_records = store.read_audit_since("r1", 0)
+    assert len(all_records) == 4
+
+    after_two = store.read_audit_since("r1", 2)
+    assert len(after_two) == 2
+    assert [r.sequence for r in after_two] == [
+        r.sequence for r in all_records[2:]
+    ]
+
+    after_all = store.read_audit_since(
+        "r1", all_records[-1].sequence or 0
+    )
+    assert after_all == []
+
+
+def test_read_audit_since_returns_typed_union_arms(store: object) -> None:
+    assert isinstance(store, AuditStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
+    store.save_sdk_messages("r1", 1, 1, [{"type": "assistant"}])
+
+    records = store.read_audit_since("r1", 0)
+    assert isinstance(records[0], EventRecord)
+    assert isinstance(records[1], SdkMessageRecord)
+
+
+def test_read_audit_since_for_unknown_run_returns_empty(store: object) -> None:
+    assert isinstance(store, AuditStore)
+    assert store.read_audit_since("does-not-exist", 0) == []
+
+
+def test_read_audit_since_scoped_by_run_id(store: object) -> None:
+    assert isinstance(store, AuditStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, SdkMessageStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    _ensure_lifecycle(store, "r2")
+
+    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    store.append_event(EventRecord(run_id="r1", ts=ts, kind="x"))
+    store.save_sdk_messages("r2", 1, 1, [{"type": "assistant", "tag": "r2"}])
+
+    r1 = store.read_audit_since("r1", 0)
+    r2 = store.read_audit_since("r2", 0)
+    assert len(r1) == 1
+    assert len(r2) == 1
+    assert isinstance(r1[0], EventRecord)
+    assert isinstance(r2[0], SdkMessageRecord)
+    assert dict(r2[0].payload) == {"type": "assistant", "tag": "r2"}

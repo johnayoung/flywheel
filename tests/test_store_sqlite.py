@@ -18,12 +18,14 @@ from pathlib import Path
 import pytest
 
 from flywheel import (
+    CURRENT_SCHEMA_VERSION,
     Attempt,
     GraderResultRecord,
     Lifecycle,
     OptimisticConcurrencyError,
     SqliteStore,
     Status,
+    StoreSchemaError,
 )
 from flywheel.store_sqlite import _SCHEMA_PATH
 
@@ -57,6 +59,9 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
             "events",
             "grader_results",
             "claude_session_store",
+            "sdk_messages",
+            "run_sequence",
+            "schema_version",
         }
     finally:
         store.close()
@@ -132,9 +137,10 @@ def test_foreign_keys_rejects_orphan_event_insert(tmp_path: Path) -> None:
     try:
         with pytest.raises(sqlite3.IntegrityError):
             store._connection.execute(
-                "INSERT INTO events (run_id, ts, kind, payload_json) "
-                "VALUES (?, ?, ?, ?)",
-                ("missing-run", "2024-01-01T00:00:00+00:00", "x", "{}"),
+                "INSERT INTO events "
+                "(run_id, ts, kind, payload_json, sequence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("missing-run", "2024-01-01T00:00:00+00:00", "x", "{}", 1),
             )
     finally:
         store.close()
@@ -346,5 +352,95 @@ def test_session_entries_listed_in_seq_order_for_tuple_keying(
             seqs.append(e.seq)
         assert seqs == sorted(seqs)
         assert [e.entry for e in listed] == ["e0", "e1", "e2", "e3", "e4"]
+    finally:
+        store.close()
+
+
+# --- Schema-version pin: refuse pre-feature stores -------------------------
+
+
+def _make_legacy_sqlite_db(path: Path) -> None:
+    """Bootstrap a database with the pre-audit schema (no ``sequence``
+    column on ``events``, no ``sdk_messages``/``run_sequence``/
+    ``schema_version`` tables). Mirrors the shape SqliteStore expected
+    before this feature."""
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.executescript(
+            """
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE lifecycles (
+                run_id           TEXT PRIMARY KEY,
+                task_id          TEXT NOT NULL,
+                status           TEXT NOT NULL,
+                version          INTEGER NOT NULL,
+                retries          INTEGER NOT NULL,
+                error            TEXT,
+                agent_output     TEXT,
+                session_id       TEXT,
+                artifacts_dir    TEXT,
+                worker_id        TEXT,
+                timestamps_json  TEXT NOT NULL,
+                updated_at       DATETIME NOT NULL
+            );
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id          TEXT NOT NULL,
+                attempt_number  INTEGER,
+                ts              DATETIME NOT NULL,
+                kind            TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+            );
+            """
+        )
+    finally:
+        conn.close()
+
+
+def test_opening_legacy_store_raises_store_schema_error(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "legacy.db"
+    _make_legacy_sqlite_db(db)
+    with pytest.raises(StoreSchemaError) as exc:
+        SqliteStore(db)
+    assert "store must be re-created" in str(exc.value)
+    assert exc.value.expected_version == CURRENT_SCHEMA_VERSION
+    assert exc.value.observed_version is None
+
+
+def test_opening_store_with_mismatched_schema_version_raises(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "mismatch.db"
+    store = SqliteStore(db)
+    store.close()
+    # Corrupt the version row to simulate a future-schema store.
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute(
+            "UPDATE schema_version SET version = ? WHERE id = 1",
+            (CURRENT_SCHEMA_VERSION + 99,),
+        )
+    finally:
+        conn.close()
+    with pytest.raises(StoreSchemaError) as exc:
+        SqliteStore(db)
+    assert "store must be re-created" in str(exc.value)
+    assert exc.value.observed_version == CURRENT_SCHEMA_VERSION + 99
+    assert exc.value.expected_version == CURRENT_SCHEMA_VERSION
+
+
+def test_fresh_store_records_current_schema_version(tmp_path: Path) -> None:
+    db = tmp_path / "fresh.db"
+    store = SqliteStore(db)
+    try:
+        row = store._connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert row is not None
+        assert int(row["version"]) == CURRENT_SCHEMA_VERSION
     finally:
         store.close()

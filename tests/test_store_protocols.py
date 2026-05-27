@@ -16,9 +16,12 @@ from datetime import datetime, timezone
 import pytest
 
 from flywheel import (
+    CURRENT_SCHEMA_VERSION,
     AgentSessionStore,
     Attempt,
     AttemptStore,
+    AuditRecord,
+    AuditStore,
     ClaudeSessionEntry,
     EventRecord,
     EventStore,
@@ -29,7 +32,10 @@ from flywheel import (
     LifecycleNotFoundError,
     LifecycleStore,
     OptimisticConcurrencyError,
+    SdkMessageRecord,
+    SdkMessageStore,
     StoreConflictError,
+    StoreSchemaError,
 )
 
 
@@ -95,6 +101,27 @@ class _AgentSessionStub:
         return []
 
 
+class _SdkMessageStub:
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: object,
+    ) -> list[SdkMessageRecord]:
+        return []
+
+    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
+        return []
+
+
+class _AuditStub:
+    def read_audit_since(
+        self, run_id: str, cursor: int
+    ) -> list[AuditRecord]:
+        return []
+
+
 def test_lifecycle_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_LifecycleStub(), LifecycleStore)
 
@@ -113,6 +140,14 @@ def test_grader_result_store_protocol_is_satisfiable_by_stub() -> None:
 
 def test_agent_session_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_AgentSessionStub(), AgentSessionStore)
+
+
+def test_sdk_message_store_protocol_is_satisfiable_by_stub() -> None:
+    assert isinstance(_SdkMessageStub(), SdkMessageStore)
+
+
+def test_audit_store_protocol_is_satisfiable_by_stub() -> None:
+    assert isinstance(_AuditStub(), AuditStore)
 
 
 # --- Append-only contract on grader_results --------------------------------
@@ -180,7 +215,36 @@ def test_event_record_is_dataclass_with_schema_fields() -> None:
         "ts",
         "kind",
         "payload",
+        "sequence",
     }
+
+
+def test_sdk_message_record_is_dataclass_with_schema_fields() -> None:
+    assert is_dataclass(SdkMessageRecord)
+    names = {f.name for f in fields(SdkMessageRecord)}
+    assert names == {
+        "id",
+        "run_id",
+        "attempt_number",
+        "iteration_number",
+        "sequence",
+        "message_type",
+        "payload",
+        "ts",
+    }
+
+
+def test_sdk_message_record_defaults_sequence_and_id_to_none() -> None:
+    rec = SdkMessageRecord(
+        run_id="r1",
+        attempt_number=1,
+        iteration_number=2,
+        message_type="assistant",
+        payload={"raw": "x"},
+        ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    assert rec.sequence is None
+    assert rec.id is None
 
 
 def test_grader_result_record_is_dataclass_with_schema_fields() -> None:
@@ -233,6 +297,7 @@ def test_event_record_payload_defaults_to_empty_mapping() -> None:
     assert dict(e.payload) == {}
     assert e.attempt_number is None
     assert e.id is None
+    assert e.sequence is None
 
 
 def test_grader_result_record_constructs_with_required_fields() -> None:
@@ -279,3 +344,30 @@ def test_optimistic_concurrency_error_is_raisable() -> None:
             "run-x", expected_version=4, actual_version=7
         )
     assert exc_info.value.actual_version == 7
+
+
+# --- Schema-version mismatch signal ----------------------------------------
+
+
+def test_store_schema_error_carries_versions_and_message() -> None:
+    err = StoreSchemaError(
+        observed_version=1, expected_version=CURRENT_SCHEMA_VERSION
+    )
+    assert err.observed_version == 1
+    assert err.expected_version == CURRENT_SCHEMA_VERSION
+    msg = str(err)
+    assert "store must be re-created" in msg
+    assert str(CURRENT_SCHEMA_VERSION) in msg
+
+
+def test_store_schema_error_handles_unknown_observed_version() -> None:
+    err = StoreSchemaError(
+        observed_version=None, expected_version=CURRENT_SCHEMA_VERSION
+    )
+    assert err.observed_version is None
+    assert "store must be re-created" in str(err)
+
+
+def test_current_schema_version_is_positive_integer() -> None:
+    assert isinstance(CURRENT_SCHEMA_VERSION, int)
+    assert CURRENT_SCHEMA_VERSION >= 1

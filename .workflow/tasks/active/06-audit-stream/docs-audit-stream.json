@@ -1,0 +1,41 @@
+{
+  "id": "docs-audit-stream",
+  "goal": "docs/vision.md and docs/loop.md document the audit stream as the canonical observability surface and call out the sensitive-by-default store policy.",
+  "prerequisites": ["audit-cli"],
+  "tags": ["audit", "docs"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00006-FEATURE-audit-stream.md",
+      "docs/vision.md",
+      "docs/loop.md",
+      "src/flywheel/_schema/persistence-schema.sql"
+    ],
+    "references": [
+      "docs/vision.md -- observability section gets a paragraph naming flywheel.audit.stream and the python -m flywheel.audit CLI as the canonical inspection surface, plus the sensitive-by-default note",
+      "docs/loop.md -- harness section references audit records (EventRecord + SdkMessageRecord) as the canonical execution-history substrate; envelope and grader docs unchanged"
+    ],
+    "constraints": [
+      "docs/vision.md: in the observability section, add a brief subsection 'Audit stream' that names: (a) flywheel.audit.stream(run_id, follow=...) as the programmatic API, (b) python -m flywheel.audit as the operator CLI, (c) the sensitive-by-default policy with a one-line redaction-is-future-work note. Keep it terse -- two short paragraphs at most.",
+      "docs/loop.md: where harness behavior and event emission are canonized, add a one-line reference noting that every SDK message is also persisted under the same per-run monotonic sequence and that the audit stream is the canonical replay/inspection surface. Do not duplicate the spec; link by name to flywheel.audit.",
+      "Do not regenerate or rewrite either doc -- minimal additive edits only.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch (none expected in this task, but verify nothing else was edited).",
+      "Commit the change with a Conventional Commits message (e.g. 'docs:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not create new doc files. The audit stream is a feature of the existing loop; it does not get its own top-level doc page.",
+      "Do not modify docs/task-schema.md or docs/task-lifecycle.md -- the audit stream is orthogonal to task and lifecycle shape.",
+      "Do not edit docs/strategy.md or docs/roadmap.md (the latter is being deprecated; see memory)."
+    ],
+    "edge_cases": [
+      "If docs/vision.md already references observability in a way that subsumes the audit stream, prefer extending the existing section over creating a new one.",
+      "Keep prose terse per /home/johnayoung/.claude/CLAUDE.md: front-load critical info; default to 1-2 sentence explanations."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "grep -q 'flywheel.audit' docs/vision.md", "name": "vision-mentions-audit" },
+    { "type": "command", "run": "grep -qi 'sensitive' docs/vision.md", "name": "vision-mentions-sensitive-default" },
+    { "type": "command", "run": "grep -qi 'audit' docs/loop.md", "name": "loop-mentions-audit" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-still-passes" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^docs:'", "name": "commit-landed" }
+  ]
+}

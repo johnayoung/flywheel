@@ -1,0 +1,61 @@
+{
+  "id": "audit-schema-and-protocol",
+  "goal": "Persistence schema and store-protocol surface gain sdk_messages, an events.sequence column, and a per-run monotonic counter, with a store-version check that refuses pre-feature stores.",
+  "tags": ["audit", "schema", "store"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00006-FEATURE-audit-stream.md",
+      "src/flywheel/_schema/persistence-schema.sql",
+      "src/flywheel/_schema/persistence-schema-postgres.sql",
+      "src/flywheel/store_protocols.py",
+      "src/flywheel/store_memory.py",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/store_postgres.py",
+      "tests/test_store_protocols.py",
+      "tests/test_store_protocols_module_purity.py",
+      "tests/test_store_contract.py"
+    ],
+    "references": [
+      "src/flywheel/store_protocols.py:79-117 -- EventRecord / GraderResultRecord pattern; SdkMessageRecord mirrors this shape",
+      "src/flywheel/store_protocols.py:192-205 -- EventStore protocol; the new SdkMessageStore protocol mirrors its shape",
+      "src/flywheel/_schema/persistence-schema.sql:52-60 -- events table; gains a sequence INTEGER NOT NULL column and a per-run uniqueness invariant",
+      "src/flywheel/_schema/persistence-schema.sql:95-110 -- claude_session_store demonstrates an append-only, ordered table layout to mirror for sdk_messages",
+      "src/flywheel/store_memory.py:114-188 -- InMemoryStore's append_event / sequence counter pattern; sdk_messages and the per-run sequence reuse this style"
+    ],
+    "constraints": [
+      "Add SdkMessageRecord to flywheel.store_protocols with kw_only fields: run_id (str), attempt_number (int), iteration_number (int), sequence (int | None, store-assigned), message_type (str), payload (Mapping[str, Any]), ts (datetime), id (int | None). Mirror EventRecord's dataclass style.",
+      "Add SdkMessageStore Protocol with save_sdk_messages(run_id, attempt_number, iteration_number, messages: Sequence[Mapping[str, Any]]) -> list[SdkMessageRecord] (assigns per-run sequence numbers atomically) and list_sdk_messages(run_id) -> list[SdkMessageRecord].",
+      "Add read_audit_since(run_id: str, cursor: int) -> list[AuditRecord] to a new AuditStore Protocol; AuditRecord is the typed union of EventRecord and SdkMessageRecord. The method returns records with sequence > cursor in ascending sequence order, capped at an internal page size.",
+      "Extend EventRecord with a sequence: int | None = None field. Stores assign the sequence on append_event; existing callers that leave it None must continue to work.",
+      "Stores must maintain a per-run monotonic sequence counter shared by append_event and save_sdk_messages so a single ordering exists across both writes. Choice between a dedicated run_sequence table and MAX(seq)+1 under per-row locking is implementation-detail; either is acceptable as long as the test in test_store_contract.py asserting interleaved appends produce strictly ascending per-run sequences passes for all three backends.",
+      "Update src/flywheel/_schema/persistence-schema.sql AND src/flywheel/_schema/persistence-schema-postgres.sql in lockstep. Add a sdk_messages table keyed by (run_id, sequence) plus indexes for (run_id, sequence) and (run_id, attempt_number, iteration_number). Add a sequence column (NOT NULL) to events. Add a run_sequence table OR document the MAX()+1 strategy with a comment in the schema header. Add a schema_version row/table so the store can refuse legacy databases.",
+      "Update the header comment on persistence-schema.sql to note: 'Store contents are sensitive-by-default; payloads are persisted verbatim and unredacted.' per spec NFR-Security.",
+      "store_sqlite.SqliteStore and store_postgres.PostgresStore must, on open, read the schema_version row and raise a clear 'store must be re-created' error if the version mismatches the current one. InMemoryStore is always at the current version.",
+      "Extend tests/test_store_contract.py with a shared conformance suite that asserts: (a) save_sdk_messages persists every supplied payload byte-for-byte and assigns ascending per-run sequences, (b) list_sdk_messages returns them in sequence order, (c) interleaved append_event + save_sdk_messages calls produce strictly ascending per-run sequences across both record types, (d) read_audit_since with cursor=0 returns every record, and with cursor=N skips the first N and returns the rest, (e) store_sqlite / store_postgres reject a pre-feature schema with a clear error. The InMemoryStore, SqliteStore, and PostgresStore (gated by the existing env-var flag) must all pass.",
+      "tests/test_store_protocols_module_purity.py: re-run unchanged. flywheel.store_protocols stays a pure type module -- no IO, json, pathlib, open() imports may be introduced.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not wire harness or invoker writes in this task -- the harness still emits events through the existing _emit helper without sequence-aware behavior. Sequence assignment for harness-emitted events is enforced by the store's append_event implementation, not by the caller.",
+      "Do not build the flywheel.audit module or CLI in this task -- those are downstream tasks.",
+      "Do not change the GraderResultRecord shape or the grader_results table.",
+      "Do not introduce a backfill migration for pre-feature stores -- the spec explicitly chooses 'require fresh store'."
+    ],
+    "edge_cases": [
+      "Interleaved save_sdk_messages and append_event for the same run_id must produce strictly increasing per-run sequences. Two writers racing on the same run_id is out of scope (the harness serializes per-run), but the test must demonstrate the property under sequential interleaving.",
+      "SdkMessageRecord.payload is a Mapping[str, Any] opaque JSON-compatible blob. Stores serialize via json (sqlite/postgres) and dict-copy (memory) the same way EventRecord.payload is handled today -- no typed coupling to claude-agent-sdk dataclasses.",
+      "Records returned to callers are defensive copies (mirrors the existing InMemoryStore.append_event pattern at store_memory.py:176-188).",
+      "schema_version mismatch surfaces as a typed StoreSchemaError (new exception in store_protocols) so callers can distinguish it from generic OperationalError; the message must say 'store must be re-created' and include the observed and expected versions."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_store_protocols.py tests/test_store_protocols_module_purity.py tests/test_store_contract.py tests/test_store_memory.py tests/test_store_sqlite.py tests/test_store_postgres.py -v", "name": "store-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "grep -q 'sdk_messages' src/flywheel/_schema/persistence-schema.sql && grep -q 'sdk_messages' src/flywheel/_schema/persistence-schema-postgres.sql", "name": "schema-has-sdk-messages" },
+    { "type": "command", "run": "grep -q 'sequence' src/flywheel/_schema/persistence-schema.sql", "name": "events-has-sequence" },
+    { "type": "command", "run": "grep -q 'schema_version' src/flywheel/_schema/persistence-schema.sql", "name": "schema-version-pin" },
+    { "type": "command", "run": "uv run python -c \"from flywheel.store_protocols import SdkMessageRecord, EventRecord; r = EventRecord(run_id='x', ts=__import__('datetime').datetime.now(), kind='k'); assert hasattr(r, 'sequence')\"", "name": "event-record-has-sequence" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor):'", "name": "commit-landed" }
+  ]
+}

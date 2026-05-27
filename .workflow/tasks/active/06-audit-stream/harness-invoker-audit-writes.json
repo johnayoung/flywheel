@@ -1,0 +1,54 @@
+{
+  "id": "harness-invoker-audit-writes",
+  "goal": "Harness and invoker persist every SDK Message to the store and assign per-run monotonic sequence to each EventRecord, finalizing the attempt as INTERNAL_ERROR when an audit write fails.",
+  "prerequisites": ["audit-schema-and-protocol"],
+  "tags": ["audit", "harness", "invoker"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00006-FEATURE-audit-stream.md",
+      "src/flywheel/invoker.py",
+      "src/flywheel/harness.py",
+      "src/flywheel/store_protocols.py",
+      "tests/test_invoker.py",
+      "tests/test_harness.py"
+    ],
+    "references": [
+      "src/flywheel/harness.py:237-255 -- _emit helper that writes every EventRecord; the natural integration point if the store's append_event now assigns sequence atomically",
+      "src/flywheel/harness.py:813-889 -- _drive_iterations loop; the post-iteration block at lines 855-878 already emits harness.iteration_completed and is the right place to invoke store.save_sdk_messages",
+      "src/flywheel/harness.py:604-637 -- existing crash -> INTERNAL_ERROR flow; the audit-write-failure path uses this same finalize_attempt + transition pattern",
+      "src/flywheel/harness.py:1030-1097 -- finalize_stranded_lifecycle must continue to work; its _emit calls now also assign sequence numbers (no caller change needed since the store does the assignment)",
+      "src/flywheel/invoker.py:128-131 -- IterationResult.messages already carries every Message observed; harness reads this tuple and persists via save_sdk_messages"
+    ],
+    "constraints": [
+      "In src/flywheel/harness.py _drive_iterations (around line 855), after each invoke_iteration call and before the harness.iteration_completed event, persist the full iteration_result.messages tuple via store.save_sdk_messages(run_id, attempt_number, iteration_number, payloads). Serialize each Message to a JSON-compatible dict using a private _serialize_sdk_message helper. The serializer captures message_type (the class name), the full message body, and never truncates.",
+      "The _serialize_sdk_message helper handles AssistantMessage, UserMessage, ResultMessage, RateLimitEvent, HookEventMessage. Nested blocks (TextBlock, ToolUseBlock, ToolResultBlock) are serialized recursively as plain dicts. Use dataclasses.asdict where possible; fall back to vars(obj) for SDK types that are not dataclasses. The helper lives in src/flywheel/invoker.py (where Message types are already imported) and is exported for harness use; flywheel.task and flywheel.lifecycle stay untouched.",
+      "Per spec FR-5 Strict-audit persistence: wrap every store.append_event AND store.save_sdk_messages call in the harness in a try/except. On any exception, emit a final 'harness.audit_write_failed' event (best-effort; if THAT also fails, swallow), call _finalize_attempt with Outcome.INTERNAL_ERROR and error='audit write failed: <type>: <message>', and _transition the lifecycle to Status.INTERNAL_ERROR. Then return. The retry policy already applies to INTERNAL_ERROR outcomes; do not change retry logic.",
+      "The harness.audit_write_failed event payload must include: failing_method (str: 'append_event' or 'save_sdk_messages'), error_type, message, attempt_number, iteration_number (when known).",
+      "Sequence assignment is the store's job (per audit-schema-and-protocol); the harness does not pass a sequence field on either write path. Tests assert sequences arrive monotonic when read back via store.list_events and store.list_sdk_messages.",
+      "tests/test_invoker.py: add tests that inject a known sequence of AssistantMessage / UserMessage / ResultMessage / RateLimitEvent / HookEventMessage via message_stream and assert (a) IterationResult.messages preserves the input order and (b) _serialize_sdk_message produces a JSON-roundtrippable dict that preserves every field. The 'forbidden' purity test at tests/test_invoker.py:408-416 must continue to pass -- do not introduce file/json/io imports the test forbids.",
+      "tests/test_harness.py: add cases covering (a) end-to-end: a run with N iterations persists exactly N batches of SDK messages, all visible via store.list_sdk_messages in input order; (b) interleaved sequence numbers: EventRecords and SdkMessageRecords share a strictly ascending per-run sequence; (c) strict-audit failure: a stub store that raises on save_sdk_messages results in attempt outcome=INTERNAL_ERROR, lifecycle status=INTERNAL_ERROR, exactly one harness.audit_write_failed event recorded; (d) same for a stub that raises on append_event; (e) finalize_stranded_lifecycle still works and the events it emits receive sequence numbers.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not build flywheel.audit, AuditRecord union types beyond what exists in store_protocols, or the CLI in this task.",
+      "Do not change Attempt.agent_output / Lifecycle.agent_output -- the spec explicitly keeps both fields.",
+      "Do not add redaction, payload size caps, or truncation -- spec out of scope.",
+      "Do not change the InvocationSignals dataclass; the full Message tuple is already on IterationResult.messages."
+    ],
+    "edge_cases": [
+      "An iteration that produces zero SDK messages (e.g. immediate failure before the SDK yields anything) calls save_sdk_messages with an empty sequence; the store must accept this without assigning sequence numbers. The harness still emits harness.iteration_completed.",
+      "Multi-MB ToolResultBlock content is persisted verbatim; the serializer never truncates.",
+      "Two attempts on the same run_id share the per-run sequence counter; spec edge case asserts sequence continues monotonically across attempts -- this falls out for free if the store-level counter is per-run not per-attempt.",
+      "If save_sdk_messages raises mid-iteration after harness.iteration_completed was already emitted, the audit-write-failure path still finalizes the attempt as INTERNAL_ERROR (no rollback).",
+      "claude-agent-sdk Message subclasses may evolve; the serializer uses dataclasses.asdict when available and falls back to vars(obj) so new fields appear in the payload automatically without code changes."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_invoker.py tests/test_harness.py -v", "name": "invoker-and-harness-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "grep -q 'save_sdk_messages' src/flywheel/harness.py", "name": "harness-persists-sdk-messages" },
+    { "type": "command", "run": "grep -q 'audit_write_failed' src/flywheel/harness.py", "name": "harness-emits-audit-write-failed" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor):'", "name": "commit-landed" }
+  ]
+}

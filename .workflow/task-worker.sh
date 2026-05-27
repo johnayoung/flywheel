@@ -439,8 +439,11 @@ create_worktree() {
 }
 
 merge_worktree() {
-  # Returns 0 if commits were merged into PHASE_BASE; non-zero if nothing
-  # was merged (parked for forensics OR no-op because the agent did no work).
+  # Returns 0 when the DONE lifecycle is accepted (commits merged OR
+  # legitimate zero-commit no-op cleaned up). Returns non-zero only when
+  # the worktree had to be parked for forensics (uncommitted changes,
+  # rebase failed, post-rebase FF failed). Prints its own per-outcome
+  # message on stderr.
   local task_id="$1"
   local phase="$2"
   local worktree="$WORKTREES_DIR/$task_id"
@@ -454,20 +457,27 @@ merge_worktree() {
     return 1
   fi
 
-  # Zero-commit branch: agent claimed done but produced no commits. Nothing
-  # to park forensically, so clean up -- but signal failure so an operator
-  # notices that a "done" lifecycle row has no work behind it.
+  # Zero-commit branch: lifecycle reached DONE without producing any
+  # commits beyond PHASE_BASE. Legitimate cases include:
+  #   * The work was already merged into PHASE_BASE (cherry-pick, manual
+  #     merge, hot-fix), so the agent inspected the worktree, saw the
+  #     change already in place, and emitted intent=verify on iter 1.
+  #   * The task's only graders are inspection checks (doc greps, sanity
+  #     smokes) that legitimately have no diff but still pass.
+  # The lifecycle row is the source of truth -- DONE means done. Just
+  # clean up the empty branch+worktree quietly.
   local commit_count
   commit_count=$(git -C "$REPO_ROOT" rev-list --count "${PHASE_BASE}..${branch}")
   if [[ "$commit_count" -eq 0 ]]; then
-    echo "[worker] WARNING: $task_id reached DONE with zero commits on $branch -- agent did no work; treating as task failure" >&2
+    echo "[worker] $task_id reached DONE with no commits beyond $PHASE_BASE; nothing to merge" >&2
     git -C "$REPO_ROOT" worktree remove "$worktree"
     git -C "$REPO_ROOT" branch -d "$branch"
-    return 1
+    return 0
   fi
 
   # Fast-forward merge attempt.
   if git -C "$REPO_ROOT" merge --ff-only "$branch"; then
+    echo "[worker] Merged $branch into $PHASE_BASE ($commit_count commit(s))" >&2
     git -C "$REPO_ROOT" worktree remove "$worktree"
     git -C "$REPO_ROOT" branch -d "$branch"
     return 0
@@ -482,6 +492,7 @@ merge_worktree() {
     return 1
   fi
   if git -C "$REPO_ROOT" merge --ff-only "$branch"; then
+    echo "[worker] Merged $branch into $PHASE_BASE after rebase ($commit_count commit(s))" >&2
     git -C "$REPO_ROOT" worktree remove "$worktree"
     git -C "$REPO_ROOT" branch -d "$branch"
     return 0
@@ -575,9 +586,10 @@ remove_finished() {
 
     case "$status" in
       done)
-        if merge_worktree "$task_id" "$phase"; then
-          echo "[worker] Merged flywheel/$phase/$task_id into $PHASE_BASE" >&2
-        fi
+        # merge_worktree prints its own per-outcome message; treat any
+        # success exit as "lifecycle accepted." Zero-commit DONE is a
+        # legitimate no-op outcome, not a failure to report here.
+        merge_worktree "$task_id" "$phase" || true
         ;;
       failed|interrupted)
         echo "[worker] Lifecycle $status; worktree preserved at $worktree" >&2

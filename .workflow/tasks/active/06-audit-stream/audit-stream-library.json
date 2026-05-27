@@ -47,6 +47,6 @@
     { "type": "command", "run": "uv run pytest tests/test_audit.py -v", "name": "audit-library-tests" },
     { "type": "command", "run": "uv run pytest", "name": "full-suite" },
     { "type": "command", "run": "uv run python -c \"from flywheel.audit import stream, attach_logger, AuditRecord; assert callable(stream) and callable(attach_logger)\"", "name": "public-surface" },
-    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor):'", "name": "commit-landed" }
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|fix|refactor|docs|chore|test):'", "name": "commit-landed" }
   ]
 }

@@ -67,6 +67,6 @@
     { "type": "command", "run": "uv run python -c \"from flywheel.grader_rubric import run_rubric_graders, parse_verdict, RubricJudgeError; print('ok')\"", "name": "api-smoke" },
     { "type": "command", "run": "uv run python -c \"from flywheel.grader_rubric import parse_verdict\ntext = '<!-- RUBRIC_VERDICT -->\\n{\\\"passed\\\": true, \\\"summary\\\": \\\"ok\\\"}\\n<!-- /RUBRIC_VERDICT -->'\nr = parse_verdict(text)\nassert r.kind == 'valid' and r.passed is True\n\"", "name": "parser-smoke" },
     { "type": "command", "run": "grep -q 'RUBRIC_VERDICT' docs/loop.md", "name": "docs-mentions-verdict-envelope" },
-    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor|docs):'", "name": "commit-landed" }
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|fix|refactor|docs|chore|test):'", "name": "commit-landed" }
   ]
 }

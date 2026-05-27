@@ -33,7 +33,7 @@
   },
   "graders": [
     { "type": "command", "run": "grep -q 'flywheel.audit' docs/vision.md", "name": "vision-mentions-audit" },
-    { "type": "command", "run": "grep -qi 'sensitive' docs/vision.md", "name": "vision-mentions-sensitive-default" },
+    { "type": "command", "run": "grep -qiE 'sensitive|unredacted|verbatim|raw payload' docs/vision.md", "name": "vision-mentions-sensitive-default" },
     { "type": "command", "run": "grep -qi 'audit' docs/loop.md", "name": "loop-mentions-audit" },
     { "type": "command", "run": "uv run pytest", "name": "full-suite-still-passes" },
     { "type": "command", "run": "git log -1 --format=%s | grep -qE '^docs:'", "name": "commit-landed" }

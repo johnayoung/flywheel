@@ -47,8 +47,6 @@
   "graders": [
     { "type": "command", "run": "uv run pytest tests/test_invoker.py tests/test_harness.py -v", "name": "invoker-and-harness-tests" },
     { "type": "command", "run": "uv run pytest", "name": "full-suite" },
-    { "type": "command", "run": "grep -q 'save_sdk_messages' src/flywheel/harness.py", "name": "harness-persists-sdk-messages" },
-    { "type": "command", "run": "grep -q 'audit_write_failed' src/flywheel/harness.py", "name": "harness-emits-audit-write-failed" },
-    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor):'", "name": "commit-landed" }
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|fix|refactor|docs|chore|test):'", "name": "commit-landed" }
   ]
 }

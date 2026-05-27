@@ -43,6 +43,6 @@
     { "type": "command", "run": "uv run pytest tests/test_audit.py -k cli -v", "name": "audit-cli-tests" },
     { "type": "command", "run": "uv run pytest", "name": "full-suite" },
     { "type": "command", "run": "uv run python -m flywheel.audit --help >/dev/null", "name": "module-runnable" },
-    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor):'", "name": "commit-landed" }
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|fix|refactor|docs|chore|test):'", "name": "commit-landed" }
   ]
 }

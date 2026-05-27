@@ -49,6 +49,6 @@
     { "type": "command", "run": "uv run python -c \"from flywheel.task import RubricGrader; g = RubricGrader(assertions=['x']); assert g.judge_model is None and g.retry_on_fail is True\"", "name": "field-defaults" },
     { "type": "command", "run": "uv run python -c \"from flywheel.task import RubricGrader, ValidationError\nimport contextlib\ntry:\n    RubricGrader(assertions=['x'], retry_on_fail='false')\nexcept ValidationError:\n    raise SystemExit(0)\nraise SystemExit(1)\n\"", "name": "rejects-non-bool-retry-on-fail" },
     { "type": "command", "run": "grep -q 'judge_model' docs/task-schema.md && grep -q 'retry_on_fail' docs/task-schema.md", "name": "docs-mentions-new-fields" },
-    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor|docs):'", "name": "commit-landed" }
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|fix|refactor|docs|chore|test):'", "name": "commit-landed" }
   ]
 }

@@ -663,6 +663,9 @@ remove_finished() {
     status=$(read_lifecycle_status "$task_id")
     echo "[worker] Lifecycle     : $task_id ${status:-unknown}" >&2
 
+    # Shared counter: reset only when a lifecycle row exists (confirmed-good outcome), not on a successful create_worktree -- so post-spawn crashes that leave no row can actually accumulate to the threshold.
+    [[ -n "$status" ]] && SPAWN_FAILURES[$task_id]=0
+
     case "$status" in
       done)
         # merge_worktree prints its own per-outcome message; treat any
@@ -756,7 +759,6 @@ spawn_eligible() {
       fi
       break
     fi
-    SPAWN_FAILURES[$task_id]=0
 
     spawn_task "$task_file" "$task_id" "$phase" "$worktree" "$logfile"
   done

@@ -62,6 +62,8 @@ The envelope is untrusted protocol input. The harness must handle malformed JSON
 
 Per-state dispatch is specified by the **Loop service** column of the detection map above. Each detected state maps to a concrete loop action — bookkeeping, watchdog reset, verification orchestration, pause-for-intervention, retry policy, or fail-loud. Complex cases (thrash detection, crash classification, context-recovery policy) are flagged as TODO subsystems in that column.
 
+Every harness `EventRecord` and every SDK `Message` observed during an iteration is persisted under a single per-run monotonic sequence; `flywheel.audit` is the canonical replay and live-inspection surface for that stream.
+
 ## Graders
 
 Triggered when the agent claims `completed`. Driven by the task's `graders` list. Run in cost order; first failure inside a type skips the rest of that type and later types.

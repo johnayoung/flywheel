@@ -37,7 +37,13 @@ Observability is a first-class property of the loop.
 
 Every meaningful event in execution is emitted as structured data: lifecycle transitions, agent invocations, iteration envelopes, verification results, interruptions, protocol errors, and infrastructure failures. This creates a durable execution record that can power logs, dashboards, alerts, automation, and postmortems.
 
-The loop is not merely a reporter. It is the controller for a single task’s execution lifecycle. Business policy such as queueing, prioritization, retry budgets, and escalation thresholds can live above it, but the loop still owns the state transitions and local operational behavior required to run safely. 
+The loop is not merely a reporter. It is the controller for a single task’s execution lifecycle. Business policy such as queueing, prioritization, retry budgets, and escalation thresholds can live above it, but the loop still owns the state transitions and local operational behavior required to run safely.
+
+#### Audit stream
+
+Every harness event and every SDK message the agent emits is persisted under a single per-run monotonic sequence, exposed through `flywheel.audit.stream(run_id, follow=...)` as the programmatic API and `python -m flywheel.audit` as the operator CLI. Replay and live tailing share one iterator; this is the canonical inspection surface for "what did the agent actually do?".
+
+The store is sensitive-by-default: payloads are captured verbatim with no truncation or redaction, so audit records may contain prompts, tool inputs, and tool outputs in the clear. A redaction layer is future work that will sit on top of this stream.
 
 ### Claim-based signaling
 

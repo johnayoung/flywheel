@@ -83,6 +83,7 @@ from flywheel.prompt import IterationInputs, RubricFindings, build_iteration_pro
 from flywheel.store_protocols import (
     EventRecord,
     GraderResultRecord,
+    LifecycleAlreadyExistsError,
 )
 from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
 
@@ -753,6 +754,94 @@ def _parse_blocked_requires_json(
     return tuple(parsed)
 
 
+# Statuses that require an ``error`` argument on transition_to per
+# flywheel.lifecycle._REQUIRES_ERROR. Mirrored here so the harness's
+# entry-crash recorder picks the right argument shape without reaching
+# into the lifecycle module's private surface.
+_TRANSITION_REQUIRES_ERROR: frozenset[Status] = frozenset(
+    {Status.FAILED, Status.FAILED_VALIDATION, Status.INTERNAL_ERROR}
+)
+
+
+# Per-status walk from an entry-crash detection point to Status.FAILED.
+# The state machine in :class:`Lifecycle.transition_to` only permits
+# the listed edges; we pre-compute the sequence so the recorder applies
+# the minimum number of legal transitions. Statuses absent from this
+# map (DONE, FAILED, INTERRUPTED) are already terminal or quiescent --
+# no walk is required and none is attempted.
+_ENTRY_CRASH_PATH_TO_FAILED: dict[Status, tuple[Status, ...]] = {
+    Status.PENDING: (Status.READY, Status.RUNNING, Status.FAILED),
+    Status.READY: (Status.RUNNING, Status.FAILED),
+    Status.RUNNING: (Status.FAILED,),
+    Status.VALIDATING: (Status.INTERNAL_ERROR, Status.FAILED),
+    Status.FAILED_VALIDATION: (Status.FAILED,),
+    Status.INTERNAL_ERROR: (Status.FAILED,),
+}
+
+
+def _record_entry_crash(
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    exception: BaseException,
+    *,
+    clock: Callable[[], datetime],
+) -> None:
+    """Emit one ``harness.crash`` event and walk to :attr:`Status.FAILED`.
+
+    Used by :func:`run_task`'s top-level handler when an uncaught
+    :class:`Exception` escapes the main loop after the lifecycle row
+    has been persisted. Three secondary-failure shapes are explicitly
+    handled:
+
+    * An audit-write failure inside :func:`_emit` is swallowed via
+      ``best_effort=True`` so the recorder cannot itself loop and mask
+      the original exception (the caller re-raises after this returns).
+    * A transition failure (e.g.
+      :class:`~flywheel.store_protocols.OptimisticConcurrencyError`
+      from a concurrent harness racing on the same ``run_id``)
+      propagates: the loser must learn its lifecycle is owned by
+      another worker.
+    * A lifecycle already in a terminal or quiescent state
+      (:attr:`Status.DONE`, :attr:`Status.FAILED`,
+      :attr:`Status.INTERRUPTED`) is left untouched -- no walk is
+      attempted because there is no legal edge that lands on FAILED
+      from those states and re-emitting the crash event after the run
+      is already closed would be misleading.
+
+    Payload keys match the existing ``harness.crash`` convention so no
+    new event schema is introduced: ``classification='entry_error'``,
+    ``exception_type``, and ``message``.
+    """
+    error = (
+        f"harness entry crash: {type(exception).__name__}: {exception}"
+    )
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.crash",
+        payload={
+            "classification": "entry_error",
+            "exception_type": type(exception).__name__,
+            "message": str(exception),
+        },
+        now=clock,
+        best_effort=True,
+    )
+
+    path = _ENTRY_CRASH_PATH_TO_FAILED.get(lifecycle.status, ())
+    for target in path:
+        target_error = (
+            error if target in _TRANSITION_REQUIRES_ERROR else ""
+        )
+        _transition(
+            lifecycle,
+            target,
+            store=store,
+            error=target_error,
+            now=clock,
+        )
+
+
 async def run_task(
     task: Task,
     lifecycle: Lifecycle,
@@ -797,6 +886,48 @@ async def run_task(
     ``invoke`` defaults to :func:`invoke_iteration` (via
     :func:`_default_invoke`); tests inject a stub callable returning
     pre-built :class:`IterationResult` instances.
+
+    **Entry ordering and resume reconciliation.** The first store
+    interaction is :meth:`HarnessStore.create_lifecycle`; any
+    :class:`LifecycleAlreadyExistsError` (the resume case) is swallowed
+    so we fall through to a follow-up
+    :meth:`HarnessStore.load_lifecycle`. The persisted row wins: on
+    resume the harness reconciles the caller's in-memory lifecycle
+    fields (``status``, ``version``, ``retries``, ``error``,
+    ``timestamps``, ``blocked_requires_json``, ``agent_output``,
+    ``session_id``, ``artifacts_dir``, ``worker_id``) from the loaded
+    row before any normalization runs. This guarantees the
+    optimistic-concurrency check on the first ``update_lifecycle``
+    sees the canonical ``expected_version`` even when the caller hands
+    in a stale ``Lifecycle``.
+
+    **Entry-time crash recording.** Once the lifecycle row exists, the
+    main loop body runs under a top-level ``except Exception`` handler.
+    Any uncaught exception emits a single ``harness.crash`` event with
+    ``classification='entry_error'`` (best-effort — audit-write failure
+    here is swallowed so it cannot mask the original exception) and
+    walks the lifecycle to :attr:`Status.FAILED` via whichever
+    transition path the state machine allows from the current status.
+    FAILED is chosen over INTERRUPTED because an unhandled Python
+    exception is not recoverable by the run itself — surfacing the
+    failure as terminal matches the semantic and lets the worker exit
+    non-zero with the original traceback intact (we re-raise after
+    recording). :exc:`asyncio.CancelledError` and
+    :exc:`KeyboardInterrupt` are deliberately *not* caught here:
+    operator-driven shutdown remains the existing
+    :func:`finalize_stranded_lifecycle` path in
+    :mod:`flywheel.workflow`. If a concurrent harness lands a
+    transition first, the loser's
+    :class:`~flywheel.store_protocols.OptimisticConcurrencyError`
+    surfaces to the caller verbatim — not swallowed — so the worker
+    learns its run_id is racing.
+
+    **Remaining gap.** If :meth:`HarnessStore.create_lifecycle` itself
+    fails (catastrophic schema breakage that the INSERT cannot satisfy)
+    no lifecycle row can exist and ``harness.crash`` cannot foreign-key
+    against ``run_id``. That exception propagates straight to the
+    caller; the worker-side circuit breaker (separate task) covers the
+    repeating-spawn shape.
     """
 
     config = config or HarnessConfig()
@@ -804,108 +935,140 @@ async def run_task(
     clock = now or _utcnow
     mclock = monotonic or _default_monotonic
 
-    # Ensure the lifecycle row exists. If the caller has previously
-    # persisted it (e.g. resuming an interrupted run), trust the
-    # in-memory copy they passed — the store's optimistic concurrency
-    # check will catch any divergence on the first update.
-    stored = store.load_lifecycle(lifecycle.run_id)
-    if stored is None:
+    # Ensure the lifecycle row exists as the first store interaction.
+    # Create-then-swallow is the defensive shape: a load-time failure
+    # (e.g. OperationalError on schema drift) would otherwise leave the
+    # run with zero rows across lifecycles/attempts/events, which the
+    # audit at .workflow/audits/08-recoverable-blocked-lifecycles.md
+    # documents as the silent-crash shape we are closing here.
+    try:
         store.create_lifecycle(lifecycle)
+    except LifecycleAlreadyExistsError:
+        # Resume case: the row was persisted by a prior run_task call
+        # (or by the workflow CLI's resume path). Fall through to the
+        # follow-up load_lifecycle so the canonical state replaces any
+        # stale fields the caller may be holding.
+        pass
 
-    # Entry-time normalization: bring resumable states to `ready`.
-    if lifecycle.status == Status.PENDING:
-        _transition(lifecycle, Status.READY, store=store, now=clock)
-    elif lifecycle.status == Status.INTERRUPTED:
-        _transition(lifecycle, Status.READY, store=store, now=clock)
+    # Reconcile from the persisted row so optimistic concurrency on
+    # the first update_lifecycle sees the right expected_version. The
+    # caller's Lifecycle is mutated in place so the HarnessOutcome
+    # they receive at the end reflects the same identity.
+    stored = store.load_lifecycle(lifecycle.run_id)
+    if stored is not None:
+        lifecycle.replace_from(stored)
 
-    while True:
-        if lifecycle.status in (Status.DONE, Status.FAILED):
-            break
-        if lifecycle.status == Status.INTERRUPTED:
-            # Paused this run; caller resumes by invoking run_task again.
-            break
+    try:
+        # Entry-time normalization: bring resumable states to `ready`.
+        if lifecycle.status == Status.PENDING:
+            _transition(lifecycle, Status.READY, store=store, now=clock)
+        elif lifecycle.status == Status.INTERRUPTED:
+            _transition(lifecycle, Status.READY, store=store, now=clock)
 
-        if lifecycle.status == Status.READY:
-            await _run_attempt(
-                task=task,
-                lifecycle=lifecycle,
-                store=store,
-                config=config,
-                invoker=invoker,
-                clock=clock,
-                mclock=mclock,
-            )
-            continue
+        while True:
+            if lifecycle.status in (Status.DONE, Status.FAILED):
+                break
+            if lifecycle.status == Status.INTERRUPTED:
+                # Paused this run; caller resumes by invoking run_task again.
+                break
 
-        if lifecycle.status in (
-            Status.FAILED_VALIDATION,
-            Status.INTERNAL_ERROR,
-        ):
-            if lifecycle.is_retry_eligible(config.max_retries):
-                try:
-                    _emit(
-                        store,
-                        run_id=lifecycle.run_id,
-                        kind="harness.retry_scheduled",
-                        payload={
-                            "retries_used": lifecycle.retries,
-                            "max_retries": config.max_retries,
-                        },
-                        now=clock,
-                    )
-                except _AuditWriteError as exc:
-                    # No active attempt to finalize between retries; emit
-                    # the audit-failure event best-effort and terminate
-                    # the run as FAILED with the audit error.
-                    audit_error = (
-                        f"audit write failed: "
-                        f"{type(exc.inner).__name__}: {exc.inner}"
-                    )
-                    _emit(
-                        store,
-                        run_id=lifecycle.run_id,
-                        kind="harness.audit_write_failed",
-                        payload={
-                            "failing_method": exc.failing_method,
-                            "error_type": type(exc.inner).__name__,
-                            "message": str(exc.inner),
-                            "attempt_number": exc.attempt_number,
-                            "iteration_number": exc.iteration_number,
-                        },
-                        now=clock,
-                        best_effort=True,
-                    )
+            if lifecycle.status == Status.READY:
+                await _run_attempt(
+                    task=task,
+                    lifecycle=lifecycle,
+                    store=store,
+                    config=config,
+                    invoker=invoker,
+                    clock=clock,
+                    mclock=mclock,
+                )
+                continue
+
+            if lifecycle.status in (
+                Status.FAILED_VALIDATION,
+                Status.INTERNAL_ERROR,
+            ):
+                if lifecycle.is_retry_eligible(config.max_retries):
                     try:
-                        _transition(
-                            lifecycle,
-                            Status.FAILED,
-                            store=store,
-                            error=audit_error,
+                        _emit(
+                            store,
+                            run_id=lifecycle.run_id,
+                            kind="harness.retry_scheduled",
+                            payload={
+                                "retries_used": lifecycle.retries,
+                                "max_retries": config.max_retries,
+                            },
                             now=clock,
                         )
-                    except Exception:
-                        pass
-                    break
-                _transition(lifecycle, Status.READY, store=store, now=clock)
+                    except _AuditWriteError as exc:
+                        # No active attempt to finalize between retries;
+                        # emit the audit-failure event best-effort and
+                        # terminate the run as FAILED with the audit
+                        # error.
+                        audit_error = (
+                            f"audit write failed: "
+                            f"{type(exc.inner).__name__}: {exc.inner}"
+                        )
+                        _emit(
+                            store,
+                            run_id=lifecycle.run_id,
+                            kind="harness.audit_write_failed",
+                            payload={
+                                "failing_method": exc.failing_method,
+                                "error_type": type(exc.inner).__name__,
+                                "message": str(exc.inner),
+                                "attempt_number": exc.attempt_number,
+                                "iteration_number": exc.iteration_number,
+                            },
+                            now=clock,
+                            best_effort=True,
+                        )
+                        try:
+                            _transition(
+                                lifecycle,
+                                Status.FAILED,
+                                store=store,
+                                error=audit_error,
+                                now=clock,
+                            )
+                        except Exception:
+                            pass
+                        break
+                    _transition(
+                        lifecycle, Status.READY, store=store, now=clock
+                    )
+                    continue
+                terminal_error = (
+                    lifecycle.error
+                    or f"retries exhausted ({lifecycle.retries}/"
+                    f"{config.max_retries})"
+                )
+                _transition(
+                    lifecycle,
+                    Status.FAILED,
+                    store=store,
+                    error=terminal_error,
+                    now=clock,
+                )
                 continue
-            terminal_error = (
-                lifecycle.error
-                or f"retries exhausted ({lifecycle.retries}/{config.max_retries})"
-            )
-            _transition(
-                lifecycle,
-                Status.FAILED,
-                store=store,
-                error=terminal_error,
-                now=clock,
-            )
-            continue
 
-        # Defensive: any other state in the loop is a bug.
-        raise RuntimeError(
-            f"harness encountered unexpected lifecycle status: "
-            f"{lifecycle.status.value}"
+            # Defensive: any other state in the loop is a bug.
+            raise RuntimeError(
+                f"harness encountered unexpected lifecycle status: "
+                f"{lifecycle.status.value}"
+            )
+    except Exception as exc:
+        # asyncio.CancelledError and KeyboardInterrupt inherit from
+        # BaseException (Python 3.8+), so this except deliberately
+        # cannot catch them — operator shutdown stays on the existing
+        # finalize_stranded_lifecycle path in workflow.py. Everything
+        # else is internal failure: record one harness.crash event and
+        # walk the lifecycle to FAILED before re-raising so the worker
+        # subshell still exits non-zero with the original traceback.
+        _record_entry_crash(
+            store, lifecycle, exc, clock=clock
         )
+        raise
 
     attempts = tuple(store.list_attempts(lifecycle.run_id))
     return HarnessOutcome(lifecycle=lifecycle, attempts=attempts)

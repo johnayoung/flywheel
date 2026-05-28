@@ -1144,3 +1144,72 @@ def test_main_status_json_includes_parsed_blocked_requires_when_present(
     assert "blocked_requires" in by_id["blocked"]
     assert by_id["blocked"]["blocked_requires"] == persisted_requires
     assert "blocked_requires" not in by_id["fresh"]
+
+
+# ---------- run_task_file entry-time crash recording ----------
+
+
+def test_run_task_file_records_crash_for_invoke_runtime_error(
+    tmp_path: Path,
+) -> None:
+    """A stub invoke that raises mid-call must leave a non-empty
+    lifecycles row and at least one harness.crash event in the
+    SqliteStore. workflow.py's run_task_file re-raises the original
+    exception so the worker subshell sees a non-zero exit.
+
+    Backs the audit at
+    ``.workflow/audits/08-recoverable-blocked-lifecycles.md`` finding
+    "Crashes before create_lifecycle are invisible to every loop
+    subsystem except the worker log": the new harness ordering must
+    write the lifecycle row first so this exact failure shape is now
+    visible in the DB.
+    """
+    import asyncio
+
+    from flywheel.harness import InvocationRequest
+    from flywheel.invoker import IterationResult
+    from flywheel.workflow import run_task_file
+
+    task_file = tmp_path / "task.json"
+    _write_task(task_file, "probe")
+    db = tmp_path / "db.sqlite"
+    sandbox = tmp_path / "sandbox"
+
+    async def _raising_invoke(_request: InvocationRequest) -> IterationResult:
+        raise RuntimeError("workflow stub blew up")
+
+    with pytest.raises(RuntimeError, match="workflow stub blew up"):
+        asyncio.run(
+            run_task_file(
+                task_file,
+                db_path=db,
+                sandbox=sandbox,
+                invoke=_raising_invoke,
+            )
+        )
+
+    # Re-open the store to verify the DB recorded the crash before the
+    # exception propagated to the caller.
+    store = SqliteStore(db)
+    try:
+        conn = store._connection  # noqa: SLF001 — inspecting raw rows
+        lifecycle_rows = conn.execute(
+            "SELECT run_id, status FROM lifecycles WHERE task_id = ?",
+            ("probe",),
+        ).fetchall()
+        assert len(lifecycle_rows) == 1
+        row = lifecycle_rows[0]
+        run_id = row["run_id"]
+        # Terminal status: the entry-crash recorder walks the lifecycle
+        # to FAILED so subsequent observers see the run is over.
+        assert row["status"] == Status.FAILED.value
+        # The harness.crash event is the audit-visible record of the
+        # failure mode.
+        crash_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM events "
+            "WHERE run_id = ? AND kind = 'harness.crash'",
+            (run_id,),
+        ).fetchone()["n"]
+        assert crash_count >= 1
+    finally:
+        store.close()

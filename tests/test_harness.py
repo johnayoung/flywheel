@@ -1201,6 +1201,195 @@ class TestFinalizeStranded:
         assert ok is False
 
 
+# --- Entry-time crash recording ------------------------------------------
+
+
+class TestEntryTimeCrash:
+    """run_task must persist a lifecycle row and a harness.crash event
+    when a Python exception escapes after the lifecycle row exists.
+
+    Backs the audit finding in
+    ``.workflow/audits/08-recoverable-blocked-lifecycles.md``: 76
+    crashed run_ids produced zero rows in lifecycles/attempts/events
+    because the failure happened before any DB write. With the
+    create-first ordering and the top-level handler in run_task, the
+    lifecycle is always persisted and harness.crash records the
+    classification before the exception propagates.
+    """
+
+    def _raising_invoke(
+        self, exc: BaseException
+    ) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
+        async def _invoke(_request: InvocationRequest) -> IterationResult:
+            raise exc
+
+        return _invoke
+
+    def test_invoke_exception_writes_crash_event_and_lifecycle_row(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-entry-crash")
+        invoke = self._raising_invoke(RuntimeError("transport blew up"))
+
+        with pytest.raises(RuntimeError, match="transport blew up"):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        # Lifecycle row exists despite the crash -- the create-first
+        # ordering is the whole point.
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        # Terminal status: we walk RUNNING -> FAILED.
+        assert reloaded.status == Status.FAILED
+        assert "RuntimeError" in reloaded.error
+        assert "transport blew up" in reloaded.error
+
+        # Exactly one harness.crash event with the entry_error
+        # classification.
+        crash_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert len(crash_events) == 1
+        payload = crash_events[0].payload
+        assert payload["classification"] == "entry_error"
+        assert payload["exception_type"] == "RuntimeError"
+        assert payload["message"] == "transport blew up"
+
+    def test_no_duplicate_crash_event_when_invoke_raises_mid_attempt(
+        self,
+    ) -> None:
+        """attempt_started fired, then invoke raises -- exactly one
+        harness.crash event must land, never two."""
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-crash-no-dup")
+        invoke = self._raising_invoke(ValueError("boom"))
+
+        with pytest.raises(ValueError, match="boom"):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        kinds = [e.kind for e in events]
+        # attempt_started must have fired before the crash (proves the
+        # crash happened mid-attempt, not before any harness work).
+        assert "harness.attempt_started" in kinds
+        # But only one crash event, despite the attempt being open at
+        # the time the exception was raised.
+        crash_events = [e for e in events if e.kind == "harness.crash"]
+        assert len(crash_events) == 1
+        assert crash_events[0].payload["classification"] == "entry_error"
+
+    def test_resume_with_persisted_row_does_not_emit_crash(self) -> None:
+        """A caller-supplied stale Lifecycle whose row is already
+        persisted must reconcile to the persisted state, run normally,
+        and produce no harness.crash event."""
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        # First run pauses on blocked; persists row at version > 1.
+        lifecycle = Lifecycle(task_id="t1", run_id="run-resume-clean")
+        invoke_first = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.BLOCKED,
+                        reason="paused",
+                        requires=(CommandGraderRequirement(name="ok"),),
+                    ),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+        _run(run_task(task, lifecycle, store, invoke=invoke_first))
+        assert lifecycle.status == Status.INTERRUPTED
+        persisted = store.load_lifecycle(lifecycle.run_id)
+        assert persisted is not None
+        canonical_version = persisted.version
+        assert canonical_version > 1
+
+        # Build a stale Lifecycle for the same run_id; the caller may
+        # have constructed it fresh without loading the row.
+        stale = Lifecycle(task_id="t1", run_id="run-resume-clean")
+        assert stale.status == Status.PENDING
+        assert stale.version == 1
+        invoke_second = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        outcome = _run(
+            run_task(task, stale, store, invoke=invoke_second)
+        )
+
+        # Reconciliation: the stale Lifecycle's status/version were
+        # overwritten with the persisted row's values before the loop
+        # started.
+        assert outcome.lifecycle.status == Status.DONE
+        # No harness.crash event from the resume path.
+        crash_events = [
+            e
+            for e in store.list_events(stale.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert crash_events == []
+
+    def test_original_exception_propagates_after_crash_recorded(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-propagate")
+        sentinel = RuntimeError("propagate me unchanged")
+        invoke = self._raising_invoke(sentinel)
+
+        # The caller observes the original exception, not a wrapper.
+        with pytest.raises(RuntimeError) as excinfo:
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+        assert excinfo.value is sentinel
+
+        # And the crash event landed before the propagation.
+        crash_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert len(crash_events) == 1
+
+
 # --- Audit-stream: SDK message persistence + strict-audit failure --------
 
 

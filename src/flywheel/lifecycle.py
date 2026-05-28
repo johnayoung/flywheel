@@ -140,6 +140,33 @@ class Lifecycle:
         if target == Status.READY:
             self.blocked_requires_json = None
 
+    def replace_from(self, persisted: "Lifecycle") -> None:
+        """Overwrite this lifecycle's mutable state from a persisted row.
+
+        Not a state-machine transition: used by the harness at run_task
+        entry to align an in-memory Lifecycle with the canonical row a
+        prior run persisted, so the first optimistic-concurrency check
+        on update_lifecycle sees the right expected_version. The
+        persisted row is the source of truth for the entire mutable
+        surface -- status, version, retries, error, timestamps, the
+        blocked-requires snapshot, and agent-side scratch fields. The
+        identity-shaping fields (run_id, task_id) are deliberately not
+        copied; a divergence there is a caller bug, not a stale-state
+        issue, and silent reassignment would mask it. attempts is also
+        left alone: the harness reloads attempts from the store
+        independently and does not rely on this list.
+        """
+        self.status = persisted.status
+        self.version = persisted.version
+        self.retries = persisted.retries
+        self.error = persisted.error
+        self.timestamps = dict(persisted.timestamps)
+        self.blocked_requires_json = persisted.blocked_requires_json
+        self.agent_output = persisted.agent_output
+        self.session_id = persisted.session_id
+        self.artifacts_dir = persisted.artifacts_dir
+        self.worker_id = persisted.worker_id
+
     def is_retry_eligible(self, max_retries: int) -> bool:
         return (
             self.status in _RETRY_SOURCE_STATUSES

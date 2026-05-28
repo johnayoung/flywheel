@@ -22,6 +22,7 @@ from flywheel import (
     build_iteration_prompt,
 )
 from flywheel.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
+from flywheel.prompt import RubricFindings
 
 
 def _minimal_task() -> Task:
@@ -308,3 +309,203 @@ def test_iteration_inputs_is_frozen() -> None:
     except Exception:
         return
     raise AssertionError("IterationInputs should be frozen")
+
+
+def test_iteration_inputs_prior_rubric_findings_defaults_to_empty_tuple() -> None:
+    inputs = IterationInputs(max_retries=2)
+
+    assert inputs.prior_rubric_findings == ()
+
+
+def test_empty_prior_rubric_findings_omits_reviewer_feedback_section() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(max_retries=3)
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert "# Reviewer feedback" not in prompt
+
+
+def test_empty_prior_rubric_findings_byte_identical_to_default_inputs() -> None:
+    """Pin: omitting the new field must not perturb the first-attempt prompt."""
+
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+
+    without_field = build_iteration_prompt(
+        task, lifecycle, IterationInputs(max_retries=3)
+    )
+    with_empty_tuple = build_iteration_prompt(
+        task,
+        lifecycle,
+        IterationInputs(max_retries=3, prior_rubric_findings=()),
+    )
+
+    assert without_field == with_empty_tuple
+
+
+def test_single_rubric_finding_renders_grader_attempt_and_summary() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="Backoff base delay missing; only the ceiling is enforced.",
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert "# Reviewer feedback" in prompt
+    assert "## attempt #1" in prompt
+    assert (
+        "- rubric `semantics`: Backoff base delay missing; "
+        "only the ceiling is enforced."
+    ) in prompt
+
+
+def test_multiple_findings_same_attempt_render_in_tuple_order() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="first",
+            ),
+            RubricFindings(
+                grader_name="aaa-alpha-first-alphabetically",
+                attempt_number=1,
+                summary="second",
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    # Single attempt heading.
+    assert prompt.count("## attempt #1") == 1
+    # Tuple order is preserved — NOT re-sorted by grader_name.
+    first_idx = prompt.index("- rubric `semantics`: first")
+    second_idx = prompt.index(
+        "- rubric `aaa-alpha-first-alphabetically`: second"
+    )
+    assert first_idx < second_idx
+
+
+def test_findings_across_attempts_render_in_ascending_attempt_order() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    # Intentionally supply attempt #2's findings before attempt #1's to
+    # confirm the renderer sorts by attempt_number rather than tuple index.
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=2,
+                summary="second-attempt finding",
+            ),
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="first-attempt finding",
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    one_idx = prompt.index("## attempt #1")
+    two_idx = prompt.index("## attempt #2")
+    assert one_idx < two_idx
+    first_bullet = prompt.index("first-attempt finding")
+    second_bullet = prompt.index("second-attempt finding")
+    assert first_bullet < second_bullet
+    # Each attempt has its own heading.
+    assert prompt.count("## attempt #1") == 1
+    assert prompt.count("## attempt #2") == 1
+
+
+def test_empty_summary_finding_renders_placeholder() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="",
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert "- rubric `semantics`: (no summary provided)" in prompt
+
+
+def test_reviewer_feedback_section_is_byte_deterministic() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="first",
+            ),
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=2,
+                summary="",
+            ),
+        ),
+    )
+
+    first = build_iteration_prompt(task, lifecycle, inputs)
+    second = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert first == second
+
+
+def test_reviewer_feedback_appears_between_context_and_verification() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics",
+                attempt_number=1,
+                summary="something to review",
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    context_idx = prompt.index("# Context")
+    feedback_idx = prompt.index("# Reviewer feedback")
+    verification_idx = prompt.index("# Verification")
+    assert context_idx < feedback_idx < verification_idx
+
+
+def test_rubric_findings_is_frozen() -> None:
+    finding = RubricFindings(
+        grader_name="semantics", attempt_number=1, summary="x"
+    )
+    try:
+        finding.summary = "y"  # type: ignore[misc]
+    except Exception:
+        return
+    raise AssertionError("RubricFindings should be frozen")

@@ -40,6 +40,21 @@ from flywheel.task import (
 
 
 @dataclass(frozen=True, kw_only=True)
+class RubricFindings:
+    """A single rubric finding carried forward into the next iteration.
+
+    Pure data: produced by the harness (which queries the grader-results
+    store) and consumed by :func:`build_iteration_prompt` to render the
+    ``# Reviewer feedback`` section. The dataclass is frozen so the prompt
+    builder cannot mutate it and remains deterministic.
+    """
+
+    grader_name: str
+    attempt_number: int
+    summary: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class IterationInputs:
     """Per-iteration parameters not carried by the Task or Lifecycle.
 
@@ -49,6 +64,7 @@ class IterationInputs:
     """
 
     max_retries: int
+    prior_rubric_findings: tuple[RubricFindings, ...] = ()
 
 
 def build_iteration_prompt(
@@ -69,6 +85,11 @@ def build_iteration_prompt(
     context_section = _section_context(task)
     if context_section is not None:
         sections.append(context_section)
+
+    if iteration_inputs.prior_rubric_findings:
+        sections.append(
+            _section_reviewer_feedback(iteration_inputs.prior_rubric_findings)
+        )
 
     sections.append(_section_graders(task))
     sections.append(_section_lifecycle(lifecycle, iteration_inputs))
@@ -104,6 +125,31 @@ def _section_context(task: Task) -> str | None:
 def _bulleted(heading: str, items: list[str]) -> str:
     bullets = "\n".join(f"- {item}" for item in items)
     return f"## {heading}\n\n{bullets}"
+
+
+def _section_reviewer_feedback(findings: tuple[RubricFindings, ...]) -> str:
+    """Render the ``# Reviewer feedback`` section from rubric findings.
+
+    Findings are grouped under ``## attempt #N`` subheadings in ascending
+    ``attempt_number`` order; within each attempt, bullets appear in the
+    same order they were supplied in the tuple — they are NOT re-sorted by
+    grader name. This ordering is the module's deterministic-output
+    contract: the harness controls the tuple it supplies, and the renderer
+    only walks it.
+    """
+    grouped: dict[int, list[RubricFindings]] = {}
+    for finding in findings:
+        grouped.setdefault(finding.attempt_number, []).append(finding)
+
+    lines: list[str] = ["# Reviewer feedback"]
+    for attempt_number in sorted(grouped):
+        lines.append("")
+        lines.append(f"## attempt #{attempt_number}")
+        lines.append("")
+        for finding in grouped[attempt_number]:
+            summary = finding.summary or "(no summary provided)"
+            lines.append(f"- rubric `{finding.grader_name}`: {summary}")
+    return "\n".join(lines)
 
 
 def _section_graders(task: Task) -> str:

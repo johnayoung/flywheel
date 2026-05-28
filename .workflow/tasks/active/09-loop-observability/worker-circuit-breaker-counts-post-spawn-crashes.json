@@ -1,0 +1,50 @@
+{
+  "id": "worker-circuit-breaker-counts-post-spawn-crashes",
+  "goal": "task-worker.sh accumulates post-spawn crashes (workflow exits non-zero with no lifecycle row written) against SPAWN_FAILURE_THRESHOLD without the intervening successful create_worktree resetting the counter, so a repeating no-lifecycle-row crash trips the breaker at 3 instead of spinning forever.",
+  "tags": ["worker", "circuit-breaker", "shell", "phase-09"],
+  "context": {
+    "relevant": [
+      ".workflow/task-worker.sh",
+      ".workflow/audits/08-recoverable-blocked-lifecycles.md",
+      "tests/test_workflow.py"
+    ],
+    "references": [
+      ".workflow/task-worker.sh:58 -- SPAWN_FAILURE_THRESHOLD=3 (keep this default)",
+      ".workflow/task-worker.sh:685-699 -- remove_finished's `*)` (no-lifecycle-row) branch increments SPAWN_FAILURES[$task_id]; this is the path the audit caught spinning",
+      ".workflow/task-worker.sh:733-739 -- spawn_eligible's skip check against the same counter",
+      ".workflow/task-worker.sh:750-759 -- create_worktree path: increments SPAWN_FAILURES on failure, then unconditionally resets to 0 on success (line 759 is the bug -- it resets the counter the no-row branch is trying to accumulate)",
+      ".workflow/audits/08-recoverable-blocked-lifecycles.md -- Cross-task pattern 'The spawn-failure circuit breaker covers only one of the two pre-lifecycle failure shapes'; evidence: 76 distinct run_ids across logs/worker/harness-recheck-primitive_cf45b5_20260528T123134.log through ..T123512.log against a threshold of 3"
+    ],
+    "constraints": [
+      "Reset placement must be gated on a confirmed-good outcome (a lifecycle row was written by the spawned workflow), not merely on a successful create_worktree call. Either share one counter that resets only when remove_finished observes a non-empty lifecycle status for the task, or split into two independent counters (worktree-creation vs post-spawn-crash) -- pick one and document the choice in a one-line comment at the reset site.",
+      "The 'worktree creation kept failing' detection at line 750-758 must continue to work: 3 consecutive create_worktree failures must trip the breaker.",
+      "The 'no lifecycle row after spawn' detection at line 685-699 must now actually trip: 3 consecutive post-spawn crashes for the same task with no lifecycle row written must skip the task on the next spawn_eligible pass (existing message text at line 695 and 734 is sufficient).",
+      "Operator-recovery contract preserved: a circuit-broken task stays skipped until the operator clears $worktree and refs/heads/flywheel/*/$task_id manually (existing messages reference this; do not change that contract).",
+      "A task that crashes twice with no lifecycle row then succeeds (lifecycle row written) on attempt 3 must reset the counter to 0 so a later unrelated crash does not compound with old history.",
+      "bash -n .workflow/task-worker.sh must pass cleanly after the change.",
+      "Add tests/test_task_worker_circuit_breaker.py that drives the modified worker with a stub workflow (e.g. a shim script that always exits non-zero without touching the DB) and asserts the worker stops spawning the same task after SPAWN_FAILURE_THRESHOLD attempts. Use subprocess + tmp_path; bound the test wall-clock with a small SPAWN_FAILURE_THRESHOLD via env or a test-only flag if you need to keep the test fast, otherwise leave the default and timeout after a few seconds with assertions on the captured stderr containing the 'giving up' message. Do NOT require an actual claude-agent-sdk call.",
+      "Existing test suite must continue to pass.",
+      "Commit the change with a Conventional Commits message (e.g. 'fix:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not change SPAWN_FAILURE_THRESHOLD's default value (3).",
+      "Do not touch the shutdown / drain / signal-handling code paths (handle_shutdown, on_exit).",
+      "Do not introduce new external dependencies; task-worker.sh's existing requirements (git, uv, sqlite3, bash) are the ceiling.",
+      "Do not modify src/flywheel/ -- this is a pure worker-script + test fix. The harness-side visibility fix lives in the sibling task harness-records-pre-lifecycle-crashes.",
+      "Do not change the retention sweep, single-instance lock, or recovery-sweep behavior."
+    ],
+    "edge_cases": [
+      "First spawn for a task: counter is unset; the existing `${SPAWN_FAILURES[$task_id]:-0}` idiom must keep handling this.",
+      "Worker restart resets in-memory counters (associative array lives in the bash process); this is the existing recovery story -- preserve it.",
+      "A task whose create_worktree fails AND whose subsequent spawns crash with no lifecycle row: the chosen counter design must give a deterministic answer about which failure mode it attributes a given iteration to (one shared counter conflates them; two separate counters keep them distinct -- either is acceptable as long as the choice is comment-documented).",
+      "remove_finished's `running|validating` branch (line 676-684) reconciles to interrupted and is a different recovery path -- do not let the new gating accidentally count interrupted-after-reconcile as a no-lifecycle-row crash."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "bash -n .workflow/task-worker.sh", "name": "worker-syntax" },
+    { "type": "command", "run": "uv run pytest tests/test_task_worker_circuit_breaker.py -v", "name": "circuit-breaker-test" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "test -z \"$(awk 'NR==759 && /^[[:space:]]*SPAWN_FAILURES\\[\\$task_id\\]=0[[:space:]]*$/' .workflow/task-worker.sh)\"", "name": "unconditional-reset-gone" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(fix|refactor):'", "name": "commit-landed" }
+  ]
+}

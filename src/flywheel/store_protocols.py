@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, Protocol, Union, runtime_checkable
 
+from flywheel.events import DomainEvent
 from flywheel.lifecycle import Attempt, Lifecycle
 
 
@@ -121,6 +122,13 @@ class EventRecord:
     :class:`SdkMessageRecord` so events and SDK messages form a single
     totally-ordered audit stream. Stores assign ``sequence`` on
     ``append_event``; callers leave it ``None``.
+
+    ``category`` discriminates a ``'domain'`` event (a state-bearing
+    member of the event-sourced log, written via
+    :meth:`DomainEventStore.append_domain_event`) from a ``'telemetry'``
+    event (pure observability, written via :meth:`EventStore.append_event`).
+    Both share the ``events`` table and the per-run ``sequence`` ordering;
+    only domain events are folded into lifecycle state.
     """
 
     run_id: str
@@ -130,6 +138,7 @@ class EventRecord:
     attempt_number: int | None = None
     id: int | None = None
     sequence: int | None = None
+    category: str = "telemetry"
 
 
 @dataclass(kw_only=True)
@@ -237,6 +246,41 @@ class LifecycleStore(Protocol):
     ) -> None: ...
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+
+@runtime_checkable
+class DomainEventStore(Protocol):
+    """Event-sourced write contract for the lifecycle.
+
+    Lifecycle state is the fold of an ordered domain-event log. Appending
+    a domain event is the single authoritative write: it advances the log,
+    updates the ``lifecycles`` projection (and the ``attempts`` /
+    ``grader_results`` projections it implies) atomically, and returns the
+    folded :class:`Lifecycle`. There is no separate "mutate row then emit
+    event" step, so state and timeline cannot diverge.
+
+    Concurrency: ``expected_version`` is the optimistic-concurrency
+    compare-and-swap key — the caller's view of the current domain-event
+    offset (``Lifecycle.version``). A mismatch raises
+    ``OptimisticConcurrencyError``. The seed event
+    (:class:`flywheel.events.LifecycleInitialized`) creates the projection
+    row and raises ``LifecycleAlreadyExistsError`` if it already exists;
+    its ``expected_version`` is ignored. Every other event raises
+    ``LifecycleNotFoundError`` when no row exists for the event's
+    ``run_id``.
+
+    ``list_domain_events`` returns the run's domain events in ascending
+    ``sequence`` order, suitable for ``flywheel.events.replay``.
+    """
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle: ...
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]: ...
 
 
 @runtime_checkable
@@ -375,6 +419,7 @@ __all__ = [
     "AuditStore",
     "CURRENT_SCHEMA_VERSION",
     "ClaudeSessionEntry",
+    "DomainEventStore",
     "EventRecord",
     "EventStore",
     "GraderResultRecord",

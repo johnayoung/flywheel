@@ -216,6 +216,7 @@ def test_event_record_is_dataclass_with_schema_fields() -> None:
         "kind",
         "payload",
         "sequence",
+        "category",
     }
 
 

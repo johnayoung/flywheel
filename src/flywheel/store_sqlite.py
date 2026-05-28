@@ -33,13 +33,23 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, cast
 
+from flywheel.event_serde import event_from_record, event_kind, event_payload
+from flywheel.events import (
+    AttemptFinalized,
+    AttemptStarted,
+    DomainEvent,
+    GraderEvaluated,
+    LifecycleInitialized,
+    apply,
+)
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
@@ -173,6 +183,15 @@ class SqliteStore:
             conn.execute(
                 "ALTER TABLE lifecycles ADD COLUMN blocked_requires_json TEXT"
             )
+        # Additive, same back-compat path as blocked_requires_json: the
+        # events.category column distinguishes domain (state-bearing) from
+        # telemetry rows. Existing v2 databases lack it; the DEFAULT means
+        # every pre-existing row is correctly 'telemetry'. No version bump.
+        if not _events_has_category(conn):
+            conn.execute(
+                "ALTER TABLE events ADD COLUMN category TEXT NOT NULL "
+                "DEFAULT 'telemetry'"
+            )
         # Final version pin: any row mismatch is fatal regardless of how
         # the database got here. The schema_version table has a CHECK
         # (id = 1) so there is at most one row to read.
@@ -206,6 +225,26 @@ class SqliteStore:
         ).fetchone()
         assert row is not None
         return int(row["next_seq"])
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        """Run a block as one atomic unit under ``BEGIN IMMEDIATE``.
+
+        The connection is in autocommit mode, so domain-event appends —
+        which must check the version, write the projection, and append the
+        event row indivisibly — issue an explicit immediate transaction.
+        BEGIN IMMEDIATE acquires the write lock up front so a concurrent
+        appender cannot interleave between the version check and the write
+        (the SQLite analog of Postgres ``SELECT ... FOR UPDATE``).
+        """
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        else:
+            self._connection.execute("COMMIT")
 
     def close(self) -> None:
         self._connection.close()
@@ -328,6 +367,100 @@ class SqliteStore:
         lc.attempts = self.list_attempts(run_id)
         return lc
 
+    # --- DomainEventStore -------------------------------------------------
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle:
+        with self._transaction():
+            if isinstance(event, LifecycleInitialized):
+                folded = apply(None, event)
+                # create_lifecycle raises LifecycleAlreadyExistsError on a
+                # duplicate seed; the transaction rolls back around it.
+                self.create_lifecycle(folded)
+            else:
+                current = self.load_lifecycle(event.run_id)
+                if current is None:
+                    raise LifecycleNotFoundError(event.run_id)
+                if current.version != expected_version:
+                    raise OptimisticConcurrencyError(
+                        event.run_id,
+                        expected_version=expected_version,
+                        actual_version=current.version,
+                    )
+                folded = apply(current, event)
+                self.update_lifecycle(
+                    folded, expected_version=expected_version
+                )
+                self._project_domain_event(event, folded)
+            self._insert_domain_event_row(event)
+            return folded
+
+    def _insert_domain_event_row(self, event: DomainEvent) -> None:
+        sequence = self._next_run_sequence(event.run_id)
+        self._connection.execute(
+            """
+            INSERT INTO events (
+                run_id, attempt_number, ts, kind, payload_json, sequence,
+                category
+            ) VALUES (?, ?, ?, ?, ?, ?, 'domain')
+            """,
+            (
+                event.run_id,
+                event.attempt_number,
+                _iso(event.ts),
+                event_kind(event),
+                json.dumps(event_payload(event)),
+                sequence,
+            ),
+        )
+
+    def _project_domain_event(
+        self, event: DomainEvent, folded: Lifecycle
+    ) -> None:
+        """Maintain the attempts / grader_results read-model projections.
+
+        Called inside the append transaction so the projections commit
+        atomically with the event row and the lifecycle row.
+        """
+        if isinstance(event, (AttemptStarted, AttemptFinalized)):
+            attempt = next(
+                a for a in folded.attempts if a.number == event.number
+            )
+            self.save_attempt(folded.run_id, attempt)
+        elif isinstance(event, GraderEvaluated):
+            assert event.attempt_number is not None
+            self.append_grader_result(
+                GraderResultRecord(
+                    run_id=event.run_id,
+                    attempt_number=event.attempt_number,
+                    ordinal=event.ordinal,
+                    grader_type=cast(GraderType, event.grader_type),
+                    grader_spec=dict(event.grader_spec),
+                    passed=event.passed,
+                    duration_ms=event.duration_ms,
+                    payload=dict(event.payload),
+                    ts=event.ts,
+                    grader_name=event.grader_name,
+                )
+            )
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        rows = self._connection.execute(
+            """
+            SELECT id, run_id, attempt_number, ts, kind, payload_json,
+                   sequence
+            FROM events
+            WHERE run_id = ? AND category = 'domain'
+            ORDER BY sequence
+            """,
+            (run_id,),
+        ).fetchall()
+        return [_row_to_domain_event(r) for r in rows]
+
     # --- AttemptStore -----------------------------------------------------
 
     def save_attempt(self, run_id: str, attempt: Attempt) -> None:
@@ -414,7 +547,7 @@ class SqliteStore:
         rows = self._connection.execute(
             """
             SELECT id, run_id, attempt_number, ts, kind, payload_json,
-                   sequence
+                   sequence, category
             FROM events
             WHERE run_id = ?
             ORDER BY ts, id
@@ -492,7 +625,7 @@ class SqliteStore:
         event_rows = self._connection.execute(
             """
             SELECT id, run_id, attempt_number, ts, kind, payload_json,
-                   sequence
+                   sequence, category
             FROM events
             WHERE run_id = ? AND sequence > ?
             ORDER BY sequence
@@ -652,6 +785,22 @@ def _row_to_event(row: sqlite3.Row) -> EventRecord:
         attempt_number=row["attempt_number"],
         id=int(row["id"]),
         sequence=int(sequence_raw) if sequence_raw is not None else None,
+        category=row["category"],
+    )
+
+
+def _row_to_domain_event(row: sqlite3.Row) -> DomainEvent:
+    ts = _parse_iso(row["ts"])
+    assert ts is not None
+    sequence_raw = row["sequence"]
+    return event_from_record(
+        kind=row["kind"],
+        payload=json.loads(row["payload_json"]),
+        run_id=row["run_id"],
+        ts=ts,
+        attempt_number=row["attempt_number"],
+        sequence=int(sequence_raw) if sequence_raw is not None else None,
+        id=int(row["id"]),
     )
 
 
@@ -684,6 +833,11 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
 def _events_has_sequence(conn: sqlite3.Connection) -> bool:
     rows = conn.execute("PRAGMA table_info(events)").fetchall()
     return any(r["name"] == "sequence" for r in rows)
+
+
+def _events_has_category(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute("PRAGMA table_info(events)").fetchall()
+    return any(r["name"] == "category" for r in rows)
 
 
 def _lifecycles_has_blocked_requires_json(conn: sqlite3.Connection) -> bool:

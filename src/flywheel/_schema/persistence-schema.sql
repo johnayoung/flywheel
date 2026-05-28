@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS attempts (
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
 
+-- category discriminates a state-bearing 'domain' event (an event-sourced
+-- member of the lifecycle log, folded into state) from a pure-observability
+-- 'telemetry' event. Both share this table and the per-run sequence ordering
+-- so the audit stream is one totally-ordered log; only domain rows are folded.
+-- kind holds the DomainEventKind value for domain rows and the harness.*
+-- string for telemetry rows.
 CREATE TABLE IF NOT EXISTS events (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id          TEXT NOT NULL,
@@ -72,6 +78,7 @@ CREATE TABLE IF NOT EXISTS events (
   kind            TEXT NOT NULL,
   payload_json    TEXT NOT NULL,
   sequence        INTEGER NOT NULL,
+  category        TEXT NOT NULL DEFAULT 'telemetry',
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id),
   UNIQUE (run_id, sequence)
 );

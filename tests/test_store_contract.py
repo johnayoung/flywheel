@@ -31,16 +31,21 @@ import pytest
 from flywheel import (
     AgentSessionStore,
     Attempt,
+    AttemptFinalized,
+    AttemptStarted,
     AttemptStore,
     AuditStore,
     ClaudeSessionEntry,
+    DomainEventStore,
     EventRecord,
     EventStore,
+    GraderEvaluated,
     GraderResultRecord,
     GraderResultStore,
     InMemoryStore,
     Lifecycle,
     LifecycleAlreadyExistsError,
+    LifecycleInitialized,
     LifecycleNotFoundError,
     LifecycleStore,
     OptimisticConcurrencyError,
@@ -49,6 +54,8 @@ from flywheel import (
     SdkMessageStore,
     SqliteStore,
     Status,
+    TransitionedTo,
+    replay,
 )
 
 # Postgres backend: gated by docker/testcontainers availability. The
@@ -970,3 +977,203 @@ def test_read_audit_since_scoped_by_run_id(store: object) -> None:
     assert isinstance(r1[0], EventRecord)
     assert isinstance(r2[0], SdkMessageRecord)
     assert dict(r2[0].payload) == {"type": "assistant", "tag": "r2"}
+
+
+# --- Event-sourced domain-event write path ---------------------------------
+
+
+def _dts(n: int) -> datetime:
+    return datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)
+
+
+def _seed(store: object, run_id: str = "r1") -> Lifecycle:
+    assert isinstance(store, DomainEventStore)
+    return store.append_domain_event(
+        LifecycleInitialized(
+            run_id=run_id,
+            ts=_dts(0),
+            task_id="t",
+            worker_id="w",
+            artifacts_dir="/artifacts",
+        ),
+        expected_version=0,
+    )
+
+
+def _drive_to_done(store: object, run_id: str = "r1") -> None:
+    """Append a full happy-path domain-event stream ending in DONE."""
+    assert isinstance(store, DomainEventStore)
+    _seed(store, run_id)
+    store.append_domain_event(
+        TransitionedTo(run_id=run_id, ts=_dts(1), target=Status.READY),
+        expected_version=1,
+    )
+    store.append_domain_event(
+        TransitionedTo(run_id=run_id, ts=_dts(2), target=Status.RUNNING),
+        expected_version=2,
+    )
+    store.append_domain_event(
+        AttemptStarted(
+            run_id=run_id,
+            ts=_dts(3),
+            attempt_number=1,
+            number=1,
+            attempt_run_id=run_id,
+            started_at=_dts(3),
+            agent_context={"model_id": "claude-opus-4-8"},
+        ),
+        expected_version=3,
+    )
+    store.append_domain_event(
+        TransitionedTo(run_id=run_id, ts=_dts(4), target=Status.VALIDATING),
+        expected_version=4,
+    )
+    store.append_domain_event(
+        GraderEvaluated(
+            run_id=run_id,
+            ts=_dts(5),
+            attempt_number=1,
+            ordinal=0,
+            grader_type="command",
+            passed=True,
+            duration_ms=7,
+            grader_name="pytest",
+            grader_spec={"type": "command", "run": "uv run pytest"},
+            payload={"exit_code": 0},
+        ),
+        expected_version=5,
+    )
+    store.append_domain_event(
+        AttemptFinalized(
+            run_id=run_id,
+            ts=_dts(6),
+            attempt_number=1,
+            number=1,
+            outcome=Outcome.SUCCEEDED,
+            ended_at=_dts(6),
+            agent_output="done",
+        ),
+        expected_version=6,
+    )
+    store.append_domain_event(
+        TransitionedTo(run_id=run_id, ts=_dts(7), target=Status.DONE),
+        expected_version=7,
+    )
+
+
+def test_store_satisfies_domain_event_store_protocol(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+
+
+def test_seed_event_creates_projection_row(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, LifecycleStore)
+    folded = _seed(store)
+    assert folded.status is Status.PENDING
+    assert folded.version == 1
+    loaded = store.load_lifecycle("r1")
+    assert loaded is not None
+    assert loaded.status is Status.PENDING
+    assert loaded.version == 1
+    assert loaded.task_id == "t"
+    assert loaded.worker_id == "w"
+    assert loaded.artifacts_dir == "/artifacts"
+
+
+def test_duplicate_seed_raises_already_exists(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+    _seed(store)
+    with pytest.raises(LifecycleAlreadyExistsError):
+        _seed(store)
+
+
+def test_append_to_unknown_run_raises_not_found(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+    with pytest.raises(LifecycleNotFoundError):
+        store.append_domain_event(
+            TransitionedTo(run_id="ghost", ts=_dts(1), target=Status.READY),
+            expected_version=1,
+        )
+
+
+def test_append_with_stale_version_raises_conflict(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+    _seed(store)  # version 1
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(1), target=Status.READY),
+        expected_version=1,
+    )  # version 2
+    with pytest.raises(OptimisticConcurrencyError) as exc_info:
+        store.append_domain_event(
+            TransitionedTo(run_id="r1", ts=_dts(2), target=Status.RUNNING),
+            expected_version=1,  # stale: store is at version 2
+        )
+    assert exc_info.value.expected_version == 1
+    assert exc_info.value.actual_version == 2
+
+
+def test_happy_path_folds_to_done_with_projections(store: object) -> None:
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, LifecycleStore)
+    assert isinstance(store, GraderResultStore)
+    _drive_to_done(store)
+
+    loaded = store.load_lifecycle("r1")
+    assert loaded is not None
+    assert loaded.status is Status.DONE
+    assert loaded.version == 8
+    assert loaded.agent_output == "done"
+    # attempts projection populated from AttemptStarted/AttemptFinalized.
+    assert len(loaded.attempts) == 1
+    assert loaded.attempts[0].outcome is Outcome.SUCCEEDED
+    assert loaded.attempts[0].agent_context == {"model_id": "claude-opus-4-8"}
+    # grader_results projection populated from GraderEvaluated.
+    grader_results = store.list_grader_results("r1", 1)
+    assert len(grader_results) == 1
+    assert grader_results[0].passed
+    assert grader_results[0].grader_name == "pytest"
+
+
+def test_replay_of_domain_events_equals_loaded_projection(
+    store: object,
+) -> None:
+    """The determinism oracle: folding the persisted domain-event log
+    reproduces the stored projection exactly, on every backend."""
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, LifecycleStore)
+    _drive_to_done(store)
+    loaded = store.load_lifecycle("r1")
+    folded = replay(store.list_domain_events("r1"))
+    assert loaded == folded
+
+
+def test_domain_events_interleave_with_telemetry_in_audit_stream(
+    store: object,
+) -> None:
+    """Domain and telemetry events share the events table and the per-run
+    sequence, so the audit stream is one totally-ordered log."""
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, EventStore)
+    assert isinstance(store, AuditStore)
+    _seed(store)
+    store.append_event(
+        EventRecord(run_id="r1", ts=_dts(1), kind="harness.attempt_started")
+    )
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(2), target=Status.READY),
+        expected_version=1,
+    )
+
+    records = store.read_audit_since("r1", 0)
+    # The seed, the telemetry event, and the domain transition are all here.
+    kinds = [r.kind for r in records if isinstance(r, EventRecord)]
+    assert "lifecycle_initialized" in kinds
+    assert "harness.attempt_started" in kinds
+    assert "transitioned_to" in kinds
+    categories = {
+        r.kind: r.category for r in records if isinstance(r, EventRecord)
+    }
+    assert categories["harness.attempt_started"] == "telemetry"
+    assert categories["transitioned_to"] == "domain"
+    seqs = [r.sequence for r in records]
+    assert seqs == sorted(seqs)

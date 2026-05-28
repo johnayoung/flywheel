@@ -54,6 +54,15 @@ except ImportError as exc:  # pragma: no cover - exercised via monkeypatch
         "install with: uv add 'flywheel[postgres]'"
     ) from exc
 
+from flywheel.event_serde import event_from_record, event_kind, event_payload
+from flywheel.events import (
+    AttemptFinalized,
+    AttemptStarted,
+    DomainEvent,
+    GraderEvaluated,
+    LifecycleInitialized,
+    apply,
+)
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
@@ -258,6 +267,25 @@ class PostgresStore:
                         "ALTER TABLE lifecycles "
                         "ADD COLUMN blocked_requires_json TEXT"
                     )
+                # Additive, same back-compat path as blocked_requires_json:
+                # events.category distinguishes domain (state-bearing) from
+                # telemetry rows. The DEFAULT makes pre-existing rows
+                # 'telemetry'. No schema_version bump.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'events'
+                      AND column_name = 'category'
+                    """,
+                    (self._schema,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "ALTER TABLE events ADD COLUMN category TEXT "
+                        "NOT NULL DEFAULT 'telemetry'"
+                    )
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
                 )
@@ -423,6 +451,266 @@ class PostgresStore:
         lc.attempts = self.list_attempts(run_id)
         return lc
 
+    # --- DomainEventStore -------------------------------------------------
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle:
+        # One pooled connection => one transaction. The context manager
+        # commits on success and rolls back on any exception, so the
+        # version check, projection writes, and event-row append are
+        # atomic. SELECT ... FOR UPDATE locks the lifecycle row for the
+        # transaction so a concurrent appender cannot interleave. Each
+        # helper opens its own cursor on the shared connection; the lock
+        # and transaction live on the connection, not the cursor.
+        with self._pool.connection() as conn:
+            if isinstance(event, LifecycleInitialized):
+                folded = apply(None, event)
+                try:
+                    self._insert_lifecycle_conn(conn, folded)
+                except psycopg.errors.UniqueViolation as exc:
+                    raise LifecycleAlreadyExistsError(event.run_id) from exc
+            else:
+                current = self._load_lifecycle_for_update(conn, event.run_id)
+                if current is None:
+                    raise LifecycleNotFoundError(event.run_id)
+                if current.version != expected_version:
+                    raise OptimisticConcurrencyError(
+                        event.run_id,
+                        expected_version=expected_version,
+                        actual_version=current.version,
+                    )
+                folded = apply(current, event)
+                self._update_lifecycle_conn(conn, folded)
+                self._project_domain_event_conn(conn, event, folded)
+            self._insert_domain_event_row_conn(conn, event)
+        return folded
+
+    def _insert_lifecycle_conn(
+        self, conn: Connection[Any], lc: Lifecycle
+    ) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lifecycles (
+                    run_id, task_id, status, version, retries, error,
+                    agent_output, session_id, artifacts_dir, worker_id,
+                    timestamps_json, updated_at, blocked_requires_json
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    lc.run_id,
+                    lc.task_id,
+                    lc.status.value,
+                    lc.version,
+                    lc.retries,
+                    lc.error or None,
+                    lc.agent_output or None,
+                    lc.session_id or None,
+                    lc.artifacts_dir or None,
+                    lc.worker_id or None,
+                    Jsonb(_serialize_timestamps(lc.timestamps)),
+                    _utcnow(),
+                    lc.blocked_requires_json,
+                ),
+            )
+
+    def _update_lifecycle_conn(
+        self, conn: Connection[Any], lc: Lifecycle
+    ) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE lifecycles SET
+                    task_id = %s,
+                    status = %s,
+                    version = %s,
+                    retries = %s,
+                    error = %s,
+                    agent_output = %s,
+                    session_id = %s,
+                    artifacts_dir = %s,
+                    worker_id = %s,
+                    timestamps_json = %s,
+                    updated_at = %s,
+                    blocked_requires_json = %s
+                WHERE run_id = %s
+                """,
+                (
+                    lc.task_id,
+                    lc.status.value,
+                    lc.version,
+                    lc.retries,
+                    lc.error or None,
+                    lc.agent_output or None,
+                    lc.session_id or None,
+                    lc.artifacts_dir or None,
+                    lc.worker_id or None,
+                    Jsonb(_serialize_timestamps(lc.timestamps)),
+                    _utcnow(),
+                    lc.blocked_requires_json,
+                    lc.run_id,
+                ),
+            )
+
+    def _load_lifecycle_for_update(
+        self, conn: Connection[Any], run_id: str
+    ) -> Lifecycle | None:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT run_id, task_id, status, version, retries, error,
+                       agent_output, session_id, artifacts_dir, worker_id,
+                       timestamps_json, blocked_requires_json
+                FROM lifecycles
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            lc = Lifecycle(
+                task_id=row["task_id"],
+                run_id=row["run_id"],
+                worker_id=row["worker_id"] or "",
+                status=Status(row["status"]),
+                timestamps=_deserialize_timestamps(row["timestamps_json"]),
+                version=int(row["version"]),
+                retries=int(row["retries"]),
+                error=row["error"] or "",
+                agent_output=row["agent_output"] or "",
+                session_id=row["session_id"] or "",
+                artifacts_dir=row["artifacts_dir"] or "",
+                blocked_requires_json=row["blocked_requires_json"],
+            )
+            cur.execute(
+                """
+                SELECT number, attempt_run_id, started_at, ended_at,
+                       outcome, agent_output, error, agent_context_json
+                FROM attempts
+                WHERE run_id = %s
+                ORDER BY number
+                """,
+                (run_id,),
+            )
+            lc.attempts = [_row_to_attempt(r) for r in cur.fetchall()]
+        return lc
+
+    def _project_domain_event_conn(
+        self, conn: Connection[Any], event: DomainEvent, folded: Lifecycle
+    ) -> None:
+        if isinstance(event, (AttemptStarted, AttemptFinalized)):
+            attempt = next(
+                a for a in folded.attempts if a.number == event.number
+            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO attempts (
+                        run_id, number, attempt_run_id, started_at, ended_at,
+                        outcome, agent_output, error, agent_context_json
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, number) DO UPDATE SET
+                        attempt_run_id = EXCLUDED.attempt_run_id,
+                        started_at = EXCLUDED.started_at,
+                        ended_at = EXCLUDED.ended_at,
+                        outcome = EXCLUDED.outcome,
+                        agent_output = EXCLUDED.agent_output,
+                        error = EXCLUDED.error,
+                        agent_context_json = EXCLUDED.agent_context_json
+                    """,
+                    (
+                        folded.run_id,
+                        attempt.number,
+                        attempt.run_id or None,
+                        attempt.started_at,
+                        attempt.ended_at,
+                        attempt.outcome.value if attempt.outcome else None,
+                        attempt.agent_output or None,
+                        attempt.error or None,
+                        Jsonb(dict(attempt.agent_context)),
+                    ),
+                )
+        elif isinstance(event, GraderEvaluated):
+            assert event.attempt_number is not None
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO grader_results (
+                        run_id, attempt_number, ordinal, grader_type,
+                        grader_name, grader_spec_json, passed, duration_ms,
+                        payload_json, ts
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        event.run_id,
+                        event.attempt_number,
+                        event.ordinal,
+                        event.grader_type,
+                        event.grader_name,
+                        Jsonb(dict(event.grader_spec)),
+                        event.passed,
+                        event.duration_ms,
+                        Jsonb(dict(event.payload)),
+                        event.ts,
+                    ),
+                )
+
+    def _insert_domain_event_row_conn(
+        self, conn: Connection[Any], event: DomainEvent
+    ) -> None:
+        with conn.cursor() as cur:
+            sequence = self._next_run_sequence(cur, event.run_id)
+            cur.execute(
+                """
+                INSERT INTO events (
+                    run_id, attempt_number, ts, kind, payload_json, sequence,
+                    category
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'domain')
+                """,
+                (
+                    event.run_id,
+                    event.attempt_number,
+                    event.ts,
+                    event_kind(event),
+                    Jsonb(event_payload(event)),
+                    sequence,
+                ),
+            )
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_id, attempt_number, ts, kind,
+                           payload_json, sequence
+                    FROM events
+                    WHERE run_id = %s AND category = 'domain'
+                    ORDER BY sequence
+                    """,
+                    (run_id,),
+                )
+                rows = cur.fetchall()
+        return [
+            event_from_record(
+                kind=r["kind"],
+                payload=dict(r["payload_json"]),
+                run_id=r["run_id"],
+                ts=r["ts"],
+                attempt_number=r["attempt_number"],
+                sequence=int(r["sequence"]) if r["sequence"] is not None
+                else None,
+                id=int(r["id"]),
+            )
+            for r in rows
+        ]
+
     # --- AttemptStore -----------------------------------------------------
 
     def save_attempt(self, run_id: str, attempt: Attempt) -> None:
@@ -532,7 +820,7 @@ class PostgresStore:
                 cur.execute(
                     """
                     SELECT id, run_id, attempt_number, ts, kind,
-                           payload_json, sequence
+                           payload_json, sequence, category
                     FROM events
                     WHERE run_id = %s
                     ORDER BY ts, id
@@ -621,7 +909,7 @@ class PostgresStore:
                 cur.execute(
                     """
                     SELECT id, run_id, attempt_number, ts, kind,
-                           payload_json, sequence
+                           payload_json, sequence, category
                     FROM events
                     WHERE run_id = %s AND sequence > %s
                     ORDER BY sequence
@@ -800,6 +1088,7 @@ def _row_to_event(row: dict[str, Any]) -> EventRecord:
         attempt_number=row["attempt_number"],
         id=int(row["id"]),
         sequence=int(sequence_raw) if sequence_raw is not None else None,
+        category=row.get("category", "telemetry"),
     )
 
 

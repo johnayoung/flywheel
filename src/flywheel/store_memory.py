@@ -26,14 +26,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
+from flywheel.event_serde import event_from_record, event_kind, event_payload
+from flywheel.events import (
+    AttemptFinalized,
+    AttemptStarted,
+    DomainEvent,
+    GraderEvaluated,
+    LifecycleInitialized,
+    apply,
+)
 from flywheel.lifecycle import Attempt, Lifecycle
 from flywheel.store_protocols import (
     AuditRecord,
     ClaudeSessionEntry,
     EventRecord,
     GraderResultRecord,
+    GraderType,
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
@@ -88,6 +98,7 @@ def _clone_event(e: EventRecord) -> EventRecord:
         attempt_number=e.attempt_number,
         id=e.id,
         sequence=e.sequence,
+        category=e.category,
     )
 
 
@@ -192,6 +203,95 @@ class InMemoryStore:
         lc = _clone_lifecycle_row(stored)
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    # --- DomainEventStore --------------------------------------------------
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle:
+        if isinstance(event, LifecycleInitialized):
+            folded = apply(None, event)
+            # Raises LifecycleAlreadyExistsError on a duplicate seed.
+            self.create_lifecycle(folded)
+        else:
+            current = self.load_lifecycle(event.run_id)
+            if current is None:
+                raise LifecycleNotFoundError(event.run_id)
+            if current.version != expected_version:
+                raise OptimisticConcurrencyError(
+                    event.run_id,
+                    expected_version=expected_version,
+                    actual_version=current.version,
+                )
+            folded = apply(current, event)
+            self.update_lifecycle(folded, expected_version=expected_version)
+            self._project_domain_event(event, folded)
+        self._append_domain_event_row(event)
+        return folded
+
+    def _append_domain_event_row(self, event: DomainEvent) -> None:
+        self._event_seq += 1
+        sequence = self._next_run_sequence(event.run_id)
+        self._events.append(
+            EventRecord(
+                run_id=event.run_id,
+                ts=event.ts,
+                kind=event_kind(event),
+                payload=event_payload(event),
+                attempt_number=event.attempt_number,
+                id=self._event_seq,
+                sequence=sequence,
+                category="domain",
+            )
+        )
+
+    def _project_domain_event(
+        self, event: DomainEvent, folded: Lifecycle
+    ) -> None:
+        if isinstance(event, (AttemptStarted, AttemptFinalized)):
+            attempt = next(
+                a for a in folded.attempts if a.number == event.number
+            )
+            self.save_attempt(folded.run_id, attempt)
+        elif isinstance(event, GraderEvaluated):
+            assert event.attempt_number is not None
+            self.append_grader_result(
+                GraderResultRecord(
+                    run_id=event.run_id,
+                    attempt_number=event.attempt_number,
+                    ordinal=event.ordinal,
+                    grader_type=cast(GraderType, event.grader_type),
+                    grader_spec=dict(event.grader_spec),
+                    passed=event.passed,
+                    duration_ms=event.duration_ms,
+                    payload=dict(event.payload),
+                    ts=event.ts,
+                    grader_name=event.grader_name,
+                )
+            )
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        rows = [
+            e
+            for e in self._events
+            if e.run_id == run_id and e.category == "domain"
+        ]
+        rows.sort(key=lambda e: e.sequence if e.sequence is not None else 0)
+        return [
+            event_from_record(
+                kind=e.kind,
+                payload=dict(e.payload),
+                run_id=e.run_id,
+                ts=e.ts,
+                attempt_number=e.attempt_number,
+                sequence=e.sequence,
+                id=e.id,
+            )
+            for e in rows
+        ]
 
     # --- AttemptStore ------------------------------------------------------
 

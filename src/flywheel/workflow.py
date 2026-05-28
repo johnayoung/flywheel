@@ -34,6 +34,7 @@ Subcommands::
                                      [--model MODEL] [--max-retries N]
                                      [--max-turns N]
     python -m flywheel.workflow status [--tasks-dir DIR] [--db PATH]
+    python -m flywheel.workflow live   [--db PATH] [--watch SECONDS]
     python -m flywheel.workflow is-done TASK_FILE [--db PATH]
     python -m flywheel.workflow archive [--tasks-dir DIR] [--db PATH]
     python -m flywheel.workflow recover [--db PATH]
@@ -47,11 +48,13 @@ import json
 import os
 import shutil
 import sys
-from collections.abc import Iterable, Iterator
+import time
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from claude_agent_sdk import ClaudeAgentOptions
 
@@ -538,6 +541,255 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome.lifecycle.status == Status.DONE else 1
 
 
+# --- Live progress snapshot -------------------------------------------------
+#
+# `live` answers "what is the agent doing right now, and is it still moving?"
+# by joining the in-flight lifecycles to the most recent sdk_message and event
+# rows. The output is intentionally one line per run -- it is meant to be
+# tail-friendly inside task-worker.sh's heartbeat as well as readable on its
+# own. Stale-after threshold is heuristic: a healthy turn can take 30-60s on a
+# slow read or API call, so we wait past that before flagging.
+
+_LIVE_STALE_AFTER_SECONDS: int = 90
+
+
+@dataclass(frozen=True, kw_only=True)
+class LiveRunRow:
+    """Per-in-flight-run snapshot used by ``live`` reporting."""
+
+    run_id: str
+    task_id: str
+    status: Status
+    iteration: int | None
+    last_kind: str
+    last_detail: str
+    last_ts: datetime | None
+
+
+_SDK_KIND_LABELS: dict[str, str] = {
+    "AssistantMessage": "ASSISTANT",
+    "UserMessage": "USER",
+    "SystemMessage": "SYSTEM",
+    "ResultMessage": "RESULT",
+}
+
+
+def _short(value: object, limit: int = 60) -> str:
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    return text if len(text) <= limit else text[: max(limit - 1, 1)] + "…"
+
+
+def _summarize_assistant(payload: Mapping[str, Any]) -> str:
+    content = payload.get("content") or []
+    if not content:
+        return "(empty)"
+    first = content[0]
+    if not isinstance(first, Mapping):
+        return _short(first)
+    ctype = first.get("type")
+    if ctype == "tool_use":
+        name = first.get("name", "?")
+        input_obj = first.get("input") or {}
+        if isinstance(input_obj, Mapping) and input_obj:
+            kv = ", ".join(
+                f"{k}={_short(v, 30)}"
+                for k, v in list(input_obj.items())[:2]
+            )
+            return f"{name}({kv})"
+        return f"{name}()"
+    text = first.get("text") if isinstance(first, Mapping) else None
+    if isinstance(text, str):
+        return _short(text)
+    return _short(first)
+
+
+def _summarize_user(payload: Mapping[str, Any]) -> str:
+    content = payload.get("content") or []
+    if not content:
+        return "(empty)"
+    first = content[0]
+    if isinstance(first, Mapping):
+        if "tool_use_id" in first:
+            body = first.get("content")
+            size = len(body) if isinstance(body, str) else 0
+            return f"tool_result({size}B)"
+        text = first.get("text")
+        if isinstance(text, str):
+            return _short(text)
+    return _short(first)
+
+
+def _summarize_result(payload: Mapping[str, Any]) -> str:
+    return (
+        f"subtype={payload.get('subtype', '?')} "
+        f"turns={payload.get('num_turns', '?')} "
+        f"dur={payload.get('duration_ms', '?')}ms"
+    )
+
+
+def _summarize_system(payload: Mapping[str, Any]) -> str:
+    subtype = payload.get("subtype")
+    return str(subtype) if subtype is not None else "(system)"
+
+
+def _summarize_sdk_message(message_type: str, payload_json: str) -> str:
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
+        return "(unparseable payload)"
+    if not isinstance(payload, Mapping):
+        return _short(payload)
+    if message_type == "AssistantMessage":
+        return _summarize_assistant(payload)
+    if message_type == "UserMessage":
+        return _summarize_user(payload)
+    if message_type == "ResultMessage":
+        return _summarize_result(payload)
+    if message_type == "SystemMessage":
+        return _summarize_system(payload)
+    return message_type
+
+
+def _parse_db_ts(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
+    """Snapshot every in-flight run with its latest activity, newest last.
+
+    Reads ``lifecycles`` for status in ``{running, validating}`` and joins
+    each row to the freshest ``sdk_messages``/``events`` entry by
+    per-run sequence. The two tables share a monotonic counter (see
+    ``run_sequence``), so picking the higher sequence is correct even
+    when the timestamps are within microseconds of each other.
+    """
+    conn = store._connection  # noqa: SLF001
+    lifecycles = conn.execute(
+        """
+        SELECT run_id, task_id, status
+        FROM lifecycles
+        WHERE status IN ('running', 'validating')
+        ORDER BY updated_at
+        """
+    ).fetchall()
+    rows: list[LiveRunRow] = []
+    for lc in lifecycles:
+        run_id = lc["run_id"]
+        sdk = conn.execute(
+            """
+            SELECT iteration_number, sequence, message_type, payload_json, ts
+            FROM sdk_messages
+            WHERE run_id = ?
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        evt = conn.execute(
+            """
+            SELECT attempt_number, sequence, kind, ts
+            FROM events
+            WHERE run_id = ?
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        sdk_seq = sdk["sequence"] if sdk is not None else -1
+        evt_seq = evt["sequence"] if evt is not None else -1
+        iteration: int | None = None
+        last_kind = "(none)"
+        last_detail = "(no activity yet)"
+        last_ts: datetime | None = None
+        if sdk_seq >= 0 and sdk_seq >= evt_seq and sdk is not None:
+            iteration = sdk["iteration_number"]
+            last_kind = _SDK_KIND_LABELS.get(
+                sdk["message_type"], sdk["message_type"].upper()
+            )
+            last_detail = _summarize_sdk_message(
+                sdk["message_type"], sdk["payload_json"]
+            )
+            last_ts = _parse_db_ts(sdk["ts"])
+        elif evt is not None and evt_seq >= 0:
+            last_kind = "EVENT"
+            last_detail = str(evt["kind"])
+            last_ts = _parse_db_ts(evt["ts"])
+        rows.append(
+            LiveRunRow(
+                run_id=run_id,
+                task_id=lc["task_id"],
+                status=Status(lc["status"]),
+                iteration=iteration,
+                last_kind=last_kind,
+                last_detail=last_detail,
+                last_ts=last_ts,
+            )
+        )
+    return rows
+
+
+def _format_live_line(row: LiveRunRow, now: datetime) -> str:
+    if row.last_ts is None:
+        age_str = "—"
+        stale = ""
+    else:
+        age_s = int((now - row.last_ts).total_seconds())
+        # Negative ages (clock skew between SQLite and host) read as "0s"
+        # rather than a misleading negative.
+        if age_s < 0:
+            age_s = 0
+        age_str = f"{age_s}s"
+        stale = "  STALE" if age_s > _LIVE_STALE_AFTER_SECONDS else ""
+    iter_str = (
+        f"iter={row.iteration}" if row.iteration is not None else "iter=?"
+    )
+    return (
+        f"{row.task_id}  {row.status.value}  {iter_str}  "
+        f"age={age_str}  {row.last_kind}  {row.last_detail}{stale}"
+    )
+
+
+def _cmd_live(args: argparse.Namespace) -> int:
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    interval = int(args.watch) if args.watch else 0
+
+    def snapshot() -> None:
+        store = SqliteStore(db_path)
+        try:
+            rows = collect_live_rows(store)
+        finally:
+            store.close()
+        now = datetime.now(timezone.utc)
+        if not rows:
+            print("(no in-flight runs)")
+            return
+        for row in rows:
+            print(_format_live_line(row, now))
+
+    if interval <= 0:
+        snapshot()
+        return 0
+
+    try:
+        while True:
+            # ANSI clear+home; falls back to scroll on dumb terminals.
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.write(
+                f"flywheel live  (refresh {interval}s, Ctrl-C to exit)\n\n"
+            )
+            snapshot()
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)
@@ -707,6 +959,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_status.set_defaults(func=_cmd_status)
 
+    p_live = sub.add_parser(
+        "live",
+        help=(
+            "Print one line per in-flight run showing its latest agent "
+            "message or harness event (with age) so a watcher can tell at "
+            "a glance whether progress is still being made."
+        ),
+    )
+    _add_common_db(p_live)
+    p_live.add_argument(
+        "--watch",
+        type=int,
+        default=0,
+        metavar="SECONDS",
+        help=(
+            "Refresh continuously every SECONDS; clears the screen on each "
+            "tick. Default 0 prints one snapshot and exits."
+        ),
+    )
+    p_live.set_defaults(func=_cmd_live)
+
     p_is_done = sub.add_parser(
         "is-done",
         help="Exit 0 if the named task has at least one done lifecycle.",
@@ -758,10 +1031,12 @@ __all__ = [
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_TURNS",
     "DEFAULT_TASKS_DIR",
+    "LiveRunRow",
     "TaskState",
     "TaskStatusRow",
     "archive_completed_phases",
     "build_status_rows",
+    "collect_live_rows",
     "iter_active_phase_dirs",
     "iter_active_task_files",
     "load_active_tasks",

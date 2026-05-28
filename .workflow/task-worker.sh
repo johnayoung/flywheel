@@ -46,6 +46,8 @@ MAX_TURNS=500
 MAX_RETRIES=1
 MAX_PARALLEL=1
 RETENTION_DAYS=7
+HEARTBEAT_INTERVAL=10
+LAST_HEARTBEAT_TS=0
 # Escalating shutdown level driven by SIGINT/SIGTERM:
 #   0 = running, 1 = graceful drain (stop spawning, let children finish),
 #   2 = SIGTERM children's process groups, 3+ = SIGKILL them.
@@ -86,6 +88,8 @@ while [[ $# -gt 0 ]]; do
     --worktree-retention-days=*) RETENTION_DAYS="${1#*=}"; shift ;;
     --max-parallel)   MAX_PARALLEL="$2"; shift 2 ;;
     --max-parallel=*) MAX_PARALLEL="${1#*=}"; shift ;;
+    --heartbeat)      HEARTBEAT_INTERVAL="$2"; shift 2 ;;
+    --heartbeat=*)    HEARTBEAT_INTERVAL="${1#*=}"; shift ;;
     -h|--help)
       cat <<EOF
 Usage: task-worker.sh [options]
@@ -114,6 +118,11 @@ Options:
                                    stay serialized in the parent process)  (default: 1)
   --worktree-retention-days <N>    Days a parked worktree may live before
                                    the startup sweep removes it           (default: 7)
+  --heartbeat <SECONDS>            Print a per-in-flight-task progress line every
+                                   SECONDS seconds while tasks are running so a
+                                   watcher can see the agent is still moving.
+                                   Reads the DB via `flywheel.workflow live`.
+                                   0 disables.                            (default: 10)
   -h, --help                       Show this help
 
 A single-instance lock is held at .workflow/.worker.lock for the duration
@@ -141,6 +150,11 @@ done
 
 if ! [[ "$MAX_PARALLEL" =~ ^[0-9]+$ ]] || [[ "$MAX_PARALLEL" -lt 1 ]]; then
   echo "ERROR: --max-parallel must be a positive integer, got: $MAX_PARALLEL" >&2
+  exit 1
+fi
+
+if ! [[ "$HEARTBEAT_INTERVAL" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --heartbeat must be a non-negative integer, got: $HEARTBEAT_INTERVAL" >&2
   exit 1
 fi
 
@@ -279,6 +293,24 @@ archive_completed() {
   while IFS= read -r line; do
     [[ -n "$line" ]] && echo "[worker] Archived phase: $line" >&2
   done < <(run_workflow archive --tasks-dir "$TASKS_DIR" --db "$DB_PATH" 2>/dev/null)
+}
+
+emit_heartbeat() {
+  # Periodic per-in-flight-task progress line driven by `flywheel.workflow live`.
+  # Pulls the latest sdk_message/event for each running lifecycle from the DB,
+  # so a watcher can see whether the agent is actually moving or wedged. Quiet
+  # when no tasks are in flight (no point logging an empty board).
+  [[ "$HEARTBEAT_INTERVAL" -eq 0 ]] && return 0
+  [[ ${#RUNNING_PIDS[@]} -eq 0 ]] && return 0
+  local now
+  now=$(date +%s)
+  if (( now - LAST_HEARTBEAT_TS < HEARTBEAT_INTERVAL )); then
+    return 0
+  fi
+  LAST_HEARTBEAT_TS=$now
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo "[heartbeat] $line" >&2
+  done < <(run_workflow live --db "$DB_PATH" 2>/dev/null)
 }
 
 commit_task_files() {
@@ -779,6 +811,11 @@ echo "[worker] Worktrees : $WORKTREES_DIR"      >&2
 echo "[worker] Base      : $PHASE_BASE"         >&2
 echo "[worker] Retention : ${RETENTION_DAYS}d"  >&2
 echo "[worker] Parallel  : $MAX_PARALLEL"       >&2
+if [[ "$HEARTBEAT_INTERVAL" -eq 0 ]]; then
+  echo "[worker] Heartbeat : disabled"          >&2
+else
+  echo "[worker] Heartbeat : ${HEARTBEAT_INTERVAL}s" >&2
+fi
 echo "[worker] PID       : $$"                  >&2
 echo ""                                         >&2
 
@@ -796,6 +833,7 @@ while [[ "$SHUTDOWN_LEVEL" -eq 0 ]]; do
   archive_completed
   remove_finished
   spawn_eligible
+  emit_heartbeat
 
   prior_count=${#RUNNING_PIDS[@]}
   poll_budget=5
@@ -806,6 +844,7 @@ while [[ "$SHUTDOWN_LEVEL" -eq 0 ]]; do
     sleep 1
     if [[ ${#RUNNING_PIDS[@]} -gt 0 ]]; then
       remove_finished
+      emit_heartbeat
       # If a slot freed up, break to the outer iteration to refill it.
       [[ ${#RUNNING_PIDS[@]} -lt $prior_count ]] && break
     fi

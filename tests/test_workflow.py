@@ -16,11 +16,13 @@ from pathlib import Path
 import pytest
 
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel.store_protocols import EventRecord
 from flywheel.store_sqlite import SqliteStore
 from flywheel.workflow import (
     TaskState,
     archive_completed_phases,
     build_status_rows,
+    collect_live_rows,
     iter_active_phase_dirs,
     iter_active_task_files,
     main,
@@ -409,6 +411,182 @@ def test_main_is_done_reflects_store(
         store.close()
     rc = main(["is-done", str(task_file), "--db", str(db)])
     assert rc == 0
+
+
+# ---------- Live progress snapshot ----------
+
+
+def test_live_skips_runs_that_are_not_in_flight(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "done-task")
+        _seed_failed(store, "failed-task")
+        _seed_interrupted(store, "interrupted-task")
+        assert collect_live_rows(store) == []
+    finally:
+        store.close()
+
+
+def test_live_reports_latest_sdk_message_when_newer(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-a")
+        ts0 = datetime.now(timezone.utc)
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=ts0,
+                kind="harness.attempt_started",
+                payload={},
+                attempt_number=1,
+            )
+        )
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=1,
+            iteration_number=2,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Edit",
+                            "input": {"file_path": "README.md"},
+                        }
+                    ],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.task_id == "task-a"
+        assert row.status == Status.RUNNING
+        assert row.iteration == 2
+        assert row.last_kind == "ASSISTANT"
+        assert "Edit" in row.last_detail
+        assert "README.md" in row.last_detail
+    finally:
+        store.close()
+
+
+def test_live_falls_back_to_event_when_no_sdk_messages(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-b")
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_completed",
+                payload={},
+                attempt_number=1,
+            )
+        )
+        rows = collect_live_rows(store)
+        assert len(rows) == 1
+        assert rows[0].last_kind == "EVENT"
+        assert rows[0].last_detail == "harness.iteration_completed"
+        assert rows[0].iteration is None
+    finally:
+        store.close()
+
+
+def test_live_marks_runs_with_no_activity(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-c")
+        rows = collect_live_rows(store)
+        assert len(rows) == 1
+        assert rows[0].last_kind == "(none)"
+        assert rows[0].last_ts is None
+    finally:
+        store.close()
+
+
+def test_live_summarizes_user_tool_result(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-d")
+        body = "x" * 1234
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=1,
+            iteration_number=1,
+            messages=[
+                {
+                    "message_type": "UserMessage",
+                    "content": [
+                        {"tool_use_id": "toolu_x", "content": body}
+                    ],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+        assert rows[0].last_kind == "USER"
+        assert rows[0].last_detail == f"tool_result({len(body)}B)"
+    finally:
+        store.close()
+
+
+def test_main_live_prints_one_line_per_running_task(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running_a = _seed_running(store, "task-a")
+        running_b = _seed_running(store, "task-b")
+        store.save_sdk_messages(
+            run_id=running_a.run_id,
+            attempt_number=1,
+            iteration_number=1,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "x.py"},
+                        }
+                    ],
+                }
+            ],
+        )
+        store.append_event(
+            EventRecord(
+                run_id=running_b.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.attempt_started",
+                payload={},
+                attempt_number=1,
+            )
+        )
+    finally:
+        store.close()
+    rc = main(["live", "--db", str(db)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert any("task-a" in ln and "ASSISTANT" in ln and "Read" in ln for ln in lines)
+    assert any("task-b" in ln and "EVENT" in ln for ln in lines)
+
+
+def test_main_live_empty_prints_placeholder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "db.sqlite"
+    rc = main(["live", "--db", str(db)])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "(no in-flight runs)"
 
 
 def test_main_status_json_emits_machine_readable(

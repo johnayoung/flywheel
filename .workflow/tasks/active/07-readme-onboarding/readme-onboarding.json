@@ -1,0 +1,61 @@
+{
+  "id": "readme-onboarding",
+  "goal": "Populate README.md with an OSS-style onboarding page (pitch, pre-release banner, quickstart, docs links, contributing, license) and add a minimal CONTRIBUTING.md stub that the README links to.",
+  "tags": ["docs", "onboarding"],
+  "context": {
+    "relevant": [
+      "README.md",
+      "CONTRIBUTING.md",
+      "pyproject.toml",
+      "docs/vision.md",
+      "docs/task-schema.md",
+      "docs/task-lifecycle.md",
+      "docs/loop.md",
+      "docs/strategy.md",
+      ".workflow/specs/00007-FEATURE-readme-onboarding.md",
+      "src/flywheel/workflow.py",
+      "src/flywheel/loaders.py",
+      "CLAUDE.md"
+    ],
+    "references": [
+      ".workflow/specs/00007-FEATURE-readme-onboarding.md -- authoritative spec; mirror its required section list, ordering, and acceptance grep targets.",
+      "pyproject.toml `description` field -- source of the README's one-line pitch (do not contradict it).",
+      "src/flywheel/workflow.py -- canonical `python -m flywheel.workflow run` CLI shape; the copy-pastable invocation in the README must use the real subcommand and any required flags (see the `run` subparser in `_build_parser`)."
+    ],
+    "constraints": [
+      "README section order: title + one-line pitch, pre-release/WIP banner, Quickstart, Documentation, Contributing, License.",
+      "Quickstart shows, in order: (a) the Python 3.13 requirement, (b) `uv sync` install, (c) a fenced ```json Task block inlined in the README, (d) the `python -m flywheel.workflow run` invocation with whatever flags a copy-paste needs to avoid an immediate CLI usage error.",
+      "The inline Task JSON in the Quickstart MUST validate cleanly through `flywheel.loaders.load_task_file` -- a grader extracts the first ```json fenced block in README.md and feeds it through the loader.",
+      "Repo URL used in clone instructions is exactly `https://github.com/johnayoung/flywheel`.",
+      "CONTRIBUTING.md is a stub (~30 lines) covering: `uv sync` on Python 3.13, `uv run pytest`, the phrase `Conventional Commits`, and a link to `docs/vision.md`.",
+      "No LICENSE file in this task -- README states `License: TBD`.",
+      "No emojis anywhere in README.md or CONTRIBUTING.md (project-wide rule in CLAUDE.md).",
+      "No badges, no `<img>` tags, no `![...]` images, no `[![...]` shields in README.md or CONTRIBUTING.md.",
+      "Do not embed full doc bodies in README -- link to docs/*.md with a one-line description per link.",
+      "Commit the changes with a Conventional Commits message using the `docs:` prefix before reporting verify."
+    ],
+    "non_goals": [
+      "Do not create a LICENSE file.",
+      "Do not add a project-layout / directory-tree section to the README.",
+      "Do not edit existing files under docs/.",
+      "Do not add CI, version, or license badges.",
+      "Do not add tutorials, architecture deep-dives, or design rationale to the README -- those belong in docs/."
+    ],
+    "edge_cases": [
+      "Reader is on Python < 3.13 -- the Python 3.13 requirement must be stated before any install command runs.",
+      "Reader does not have `uv` installed -- link to the official uv install docs rather than reproducing them.",
+      "Reader runs the quickstart from a directory that is not the repo root -- state that paths are relative to the repo root."
+    ]
+  },
+  "graders": [
+    { "type": "command", "name": "readme-nonempty",         "run": "test -s README.md" },
+    { "type": "command", "name": "contributing-exists",     "run": "test -f CONTRIBUTING.md" },
+    { "type": "command", "name": "readme-keywords",         "run": "grep -Eq 'pre-release|WIP' README.md && grep -q 'uv sync' README.md && grep -q 'python -m flywheel.workflow run' README.md && grep -q 'CONTRIBUTING.md' README.md && grep -q 'License: TBD' README.md && grep -q 'github.com/johnayoung/flywheel' README.md" },
+    { "type": "command", "name": "readme-doc-links",        "run": "grep -q 'docs/vision.md' README.md && grep -q 'docs/task-schema.md' README.md && grep -q 'docs/task-lifecycle.md' README.md && grep -q 'docs/loop.md' README.md && grep -q 'docs/strategy.md' README.md" },
+    { "type": "command", "name": "contributing-keywords",   "run": "grep -q 'uv sync' CONTRIBUTING.md && grep -q 'uv run pytest' CONTRIBUTING.md && grep -q 'Conventional Commits' CONTRIBUTING.md && grep -q 'docs/vision.md' CONTRIBUTING.md" },
+    { "type": "command", "name": "no-badges-or-images",     "run": "! grep -E '!\\[|<img|\\[!\\[' README.md CONTRIBUTING.md" },
+    { "type": "command", "name": "no-emoji",                "run": "uv run python -c 'import re, pathlib, sys; pat = re.compile(\"[\\U0001F300-\\U0001FAFF\\U0001F600-\\U0001F64F\\U0001F900-\\U0001F9FF\\U00002700-\\U000027BF]\"); bad = [(f, m.group(), m.start()) for f in (\"README.md\",\"CONTRIBUTING.md\") for m in pat.finditer(pathlib.Path(f).read_text())]; sys.exit(0 if not bad else \"emoji found: \" + repr(bad))'" },
+    { "type": "command", "name": "readme-quickstart-json",  "run": "sed -n '/^```json$/,/^```$/{//!p;}' README.md > .readme-task-block.json && test -s .readme-task-block.json && uv run python -c 'from flywheel.loaders import load_task_file; load_task_file(\".readme-task-block.json\")' && rm -f .readme-task-block.json" },
+    { "type": "command", "name": "commit-landed",           "run": "git log -1 --format=%s | grep -Eq '^docs(\\(.+\\))?:'" }
+  ]
+}

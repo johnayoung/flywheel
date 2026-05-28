@@ -1,5 +1,10 @@
 from typing import TYPE_CHECKING
 
+from flywheel.audit import (
+    AuditLoggerHandle,
+    attach_logger,
+    stream,
+)
 from flywheel.envelope import (
     CLOSING_FENCE,
     OPENING_FENCE,
@@ -130,6 +135,7 @@ __all__ = [
     "AgentSessionStore",
     "Attempt",
     "AttemptStore",
+    "AuditLoggerHandle",
     "AuditRecord",
     "AuditStore",
     "BreachedField",
@@ -193,6 +199,7 @@ __all__ = [
     "VALID_INTENTS",
     "ValidEnvelope",
     "ValidationError",
+    "attach_logger",
     "build_iteration_prompt",
     "derive_slug",
     "enforce_transcript_limits",
@@ -206,5 +213,6 @@ __all__ = [
     "run_command_graders",
     "run_task",
     "run_transcript_graders",
+    "stream",
     "total_tokens_from_usage",
 ]

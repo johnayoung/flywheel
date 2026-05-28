@@ -7,10 +7,15 @@ suite stays sqlite/postgres-independent.
 
 from __future__ import annotations
 
+import io
+import json
 import logging
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,9 +26,15 @@ from flywheel import (
     InMemoryStore,
     Lifecycle,
     SdkMessageRecord,
+    SqliteStore,
     Status,
     attach_logger,
     stream,
+)
+from flywheel.audit._cli import (
+    PREVIEW_MAX_CHARS,
+    TRUNCATION_HINT,
+    main as cli_main,
 )
 
 
@@ -380,3 +391,261 @@ def test_stream_is_lazy_iterator() -> None:
     # type-level test here is just that next() works without indexing.
     with pytest.raises(StopIteration):
         next(it)
+
+
+# --- python -m flywheel.audit CLI -------------------------------------------
+#
+# These tests carry the keyword "cli" so ``pytest -k cli`` selects only
+# the CLI surface. They write fixtures into a SqliteStore (the canonical
+# durable backend) and exercise the CLI via either ``cli_main`` for
+# speed or a real ``python -m flywheel.audit`` subprocess for the
+# end-to-end integration acceptance criterion.
+
+
+def _build_sqlite_fixture(
+    db_path: Path,
+    *,
+    run_id: str = "run-cli-fixture",
+    extra_payload: dict[str, Any] | None = None,
+    terminal: bool = False,
+) -> str:
+    """Populate ``db_path`` with one lifecycle, three audit records.
+
+    Returns the ``run_id`` so callers can pass it back into the CLI.
+    The fixture is deterministic: every test sees the same six-field
+    payload layout unless it asks for an ``extra_payload`` override
+    (used by the truncation test to inject a multi-MB blob).
+    """
+    store = SqliteStore(db_path)
+    try:
+        store.create_lifecycle(Lifecycle(task_id="t", run_id=run_id))
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.READY)
+        store.update_lifecycle(lc, expected_version=1)
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.RUNNING)
+        store.update_lifecycle(lc, expected_version=2)
+
+        store.append_event(
+            EventRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_start",
+                payload={"attempt": 1, "iteration": 1},
+                attempt_number=1,
+            )
+        )
+        sdk_payload: dict[str, Any] = {
+            "message_type": "assistant",
+            "text": "hello world",
+        }
+        if extra_payload is not None:
+            sdk_payload.update(extra_payload)
+        store.save_sdk_messages(run_id, 1, 1, [sdk_payload])
+        store.append_event(
+            EventRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_end",
+                payload={"attempt": 1, "iteration": 1},
+                attempt_number=1,
+            )
+        )
+
+        if terminal:
+            lc = store.load_lifecycle(run_id)
+            assert lc is not None
+            lc.transition_to(Status.VALIDATING)
+            store.update_lifecycle(lc, expected_version=lc.version - 1)
+            lc = store.load_lifecycle(run_id)
+            assert lc is not None
+            lc.transition_to(Status.DONE)
+            store.update_lifecycle(lc, expected_version=lc.version - 1)
+    finally:
+        store.close()
+    return run_id
+
+
+def _run_cli(
+    *args: str,
+) -> tuple[int, str, str]:
+    """Invoke ``cli_main`` with captured stdout/stderr.
+
+    Returns ``(exit_code, stdout, stderr)``. Faster than spawning a
+    subprocess; used by every test that doesn't specifically assert the
+    ``python -m flywheel.audit`` boot path.
+    """
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    code = cli_main(list(args), stdout=stdout, stderr=stderr)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_cli_default_mode_prints_records_in_chronological_order_via_subprocess(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: ``python -m flywheel.audit`` against a SqliteStore.
+
+    This is the spec's named integration test -- it opens a tmp sqlite
+    db, writes a fixture run, and invokes the module via subprocess so
+    the ``__main__`` boot path is exercised too.
+    """
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "flywheel.audit",
+            run_id,
+            "--db",
+            str(db),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    lines = [line for line in completed.stdout.splitlines() if line]
+    # Three persisted records: two events + one SDK message.
+    assert len(lines) == 3
+    # Sequence numbers appear in ascending order.
+    seqs = [int(line.split(" seq=", 1)[1].split(" ", 1)[0]) for line in lines]
+    assert seqs == sorted(seqs)
+    assert seqs == [1, 2, 3]
+    # The first and third records are events; the middle one is the SDK
+    # assistant message. The kind=<k> column carries the type prefix.
+    assert "kind=event:harness.iteration_start" in lines[0]
+    assert "kind=sdk:assistant" in lines[1]
+    assert "kind=event:harness.iteration_end" in lines[2]
+
+
+def test_cli_json_mode_emits_ndjson_with_full_payload(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    code, stdout, _stderr = _run_cli(run_id, "--db", str(db), "--json")
+    assert code == 0
+    lines = [line for line in stdout.splitlines() if line]
+    assert len(lines) == 3
+    parsed = [json.loads(line) for line in lines]
+    # Schema: every record carries the spec'd field set.
+    for obj in parsed:
+        assert set(obj.keys()) == {
+            "ts",
+            "sequence",
+            "run_id",
+            "attempt_number",
+            "iteration_number",
+            "kind_or_message_type",
+            "payload",
+        }
+        assert obj["run_id"] == run_id
+        assert isinstance(obj["payload"], dict)
+    # Events have iteration_number == None; the SDK message has 1.
+    iters = [obj["iteration_number"] for obj in parsed]
+    assert iters == [None, 1, None]
+    discriminators = [obj["kind_or_message_type"] for obj in parsed]
+    assert discriminators == [
+        "harness.iteration_start",
+        "assistant",
+        "harness.iteration_end",
+    ]
+
+
+def test_cli_unknown_run_id_prints_empty_state_message_and_exits_zero(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "flywheel.sqlite"
+    # Bootstrap an empty sqlite store so the file exists but has no
+    # lifecycle rows.
+    SqliteStore(db).close()
+
+    code, stdout, stderr = _run_cli("nonexistent-run", "--db", str(db))
+    assert code == 0
+    assert stdout == ""
+    assert "no records for run_id nonexistent-run" in stderr
+
+
+def test_cli_follow_exits_when_lifecycle_reaches_done(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db, terminal=True)
+
+    start = time.monotonic()
+    code, stdout, _stderr = _run_cli(
+        run_id,
+        "--db",
+        str(db),
+        "--follow",
+        "--poll-interval",
+        "5.0",
+    )
+    elapsed = time.monotonic() - start
+    assert code == 0
+    # Already-terminal lifecycle must drain and exit immediately; the
+    # 5.0s poll interval would dominate runtime otherwise.
+    assert elapsed < 2.0
+    lines = [line for line in stdout.splitlines() if line]
+    assert len(lines) == 3
+
+
+def test_cli_preview_truncates_large_payload_in_default_but_full_in_json(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "flywheel.sqlite"
+    huge_blob = "X" * 4096
+    run_id = _build_sqlite_fixture(
+        db, extra_payload={"content": huge_blob}
+    )
+
+    code, default_stdout, _ = _run_cli(run_id, "--db", str(db))
+    assert code == 0
+    default_lines = [
+        line for line in default_stdout.splitlines() if line
+    ]
+    assert len(default_lines) == 3
+    sdk_line = next(
+        line for line in default_lines if "kind=sdk:assistant" in line
+    )
+    # The preview is the tail after " | ". It must contain the
+    # truncation hint and stay within the byte budget so terminals do
+    # not wrap. The huge_blob must NOT appear in full.
+    _, preview = sdk_line.split(" | ", 1)
+    assert TRUNCATION_HINT in preview
+    assert len(preview) <= PREVIEW_MAX_CHARS
+    assert huge_blob not in preview
+
+    code, json_stdout, _ = _run_cli(run_id, "--db", str(db), "--json")
+    assert code == 0
+    json_lines = [line for line in json_stdout.splitlines() if line]
+    sdk_obj = next(
+        json.loads(line)
+        for line in json_lines
+        if json.loads(line)["kind_or_message_type"] == "assistant"
+    )
+    # Full payload survives the JSON path byte-for-byte.
+    assert sdk_obj["payload"]["content"] == huge_blob
+
+
+def test_cli_help_runs_cleanly() -> None:
+    """``--help`` is part of the verification harness; ensure it exits 0
+    and emits something on stdout."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "flywheel.audit", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "python -m flywheel.audit" in completed.stdout
+    # Spec-required flags are documented.
+    assert "--json" in completed.stdout
+    assert "--follow" in completed.stdout
+    assert "--poll-interval" in completed.stdout

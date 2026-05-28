@@ -79,6 +79,8 @@ The verdict is untrusted protocol input. The parser returns a closed taxonomy an
 - `DuplicateVerdict` — more than one fence pair (guards against prompt-injection style fake verdicts).
 - `MalformedVerdict` — JSON decode failure or field-level shape violation (missing/wrong-type `passed`, `summary`, or `unknown`).
 
+When a rubric `passed=false` verdict triggers an auto-retry (`retry_on_fail=True`), its `summary` is carried into the next attempt's prompt as a `# Reviewer feedback` section so the working agent sees the critique on its next iteration.
+
 ## Harness behavior
 
 Per-state dispatch is specified by the **Loop service** column of the detection map above. Each detected state maps to a concrete loop action — bookkeeping, watchdog reset, verification orchestration, pause-for-intervention, retry policy, or fail-loud. Complex cases (thrash detection, crash classification, context-recovery policy) are flagged as TODO subsystems in that column.

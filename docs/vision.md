@@ -135,7 +135,7 @@ Path-level constraints such as `max_turns`, `max_total_tokens`, and `max_wall_se
 
 A separate LLM call, distinct from the working agent, evaluates natural-language assertions against the original goal, the diff, and other execution artifacts. Useful for catching the class of failure where deterministic checks pass but the implementation still does not match intent. It should be treated as semantic review assistance, not as a perfectly reliable judge, especially for broad or context-heavy tasks.
 
-For MVP, a rubric failure does not auto-retry. The task pauses and surfaces the verifier's assessment for operator review.
+For MVP, a rubric failure auto-retries by default (`retry_on_fail=True` on each `RubricGrader`): the verifier's assessment is persisted as a grader receipt and surfaced as a `# Reviewer feedback` section in the next attempt's prompt, so the working agent can correct course on its own. Operators opt into the original pause-for-review behavior on a per-grader basis by setting `retry_on_fail=False`, which routes the lifecycle to `interrupted` instead.
 
 ### `manual`
 
@@ -152,7 +152,7 @@ Within an attempt, graders run in cost order:
 3. `rubric`
 4. `manual`
 
-Within a type, list order is respected. The first failure inside a type skips the remainder of that type and all later types. A failed grader records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, only `command` and `transcript` failures retry automatically — `rubric` and `manual` failures pause for operator intervention.
+Within a type, list order is respected. The first failure inside a type skips the remainder of that type and all later types. A failed grader records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, `command`, `transcript`, and `rubric` failures retry automatically (rubric carries the auto-retry default per-grader via `retry_on_fail=True`; flipping it to `false` opts a specific rubric back into the original pause-for-review behavior). `manual` failures still pause for operator intervention.
 
 Future versions may add richer validation-failure categories, smarter retry policy, stuck detection, and structured repair hints. For MVP, the policy stays intentionally narrow.
 

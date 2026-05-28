@@ -24,11 +24,14 @@ pending -> ready -> running -> validating -> done
                       |      failed_validation -> ready (retry) or failed
                       |           |
                       |           +-> interrupted -> ready
+                      |           +-> internal_error -> ready (retry) or failed
                       |
                       +-> internal_error -> ready (retry) or failed
                       +-> failed
                       +-> interrupted -> ready
 ```
+
+`validating -> internal_error` covers rubric-judge infrastructure failures (SDK crash, parse failure, missing/duplicate/truncated verdict envelope); the existing retry budget applies just as it does for `running -> internal_error`.
 
 Key rules:
 - `done` and `failed` are terminal — no transitions out

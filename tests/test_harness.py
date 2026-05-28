@@ -38,10 +38,20 @@ from flywheel import (
     IterationResult,
     Lifecycle,
     Outcome,
+    RubricGrader,
     Status,
     Task,
     TranscriptGrader,
     run_task,
+)
+from flywheel.grader_rubric import (
+    CLOSING_FENCE as RUBRIC_CLOSING_FENCE,
+)
+from flywheel.grader_rubric import (
+    OPENING_FENCE as RUBRIC_OPENING_FENCE,
+)
+from flywheel.grader_rubric import (
+    RubricJudgeError,
 )
 from flywheel.harness import finalize_stranded_lifecycle
 from flywheel.envelope import (
@@ -1430,3 +1440,509 @@ class TestDeferredSubsystems:
             "blocked_implicit semantic similarity",
         }
         assert set(harness_module._DEFERRED_LOOP_SUBSYSTEMS) == expected
+
+
+# --- Rubric grader integration -------------------------------------------
+
+
+def _rubric_wrap(payload: str) -> str:
+    return f"{RUBRIC_OPENING_FENCE}\n{payload}\n{RUBRIC_CLOSING_FENCE}"
+
+
+class _ScriptedJudge:
+    """Fake ``judge_invoke`` returning canned responses, recording calls."""
+
+    def __init__(self, responses: list[str | Exception]) -> None:
+        self._responses: list[str | Exception] = list(responses)
+        self.calls: list[tuple[str, RubricGrader, Any]] = []
+
+    async def __call__(
+        self,
+        prompt: str,
+        grader: RubricGrader,
+        worktree: Any,
+    ) -> str:
+        self.calls.append((prompt, grader, worktree))
+        if not self._responses:
+            raise AssertionError("scripted judge ran out of responses")
+        head = self._responses.pop(0)
+        if isinstance(head, Exception):
+            raise head
+        return head
+
+
+def _ok_command() -> CommandGrader:
+    return CommandGrader(
+        run=f"{sys.executable} -c 'raise SystemExit(0)'",
+        name="ok",
+    )
+
+
+class TestRubricIntegration:
+    def test_all_pass_rubric_reaches_done(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-done")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.attempts[-1].outcome == Outcome.SUCCEEDED
+        rows = store.list_grader_results(lifecycle.run_id, 1)
+        assert [r.grader_type for r in rows] == ["command", "rubric"]
+        assert all(r.passed for r in rows)
+
+    def test_rubric_fail_with_retry_on_fail_true_consumes_retry(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"], name="semantics", retry_on_fail=True
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-retry")
+        judge = _ScriptedJudge(
+            [
+                _rubric_wrap('{"passed": false, "summary": "wrong file"}'),
+                _rubric_wrap('{"passed": true, "summary": "fixed"}'),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.lifecycle.retries == 1
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.VALIDATION_FAILED
+        assert outcome.attempts[0].error == (
+            "rubric grader 'semantics' failed"
+        )
+
+    def test_rubric_fail_with_retry_on_fail_false_interrupts(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"], name="halt-me", retry_on_fail=False
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-interrupt")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": false, "summary": "park me"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=5,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.lifecycle.retries == 0  # no retry consumed
+        assert outcome.attempts[0].outcome == Outcome.VALIDATION_FAILED
+        assert "halt-me" in outcome.attempts[0].error
+
+    def test_rubric_fail_with_retries_exhausted_reaches_failed(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"], name="strict", retry_on_fail=True
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-exhaust")
+        judge = _ScriptedJudge(
+            [
+                _rubric_wrap('{"passed": false, "summary": "first"}'),
+                _rubric_wrap('{"passed": false, "summary": "second"}'),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        assert "strict" in outcome.lifecycle.error
+        assert outcome.lifecycle.retries == 1
+        assert len(outcome.attempts) == 2
+
+    def test_command_fail_short_circuits_before_rubric(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(1)'",
+                    name="bad",
+                ),
+                RubricGrader(assertions=["a"], name="r0"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-skip")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "should not run"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        assert judge.calls == []
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.rubric_invoked"
+        ]
+        assert events == []
+
+    def test_rubric_invoked_and_verdict_events_emit_with_metadata(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"],
+                    name="semantics",
+                    judge_model="claude-x",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-events")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "great"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        invoked = [e for e in events if e.kind == "harness.rubric_invoked"]
+        assert len(invoked) == 1
+        assert invoked[0].payload["grader_name"] == "semantics"
+        assert invoked[0].payload["judge_model"] == "claude-x"
+        assert invoked[0].payload["attempt_number"] == 1
+        assert invoked[0].attempt_number == 1
+
+        verdicts = [e for e in events if e.kind == "harness.rubric_verdict"]
+        assert len(verdicts) == 1
+        assert verdicts[0].payload["grader_name"] == "semantics"
+        assert verdicts[0].payload["passed"] is True
+        assert verdicts[0].payload["summary"] == "great"
+        assert verdicts[0].payload["unknown"] is False
+
+    def test_judge_crash_routes_to_internal_error(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="rcrash"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-crash")
+        crash = RubricJudgeError(
+            grader_name="rcrash", reason="network down"
+        )
+        judge = _ScriptedJudge([crash])
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # With max_retries=0, INTERNAL_ERROR exhausts immediately -> FAILED.
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "rubric judge failed" in attempt.error
+        assert "rcrash" in attempt.error
+        crash_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert len(crash_events) == 1
+        assert (
+            crash_events[0].payload["classification"]
+            == "rubric_judge_error"
+        )
+        assert crash_events[0].payload["grader_name"] == "rcrash"
+        assert crash_events[0].payload["reason"] == "network down"
+
+    def test_judge_crash_repeated_retries_exhaust_to_failed(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="rcrash"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-crash-x")
+        judge = _ScriptedJudge(
+            [
+                RubricJudgeError(
+                    grader_name="rcrash", reason="boom-1"
+                ),
+                RubricJudgeError(
+                    grader_name="rcrash", reason="boom-2"
+                ),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        assert outcome.attempts[1].outcome == Outcome.INTERNAL_ERROR
+        assert outcome.lifecycle.retries == 1
+
+    def test_unknown_verdict_reaches_done_and_emits_warning(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="speculative"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-unknown")
+        judge = _ScriptedJudge(
+            [
+                _rubric_wrap(
+                    '{"passed": false, "summary": "punted",'
+                    ' "unknown": true}'
+                )
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        unknown_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.rubric_unknown"
+        ]
+        assert len(unknown_events) == 1
+        assert unknown_events[0].payload["grader_name"] == "speculative"
+        assert unknown_events[0].payload["summary"] == "punted"
+
+    def test_retry_attempt_carries_prior_rubric_findings_into_prompt(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"], name="semantics", retry_on_fail=True
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-feedback")
+        judge = _ScriptedJudge(
+            [
+                _rubric_wrap(
+                    '{"passed": false, "summary":'
+                    ' "modified wrong file"}'
+                ),
+                _rubric_wrap('{"passed": true, "summary": "fixed"}'),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            worktree="/tmp/wt",
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        # Attempt #2's prompt must include the # Reviewer feedback section.
+        second_prompt = invoke.calls[1].prompt  # type: ignore[attr-defined]
+        assert "# Reviewer feedback" in second_prompt
+        assert "semantics" in second_prompt
+        assert "modified wrong file" in second_prompt
+        # Attempt #1's prompt must NOT include the section.
+        first_prompt = invoke.calls[0].prompt  # type: ignore[attr-defined]
+        assert "# Reviewer feedback" not in first_prompt
+
+
+class TestHarnessConfigDefaults:
+    def test_default_rubric_config_fields(self) -> None:
+        cfg = HarnessConfig()
+        assert cfg.rubric_judge_model is None
+        assert cfg.rubric_judge_max_turns == 8
+        assert cfg.worktree is None
+        assert cfg.rubric_judge_invoke is None

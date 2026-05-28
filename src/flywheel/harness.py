@@ -56,6 +56,11 @@ from flywheel.envelope import (
     ValidEnvelope,
 )
 from flywheel.grader_command import run_command_graders
+from flywheel.grader_rubric import (
+    JudgeInvoke,
+    RubricJudgeError,
+    run_rubric_graders,
+)
 from flywheel.grader_transcript import (
     TranscriptObservation,
     first_breach,
@@ -68,12 +73,12 @@ from flywheel.invoker import (
     invoke_iteration,
 )
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
-from flywheel.prompt import IterationInputs, build_iteration_prompt
+from flywheel.prompt import IterationInputs, RubricFindings, build_iteration_prompt
 from flywheel.store_protocols import (
     EventRecord,
     GraderResultRecord,
 )
-from flywheel.task import Task, TranscriptGrader
+from flywheel.task import RubricGrader, Task, TranscriptGrader
 
 
 # Loop.md flags these subsystems as TODO. They are intentionally not
@@ -183,12 +188,33 @@ class HarnessConfig:
     does not mutate or extend the supplied mapping; later analysis can
     distinguish model swaps from regressions because every Attempt
     carries exactly the context that produced it.
+
+    ``worktree`` is the per-attempt working directory the rubric judge
+    runs against (typically the same sandbox the working agent uses).
+    When ``None`` and the task declares a :class:`RubricGrader`, the
+    rubric runner raises :class:`RubricJudgeError` ("worktree not
+    available") which the harness routes through ``INTERNAL_ERROR``.
+    Workflow CLIs populate this with their sandbox path.
+
+    ``rubric_judge_model`` is the default model for rubric judges when
+    the per-grader ``RubricGrader.judge_model`` is unset; ``None`` falls
+    through to the SDK's own default. ``rubric_judge_max_turns`` caps
+    the per-judge-call turn budget (default 8).
+
+    ``rubric_judge_invoke`` is a test seam: when set, the harness passes
+    it to ``run_rubric_graders`` instead of the runner's default fresh
+    ``claude_agent_sdk.query`` invoker. Production callers leave it
+    ``None``.
     """
 
     max_retries: int = 0
     max_iterations_per_attempt: int = 1
     artifacts_root: str | os.PathLike[str] | None = None
     agent_context: Mapping[str, str] = field(default_factory=dict)
+    worktree: str | os.PathLike[str] | None = None
+    rubric_judge_model: str | None = None
+    rubric_judge_max_turns: int = 8
+    rubric_judge_invoke: JudgeInvoke | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -512,6 +538,51 @@ def _grader_failure_error(
             name = result.grader_name or result.grader_type
             return f"{result.grader_type} grader {name!r} failed"
     return "grader failure"
+
+
+def _collect_prior_rubric_findings(
+    store: HarnessStore,
+    run_id: str,
+    current_attempt_number: int,
+) -> tuple[RubricFindings, ...]:
+    """Build ``IterationInputs.prior_rubric_findings`` from prior attempts.
+
+    Walks attempts backwards from ``current_attempt_number - 1`` to find
+    the most recent attempt that has failing rubric records. Returns the
+    failing rubric rows from that attempt in ordinal order. Returns an
+    empty tuple when no prior attempt carried any failing rubric record
+    (including the first attempt of a lifecycle).
+
+    A rubric record's ``passed`` field is the lifecycle-level pass/fail
+    bit: the rubric runner stores ``passed=True`` for both
+    well-formed-pass verdicts and ``unknown=True`` verdicts, so
+    filtering on ``passed=False`` naturally excludes unknown verdicts
+    from the next attempt's feedback section.
+    """
+    if current_attempt_number <= 1:
+        return ()
+    for prior in range(current_attempt_number - 1, 0, -1):
+        rows = store.list_grader_results(run_id, prior)
+        failing = [
+            r
+            for r in rows
+            if r.grader_type == "rubric" and not r.passed
+        ]
+        if not failing:
+            continue
+        findings: list[RubricFindings] = []
+        for row in sorted(failing, key=lambda r: r.ordinal):
+            summary_raw = row.payload.get("summary")
+            summary = summary_raw if isinstance(summary_raw, str) else ""
+            findings.append(
+                RubricFindings(
+                    grader_name=row.grader_name or "<unnamed>",
+                    attempt_number=row.attempt_number,
+                    summary=summary,
+                )
+            )
+        return tuple(findings)
+    return ()
 
 
 # SIGINT (Ctrl+C from operator) and SIGTERM (typical process shutdown)
@@ -974,6 +1045,7 @@ async def _run_attempt_body(
             task=task,
             lifecycle=lifecycle,
             store=store,
+            config=config,
             attempt=attempt,
             attempt_dir=attempt_dir,
             observation=observation,
@@ -1059,13 +1131,20 @@ async def _drive_iterations(
     started_monotonic = mclock()
     wall_seconds = 0.0
 
+    prior_rubric_findings = _collect_prior_rubric_findings(
+        store, lifecycle.run_id, attempt_number
+    )
+
     while iteration_number < config.max_iterations_per_attempt:
         iteration_number += 1
 
         prompt = build_iteration_prompt(
             task,
             lifecycle,
-            IterationInputs(max_retries=config.max_retries),
+            IterationInputs(
+                max_retries=config.max_retries,
+                prior_rubric_findings=prior_rubric_findings,
+            ),
         )
         request = InvocationRequest(
             prompt=prompt,
@@ -1126,14 +1205,26 @@ async def _validate(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    config: HarnessConfig,
     attempt: Attempt,
     attempt_dir: Path | None,
     observation: TranscriptObservation,
     agent_output: str,
     clock: Callable[[], datetime],
 ) -> None:
-    """Run command then transcript graders; transition validating -> done
-    or validating -> failed_validation."""
+    """Run command, transcript, then rubric graders.
+
+    Transitions:
+    - All pass -> ``DONE``.
+    - Command/transcript fail -> ``FAILED_VALIDATION``.
+    - Operator-signal-killed command grader -> ``INTERRUPTED``.
+    - Rubric fail with ``retry_on_fail=True`` -> ``FAILED_VALIDATION``.
+    - Rubric fail with ``retry_on_fail=False`` -> ``INTERRUPTED``.
+    - Judge infra failure (``RubricJudgeError``) ->
+      ``INTERNAL_ERROR`` outcome + ``INTERRUPTED`` lifecycle status
+      via a ``harness.crash`` event whose ``classification`` is
+      ``rubric_judge_error``.
+    """
     command_results = run_command_graders(
         task,
         store,
@@ -1155,7 +1246,74 @@ async def _validate(
     )
     transcript_passed = _all_passed(transcript_results)
 
+    # Rubric graders only run when command + transcript both passed
+    # (cost-order short-circuit). The runner itself enforces this
+    # invariant; the harness honors it so no rubric events emit on
+    # earlier failures.
+    rubric_results: list[GraderResultRecord] = []
+    rubric_passed = True
     if command_passed and transcript_passed:
+        try:
+            rubric_results = await run_rubric_graders(
+                task,
+                store,
+                run_id=lifecycle.run_id,
+                attempt_number=attempt.number,
+                transcript=agent_output,
+                worktree=config.worktree,
+                command_passed=command_passed,
+                transcript_passed=transcript_passed,
+                judge_invoke=config.rubric_judge_invoke,
+                judge_model=config.rubric_judge_model,
+                judge_max_turns=config.rubric_judge_max_turns,
+                now=clock,
+            )
+        except RubricJudgeError as exc:
+            error = (
+                f"rubric judge failed: {exc.grader_name}: {exc.reason}"
+            )
+            _emit(
+                store,
+                run_id=lifecycle.run_id,
+                kind="harness.crash",
+                payload={
+                    "classification": "rubric_judge_error",
+                    "grader_name": exc.grader_name,
+                    "reason": exc.reason,
+                    "message": error,
+                },
+                attempt_number=attempt.number,
+                now=clock,
+            )
+            _finalize_attempt(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.INTERNAL_ERROR,
+                error=error,
+                agent_output=agent_output,
+                clock=clock,
+            )
+            _transition(
+                lifecycle,
+                Status.INTERNAL_ERROR,
+                store=store,
+                error=error,
+                now=clock,
+            )
+            return
+
+        for record in rubric_results:
+            _emit_rubric_events(
+                store,
+                run_id=lifecycle.run_id,
+                attempt_number=attempt.number,
+                record=record,
+                clock=clock,
+            )
+        rubric_passed = all(r.passed for r in rubric_results)
+
+    if command_passed and transcript_passed and rubric_passed:
         _finalize_attempt(
             store=store,
             lifecycle=lifecycle,
@@ -1208,8 +1366,53 @@ async def _validate(
             )
             return
         error = _grader_failure_error(command_results)
-    else:
+        _finalize_attempt(
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.VALIDATION_FAILED,
+            error=error,
+            agent_output=agent_output,
+            clock=clock,
+        )
+        _transition(
+            lifecycle,
+            Status.FAILED_VALIDATION,
+            store=store,
+            error=error,
+            now=clock,
+        )
+        return
+
+    if not transcript_passed:
         error = _grader_failure_error(transcript_results)
+        _finalize_attempt(
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.VALIDATION_FAILED,
+            error=error,
+            agent_output=agent_output,
+            clock=clock,
+        )
+        _transition(
+            lifecycle,
+            Status.FAILED_VALIDATION,
+            store=store,
+            error=error,
+            now=clock,
+        )
+        return
+
+    # Rubric failure: the first failing rubric record's grader controls
+    # the retry-on-fail policy.
+    failed_record = next(r for r in rubric_results if not r.passed)
+    grader = task.graders[failed_record.ordinal]
+    assert isinstance(grader, RubricGrader), (
+        "rubric record ordinal must point to a RubricGrader"
+    )
+    grader_label = failed_record.grader_name or "rubric"
+    error = f"rubric grader {grader_label!r} failed"
     _finalize_attempt(
         store=store,
         lifecycle=lifecycle,
@@ -1219,13 +1422,80 @@ async def _validate(
         agent_output=agent_output,
         clock=clock,
     )
-    _transition(
-        lifecycle,
-        Status.FAILED_VALIDATION,
-        store=store,
-        error=error,
+    if grader.retry_on_fail:
+        _transition(
+            lifecycle,
+            Status.FAILED_VALIDATION,
+            store=store,
+            error=error,
+            now=clock,
+        )
+    else:
+        _transition(
+            lifecycle,
+            Status.INTERRUPTED,
+            store=store,
+            error=error,
+            now=clock,
+        )
+
+
+def _emit_rubric_events(
+    store: HarnessStore,
+    *,
+    run_id: str,
+    attempt_number: int,
+    record: GraderResultRecord,
+    clock: Callable[[], datetime],
+) -> None:
+    """Emit harness.rubric_invoked / harness.rubric_verdict (and, when
+    applicable, harness.rubric_unknown) for one persisted rubric record.
+
+    Derived from the record so the events and the durable receipt agree
+    by construction. ``rubric_invoked`` precedes ``rubric_verdict`` to
+    preserve start-then-end ordering in the audit stream.
+    """
+    payload = record.payload
+    summary = payload.get("summary")
+    unknown = bool(payload.get("unknown", False))
+    judge_model = payload.get("judge_model")
+    _emit(
+        store,
+        run_id=run_id,
+        kind="harness.rubric_invoked",
+        payload={
+            "grader_name": record.grader_name,
+            "judge_model": judge_model,
+            "attempt_number": record.attempt_number,
+        },
+        attempt_number=attempt_number,
         now=clock,
     )
+    _emit(
+        store,
+        run_id=run_id,
+        kind="harness.rubric_verdict",
+        payload={
+            "grader_name": record.grader_name,
+            "passed": record.passed,
+            "summary": summary,
+            "unknown": unknown,
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+    if unknown:
+        _emit(
+            store,
+            run_id=run_id,
+            kind="harness.rubric_unknown",
+            payload={
+                "grader_name": record.grader_name,
+                "summary": summary,
+            },
+            attempt_number=attempt_number,
+            now=clock,
+        )
 
 
 def _finalize_attempt(

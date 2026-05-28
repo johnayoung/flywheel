@@ -424,6 +424,7 @@ async def run_task_file(
                         "agent_sdk": "claude_agent_sdk",
                         "sandbox": str(sandbox),
                     },
+                    worktree=sandbox,
                 ),
                 invoke=invoker,
             )

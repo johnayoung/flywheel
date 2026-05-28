@@ -286,10 +286,11 @@ class PostgresStore:
                         INSERT INTO lifecycles (
                             run_id, task_id, status, version, retries,
                             error, agent_output, session_id, artifacts_dir,
-                            worker_id, timestamps_json, updated_at
+                            worker_id, timestamps_json, updated_at,
+                            blocked_requires_json
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s
+                            %s, %s
                         )
                         """,
                         (
@@ -305,6 +306,7 @@ class PostgresStore:
                             lifecycle.worker_id or None,
                             Jsonb(_serialize_timestamps(lifecycle.timestamps)),
                             _utcnow(),
+                            lifecycle.blocked_requires_json,
                         ),
                     )
         except psycopg.errors.UniqueViolation as exc:
@@ -331,7 +333,8 @@ class PostgresStore:
                         artifacts_dir = %s,
                         worker_id = %s,
                         timestamps_json = %s,
-                        updated_at = %s
+                        updated_at = %s,
+                        blocked_requires_json = %s
                     WHERE run_id = %s AND version = %s
                     """,
                     (
@@ -346,6 +349,7 @@ class PostgresStore:
                         lifecycle.worker_id or None,
                         Jsonb(_serialize_timestamps(lifecycle.timestamps)),
                         _utcnow(),
+                        lifecycle.blocked_requires_json,
                         lifecycle.run_id,
                         expected_version,
                     ),
@@ -373,7 +377,7 @@ class PostgresStore:
                     """
                     SELECT run_id, task_id, status, version, retries, error,
                            agent_output, session_id, artifacts_dir, worker_id,
-                           timestamps_json
+                           timestamps_json, blocked_requires_json
                     FROM lifecycles
                     WHERE run_id = %s
                     """,
@@ -394,6 +398,7 @@ class PostgresStore:
             agent_output=row["agent_output"] or "",
             session_id=row["session_id"] or "",
             artifacts_dir=row["artifacts_dir"] or "",
+            blocked_requires_json=row["blocked_requires_json"],
         )
         lc.attempts = self.list_attempts(run_id)
         return lc

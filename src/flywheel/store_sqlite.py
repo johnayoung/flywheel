@@ -210,8 +210,8 @@ class SqliteStore:
                 INSERT INTO lifecycles (
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
-                    timestamps_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamps_json, updated_at, blocked_requires_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lifecycle.run_id,
@@ -226,6 +226,7 @@ class SqliteStore:
                     lifecycle.worker_id,
                     _serialize_timestamps(lifecycle.timestamps),
                     _utcnow_iso(),
+                    lifecycle.blocked_requires_json,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -252,7 +253,8 @@ class SqliteStore:
                 artifacts_dir = ?,
                 worker_id = ?,
                 timestamps_json = ?,
-                updated_at = ?
+                updated_at = ?,
+                blocked_requires_json = ?
             WHERE run_id = ? AND version = ?
             """,
             (
@@ -267,6 +269,7 @@ class SqliteStore:
                 lifecycle.worker_id,
                 _serialize_timestamps(lifecycle.timestamps),
                 _utcnow_iso(),
+                lifecycle.blocked_requires_json,
                 lifecycle.run_id,
                 expected_version,
             ),
@@ -291,7 +294,7 @@ class SqliteStore:
             """
             SELECT run_id, task_id, status, version, retries, error,
                    agent_output, session_id, artifacts_dir, worker_id,
-                   timestamps_json
+                   timestamps_json, blocked_requires_json
             FROM lifecycles
             WHERE run_id = ?
             """,
@@ -311,6 +314,7 @@ class SqliteStore:
             agent_output=row["agent_output"] or "",
             session_id=row["session_id"] or "",
             artifacts_dir=row["artifacts_dir"] or "",
+            blocked_requires_json=row["blocked_requires_json"],
         )
         lc.attempts = self.list_attempts(run_id)
         return lc

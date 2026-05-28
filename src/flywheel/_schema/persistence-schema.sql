@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   artifacts_dir        TEXT,
   worker_id            TEXT,
   timestamps_json      TEXT NOT NULL,
-  updated_at           DATETIME NOT NULL
+  updated_at           DATETIME NOT NULL,
+  blocked_requires_json TEXT
 );
 
 -- agent_context_json captures the agent identity for this attempt so the run

@@ -62,6 +62,7 @@ def _clone_lifecycle_row(lc: Lifecycle) -> Lifecycle:
         attempts=[],
         session_id=lc.session_id,
         artifacts_dir=lc.artifacts_dir,
+        blocked_requires_json=lc.blocked_requires_json,
     )
 
 

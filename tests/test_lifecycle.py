@@ -55,8 +55,14 @@ def test_lifecycle_fields_match_spec_table() -> None:
         "attempts",
         "session_id",
         "artifacts_dir",
+        "blocked_requires_json",
     }
     assert {f.name for f in fields(Lifecycle)} == expected
+
+
+def test_default_lifecycle_blocked_requires_json_is_none() -> None:
+    lc = Lifecycle(task_id="t1")
+    assert lc.blocked_requires_json is None
 
 
 def test_attempt_fields_match_spec_table() -> None:

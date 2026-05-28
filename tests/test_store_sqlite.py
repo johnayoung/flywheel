@@ -324,6 +324,93 @@ def test_lifecycle_state_survives_close_and_reopen(tmp_path: Path) -> None:
         s2.close()
 
 
+# --- blocked_requires_json column round-trip -------------------------------
+
+
+def test_blocked_requires_json_persists_verbatim_in_sqlite(
+    tmp_path: Path,
+) -> None:
+    """The hand-written SqliteStore SELECT/INSERT/UPDATE statements must
+    name ``blocked_requires_json`` so the column round-trips. NULL must
+    survive as ``None`` (not coerced to empty string)."""
+    store = SqliteStore(tmp_path / "blocked.db")
+    try:
+        # 1. Persist with the column set to a non-empty JSON string.
+        payload = (
+            '[{"type": "command_grader", "name": "full-suite"}]'
+        )
+        lc = Lifecycle(
+            task_id="t",
+            run_id="r-set",
+            blocked_requires_json=payload,
+        )
+        store.create_lifecycle(lc)
+        loaded = store.load_lifecycle("r-set")
+        assert loaded is not None
+        assert loaded.blocked_requires_json == payload
+
+        # The raw stored value is the same string verbatim, not JSON-encoded.
+        raw = store._connection.execute(
+            "SELECT blocked_requires_json FROM lifecycles WHERE run_id = ?",
+            ("r-set",),
+        ).fetchone()
+        assert raw["blocked_requires_json"] == payload
+
+        # 2. Persist with the column omitted -> NULL -> None.
+        lc_null = Lifecycle(task_id="t", run_id="r-null")
+        store.create_lifecycle(lc_null)
+        loaded_null = store.load_lifecycle("r-null")
+        assert loaded_null is not None
+        assert loaded_null.blocked_requires_json is None
+        raw_null = store._connection.execute(
+            "SELECT blocked_requires_json FROM lifecycles WHERE run_id = ?",
+            ("r-null",),
+        ).fetchone()
+        assert raw_null["blocked_requires_json"] is None
+
+        # 3. Update can clear the column back to NULL.
+        loaded.transition_to(Status.READY)
+        loaded.blocked_requires_json = None
+        store.update_lifecycle(loaded, expected_version=1)
+        cleared = store.load_lifecycle("r-set")
+        assert cleared is not None
+        assert cleared.blocked_requires_json is None
+        raw_cleared = store._connection.execute(
+            "SELECT blocked_requires_json FROM lifecycles WHERE run_id = ?",
+            ("r-set",),
+        ).fetchone()
+        assert raw_cleared["blocked_requires_json"] is None
+    finally:
+        store.close()
+
+
+def test_blocked_requires_json_survives_close_and_reopen(
+    tmp_path: Path,
+) -> None:
+    """The column must survive a process boundary, not just a single
+    connection. Durability of the persisted JSON string is the whole
+    point of moving it onto the lifecycle row."""
+    db = tmp_path / "blocked-durable.db"
+    payload = '[{"type": "file_exists", "path": "/tmp/x", "present": true}]'
+    s1 = SqliteStore(db)
+    s1.create_lifecycle(
+        Lifecycle(
+            task_id="t",
+            run_id="r1",
+            blocked_requires_json=payload,
+        )
+    )
+    s1.close()
+
+    s2 = SqliteStore(db)
+    try:
+        loaded = s2.load_lifecycle("r1")
+        assert loaded is not None
+        assert loaded.blocked_requires_json == payload
+    finally:
+        s2.close()
+
+
 # --- Session ordering ------------------------------------------------------
 
 

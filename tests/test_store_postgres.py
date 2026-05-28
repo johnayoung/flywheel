@@ -428,6 +428,65 @@ def test_close_releases_pool_resources(fresh_schema: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_blocked_requires_json_round_trips_through_postgres(
+    pg_store: Any,
+) -> None:
+    """The hand-written PostgresStore INSERT/UPDATE/SELECT statements
+    must name ``blocked_requires_json`` so the column round-trips. NULL
+    must survive as ``None`` (not coerced to empty string) and updating
+    a non-None value back to NULL must work."""
+    payload = (
+        '[{"type": "command_grader", "name": "full-suite"}, '
+        '{"type": "file_exists", "path": ".workflow/lkg/.venv", '
+        '"present": true}]'
+    )
+
+    # 1. Persist with the column set.
+    lc = Lifecycle(
+        task_id="t",
+        run_id="r-set",
+        blocked_requires_json=payload,
+    )
+    pg_store.create_lifecycle(lc)
+    loaded = pg_store.load_lifecycle("r-set")
+    assert loaded is not None
+    assert loaded.blocked_requires_json == payload
+
+    # The raw stored TEXT column is the same string, byte-for-byte.
+    rows = _query(
+        pg_store,
+        "SELECT blocked_requires_json FROM lifecycles WHERE run_id = %s",
+        ("r-set",),
+    )
+    assert rows[0][0] == payload
+
+    # 2. Persist a row that leaves the column unset; NULL becomes None.
+    pg_store.create_lifecycle(Lifecycle(task_id="t", run_id="r-null"))
+    loaded_null = pg_store.load_lifecycle("r-null")
+    assert loaded_null is not None
+    assert loaded_null.blocked_requires_json is None
+    rows_null = _query(
+        pg_store,
+        "SELECT blocked_requires_json FROM lifecycles WHERE run_id = %s",
+        ("r-null",),
+    )
+    assert rows_null[0][0] is None
+
+    # 3. Update can clear the column back to NULL.
+    loaded.transition_to(Status.READY)
+    loaded.blocked_requires_json = None
+    pg_store.update_lifecycle(loaded, expected_version=1)
+    cleared = pg_store.load_lifecycle("r-set")
+    assert cleared is not None
+    assert cleared.blocked_requires_json is None
+    rows_cleared = _query(
+        pg_store,
+        "SELECT blocked_requires_json FROM lifecycles WHERE run_id = %s",
+        ("r-set",),
+    )
+    assert rows_cleared[0][0] is None
+
+
 def test_timestamptz_round_trips_as_aware_utc(pg_store: Any) -> None:
     lc = Lifecycle(task_id="t", run_id="r1")
     lc.transition_to(Status.READY)

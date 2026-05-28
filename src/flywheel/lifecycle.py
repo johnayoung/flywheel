@@ -101,6 +101,7 @@ class Lifecycle:
     attempts: list[Attempt] = field(default_factory=list)
     session_id: str = ""
     artifacts_dir: str = ""
+    blocked_requires_json: str | None = None
 
     def transition_to(
         self,

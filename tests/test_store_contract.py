@@ -309,6 +309,61 @@ def test_lifecycle_stored_row_is_isolated_from_caller_mutations(
     assert again.task_id == "t"
 
 
+def test_blocked_requires_json_round_trips_through_create_update_load(
+    store: object,
+) -> None:
+    """blocked_requires_json must persist verbatim on create, survive
+    update (including clearing back to NULL/None), and default to None
+    when unset. Mirrors the contract across every backend so no store can
+    silently drop the column."""
+    assert isinstance(store, LifecycleStore)
+
+    # 1. Default is None on a freshly-created lifecycle.
+    lc_default = Lifecycle(task_id="t", run_id="r-default")
+    store.create_lifecycle(lc_default)
+    loaded_default = store.load_lifecycle("r-default")
+    assert loaded_default is not None
+    assert loaded_default.blocked_requires_json is None
+
+    # 2. A non-empty JSON string round-trips byte-for-byte on create.
+    payload = (
+        '[{"type": "command_grader", "name": "full-suite"}, '
+        '{"type": "file_exists", "path": ".workflow/lkg/.venv", '
+        '"present": true}]'
+    )
+    lc = Lifecycle(
+        task_id="t",
+        run_id="r-set",
+        blocked_requires_json=payload,
+    )
+    store.create_lifecycle(lc)
+    loaded = store.load_lifecycle("r-set")
+    assert loaded is not None
+    assert loaded.blocked_requires_json == payload
+
+    # 3. Update can clear blocked_requires_json back to None.
+    loaded.transition_to(Status.READY)  # version becomes 2
+    loaded.blocked_requires_json = None
+    store.update_lifecycle(loaded, expected_version=1)
+    reloaded = store.load_lifecycle("r-set")
+    assert reloaded is not None
+    assert reloaded.blocked_requires_json is None
+    assert reloaded.version == 2
+
+    # 4. Update can also set blocked_requires_json on a row where it
+    # was previously None (the inverse direction).
+    reloaded.blocked_requires_json = '[{"type": "env_var_set", "name": "X"}]'
+    # NB: transition not required to update the column, but version bump
+    # is needed to satisfy optimistic concurrency.
+    reloaded.version = 3
+    store.update_lifecycle(reloaded, expected_version=2)
+    final = store.load_lifecycle("r-set")
+    assert final is not None
+    assert final.blocked_requires_json == (
+        '[{"type": "env_var_set", "name": "X"}]'
+    )
+
+
 def test_load_lifecycle_attaches_attempts_in_number_order(
     store: object,
 ) -> None:

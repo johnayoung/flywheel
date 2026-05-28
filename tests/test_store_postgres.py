@@ -605,3 +605,78 @@ def test_fresh_postgres_records_current_schema_version(
     )
     assert len(rows) == 1
     assert int(rows[0][0]) == CURRENT_SCHEMA_VERSION
+
+
+def test_opening_v2_postgres_without_blocked_requires_json_adds_column(
+    fresh_schema: str,
+) -> None:
+    # Simulates a schema created before cf45b58: schema_version is 2 and
+    # every other v2 table is present, but lifecycles.blocked_requires_json
+    # is missing. Reopening must ALTER the column back in instead of leaving
+    # SELECTs to crash with "column does not exist".
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    ).close()
+
+    import psycopg
+    from psycopg import sql
+
+    schema_ident = sql.Identifier(fresh_schema)
+    with psycopg.connect(dsn) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(schema_ident)
+            )
+            cur.execute(
+                "ALTER TABLE lifecycles DROP COLUMN blocked_requires_json"
+            )
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'lifecycles'
+                  AND column_name = 'blocked_requires_json'
+                """,
+                (fresh_schema,),
+            )
+            assert cur.fetchone() is None
+
+    store = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    )
+    try:
+        rows = _query(
+            store,
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = 'lifecycles'
+              AND column_name = 'blocked_requires_json'
+            """,
+            (fresh_schema,),
+        )
+        assert len(rows) == 1
+        lifecycle = Lifecycle(
+            run_id="run-recovered",
+            task_id="t",
+            status=Status.PENDING,
+            timestamps={
+                Status.PENDING: datetime(2026, 1, 1, tzinfo=timezone.utc)
+            },
+            blocked_requires_json='[{"type": "file_exists", "path": "x"}]',
+        )
+        store.create_lifecycle(lifecycle)
+        loaded = store.load_lifecycle("run-recovered")
+        assert loaded is not None
+        assert (
+            loaded.blocked_requires_json
+            == '[{"type": "file_exists", "path": "x"}]'
+        )
+    finally:
+        store.close()

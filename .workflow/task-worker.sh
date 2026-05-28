@@ -641,13 +641,14 @@ remove_finished() {
     local task_id="${RUNNING_TASKS[$i]}"
     local phase="${RUNNING_PHASES[$i]}"
     local worktree="${RUNNING_WORKTREES[$i]}"
+    local logfile="${RUNNING_LOGS[$i]}"
 
     if kill -0 "$pid" 2>/dev/null; then
       new_pids+=("$pid")
       new_tasks+=("$task_id")
       new_phases+=("$phase")
       new_worktrees+=("$worktree")
-      new_logs+=("${RUNNING_LOGS[$i]}")
+      new_logs+=("$logfile")
       continue
     fi
 
@@ -682,7 +683,19 @@ remove_finished() {
         reconcile_to_interrupted "$task_id"
         ;;
       *)
-        echo "[worker] Unexpected lifecycle status '${status:-unknown}'; worktree preserved at $worktree" >&2
+        # Harness exited before it could write a lifecycle row (e.g. import
+        # error, schema mismatch, or any crash before store.create_lifecycle).
+        # Without a row, `flywheel.workflow next` re-picks the same task on
+        # the next iteration -- left unchecked this spins forever. Count it
+        # against the per-task spawn-failure circuit breaker so a broken
+        # task can't starve the loop. Operator clears the counter by
+        # removing $worktree and refs/heads/flywheel/*/$task_id.
+        SPAWN_FAILURES[$task_id]=$(( ${SPAWN_FAILURES[$task_id]:-0} + 1 ))
+        if [[ "${SPAWN_FAILURES[$task_id]}" -ge "$SPAWN_FAILURE_THRESHOLD" ]]; then
+          echo "[worker] ERROR: $task_id finished with no lifecycle row $SPAWN_FAILURE_THRESHOLD times -- giving up. Inspect $worktree and $logfile, then clear manually." >&2
+        else
+          echo "[worker] Unexpected lifecycle status '${status:-unknown}' (attempt ${SPAWN_FAILURES[$task_id]}/$SPAWN_FAILURE_THRESHOLD); worktree preserved at $worktree" >&2
+        fi
         ;;
     esac
   done

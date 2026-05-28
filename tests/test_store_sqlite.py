@@ -531,3 +531,48 @@ def test_fresh_store_records_current_schema_version(tmp_path: Path) -> None:
         assert int(row["version"]) == CURRENT_SCHEMA_VERSION
     finally:
         store.close()
+
+
+def test_opening_v2_store_without_blocked_requires_json_adds_column(
+    tmp_path: Path,
+) -> None:
+    # Simulates a database created before cf45b58: schema_version is 2
+    # and every other v2 table is present, but lifecycles.blocked_requires_json
+    # is missing. The bootstrap must ALTER the column back in instead of
+    # leaving SELECTs to crash with "no such column".
+    db = tmp_path / "pre_blocked.db"
+    SqliteStore(db).close()
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute(
+            "ALTER TABLE lifecycles DROP COLUMN blocked_requires_json"
+        )
+        rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
+        assert not any(r[1] == "blocked_requires_json" for r in rows)
+    finally:
+        conn.close()
+
+    store = SqliteStore(db)
+    try:
+        rows = store._connection.execute(
+            "PRAGMA table_info(lifecycles)"
+        ).fetchall()
+        assert any(r["name"] == "blocked_requires_json" for r in rows)
+        lifecycle = Lifecycle(
+            run_id="run-recovered",
+            task_id="t",
+            status=Status.PENDING,
+            timestamps={
+                Status.PENDING: datetime(2026, 1, 1, tzinfo=timezone.utc)
+            },
+            blocked_requires_json='[{"type": "file_exists", "path": "x"}]',
+        )
+        store.create_lifecycle(lifecycle)
+        loaded = store.load_lifecycle("run-recovered")
+        assert loaded is not None
+        assert (
+            loaded.blocked_requires_json
+            == '[{"type": "file_exists", "path": "x"}]'
+        )
+    finally:
+        store.close()

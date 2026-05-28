@@ -164,6 +164,15 @@ class SqliteStore:
         conn.execute("PRAGMA foreign_keys = ON;")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
+        # Back-compat migration: cf45b58 added blocked_requires_json to
+        # lifecycles without bumping schema_version (per its commit msg,
+        # nullable-add is the spec's back-compat path). Existing v2 DBs
+        # created before that commit lack the column; CREATE TABLE IF NOT
+        # EXISTS above no-ops on them, so add the column here when missing.
+        if not _lifecycles_has_blocked_requires_json(conn):
+            conn.execute(
+                "ALTER TABLE lifecycles ADD COLUMN blocked_requires_json TEXT"
+            )
         # Final version pin: any row mismatch is fatal regardless of how
         # the database got here. The schema_version table has a CHECK
         # (id = 1) so there is at most one row to read.
@@ -675,6 +684,11 @@ def _has_table(conn: sqlite3.Connection, table: str) -> bool:
 def _events_has_sequence(conn: sqlite3.Connection) -> bool:
     rows = conn.execute("PRAGMA table_info(events)").fetchall()
     return any(r["name"] == "sequence" for r in rows)
+
+
+def _lifecycles_has_blocked_requires_json(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
+    return any(r["name"] == "blocked_requires_json" for r in rows)
 
 
 def _row_to_grader_result(row: sqlite3.Row) -> GraderResultRecord:

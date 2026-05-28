@@ -238,6 +238,26 @@ class PostgresStore:
                             expected_version=CURRENT_SCHEMA_VERSION,
                         )
                 cur.execute(_read_schema_sql())
+                # Back-compat migration: cf45b58 added blocked_requires_json
+                # to lifecycles without bumping schema_version. Existing
+                # schema_version=2 databases created before that commit lack
+                # the column; CREATE TABLE IF NOT EXISTS above no-ops on
+                # them, so add the column here when missing.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'lifecycles'
+                      AND column_name = 'blocked_requires_json'
+                    """,
+                    (self._schema,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "ALTER TABLE lifecycles "
+                        "ADD COLUMN blocked_requires_json TEXT"
+                    )
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
                 )

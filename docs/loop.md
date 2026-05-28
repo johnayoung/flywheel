@@ -58,6 +58,27 @@ The envelope carries agent intent only; observed state comes from SDK signals pe
 
 The envelope is untrusted protocol input. The harness must handle malformed JSON, missing fences, duplicates, truncation, and contradictory claims as first-class cases.
 
+## Rubric verdict envelope
+
+Rubric graders run an LLM-as-judge in a fresh `claude-agent-sdk` session and require the judge to terminate its response with one fenced JSON block:
+
+```html
+<!-- RUBRIC_VERDICT -->
+{"passed": true, "summary": "<one or two sentences>", "unknown": false}
+<!-- /RUBRIC_VERDICT -->
+```
+
+- `passed` (bool, required) — true if every assertion holds.
+- `summary` (str, required) — brief rationale; empty string accepted.
+- `unknown` (bool, optional, default false) — set true only when evidence is insufficient. Counts as a pass for lifecycle purposes; surfaced via `harness.rubric_unknown`.
+
+The verdict is untrusted protocol input. The parser returns a closed taxonomy and each non-valid variant routes through `INTERNAL_ERROR` (judge-infrastructure failure, retry-eligible):
+
+- `MissingVerdict` — no opening fence in the judge's response.
+- `TruncatedVerdict` — opening fence with no matching closing fence.
+- `DuplicateVerdict` — more than one fence pair (guards against prompt-injection style fake verdicts).
+- `MalformedVerdict` — JSON decode failure or field-level shape violation (missing/wrong-type `passed`, `summary`, or `unknown`).
+
 ## Harness behavior
 
 Per-state dispatch is specified by the **Loop service** column of the detection map above. Each detected state maps to a concrete loop action — bookkeeping, watchdog reset, verification orchestration, pause-for-intervention, retry policy, or fail-loud. Complex cases (thrash detection, crash classification, context-recovery policy) are flagged as TODO subsystems in that column.

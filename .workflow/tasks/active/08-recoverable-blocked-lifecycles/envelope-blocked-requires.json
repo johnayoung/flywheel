@@ -1,0 +1,52 @@
+{
+  "id": "envelope-blocked-requires",
+  "goal": "Extend the LOOP_STATUS envelope parser so intent=blocked envelopes carry a validated tuple of structured requires predicates (command_grader, file_exists, env_var_set).",
+  "tags": ["envelope", "loop", "schema", "phase-08"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00004-FEATURE-recoverable-blocked-lifecycles.md",
+      "src/flywheel/envelope.py",
+      "tests/test_envelope.py",
+      "tests/test_envelope_module_purity.py",
+      "docs/loop.md"
+    ],
+    "references": [
+      "src/flywheel/envelope.py:32-36 -- existing ValidEnvelope shape that gains the requires field",
+      "src/flywheel/envelope.py:93-183 -- parse_envelope JSON-decode + per-field validation pattern to mirror for requires",
+      "Parked branch flywheel/04-recoverable-blocked-lifecycles/envelope-blocked-requires (commit e9587a0) implemented this FR previously; its diff (e.g. `git show e9587a0 -- src/flywheel/envelope.py`) is a working reference but is NOT the source of truth -- the current spec wording wins on any divergence."
+    ],
+    "constraints": [
+      "Add a BlockedRequirement tagged-union family of frozen kw_only dataclasses in flywheel.envelope: CommandGraderRequirement(name: str), FileExistsRequirement(path: str, present: bool = True), EnvVarSetRequirement(name: str). Each has a type: Literal['<discriminator>'] field. No other predicate types in v1.",
+      "Add `requires: tuple[BlockedRequirement, ...] = ()` to ValidEnvelope. The field is empty for non-blocked intents and populated only when intent=blocked.",
+      "Export the new types from flywheel.envelope and re-export them from flywheel.__init__ (mirror how Intent / ValidEnvelope / MalformedEnvelope are re-exported today).",
+      "parse_envelope rejects any intent=blocked envelope that: (a) omits requires, (b) sets requires to a non-list, (c) sets requires to an empty list, (d) contains an entry that is not a JSON object, (e) contains an entry missing 'type' or with an unknown 'type', (f) contains a predicate entry missing per-type required fields or with wrong-typed fields. Each rejection returns MalformedEnvelope with a precise reason string and an offending snippet via the existing _truncate helper.",
+      "file_exists.present defaults to true when the key is omitted; reject when present is provided but is not a bool. env_var_set rejects when name is provided but is not a string (or is empty). command_grader rejects when name is provided but is not a string (or is empty). The parser does NOT resolve command_grader names against any Task -- that validation happens in the harness in a later task.",
+      "Non-blocked intents (verify, continue, abort) continue to parse with requires=() even if the envelope payload happens to include a requires key (ignore it for non-blocked intents -- matches the existing 'extra fields accepted' behavior).",
+      "flywheel.envelope MUST stay pure: no new imports beyond stdlib json/dataclasses/enum/typing. The forbidden-imports allowlist in tests/test_envelope_module_purity.py must continue to pass unchanged.",
+      "Update tests/test_envelope.py: (a) any existing test that builds a blocked envelope without `requires` must be updated to include a valid requires list -- those tests will be red until you fix them; (b) add new tests covering: well-formed parse of each predicate type, missing requires -> MalformedEnvelope, non-list requires -> MalformedEnvelope, empty requires list -> MalformedEnvelope, unknown predicate type -> MalformedEnvelope, missing per-type field -> MalformedEnvelope, wrong-typed per-type field -> MalformedEnvelope, file_exists.present default true, file_exists.present=false accepted, env_var_set with empty name -> MalformedEnvelope, non-blocked intent with stray requires key still parses with requires=().",
+      "Update docs/loop.md 'Iteration envelope' section so the blocked intent contract documents the requires field as mandatory, lists the three predicate shapes inline, and notes that non-blocked intents omit it. Keep prose terse -- one example block per predicate type at most.",
+      "After editing Python, run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify -- treat them as build failures (see CLAUDE.md).",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting verify."
+    ],
+    "non_goals": [
+      "Do not touch src/flywheel/harness.py, src/flywheel/lifecycle.py, the persistence schema, or any store module -- those layers come in later tasks.",
+      "Do not add a fourth predicate type (manual_ack and friends are deferred per the spec's Out of Scope).",
+      "Do not validate command_grader.name against a Task -- the parser is task-unaware by design (FR-3).",
+      "Do not change the envelope fence syntax, intent enum membership, or the existing MissingEnvelope / TruncatedEnvelope / DuplicateEnvelope variants.",
+      "Do not update src/flywheel/prompt.py to render the new predicate types in the envelope contract block -- the contract documentation lives in docs/loop.md and the existing OPENING_FENCE/CLOSING_FENCE notation is sufficient. If the prompt needs updating, that lives with the harness task."
+    ],
+    "edge_cases": [
+      "Duplicate predicate entries (same predicate twice) parse successfully -- no de-dup. The spec calls this out under Edge Cases.",
+      "An intent=blocked envelope whose requires entries are individually well-formed but whose JSON list itself is empty must MalformedEnvelope -- empty would unblock on first recheck.",
+      "A non-blocked envelope that nonetheless includes a syntactically-broken requires field is accepted (we never look at it). Verify the parser does not eagerly validate requires unless intent=blocked.",
+      "ValidEnvelope is a frozen dataclass; a `requires: tuple[...]` default of `()` is correct (no mutable-default trap). Do not use a list."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_envelope.py tests/test_envelope_module_purity.py -v", "name": "envelope-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "uv run python -c \"from flywheel import CommandGraderRequirement, FileExistsRequirement, EnvVarSetRequirement, ValidEnvelope, Intent; v = ValidEnvelope(intent=Intent.BLOCKED, requires=(CommandGraderRequirement(name='x'),)); assert v.requires[0].name == 'x'\"", "name": "api-smoke" },
+    { "type": "command", "run": "grep -qE 'requires' docs/loop.md", "name": "docs-mentions-requires" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|refactor|docs):'", "name": "commit-landed" }
+  ]
+}

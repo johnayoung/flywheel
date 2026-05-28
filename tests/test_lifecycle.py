@@ -168,6 +168,53 @@ def test_interrupted_to_ready() -> None:
     assert lc.status is Status.READY
 
 
+# --- blocked_requires_json centralized clear ------------------------------
+
+
+def test_interrupted_to_ready_clears_blocked_requires_json() -> None:
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.INTERRUPTED,
+        blocked_requires_json='[{"type":"env_var_set","name":"FOO"}]',
+    )
+    lc.transition_to(Status.READY)
+    assert lc.blocked_requires_json is None
+
+
+def test_failed_validation_retry_clears_blocked_requires_json() -> None:
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.FAILED_VALIDATION,
+        error="x",
+        blocked_requires_json='[{"type":"env_var_set","name":"FOO"}]',
+    )
+    lc.transition_to(Status.READY)
+    assert lc.blocked_requires_json is None
+
+
+def test_internal_error_retry_clears_blocked_requires_json() -> None:
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.INTERNAL_ERROR,
+        error="x",
+        blocked_requires_json='[{"type":"env_var_set","name":"FOO"}]',
+    )
+    lc.transition_to(Status.READY)
+    assert lc.blocked_requires_json is None
+
+
+def test_pending_to_ready_clears_blocked_requires_json() -> None:
+    """Entry-time normalization edge — should also drop the snapshot
+    so a never-cleared payload on a fresh lifecycle row cannot survive
+    the very first transition into the active state machine."""
+    lc = Lifecycle(
+        task_id="t",
+        blocked_requires_json='[{"type":"env_var_set","name":"FOO"}]',
+    )
+    lc.transition_to(Status.READY)
+    assert lc.blocked_requires_json is None
+
+
 # --- Illegal transitions ---------------------------------------------------
 
 

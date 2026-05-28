@@ -42,6 +42,8 @@ from flywheel.harness import (
     HarnessStore,
     InvocationRequest,
     InvokeFunc,
+    RecheckOutcome,
+    recheck_blocked_lifecycle,
     run_task,
 )
 from flywheel.invoker import (
@@ -187,6 +189,7 @@ __all__ = [
     "OptimisticConcurrencyError",
     "Outcome",
     "PostgresStore",
+    "RecheckOutcome",
     "RubricGrader",
     "SdkMessageRecord",
     "SdkMessageStore",
@@ -220,6 +223,7 @@ __all__ = [
     "load_task_file",
     "load_tasks_jsonl",
     "parse_envelope",
+    "recheck_blocked_lifecycle",
     "run_command_graders",
     "run_task",
     "run_transcript_graders",

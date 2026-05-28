@@ -10,6 +10,7 @@ state-detection-map branch the MVP handles.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import datetime, timezone
@@ -56,7 +57,9 @@ from flywheel.grader_rubric import (
 from flywheel.harness import finalize_stranded_lifecycle
 from flywheel.envelope import (
     CLOSING_FENCE,
+    CommandGraderRequirement,
     DuplicateEnvelope,
+    EnvVarSetRequirement,
     Intent,
     MalformedEnvelope,
     MissingEnvelope,
@@ -474,16 +477,22 @@ class TestBlockedAndAbort:
             graders=[
                 CommandGrader(
                     run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="full-suite",
                 )
             ],
         )
         lifecycle = Lifecycle(task_id="t1", run_id="run-blocked")
+        requires = (
+            CommandGraderRequirement(name="full-suite"),
+            EnvVarSetRequirement(name="MISSING_KEY"),
+        )
         invoke = _scripted_invoker(
             [
                 _iteration(
                     envelope=ValidEnvelope(
                         intent=Intent.BLOCKED,
                         reason="need API key",
+                        requires=requires,
                     ),
                     messages=(_assistant(),),
                 )
@@ -503,6 +512,69 @@ class TestBlockedAndAbort:
         assert "need API key" in attempt.error
         # No grader rows — validation did not run.
         assert store.list_grader_results(lifecycle.run_id, 1) == []
+        # Structured snapshot persisted on the lifecycle row.
+        expected_requires = [
+            {"type": "command_grader", "name": "full-suite"},
+            {"type": "env_var_set", "name": "MISSING_KEY"},
+        ]
+        assert outcome.lifecycle.blocked_requires_json == json.dumps(
+            expected_requires
+        )
+        # harness.blocked event carries the structured list alongside reason.
+        blocked_events = [
+            e for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.blocked"
+        ]
+        assert len(blocked_events) == 1
+        payload = dict(blocked_events[0].payload)
+        assert payload["reason"] == "need API key"
+        assert payload["requires"] == expected_requires
+
+    def test_blocked_with_unknown_command_grader_routes_through_protocol_failure(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="other",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-bad-blocked")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.BLOCKED,
+                        reason="need help",
+                        requires=(
+                            CommandGraderRequirement(name="not-on-task"),
+                        ),
+                    ),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+        config = HarnessConfig(max_retries=0)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Routed through protocol-failure path: FAILED_VALIDATION terminal
+        # (no retry budget here), AGENT_ERROR outcome, harness.blocked
+        # never emitted, blocked_requires_json never populated.
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.AGENT_ERROR
+        assert "invalid blocked requires" in attempt.error
+        assert outcome.lifecycle.blocked_requires_json is None
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.blocked" not in kinds
+        assert "harness.protocol_failure" in kinds
 
     def test_abort_transitions_to_failed(self) -> None:
         store = InMemoryStore()
@@ -850,6 +922,7 @@ class TestEntryNormalization:
             graders=[
                 CommandGrader(
                     run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
                 )
             ],
         )
@@ -859,7 +932,9 @@ class TestEntryNormalization:
             [
                 _iteration(
                     envelope=ValidEnvelope(
-                        intent=Intent.BLOCKED, reason="need help"
+                        intent=Intent.BLOCKED,
+                        reason="need help",
+                        requires=(CommandGraderRequirement(name="ok"),),
                     ),
                     messages=(_assistant(),),
                 )
@@ -867,6 +942,9 @@ class TestEntryNormalization:
         )
         _run(run_task(task, lifecycle, store, invoke=invoke_first))
         assert lifecycle.status == Status.INTERRUPTED
+        # Per the centralized clearer, the resume drain (INTERRUPTED ->
+        # READY) drops the structured snapshot back to NULL.
+        assert lifecycle.blocked_requires_json is not None
 
         invoke_second = _scripted_invoker(
             [
@@ -879,6 +957,7 @@ class TestEntryNormalization:
         outcome = _run(run_task(task, lifecycle, store, invoke=invoke_second))
 
         assert outcome.lifecycle.status == Status.DONE
+        assert outcome.lifecycle.blocked_requires_json is None
         assert len(outcome.attempts) == 2
 
 

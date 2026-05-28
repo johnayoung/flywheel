@@ -39,6 +39,7 @@ Key rules:
 - `interrupted` always resumes via `ready` and does **not** consume retry budget
 - Transitioning to `failed`, `failed_validation`, or `internal_error` requires the `Error` field to be set
 - Operator interruption (worker SIGINT/SIGTERM, command-grader SIGINT/SIGTERM) routes through `interrupted` so the retry budget is preserved; the attempt's `Outcome` is `internal_error` and a `harness.crash` event records the classification (`worker_interrupted` or `grader_signaled`)
+- `interrupted -> ready` can be driven by three callers: `run_task` entry-time normalization (SIGINT-pause resume), explicit operator promotion, and `flywheel.harness.recheck_blocked_lifecycle` (envelope-blocked recovery once every persisted `requires` predicate is satisfied). Every `-> ready` edge clears `blocked_requires_json` centrally inside `Lifecycle.transition_to`.
 
 ## Lifecycle struct
 

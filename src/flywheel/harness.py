@@ -36,7 +36,9 @@ heuristics.
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -47,8 +49,12 @@ from typing import Any, Protocol, runtime_checkable
 from claude_agent_sdk import AssistantMessage, Message, ResultMessage
 
 from flywheel.envelope import (
+    BlockedRequirement,
+    CommandGraderRequirement,
     DuplicateEnvelope,
+    EnvVarSetRequirement,
     EnvelopeResult,
+    FileExistsRequirement,
     Intent,
     MalformedEnvelope,
     MissingEnvelope,
@@ -78,7 +84,7 @@ from flywheel.store_protocols import (
     EventRecord,
     GraderResultRecord,
 )
-from flywheel.task import RubricGrader, Task, TranscriptGrader
+from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
 
 
 # Loop.md flags these subsystems as TODO. They are intentionally not
@@ -616,6 +622,137 @@ def _signal_killed_grader(
     return None
 
 
+def _serialize_requires(
+    requires: Sequence[BlockedRequirement],
+) -> list[dict[str, Any]]:
+    """Render ``requires`` as a stable, JSON-ready list of dicts.
+
+    Order is preserved. The shape mirrors the parser input shape (each
+    predicate as ``{type, ...fields}``) so a round trip through the
+    persisted ``blocked_requires_json`` column reconstructs identical
+    :class:`BlockedRequirement` instances. This is the single chokepoint
+    for the serialization shape so the harness, the event payload, and
+    recheck-time parsing cannot drift.
+    """
+    out: list[dict[str, Any]] = []
+    for req in requires:
+        if isinstance(req, CommandGraderRequirement):
+            out.append({"type": "command_grader", "name": req.name})
+        elif isinstance(req, FileExistsRequirement):
+            out.append(
+                {
+                    "type": "file_exists",
+                    "path": req.path,
+                    "present": req.present,
+                }
+            )
+        elif isinstance(req, EnvVarSetRequirement):
+            out.append({"type": "env_var_set", "name": req.name})
+    return out
+
+
+def _validate_blocked_requires_against_task(
+    requires: Sequence[BlockedRequirement],
+    task: Task,
+) -> str | None:
+    """Return an error string when any predicate is unresolvable against
+    ``task``; otherwise ``None``.
+
+    Per spec FR-3, the envelope parser cannot validate ``command_grader``
+    predicates in isolation (it has no :class:`Task`). The harness owns
+    that check: a predicate that names a grader missing from
+    ``task.graders`` or present but of the wrong grader type is a
+    protocol failure.
+    """
+    grader_by_name: dict[str, Any] = {}
+    for grader in task.graders:
+        name = getattr(grader, "name", None)
+        if isinstance(name, str) and name:
+            grader_by_name[name] = grader
+    for req in requires:
+        if isinstance(req, CommandGraderRequirement):
+            grader = grader_by_name.get(req.name)
+            if grader is None:
+                return (
+                    f"command_grader predicate references unknown grader "
+                    f"name {req.name!r}"
+                )
+            if not isinstance(grader, CommandGrader):
+                grader_type = getattr(grader, "type", type(grader).__name__)
+                return (
+                    f"command_grader predicate {req.name!r} resolves to a "
+                    f"{grader_type!r} grader, not 'command'"
+                )
+    return None
+
+
+def _parse_blocked_requires_json(
+    payload: str,
+) -> tuple[BlockedRequirement, ...] | str:
+    """Round-trip the persisted ``blocked_requires_json`` back into a
+    typed predicate tuple, or return an error string.
+
+    Reuses :class:`BlockedRequirement` dataclasses so the type contract is
+    identical to the parse-time shape. Defers structural validation to a
+    minimal inline pass (the persisted payload was emitted by the harness
+    itself, so divergence implies data corruption rather than untrusted
+    input).
+    """
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return f"blocked_requires_json is not valid JSON: {exc.msg}"
+    if not isinstance(data, list):
+        return (
+            f"blocked_requires_json must decode to a list, "
+            f"got {type(data).__name__}"
+        )
+    parsed: list[BlockedRequirement] = []
+    for index, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            return (
+                f"blocked_requires_json[{index}] is not a JSON object "
+                f"(got {type(entry).__name__})"
+            )
+        raw_type = entry.get("type")
+        if raw_type == "command_grader":
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                return (
+                    f"blocked_requires_json[{index}] command_grader 'name' "
+                    f"must be a non-empty string"
+                )
+            parsed.append(CommandGraderRequirement(name=name))
+        elif raw_type == "file_exists":
+            path = entry.get("path")
+            if not isinstance(path, str) or not path:
+                return (
+                    f"blocked_requires_json[{index}] file_exists 'path' "
+                    f"must be a non-empty string"
+                )
+            present = entry.get("present", True)
+            if not isinstance(present, bool):
+                return (
+                    f"blocked_requires_json[{index}] file_exists 'present' "
+                    f"must be a bool"
+                )
+            parsed.append(FileExistsRequirement(path=path, present=present))
+        elif raw_type == "env_var_set":
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                return (
+                    f"blocked_requires_json[{index}] env_var_set 'name' "
+                    f"must be a non-empty string"
+                )
+            parsed.append(EnvVarSetRequirement(name=name))
+        else:
+            return (
+                f"blocked_requires_json[{index}] has unknown 'type' "
+                f"{raw_type!r}"
+            )
+    return tuple(parsed)
+
+
 async def run_task(
     task: Task,
     lifecycle: Lifecycle,
@@ -958,7 +1095,60 @@ async def _run_attempt_body(
             return
 
         if envelope.intent == Intent.BLOCKED:
+            # Task-aware validation: the envelope parser cannot see
+            # ``task.graders``, so unresolvable command_grader predicates
+            # surface here. Per spec FR-3 they are protocol failures, not
+            # benign blocks — route through the same shape the parser-side
+            # protocol_failure path uses (no harness.blocked emit).
+            requires_error = _validate_blocked_requires_against_task(
+                envelope.requires, task
+            )
+            if requires_error is not None:
+                protocol_error = (
+                    f"protocol failure: invalid blocked requires: "
+                    f"{requires_error}"
+                )
+                _transition(
+                    lifecycle, Status.VALIDATING, store=store, now=clock
+                )
+                _emit(
+                    store,
+                    run_id=lifecycle.run_id,
+                    kind="harness.protocol_failure",
+                    payload={
+                        "kind": "invalid_blocked_requires",
+                        "reason": requires_error,
+                        "intent": envelope.intent.value,
+                    },
+                    attempt_number=attempt_number,
+                    now=clock,
+                )
+                _finalize_attempt(
+                    store=store,
+                    lifecycle=lifecycle,
+                    attempt=attempt,
+                    outcome=Outcome.AGENT_ERROR,
+                    error=protocol_error,
+                    agent_output=iteration_result.transcript,
+                    clock=clock,
+                )
+                _transition(
+                    lifecycle,
+                    Status.FAILED_VALIDATION,
+                    store=store,
+                    error=protocol_error,
+                    now=clock,
+                )
+                return
+
             reason = envelope.reason or "agent reported blocked intent"
+            requires_payload = _serialize_requires(envelope.requires)
+            # Persist the structured snapshot on the lifecycle row before
+            # the transition so the update_lifecycle write inside
+            # _transition picks up the new field atomically with the
+            # status change. Lifecycle.transition_to clears this field on
+            # every -> READY edge (recheck, retry, normalization).
+            lifecycle.blocked_requires_json = json.dumps(requires_payload)
             _finalize_attempt(
                 store=store,
                 lifecycle=lifecycle,
@@ -972,7 +1162,10 @@ async def _run_attempt_body(
                 store,
                 run_id=lifecycle.run_id,
                 kind="harness.blocked",
-                payload={"reason": reason},
+                payload={
+                    "reason": reason,
+                    "requires": requires_payload,
+                },
                 attempt_number=attempt_number,
                 now=clock,
             )
@@ -1599,12 +1792,244 @@ def finalize_stranded_lifecycle(
     return True
 
 
+@dataclass(frozen=True, kw_only=True)
+class RecheckOutcome:
+    """Return value of :func:`recheck_blocked_lifecycle`.
+
+    ``applied`` is ``True`` only when a transition ``INTERRUPTED -> READY``
+    actually landed on this call. ``reason`` is a short stable token
+    (``"not_blocked"``, ``"dry_run"``, ``"unsatisfied"``, ``"unblocked"``,
+    or ``"parse_error: ..."``) for programmatic consumers. ``per_predicate``
+    mirrors the ``harness.recheck_attempted`` payload entries — one dict
+    per persisted predicate with ``type``, ``identifier``, ``satisfied``,
+    and ``detail``.
+    """
+
+    applied: bool
+    reason: str
+    per_predicate: tuple[dict[str, object], ...]
+
+
+def _evaluate_blocked_predicate(
+    req: BlockedRequirement,
+    grader_by_name: Mapping[str, Any],
+) -> dict[str, object]:
+    """Evaluate one persisted predicate against the worker CWD/env and the
+    supplied grader map. Never raises — OS errors are surfaced via the
+    ``detail`` string with ``satisfied=False``.
+
+    ``command_grader`` predicates resolve the named grader from
+    ``task.graders`` and invoke its ``run`` string with ``subprocess.run``
+    (``shell=True``), inheriting ``os.getcwd()`` / ``os.environ``. Exit
+    code ``0`` means satisfied. We deliberately do **not** call
+    :func:`flywheel.grader_command.run_command_graders` because that path
+    persists a ``grader_results`` row, and per spec FR-5 recheck is a
+    control-plane operation whose audit surface is the event payload.
+    """
+    if isinstance(req, CommandGraderRequirement):
+        grader = grader_by_name.get(req.name)
+        if grader is None or not isinstance(grader, CommandGrader):
+            return {
+                "type": "command_grader",
+                "identifier": req.name,
+                "satisfied": False,
+                "detail": "grader not found",
+            }
+        try:
+            proc = subprocess.run(
+                grader.run,
+                shell=True,
+                cwd=os.getcwd(),
+                env=os.environ.copy(),
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            return {
+                "type": "command_grader",
+                "identifier": req.name,
+                "satisfied": False,
+                "detail": f"subprocess failed to start: {exc}",
+            }
+        satisfied = proc.returncode == 0
+        return {
+            "type": "command_grader",
+            "identifier": req.name,
+            "satisfied": satisfied,
+            "detail": f"exit_code={proc.returncode}",
+        }
+    if isinstance(req, FileExistsRequirement):
+        exists = os.path.exists(req.path)
+        satisfied = exists if req.present else not exists
+        observed = "present" if exists else "absent"
+        expected = "present" if req.present else "absent"
+        detail = (
+            observed if satisfied else f"observed={observed}, expected={expected}"
+        )
+        return {
+            "type": "file_exists",
+            "identifier": req.path,
+            "satisfied": satisfied,
+            "detail": detail,
+        }
+    # env_var_set: non-empty value required.
+    value = os.environ.get(req.name)
+    satisfied = bool(value)
+    detail = "set" if satisfied else "unset_or_empty"
+    return {
+        "type": "env_var_set",
+        "identifier": req.name,
+        "satisfied": satisfied,
+        "detail": detail,
+    }
+
+
+def recheck_blocked_lifecycle(
+    store: HarnessStore,
+    run_id: str,
+    task: Task,
+    *,
+    dry_run: bool = False,
+    now: Callable[[], datetime] | None = None,
+) -> RecheckOutcome:
+    """Re-evaluate a blocked lifecycle's persisted ``requires`` predicates
+    and, when all are satisfied and ``dry_run`` is ``False``, transition
+    ``INTERRUPTED -> READY``.
+
+    Per spec FR-5:
+
+    * loads the lifecycle. If status is not :attr:`Status.INTERRUPTED` or
+      ``blocked_requires_json`` is ``None``, returns a no-event no-op
+      ``RecheckOutcome(applied=False, reason="not_blocked")``;
+    * parses the persisted ``requires`` snapshot, evaluating each
+      predicate against the **caller's** CWD and ``os.environ`` (per the
+      spec the caller owns the sandbox);
+    * emits ``harness.recheck_attempted`` recording per-predicate detail,
+      the aggregate ``all_satisfied`` bit, and the ``dry_run`` flag;
+    * if ``dry_run`` is ``True``, never transitions and never emits
+      ``harness.unblocked``;
+    * if all predicates satisfied, transitions ``INTERRUPTED -> READY``
+      (which clears ``blocked_requires_json`` via the centralized clearer
+      in :meth:`Lifecycle.transition_to`) and emits ``harness.unblocked``.
+
+    ``command_grader`` predicates run their ``run`` string via
+    :func:`subprocess.run` rather than reusing
+    :func:`flywheel.grader_command.run_command_graders`: the latter
+    persists a ``grader_results`` row, but recheck's audit surface is the
+    event payload only (FR-5 Out of Scope).
+
+    Concurrent callers race on ``lifecycle.version`` exactly as the rest
+    of the harness does; the loser surfaces
+    :class:`flywheel.store_protocols.OptimisticConcurrencyError` to its
+    caller — this function does not swallow it.
+    """
+    clock = now or _utcnow
+    lifecycle = store.load_lifecycle(run_id)
+    if lifecycle is None:
+        return RecheckOutcome(
+            applied=False, reason="not_blocked", per_predicate=()
+        )
+    if lifecycle.status != Status.INTERRUPTED:
+        return RecheckOutcome(
+            applied=False, reason="not_blocked", per_predicate=()
+        )
+    if lifecycle.blocked_requires_json is None:
+        return RecheckOutcome(
+            applied=False, reason="not_blocked", per_predicate=()
+        )
+
+    parsed = _parse_blocked_requires_json(lifecycle.blocked_requires_json)
+    if isinstance(parsed, str):
+        per_predicate: tuple[dict[str, object], ...] = (
+            {
+                "type": "parse_error",
+                "identifier": None,
+                "satisfied": False,
+                "detail": parsed,
+            },
+        )
+        _emit(
+            store,
+            run_id=run_id,
+            kind="harness.recheck_attempted",
+            payload={
+                "per_predicate": [dict(p) for p in per_predicate],
+                "all_satisfied": False,
+                "dry_run": dry_run,
+            },
+            now=clock,
+        )
+        return RecheckOutcome(
+            applied=False,
+            reason=f"parse_error: {parsed}",
+            per_predicate=per_predicate,
+        )
+
+    grader_by_name: dict[str, Any] = {}
+    for grader in task.graders:
+        gname = getattr(grader, "name", None)
+        if isinstance(gname, str) and gname:
+            grader_by_name[gname] = grader
+
+    evaluated: list[dict[str, object]] = []
+    for req in parsed:
+        evaluated.append(_evaluate_blocked_predicate(req, grader_by_name))
+    all_satisfied = all(bool(p["satisfied"]) for p in evaluated)
+
+    _emit(
+        store,
+        run_id=run_id,
+        kind="harness.recheck_attempted",
+        payload={
+            "per_predicate": [dict(p) for p in evaluated],
+            "all_satisfied": all_satisfied,
+            "dry_run": dry_run,
+        },
+        now=clock,
+    )
+
+    per_predicate_out: tuple[dict[str, object], ...] = tuple(evaluated)
+
+    if dry_run:
+        return RecheckOutcome(
+            applied=False,
+            reason="dry_run",
+            per_predicate=per_predicate_out,
+        )
+
+    if not all_satisfied:
+        return RecheckOutcome(
+            applied=False,
+            reason="unsatisfied",
+            per_predicate=per_predicate_out,
+        )
+
+    _transition(lifecycle, Status.READY, store=store, now=clock)
+    _emit(
+        store,
+        run_id=run_id,
+        kind="harness.unblocked",
+        payload={
+            "from_status": Status.INTERRUPTED.value,
+            "to_status": Status.READY.value,
+        },
+        now=clock,
+    )
+    return RecheckOutcome(
+        applied=True,
+        reason="unblocked",
+        per_predicate=per_predicate_out,
+    )
+
+
 __all__ = [
     "HarnessConfig",
     "HarnessOutcome",
     "HarnessStore",
     "InvocationRequest",
     "InvokeFunc",
+    "RecheckOutcome",
     "finalize_stranded_lifecycle",
+    "recheck_blocked_lifecycle",
     "run_task",
 ]

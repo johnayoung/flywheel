@@ -130,6 +130,15 @@ class Lifecycle:
             self.error = ""
         elif error:
             self.error = error
+        # Centralized clear: any transition that lands on READY drops the
+        # pending blocked-requires snapshot. This covers the recheck
+        # primitive (interrupted -> ready), failed_validation/internal_error
+        # retries (which inherit the snapshot only if a prior caller set it
+        # outside the harness happy path), and run_task entry-time
+        # normalization for interrupted lifecycles. flywheel.lifecycle stays
+        # pure: the harness writes the JSON, this module only nulls it.
+        if target == Status.READY:
+            self.blocked_requires_json = None
 
     def is_retry_eligible(self, max_retries: int) -> bool:
         return (

@@ -56,6 +56,16 @@ The envelope carries agent intent only; observed state comes from SDK signals pe
 <!-- /LOOP_STATUS -->
 ```
 
+`intent=blocked` MUST additionally carry a non-empty `requires` array describing what would unblock the lifecycle. Non-blocked intents omit `requires`; any payload-level `requires` on `verify`, `continue`, or `abort` is ignored. Three predicate shapes are recognized in v1 (and only these three):
+
+```json
+{"type": "command_grader", "name": "<grader-name>"}
+{"type": "file_exists", "path": "<path>", "present": true}
+{"type": "env_var_set", "name": "<ENV_VAR>"}
+```
+
+`file_exists.present` defaults to `true` when omitted. A blocked envelope without `requires`, with a non-list `requires`, with an empty list, or with an entry of unknown `type` or missing per-type field is a protocol failure.
+
 The envelope is untrusted protocol input. The harness must handle malformed JSON, missing fences, duplicates, truncation, and contradictory claims as first-class cases.
 
 ## Rubric verdict envelope

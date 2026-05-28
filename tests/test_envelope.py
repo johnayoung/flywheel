@@ -3,7 +3,10 @@ import pytest
 from flywheel.envelope import (
     CLOSING_FENCE,
     OPENING_FENCE,
+    CommandGraderRequirement,
     DuplicateEnvelope,
+    EnvVarSetRequirement,
+    FileExistsRequirement,
     Intent,
     MalformedEnvelope,
     MissingEnvelope,
@@ -17,6 +20,11 @@ def _wrap(payload: str) -> str:
     return f"{OPENING_FENCE}\n{payload}\n{CLOSING_FENCE}"
 
 
+_BLOCKED_REQUIRES_JSON = (
+    '"requires": [{"type": "command_grader", "name": "full-suite"}]'
+)
+
+
 class TestValidEnvelopes:
     def test_minimal_envelope_with_only_intent(self) -> None:
         output = _wrap('{"intent": "continue"}')
@@ -24,28 +32,36 @@ class TestValidEnvelopes:
         assert isinstance(result, ValidEnvelope)
         assert result.intent is Intent.CONTINUE
         assert result.reason is None
+        assert result.requires == ()
         assert result.kind == "valid"
 
     def test_envelope_with_intent_and_reason(self) -> None:
-        output = _wrap('{"intent": "blocked", "reason": "needs API key"}')
+        output = _wrap(
+            '{"intent": "blocked", "reason": "needs API key", '
+            + _BLOCKED_REQUIRES_JSON
+            + "}"
+        )
         result = parse_envelope(output)
         assert isinstance(result, ValidEnvelope)
         assert result.intent is Intent.BLOCKED
         assert result.reason == "needs API key"
+        assert len(result.requires) == 1
+        assert isinstance(result.requires[0], CommandGraderRequirement)
+        assert result.requires[0].name == "full-suite"
 
     @pytest.mark.parametrize(
-        "intent_value, expected",
+        "intent_value, expected, extras",
         [
-            ("verify", Intent.VERIFY),
-            ("blocked", Intent.BLOCKED),
-            ("continue", Intent.CONTINUE),
-            ("abort", Intent.ABORT),
+            ("verify", Intent.VERIFY, ""),
+            ("blocked", Intent.BLOCKED, ", " + _BLOCKED_REQUIRES_JSON),
+            ("continue", Intent.CONTINUE, ""),
+            ("abort", Intent.ABORT, ""),
         ],
     )
     def test_each_closed_enum_intent_parses(
-        self, intent_value: str, expected: Intent
+        self, intent_value: str, expected: Intent, extras: str
     ) -> None:
-        output = _wrap(f'{{"intent": "{intent_value}"}}')
+        output = _wrap(f'{{"intent": "{intent_value}"{extras}}}')
         result = parse_envelope(output)
         assert isinstance(result, ValidEnvelope)
         assert result.intent is expected
@@ -153,7 +169,11 @@ class TestMalformedEnvelope:
         assert isinstance(result, MalformedEnvelope)
 
     def test_reason_must_be_string_when_present(self) -> None:
-        output = _wrap('{"intent": "blocked", "reason": 123}')
+        output = _wrap(
+            '{"intent": "blocked", "reason": 123, '
+            + _BLOCKED_REQUIRES_JSON
+            + "}"
+        )
         result = parse_envelope(output)
         assert isinstance(result, MalformedEnvelope)
         assert "reason" in result.reason
@@ -182,9 +202,15 @@ class TestDuplicateEnvelope:
         assert result.count == 2
 
     def test_three_envelopes(self) -> None:
+        blocked_payload = (
+            '{"intent": "blocked", ' + _BLOCKED_REQUIRES_JSON + "}"
+        )
         output = "\n".join(
-            _wrap(f'{{"intent": "{intent}"}}')
-            for intent in ("continue", "verify", "blocked")
+            [
+                _wrap('{"intent": "continue"}'),
+                _wrap('{"intent": "verify"}'),
+                _wrap(blocked_payload),
+            ]
         )
         result = parse_envelope(output)
         assert isinstance(result, DuplicateEnvelope)
@@ -218,3 +244,275 @@ class TestApiContract:
             "continue",
             "abort",
         }
+
+
+class TestBlockedRequires:
+    def test_command_grader_predicate_parses(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "command_grader", "name": "full-suite"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.intent is Intent.BLOCKED
+        assert result.requires == (CommandGraderRequirement(name="full-suite"),)
+
+    def test_file_exists_predicate_parses_with_explicit_present_true(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", '
+            '"path": ".workflow/lkg/.venv", "present": true}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.requires == (
+            FileExistsRequirement(path=".workflow/lkg/.venv", present=True),
+        )
+
+    def test_file_exists_predicate_defaults_present_to_true(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", "path": "/tmp/x"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert len(result.requires) == 1
+        req = result.requires[0]
+        assert isinstance(req, FileExistsRequirement)
+        assert req.path == "/tmp/x"
+        assert req.present is True
+
+    def test_file_exists_predicate_accepts_present_false(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", "path": "/tmp/x", '
+            '"present": false}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        req = result.requires[0]
+        assert isinstance(req, FileExistsRequirement)
+        assert req.present is False
+
+    def test_env_var_set_predicate_parses(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "env_var_set", "name": "ANTHROPIC_API_KEY"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.requires == (
+            EnvVarSetRequirement(name="ANTHROPIC_API_KEY"),
+        )
+
+    def test_multiple_predicates_preserve_order(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": ['
+            '{"type": "command_grader", "name": "full-suite"}, '
+            '{"type": "file_exists", "path": "/tmp/x"}, '
+            '{"type": "env_var_set", "name": "FOO"}'
+            "]}"
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.requires == (
+            CommandGraderRequirement(name="full-suite"),
+            FileExistsRequirement(path="/tmp/x", present=True),
+            EnvVarSetRequirement(name="FOO"),
+        )
+
+    def test_duplicate_predicate_entries_accepted_without_dedup(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": ['
+            '{"type": "file_exists", "path": "/tmp/x"}, '
+            '{"type": "file_exists", "path": "/tmp/x"}'
+            "]}"
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert len(result.requires) == 2
+
+    def test_blocked_envelope_missing_requires_is_malformed(self) -> None:
+        output = _wrap('{"intent": "blocked", "reason": "no requires"}')
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "requires" in result.reason
+
+    def test_blocked_envelope_with_non_list_requires_is_malformed(self) -> None:
+        output = _wrap('{"intent": "blocked", "requires": "full-suite"}')
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "requires" in result.reason
+        assert "list" in result.reason
+
+    def test_blocked_envelope_with_empty_requires_list_is_malformed(self) -> None:
+        output = _wrap('{"intent": "blocked", "requires": []}')
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "requires" in result.reason
+        assert "at least one" in result.reason
+
+    def test_requires_entry_must_be_object_not_string(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": ["full-suite"]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "requires" in result.reason
+
+    def test_requires_entry_missing_type_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": [{"name": "x"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "type" in result.reason
+
+    def test_requires_entry_with_unknown_type_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "manual_ack", "name": "operator"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "type" in result.reason
+        assert "'manual_ack'" in result.reason
+
+    def test_requires_entry_with_non_string_type_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": [{"type": 42}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "type" in result.reason
+
+    def test_command_grader_missing_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": [{"type": "command_grader"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "command_grader" in result.reason
+        assert "name" in result.reason
+
+    def test_command_grader_non_string_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "command_grader", "name": 42}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "command_grader" in result.reason
+        assert "name" in result.reason
+
+    def test_command_grader_empty_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "command_grader", "name": ""}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "command_grader" in result.reason
+        assert "non-empty" in result.reason
+
+    def test_file_exists_missing_path_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": [{"type": "file_exists"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "file_exists" in result.reason
+        assert "path" in result.reason
+
+    def test_file_exists_non_string_path_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", "path": 42}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "file_exists" in result.reason
+        assert "path" in result.reason
+
+    def test_file_exists_empty_path_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", "path": ""}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "file_exists" in result.reason
+
+    def test_file_exists_non_bool_present_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "file_exists", "path": "/tmp/x", '
+            '"present": "yes"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "file_exists" in result.reason
+        assert "present" in result.reason
+
+    def test_env_var_set_missing_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", "requires": [{"type": "env_var_set"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "env_var_set" in result.reason
+        assert "name" in result.reason
+
+    def test_env_var_set_non_string_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "env_var_set", "name": 42}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "env_var_set" in result.reason
+        assert "name" in result.reason
+
+    def test_env_var_set_empty_name_is_malformed(self) -> None:
+        output = _wrap(
+            '{"intent": "blocked", '
+            '"requires": [{"type": "env_var_set", "name": ""}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "env_var_set" in result.reason
+        assert "non-empty" in result.reason
+
+    def test_offending_snippet_present_on_requires_rejection(self) -> None:
+        output = _wrap('{"intent": "blocked", "requires": "not-a-list"}')
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert result.offending is not None
+        assert "not-a-list" in result.offending
+
+    def test_non_blocked_intent_with_stray_requires_still_parses_empty(
+        self,
+    ) -> None:
+        # Non-blocked intents do not consult `requires` at all -- even when the
+        # payload contains a malformed `requires` field, it is treated as an
+        # ignored extra field (mirrors the existing "extra fields accepted"
+        # contract). ValidEnvelope.requires is empty.
+        output = _wrap(
+            '{"intent": "continue", "requires": "this is syntactically broken"}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.intent is Intent.CONTINUE
+        assert result.requires == ()
+
+    def test_non_blocked_intent_with_broken_requires_list_still_parses(
+        self,
+    ) -> None:
+        output = _wrap(
+            '{"intent": "verify", '
+            '"requires": [{"type": "totally_bogus_predicate"}]}'
+        )
+        result = parse_envelope(output)
+        assert isinstance(result, ValidEnvelope)
+        assert result.intent is Intent.VERIFY
+        assert result.requires == ()

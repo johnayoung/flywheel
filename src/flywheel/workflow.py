@@ -248,15 +248,24 @@ def select_next_task(rows: Iterable[TaskStatusRow]) -> TaskStatusRow | None:
 
     A task is eligible when:
 
-    * its state is :attr:`TaskState.FRESH` or :attr:`TaskState.RETRYABLE`,
-      AND
+    * its state is :attr:`TaskState.FRESH`, :attr:`TaskState.RETRYABLE`,
+      or :attr:`TaskState.INTERRUPTED`, AND
     * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`.
 
     Tasks whose prerequisites are missing from the workspace are treated
     as ineligible so a dangling reference never silently runs.
+
+    Interrupted tasks resume because ``run_task`` normalizes an entry-time
+    ``INTERRUPTED`` lifecycle back to ``READY`` (see harness ``run_task``
+    and docs/task-lifecycle.md): the interrupt preserves retry budget and
+    parks the worktree for reuse, it does not require operator unblock.
     """
     by_id: dict[str, TaskStatusRow] = {row.task.id: row for row in rows}
-    eligible_states = (TaskState.FRESH, TaskState.RETRYABLE)
+    eligible_states = (
+        TaskState.FRESH,
+        TaskState.RETRYABLE,
+        TaskState.INTERRUPTED,
+    )
     for row in by_id.values():
         if row.state not in eligible_states:
             continue

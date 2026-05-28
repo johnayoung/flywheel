@@ -78,6 +78,16 @@ def _seed_running(store: SqliteStore, task_id: str) -> Lifecycle:
     return lc
 
 
+def _seed_interrupted(store: SqliteStore, task_id: str) -> Lifecycle:
+    now = datetime.now(timezone.utc)
+    lc = Lifecycle(task_id=task_id, run_id=f"run-{task_id}-interrupted")
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.INTERRUPTED, now=now)
+    store.create_lifecycle(lc)
+    return lc
+
+
 # ---------- Filesystem walking ----------
 
 
@@ -113,7 +123,7 @@ def test_iter_active_task_files_skips_underscore_and_hidden(
 # ---------- Status classification ----------
 
 
-def test_build_status_rows_classifies_fresh_done_failed_running(
+def test_build_status_rows_classifies_fresh_done_failed_running_interrupted(
     tmp_path: Path,
 ) -> None:
     phase = tmp_path / "active" / "01-phase"
@@ -121,12 +131,14 @@ def test_build_status_rows_classifies_fresh_done_failed_running(
     _write_task(phase / "done.json", "done")
     _write_task(phase / "failed.json", "failed")
     _write_task(phase / "running.json", "running")
+    _write_task(phase / "interrupted.json", "interrupted")
 
     store = SqliteStore(":memory:")
     try:
         _seed_done(store, "done")
         _seed_failed(store, "failed")
         _seed_running(store, "running")
+        _seed_interrupted(store, "interrupted")
 
         rows = build_status_rows(tmp_path, store)
         state_by_id = {row.task.id: row.state for row in rows}
@@ -135,6 +147,7 @@ def test_build_status_rows_classifies_fresh_done_failed_running(
             "done": TaskState.DONE,
             "failed": TaskState.RETRYABLE,
             "running": TaskState.IN_PROGRESS,
+            "interrupted": TaskState.INTERRUPTED,
         }
     finally:
         store.close()
@@ -221,6 +234,52 @@ def test_select_next_retries_failed_task(tmp_path: Path) -> None:
         pick = select_next_task(rows)
         assert pick is not None and pick.task.id == "broken"
         assert pick.state == TaskState.RETRYABLE
+    finally:
+        store.close()
+
+
+def test_select_next_resumes_interrupted_task(tmp_path: Path) -> None:
+    """Interrupted tasks are retry-eligible without operator unblock.
+
+    The harness normalizes INTERRUPTED -> READY at entry (see
+    docs/task-lifecycle.md), and the worker reconciles stranded
+    lifecycles to INTERRUPTED on startup. The selector must agree:
+    interrupted tasks block the phase otherwise."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_task(phase / "paused.json", "paused")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_interrupted(store, "paused")
+        rows = build_status_rows(tmp_path, store)
+        pick = select_next_task(rows)
+        assert pick is not None and pick.task.id == "paused"
+        assert pick.state == TaskState.INTERRUPTED
+    finally:
+        store.close()
+
+
+def test_select_next_unblocks_downstream_after_interrupted(
+    tmp_path: Path,
+) -> None:
+    """Interrupted root of a dependency chain must not freeze the phase.
+
+    Regression guard for the symptom that triggered this change: the worker
+    reconciles a SIGTERM'd task to INTERRUPTED, and every downstream task
+    that lists it as a prerequisite would stall forever if INTERRUPTED were
+    treated as ineligible. The selector picks the interrupted root first;
+    downstream only unblocks once that root reaches DONE."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_task(phase / "root.json", "root")
+    _write_task(phase / "leaf.json", "leaf", prerequisites=["root"])
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_interrupted(store, "root")
+        rows = build_status_rows(tmp_path, store)
+        pick = select_next_task(rows)
+        assert pick is not None and pick.task.id == "root"
+        assert pick.state == TaskState.INTERRUPTED
     finally:
         store.close()
 

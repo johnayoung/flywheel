@@ -23,12 +23,22 @@ class RubricGrader:
     assertions: list[str]
     rubric: str | None = None
     name: str | None = None
+    judge_model: str | None = None
+    retry_on_fail: bool = True
     type: Literal["rubric"] = "rubric"
 
     def __post_init__(self) -> None:
         if not isinstance(self.assertions, list) or len(self.assertions) == 0:
             raise ValidationError(
                 "rubric grader requires a non-empty 'assertions' list"
+            )
+        if self.judge_model is not None and not isinstance(self.judge_model, str):
+            raise ValidationError(
+                "rubric grader 'judge_model' must be a string or None"
+            )
+        if not isinstance(self.retry_on_fail, bool):
+            raise ValidationError(
+                "rubric grader 'retry_on_fail' must be a bool"
             )
 
 

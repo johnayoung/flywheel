@@ -126,6 +126,32 @@ def test_rubric_grader_rejects_empty_assertions() -> None:
         RubricGrader(assertions=[])
 
 
+def test_rubric_grader_defaults_judge_model_and_retry_on_fail() -> None:
+    grader = RubricGrader(assertions=["does the thing"])
+    assert grader.judge_model is None
+    assert grader.retry_on_fail is True
+
+
+def test_rubric_grader_round_trips_judge_model_and_retry_on_fail() -> None:
+    grader = RubricGrader(
+        assertions=["does the thing"],
+        judge_model="claude-haiku-4-5",
+        retry_on_fail=False,
+    )
+    assert grader.judge_model == "claude-haiku-4-5"
+    assert grader.retry_on_fail is False
+
+
+def test_rubric_grader_rejects_non_bool_retry_on_fail() -> None:
+    with pytest.raises(ValidationError, match="retry_on_fail"):
+        RubricGrader(assertions=["x"], retry_on_fail="false")  # type: ignore[arg-type]
+
+
+def test_rubric_grader_rejects_non_string_judge_model() -> None:
+    with pytest.raises(ValidationError, match="judge_model"):
+        RubricGrader(assertions=["x"], judge_model=123)  # type: ignore[arg-type]
+
+
 def test_manual_grader_rejects_construction_without_instruction() -> None:
     with pytest.raises(TypeError):
         ManualGrader()  # type: ignore[call-arg]

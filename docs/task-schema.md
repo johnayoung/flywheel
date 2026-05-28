@@ -62,11 +62,13 @@ The general workhorse. Tests, lint, typecheck, build, custom scripts, filesystem
 
 Natural-language assertions evaluated by a separate LLM call against the goal, diff, and execution artifacts. Use for intent-level checks that deterministic commands cannot express.
 
-| Field        | Required | Description                                                  |
-| ------------ | -------- | ------------------------------------------------------------ |
-| `assertions` | yes      | List of natural-language statements; all must be judged true |
-| `rubric`     | no       | Path to a markdown file with extended judging guidance       |
-| `name`       | no       | Short label                                                  |
+| Field           | Required | Description                                                  |
+| --------------- | -------- | ------------------------------------------------------------ |
+| `assertions`    | yes      | List of natural-language statements; all must be judged true |
+| `rubric`        | no       | Path to a markdown file with extended judging guidance       |
+| `name`          | no       | Short label                                                  |
+| `judge_model`   | no       | Override `HarnessConfig.rubric_judge_model` for this grader  |
+| `retry_on_fail` | no       | Default `true`; when `false` a failing verdict routes to `INTERRUPTED` instead of `FAILED_VALIDATION` |
 
 ```json
 {

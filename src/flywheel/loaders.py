@@ -100,6 +100,8 @@ def _build_grader(entry: dict[str, Any], source: str, idx: int) -> Grader:
                 assertions=entry.get("assertions") or [],
                 rubric=entry.get("rubric"),
                 name=name,
+                judge_model=entry.get("judge_model"),
+                retry_on_fail=entry.get("retry_on_fail", True),
             )
         if grader_type == "manual":
             return ManualGrader(

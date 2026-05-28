@@ -282,6 +282,86 @@ def test_load_tasks_jsonl_stream_without_name_uses_stream_label() -> None:
     assert ":1" in str(exc.value)
 
 
+# ---------- rubric grader optional fields ----------
+
+
+def test_load_task_file_parses_rubric_judge_model_and_retry_on_fail(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        **_well_formed(),
+        "graders": [
+            {
+                "type": "rubric",
+                "assertions": ["does the thing"],
+                "judge_model": "claude-haiku-4-5",
+                "retry_on_fail": False,
+            }
+        ],
+    }
+    p = tmp_path / "rubric.json"
+    p.write_text(json.dumps(payload))
+    task = load_task_file(p)
+    grader = task.graders[0]
+    assert isinstance(grader, RubricGrader)
+    assert grader.judge_model == "claude-haiku-4-5"
+    assert grader.retry_on_fail is False
+
+
+def test_load_task_file_rubric_defaults_when_fields_omitted(tmp_path: Path) -> None:
+    payload = {
+        **_well_formed(),
+        "graders": [{"type": "rubric", "assertions": ["does the thing"]}],
+    }
+    p = tmp_path / "rubric-defaults.json"
+    p.write_text(json.dumps(payload))
+    task = load_task_file(p)
+    grader = task.graders[0]
+    assert isinstance(grader, RubricGrader)
+    assert grader.judge_model is None
+    assert grader.retry_on_fail is True
+
+
+def test_load_task_file_rejects_retry_on_fail_string(tmp_path: Path) -> None:
+    payload = {
+        **_well_formed(),
+        "graders": [
+            {
+                "type": "rubric",
+                "assertions": ["does the thing"],
+                "retry_on_fail": "false",
+            }
+        ],
+    }
+    p = tmp_path / "bad-retry.json"
+    p.write_text(json.dumps(payload))
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_file(p)
+    msg = str(exc.value)
+    assert "graders[0]" in msg
+    assert "retry_on_fail" in msg
+
+
+def test_load_task_file_rejects_non_string_judge_model(tmp_path: Path) -> None:
+    payload = {
+        **_well_formed(),
+        "graders": [
+            {
+                "type": "rubric",
+                "assertions": ["does the thing"],
+                "judge_model": 123,
+            }
+        ],
+    }
+    p = tmp_path / "bad-judge-model.json"
+    p.write_text(json.dumps(payload))
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_file(p)
+    msg = str(exc.value)
+    assert "graders[0]" in msg
+    assert "judge_model" in msg
+
+
 # ---------- coexistence with direct construction ----------
 
 

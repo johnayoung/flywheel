@@ -90,6 +90,48 @@ def _seed_interrupted(store: SqliteStore, task_id: str) -> Lifecycle:
     return lc
 
 
+def _seed_blocked(
+    store: SqliteStore,
+    task_id: str,
+    requires_payload: list[dict[str, object]],
+    *,
+    run_id: str | None = None,
+) -> Lifecycle:
+    """Persist an INTERRUPTED lifecycle whose ``blocked_requires_json``
+    captures ``requires_payload`` — the recheck-eligible shape.
+
+    Mirrors what the harness's ``Intent.BLOCKED`` branch writes: status
+    INTERRUPTED + a non-null persisted requires snapshot. Used by the
+    recheck-blocked CLI tests so the scan filter sees them and the
+    primitive has predicates to evaluate.
+    """
+    rid = run_id or f"run-{task_id}-blocked"
+    now = datetime.now(timezone.utc)
+    lc = Lifecycle(task_id=task_id, run_id=rid)
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.INTERRUPTED, now=now)
+    lc.blocked_requires_json = json.dumps(requires_payload)
+    store.create_lifecycle(lc)
+    return lc
+
+
+def _write_blocked_task(path: Path, task_id: str, grader_name: str) -> Path:
+    """Task file with a single command grader the recheck primitive can
+    resolve when a ``command_grader`` predicate references ``grader_name``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "id": task_id,
+        "goal": f"Goal for {task_id}.",
+        "graders": [
+            {"type": "command", "run": "true", "name": grader_name}
+        ],
+    }
+    path.write_text(json.dumps(payload))
+    return path
+
+
 # ---------- Filesystem walking ----------
 
 
@@ -730,3 +772,375 @@ def test_main_recover_empty_prints_placeholder(
     rc = main(["recover", "--db", str(db)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "(no stranded lifecycles)"
+
+
+# ---------- recheck-blocked CLI ----------
+
+
+def test_main_recheck_blocked_empty_store_prints_placeholder(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No blocked lifecycles -> the scan exits cleanly with a clear empty
+    state line, never raises. Covers both 'no lifecycles at all' and
+    'lifecycles exist but none with blocked_requires_json'."""
+    db = tmp_path / "db.sqlite"
+    SqliteStore(db).close()
+    rc = main(
+        [
+            "recheck-blocked",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "(no blocked lifecycles)"
+
+
+def test_main_recheck_blocked_all_satisfied_transitions_and_prints_unblocked(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All predicates satisfied -> recheck applies the transition and the
+    CLI line announces the unblock. The lifecycle is now READY and
+    blocked_requires_json was cleared by the harness."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "task-a.json", "task-a", "full-suite")
+    db = tmp_path / "db.sqlite"
+
+    store = SqliteStore(db)
+    try:
+        seeded = _seed_blocked(
+            store,
+            "task-a",
+            [
+                {"type": "file_exists", "path": "ready.flag", "present": True}
+            ],
+        )
+    finally:
+        store.close()
+
+    # file_exists predicate evaluates against the worker CWD. Make the
+    # path real *in* that CWD so the predicate satisfies.
+    (tmp_path / "ready.flag").write_text("ok")
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(
+        [
+            "recheck-blocked",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    out_lines = [
+        ln for ln in capsys.readouterr().out.splitlines() if ln.strip()
+    ]
+    assert rc == 0
+    assert out_lines == [f"{seeded.run_id}: unblocked"]
+
+    store = SqliteStore(db)
+    try:
+        reloaded = store.load_lifecycle(seeded.run_id)
+    finally:
+        store.close()
+    assert reloaded is not None
+    assert reloaded.status == Status.READY
+    assert reloaded.blocked_requires_json is None
+
+
+def test_main_recheck_blocked_partially_satisfied_reports_still_blocked(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One satisfied + one unsatisfied predicate -> no transition; CLI
+    line names only the misses, not every predicate."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "task-p.json", "task-p", "full-suite")
+    db = tmp_path / "db.sqlite"
+
+    monkeypatch.delenv("RECHECK_CLI_VAR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    store = SqliteStore(db)
+    try:
+        seeded = _seed_blocked(
+            store,
+            "task-p",
+            [
+                {
+                    "type": "file_exists",
+                    "path": "ignored",
+                    "present": False,
+                },
+                {"type": "env_var_set", "name": "RECHECK_CLI_VAR"},
+            ],
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "recheck-blocked",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out.startswith(f"{seeded.run_id}: still blocked (")
+    assert "env_var_set=RECHECK_CLI_VAR" in out
+    # The satisfied predicate must not appear in the "still blocked" list.
+    assert "file_exists=ignored" not in out
+
+    store = SqliteStore(db)
+    try:
+        reloaded = store.load_lifecycle(seeded.run_id)
+    finally:
+        store.close()
+    assert reloaded is not None
+    assert reloaded.status == Status.INTERRUPTED
+    assert reloaded.blocked_requires_json is not None
+
+
+def test_main_recheck_blocked_run_id_targets_one_lifecycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--run-id processes the named lifecycle only; siblings stay
+    interrupted with their persisted requires intact."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "task-a.json", "task-a", "full-suite")
+    _write_blocked_task(phase / "task-b.json", "task-b", "full-suite")
+    db = tmp_path / "db.sqlite"
+
+    (tmp_path / "ready.flag").write_text("ok")
+    monkeypatch.chdir(tmp_path)
+
+    store = SqliteStore(db)
+    try:
+        targeted = _seed_blocked(
+            store,
+            "task-a",
+            [
+                {"type": "file_exists", "path": "ready.flag", "present": True}
+            ],
+            run_id="run-target",
+        )
+        other = _seed_blocked(
+            store,
+            "task-b",
+            [
+                {"type": "file_exists", "path": "ready.flag", "present": True}
+            ],
+            run_id="run-other",
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "recheck-blocked",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+            "--run-id",
+            "run-target",
+        ]
+    )
+    out_lines = [
+        ln for ln in capsys.readouterr().out.splitlines() if ln.strip()
+    ]
+    assert rc == 0
+    assert out_lines == [f"{targeted.run_id}: unblocked"]
+
+    store = SqliteStore(db)
+    try:
+        reloaded_target = store.load_lifecycle(targeted.run_id)
+        reloaded_other = store.load_lifecycle(other.run_id)
+    finally:
+        store.close()
+    assert reloaded_target is not None
+    assert reloaded_target.status == Status.READY
+    assert reloaded_other is not None
+    assert reloaded_other.status == Status.INTERRUPTED
+    assert reloaded_other.blocked_requires_json is not None
+
+
+def test_main_recheck_blocked_dry_run_reports_without_transitioning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--dry-run on an all-satisfied lifecycle prints 'would unblock',
+    leaves status INTERRUPTED, leaves blocked_requires_json intact, and
+    emits harness.recheck_attempted but never harness.unblocked."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "task-d.json", "task-d", "full-suite")
+    db = tmp_path / "db.sqlite"
+
+    (tmp_path / "ready.flag").write_text("ok")
+    monkeypatch.chdir(tmp_path)
+
+    store = SqliteStore(db)
+    try:
+        seeded = _seed_blocked(
+            store,
+            "task-d",
+            [
+                {"type": "file_exists", "path": "ready.flag", "present": True}
+            ],
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "recheck-blocked",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+            "--dry-run",
+        ]
+    )
+    out_lines = [
+        ln for ln in capsys.readouterr().out.splitlines() if ln.strip()
+    ]
+    assert rc == 0
+    assert out_lines == [f"{seeded.run_id}: would unblock"]
+
+    store = SqliteStore(db)
+    try:
+        reloaded = store.load_lifecycle(seeded.run_id)
+        events = [e.kind for e in store.list_events(seeded.run_id)]
+    finally:
+        store.close()
+    assert reloaded is not None
+    assert reloaded.status == Status.INTERRUPTED
+    assert reloaded.blocked_requires_json is not None
+    assert "harness.recheck_attempted" in events
+    assert "harness.unblocked" not in events
+
+
+# ---------- status: blocked_on surface ----------
+
+
+def test_main_status_text_includes_blocked_on_for_blocked_interrupted_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Interrupted row with blocked_requires_json -> text output carries
+    a `blocked_on:` summary listing predicate type=identifier pairs."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "task-s.json", "task-s", "full-suite")
+    db = tmp_path / "db.sqlite"
+
+    store = SqliteStore(db)
+    try:
+        _seed_blocked(
+            store,
+            "task-s",
+            [
+                {"type": "command_grader", "name": "full-suite"},
+                {
+                    "type": "file_exists",
+                    "path": ".workflow/lkg/.venv",
+                    "present": True,
+                },
+            ],
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "status",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "blocked_on:" in out
+    assert "command_grader=full-suite" in out
+    assert "file_exists=.workflow/lkg/.venv" in out
+
+
+def test_main_status_text_omits_blocked_on_for_sigint_interrupted_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SIGINT-paused lifecycle (INTERRUPTED, blocked_requires_json IS
+    NULL) renders cleanly without a blocked_on line."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_task(phase / "task-i.json", "task-i")
+    db = tmp_path / "db.sqlite"
+
+    store = SqliteStore(db)
+    try:
+        _seed_interrupted(store, "task-i")
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "status",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "interrupted" in out
+    assert "blocked_on:" not in out
+
+
+def test_main_status_json_includes_parsed_blocked_requires_when_present(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """JSON mode emits the parsed list (list of dicts) on blocked rows
+    and OMITS the key entirely on rows without a snapshot — null is not a
+    valid sentinel, the key must be absent."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_blocked_task(phase / "blocked.json", "blocked", "full-suite")
+    _write_task(phase / "fresh.json", "fresh")
+    db = tmp_path / "db.sqlite"
+
+    persisted_requires: list[dict[str, object]] = [
+        {"type": "command_grader", "name": "full-suite"},
+        {"type": "env_var_set", "name": "READY"},
+    ]
+    store = SqliteStore(db)
+    try:
+        _seed_blocked(store, "blocked", persisted_requires)
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "status",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    by_id = {row["task_id"]: row for row in payload}
+
+    assert "blocked_requires" in by_id["blocked"]
+    assert by_id["blocked"]["blocked_requires"] == persisted_requires
+    assert "blocked_requires" not in by_id["fresh"]

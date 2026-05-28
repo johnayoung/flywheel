@@ -38,6 +38,8 @@ Subcommands::
     python -m flywheel.workflow is-done TASK_FILE [--db PATH]
     python -m flywheel.workflow archive [--tasks-dir DIR] [--db PATH]
     python -m flywheel.workflow recover [--db PATH]
+    python -m flywheel.workflow recheck-blocked [--tasks-dir DIR] [--db PATH]
+                                                [--run-id ID] [--dry-run]
 """
 
 from __future__ import annotations
@@ -63,7 +65,9 @@ from flywheel.harness import (
     HarnessOutcome,
     InvocationRequest,
     InvokeFunc,
+    RecheckOutcome,
     finalize_stranded_lifecycle,
+    recheck_blocked_lifecycle,
     run_task,
 )
 from flywheel.invoker import IterationResult, invoke_iteration
@@ -92,7 +96,14 @@ class TaskState(str, Enum):
 
 @dataclass(frozen=True, kw_only=True)
 class TaskStatusRow:
-    """Per-task status snapshot used by ``status`` and ``next`` reporting."""
+    """Per-task status snapshot used by ``status`` and ``next`` reporting.
+
+    ``blocked_requires`` carries the raw ``blocked_requires_json`` column
+    value from the latest lifecycle verbatim (no parsing). ``None`` means
+    either the lifecycle never blocked with structured requires, or the
+    lifecycle is in a state where the snapshot was cleared (e.g. resumed
+    READY/RUNNING/DONE). The status surface decodes it lazily.
+    """
 
     task_file: Path
     task: Task
@@ -100,6 +111,7 @@ class TaskStatusRow:
     latest_run_id: str | None
     latest_status: Status | None
     latest_error: str
+    blocked_requires: str | None = None
 
 
 # --- Filesystem walking -----------------------------------------------------
@@ -154,17 +166,20 @@ _ACTIVE_STATUSES: frozenset[Status] = frozenset(
 
 def _latest_lifecycle_row(
     store: SqliteStore, task_id: str
-) -> tuple[str, Status, str] | None:
-    """Return ``(run_id, status, error)`` of the most recent lifecycle for
-    ``task_id``, or ``None`` if no lifecycle exists.
+) -> tuple[str, Status, str, str | None] | None:
+    """Return ``(run_id, status, error, blocked_requires_json)`` of the
+    most recent lifecycle for ``task_id``, or ``None`` if no lifecycle
+    exists.
 
     Uses the SQLite connection directly because no Protocol method exposes
     a by-task-id lookup — and adding one would leak workflow concerns into
-    the store contract.
+    the store contract. ``blocked_requires_json`` is returned verbatim so
+    callers can decide whether to parse it (text status flattens, JSON
+    status emits the decoded list).
     """
     cursor = store._connection.execute(  # noqa: SLF001 — intentional
         """
-        SELECT run_id, status, error
+        SELECT run_id, status, error, blocked_requires_json
         FROM lifecycles
         WHERE task_id = ?
         ORDER BY updated_at DESC, run_id DESC
@@ -175,7 +190,12 @@ def _latest_lifecycle_row(
     row = cursor.fetchone()
     if row is None:
         return None
-    return row["run_id"], Status(row["status"]), row["error"] or ""
+    return (
+        row["run_id"],
+        Status(row["status"]),
+        row["error"] or "",
+        row["blocked_requires_json"],
+    )
 
 
 def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
@@ -197,8 +217,9 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
             latest_run_id=None,
             latest_status=None,
             latest_error="",
+            blocked_requires=None,
         )
-    run_id, status, error = latest
+    run_id, status, error, blocked_requires = latest
 
     if _has_done_lifecycle(store, task.id):
         state = TaskState.DONE
@@ -220,6 +241,7 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
         latest_run_id=run_id,
         latest_status=status,
         latest_error=error,
+        blocked_requires=blocked_requires,
     )
 
 
@@ -238,6 +260,7 @@ def build_status_rows(
                 latest_run_id=snapshot.latest_run_id,
                 latest_status=snapshot.latest_status,
                 latest_error=snapshot.latest_error,
+                blocked_requires=snapshot.blocked_requires,
             )
         )
     return rows
@@ -790,6 +813,78 @@ def _cmd_live(args: argparse.Namespace) -> int:
         return 0
 
 
+def _parse_blocked_requires(payload: str | None) -> list[dict[str, Any]] | None:
+    """Decode ``blocked_requires_json`` into a list of predicate dicts.
+
+    Returns ``None`` when the payload is ``None`` or fails to decode into a
+    list of objects. The status surface treats parse failure the same as
+    "no snapshot" because the harness writes this column itself — any
+    divergence is data corruption, not untrusted input.
+    """
+    if payload is None:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return [entry for entry in data if isinstance(entry, dict)]
+
+
+def _predicate_identifier(predicate: Mapping[str, Any]) -> str:
+    """Map a persisted predicate dict to its primary identifier string.
+
+    Mirrors the keys the harness emits in :func:`_serialize_requires`:
+    ``command_grader`` -> ``name``; ``file_exists`` -> ``path``;
+    ``env_var_set`` -> ``name``. Unknown predicate types fall back to
+    ``"?"`` so the operator surface never crashes on a forward-compat
+    payload.
+    """
+    ptype = predicate.get("type")
+    if ptype == "command_grader" or ptype == "env_var_set":
+        value = predicate.get("name")
+    elif ptype == "file_exists":
+        value = predicate.get("path")
+    else:
+        value = None
+    return str(value) if isinstance(value, str) and value else "?"
+
+
+def _format_blocked_on(predicates: list[dict[str, Any]]) -> str:
+    """Render the persisted requires list as ``type=identifier, ...``."""
+    parts: list[str] = []
+    for pred in predicates:
+        ptype = pred.get("type")
+        type_str = str(ptype) if isinstance(ptype, str) and ptype else "?"
+        parts.append(f"{type_str}={_predicate_identifier(pred)}")
+    return ", ".join(parts)
+
+
+def _format_unsatisfied(
+    per_predicate: tuple[Mapping[str, Any], ...],
+) -> str:
+    """Render the unmet predicates from a ``RecheckOutcome.per_predicate``.
+
+    The recheck primitive emits per-predicate dicts with normalized
+    ``type``/``identifier`` keys (see
+    :func:`flywheel.harness._evaluate_blocked_predicate`), so we can read
+    them directly without re-deriving identifiers per predicate shape.
+    """
+    parts: list[str] = []
+    for pred in per_predicate:
+        if pred.get("satisfied"):
+            continue
+        ptype = pred.get("type")
+        type_str = str(ptype) if isinstance(ptype, str) and ptype else "?"
+        identifier = pred.get("identifier")
+        if isinstance(identifier, str) and identifier:
+            parts.append(f"{type_str}={identifier}")
+        else:
+            parts.append(type_str)
+    return ", ".join(parts)
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)
@@ -800,8 +895,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
     finally:
         store.close()
     if args.json:
-        out = [
-            {
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            entry: dict[str, Any] = {
                 "task_id": row.task.id,
                 "task_file": str(row.task_file),
                 "state": row.state.value,
@@ -812,8 +908,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "latest_error": row.latest_error,
                 "prerequisites": list(row.task.prerequisites),
             }
-            for row in rows
-        ]
+            parsed = _parse_blocked_requires(row.blocked_requires)
+            if parsed is not None:
+                # Spec: omit the key entirely when null; emit the parsed
+                # list (list of dicts) when present.
+                entry["blocked_requires"] = parsed
+            out.append(entry)
         print(json.dumps(out, indent=2))
         return 0
     if not rows:
@@ -829,6 +929,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"  {phase}/{row.task.id:<{width}}  "
             f"{row.state.value:<12}{suffix}"
         )
+        if (
+            row.latest_status == Status.INTERRUPTED
+            and row.blocked_requires is not None
+        ):
+            parsed = _parse_blocked_requires(row.blocked_requires)
+            if parsed:
+                print(f"    blocked_on: {_format_blocked_on(parsed)}")
     return 0
 
 
@@ -842,6 +949,120 @@ def _cmd_is_done(args: argparse.Namespace) -> int:
     finally:
         store.close()
     return 0 if done else 1
+
+
+def _list_blocked_lifecycles(store: SqliteStore) -> list[tuple[str, str]]:
+    """Return ``(run_id, task_id)`` for every recheckable blocked lifecycle.
+
+    Filter mirrors spec FR-7: only ``INTERRUPTED`` rows with a non-NULL
+    ``blocked_requires_json`` qualify — SIGINT-paused lifecycles (which
+    leave the column NULL) are intentionally excluded so they keep using
+    the existing run_task entry-time normalization to resume.
+    """
+    cursor = store._connection.execute(  # noqa: SLF001 — intentional
+        """
+        SELECT run_id, task_id
+        FROM lifecycles
+        WHERE status = ? AND blocked_requires_json IS NOT NULL
+        ORDER BY updated_at
+        """,
+        (Status.INTERRUPTED.value,),
+    )
+    return [(row["run_id"], row["task_id"]) for row in cursor.fetchall()]
+
+
+def _format_recheck_line(
+    run_id: str, outcome: RecheckOutcome, *, dry_run: bool
+) -> str:
+    """Render one CLI line for a single recheck outcome.
+
+    Three cases per spec FR-6:
+
+    * ``applied=True`` (live mode, transitioned) -> ``<run_id>: unblocked``;
+    * ``reason="dry_run"`` with every predicate satisfied -> ``would unblock``;
+    * anything else (``unsatisfied``, ``dry_run`` with misses, ``parse_error``)
+      -> ``still blocked (...)`` with a short summary of unmet predicates.
+
+    The summary is intentionally derived from ``per_predicate`` rather
+    than the persisted requires snapshot so it names only the misses, not
+    every predicate.
+    """
+    if outcome.applied:
+        return f"{run_id}: unblocked"
+    if dry_run and outcome.reason == "dry_run" and all(
+        bool(p.get("satisfied")) for p in outcome.per_predicate
+    ):
+        return f"{run_id}: would unblock"
+    summary = _format_unsatisfied(outcome.per_predicate)
+    if not summary:
+        summary = outcome.reason
+    return f"{run_id}: still blocked ({summary})"
+
+
+def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
+    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    db_path = _resolve_db(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        # Build a task_id -> Task map by walking the active tasks dir.
+        # An archived (or not-yet-active) task whose lifecycle is blocked
+        # in the store is skipped with a stderr warning so a single
+        # missing file does not crash the batch.
+        task_by_id: dict[str, Task] = {}
+        for _path, task in load_active_tasks(tasks_dir):
+            task_by_id[task.id] = task
+
+        if args.run_id:
+            lifecycle = store.load_lifecycle(args.run_id)
+            if lifecycle is None:
+                print(f"{args.run_id}: not found")
+                return 0
+            if (
+                lifecycle.status != Status.INTERRUPTED
+                or lifecycle.blocked_requires_json is None
+            ):
+                print(f"{args.run_id}: not blocked")
+                return 0
+            task = task_by_id.get(lifecycle.task_id)
+            if task is None:
+                print(
+                    f"warning: {args.run_id}: task "
+                    f"{lifecycle.task_id!r} not found in active tasks; "
+                    f"skipping",
+                    file=sys.stderr,
+                )
+                return 0
+            outcome = recheck_blocked_lifecycle(
+                store, args.run_id, task, dry_run=args.dry_run
+            )
+            print(
+                _format_recheck_line(
+                    args.run_id, outcome, dry_run=args.dry_run
+                )
+            )
+            return 0
+
+        targets = _list_blocked_lifecycles(store)
+        if not targets:
+            print("(no blocked lifecycles)")
+            return 0
+        for run_id, task_id in targets:
+            task = task_by_id.get(task_id)
+            if task is None:
+                print(
+                    f"warning: {run_id}: task {task_id!r} not found in "
+                    f"active tasks; skipping",
+                    file=sys.stderr,
+                )
+                continue
+            outcome = recheck_blocked_lifecycle(
+                store, run_id, task, dry_run=args.dry_run
+            )
+            print(_format_recheck_line(run_id, outcome, dry_run=args.dry_run))
+        return 0
+    finally:
+        store.close()
 
 
 def _cmd_recover(args: argparse.Namespace) -> int:
@@ -998,6 +1219,37 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_tasks_dir(p_archive)
     _add_common_db(p_archive)
     p_archive.set_defaults(func=_cmd_archive)
+
+    p_recheck_blocked = sub.add_parser(
+        "recheck-blocked",
+        help=(
+            "Re-evaluate blocked lifecycles' persisted requires and, when "
+            "all predicates are satisfied, transition interrupted -> ready. "
+            "Default scans every blocked lifecycle; --run-id targets one; "
+            "--dry-run reports without transitioning."
+        ),
+    )
+    _add_common_tasks_dir(p_recheck_blocked)
+    _add_common_db(p_recheck_blocked)
+    p_recheck_blocked.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "Target a single lifecycle by run_id; skips the default scan. "
+            "Prints a clear message and exits 0 when the run is missing "
+            "or not blocked."
+        ),
+    )
+    p_recheck_blocked.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Evaluate predicates and report without applying the "
+            "interrupted -> ready transition. Emits harness.recheck_attempted "
+            "for the audit trail; does not emit harness.unblocked."
+        ),
+    )
+    p_recheck_blocked.set_defaults(func=_cmd_recheck_blocked)
 
     p_recover = sub.add_parser(
         "recover",

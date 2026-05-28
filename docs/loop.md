@@ -97,6 +97,8 @@ Per-state dispatch is specified by the **Loop service** column of the detection 
 
 Every harness `EventRecord` and every SDK `Message` observed during an iteration is persisted under a single per-run monotonic sequence; `flywheel.audit` is the canonical replay and live-inspection surface for that stream.
 
+Blocked lifecycles carry their `requires` snapshot on the persisted lifecycle row, and the `flywheel recheck-blocked` CLI subcommand drives `flywheel.harness.recheck_blocked_lifecycle` from outside the loop — by default it scans every `interrupted` lifecycle with a non-null `blocked_requires_json`, evaluates the persisted predicates against the caller's CWD, and applies `interrupted -> ready` for any whose predicates are all satisfied. `--run-id <id>` targets one lifecycle; `--dry-run` reports without transitioning (still emits `harness.recheck_attempted`, never emits `harness.unblocked`). `flywheel status` surfaces the same snapshot as a `blocked_on:` summary on interrupted rows (text) or a `blocked_requires` key on each JSON row.
+
 ## Graders
 
 Triggered when the agent claims `completed`. Driven by the task's `graders` list. Run in cost order; first failure inside a type skips the rest of that type and later types.

@@ -20,6 +20,7 @@ Fixture quirks:
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,14 @@ def _get_postgres_dsn() -> str | None:
     if _PG_CONTAINER_STATE["checked"]:
         return _PG_CONTAINER_STATE.get("dsn")  # type: ignore[return-value]
     _PG_CONTAINER_STATE["checked"] = True
+    # The postgres backend needs the `flywheel[postgres]` extra (psycopg +
+    # psycopg_pool) at runtime. Without it, PostgresStore construction
+    # would raise ImportError mid-test; skip cleanly instead.
+    if importlib.util.find_spec("psycopg") is None:
+        _PG_CONTAINER_STATE["reason"] = (
+            "flywheel[postgres] extra not installed (psycopg missing)"
+        )
+        return None
     try:
         from testcontainers.postgres import PostgresContainer
     except ImportError:

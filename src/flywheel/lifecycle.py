@@ -103,13 +103,24 @@ class Lifecycle:
     artifacts_dir: str = ""
     blocked_requires_json: str | None = None
 
-    def transition_to(
+    def apply_transition(
         self,
         target: Status,
         *,
         error: str = "",
         now: datetime | None = None,
     ) -> None:
+        """Mutate state for one transition WITHOUT bumping ``version``.
+
+        This is the pure state-machine core shared by two callers:
+        :meth:`transition_to` (the legacy in-place path that also bumps
+        ``version``) and :func:`flywheel.events.apply` (the reducer path).
+        Under event sourcing ``version`` is the domain-event offset and is
+        owned by the appending caller, not by an individual transition, so
+        the legality/retry/clear rules live here and the increment lives in
+        the wrapper. flywheel.lifecycle stays pure: the harness writes the
+        blocked-requires JSON, this module only nulls it.
+        """
         allowed = _VALID_EDGES.get(self.status, frozenset())
         if target not in allowed:
             raise LifecycleTransitionError(
@@ -124,7 +135,6 @@ class Lifecycle:
         )
         self.status = target
         self.timestamps[target] = now if now is not None else _utcnow()
-        self.version += 1
         if is_retry_edge:
             self.retries += 1
             self.error = ""
@@ -135,10 +145,19 @@ class Lifecycle:
         # primitive (interrupted -> ready), failed_validation/internal_error
         # retries (which inherit the snapshot only if a prior caller set it
         # outside the harness happy path), and run_task entry-time
-        # normalization for interrupted lifecycles. flywheel.lifecycle stays
-        # pure: the harness writes the JSON, this module only nulls it.
+        # normalization for interrupted lifecycles.
         if target == Status.READY:
             self.blocked_requires_json = None
+
+    def transition_to(
+        self,
+        target: Status,
+        *,
+        error: str = "",
+        now: datetime | None = None,
+    ) -> None:
+        self.apply_transition(target, error=error, now=now)
+        self.version += 1
 
     def replace_from(self, persisted: "Lifecycle") -> None:
         """Overwrite this lifecycle's mutable state from a persisted row.

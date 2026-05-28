@@ -246,7 +246,9 @@ class InMemoryStore:
             self._sdk_message_seq += 1
             sequence = self._next_run_sequence(run_id)
             payload = dict(msg)
-            message_type = str(payload.get("type", ""))
+            message_type = str(
+                payload.get("message_type", payload.get("type", ""))
+            )
             record = SdkMessageRecord(
                 run_id=run_id,
                 attempt_number=attempt_number,

@@ -422,7 +422,9 @@ class SqliteStore:
         persisted: list[SdkMessageRecord] = []
         for msg in messages:
             payload = dict(msg)
-            message_type = str(payload.get("type", ""))
+            message_type = str(
+                payload.get("message_type", payload.get("type", ""))
+            )
             ts = datetime.now(timezone.utc)
             sequence = self._next_run_sequence(run_id)
             cursor = self._connection.execute(

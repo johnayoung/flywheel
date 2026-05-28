@@ -1112,6 +1112,301 @@ class TestFinalizeStranded:
         assert ok is False
 
 
+# --- Audit-stream: SDK message persistence + strict-audit failure --------
+
+
+class _RaisingStore(InMemoryStore):
+    """In-memory store with selectively-raising audit write paths.
+
+    Used by the strict-audit tests to assert the harness routes both
+    ``append_event`` failures and ``save_sdk_messages`` failures through
+    the same ``harness.audit_write_failed`` / ``INTERNAL_ERROR``
+    finalization path. Callers configure which method raises by setting
+    the ``raise_on_append_event`` / ``raise_on_save_sdk_messages``
+    attributes; failures are emitted by the harness via the
+    best-effort secondary emit, which on this store SUCCEEDS by
+    design (so we can assert exactly one audit_write_failed event was
+    recorded).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raise_on_save_sdk_messages: bool = False
+        self.raise_on_append_event_kind: str | None = None
+
+    def save_sdk_messages(
+        self, run_id, attempt_number, iteration_number, messages
+    ):  # type: ignore[override]
+        if self.raise_on_save_sdk_messages:
+            raise RuntimeError("simulated sdk persistence failure")
+        return super().save_sdk_messages(
+            run_id, attempt_number, iteration_number, messages
+        )
+
+    def append_event(self, event):  # type: ignore[override]
+        if (
+            self.raise_on_append_event_kind is not None
+            and event.kind == self.raise_on_append_event_kind
+        ):
+            raise RuntimeError("simulated event persistence failure")
+        return super().append_event(event)
+
+
+class TestSdkMessagePersistence:
+    def test_each_iteration_persists_its_message_batch(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sdk-persist")
+        iter1_msgs: tuple[Message, ...] = (
+            _assistant(text="iter-1-a"),
+        )
+        iter2_msgs: tuple[Message, ...] = (
+            _assistant(text="iter-2-a"),
+            _assistant(text="iter-2-b"),
+            _result_msg(num_turns=2),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=iter1_msgs,
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=iter2_msgs,
+                ),
+            ]
+        )
+        config = HarnessConfig(max_iterations_per_attempt=2)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+        assert outcome.lifecycle.status == Status.DONE
+
+        listed = store.list_sdk_messages(lifecycle.run_id)
+        # All 4 messages across the two iterations, in input order.
+        assert len(listed) == len(iter1_msgs) + len(iter2_msgs)
+        types = [m.message_type for m in listed]
+        assert types == [
+            "AssistantMessage",
+            "AssistantMessage",
+            "AssistantMessage",
+            "ResultMessage",
+        ]
+        # Iteration scoping is preserved.
+        iter1 = [m for m in listed if m.iteration_number == 1]
+        iter2 = [m for m in listed if m.iteration_number == 2]
+        assert len(iter1) == 1
+        assert len(iter2) == 3
+
+    def test_zero_message_iteration_persists_empty_batch(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sdk-empty")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+        # No SDK messages recorded but iteration_completed still fired.
+        assert store.list_sdk_messages(lifecycle.run_id) == []
+        completed = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.iteration_completed"
+        ]
+        assert len(completed) == 1
+
+
+class TestInterleavedAuditSequence:
+    def test_events_and_sdk_messages_share_one_monotonic_run_sequence(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interleaved")
+        messages: tuple[Message, ...] = (
+            _assistant(text="a"),
+            _assistant(text="b"),
+            _result_msg(num_turns=2),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=messages,
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        sdk = store.list_sdk_messages(lifecycle.run_id)
+        all_seqs = [e.sequence for e in events] + [m.sequence for m in sdk]
+        assert all(s is not None for s in all_seqs)
+        # Strictly ascending across both record types.
+        deduped = sorted(set(all_seqs))
+        assert deduped == sorted(all_seqs)
+        assert len(deduped) == len(all_seqs)
+        # The earliest sequence is 1; no gaps.
+        assert deduped == list(range(1, len(deduped) + 1))
+
+
+class TestStrictAuditFailure:
+    def test_save_sdk_messages_failure_finalizes_attempt_as_internal_error(
+        self,
+    ) -> None:
+        store = _RaisingStore()
+        store.raise_on_save_sdk_messages = True
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-sdk-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        # Retries default to 0, so lifecycle ends in FAILED with the
+        # audit error propagated through the retry policy.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert "audit write failed" in outcome.lifecycle.error
+        # Attempt was finalized as INTERNAL_ERROR per spec.
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "audit write failed" in attempt.error
+        # Exactly one harness.audit_write_failed event was emitted, with
+        # the failing_method correctly identifying the broken write path.
+        audit_failures = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.audit_write_failed"
+        ]
+        assert len(audit_failures) == 1
+        payload = audit_failures[0].payload
+        assert payload["failing_method"] == "save_sdk_messages"
+        assert payload["error_type"] == "RuntimeError"
+        assert "simulated sdk persistence failure" in payload["message"]
+        # iteration_number is known at the failure site.
+        assert payload["attempt_number"] == 1
+        assert payload["iteration_number"] == 1
+        # Command grader did NOT run — validation never started.
+        assert store.list_grader_results(lifecycle.run_id, 1) == []
+
+    def test_append_event_failure_finalizes_attempt_as_internal_error(
+        self,
+    ) -> None:
+        store = _RaisingStore()
+        # Fail on the iteration_completed emit so we are clearly past
+        # save_sdk_messages and inside the same iteration's events.
+        store.raise_on_append_event_kind = "harness.iteration_completed"
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-evt-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "audit write failed" in attempt.error
+        audit_failures = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.audit_write_failed"
+        ]
+        assert len(audit_failures) == 1
+        payload = audit_failures[0].payload
+        assert payload["failing_method"] == "append_event"
+        assert payload["error_type"] == "RuntimeError"
+        # The save_sdk_messages call succeeded before the append_event
+        # failure, so the iteration's SDK messages should already be in
+        # the audit trail.
+        assert len(store.list_sdk_messages(lifecycle.run_id)) == 1
+
+
+class TestFinalizeStrandedReceivesSequenceNumbers:
+    def test_finalize_stranded_emits_events_with_assigned_sequences(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id="run-strand-seq")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        store.create_lifecycle(lc)
+        store.save_attempt(
+            lc.run_id,
+            Attempt(number=1, started_at=now, run_id=lc.run_id),
+        )
+
+        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        assert ok is True
+
+        # Every event the stranded-finalize emitted carries a
+        # per-run monotonic sequence assigned by the store.
+        events = store.list_events(lc.run_id)
+        assert len(events) >= 1
+        seqs = [e.sequence for e in events]
+        assert all(s is not None for s in seqs)
+        assert seqs == sorted(seqs)
+        # No collisions.
+        assert len(set(seqs)) == len(seqs)
+
+
 # --- TODO subsystems remain deferred --------------------------------------
 
 

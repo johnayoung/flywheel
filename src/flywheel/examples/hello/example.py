@@ -31,6 +31,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, TextIO
 
+from collections.abc import Mapping, Sequence
+
 from claude_agent_sdk import ClaudeAgentOptions
 
 from flywheel import (
@@ -45,6 +47,7 @@ from flywheel import (
     InvokeFunc,
     IterationResult,
     Lifecycle,
+    SdkMessageRecord,
     SqliteStore,
     Status,
     Task,
@@ -192,6 +195,17 @@ class _EventStreamingStore:
         )
         print(f"event {line}", flush=True)
         return persisted
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[SdkMessageRecord]:
+        return self._wrapped.save_sdk_messages(
+            run_id, attempt_number, iteration_number, messages
+        )
 
     def append_grader_result(
         self, result: GraderResultRecord

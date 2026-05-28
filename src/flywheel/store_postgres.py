@@ -531,7 +531,9 @@ class PostgresStore:
             with conn.cursor() as cur:
                 for msg in messages:
                     payload = dict(msg)
-                    message_type = str(payload.get("type", ""))
+                    message_type = str(
+                        payload.get("message_type", payload.get("type", ""))
+                    )
                     ts = datetime.now(timezone.utc)
                     sequence = self._next_run_sequence(cur, run_id)
                     cur.execute(

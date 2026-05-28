@@ -7,11 +7,13 @@ without depending on the CLI being installed or authenticated.
 """
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
+    HookEventMessage,
     Message,
     ProcessError,
     RateLimitEvent,
@@ -37,6 +39,7 @@ from flywheel.invoker import (
     IterationResult,
     ToolInteraction,
     ToolResultObservation,
+    _serialize_sdk_message,
     invoke_iteration,
 )
 
@@ -435,3 +438,129 @@ class TestInvokerScope:
                     if alias.name == "parse_envelope":
                         delegates = True
         assert delegates, "invoker must import parse_envelope from flywheel.envelope"
+
+
+# --- SDK message capture --------------------------------------------------
+
+
+class TestMessageCapturePreservesOrder:
+    """``IterationResult.messages`` must reproduce the input stream order
+    so the harness can persist a verbatim audit trail.
+    """
+
+    def test_iteration_result_messages_preserve_input_order(self) -> None:
+        rate_event = RateLimitEvent(
+            rate_limit_info=RateLimitInfo(status="allowed"),
+            uuid="rl-1",
+            session_id="sess-1",
+        )
+        hook_event = HookEventMessage(
+            subtype="hook_started",
+            data={"hook_event": "PreToolUse", "raw": "x"},
+            hook_event_name="PreToolUse",
+            session_id="sess-1",
+            uuid="hk-1",
+        )
+        transcript = _wrap_envelope('{"intent": "verify"}')
+        ordered: tuple[Message, ...] = (
+            rate_event,
+            _assistant(TextBlock(text="hello "), stop_reason="tool_use"),
+            _user_with_tool_result("tu-1", content="ok"),
+            hook_event,
+            _assistant(TextBlock(text=transcript), stop_reason="end_turn"),
+            _result(num_turns=2),
+        )
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=_stream(*ordered))
+        )
+        assert result.messages == ordered
+
+
+class TestSerializeSdkMessage:
+    """``_serialize_sdk_message`` produces a JSON-roundtrippable dict that
+    preserves every field of the SDK message and is tagged with
+    ``message_type``.
+    """
+
+    def test_serializes_assistant_message_with_nested_blocks(self) -> None:
+        msg = _assistant(
+            TextBlock(text="hi"),
+            ToolUseBlock(id="tu-1", name="Bash", input={"command": "ls"}),
+        )
+        payload = _serialize_sdk_message(msg)
+        assert payload["message_type"] == "AssistantMessage"
+        assert payload["model"] == "claude-test"
+        assert payload["session_id"] == "sess-1"
+        assert payload["stop_reason"] == "end_turn"
+        # Nested blocks come out as plain dicts.
+        assert payload["content"] == [
+            {"text": "hi"},
+            {"id": "tu-1", "name": "Bash", "input": {"command": "ls"}},
+        ]
+        # JSON-roundtrippable.
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_serializes_user_message_with_tool_result_block(self) -> None:
+        msg = _user_with_tool_result(
+            "tu-1", is_error=False, content="ok"
+        )
+        payload = _serialize_sdk_message(msg)
+        assert payload["message_type"] == "UserMessage"
+        assert payload["content"] == [
+            {"tool_use_id": "tu-1", "content": "ok", "is_error": False}
+        ]
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_serializes_result_message_with_full_body(self) -> None:
+        msg = _result(num_turns=3, total_cost_usd=0.42)
+        payload = _serialize_sdk_message(msg)
+        assert payload["message_type"] == "ResultMessage"
+        assert payload["subtype"] == "success"
+        assert payload["num_turns"] == 3
+        assert payload["total_cost_usd"] == 0.42
+        assert payload["is_error"] is False
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_serializes_rate_limit_event_recursively(self) -> None:
+        info = RateLimitInfo(
+            status="allowed_warning",
+            resets_at=1_700_000_000,
+            rate_limit_type="five_hour",
+            utilization=0.92,
+        )
+        event = RateLimitEvent(
+            rate_limit_info=info, uuid="rl-1", session_id="sess-1"
+        )
+        payload = _serialize_sdk_message(event)
+        assert payload["message_type"] == "RateLimitEvent"
+        assert payload["uuid"] == "rl-1"
+        assert payload["rate_limit_info"]["status"] == "allowed_warning"
+        assert payload["rate_limit_info"]["utilization"] == 0.92
+        assert payload["rate_limit_info"]["resets_at"] == 1_700_000_000
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_serializes_hook_event_message(self) -> None:
+        msg = HookEventMessage(
+            subtype="hook_response",
+            data={"output": "ok", "exit_code": 0},
+            hook_event_name="PostToolUse",
+            session_id="sess-1",
+            uuid="hk-1",
+        )
+        payload = _serialize_sdk_message(msg)
+        assert payload["message_type"] == "HookEventMessage"
+        assert payload["subtype"] == "hook_response"
+        assert payload["data"] == {"output": "ok", "exit_code": 0}
+        assert payload["hook_event_name"] == "PostToolUse"
+        assert json.loads(json.dumps(payload)) == payload
+
+    def test_serializer_never_truncates_large_tool_result_content(
+        self,
+    ) -> None:
+        """Multi-MB tool outputs are persisted verbatim per spec."""
+        big = "x" * (2 * 1024 * 1024)  # 2 MB string
+        msg = _user_with_tool_result("tu-big", content=big)
+        payload = _serialize_sdk_message(msg)
+        assert payload["content"][0]["content"] == big
+        # Size sanity: serialized text contains the full body.
+        assert len(json.dumps(payload)) >= len(big)

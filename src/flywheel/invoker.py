@@ -10,6 +10,7 @@ raw messages.
 Envelope extraction delegates entirely to :func:`flywheel.envelope.parse_envelope`.
 """
 
+import dataclasses
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -295,6 +296,55 @@ async def invoke_iteration(
         signals=signals,
         failure=failure,
     )
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert ``value`` to JSON-compatible primitives.
+
+    Handles dataclasses (via :func:`dataclasses.fields`), lists/tuples,
+    dicts, and primitives. For SDK objects that are neither dataclasses
+    nor primitives, falls back to ``vars(value)`` so new fields appear
+    in the payload automatically without code changes; if even that
+    fails (no ``__dict__``), falls back to ``repr``. Never truncates.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            f.name: _to_jsonable(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+        }
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    try:
+        return {str(k): _to_jsonable(v) for k, v in vars(value).items()}
+    except TypeError:
+        return repr(value)
+
+
+def _serialize_sdk_message(msg: Message) -> dict[str, Any]:
+    """Serialize one ``claude-agent-sdk`` :class:`Message` to a
+    JSON-compatible dict.
+
+    The result includes a top-level ``message_type`` key (the SDK
+    class name like ``"AssistantMessage"``) plus every field of the
+    message body. Nested content blocks (:class:`TextBlock`,
+    :class:`ToolUseBlock`, :class:`ToolResultBlock`, etc.) are
+    serialized recursively as plain dicts via :func:`_to_jsonable`.
+
+    Used by :mod:`flywheel.harness` to feed
+    ``store.save_sdk_messages`` per iteration. Lives here because
+    every SDK :class:`Message` subtype is already imported in this
+    module. The harness re-exports nothing — it imports this helper
+    directly.
+    """
+    body = _to_jsonable(msg)
+    if not isinstance(body, dict):
+        body = {"value": body}
+    body["message_type"] = type(msg).__name__
+    return body
 
 
 __all__ = [

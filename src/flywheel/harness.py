@@ -62,7 +62,11 @@ from flywheel.grader_transcript import (
     run_transcript_graders,
     total_tokens_from_usage,
 )
-from flywheel.invoker import IterationResult, invoke_iteration
+from flywheel.invoker import (
+    IterationResult,
+    _serialize_sdk_message,
+    invoke_iteration,
+)
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.prompt import IterationInputs, build_iteration_prompt
 from flywheel.store_protocols import (
@@ -109,6 +113,14 @@ class HarnessStore(Protocol):
     def list_attempts(self, run_id: str) -> list[Attempt]: ...
 
     def append_event(self, event: EventRecord) -> EventRecord: ...
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[Any]: ...
 
     def append_grader_result(
         self, result: GraderResultRecord
@@ -234,6 +246,35 @@ def _transition(
     store.update_lifecycle(lifecycle, expected_version=expected_version)
 
 
+class _AuditWriteError(Exception):
+    """Sentinel exception raised when an audit-stream write fails.
+
+    Carries the structured detail used to populate the final
+    ``harness.audit_write_failed`` event and the
+    :class:`Attempt`/`:class:`Lifecycle` finalization. The harness catches
+    this exception at the :func:`_run_attempt` boundary; everywhere else
+    it propagates so the caller (e.g. the outer ``run_task`` retry-arm
+    or :func:`finalize_stranded_lifecycle`) can surface the failure.
+    """
+
+    def __init__(
+        self,
+        *,
+        failing_method: str,
+        inner: BaseException,
+        attempt_number: int | None,
+        iteration_number: int | None = None,
+    ) -> None:
+        super().__init__(
+            f"audit write failed via {failing_method}: "
+            f"{type(inner).__name__}: {inner}"
+        )
+        self.failing_method = failing_method
+        self.inner = inner
+        self.attempt_number = attempt_number
+        self.iteration_number = iteration_number
+
+
 def _emit(
     store: HarnessStore,
     *,
@@ -242,17 +283,121 @@ def _emit(
     payload: Mapping[str, Any],
     attempt_number: int | None = None,
     now: Callable[[], datetime] | None = None,
+    best_effort: bool = False,
 ) -> None:
+    """Persist one :class:`EventRecord`.
+
+    On any store-side exception, wraps the underlying error in
+    :class:`_AuditWriteError` and re-raises so the harness can route
+    the failure through the strict-audit policy (FR-5). When
+    ``best_effort=True`` the exception is swallowed instead — used for
+    the final ``harness.audit_write_failed`` emit so the failure path
+    cannot itself loop.
+    """
     clock = now or _utcnow
-    store.append_event(
-        EventRecord(
-            run_id=run_id,
-            ts=clock(),
-            kind=kind,
-            payload=dict(payload),
-            attempt_number=attempt_number,
+    try:
+        store.append_event(
+            EventRecord(
+                run_id=run_id,
+                ts=clock(),
+                kind=kind,
+                payload=dict(payload),
+                attempt_number=attempt_number,
+            )
         )
+    except Exception as exc:
+        if best_effort:
+            return
+        raise _AuditWriteError(
+            failing_method="append_event",
+            inner=exc,
+            attempt_number=attempt_number,
+        ) from exc
+
+
+def _persist_sdk_messages(
+    store: HarnessStore,
+    *,
+    run_id: str,
+    attempt_number: int,
+    iteration_number: int,
+    messages: Sequence[Message],
+) -> None:
+    """Persist every SDK :class:`Message` observed during one iteration.
+
+    Serializes each message via :func:`_serialize_sdk_message` and hands
+    the payload sequence to ``store.save_sdk_messages``. Empty batches
+    are forwarded unchanged so the store can record an
+    iteration-with-no-messages without assigning sequence numbers. On
+    failure raises :class:`_AuditWriteError` carrying the failing method
+    and the attempt/iteration context.
+    """
+    payloads = [_serialize_sdk_message(m) for m in messages]
+    try:
+        store.save_sdk_messages(
+            run_id, attempt_number, iteration_number, payloads
+        )
+    except Exception as exc:
+        raise _AuditWriteError(
+            failing_method="save_sdk_messages",
+            inner=exc,
+            attempt_number=attempt_number,
+            iteration_number=iteration_number,
+        ) from exc
+
+
+def _handle_audit_failure(
+    exc: _AuditWriteError,
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """Best-effort finalization after a strict-audit write failure.
+
+    Emits ``harness.audit_write_failed`` (best-effort — swallows nested
+    failures so the audit path cannot itself loop), finalizes the open
+    attempt as :attr:`Outcome.INTERNAL_ERROR`, and transitions the
+    lifecycle to :attr:`Status.INTERNAL_ERROR`. The outer retry policy
+    then decides whether the run continues or terminates.
+    """
+    error = (
+        f"audit write failed: {type(exc.inner).__name__}: {exc.inner}"
     )
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.audit_write_failed",
+        payload={
+            "failing_method": exc.failing_method,
+            "error_type": type(exc.inner).__name__,
+            "message": str(exc.inner),
+            "attempt_number": exc.attempt_number,
+            "iteration_number": exc.iteration_number,
+        },
+        attempt_number=exc.attempt_number,
+        now=clock,
+        best_effort=True,
+    )
+    if attempt is not None and attempt.ended_at is None:
+        attempt.ended_at = clock()
+        attempt.outcome = Outcome.INTERNAL_ERROR
+        attempt.error = error
+        try:
+            store.save_attempt(lifecycle.run_id, attempt)
+        except Exception:
+            pass
+    try:
+        _transition(
+            lifecycle,
+            Status.INTERNAL_ERROR,
+            store=store,
+            error=error,
+            now=clock,
+        )
+    except Exception:
+        pass
 
 
 def _ensure_attempt_dir(
@@ -489,16 +634,50 @@ async def run_task(
             Status.INTERNAL_ERROR,
         ):
             if lifecycle.is_retry_eligible(config.max_retries):
-                _emit(
-                    store,
-                    run_id=lifecycle.run_id,
-                    kind="harness.retry_scheduled",
-                    payload={
-                        "retries_used": lifecycle.retries,
-                        "max_retries": config.max_retries,
-                    },
-                    now=clock,
-                )
+                try:
+                    _emit(
+                        store,
+                        run_id=lifecycle.run_id,
+                        kind="harness.retry_scheduled",
+                        payload={
+                            "retries_used": lifecycle.retries,
+                            "max_retries": config.max_retries,
+                        },
+                        now=clock,
+                    )
+                except _AuditWriteError as exc:
+                    # No active attempt to finalize between retries; emit
+                    # the audit-failure event best-effort and terminate
+                    # the run as FAILED with the audit error.
+                    audit_error = (
+                        f"audit write failed: "
+                        f"{type(exc.inner).__name__}: {exc.inner}"
+                    )
+                    _emit(
+                        store,
+                        run_id=lifecycle.run_id,
+                        kind="harness.audit_write_failed",
+                        payload={
+                            "failing_method": exc.failing_method,
+                            "error_type": type(exc.inner).__name__,
+                            "message": str(exc.inner),
+                            "attempt_number": exc.attempt_number,
+                            "iteration_number": exc.iteration_number,
+                        },
+                        now=clock,
+                        best_effort=True,
+                    )
+                    try:
+                        _transition(
+                            lifecycle,
+                            Status.FAILED,
+                            store=store,
+                            error=audit_error,
+                            now=clock,
+                        )
+                    except Exception:
+                        pass
+                    break
                 _transition(lifecycle, Status.READY, store=store, now=clock)
                 continue
             terminal_error = (
@@ -546,23 +725,68 @@ async def _run_attempt(
         agent_context=dict(config.agent_context),
     )
     store.save_attempt(lifecycle.run_id, attempt)
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
-        kind="harness.attempt_started",
-        payload={
-            "number": attempt_number,
-            "agent_context": dict(config.agent_context),
-        },
-        attempt_number=attempt_number,
-        now=clock,
-    )
+    try:
+        _emit(
+            store,
+            run_id=lifecycle.run_id,
+            kind="harness.attempt_started",
+            payload={
+                "number": attempt_number,
+                "agent_context": dict(config.agent_context),
+            },
+            attempt_number=attempt_number,
+            now=clock,
+        )
 
-    attempt_dir = _ensure_attempt_dir(config, lifecycle, attempt_number)
-    transcript_graders: tuple[TranscriptGrader, ...] = tuple(
-        g for g in task.graders if isinstance(g, TranscriptGrader)
-    )
+        attempt_dir = _ensure_attempt_dir(config, lifecycle, attempt_number)
+        transcript_graders: tuple[TranscriptGrader, ...] = tuple(
+            g for g in task.graders if isinstance(g, TranscriptGrader)
+        )
 
+        await _run_attempt_body(
+            task=task,
+            lifecycle=lifecycle,
+            store=store,
+            config=config,
+            invoker=invoker,
+            clock=clock,
+            mclock=mclock,
+            attempt=attempt,
+            attempt_dir=attempt_dir,
+            transcript_graders=transcript_graders,
+        )
+    except _AuditWriteError as exc:
+        _handle_audit_failure(
+            exc,
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            clock=clock,
+        )
+
+
+async def _run_attempt_body(
+    *,
+    task: Task,
+    lifecycle: Lifecycle,
+    store: HarnessStore,
+    config: HarnessConfig,
+    invoker: InvokeFunc,
+    clock: Callable[[], datetime],
+    mclock: Callable[[], float],
+    attempt: Attempt,
+    attempt_dir: Path | None,
+    transcript_graders: tuple[TranscriptGrader, ...],
+) -> None:
+    """Inner body of :func:`_run_attempt`, split out so the audit-write
+    sentinel exception can be caught at one boundary.
+
+    Every store-write inside this function (either ``append_event`` via
+    :func:`_emit` or ``save_sdk_messages`` via :func:`_persist_sdk_messages`)
+    raises :class:`_AuditWriteError` on failure; the caller routes that
+    through :func:`_handle_audit_failure`.
+    """
+    attempt_number = attempt.number
     iteration_result, _iterations_run, wall_seconds = await _drive_iterations(
         task=task,
         lifecycle=lifecycle,
@@ -851,6 +1075,14 @@ async def _drive_iterations(
         )
         iteration_result = await invoker(request)
         wall_seconds = mclock() - started_monotonic
+
+        _persist_sdk_messages(
+            store,
+            run_id=lifecycle.run_id,
+            attempt_number=attempt_number,
+            iteration_number=iteration_number,
+            messages=iteration_result.messages,
+        )
 
         _emit(
             store,

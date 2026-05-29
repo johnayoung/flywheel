@@ -184,6 +184,11 @@ class SqliteStore:
         # foreign_keys is per-connection; reaffirm it so a later schema
         # edit cannot silently drop the per-connection guarantee.
         conn.execute("PRAGMA foreign_keys = ON;")
+        # Multi-worker contention: when two workers write the same file
+        # (each its own connection, e.g. competing for task claims), make a
+        # blocked writer wait for the lock instead of erroring immediately
+        # with "database is locked". Per-connection, so set on every open.
+        conn.execute("PRAGMA busy_timeout = 5000;")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
         # Back-compat migration: cf45b58 added blocked_requires_json to

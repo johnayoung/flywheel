@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -290,3 +291,133 @@ def test_stranded_lifecycle_is_recovered_then_task_runs(
     resumable = [r for r in report.runs if r.task_id == "resumable"]
     assert len(resumable) == 1
     assert resumable[0].status is Status.DONE
+
+
+# --- multi-worker coordination (P5) ----------------------------------------
+
+
+def test_held_claim_makes_orchestrator_skip_the_task(tmp_path: Path) -> None:
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "owned")
+    db_path = tmp_path / "flywheel.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # A peer worker holds a live lease on the only task.
+    holder = SqliteStore(db_path)
+    try:
+        claim = holder.acquire_claim(
+            "owned",
+            "other-worker",
+            now=datetime.now(timezone.utc),
+            lease_seconds=3600,
+        )
+        assert claim is not None
+    finally:
+        holder.close()  # the claim row persists in the file
+
+    report = _orchestrate(tmp_path, _always_verify())
+    # The task is claimed by a live peer, so this worker runs nothing.
+    assert report.runs == ()
+
+    # Once the lease is released, a fresh orchestrate run picks it up.
+    releaser = SqliteStore(db_path)
+    try:
+        releaser.release_claim(claim)
+    finally:
+        releaser.close()
+    report2 = _orchestrate(tmp_path, _always_verify())
+    assert [r.task_id for r in report2.runs] == ["owned"]
+    assert report2.runs[0].status is Status.DONE
+
+
+def test_claim_is_released_after_a_run(tmp_path: Path) -> None:
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+    report = _orchestrate(tmp_path, _always_verify())
+    assert [r.task_id for r in report.runs] == ["solo"]
+
+    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    try:
+        assert store.load_claim("solo") is None
+    finally:
+        store.close()
+
+
+def test_two_workers_run_each_task_exactly_once(tmp_path: Path) -> None:
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    task_ids = ["t1", "t2", "t3", "t4"]
+    for tid in task_ids:
+        _write_task(phase, tid)
+    db_path = tmp_path / "flywheel.sqlite"
+
+    async def _slow_verify_invoke(request: InvocationRequest):
+        # A short delay so the two workers overlap and actually contend for
+        # claims rather than serializing by accident.
+        await asyncio.sleep(0.02)
+        return _verify_result()
+
+    results: dict[str, object] = {}
+
+    def _worker(name: str) -> None:
+        results[name] = asyncio.run(
+            orchestrate(
+                tasks_dir=tmp_path / "tasks",
+                db_path=db_path,
+                sandbox_root=tmp_path / "sb" / name,
+                invoke=_slow_verify_invoke,
+                worker_id=name,
+                max_retries=0,
+                max_turns=4,
+                lease_seconds=60,
+                stream=io.StringIO(),
+            )
+        )
+
+    import threading
+
+    threads = [
+        threading.Thread(target=_worker, args=(name,))
+        for name in ("worker-a", "worker-b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert all(not t.is_alive() for t in threads)
+
+    report_a = results["worker-a"]
+    report_b = results["worker-b"]
+    ran_a = {r.task_id for r in report_a.runs}  # type: ignore[attr-defined]
+    ran_b = {r.task_id for r in report_b.runs}  # type: ignore[attr-defined]
+
+    # No task was run by both workers, and together they covered every task.
+    assert ran_a.isdisjoint(ran_b)
+    assert ran_a | ran_b == set(task_ids)
+    all_runs = list(report_a.runs) + list(report_b.runs)  # type: ignore[attr-defined]
+    assert len(all_runs) == len(task_ids)
+    assert all(r.status is Status.DONE for r in all_runs)
+
+
+def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
+    from flywheel.orchestrator import _ClaimHeartbeat
+
+    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    try:
+        start = datetime.now(timezone.utc)
+        claim = store.acquire_claim("t", "w", now=start, lease_seconds=10)
+        assert claim is not None
+        heartbeat = _ClaimHeartbeat(
+            store=store,
+            claim=claim,
+            lease_seconds=10,
+            interval=0.02,
+            now=lambda: datetime.now(timezone.utc),
+        ).start()
+        time.sleep(0.12)  # ~6 renewal ticks
+        latest = heartbeat.stop()
+        assert latest.version > claim.version
+        reloaded = store.load_claim("t")
+        assert reloaded is not None
+        assert reloaded.version >= 2
+    finally:
+        store.close()

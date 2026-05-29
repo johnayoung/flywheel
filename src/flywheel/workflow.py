@@ -608,6 +608,8 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
             model=args.model,
             max_turns=args.max_turns,
             max_retries=args.max_retries,
+            worker_id=args.worker_id,
+            lease_seconds=args.lease_seconds,
         )
     )
     for run_id in report.recovered:
@@ -1263,6 +1265,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             f"Harness retry budget after failed_validation "
             f"(default: {DEFAULT_MAX_RETRIES})."
+        ),
+    )
+    p_orchestrate.add_argument(
+        "--worker-id",
+        default=None,
+        help=(
+            "Stable id for this worker (default: a random per-process id). "
+            "Used for the per-task claim lease that keeps concurrent workers "
+            "from double-running a task."
+        ),
+    )
+    p_orchestrate.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=300.0,
+        help=(
+            "Task-claim lease window in seconds (default: 300). A live lease "
+            "is renewed by a heartbeat while the task runs; a crashed "
+            "worker's lease lapses after this window so the task is "
+            "reclaimable."
         ),
     )
     p_orchestrate.set_defaults(func=_cmd_orchestrate)

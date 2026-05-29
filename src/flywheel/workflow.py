@@ -1132,7 +1132,7 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
-        finalized = recover_stranded_lifecycles(store)
+        finalized = recover_stranded_lifecycles(store, task_id=args.task_id)
     finally:
         store.close()
     if not finalized:
@@ -1381,6 +1381,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_db(p_recover)
+    p_recover.add_argument(
+        "--task-id",
+        default=None,
+        help=(
+            "Only recover stranded lifecycles for this task id. Omit to "
+            "recover every stranded lifecycle in the store."
+        ),
+    )
     p_recover.set_defaults(func=_cmd_recover)
 
     return parser

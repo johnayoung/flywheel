@@ -763,6 +763,38 @@ def test_main_recover_prints_run_ids(
     assert out == [seeded.run_id]
 
 
+def test_main_recover_task_id_finalizes_only_that_task(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The bash worker's reconcile_to_interrupted relies on this CLI flag to
+    # recover exactly one task's stranded lifecycle (siblings running in
+    # other subshells must stay running) via the event-sourced path.
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        a = _seed_running(store, "task-a")
+        b = _seed_running(store, "task-b")
+    finally:
+        store.close()
+    rc = main(["recover", "--db", str(db), "--task-id", "task-a"])
+    assert rc == 0
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out == [a.run_id]
+    store = SqliteStore(db)
+    try:
+        reloaded_a = store.load_lifecycle(a.run_id)
+        reloaded_b = store.load_lifecycle(b.run_id)
+        assert reloaded_a is not None and reloaded_a.status == Status.INTERRUPTED
+        # The interrupted transition was event-sourced: replaying the domain
+        # log reconstructs the same status, so log and projection agree.
+        assert "harness.crash" in [
+            e.kind for e in store.list_events(a.run_id)
+        ]
+        assert reloaded_b is not None and reloaded_b.status == Status.RUNNING
+    finally:
+        store.close()
+
+
 def test_main_recover_empty_prints_placeholder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

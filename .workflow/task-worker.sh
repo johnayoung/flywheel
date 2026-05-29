@@ -365,31 +365,22 @@ read_lifecycle_status() {
 }
 
 reconcile_to_interrupted() {
-  # Direct DB write to transition the most recent lifecycle for $task_id out
-  # of `running`/`validating` and into `interrupted`. Workaround for the
+  # Transition the most recent lifecycle for $task_id out of
+  # `running`/`validating` and into `interrupted`. Workaround for the
   # python harness not catching SIGTERM/SIGKILL -- without this the row sits
   # in `running`, `flywheel.workflow next` won't pick the task up again, and
   # the parked worktree dangles until the retention sweep deletes it
   # (see audit recommendation #3 in .workflow/audits/02-harness-resilience.md).
-  # Both `running -> interrupted` and `validating -> interrupted` are valid
-  # transitions per src/flywheel/lifecycle.py:_VALID_EDGES; INTERRUPTED is not
-  # in _REQUIRES_ERROR, so we omit the error field.
+  #
+  # Routed through `flywheel.workflow recover --task-id`, which uses the
+  # event-sourced finalize_stranded_lifecycle path: it appends the
+  # AttemptFinalized + interrupted domain events and the harness.crash
+  # telemetry. A raw SQL UPDATE here would flip the lifecycle projection
+  # without writing those domain events, permanently diverging the
+  # append-only event log (the source of truth) from the projection -- a
+  # replay would then reconstruct `running`, not `interrupted`.
   local task_id="$1"
-  local now_iso
-  now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00)
-  sqlite3 "$DB_PATH" <<SQL 2>/dev/null || true
-UPDATE lifecycles
-SET status = 'interrupted',
-    version = version + 1,
-    updated_at = '${now_iso}',
-    timestamps_json = json_set(timestamps_json, '\$.interrupted', '${now_iso}')
-WHERE run_id = (
-        SELECT run_id FROM lifecycles
-        WHERE task_id = '${task_id}'
-        ORDER BY updated_at DESC LIMIT 1
-      )
-  AND status IN ('running', 'validating');
-SQL
+  run_workflow recover --db "$DB_PATH" --task-id "$task_id" >/dev/null 2>&1 || true
 }
 
 scrub_worktree_locks() {
@@ -778,16 +769,12 @@ startup_recovery_sweep() {
     2>/dev/null || echo 0)
   [[ "$count" -eq 0 ]] && return 0
   echo "[worker] Recovery: reconciling $count stranded lifecycle(s) to interrupted" >&2
-  local now_iso
-  now_iso=$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00)
-  sqlite3 "$DB_PATH" <<SQL 2>/dev/null || true
-UPDATE lifecycles
-SET status = 'interrupted',
-    version = version + 1,
-    updated_at = '${now_iso}',
-    timestamps_json = json_set(timestamps_json, '\$.interrupted', '${now_iso}')
-WHERE status IN ('running', 'validating');
-SQL
+  # Event-sourced recovery (see reconcile_to_interrupted): `recover` with no
+  # --task-id finalizes every stranded lifecycle through
+  # finalize_stranded_lifecycle so the event log and projection stay in sync.
+  # Safe to recover all here because the single-instance lock is held and no
+  # task subshells have been spawned yet, so nothing is legitimately running.
+  run_workflow recover --db "$DB_PATH" >/dev/null 2>&1 || true
 }
 
 retention_sweep() {

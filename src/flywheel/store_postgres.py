@@ -35,7 +35,9 @@ mapped from the ``ERRCODE = 'check_violation'`` clause on the trigger's
 
 from __future__ import annotations
 
+import logging
 import re
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
@@ -79,9 +81,16 @@ from flywheel.store_protocols import (
     StoreSchemaError,
 )
 
+_LOGGER = logging.getLogger(__name__)
+
 # Page size for ``read_audit_since``; matches the SQLite and in-memory
 # stores so the audit-stream contract behaves identically across backends.
 _AUDIT_PAGE_SIZE: int = 500
+
+# Postgres channel-name limit (NAMEDATALEN - 1). pg_notify rejects a
+# longer channel, and LISTEN silently truncates it, so we refuse a schema
+# whose derived channel would exceed this rather than risk a mismatch.
+_MAX_CHANNEL_BYTES: int = 63
 
 # Bundled as package data so the DDL travels with the install — no
 # reliance on a repo-relative ``docs/`` path that breaks under wheel
@@ -156,6 +165,11 @@ class PostgresStore:
     Bootstrap is idempotent against an already-initialised database.
     """
 
+    # Listener thread cadence: how long each notifies() drain blocks before
+    # re-checking the stop flag, and how long close() waits to join.
+    _LISTEN_POLL_SECONDS: float = 1.0
+    _LISTEN_JOIN_SECONDS: float = 2.0
+
     def __init__(
         self,
         dsn: str,
@@ -164,14 +178,22 @@ class PostgresStore:
         pool_max: int = 10,
         schema: str = "public",
         notifier: RunNotifier | None = None,
+        listen: bool = False,
     ) -> None:
-        # In-process reactivity for same-instance consumers. Cross-process
-        # push (the typical Postgres multi-host case) is a later layer
-        # built on LISTEN/NOTIFY; until then cross-process consumers rely
-        # on the audit follower's bounded poll.
+        # In-process reactivity for same-instance consumers always works.
+        # Cross-process push (the multi-host case) is opt-in via ``listen``:
+        # a dedicated LISTEN connection bridges other instances' committed
+        # writes into this same notifier. Writes always issue NOTIFY, so a
+        # listening consumer on any instance is woken; with no listener the
+        # NOTIFY is simply discarded by Postgres.
         self.notifier: RunNotifier = notifier or RunNotifier()
         self._schema: str = _validate_schema(schema)
         self._schema_ident = sql.Identifier(self._schema)
+        self._dsn = dsn
+        self._channel = self._derive_channel(self._schema)
+        self._listen_stop = threading.Event()
+        self._listen_ready = threading.Event()
+        self._listen_thread: threading.Thread | None = None
         # Eagerly validate connectivity. psycopg.OperationalError bubbles
         # up unchanged from this call -- the message names the host/port
         # so operators see auth/network failures directly.
@@ -189,9 +211,24 @@ class PostgresStore:
         try:
             self._pool.open(wait=True)
             self._bootstrap()
+            if listen:
+                self._start_listener()
         except Exception:
+            self._listen_stop.set()
             self._pool.close()
             raise
+
+    @staticmethod
+    def _derive_channel(schema: str) -> str:
+        """Schema-qualified NOTIFY channel so deployments sharing a database
+        under different schemas do not cross-talk."""
+        channel = f"flywheel_run_{schema}"
+        if len(channel.encode("utf-8")) > _MAX_CHANNEL_BYTES:
+            raise ValueError(
+                f"schema {schema!r} is too long: the derived NOTIFY channel "
+                f"{channel!r} exceeds {_MAX_CHANNEL_BYTES} bytes"
+            )
+        return channel
 
     # --- pool lifecycle ---------------------------------------------------
 
@@ -326,8 +363,94 @@ class PostgresStore:
         assert row is not None
         return int(row[0])
 
+    def _notify_pg(self, cur: Any, run_id: str, sequence: int) -> None:
+        """Queue a cross-process NOTIFY on the write's own transaction.
+
+        Postgres holds the notification until the surrounding transaction
+        commits, so a listener never observes a watermark for an aborted
+        write. The payload is ``"<run_id>:<sequence>"``; the listener splits
+        on the last colon.
+        """
+        cur.execute(
+            "SELECT pg_notify(%s, %s)",
+            (self._channel, f"{run_id}:{sequence}"),
+        )
+
+    def _start_listener(self) -> None:
+        self._listen_thread = threading.Thread(
+            target=self._run_listener,
+            name=f"flywheel-pg-listener-{self._schema}",
+            daemon=True,
+        )
+        self._listen_thread.start()
+
+    def _run_listener(self) -> None:
+        """Bridge committed cross-instance writes into the in-process
+        notifier via a dedicated LISTEN connection.
+
+        Runs on its own autocommit connection (LISTEN must be outside a
+        transaction). Re-checks the stop flag every ``_LISTEN_POLL_SECONDS``
+        between notification drains so ``close()`` cancels promptly. The
+        bridge is best-effort: a connection failure is logged and the
+        consumer degrades to its bounded poll, never hangs.
+        """
+        try:
+            conn = psycopg.connect(self._dsn, autocommit=True)
+        except Exception as exc:  # noqa: BLE001 - degrade to poll
+            _LOGGER.warning(
+                "flywheel listener (%s) failed to connect: %s",
+                self._channel,
+                exc,
+            )
+            self._listen_ready.set()
+            return
+        try:
+            conn.execute(
+                sql.SQL("LISTEN {}").format(sql.Identifier(self._channel))
+            )
+            # Signal readiness only after LISTEN is in effect, so a producer
+            # that coordinates on this never issues a NOTIFY the listener
+            # would miss.
+            self._listen_ready.set()
+            while not self._listen_stop.is_set():
+                try:
+                    for note in conn.notifies(
+                        timeout=self._LISTEN_POLL_SECONDS
+                    ):
+                        self._handle_notify(note.payload)
+                        if self._listen_stop.is_set():
+                            break
+                except Exception as exc:  # noqa: BLE001 - transient
+                    if self._listen_stop.is_set():
+                        break
+                    _LOGGER.warning(
+                        "flywheel listener (%s) error: %s",
+                        self._channel,
+                        exc,
+                    )
+                    self._listen_stop.wait(0.5)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - best effort on shutdown
+                pass
+
+    def _handle_notify(self, payload: str) -> None:
+        run_id, sep, seq_text = payload.rpartition(":")
+        if not sep:
+            return
+        try:
+            sequence = int(seq_text)
+        except ValueError:
+            return
+        self.notifier.notify(run_id, sequence)
+
     def close(self) -> None:
-        """Drain and close the internal pool. Idempotent."""
+        """Stop the listener (if any) and drain the pool. Idempotent."""
+        self._listen_stop.set()
+        thread = self._listen_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self._LISTEN_JOIN_SECONDS)
         self._pool.close()
 
     # --- LifecycleStore ---------------------------------------------------
@@ -693,6 +816,7 @@ class PostgresStore:
                     sequence,
                 ),
             )
+            self._notify_pg(cur, event.run_id, sequence)
         return sequence
 
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
@@ -815,6 +939,7 @@ class PostgresStore:
                     ),
                 )
                 row = cur.fetchone()
+                self._notify_pg(cur, event.run_id, sequence)
         assert row is not None
         self.notifier.notify(event.run_id, sequence)
         return EventRecord(
@@ -894,6 +1019,9 @@ class PostgresStore:
                             id=int(row[0]),
                         )
                     )
+                last = persisted[-1].sequence if persisted else None
+                if last is not None:
+                    self._notify_pg(cur, run_id, last)
         if persisted and persisted[-1].sequence is not None:
             self.notifier.notify(run_id, persisted[-1].sequence)
         return persisted

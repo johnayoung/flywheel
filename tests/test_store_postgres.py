@@ -29,8 +29,10 @@ import pytest
 from flywheel import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
+    EventRecord,
     GraderResultRecord,
     Lifecycle,
+    LifecycleInitialized,
     OptimisticConcurrencyError,
     Status,
     StoreSchemaError,
@@ -680,3 +682,61 @@ def test_opening_v2_postgres_without_blocked_requires_json_adds_column(
         )
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# P3: cross-process LISTEN/NOTIFY bridges committed writes into a consumer's
+# in-process notifier, so a follower on a *different* store instance gets
+# push wakeups instead of relying solely on poll.
+# ---------------------------------------------------------------------------
+
+
+def test_listen_notify_bridges_cross_instance_writes(
+    fresh_schema: str,
+) -> None:
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    _ts = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
+    # Writer does not listen; consumer listens on the same schema/channel.
+    writer = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
+    consumer = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2, listen=True
+    )
+    try:
+        # Wait until LISTEN is actually in effect so the NOTIFY below cannot
+        # be issued before the consumer is subscribed.
+        assert consumer._listen_ready.wait(5.0)
+
+        run_id = "run-pg-listen"
+        writer.append_domain_event(
+            LifecycleInitialized(run_id=run_id, ts=_ts, task_id="t"),
+            expected_version=0,
+        )
+        # The seed alone should already wake the consumer's notifier via the
+        # cross-instance bridge; a telemetry event exercises append_event too.
+        writer.append_event(
+            EventRecord(run_id=run_id, ts=_ts, kind="harness.x")
+        )
+
+        # The consumer never wrote anything, yet its notifier watermark is
+        # advanced by the bridge translating the writer's committed NOTIFYs.
+        watermark = consumer.notifier.wait(run_id, after=0, timeout=5.0)
+        assert watermark >= 1
+    finally:
+        consumer.close()
+        writer.close()
+
+
+def test_close_stops_the_listener_thread(fresh_schema: str) -> None:
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    store = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2, listen=True
+    )
+    assert store._listen_ready.wait(5.0)
+    thread = store._listen_thread
+    assert thread is not None and thread.is_alive()
+    store.close()
+    assert not thread.is_alive()

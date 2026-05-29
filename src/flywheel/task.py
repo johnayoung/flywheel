@@ -112,8 +112,8 @@ class Task:
         if not isinstance(self.goal, str) or not self.goal.strip():
             raise ValidationError("goal must be a non-empty string")
 
-        if not isinstance(self.graders, list) or len(self.graders) == 0:
-            raise ValidationError("graders must contain at least one entry")
+        if not isinstance(self.graders, list):
+            raise ValidationError("graders must be a list")
 
         if self.id in self.prerequisites:
             raise ValidationError(

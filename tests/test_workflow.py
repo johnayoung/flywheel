@@ -15,18 +15,27 @@ from pathlib import Path
 
 import pytest
 
+from flywheel.envelope import Intent, ValidEnvelope
+from flywheel.harness import HarnessOutcome, InvocationRequest
+from flywheel.invoker import InvocationSignals, IterationResult
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel.store_protocols import EventRecord
 from flywheel.store_sqlite import SqliteStore
+from flywheel.task import CommandGrader, RubricGrader, ValidationError
 from flywheel.workflow import (
+    EVENTS_JSON,
+    EVENTS_NONE,
+    EVENTS_PLAIN,
     TaskState,
     archive_completed_phases,
+    build_inline_task,
     build_status_rows,
     collect_live_rows,
     iter_active_phase_dirs,
     iter_active_task_files,
     main,
     recover_stranded_lifecycles,
+    run_task_object,
     select_next_task,
 )
 
@@ -1245,3 +1254,216 @@ def test_run_task_file_records_crash_for_invoke_runtime_error(
         assert crash_count >= 1
     finally:
         store.close()
+
+
+# ---------- run subcommand: inline goal + event streaming ----------
+
+
+def _verify_iteration() -> IterationResult:
+    """An IterationResult whose envelope signals ``intent=verify``.
+
+    Enough to drive ``run_task`` through VALIDATING to a terminal status
+    without a real agent — the same ``invoke`` seam the harness tests use.
+    """
+    return IterationResult(
+        transcript="ok",
+        messages=(),
+        envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+        signals=InvocationSignals(
+            stop_reason="end_turn",
+            num_turns=1,
+            total_cost_usd=0.01,
+            result_is_error=False,
+            result_subtype="success",
+            api_error_status=None,
+            session_id="sess-1",
+        ),
+        failure=None,
+    )
+
+
+async def _verify_invoke(_request: InvocationRequest) -> IterationResult:
+    return _verify_iteration()
+
+
+def test_build_inline_task_is_graderless_by_default() -> None:
+    task = build_inline_task("add retries to the http client")
+    task.validate()
+    assert task.graders == []
+    assert task.goal == "add retries to the http client"
+
+
+def test_build_inline_task_builds_command_and_rubric_graders() -> None:
+    task = build_inline_task(
+        "make it correct",
+        checks=("pytest -q", "ruff check ."),
+        rubric_assertions=("retries on 5xx only",),
+    )
+    types = [type(g).__name__ for g in task.graders]
+    assert types == ["CommandGrader", "CommandGrader", "RubricGrader"]
+    assert isinstance(task.graders[0], CommandGrader)
+    assert task.graders[0].run == "pytest -q"
+    assert isinstance(task.graders[2], RubricGrader)
+    assert task.graders[2].assertions == ["retries on 5xx only"]
+
+
+def test_build_inline_task_rejects_empty_goal() -> None:
+    with pytest.raises(ValidationError, match="goal"):
+        build_inline_task("   ")
+
+
+def test_run_task_object_graderless_reaches_done_and_streams_events(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    task = build_inline_task("do the thing")
+    outcome = asyncio.run(
+        run_task_object(
+            task,
+            db_path=tmp_path / "db.sqlite",
+            sandbox=tmp_path / "sb",
+            invoke=_verify_invoke,
+            events=EVENTS_PLAIN,
+            source="(inline goal)",
+        )
+    )
+    assert outcome.lifecycle.status == Status.DONE
+    captured = capsys.readouterr()
+    # Events stream to stdout as readable lines; diagnostics to stderr.
+    event_lines = [ln for ln in captured.out.splitlines() if ln.strip()]
+    assert event_lines, "expected at least one event line on stdout"
+    assert all("] " in ln for ln in event_lines)
+    assert "harness.attempt_finalized" in captured.out
+    # The unverified-run note lands on stderr, not in the event stream.
+    assert "unverified run" in captured.err
+    assert "unverified run" not in captured.out
+
+
+def test_run_task_object_json_events_are_ndjson(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    task = build_inline_task("do the thing")
+    outcome = asyncio.run(
+        run_task_object(
+            task,
+            db_path=tmp_path / "db.sqlite",
+            sandbox=tmp_path / "sb",
+            invoke=_verify_invoke,
+            events=EVENTS_JSON,
+        )
+    )
+    assert outcome.lifecycle.status == Status.DONE
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
+    assert lines
+    for line in lines:
+        record = json.loads(line)  # every stdout line is valid JSON
+        assert {"run_id", "kind", "ts", "payload"} <= record.keys()
+
+
+def test_run_task_object_quiet_suppresses_event_stream(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    task = build_inline_task("do the thing")
+    asyncio.run(
+        run_task_object(
+            task,
+            db_path=tmp_path / "db.sqlite",
+            sandbox=tmp_path / "sb",
+            invoke=_verify_invoke,
+            events=EVENTS_NONE,
+        )
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""  # nothing on stdout when quiet
+    assert "[workflow] status  : done" in captured.err
+
+
+def test_main_run_inline_goal_dispatches_to_run_task_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``flywheel run "<goal>"`` (non-file target) builds an inline Task
+    and routes it through ``run_task_object``, not ``run_task_file``."""
+    import flywheel.workflow as workflow
+
+    captured: dict[str, object] = {}
+
+    async def _fake_run_task_object(task: object, **kwargs: object) -> object:
+        captured["task"] = task
+        captured["kwargs"] = kwargs
+        lc = Lifecycle(task_id="x", run_id="r")
+        lc.transition_to(Status.READY, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.RUNNING, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.VALIDATING, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.DONE, now=datetime.now(timezone.utc))
+        return HarnessOutcome(lifecycle=lc, attempts=())
+
+    monkeypatch.setattr(workflow, "run_task_object", _fake_run_task_object)
+    rc = main(
+        [
+            "run",
+            "add retries to the http client",
+            "--db",
+            str(tmp_path / "db.sqlite"),
+            "--check",
+            "pytest -q",
+        ]
+    )
+    assert rc == 0
+    task = captured["task"]
+    assert isinstance(task, object)
+    from flywheel.task import Task
+
+    assert isinstance(task, Task)
+    assert task.goal == "add retries to the http client"
+    assert [type(g).__name__ for g in task.graders] == ["CommandGrader"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["source"] == "(inline goal)"
+
+
+def test_main_run_file_dispatches_to_run_task_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing-file target loads as a task file via ``run_task_file``."""
+    import flywheel.workflow as workflow
+
+    task_file = _write_task(tmp_path / "task.json", "probe")
+    seen: dict[str, object] = {}
+
+    async def _fake_run_task_file(path: Path, **kwargs: object) -> object:
+        seen["path"] = path
+        lc = Lifecycle(task_id="probe", run_id="r")
+        lc.transition_to(Status.READY, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.RUNNING, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.VALIDATING, now=datetime.now(timezone.utc))
+        lc.transition_to(Status.DONE, now=datetime.now(timezone.utc))
+        return HarnessOutcome(lifecycle=lc, attempts=())
+
+    monkeypatch.setattr(workflow, "run_task_file", _fake_run_task_file)
+    rc = main(["run", str(task_file), "--db", str(tmp_path / "db.sqlite")])
+    assert rc == 0
+    assert seen["path"] == task_file
+
+
+def test_main_run_rejects_inline_graders_on_task_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--check`` against a task file is an error: the file owns graders."""
+    task_file = _write_task(tmp_path / "task.json", "probe")
+    rc = main(
+        [
+            "run",
+            str(task_file),
+            "--check",
+            "pytest -q",
+            "--db",
+            str(tmp_path / "db.sqlite"),
+        ]
+    )
+    assert rc == 2
+    assert "task file" in capsys.readouterr().err

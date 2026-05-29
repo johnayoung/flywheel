@@ -2,19 +2,19 @@
 
 A task is the unit of work in flywheel. It describes the desired outcome and how to verify it.
 
-The schema is intentionally minimal: two required fields, the rest optional with sensible defaults. The agent plans its own approach — the task states the goal, not the procedure.
+The schema is intentionally minimal: one required field (`goal`), the rest optional with sensible defaults. The agent plans its own approach — the task states the goal, not the procedure.
 
 ## Required fields
 
 | Field     | Type     | Description                                                   |
 | --------- | -------- | ------------------------------------------------------------- |
 | `goal`    | string   | Desired outcome. 1-2 sentences. Must pass the one-sentence diff test. |
-| `graders` | []Grader | Verification checks; all must pass for the task to be done (min 1). |
 
 ## Optional fields
 
 | Field           | Type     | Default   | Description                                |
 | --------------- | -------- | --------- | ------------------------------------------ |
+| `graders`       | []Grader | `[]`      | Verification checks; all must pass for `done`. Empty = unverified run (`done` reflects the agent's own claim, nothing external is checked). |
 | `id`            | string   | `uuid4()` | Unique identifier, no whitespace           |
 | `prerequisites` | []string | `[]`      | Task IDs that must complete first          |
 | `tags`          | []string | `[]`      | Free-form labels for filtering and grouping |
@@ -39,7 +39,7 @@ A bundle of optional briefing fields. Provide none, one, or all. Use these to gi
 
 ## Graders
 
-Each entry in `graders` is a typed object. The `type` field selects which other fields apply. A task is `done` only when every grader passes. Graders are binary — no partial credit, no weights.
+Each entry in `graders` is a typed object. The `type` field selects which other fields apply. A task is `done` only when every grader passes. Graders are binary — no partial credit, no weights. An empty `graders` list reaches `done` vacuously: an unverified run that trusts the agent's claim. Use it for exploratory work; add at least one grader the moment "done" must mean something checkable.
 
 In Python, `Grader` is a discriminated union of `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at construction, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON shape is unchanged: loaders dispatch on `type` to build the right variant.
 
@@ -180,6 +180,6 @@ Two fields. `id` is generated; everything else is omitted.
 
 - **`goal` is the one-sentence diff test.** If the expected change doesn't fit in one sentence, the task is too large — split along architectural layers (migration, model, service, handler) and chain via `prerequisites`.
 - **Prefer `context.relevant` over agent discovery.** Files read is the real context cost.
-- **`graders` defines "done."** If you can't write one, you can't size the task.
+- **`graders` defines "done."** If you can't write one, you can't size the task — drop to an empty `graders` list only for deliberately unverified, exploratory runs.
 - **`context.notes` is the escape hatch, not the default.** Reach for it only when nothing structured fits.
 - **Don't prescribe procedure.** State the outcome; the agent plans the approach.

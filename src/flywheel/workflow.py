@@ -30,9 +30,16 @@ field on each task.
 Subcommands::
 
     python -m flywheel.workflow next [--tasks-dir DIR] [--db PATH]
-    python -m flywheel.workflow run  TASK_FILE [--db PATH] [--sandbox DIR]
+    python -m flywheel.workflow run  GOAL_OR_FILE [--check CMD] [--rubric A]
+                                     [--db PATH] [--sandbox DIR]
                                      [--model MODEL] [--max-retries N]
-                                     [--max-turns N]
+                                     [--max-turns N] [--json | --quiet]
+
+``run`` accepts either an inline goal string or a task-file path; an inline
+goal with no ``--check``/``--rubric`` is an unverified run (DONE reflects the
+agent's own claim). Installed as the ``flywheel`` console script, so
+``flywheel run "<goal>"`` is the zero-config front door. Events stream to
+stdout as they fire (readable by default, NDJSON with ``--json``).
     python -m flywheel.workflow status [--tasks-dir DIR] [--db PATH]
     python -m flywheel.workflow live   [--db PATH] [--watch SECONDS]
     python -m flywheel.workflow is-done TASK_FILE [--db PATH]
@@ -51,7 +58,7 @@ import os
 import shutil
 import sys
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -60,9 +67,11 @@ from typing import Any, TextIO
 
 from claude_agent_sdk import ClaudeAgentOptions
 
+from flywheel.events import DomainEvent
 from flywheel.harness import (
     HarnessConfig,
     HarnessOutcome,
+    HarnessStore,
     InvocationRequest,
     InvokeFunc,
     RecheckOutcome,
@@ -71,10 +80,21 @@ from flywheel.harness import (
     run_task,
 )
 from flywheel.invoker import IterationResult, invoke_iteration
-from flywheel.lifecycle import Lifecycle, Status
+from flywheel.lifecycle import Attempt, Lifecycle, Status
 from flywheel.loaders import TaskLoadError, load_task_file
+from flywheel.store_protocols import (
+    EventRecord,
+    GraderResultRecord,
+    SdkMessageRecord,
+)
 from flywheel.store_sqlite import SqliteStore
-from flywheel.task import Task
+from flywheel.task import (
+    CommandGrader,
+    Grader,
+    RubricGrader,
+    Task,
+    ValidationError,
+)
 
 
 DEFAULT_TASKS_DIR = Path(".workflow/tasks")
@@ -366,6 +386,165 @@ def recover_stranded_lifecycles(
 
 # --- Run subcommand ---------------------------------------------------------
 
+EVENTS_PLAIN = "plain"
+EVENTS_JSON = "json"
+EVENTS_NONE = "none"
+
+
+def _event_payload_summary(payload: Mapping[str, Any], *, limit: int = 100) -> str:
+    """Render a telemetry event's payload as a compact ``k=v`` tail."""
+    if not payload:
+        return ""
+    parts: list[str] = []
+    for key, value in payload.items():
+        text = str(value).replace("\n", " ").replace("\r", " ")
+        if len(text) > 40:
+            text = text[:39] + "…"
+        parts.append(f"{key}={text}")
+    joined = " ".join(parts)
+    if len(joined) > limit:
+        joined = joined[: limit - 1] + "…"
+    return joined
+
+
+def _format_event_line(event: EventRecord) -> str:
+    """One readable line per persisted event for the default ``run`` stream."""
+    attempt = (
+        f" attempt={event.attempt_number}"
+        if event.attempt_number is not None
+        else ""
+    )
+    ts = event.ts.strftime("%H:%M:%S")
+    summary = _event_payload_summary(dict(event.payload))
+    tail = f"  {summary}" if summary else ""
+    return f"[{ts}] {event.kind}{attempt}{tail}"
+
+
+def _event_json_line(event: EventRecord) -> str:
+    """One NDJSON line per persisted event for ``--json`` consumers."""
+    return json.dumps(
+        {
+            "id": event.id,
+            "run_id": event.run_id,
+            "ts": event.ts.isoformat(),
+            "kind": event.kind,
+            "attempt_number": event.attempt_number,
+            "category": event.category,
+            "payload": dict(event.payload),
+        },
+        sort_keys=True,
+    )
+
+
+class _EventStreamingStore:
+    """Wrap a :class:`HarnessStore` and emit each persisted telemetry event.
+
+    Every store call is forwarded verbatim to ``wrapped``; ``append_event``
+    additionally hands the persisted record to ``emit`` so the run is
+    observable live on stdout while the agent works. No authoritative state
+    is owned here — the wrapped backend stays the single source of truth.
+    Mirrors the seam in ``flywheel.examples.hello`` but with a pluggable
+    formatter so ``run`` can offer both readable and JSON output.
+    """
+
+    def __init__(
+        self, wrapped: HarnessStore, *, emit: Callable[[EventRecord], None]
+    ) -> None:
+        self._wrapped = wrapped
+        self._emit = emit
+
+    @property
+    def notifier(self) -> Any:
+        """Expose the wrapped store's notifier so an in-process audit
+        follower sharing this wrapper still gets push wakeups."""
+        return getattr(self._wrapped, "notifier", None)
+
+    def create_lifecycle(self, lifecycle: Lifecycle) -> None:
+        self._wrapped.create_lifecycle(lifecycle)
+
+    def update_lifecycle(
+        self, lifecycle: Lifecycle, *, expected_version: int
+    ) -> None:
+        self._wrapped.update_lifecycle(
+            lifecycle, expected_version=expected_version
+        )
+
+    def load_lifecycle(self, run_id: str) -> Lifecycle | None:
+        return self._wrapped.load_lifecycle(run_id)
+
+    def append_domain_event(
+        self, event: DomainEvent, *, expected_version: int
+    ) -> Lifecycle:
+        return self._wrapped.append_domain_event(
+            event, expected_version=expected_version
+        )
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        return self._wrapped.list_domain_events(run_id)
+
+    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
+        self._wrapped.save_attempt(run_id, attempt)
+
+    def list_attempts(self, run_id: str) -> list[Attempt]:
+        return self._wrapped.list_attempts(run_id)
+
+    def append_event(self, event: EventRecord) -> EventRecord:
+        persisted = self._wrapped.append_event(event)
+        self._emit(persisted)
+        return persisted
+
+    def save_sdk_messages(
+        self,
+        run_id: str,
+        attempt_number: int,
+        iteration_number: int,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> list[SdkMessageRecord]:
+        return self._wrapped.save_sdk_messages(
+            run_id, attempt_number, iteration_number, messages
+        )
+
+    def append_grader_result(
+        self, result: GraderResultRecord
+    ) -> GraderResultRecord:
+        return self._wrapped.append_grader_result(result)
+
+    def list_grader_results(
+        self, run_id: str, attempt_number: int
+    ) -> list[GraderResultRecord]:
+        return self._wrapped.list_grader_results(run_id, attempt_number)
+
+
+def build_inline_task(
+    goal: str,
+    *,
+    checks: Sequence[str] = (),
+    rubric_assertions: Sequence[str] = (),
+    task_id: str | None = None,
+) -> Task:
+    """Build an in-memory :class:`Task` from a goal string and inline graders.
+
+    ``checks`` become :class:`CommandGrader` entries (the strict path);
+    ``rubric_assertions`` collapse into a single :class:`RubricGrader`. With
+    neither, the task is graderless — an unverified run that records DONE on
+    the agent's own claim (see docs/task-schema.md). No file is read or
+    written: this is the direct-construction API the CLI uses for an inline
+    goal.
+    """
+    graders: list[Grader] = [
+        CommandGrader(run=cmd, name=f"check-{index + 1}")
+        for index, cmd in enumerate(checks)
+    ]
+    if rubric_assertions:
+        graders.append(RubricGrader(assertions=list(rubric_assertions)))
+    task = (
+        Task(goal=goal, graders=graders)
+        if task_id is None
+        else Task(id=task_id, goal=goal, graders=graders)
+    )
+    task.validate()
+    return task
+
 
 def _make_claude_code_invoke(
     sandbox: Path,
@@ -393,8 +572,33 @@ def _make_claude_code_invoke(
     return _invoke
 
 
-async def run_task_file(
-    task_file: Path,
+def _make_event_emitter(
+    events: str, *, out: TextIO
+) -> Callable[[EventRecord], None] | None:
+    """Build the per-event stdout printer for ``run_task_object``.
+
+    Returns ``None`` for :data:`EVENTS_NONE` (no wrapping); a readable
+    line-formatter for :data:`EVENTS_PLAIN`; an NDJSON formatter for
+    :data:`EVENTS_JSON`. Events go to ``out`` (stdout) so they stay
+    separable from the ``[workflow]`` diagnostics on stderr.
+    """
+    if events == EVENTS_NONE:
+        return None
+    if events == EVENTS_JSON:
+
+        def emit_json(event: EventRecord) -> None:
+            print(_event_json_line(event), file=out, flush=True)
+
+        return emit_json
+
+    def emit_plain(event: EventRecord) -> None:
+        print(_format_event_line(event), file=out, flush=True)
+
+    return emit_plain
+
+
+async def run_task_object(
+    task: Task,
     *,
     db_path: Path,
     sandbox: Path,
@@ -404,20 +608,31 @@ async def run_task_file(
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
+    events: str = EVENTS_NONE,
+    source: str | None = None,
 ) -> HarnessOutcome:
-    """Load ``task_file``, persist a lifecycle, and drive it via ``run_task``.
+    """Persist a lifecycle for ``task`` and drive it via ``run_task``.
+
+    The Task-first entry point: callers pass a ``Task`` they built however
+    they like (loaded from a file, or constructed inline from a goal), so
+    this owns no input-source assumptions. :func:`run_task_file` is the
+    thin file-loading wrapper over this.
 
     ``invoke`` defaults to a real Claude Code invoker. Tests inject a fake
     callable instead — same seam, different transport.
 
+    ``events`` selects the live stdout stream: :data:`EVENTS_NONE` (silent),
+    :data:`EVENTS_PLAIN` (one readable line per event), or
+    :data:`EVENTS_JSON` (NDJSON). Diagnostics (``[workflow]`` lines) always
+    go to ``stream`` (stderr by default), kept separate from the event
+    stream on stdout.
+
     ``run_id`` selects fresh vs resume: ``None`` (default) starts a new
     lifecycle; passing an existing ``run_id`` makes ``run_task`` resume that
     lifecycle (its seed append hits ``LifecycleAlreadyExistsError`` and the
-    harness reconciles from the persisted row — e.g. continuing a
-    just-unblocked ``READY`` lifecycle on its own history).
+    harness reconciles from the persisted row).
     """
     out = stream if stream is not None else sys.stderr
-    task = load_task_file(task_file)
     lifecycle = (
         Lifecycle(task_id=task.id)
         if run_id is None
@@ -432,6 +647,12 @@ async def run_task_file(
     sandbox.mkdir(parents=True, exist_ok=True)
 
     backend = SqliteStore(db_path)
+    emitter = _make_event_emitter(events, out=sys.stdout)
+    store: HarnessStore = (
+        backend
+        if emitter is None
+        else _EventStreamingStore(backend, emit=emitter)
+    )
     try:
         # Recover any prior lifecycle for this task that was killed
         # mid-attempt before we create a new one. Keeps the audit trail
@@ -452,11 +673,19 @@ async def run_task_file(
             file=out,
             flush=True,
         )
-        print(
-            f"[workflow] file    : {task_file}",
-            file=out,
-            flush=True,
-        )
+        if source is not None:
+            print(
+                f"[workflow] source  : {source}",
+                file=out,
+                flush=True,
+            )
+        if not task.graders:
+            print(
+                "[workflow] graders : none (unverified run — DONE reflects "
+                "the agent's own claim)",
+                file=out,
+                flush=True,
+            )
         print(
             f"[workflow] run_id  : {lifecycle.run_id}",
             file=out,
@@ -466,7 +695,7 @@ async def run_task_file(
             outcome = await run_task(
                 task,
                 lifecycle,
-                backend,
+                store,
                 config=HarnessConfig(
                     max_retries=max_retries,
                     agent_context={
@@ -504,6 +733,42 @@ async def run_task_file(
     finally:
         backend.close()
     return outcome
+
+
+async def run_task_file(
+    task_file: Path,
+    *,
+    db_path: Path,
+    sandbox: Path,
+    model: str | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    invoke: InvokeFunc | None = None,
+    stream: TextIO | None = None,
+    run_id: str | None = None,
+    events: str = EVENTS_NONE,
+) -> HarnessOutcome:
+    """Load ``task_file`` and drive it via :func:`run_task_object`.
+
+    Thin convenience over the Task-first :func:`run_task_object`: all
+    execution behavior (lifecycle persistence, stranded recovery, event
+    streaming, signal handling) lives there. See that function for the
+    ``events`` and ``run_id`` semantics.
+    """
+    task = load_task_file(task_file)
+    return await run_task_object(
+        task,
+        db_path=db_path,
+        sandbox=sandbox,
+        model=model,
+        max_turns=max_turns,
+        max_retries=max_retries,
+        invoke=invoke,
+        stream=stream,
+        run_id=run_id,
+        events=events,
+        source=str(task_file),
+    )
 
 
 # --- Archive subcommand -----------------------------------------------------
@@ -571,18 +836,64 @@ def _cmd_next(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_events_mode(args: argparse.Namespace) -> str:
+    """Map ``run`` output flags to an events mode (default: readable)."""
+    if getattr(args, "quiet", False):
+        return EVENTS_NONE
+    if getattr(args, "json", False):
+        return EVENTS_JSON
+    return EVENTS_PLAIN
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    task_file = Path(args.task_file)
     db_path = _resolve_db(args.db)
     sandbox = Path(args.sandbox) if args.sandbox else Path.cwd()
+    events = _resolve_events_mode(args)
+    target = args.target
+    inline_graders = bool(args.check) or bool(args.rubric)
+
+    # File vs inline goal: an existing file is loaded as a task (which
+    # carries its own graders); anything else is treated as an inline goal.
+    if Path(target).is_file():
+        if inline_graders:
+            print(
+                "error: --check/--rubric apply to an inline goal; a task "
+                "file declares its own graders",
+                file=sys.stderr,
+            )
+            return 2
+        outcome = asyncio.run(
+            run_task_file(
+                Path(target),
+                db_path=db_path,
+                sandbox=sandbox,
+                model=args.model,
+                max_turns=args.max_turns,
+                max_retries=args.max_retries,
+                events=events,
+            )
+        )
+        return 0 if outcome.lifecycle.status == Status.DONE else 1
+
+    try:
+        task = build_inline_task(
+            target,
+            checks=tuple(args.check or ()),
+            rubric_assertions=tuple(args.rubric or ()),
+        )
+    except ValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     outcome = asyncio.run(
-        run_task_file(
-            task_file,
+        run_task_object(
+            task,
             db_path=db_path,
             sandbox=sandbox,
             model=args.model,
             max_turns=args.max_turns,
             max_retries=args.max_retries,
+            events=events,
+            source="(inline goal)",
         )
     )
     return 0 if outcome.lifecycle.status == Status.DONE else 1
@@ -1201,11 +1512,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser(
         "run",
         help=(
-            "Execute one task via flywheel.run_task; exit 0 only on DONE."
+            "Run a goal or task file via flywheel.run_task, streaming events "
+            "to stdout; exit 0 only on DONE."
+        ),
+        description=(
+            "TARGET is either an inline goal string (e.g. "
+            "'add retries to the http client') or a path to a task JSON "
+            "file. An inline goal with no --check/--rubric runs unverified: "
+            "it records DONE on the agent's own claim. Events stream to "
+            "stdout as they fire."
         ),
     )
-    p_run.add_argument("task_file", help="Path to a flywheel task JSON file.")
+    p_run.add_argument(
+        "target",
+        metavar="GOAL_OR_FILE",
+        help="Inline goal string, or path to a flywheel task JSON file.",
+    )
     _add_common_db(p_run)
+    p_run.add_argument(
+        "--check",
+        action="append",
+        default=None,
+        metavar="CMD",
+        help=(
+            "Add a command grader (pass=exit 0) for an inline goal. "
+            "Repeatable. Ignored for a task file."
+        ),
+    )
+    p_run.add_argument(
+        "--rubric",
+        action="append",
+        default=None,
+        metavar="ASSERTION",
+        help=(
+            "Add a natural-language rubric assertion for an inline goal "
+            "(LLM-judged). Repeatable. Ignored for a task file."
+        ),
+    )
     p_run.add_argument(
         "--sandbox",
         default=None,
@@ -1230,6 +1573,17 @@ def _build_parser() -> argparse.ArgumentParser:
             f"Harness retry budget after failed_validation "
             f"(default: {DEFAULT_MAX_RETRIES})."
         ),
+    )
+    p_run_events = p_run.add_mutually_exclusive_group()
+    p_run_events.add_argument(
+        "--json",
+        action="store_true",
+        help="Stream events as NDJSON instead of readable lines.",
+    )
+    p_run_events.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress the event stream; print only the final status.",
     )
     p_run.set_defaults(func=_cmd_run)
 
@@ -1423,6 +1777,7 @@ __all__ = [
     "TaskState",
     "TaskStatusRow",
     "archive_completed_phases",
+    "build_inline_task",
     "build_status_rows",
     "collect_live_rows",
     "iter_active_phase_dirs",
@@ -1431,6 +1786,7 @@ __all__ = [
     "main",
     "recover_stranded_lifecycles",
     "run_task_file",
+    "run_task_object",
     "select_next_task",
     "task_state",
 ]

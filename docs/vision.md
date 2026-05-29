@@ -119,7 +119,7 @@ The envelope schema, the agent-reported status enum, and the per-status harness 
 
 When the agent claims `completed`, the loop does not trust the claim. It runs the task's `graders`, defined in the [task schema](task-schema.md). A `validation_failed` outcome records that verification disproved the completion claim. It does not, by itself, decide what happens next. The controller applies policy to decide whether to retry, escalate, or terminate. That distinction matters: verification outcome and retry policy are not the same thing.
 
-Each grader is a typed object: `command`, `rubric`, `manual`, or `transcript`. All graders must pass for the task to reach `done`. The harness runs them cost-cheapest-first so deterministic failures abort before any LLM or human cost is incurred.
+Each grader is a typed object: `command`, `rubric`, `manual`, or `transcript`. All graders must pass for the task to reach `done`. The harness runs them cost-cheapest-first so deterministic failures abort before any LLM or human cost is incurred. Graders are optional: a task with no graders is a deliberately unverified run that reaches `done` on the agent's own claim — the right tool for exploration, the wrong one the moment "done" must mean something checkable.
 
 ### `command`
 

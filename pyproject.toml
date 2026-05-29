@@ -11,6 +11,9 @@ dependencies = [
     "claude-agent-sdk>=0.2.83",
 ]
 
+[project.scripts]
+flywheel = "flywheel.workflow:main"
+
 [project.optional-dependencies]
 postgres = [
     "psycopg[binary]>=3.2",

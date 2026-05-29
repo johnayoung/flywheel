@@ -124,7 +124,7 @@ def test_load_task_file_malformed_json_names_path(tmp_path: Path) -> None:
 
 def test_load_task_file_schema_violation_names_path(tmp_path: Path) -> None:
     p = tmp_path / "bad-schema.json"
-    p.write_text(json.dumps({"goal": "no graders", "graders": []}))
+    p.write_text(json.dumps({"goal": "bad graders", "graders": "nope"}))
     with pytest.raises(TaskLoadError) as exc:
         load_task_file(p)
     assert str(p) in str(exc.value)
@@ -263,7 +263,7 @@ def test_load_tasks_jsonl_malformed_line_names_line_number(tmp_path: Path) -> No
 
 def test_load_tasks_jsonl_schema_violation_names_line_number(tmp_path: Path) -> None:
     p = tmp_path / "bad-schema.jsonl"
-    bad = json.dumps({"goal": "x", "graders": []})
+    bad = json.dumps({"goal": "x", "graders": "nope"})
     p.write_text(
         json.dumps({**_well_formed(), "id": "a"}) + "\n"
         + bad + "\n"

@@ -68,8 +68,16 @@ def test_validate_rejects_whitespace_only_goal() -> None:
         task.validate()
 
 
-def test_validate_rejects_empty_graders() -> None:
+def test_validate_accepts_empty_graders() -> None:
+    # Graders are optional: a graderless task is an unverified run that
+    # records DONE on the agent's own claim. The harness verify path
+    # tolerates an empty list (all-pass is vacuously true).
     task = Task(goal="g", graders=[])
+    task.validate()
+
+
+def test_validate_rejects_non_list_graders() -> None:
+    task = Task(goal="g", graders="nope")  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="graders"):
         task.validate()
 

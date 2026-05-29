@@ -793,11 +793,15 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         last_ts: datetime | None = None
         if sdk_seq >= 0 and sdk_seq >= evt_seq and sdk is not None:
             iteration = sdk["iteration_number"]
+            # sqlite3.Row indexing is typed Any; pin to str so last_kind stays
+            # str (dict.get over an Any key/default otherwise widens to
+            # str | None).
+            message_type = str(sdk["message_type"])
             last_kind = _SDK_KIND_LABELS.get(
-                sdk["message_type"], sdk["message_type"].upper()
+                message_type, message_type.upper()
             )
             last_detail = _summarize_sdk_message(
-                sdk["message_type"], sdk["payload_json"]
+                message_type, sdk["payload_json"]
             )
             last_ts = _parse_db_ts(sdk["ts"])
         elif evt is not None and evt_seq >= 0:

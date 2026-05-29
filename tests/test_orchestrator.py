@@ -398,6 +398,47 @@ def test_two_workers_run_each_task_exactly_once(tmp_path: Path) -> None:
     assert all(r.status is Status.DONE for r in all_runs)
 
 
+def test_claim_lost_mid_run_relinquishes_without_killing_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A peer stealing one task's lease mid-run surfaces as
+    # OptimisticConcurrencyError out of _drive_under_lease. That must NOT
+    # unwind out of orchestrate and abandon the worker's other tasks: the
+    # losing task is relinquished (recorded as no run) and the loop carries
+    # on to the next claimable task.
+    import flywheel.orchestrator as orch
+    from flywheel import OptimisticConcurrencyError
+
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "a-loser")
+    _write_task(phase, "b-winner")
+
+    async def _stub_drive(
+        control, claim, task_file, *, task_id, stream, **kwargs
+    ):
+        if task_id == "a-loser":
+            raise OptimisticConcurrencyError(
+                f"run-{task_id}", expected_version=1, actual_version=2
+            )
+        return orch.RunRecord(
+            task_id=task_id,
+            run_id=f"run-{task_id}",
+            status=Status.DONE,
+            mode="fresh",
+            worker_id="w",
+        )
+
+    monkeypatch.setattr(orch, "_drive_under_lease", _stub_drive)
+
+    # Must return normally rather than propagating the stolen-claim error.
+    report = _orchestrate(tmp_path, _always_verify())
+
+    ran = {r.task_id for r in report.runs}
+    assert "a-loser" not in ran  # relinquished, no run recorded
+    assert "b-winner" in ran  # peer-takeover of one task did not abort the rest
+    assert all(r.status is Status.DONE for r in report.runs)
+
+
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
     from flywheel.orchestrator import _ClaimHeartbeat
 

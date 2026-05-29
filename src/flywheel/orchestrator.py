@@ -49,7 +49,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, TextIO
+from typing import Any, Callable, Literal, TextIO
 from uuid import uuid4
 
 from flywheel.harness import (
@@ -305,7 +305,7 @@ async def orchestrate(
                     if not outcome.applied:
                         continue
                     attempted_resume.add(run_id)
-                    record = await _drive_under_lease(
+                    record = await _drive_or_relinquish(
                         control,
                         claim,
                         file_by_id[row.task.id],
@@ -323,8 +323,11 @@ async def orchestrate(
                         stream=stream,
                         now=clock,
                     )
-                    claim = None  # released by _drive_under_lease
-                    runs.append(record)
+                    # _drive_under_lease releases the lease in all cases
+                    # (success or claim loss), so drop our token either way.
+                    claim = None
+                    if record is not None:
+                        runs.append(record)
                     progressed = True
                     break
                 finally:
@@ -355,7 +358,7 @@ async def orchestrate(
                     held.add(pick.task.id)
                     continue
                 attempted_fresh.add(pick.task.id)
-                record = await _drive_under_lease(
+                record = await _drive_or_relinquish(
                     control,
                     claim,
                     pick.task_file,
@@ -373,7 +376,8 @@ async def orchestrate(
                     stream=stream,
                     now=clock,
                 )
-                runs.append(record)
+                if record is not None:
+                    runs.append(record)
                 ran_fresh = True
                 break
             if ran_fresh:
@@ -446,6 +450,51 @@ async def _drive_under_lease(
         mode="resume" if run_id is not None else "fresh",
         worker_id=worker_id,
     )
+
+
+async def _drive_or_relinquish(
+    control: SqliteStore,
+    claim: TaskClaim,
+    task_file: Path,
+    *,
+    task_id: str,
+    stream: TextIO | None,
+    **kwargs: Any,
+) -> RunRecord | None:
+    """Drive one task, containing a mid-run claim loss to that one task.
+
+    If a peer steals this task's lease while it runs (the worker stalled
+    past the window, or clock skew let another worker reclaim it), the
+    peer can finalize the lifecycle out from under us. The losing harness
+    then hits the optimistic-concurrency check on its next domain append
+    (or its heartbeat raises :class:`ClaimLostError`). Without this guard
+    that exception unwinds all the way out of :func:`orchestrate`, killing
+    the whole worker and abandoning every other task it was draining.
+
+    Catching it here turns a lost race into a re-evaluation: we return
+    ``None``, the caller records no run for it, and the main loop re-reads
+    authoritative state on the next pass. Consistent with the module's
+    invariant that the worst failure mode is wasted latency, never a wrong
+    schedule.
+    """
+    try:
+        return await _drive_under_lease(
+            control,
+            claim,
+            task_file,
+            task_id=task_id,
+            stream=stream,
+            **kwargs,
+        )
+    except (OptimisticConcurrencyError, ClaimLostError) as exc:
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: claim lost mid-run "
+                f"({type(exc).__name__}); a peer took over, re-evaluating",
+                file=stream,
+                flush=True,
+            )
+        return None
 
 
 __all__ = [

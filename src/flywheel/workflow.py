@@ -269,17 +269,28 @@ def build_status_rows(
 # --- Next-task selection ----------------------------------------------------
 
 
-def select_next_task(rows: Iterable[TaskStatusRow]) -> TaskStatusRow | None:
+def select_next_task(
+    rows: Iterable[TaskStatusRow],
+    *,
+    exclude_ids: frozenset[str] = frozenset(),
+) -> TaskStatusRow | None:
     """Pick the first eligible task from ``rows``.
 
     A task is eligible when:
 
+    * its ``id`` is not in ``exclude_ids``, AND
     * its state is :attr:`TaskState.FRESH`, :attr:`TaskState.RETRYABLE`,
       or :attr:`TaskState.INTERRUPTED`, AND
     * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`.
 
     Tasks whose prerequisites are missing from the workspace are treated
     as ineligible so a dangling reference never silently runs.
+
+    ``exclude_ids`` removes tasks from *candidacy* without removing them
+    from the prerequisite-resolution map, so a caller (e.g. the
+    orchestrator) can skip an already-attempted or still-blocked task while
+    that task can still satisfy a dependent's prerequisite. The default
+    empty set preserves the pull-based CLI's behavior exactly.
 
     Interrupted tasks resume because ``run_task`` normalizes an entry-time
     ``INTERRUPTED`` lifecycle back to ``READY`` (see harness ``run_task``
@@ -293,6 +304,8 @@ def select_next_task(rows: Iterable[TaskStatusRow]) -> TaskStatusRow | None:
         TaskState.INTERRUPTED,
     )
     for row in by_id.values():
+        if row.task.id in exclude_ids:
+            continue
         if row.state not in eligible_states:
             continue
         if not all(
@@ -390,15 +403,26 @@ async def run_task_file(
     max_retries: int = DEFAULT_MAX_RETRIES,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
+    run_id: str | None = None,
 ) -> HarnessOutcome:
     """Load ``task_file``, persist a lifecycle, and drive it via ``run_task``.
 
     ``invoke`` defaults to a real Claude Code invoker. Tests inject a fake
     callable instead — same seam, different transport.
+
+    ``run_id`` selects fresh vs resume: ``None`` (default) starts a new
+    lifecycle; passing an existing ``run_id`` makes ``run_task`` resume that
+    lifecycle (its seed append hits ``LifecycleAlreadyExistsError`` and the
+    harness reconciles from the persisted row — e.g. continuing a
+    just-unblocked ``READY`` lifecycle on its own history).
     """
     out = stream if stream is not None else sys.stderr
     task = load_task_file(task_file)
-    lifecycle = Lifecycle(task_id=task.id)
+    lifecycle = (
+        Lifecycle(task_id=task.id)
+        if run_id is None
+        else Lifecycle(task_id=task.id, run_id=run_id)
+    )
 
     invoker = invoke or _make_claude_code_invoke(
         sandbox, model=model, max_turns=max_turns
@@ -562,6 +586,42 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
     )
     return 0 if outcome.lifecycle.status == Status.DONE else 1
+
+
+def _cmd_orchestrate(args: argparse.Namespace) -> int:
+    # Lazy import: flywheel.orchestrator imports this module, so importing it
+    # at module load would be circular.
+    from flywheel.orchestrator import orchestrate
+
+    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    db_path = _resolve_db(args.db)
+    sandbox_root = (
+        Path(args.sandbox_root)
+        if args.sandbox_root
+        else Path(".workflow/worktrees")
+    )
+    report = asyncio.run(
+        orchestrate(
+            tasks_dir=tasks_dir,
+            db_path=db_path,
+            sandbox_root=sandbox_root,
+            model=args.model,
+            max_turns=args.max_turns,
+            max_retries=args.max_retries,
+        )
+    )
+    for run_id in report.recovered:
+        print(f"[orchestrate] recovered: {run_id}", file=sys.stderr)
+    for record in report.runs:
+        print(
+            f"[orchestrate] {record.mode:<6} {record.task_id} "
+            f"-> {record.status.value}  ({record.run_id})",
+            file=sys.stderr,
+        )
+    # Non-zero exit if any task ended in a non-done terminal/paused state,
+    # so a CI driver can tell the batch did not fully complete.
+    incomplete = [r for r in report.runs if r.status != Status.DONE]
+    return 0 if not incomplete else 1
 
 
 # --- Live progress snapshot -------------------------------------------------
@@ -1166,6 +1226,46 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_run.set_defaults(func=_cmd_run)
+
+    p_orchestrate = sub.add_parser(
+        "orchestrate",
+        help=(
+            "Drive every eligible task to quiescence: honor prerequisites, "
+            "reactively unblock and resume blocked lifecycles, one in-process "
+            "worker. Exit 0 only if every task it ran reached done."
+        ),
+    )
+    _add_common_tasks_dir(p_orchestrate)
+    _add_common_db(p_orchestrate)
+    p_orchestrate.add_argument(
+        "--sandbox-root",
+        default=None,
+        help=(
+            "Root under which each task runs in <sandbox-root>/<task-id> "
+            "(default: .workflow/worktrees)."
+        ),
+    )
+    p_orchestrate.add_argument(
+        "--model",
+        default=None,
+        help="Override the Claude model passed to the SDK.",
+    )
+    p_orchestrate.add_argument(
+        "--max-turns",
+        type=int,
+        default=DEFAULT_MAX_TURNS,
+        help=f"Max agent turns per iteration (default: {DEFAULT_MAX_TURNS}).",
+    )
+    p_orchestrate.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=(
+            f"Harness retry budget after failed_validation "
+            f"(default: {DEFAULT_MAX_RETRIES})."
+        ),
+    )
+    p_orchestrate.set_defaults(func=_cmd_orchestrate)
 
     p_status = sub.add_parser(
         "status",

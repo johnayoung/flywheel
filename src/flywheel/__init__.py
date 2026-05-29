@@ -87,6 +87,11 @@ from flywheel.loaders import (
     load_tasks_jsonl,
 )
 from flywheel.notifier import RunNotifier
+from flywheel.orchestrator import (
+    OrchestratorReport,
+    RunRecord,
+    orchestrate,
+)
 from flywheel.prompt import IterationInputs, build_iteration_prompt
 from flywheel.store_memory import InMemoryStore
 from flywheel.store_sqlite import SqliteStore
@@ -217,12 +222,14 @@ __all__ = [
     "NoOpStrategy",
     "OPENING_FENCE",
     "OptimisticConcurrencyError",
+    "OrchestratorReport",
     "Outcome",
     "PostgresStore",
     "RecheckOutcome",
     "RetryScheduled",
     "RubricGrader",
     "RunNotifier",
+    "RunRecord",
     "SdkMessageRecord",
     "SdkMessageStore",
     "SessionRecorded",
@@ -259,6 +266,7 @@ __all__ = [
     "load_task_directory",
     "load_task_file",
     "load_tasks_jsonl",
+    "orchestrate",
     "parse_envelope",
     "recheck_blocked_lifecycle",
     "replay",

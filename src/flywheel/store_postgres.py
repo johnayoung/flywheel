@@ -64,6 +64,7 @@ from flywheel.events import (
     apply,
 )
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel.notifier import RunNotifier
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
@@ -162,7 +163,13 @@ class PostgresStore:
         pool_min: int = 1,
         pool_max: int = 10,
         schema: str = "public",
+        notifier: RunNotifier | None = None,
     ) -> None:
+        # In-process reactivity for same-instance consumers. Cross-process
+        # push (the typical Postgres multi-host case) is a later layer
+        # built on LISTEN/NOTIFY; until then cross-process consumers rely
+        # on the audit follower's bounded poll.
+        self.notifier: RunNotifier = notifier or RunNotifier()
         self._schema: str = _validate_schema(schema)
         self._schema_ident = sql.Identifier(self._schema)
         # Eagerly validate connectivity. psycopg.OperationalError bubbles
@@ -486,7 +493,11 @@ class PostgresStore:
                 folded = apply(current, event)
                 self._update_lifecycle_conn(conn, folded)
                 self._project_domain_event_conn(conn, event, folded)
-            self._insert_domain_event_row_conn(conn, event)
+            sequence = self._insert_domain_event_row_conn(conn, event)
+        # Signal only after the connection's transaction commits (on exit
+        # of the `with` block) so a woken consumer never sees a watermark
+        # for an uncommitted append.
+        self.notifier.notify(event.run_id, sequence)
         return folded
 
     def _insert_lifecycle_conn(
@@ -663,7 +674,7 @@ class PostgresStore:
 
     def _insert_domain_event_row_conn(
         self, conn: Connection[Any], event: DomainEvent
-    ) -> None:
+    ) -> int:
         with conn.cursor() as cur:
             sequence = self._next_run_sequence(cur, event.run_id)
             cur.execute(
@@ -682,6 +693,7 @@ class PostgresStore:
                     sequence,
                 ),
             )
+        return sequence
 
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
         with self._pool.connection() as conn:
@@ -804,6 +816,7 @@ class PostgresStore:
                 )
                 row = cur.fetchone()
         assert row is not None
+        self.notifier.notify(event.run_id, sequence)
         return EventRecord(
             run_id=event.run_id,
             ts=event.ts,
@@ -881,6 +894,8 @@ class PostgresStore:
                             id=int(row[0]),
                         )
                     )
+        if persisted and persisted[-1].sequence is not None:
+            self.notifier.notify(run_id, persisted[-1].sequence)
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

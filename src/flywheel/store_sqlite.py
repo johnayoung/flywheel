@@ -51,6 +51,7 @@ from flywheel.events import (
     apply,
 )
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel.notifier import RunNotifier
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
@@ -144,7 +145,16 @@ class SqliteStore:
         ``IF NOT EXISTS``).
     """
 
-    def __init__(self, path: str | Path = ":memory:") -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        notifier: RunNotifier | None = None,
+    ) -> None:
+        # Default-on in-process reactivity: a consumer sharing this store
+        # instance gets push wakeups; separate instances (e.g. another
+        # process on the same file) fall back to the audit follower's poll.
+        self.notifier: RunNotifier = notifier or RunNotifier()
         self._connection = sqlite3.connect(
             str(path),
             check_same_thread=False,
@@ -396,10 +406,14 @@ class SqliteStore:
                     folded, expected_version=expected_version
                 )
                 self._project_domain_event(event, folded)
-            self._insert_domain_event_row(event)
-            return folded
+            sequence = self._insert_domain_event_row(event)
+        # Signal only after the transaction commits so a woken consumer
+        # never observes a watermark for an uncommitted (or rolled-back)
+        # append.
+        self.notifier.notify(event.run_id, sequence)
+        return folded
 
-    def _insert_domain_event_row(self, event: DomainEvent) -> None:
+    def _insert_domain_event_row(self, event: DomainEvent) -> int:
         sequence = self._next_run_sequence(event.run_id)
         self._connection.execute(
             """
@@ -417,6 +431,7 @@ class SqliteStore:
                 sequence,
             ),
         )
+        return sequence
 
     def _project_domain_event(
         self, event: DomainEvent, folded: Lifecycle
@@ -533,6 +548,7 @@ class SqliteStore:
                 sequence,
             ),
         )
+        self.notifier.notify(event.run_id, sequence)
         return EventRecord(
             run_id=event.run_id,
             ts=event.ts,
@@ -602,6 +618,8 @@ class SqliteStore:
                     id=cursor.lastrowid,
                 )
             )
+        if persisted and persisted[-1].sequence is not None:
+            self.notifier.notify(run_id, persisted[-1].sequence)
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

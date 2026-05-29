@@ -159,6 +159,12 @@ class _EventStreamingStore:
     def __init__(self, wrapped: HarnessStore) -> None:
         self._wrapped = wrapped
 
+    @property
+    def notifier(self) -> Any:
+        """Expose the wrapped store's notifier so an audit follower sharing
+        this wrapper still gets in-process push wakeups."""
+        return getattr(self._wrapped, "notifier", None)
+
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:
         self._wrapped.create_lifecycle(lifecycle)
 

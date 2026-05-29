@@ -38,6 +38,7 @@ from flywheel.events import (
     apply,
 )
 from flywheel.lifecycle import Attempt, Lifecycle
+from flywheel.notifier import RunNotifier
 from flywheel.store_protocols import (
     AuditRecord,
     ClaudeSessionEntry,
@@ -151,7 +152,11 @@ class InMemoryStore:
     same holds in reverse for record arguments.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, notifier: RunNotifier | None = None) -> None:
+        # Default-on in-process reactivity: a consumer that shares this
+        # store instance (the common single-host case) gets push wakeups;
+        # separate instances fall back to the audit follower's poll.
+        self.notifier: RunNotifier = notifier or RunNotifier()
         self._lifecycles: dict[str, Lifecycle] = {}
         self._attempts: dict[tuple[str, int], Attempt] = {}
         self._events: list[EventRecord] = []
@@ -229,10 +234,11 @@ class InMemoryStore:
             folded = apply(current, event)
             self.update_lifecycle(folded, expected_version=expected_version)
             self._project_domain_event(event, folded)
-        self._append_domain_event_row(event)
+        sequence = self._append_domain_event_row(event)
+        self.notifier.notify(event.run_id, sequence)
         return folded
 
-    def _append_domain_event_row(self, event: DomainEvent) -> None:
+    def _append_domain_event_row(self, event: DomainEvent) -> int:
         self._event_seq += 1
         sequence = self._next_run_sequence(event.run_id)
         self._events.append(
@@ -247,6 +253,7 @@ class InMemoryStore:
                 category="domain",
             )
         )
+        return sequence
 
     def _project_domain_event(
         self, event: DomainEvent, folded: Lifecycle
@@ -326,6 +333,7 @@ class InMemoryStore:
             sequence=sequence,
         )
         self._events.append(record)
+        self.notifier.notify(event.run_id, sequence)
         return _clone_event(record)
 
     def list_events(self, run_id: str) -> list[EventRecord]:
@@ -366,6 +374,8 @@ class InMemoryStore:
             )
             self._sdk_messages.append(record)
             persisted.append(_clone_sdk_message(record))
+        if persisted and persisted[-1].sequence is not None:
+            self.notifier.notify(run_id, persisted[-1].sequence)
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

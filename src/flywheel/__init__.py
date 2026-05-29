@@ -83,6 +83,7 @@ from flywheel.loaders import (
     load_task_file,
     load_tasks_jsonl,
 )
+from flywheel.notifier import RunNotifier
 from flywheel.prompt import IterationInputs, build_iteration_prompt
 from flywheel.store_memory import InMemoryStore
 from flywheel.store_sqlite import SqliteStore
@@ -217,6 +218,7 @@ __all__ = [
     "RecheckOutcome",
     "RetryScheduled",
     "RubricGrader",
+    "RunNotifier",
     "SdkMessageRecord",
     "SdkMessageStore",
     "SessionRecorded",

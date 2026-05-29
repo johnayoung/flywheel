@@ -40,6 +40,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from flywheel.lifecycle import Status
+from flywheel.notifier import RunNotifier
 from flywheel.store_protocols import (
     AuditRecord,
     AuditStore,
@@ -126,6 +127,80 @@ def _drain(store: AuditStore, run_id: str, cursor: int) -> tuple[list[AuditRecor
         cursor = max(_record_sequence(r) for r in page)
 
 
+def _resolve_notifier(store: object) -> RunNotifier | None:
+    """Return the store's in-process notifier, or ``None`` for poll-only.
+
+    Read by duck typing so the audit surface stays decoupled from the
+    persistence layer: any store may expose a ``notifier`` attribute to
+    opt into push wakeups; one that does not falls back to bounded poll.
+    """
+    notifier = getattr(store, "notifier", None)
+    return notifier if isinstance(notifier, RunNotifier) else None
+
+
+def _wait(
+    notifier: RunNotifier | None,
+    run_id: str,
+    watermark: int,
+    timeout: float,
+    stop: threading.Event | None,
+) -> int:
+    """Block until the next write or ``timeout``; return the new watermark.
+
+    With a notifier this is a push wakeup bounded by ``timeout`` (so a
+    missed signal only costs latency). Without one it degrades to a sleep
+    — interruptible via ``stop`` for responsive cancellation. The returned
+    watermark lets the caller advance past sequences it was woken for
+    (including domain events the audit stream does not surface) so a
+    subsequent wait does not spin.
+    """
+    if notifier is not None:
+        return notifier.wait(run_id, watermark, timeout)
+    if stop is not None:
+        stop.wait(timeout)
+    else:
+        time.sleep(timeout)
+    return watermark
+
+
+def _follow(
+    store: AuditStore,
+    run_id: str,
+    *,
+    cursor: int,
+    poll_interval: float,
+    stop: threading.Event | None = None,
+) -> Iterator[AuditRecord]:
+    """Yield records as they land until the lifecycle is terminal.
+
+    The single follow loop shared by :func:`stream` and
+    :class:`AuditLoggerHandle`. ``cursor`` is the read position after the
+    caller's initial drain; ``stop`` (when given) makes the loop and its
+    waits cooperatively cancellable. A terminal lifecycle triggers one
+    final drain before the loop exits, so the write committed alongside
+    the terminal transition is never dropped.
+    """
+    notifier = _resolve_notifier(store)
+    watermark = cursor
+    while True:
+        if stop is not None and stop.is_set():
+            return
+        if not _lifecycle_exists(store, run_id):
+            return
+        terminal = _lifecycle_status(store, run_id) in _TERMINAL_STATUSES
+        if not terminal:
+            watermark = _wait(
+                notifier, run_id, watermark, poll_interval, stop
+            )
+        drained, cursor = _drain(store, run_id, cursor)
+        if drained:
+            yield from drained
+            watermark = max(watermark, cursor)
+            continue
+        if terminal:
+            return
+
+
 def stream(
     run_id: str,
     *,
@@ -159,20 +234,9 @@ def stream(
         # follow loop would spin forever waiting on a lifecycle that
         # will never exist.
         return
-    while True:
-        terminal = _lifecycle_status(store, run_id) in _TERMINAL_STATUSES
-        # When the lifecycle is terminal we still perform one more drain
-        # before exiting — see the docstring's drain-then-exit ordering
-        # rationale. If that drain yields nothing, the stream is done.
-        if not terminal:
-            time.sleep(poll_interval)
-        drained, cursor = _drain(store, run_id, cursor)
-        if drained:
-            for record in drained:
-                yield record
-            continue
-        if terminal:
-            return
+    yield from _follow(
+        store, run_id, cursor=cursor, poll_interval=poll_interval
+    )
 
 
 class AuditLoggerHandle:
@@ -209,36 +273,29 @@ class AuditLoggerHandle:
     def _run(self) -> None:
         """Background loop: drain pages and emit one LogRecord per row.
 
-        Mirrors :func:`stream` but checks the stop flag between pages so
-        ``detach()`` returns quickly. The thread does not call into
-        ``stream`` directly because we need finer-grained control over
-        the polling cadence and the cooperative cancel point.
+        Shares the initial drain and the :func:`_follow` loop with
+        :func:`stream`, passing its stop flag so ``detach()`` cancels the
+        loop (and its waits) cooperatively. The stop flag is also checked
+        between emits so a large drained batch does not delay cancellation.
         """
         cursor = 0
-        while not self._stop_event.is_set():
-            drained, cursor = _drain(self._store, self._run_id, cursor)
-            for record in drained:
-                self._emit(record)
-                if self._stop_event.is_set():
-                    return
+        drained, cursor = _drain(self._store, self._run_id, cursor)
+        for record in drained:
+            self._emit(record)
             if self._stop_event.is_set():
                 return
-            # Unknown run_id: yield nothing and exit, matching the
-            # ``stream`` spec contract. The lifecycle existence check
-            # runs after the drain in case the store gained a row
-            # between calls.
-            if not _lifecycle_exists(self._store, self._run_id):
+        if self._stop_event.is_set():
+            return
+        for record in _follow(
+            self._store,
+            self._run_id,
+            cursor=cursor,
+            poll_interval=self._poll_interval,
+            stop=self._stop_event,
+        ):
+            self._emit(record)
+            if self._stop_event.is_set():
                 return
-            terminal = (
-                _lifecycle_status(self._store, self._run_id)
-                in _TERMINAL_STATUSES
-            )
-            if terminal and not drained:
-                return
-            if not terminal:
-                # Sleep in small slices so detach() does not have to
-                # wait the full poll_interval before unblocking.
-                self._stop_event.wait(self._poll_interval)
 
     def _emit(self, record: AuditRecord) -> None:
         kind = _record_kind(record)

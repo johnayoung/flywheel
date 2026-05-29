@@ -213,12 +213,16 @@ class HarnessConfig:
     distinguish model swaps from regressions because every Attempt
     carries exactly the context that produced it.
 
-    ``worktree`` is the per-attempt working directory the rubric judge
-    runs against (typically the same sandbox the working agent uses).
-    When ``None`` and the task declares a :class:`RubricGrader`, the
-    rubric runner raises :class:`RubricJudgeError` ("worktree not
-    available") which the harness routes through ``INTERNAL_ERROR``.
-    Workflow CLIs populate this with their sandbox path.
+    ``worktree`` is the per-attempt sandbox the working agent uses. It is
+    the working directory for both the rubric judge and the ``command``
+    graders, so deterministic checks grade the tree the agent actually
+    edited rather than the harness's ambient CWD. When ``None`` and the
+    task declares a :class:`RubricGrader`, the rubric runner raises
+    :class:`RubricJudgeError` ("worktree not available") which the harness
+    routes through ``INTERNAL_ERROR``; when ``None``, command graders fall
+    back to the harness process CWD (the bash worker chdirs into the
+    sandbox, so that path stays correct). Workflow CLIs populate this with
+    their sandbox path.
 
     ``rubric_judge_model`` is the default model for rubric judges when
     the per-grader ``RubricGrader.judge_model`` is unset; ``None`` falls
@@ -1689,6 +1693,7 @@ async def _validate(
         store,
         run_id=lifecycle.run_id,
         attempt_number=attempt.number,
+        cwd=config.worktree,
         artifacts_dir=attempt_dir,
         now=clock,
     )
@@ -2113,15 +2118,20 @@ class RecheckOutcome:
 def _evaluate_blocked_predicate(
     req: BlockedRequirement,
     grader_by_name: Mapping[str, Any],
+    *,
+    cwd: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    """Evaluate one persisted predicate against the worker CWD/env and the
+    """Evaluate one persisted predicate against ``cwd``/env and the
     supplied grader map. Never raises — OS errors are surfaced via the
     ``detail`` string with ``satisfied=False``.
 
     ``command_grader`` predicates resolve the named grader from
     ``task.graders`` and invoke its ``run`` string with ``subprocess.run``
-    (``shell=True``), inheriting ``os.getcwd()`` / ``os.environ``. Exit
-    code ``0`` means satisfied. We deliberately do **not** call
+    (``shell=True``), inheriting ``os.environ``. The working directory is
+    ``cwd`` when supplied (the task's sandbox; the caller owns it) and
+    ``os.getcwd()`` otherwise. ``file_exists`` paths are resolved relative
+    to the same ``cwd`` when relative. Exit code ``0`` means satisfied. We
+    deliberately do **not** call
     :func:`flywheel.grader_command.run_command_graders` because that path
     persists a ``grader_results`` row, and per spec FR-5 recheck is a
     control-plane operation whose audit surface is the event payload.
@@ -2139,7 +2149,7 @@ def _evaluate_blocked_predicate(
             proc = subprocess.run(
                 grader.run,
                 shell=True,
-                cwd=os.getcwd(),
+                cwd=os.fspath(cwd) if cwd is not None else os.getcwd(),
                 env=os.environ.copy(),
                 capture_output=True,
                 check=False,
@@ -2159,7 +2169,10 @@ def _evaluate_blocked_predicate(
             "detail": f"exit_code={proc.returncode}",
         }
     if isinstance(req, FileExistsRequirement):
-        exists = os.path.exists(req.path)
+        probe_path = req.path
+        if cwd is not None and not os.path.isabs(probe_path):
+            probe_path = os.path.join(os.fspath(cwd), probe_path)
+        exists = os.path.exists(probe_path)
         satisfied = exists if req.present else not exists
         observed = "present" if exists else "absent"
         expected = "present" if req.present else "absent"
@@ -2190,6 +2203,7 @@ def recheck_blocked_lifecycle(
     task: Task,
     *,
     dry_run: bool = False,
+    cwd: str | os.PathLike[str] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> RecheckOutcome:
     """Re-evaluate a blocked lifecycle's persisted ``requires`` predicates
@@ -2202,8 +2216,9 @@ def recheck_blocked_lifecycle(
       ``blocked_requires_json`` is ``None``, returns a no-event no-op
       ``RecheckOutcome(applied=False, reason="not_blocked")``;
     * parses the persisted ``requires`` snapshot, evaluating each
-      predicate against the **caller's** CWD and ``os.environ`` (per the
-      spec the caller owns the sandbox);
+      predicate against ``cwd`` (the task's sandbox; the caller owns it)
+      and ``os.environ``, falling back to ``os.getcwd()`` when ``cwd`` is
+      ``None``;
     * emits ``harness.recheck_attempted`` recording per-predicate detail,
       the aggregate ``all_satisfied`` bit, and the ``dry_run`` flag;
     * if ``dry_run`` is ``True``, never transitions and never emits
@@ -2273,7 +2288,9 @@ def recheck_blocked_lifecycle(
 
     evaluated: list[dict[str, object]] = []
     for req in parsed:
-        evaluated.append(_evaluate_blocked_predicate(req, grader_by_name))
+        evaluated.append(
+            _evaluate_blocked_predicate(req, grader_by_name, cwd=cwd)
+        )
     all_satisfied = all(bool(p["satisfied"]) for p in evaluated)
 
     _emit(

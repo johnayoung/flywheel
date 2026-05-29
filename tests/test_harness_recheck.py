@@ -153,6 +153,54 @@ def test_all_satisfied_transitions_clears_column_and_emits_both_events(
     }
 
 
+@pytest.mark.parametrize("store_kind", STORE_KINDS)
+def test_cwd_argument_resolves_predicates_against_sandbox(
+    store_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The relative file_exists path and the command grader must be
+    # evaluated against the passed-in sandbox cwd, NOT the process CWD.
+    # Regression guard for the orchestrator threading the per-task sandbox
+    # into recheck_blocked_lifecycle (in-process callers cannot chdir).
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / "present.flag").write_text("ok", encoding="utf-8")
+    # Process CWD is deliberately elsewhere and lacks the flag, so a
+    # regression to os.getcwd() would leave the predicate unsatisfied.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    store = _make_store(store_kind, tmp_path)
+    task = Task(
+        goal="g",
+        graders=[
+            CommandGrader(
+                run=f"{sys.executable} -c "
+                f"\"import os,sys; sys.exit(0 if "
+                f"os.path.exists('present.flag') else 1)\"",
+                name="full-suite",
+            )
+        ],
+    )
+    lifecycle = _blocked_lifecycle(
+        store,
+        run_id="run-cwd",
+        requires_payload=[
+            {"type": "command_grader", "name": "full-suite"},
+            {"type": "file_exists", "path": "present.flag", "present": True},
+        ],
+    )
+
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, cwd=sandbox
+    )
+
+    assert outcome.applied is True
+    assert all(bool(p["satisfied"]) for p in outcome.per_predicate)
+
+
 # --- Partial satisfied path ----------------------------------------------
 
 

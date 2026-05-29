@@ -294,7 +294,10 @@ async def orchestrate(
                 try:
                     try:
                         outcome = recheck_blocked_lifecycle(
-                            control, run_id, task_by_id[row.task.id]
+                            control,
+                            run_id,
+                            task_by_id[row.task.id],
+                            cwd=sandbox_root / row.task.id,
                         )
                     except OptimisticConcurrencyError:
                         # Another worker transitioned it first; let go.

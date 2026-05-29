@@ -247,6 +247,45 @@ class TestSuccessfulRun:
         reloaded = store.list_attempts(lifecycle.run_id)[0]
         assert reloaded.agent_context["model_id"] == "claude-opus-4-7"
 
+    def test_command_grader_runs_in_worktree(self, tmp_path: Path) -> None:
+        # A relative-path check passes only if the grader's CWD is the
+        # configured sandbox. Regression guard for the harness threading
+        # config.worktree into run_command_graders (and not grading its
+        # own ambient CWD).
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        (sandbox / "sentinel.flag").write_text("ok", encoding="utf-8")
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c "
+                    f"\"import os,sys; sys.exit(0 if "
+                    f"os.path.exists('sentinel.flag') else 1)\"",
+                    name="relative-check",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-wt-cwd")
+        config = HarnessConfig(worktree=sandbox)
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # The sentinel only exists inside the sandbox, so reaching DONE
+        # proves the grader ran there rather than in the harness CWD.
+        assert outcome.lifecycle.status == Status.DONE
+
     def test_per_attempt_artifact_directory_created(self, tmp_path: Path) -> None:
         store = InMemoryStore()
         task = Task(
@@ -1795,6 +1834,13 @@ def _ok_command() -> CommandGrader:
 
 
 class TestRubricIntegration:
+    # Command graders run in config.worktree, so the sandbox must be a real
+    # directory. Each test gets a fresh tmp_path-backed worktree via this
+    # autouse fixture rather than a hardcoded path that may not exist.
+    @pytest.fixture(autouse=True)
+    def _worktree(self, tmp_path: Path) -> None:
+        self._wt = str(tmp_path)
+
     def test_all_pass_rubric_reaches_done(self) -> None:
         store = InMemoryStore()
         task = Task(
@@ -1817,7 +1863,7 @@ class TestRubricIntegration:
             ]
         )
         config = HarnessConfig(
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -1865,7 +1911,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=1,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -1906,7 +1952,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=5,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -1951,7 +1997,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=1,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -1989,7 +2035,7 @@ class TestRubricIntegration:
             ]
         )
         config = HarnessConfig(
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -2034,7 +2080,7 @@ class TestRubricIntegration:
             ]
         )
         config = HarnessConfig(
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -2079,7 +2125,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=0,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -2140,7 +2186,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=1,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -2181,7 +2227,7 @@ class TestRubricIntegration:
             ]
         )
         config = HarnessConfig(
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 
@@ -2236,7 +2282,7 @@ class TestRubricIntegration:
         )
         config = HarnessConfig(
             max_retries=1,
-            worktree="/tmp/wt",
+            worktree=self._wt,
             rubric_judge_invoke=judge,
         )
 

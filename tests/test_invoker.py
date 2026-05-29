@@ -564,3 +564,49 @@ class TestSerializeSdkMessage:
         assert payload["content"][0]["content"] == big
         # Size sanity: serialized text contains the full body.
         assert len(json.dumps(payload)) >= len(big)
+
+
+class TestOnMessageObserver:
+    """The ``on_message`` seam: pure, ordered, per-message observation."""
+
+    def test_fires_once_per_message_in_arrival_order(self) -> None:
+        a = _assistant(TextBlock(text="working"))
+        u = _user_with_tool_result("t1", content="done")
+        r = _result()
+        stream = _stream(a, u, r)
+        seen: list[Message] = []
+        result = _run(
+            invoke_iteration(
+                prompt="ignored",
+                message_stream=stream,
+                on_message=seen.append,
+            )
+        )
+        # Observed exactly the messages, in order, matching the result.
+        assert seen == [a, u, r]
+        assert result.messages == (a, u, r)
+
+    def test_raising_observer_does_not_break_the_run(self) -> None:
+        a = _assistant(TextBlock(text=_wrap_envelope('{"intent": "verify"}')))
+        r = _result()
+        stream = _stream(a, r)
+
+        def boom(_msg: Message) -> None:
+            raise RuntimeError("renderer blew up")
+
+        # A faulty observer is swallowed; the iteration still completes and
+        # every message is recorded in the result.
+        result = _run(
+            invoke_iteration(
+                prompt="ignored", message_stream=stream, on_message=boom
+            )
+        )
+        assert result.messages == (a, r)
+        assert result.failure is None
+
+    def test_absent_observer_is_a_no_op(self) -> None:
+        a = _assistant(TextBlock(text="hi"))
+        result = _run(
+            invoke_iteration(prompt="ignored", message_stream=_stream(a))
+        )
+        assert result.messages == (a,)

@@ -11,7 +11,7 @@ Envelope extraction delegates entirely to :func:`flywheel.envelope.parse_envelop
 """
 
 import dataclasses
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -137,6 +137,7 @@ async def invoke_iteration(
     prompt: str,
     options: ClaudeAgentOptions | None = None,
     message_stream: AsyncIterable[Message] | None = None,
+    on_message: Callable[[Message], None] | None = None,
 ) -> IterationResult:
     """Drive exactly one agent iteration and return its structured result.
 
@@ -144,6 +145,14 @@ async def invoke_iteration(
     without spawning a Claude subprocess — supply an ``AsyncIterable`` of
     pre-built SDK messages and the invoker consumes it directly. When
     omitted, the invoker delegates to :func:`claude_agent_sdk.query`.
+
+    ``on_message`` is a pure observation seam: when set, it is called with
+    each SDK :class:`Message` the instant it arrives, before the message is
+    processed. It lets a caller surface the agent's turns live (e.g. the
+    workflow CLI streaming them to stdout interleaved with harness events)
+    without the invoker taking on any rendering or persistence concern. A
+    raising observer is swallowed so a faulty live renderer can never break
+    the agent run; the message is still recorded in the returned result.
 
     The invoker drives exactly one iteration per call. Multi-iteration
     orchestration belongs to the harness.
@@ -181,6 +190,13 @@ async def invoke_iteration(
     try:
         async for msg in source:
             messages.append(msg)
+
+            if on_message is not None:
+                try:
+                    on_message(msg)
+                except Exception:  # noqa: BLE001 - a live renderer must
+                    # never break the agent run; observation is best-effort.
+                    pass
 
             if isinstance(msg, AssistantMessage):
                 if msg.session_id is not None:

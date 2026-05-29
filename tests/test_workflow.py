@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import Message
 
 from flywheel.envelope import Intent, ValidEnvelope
 from flywheel.harness import HarnessOutcome, InvocationRequest
@@ -1467,3 +1468,142 @@ def test_main_run_rejects_inline_graders_on_task_file(
     )
     assert rc == 2
     assert "task file" in capsys.readouterr().err
+
+
+# ---------- live agent-message streaming ----------
+
+
+def _sdk_messages_sample() -> list[Message]:
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    return [
+        AssistantMessage(
+            content=[TextBlock(text="I will create the file.")],
+            model="m",
+            stop_reason="end_turn",
+            session_id="s",
+        ),
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="t1",
+                    name="Write",
+                    input={"file_path": "hello.txt", "content": "hi"},
+                )
+            ],
+            model="m",
+            stop_reason="tool_use",
+            session_id="s",
+        ),
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="t1", content="created", is_error=False
+                )
+            ]
+        ),
+        ResultMessage(
+            subtype="success",
+            duration_ms=10,
+            duration_api_ms=8,
+            is_error=False,
+            num_turns=2,
+            session_id="s",
+            stop_reason="end_turn",
+            total_cost_usd=0.0123,
+        ),
+    ]
+
+
+def test_format_live_message_renders_text_tool_result_and_result() -> None:
+    from flywheel.workflow import _format_live_message
+
+    text, tool, user, result = _sdk_messages_sample()
+    assert "ASSISTANT  I will create the file." in _format_live_message(text)
+    tool_line = _format_live_message(tool)
+    assert "ASSISTANT  Write(file_path=hello.txt" in tool_line
+    assert "USER  tool_result(7B)" in _format_live_message(user)
+    result_line = _format_live_message(result)
+    assert "RESULT  subtype=success turns=2 cost=$0.0123" in result_line
+
+
+def test_make_message_observer_plain_writes_readable_lines() -> None:
+    import io
+
+    from flywheel.workflow import _make_message_observer
+
+    buf = io.StringIO()
+    observer = _make_message_observer(EVENTS_PLAIN, out=buf)
+    assert observer is not None
+    for msg in _sdk_messages_sample():
+        observer(msg)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 4
+    assert "Write(file_path=hello.txt" in lines[1]
+
+
+def test_make_message_observer_json_writes_valid_ndjson() -> None:
+    import io
+
+    from flywheel.workflow import _make_message_observer
+
+    buf = io.StringIO()
+    observer = _make_message_observer(EVENTS_JSON, out=buf)
+    assert observer is not None
+    for msg in _sdk_messages_sample():
+        observer(msg)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 4
+    for line in lines:
+        record = json.loads(line)
+        assert "message_type" in record
+
+
+def test_make_message_observer_none_mode_returns_none() -> None:
+    import io
+
+    from flywheel.workflow import _make_message_observer
+
+    assert _make_message_observer(EVENTS_NONE, out=io.StringIO()) is None
+
+
+def test_make_claude_code_invoke_forwards_on_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default invoker threads ``on_message`` into ``invoke_iteration``
+    so the agent's turns can be observed live."""
+    import asyncio
+
+    import flywheel.workflow as workflow
+
+    captured: dict[str, object] = {}
+
+    async def _fake_invoke_iteration(**kwargs: object) -> IterationResult:
+        captured.update(kwargs)
+        return _verify_iteration()
+
+    monkeypatch.setattr(workflow, "invoke_iteration", _fake_invoke_iteration)
+
+    def _observer(_msg: Message) -> None:
+        pass
+
+    invoker = workflow._make_claude_code_invoke(
+        tmp_path / "sb", model=None, max_turns=5, on_message=_observer
+    )
+    request = InvocationRequest(
+        prompt="go", transcript_graders=(), attempt_number=1, iteration_number=1
+    )
+
+    async def _drive() -> None:
+        await invoker(request)
+
+    asyncio.run(_drive())
+    assert captured["on_message"] is _observer
+    assert captured["prompt"] == "go"

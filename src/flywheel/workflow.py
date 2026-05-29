@@ -65,7 +65,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    Message,
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 
 from flywheel.events import DomainEvent
 from flywheel.harness import (
@@ -79,7 +88,11 @@ from flywheel.harness import (
     recheck_blocked_lifecycle,
     run_task,
 )
-from flywheel.invoker import IterationResult, invoke_iteration
+from flywheel.invoker import (
+    IterationResult,
+    _serialize_sdk_message,
+    invoke_iteration,
+)
 from flywheel.lifecycle import Attempt, Lifecycle, Status
 from flywheel.loaders import TaskLoadError, load_task_file
 from flywheel.store_protocols import (
@@ -436,6 +449,120 @@ def _event_json_line(event: EventRecord) -> str:
     )
 
 
+def _format_tool_use(name: str, tool_input: Mapping[str, Any]) -> str:
+    """Render a tool call as ``name(k=v, ...)`` for the live stream."""
+    if tool_input:
+        kv = ", ".join(
+            f"{key}={_short(value, 40)}"
+            for key, value in list(tool_input.items())[:3]
+        )
+        return f"{name}({kv})"
+    return f"{name}()"
+
+
+def _summarize_assistant_blocks(content: Sequence[Any]) -> str:
+    """Join an assistant turn's text and tool calls into one readable line."""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, TextBlock):
+            text = block.text.strip()
+            if text:
+                parts.append(_short(text, 120))
+        elif isinstance(block, ToolUseBlock):
+            parts.append(_format_tool_use(block.name, block.input))
+    return "  ".join(p for p in parts if p) or "(no content)"
+
+
+def _summarize_user_content(content: object) -> str:
+    """Summarize a user turn — tool results (with size) or echoed text."""
+    if isinstance(content, str):
+        return _short(content, 120)
+    if not isinstance(content, Sequence):
+        return _short(content)
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, ToolResultBlock):
+            body = block.content
+            if isinstance(body, str):
+                size = len(body)
+            elif body is None:
+                size = 0
+            else:
+                size = len(json.dumps(body, default=str))
+            err = " ERR" if block.is_error else ""
+            parts.append(f"tool_result({size}B{err})")
+        elif isinstance(block, TextBlock):
+            text = block.text.strip()
+            if text:
+                parts.append(_short(text, 120))
+    return "  ".join(p for p in parts if p) or "(empty)"
+
+
+def _summarize_live_message(msg: Message) -> tuple[str, str]:
+    """Map an SDK message to a ``(LABEL, detail)`` pair for the live stream.
+
+    Reads the typed message objects directly (not the persisted JSON) so
+    tool calls render as ``Write(file_path=...)`` rather than a raw block
+    dict — the live stream has the real objects in hand.
+    """
+    if isinstance(msg, AssistantMessage):
+        return ("ASSISTANT", _summarize_assistant_blocks(msg.content))
+    if isinstance(msg, UserMessage):
+        return ("USER", _summarize_user_content(msg.content))
+    if isinstance(msg, ResultMessage):
+        cost = msg.total_cost_usd
+        cost_str = f" cost=${cost:.4f}" if isinstance(cost, float) else ""
+        return (
+            "RESULT",
+            f"subtype={msg.subtype} turns={msg.num_turns}{cost_str}",
+        )
+    # SystemMessage and any forward-compat type: label by class name. Avoid
+    # importing SystemMessage (not all SDK versions export it).
+    name = type(msg).__name__
+    if name == "SystemMessage":
+        subtype = getattr(msg, "subtype", None)
+        return ("SYSTEM", str(subtype) if subtype is not None else "")
+    return (name.upper(), "")
+
+
+def _format_live_message(msg: Message) -> str:
+    """One readable line for a live SDK message, aligned with event lines."""
+    label, detail = _summarize_live_message(msg)
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    tail = f"  {detail}" if detail else ""
+    return f"[{ts}] {label}{tail}"
+
+
+def _message_json_line(msg: Message) -> str:
+    """One NDJSON line for a live SDK message (the persisted serialization)."""
+    return json.dumps(_serialize_sdk_message(msg), sort_keys=True)
+
+
+def _make_message_observer(
+    events: str, *, out: TextIO
+) -> Callable[[Message], None] | None:
+    """Build the per-SDK-message stdout printer that interleaves with events.
+
+    Returns ``None`` for :data:`EVENTS_NONE`; a readable formatter for
+    :data:`EVENTS_PLAIN`; an NDJSON formatter for :data:`EVENTS_JSON`.
+    Prints to ``out`` so messages share the event stream and, because both
+    run on one event loop, land in true arrival order.
+    """
+    if events == EVENTS_NONE:
+        return None
+    if events == EVENTS_JSON:
+
+        def emit_json(msg: Message) -> None:
+            print(_message_json_line(msg), file=out, flush=True)
+
+        return emit_json
+
+    def emit_plain(msg: Message) -> None:
+        print(_format_live_message(msg), file=out, flush=True)
+
+    return emit_plain
+
+
 class _EventStreamingStore:
     """Wrap a :class:`HarnessStore` and emit each persisted telemetry event.
 
@@ -551,11 +678,16 @@ def _make_claude_code_invoke(
     *,
     model: str | None,
     max_turns: int,
+    on_message: Callable[[Message], None] | None = None,
 ) -> InvokeFunc:
     """Production invoker: real Claude Code spawned in ``sandbox``.
 
     Mirrors :func:`flywheel.examples.hello.example.make_claude_code_invoke`
     but with the broader tool surface a real engineering task needs.
+
+    ``on_message`` is forwarded to :func:`invoke_iteration` so the agent's
+    turns surface live as they arrive — the workflow CLI passes a renderer
+    here to stream them to stdout interleaved with harness events.
     """
     options = ClaudeAgentOptions(
         cwd=str(sandbox),
@@ -567,7 +699,9 @@ def _make_claude_code_invoke(
     )
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
-        return await invoke_iteration(prompt=request.prompt, options=options)
+        return await invoke_iteration(
+            prompt=request.prompt, options=options, on_message=on_message
+        )
 
     return _invoke
 
@@ -622,10 +756,14 @@ async def run_task_object(
     callable instead — same seam, different transport.
 
     ``events`` selects the live stdout stream: :data:`EVENTS_NONE` (silent),
-    :data:`EVENTS_PLAIN` (one readable line per event), or
-    :data:`EVENTS_JSON` (NDJSON). Diagnostics (``[workflow]`` lines) always
-    go to ``stream`` (stderr by default), kept separate from the event
-    stream on stdout.
+    :data:`EVENTS_PLAIN` (readable lines), or :data:`EVENTS_JSON` (NDJSON).
+    The stream interleaves harness telemetry events with the agent's own
+    turns (assistant text, tool calls, tool results) as they arrive — both
+    render on the one event loop, so the on-screen order is the true order.
+    When a caller injects its own ``invoke``, only events stream (live agent
+    turns come from the default invoker's observer). Diagnostics
+    (``[workflow]`` lines) always go to ``stream`` (stderr by default), kept
+    separate from the event stream on stdout.
 
     ``run_id`` selects fresh vs resume: ``None`` (default) starts a new
     lifecycle; passing an existing ``run_id`` makes ``run_task`` resume that
@@ -639,9 +777,17 @@ async def run_task_object(
         else Lifecycle(task_id=task.id, run_id=run_id)
     )
 
-    invoker = invoke or _make_claude_code_invoke(
-        sandbox, model=model, max_turns=max_turns
-    )
+    # The default invoker surfaces the agent's turns live via on_message;
+    # an injected invoke (tests, alternative agents) owns its own transport.
+    if invoke is not None:
+        invoker = invoke
+    else:
+        invoker = _make_claude_code_invoke(
+            sandbox,
+            model=model,
+            max_turns=max_turns,
+            on_message=_make_message_observer(events, out=sys.stdout),
+        )
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox.mkdir(parents=True, exist_ok=True)

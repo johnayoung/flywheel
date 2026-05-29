@@ -23,6 +23,14 @@ Contract surface (see ``docs/task-schema.md`` and ``flywheel/_schema/persistence
 
 The runner has no opinion about retry policy, lifecycle transitions, or
 which graders come after ``command`` — those are the harness's concern.
+
+Trust boundary: ``grader.run`` is executed with ``shell=True`` using the
+caller-supplied ``cwd`` / ``env`` (the harness passes the task sandbox as
+``cwd`` and inherits the worker environment when ``env`` is ``None``).
+A task file is therefore arbitrary code run as the worker, and the
+captured stdout/stderr are persisted verbatim — see ``docs/task-schema.md``
+for the operator-facing warning. The runner does not sandbox or redact;
+that is a deployment concern.
 """
 
 from __future__ import annotations

@@ -79,6 +79,15 @@ from flywheel.workflow import (
 # generous so a normal run finishes well within it; the heartbeat renews at
 # roughly a third of it, so a crashed worker's lease lapses within ~one
 # window of its death and the task becomes reclaimable.
+#
+# Lease expiry is compared against a wall clock (datetime.now), and the
+# ``now`` each worker injects is its own host clock -- there is no shared or
+# monotonic time source across hosts. So ``lease_seconds`` must comfortably
+# exceed (max cross-host clock skew + the longest a healthy worker can go
+# between heartbeat renewals); otherwise a worker with a fast clock can treat
+# a live peer's lease as expired and steal it. The steal is contained (see
+# _drive_or_relinquish) but wastes the preempted work. Tighten only with NTP
+# discipline across the fleet.
 DEFAULT_LEASE_SECONDS: float = 300.0
 
 

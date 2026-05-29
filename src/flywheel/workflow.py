@@ -1284,7 +1284,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Task-claim lease window in seconds (default: 300). A live lease "
             "is renewed by a heartbeat while the task runs; a crashed "
             "worker's lease lapses after this window so the task is "
-            "reclaimable."
+            "reclaimable. Expiry uses each host's wall clock, so set this "
+            "well above (max cross-host clock skew + max heartbeat gap) or a "
+            "fast-clocked worker may steal a live peer's lease."
         ),
     )
     p_orchestrate.set_defaults(func=_cmd_orchestrate)

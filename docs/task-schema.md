@@ -58,6 +58,15 @@ The general workhorse. Tests, lint, typecheck, build, custom scripts, filesystem
 { "type": "command", "run": "uv run pytest tests/http", "name": "tests" }
 ```
 
+**Security: a task file is executable code.** `run` is executed with
+`shell=True` in the agent's sandbox, inheriting the worker's full
+environment (including any API keys). Loading and running a task is
+equivalent to running its `run` strings as the worker. The grader's
+stdout/stderr are persisted verbatim and unredacted to the store and
+artifact files, so a `run` that prints secrets durably captures them.
+Only run task files you trust, and keep deployment secrets out of the
+worker's environment.
+
 ### `rubric` — LLM-judged semantic check
 
 Natural-language assertions evaluated by a separate LLM call against the goal, diff, and execution artifacts. Use for intent-level checks that deterministic commands cannot express.

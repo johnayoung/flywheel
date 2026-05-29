@@ -1147,11 +1147,17 @@ def test_replay_of_domain_events_equals_loaded_projection(
     assert loaded == folded
 
 
-def test_domain_events_interleave_with_telemetry_in_audit_stream(
+def test_domain_events_share_the_event_log_but_not_the_audit_stream(
     store: object,
 ) -> None:
     """Domain and telemetry events share the events table and the per-run
-    sequence, so the audit stream is one totally-ordered log."""
+    sequence counter, but the audit stream (and list_events) surface only
+    telemetry rows. Domain events are read back via list_domain_events.
+
+    Keeping the audit stream telemetry-only is deliberate for this phase:
+    state-bearing domain events advance the per-run sequence (so ordering
+    stays coherent) without changing the existing observability surface.
+    """
     assert isinstance(store, DomainEventStore)
     assert isinstance(store, EventStore)
     assert isinstance(store, AuditStore)
@@ -1164,16 +1170,22 @@ def test_domain_events_interleave_with_telemetry_in_audit_stream(
         expected_version=1,
     )
 
+    # The audit stream shows only the telemetry event, not the seed or the
+    # transition (both domain).
     records = store.read_audit_since("r1", 0)
-    # The seed, the telemetry event, and the domain transition are all here.
     kinds = [r.kind for r in records if isinstance(r, EventRecord)]
-    assert "lifecycle_initialized" in kinds
-    assert "harness.attempt_started" in kinds
-    assert "transitioned_to" in kinds
-    categories = {
-        r.kind: r.category for r in records if isinstance(r, EventRecord)
-    }
-    assert categories["harness.attempt_started"] == "telemetry"
-    assert categories["transitioned_to"] == "domain"
-    seqs = [r.sequence for r in records]
-    assert seqs == sorted(seqs)
+    assert kinds == ["harness.attempt_started"]
+    assert all(
+        r.category == "telemetry"
+        for r in records
+        if isinstance(r, EventRecord)
+    )
+
+    # Domain events are read back through the dedicated, typed accessor.
+    domain_kinds = [type(e).__name__ for e in store.list_domain_events("r1")]
+    assert domain_kinds == ["LifecycleInitialized", "TransitionedTo"]
+
+    # But they did advance the shared per-run sequence: the telemetry event
+    # landed at sequence 2 (after the seed at 1), and the transition at 3.
+    telemetry = [r for r in records if isinstance(r, EventRecord)]
+    assert telemetry[0].sequence == 2

@@ -43,6 +43,7 @@ from flywheel import (
     Status,
     Task,
     TranscriptGrader,
+    replay,
     run_task,
 )
 from flywheel.grader_rubric import (
@@ -353,9 +354,12 @@ class TestRetryPolicy:
     def test_retry_eligibility_delegates_to_lifecycle(self) -> None:
         """``Lifecycle.is_retry_eligible`` is the single source of truth.
 
-        Bumping ``Lifecycle.retries`` past ``max_retries`` (simulated by
-        a prior failed run) makes a fresh failure terminal without the
-        harness reimplementing the rule.
+        With no retry budget (``max_retries=0``), the first validation
+        failure is terminal: ``retries`` (0) is not ``< max_retries`` (0),
+        so the harness routes to ``FAILED`` without reimplementing the
+        rule. (Under event sourcing ``retries`` accumulates only via real
+        retry edges in the log, so exhaustion is expressed through the
+        budget rather than a constructor-injected count.)
         """
         store = InMemoryStore()
         task = Task(
@@ -366,7 +370,7 @@ class TestRetryPolicy:
                 )
             ],
         )
-        lifecycle = Lifecycle(task_id="t1", run_id="run-elig", retries=2)
+        lifecycle = Lifecycle(task_id="t1", run_id="run-elig")
         invoke = _scripted_invoker(
             [
                 _iteration(
@@ -375,7 +379,7 @@ class TestRetryPolicy:
                 )
             ]
         )
-        config = HarnessConfig(max_retries=2)  # retries (2) >= max (2) — exhausted.
+        config = HarnessConfig(max_retries=0)  # retries (0) >= max (0) — exhausted.
 
         outcome = _run(
             run_task(task, lifecycle, store, config=config, invoke=invoke)
@@ -1550,12 +1554,56 @@ class TestInterleavedAuditSequence:
         sdk = store.list_sdk_messages(lifecycle.run_id)
         all_seqs = [e.sequence for e in events] + [m.sequence for m in sdk]
         assert all(s is not None for s in all_seqs)
-        # Strictly ascending across both record types.
+        # Strictly ascending and unique across both record types: the
+        # telemetry events and SDK messages share one per-run counter.
         deduped = sorted(set(all_seqs))
         assert deduped == sorted(all_seqs)
         assert len(deduped) == len(all_seqs)
-        # The earliest sequence is 1; no gaps.
-        assert deduped == list(range(1, len(deduped) + 1))
+        # The counter is also shared with state-bearing domain events
+        # (transitions, attempt start/finalize), which the audit stream
+        # does not surface — so the telemetry/SDK sequences are strictly
+        # ascending but not contiguous from 1.
+        domain = store.list_domain_events(lifecycle.run_id)
+        domain_seqs = [e.sequence for e in domain]
+        assert domain_seqs  # the run produced domain events
+        # No sequence value is shared between the two partitions.
+        assert set(domain_seqs).isdisjoint(set(all_seqs))
+
+    def test_harness_domain_log_replays_to_the_stored_lifecycle(
+        self,
+    ) -> None:
+        """End-to-end determinism oracle: folding the domain-event log the
+        harness produced reconstructs the persisted lifecycle exactly. This
+        is the event-sourcing guarantee at the harness level — state is the
+        fold of the log, with no separate authoritative row."""
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-oracle")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        assert outcome.lifecycle.status is Status.DONE
+
+        loaded = store.load_lifecycle("run-oracle")
+        folded = replay(store.list_domain_events("run-oracle"))
+        assert loaded == folded
+        # version is the domain-event offset.
+        assert loaded is not None
+        assert loaded.version == len(store.list_domain_events("run-oracle"))
 
 
 class TestStrictAuditFailure:

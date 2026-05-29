@@ -73,6 +73,14 @@ from flywheel.grader_transcript import (
     run_transcript_graders,
     total_tokens_from_usage,
 )
+from flywheel.events import (
+    AttemptFinalized,
+    AttemptStarted,
+    Blocked,
+    DomainEvent,
+    LifecycleInitialized,
+    TransitionedTo,
+)
 from flywheel.invoker import (
     IterationResult,
     _serialize_sdk_message,
@@ -119,6 +127,15 @@ class HarnessStore(Protocol):
     ) -> None: ...
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle: ...
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]: ...
 
     def save_attempt(self, run_id: str, attempt: Attempt) -> None: ...
 
@@ -257,6 +274,33 @@ async def _default_invoke(request: InvocationRequest) -> IterationResult:
     return await invoke_iteration(prompt=request.prompt)
 
 
+def _append(
+    lifecycle: Lifecycle,
+    event: DomainEvent,
+    *,
+    store: HarnessStore,
+) -> None:
+    """Append one domain event and re-sync the in-memory lifecycle.
+
+    This is the single authoritative state-write seam. The store folds
+    ``event`` onto the persisted projection, advances the lifecycles /
+    attempts projections, and appends the event row in one atomic unit;
+    the returned :class:`Lifecycle` is the new source-of-truth state.
+    The caller's in-memory ``lifecycle`` is reconciled from it (including
+    the version, which is the optimistic-concurrency key for the next
+    append) so a subsequent ``_append`` presents the right
+    ``expected_version``.
+
+    State and timeline can no longer diverge: there is no separate
+    "mutate row, then emit event" pair — the append *is* the transition.
+    """
+    folded = store.append_domain_event(
+        event, expected_version=lifecycle.version
+    )
+    lifecycle.replace_from(folded)
+    lifecycle.attempts = list(folded.attempts)
+
+
 def _transition(
     lifecycle: Lifecycle,
     target: Status,
@@ -265,18 +309,27 @@ def _transition(
     error: str = "",
     now: Callable[[], datetime] | None = None,
 ) -> None:
-    """Apply one lifecycle transition and persist it under optimistic
-    concurrency.
+    """Apply one lifecycle transition by appending a ``TransitionedTo``
+    domain event.
 
-    Centralized so every state change in the harness goes through the
-    same code path. :meth:`Lifecycle.transition_to` increments
-    ``lifecycle.version``; ``expected_version`` is the *prior* version,
-    matching the store's contract.
+    Centralized so every status change in the harness goes through the
+    same event-sourced path. The signature is unchanged from the
+    pre-event-sourcing version so every call site is untouched; the body
+    now appends a domain event (which folds the legal-edge, retry-counter,
+    and blocked-snapshot-clear rules) instead of mutating the row and
+    issuing a separate ``update_lifecycle``.
     """
-    expected_version = lifecycle.version
     clock = now or _utcnow
-    lifecycle.transition_to(target, error=error, now=clock())
-    store.update_lifecycle(lifecycle, expected_version=expected_version)
+    _append(
+        lifecycle,
+        TransitionedTo(
+            run_id=lifecycle.run_id,
+            ts=clock(),
+            target=target,
+            error=error,
+        ),
+        store=store,
+    )
 
 
 class _AuditWriteError(Exception):
@@ -414,11 +467,25 @@ def _handle_audit_failure(
         best_effort=True,
     )
     if attempt is not None and attempt.ended_at is None:
-        attempt.ended_at = clock()
+        ended_at = clock()
+        attempt.ended_at = ended_at
         attempt.outcome = Outcome.INTERNAL_ERROR
         attempt.error = error
         try:
-            store.save_attempt(lifecycle.run_id, attempt)
+            _append(
+                lifecycle,
+                AttemptFinalized(
+                    run_id=lifecycle.run_id,
+                    ts=ended_at,
+                    attempt_number=attempt.number,
+                    number=attempt.number,
+                    outcome=Outcome.INTERNAL_ERROR,
+                    ended_at=ended_at,
+                    agent_output=attempt.agent_output,
+                    error=error,
+                ),
+                store=store,
+            )
         except Exception:
             pass
     try:
@@ -888,7 +955,9 @@ async def run_task(
     pre-built :class:`IterationResult` instances.
 
     **Entry ordering and resume reconciliation.** The first store
-    interaction is :meth:`HarnessStore.create_lifecycle`; any
+    interaction appends a
+    :class:`~flywheel.events.LifecycleInitialized` domain event, which
+    creates the lifecycle projection as its side effect; any
     :class:`LifecycleAlreadyExistsError` (the resume case) is swallowed
     so we fall through to a follow-up
     :meth:`HarnessStore.load_lifecycle`. The persisted row wins: on
@@ -922,11 +991,14 @@ async def run_task(
     surfaces to the caller verbatim — not swallowed — so the worker
     learns its run_id is racing.
 
-    **Remaining gap.** If :meth:`HarnessStore.create_lifecycle` itself
-    fails (catastrophic schema breakage that the INSERT cannot satisfy)
-    no lifecycle row can exist and ``harness.crash`` cannot foreign-key
-    against ``run_id``. That exception propagates straight to the
-    caller; the worker-side circuit breaker (separate task) covers the
+    **Pre-lifecycle crashes.** Under event sourcing the projection row is
+    created by the very first append (the ``LifecycleInitialized`` event),
+    so there is no window in which events exist before the row — the
+    silent-crash shape documented in
+    ``.workflow/audits/08-recoverable-blocked-lifecycles.md`` is closed by
+    construction. If that first append itself fails (catastrophic store
+    breakage), the exception propagates straight to the caller with no
+    partial state to reconcile; the worker-side circuit breaker covers the
     repeating-spawn shape.
     """
 
@@ -935,14 +1007,24 @@ async def run_task(
     clock = now or _utcnow
     mclock = monotonic or _default_monotonic
 
-    # Ensure the lifecycle row exists as the first store interaction.
-    # Create-then-swallow is the defensive shape: a load-time failure
-    # (e.g. OperationalError on schema drift) would otherwise leave the
-    # run with zero rows across lifecycles/attempts/events, which the
-    # audit at .workflow/audits/08-recoverable-blocked-lifecycles.md
-    # documents as the silent-crash shape we are closing here.
+    # Seed the lifecycle by appending the first domain event. Under event
+    # sourcing the lifecycle row *is* the projection of this event, so the
+    # log and the row come into existence together — there is no window in
+    # which events could exist before the row (the silent pre-lifecycle
+    # crash shape that .workflow/audits/08-recoverable-blocked-lifecycles.md
+    # documents). Append-then-swallow is the defensive resume shape.
     try:
-        store.create_lifecycle(lifecycle)
+        _append(
+            lifecycle,
+            LifecycleInitialized(
+                run_id=lifecycle.run_id,
+                ts=clock(),
+                task_id=lifecycle.task_id,
+                worker_id=lifecycle.worker_id,
+                artifacts_dir=lifecycle.artifacts_dir,
+            ),
+            store=store,
+        )
     except LifecycleAlreadyExistsError:
         # Resume case: the row was persisted by a prior run_task call
         # (or by the workflow CLI's resume path). Fall through to the
@@ -1095,7 +1177,19 @@ async def _run_attempt(
         run_id=lifecycle.run_id,
         agent_context=dict(config.agent_context),
     )
-    store.save_attempt(lifecycle.run_id, attempt)
+    _append(
+        lifecycle,
+        AttemptStarted(
+            run_id=lifecycle.run_id,
+            ts=started_at,
+            attempt_number=attempt_number,
+            number=attempt_number,
+            attempt_run_id=lifecycle.run_id,
+            started_at=started_at,
+            agent_context=dict(config.agent_context),
+        ),
+        store=store,
+    )
     try:
         _emit(
             store,
@@ -1306,12 +1400,6 @@ async def _run_attempt_body(
 
             reason = envelope.reason or "agent reported blocked intent"
             requires_payload = _serialize_requires(envelope.requires)
-            # Persist the structured snapshot on the lifecycle row before
-            # the transition so the update_lifecycle write inside
-            # _transition picks up the new field atomically with the
-            # status change. Lifecycle.transition_to clears this field on
-            # every -> READY edge (recheck, retry, normalization).
-            lifecycle.blocked_requires_json = json.dumps(requires_payload)
             _finalize_attempt(
                 store=store,
                 lifecycle=lifecycle,
@@ -1320,6 +1408,21 @@ async def _run_attempt_body(
                 error=reason,
                 agent_output=iteration_result.transcript,
                 clock=clock,
+            )
+            # Persist the structured snapshot as a Blocked domain event
+            # before the INTERRUPTED transition so the projection carries
+            # blocked_requires_json when the status change lands. The
+            # reducer clears this field on every -> READY edge (recheck,
+            # retry, normalization), centralized in Lifecycle.
+            _append(
+                lifecycle,
+                Blocked(
+                    run_id=lifecycle.run_id,
+                    ts=clock(),
+                    attempt_number=attempt_number,
+                    requires_json=json.dumps(requires_payload),
+                ),
+                store=store,
             )
             _emit(
                 store,
@@ -1864,13 +1967,33 @@ def _finalize_attempt(
     clock: Callable[[], datetime],
     agent_output: str = "",
 ) -> None:
-    """Persist the Attempt's terminal fields and emit the finalization event."""
-    attempt.ended_at = clock()
+    """Persist the Attempt's terminal fields and emit the finalization event.
+
+    The terminal write is an ``AttemptFinalized`` domain event: it closes
+    the attempt projection and folds the lifecycle's ``agent_output`` in
+    one atomic append. The in-memory ``attempt`` object is kept in sync for
+    any local reads, but the event is the source of truth.
+    """
+    ended_at = clock()
+    attempt.ended_at = ended_at
     attempt.outcome = outcome
     attempt.error = error
     if agent_output:
         attempt.agent_output = agent_output
-    store.save_attempt(lifecycle.run_id, attempt)
+    _append(
+        lifecycle,
+        AttemptFinalized(
+            run_id=lifecycle.run_id,
+            ts=ended_at,
+            attempt_number=attempt.number,
+            number=attempt.number,
+            outcome=outcome,
+            ended_at=ended_at,
+            agent_output=agent_output,
+            error=error,
+        ),
+        store=store,
+    )
     _emit(
         store,
         run_id=lifecycle.run_id,
@@ -1922,10 +2045,24 @@ def finalize_stranded_lifecycle(
         else (attempts[-1].number if attempts else None)
     )
     for attempt in open_attempts:
-        attempt.ended_at = clock()
+        ended_at = clock()
+        attempt.ended_at = ended_at
         attempt.outcome = Outcome.INTERNAL_ERROR
         attempt.error = reason
-        store.save_attempt(run_id, attempt)
+        _append(
+            lifecycle,
+            AttemptFinalized(
+                run_id=run_id,
+                ts=ended_at,
+                attempt_number=attempt.number,
+                number=attempt.number,
+                outcome=Outcome.INTERNAL_ERROR,
+                ended_at=ended_at,
+                agent_output=attempt.agent_output,
+                error=reason,
+            ),
+            store=store,
+        )
         _emit(
             store,
             run_id=run_id,

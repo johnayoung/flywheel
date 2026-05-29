@@ -38,6 +38,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from flywheel import (
     Attempt,
     CommandGrader,
+    DomainEvent,
     EventRecord,
     GraderResultRecord,
     HarnessConfig,
@@ -173,6 +174,19 @@ class _EventStreamingStore:
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None:
         return self._wrapped.load_lifecycle(run_id)
+
+    def append_domain_event(
+        self,
+        event: DomainEvent,
+        *,
+        expected_version: int,
+    ) -> Lifecycle:
+        return self._wrapped.append_domain_event(
+            event, expected_version=expected_version
+        )
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        return self._wrapped.list_domain_events(run_id)
 
     def save_attempt(self, run_id: str, attempt: Attempt) -> None:
         self._wrapped.save_attempt(run_id, attempt)

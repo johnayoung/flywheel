@@ -549,7 +549,7 @@ class SqliteStore:
             SELECT id, run_id, attempt_number, ts, kind, payload_json,
                    sequence, category
             FROM events
-            WHERE run_id = ?
+            WHERE run_id = ? AND category = 'telemetry'
             ORDER BY ts, id
             """,
             (run_id,),
@@ -627,7 +627,7 @@ class SqliteStore:
             SELECT id, run_id, attempt_number, ts, kind, payload_json,
                    sequence, category
             FROM events
-            WHERE run_id = ? AND sequence > ?
+            WHERE run_id = ? AND sequence > ? AND category = 'telemetry'
             ORDER BY sequence
             LIMIT ?
             """,

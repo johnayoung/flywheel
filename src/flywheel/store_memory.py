@@ -329,7 +329,11 @@ class InMemoryStore:
         return _clone_event(record)
 
     def list_events(self, run_id: str) -> list[EventRecord]:
-        rows = [e for e in self._events if e.run_id == run_id]
+        rows = [
+            e
+            for e in self._events
+            if e.run_id == run_id and e.category == "telemetry"
+        ]
         rows.sort(key=lambda e: (e.ts, e.id if e.id is not None else 0))
         return [_clone_event(e) for e in rows]
 
@@ -377,6 +381,8 @@ class InMemoryStore:
         merged: list[AuditRecord] = []
         for e in self._events:
             if e.run_id != run_id or e.sequence is None:
+                continue
+            if e.category != "telemetry":
                 continue
             if e.sequence > cursor:
                 merged.append(_clone_event(e))

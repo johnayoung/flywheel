@@ -822,7 +822,7 @@ class PostgresStore:
                     SELECT id, run_id, attempt_number, ts, kind,
                            payload_json, sequence, category
                     FROM events
-                    WHERE run_id = %s
+                    WHERE run_id = %s AND category = 'telemetry'
                     ORDER BY ts, id
                     """,
                     (run_id,),
@@ -912,6 +912,7 @@ class PostgresStore:
                            payload_json, sequence, category
                     FROM events
                     WHERE run_id = %s AND sequence > %s
+                      AND category = 'telemetry'
                     ORDER BY sequence
                     LIMIT %s
                     """,

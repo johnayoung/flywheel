@@ -35,9 +35,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, is_dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from flywheel.lifecycle import Status
 from flywheel.notifier import RunNotifier
@@ -47,6 +47,25 @@ from flywheel.store_protocols import (
     EventRecord,
     SdkMessageRecord,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class EventHandler(Protocol):
+    """A read-only subscriber to the per-run audit stream.
+
+    Handlers receive each :class:`AuditRecord` in ascending ``sequence``
+    order and return nothing. They observe only committed state and are
+    handed no store or lifecycle handle, so a subscriber cannot mutate
+    authoritative state — the harness remains the sole owner of
+    transitions. A handler that raises is isolated (see
+    :class:`Subscription`); it never breaks the dispatcher or other
+    subscribers.
+    """
+
+    def on_record(self, record: AuditRecord) -> None: ...
 
 
 # Terminal lifecycle states for the follow loop's exit predicate. Mirrors
@@ -239,13 +258,29 @@ def stream(
     )
 
 
-class AuditLoggerHandle:
-    """Handle returned by :func:`attach_logger`.
+class Subscription:
+    """A background follower that dispatches each audit record to a handler.
 
-    Holds the background daemon thread and a stop flag. ``detach()``
-    flips the flag, the thread finishes the current page, and the
-    handle joins it with a short timeout so callers don't hang on a
-    sleeping consumer.
+    Spawns one daemon thread that drains the run's backlog, then follows
+    the live stream (reusing :func:`_follow`, so it consumes notifier push
+    wakeups with poll as the bounded fallback). Each record is handed to
+    ``handler`` in ascending ``sequence`` order.
+
+    **Error isolation.** Every ``handler`` call is wrapped: a raising
+    handler is reported (via ``on_error`` if supplied, else logged at
+    WARNING) and the dispatcher continues to the next record. A faulty
+    subscriber therefore never breaks the follow loop. Because each
+    subscription owns its own thread, it also cannot affect sibling
+    subscribers. This mirrors the harness's best-effort audit discipline.
+
+    **Read-only.** The handler receives only the :class:`AuditRecord`; it
+    is given no store or lifecycle handle, so it cannot mutate authoritative
+    state. The harness stays the sole owner of transitions.
+
+    **Lifecycle.** The thread exits on its own when the lifecycle reaches a
+    terminal status (and the final drain is empty) or when the ``run_id``
+    is unknown. :meth:`unsubscribe` stops it early and joins with a short
+    timeout so a slow handler cannot block the caller indefinitely.
     """
 
     _JOIN_TIMEOUT_SECONDS: float = 1.0
@@ -255,33 +290,28 @@ class AuditLoggerHandle:
         *,
         run_id: str,
         store: AuditStore,
-        logger: logging.Logger,
-        poll_interval: float,
+        handler: Callable[[AuditRecord], None],
+        poll_interval: float = 0.25,
+        on_error: Callable[[AuditRecord, BaseException], None] | None = None,
     ) -> None:
         self._run_id = run_id
         self._store = store
-        self._logger = logger
+        self._handler = handler
         self._poll_interval = poll_interval
+        self._on_error = on_error
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
-            name=f"flywheel-audit-logger-{run_id}",
+            name=f"flywheel-subscription-{run_id}",
             daemon=True,
         )
         self._thread.start()
 
     def _run(self) -> None:
-        """Background loop: drain pages and emit one LogRecord per row.
-
-        Shares the initial drain and the :func:`_follow` loop with
-        :func:`stream`, passing its stop flag so ``detach()`` cancels the
-        loop (and its waits) cooperatively. The stop flag is also checked
-        between emits so a large drained batch does not delay cancellation.
-        """
         cursor = 0
         drained, cursor = _drain(self._store, self._run_id, cursor)
         for record in drained:
-            self._emit(record)
+            self._dispatch(record)
             if self._stop_event.is_set():
                 return
         if self._stop_event.is_set():
@@ -293,9 +323,113 @@ class AuditLoggerHandle:
             poll_interval=self._poll_interval,
             stop=self._stop_event,
         ):
-            self._emit(record)
+            self._dispatch(record)
             if self._stop_event.is_set():
                 return
+
+    def _dispatch(self, record: AuditRecord) -> None:
+        try:
+            self._handler(record)
+        except Exception as exc:  # noqa: BLE001 - isolation is the point
+            if self._on_error is not None:
+                try:
+                    self._on_error(record, exc)
+                except Exception:  # noqa: BLE001 - never let on_error loop
+                    pass
+            else:
+                _LOGGER.warning(
+                    "audit subscriber for run=%s raised on seq=%s: %s: %s",
+                    self._run_id,
+                    _record_sequence(record),
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def unsubscribe(self) -> None:
+        """Stop the background dispatcher and join its thread.
+
+        Idempotent: calling it after the thread has exited is a no-op. The
+        join uses a short timeout so a thread stuck in a slow handler does
+        not block the caller indefinitely. When the store exposes a
+        notifier, the dispatcher may be parked in a (possibly long) wait;
+        ``wake`` nudges it so it re-checks the stop flag and exits promptly
+        regardless of ``poll_interval``.
+        """
+        self._stop_event.set()
+        notifier = _resolve_notifier(self._store)
+        if notifier is not None:
+            notifier.wake(self._run_id)
+        if self._thread.is_alive():
+            self._thread.join(timeout=self._JOIN_TIMEOUT_SECONDS)
+
+    @property
+    def is_alive(self) -> bool:
+        """Whether the background thread is still running."""
+        return self._thread.is_alive()
+
+
+def subscribe(
+    handler: EventHandler | Callable[[AuditRecord], None],
+    *,
+    run_id: str,
+    store: AuditStore,
+    poll_interval: float = 0.25,
+    on_error: Callable[[AuditRecord, BaseException], None] | None = None,
+) -> Subscription:
+    """Subscribe ``handler`` to ``run_id``'s audit stream.
+
+    ``handler`` may be an :class:`EventHandler` (an object with
+    ``on_record``) or a plain ``Callable[[AuditRecord], None]``. The
+    subscriber runs on its own daemon thread, observes records in
+    ``sequence`` order, and is isolated: a raising handler is reported and
+    the stream continues. Returns a :class:`Subscription` whose
+    ``unsubscribe()`` stops and joins the thread.
+
+    Plugins register here without touching the harness and cannot corrupt
+    lifecycle state — they only read committed records.
+    """
+    if isinstance(handler, EventHandler):
+        callback: Callable[[AuditRecord], None] = handler.on_record
+    elif callable(handler):
+        callback = handler
+    else:  # pragma: no cover - guarded by the type signature
+        raise TypeError(
+            "handler must be an EventHandler or a callable taking one "
+            "AuditRecord"
+        )
+    return Subscription(
+        run_id=run_id,
+        store=store,
+        handler=callback,
+        poll_interval=poll_interval,
+        on_error=on_error,
+    )
+
+
+class AuditLoggerHandle(Subscription):
+    """Handle returned by :func:`attach_logger`.
+
+    Thin back-compat shim over :class:`Subscription`: ``detach()`` is an
+    alias for :meth:`Subscription.unsubscribe`. Holds the background daemon
+    thread and a stop flag; stopping joins the thread with a short timeout
+    so callers don't hang on a sleeping consumer.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        store: AuditStore,
+        logger: logging.Logger,
+        poll_interval: float,
+    ) -> None:
+        self._logger = logger
+        super().__init__(
+            run_id=run_id,
+            store=store,
+            handler=self._emit,
+            poll_interval=poll_interval,
+        )
 
     def _emit(self, record: AuditRecord) -> None:
         kind = _record_kind(record)
@@ -308,21 +442,9 @@ class AuditLoggerHandle:
         )
 
     def detach(self) -> None:
-        """Stop the background emitter and join the thread.
-
-        Idempotent: calling ``detach()`` after the thread has already
-        exited is a no-op. The join uses a short timeout so a thread
-        stuck in a slow logger handler does not block the caller
-        indefinitely.
-        """
-        self._stop_event.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=self._JOIN_TIMEOUT_SECONDS)
-
-    @property
-    def is_alive(self) -> bool:
-        """Whether the background thread is still running."""
-        return self._thread.is_alive()
+        """Stop the background emitter and join the thread (alias for
+        :meth:`Subscription.unsubscribe`)."""
+        self.unsubscribe()
 
 
 def attach_logger(
@@ -334,16 +456,17 @@ def attach_logger(
 ) -> AuditLoggerHandle:
     """Emit every audit record for ``run_id`` through ``logger``.
 
-    Spawns a daemon thread that follows the audit stream and calls
-    ``logger.log(logging.INFO, msg, extra={'audit_record': ...})`` for
-    each record. ``msg`` is a short human-readable label of the form
-    ``audit run=<id> seq=<n> kind=<k>``; structured fields live in the
-    ``extra`` dict so handlers can route them to JSON sinks.
+    A convenience subscriber: spawns a daemon thread that follows the
+    audit stream and calls ``logger.log(logging.INFO, msg,
+    extra={'audit_record': ...})`` for each record. ``msg`` is a short
+    human-readable label of the form ``audit run=<id> seq=<n> kind=<k>``;
+    structured fields live in the ``extra`` dict so handlers can route
+    them to JSON sinks.
 
     The returned handle's ``detach()`` stops emission and joins the
     thread. There are no global side effects: calling ``attach_logger``
-    twice with the same logger returns distinct handles, each owning
-    its own thread.
+    twice with the same logger returns distinct handles, each owning its
+    own thread. Equivalent to :func:`subscribe` with a logging handler.
     """
     return AuditLoggerHandle(
         run_id=run_id,
@@ -378,6 +501,9 @@ def _record_as_dict(record: AuditRecord) -> dict[str, Any]:
 __all__ = [
     "AuditLoggerHandle",
     "AuditRecord",
+    "EventHandler",
+    "Subscription",
     "attach_logger",
     "stream",
+    "subscribe",
 ]

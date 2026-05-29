@@ -79,6 +79,18 @@ class RunNotifier:
             state.cond.wait(timeout)
             return state.watermark
 
+    def wake(self, run_id: str) -> None:
+        """Wake any waiters on ``run_id`` without advancing the watermark.
+
+        Used to make a blocked consumer re-check a condition other than the
+        watermark — e.g. its own stop flag — promptly, so cancellation does
+        not have to wait out the consumer's timeout. A woken ``wait``
+        returns the unchanged watermark.
+        """
+        state = self._state(run_id)
+        with state.cond:
+            state.cond.notify_all()
+
     def forget(self, run_id: str) -> None:
         """Drop the cached state for ``run_id`` to bound memory.
 

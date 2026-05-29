@@ -2,8 +2,11 @@ from typing import TYPE_CHECKING
 
 from flywheel.audit import (
     AuditLoggerHandle,
+    EventHandler,
+    Subscription,
     attach_logger,
     stream,
+    subscribe,
 )
 from flywheel.envelope import (
     CLOSING_FENCE,
@@ -181,6 +184,7 @@ __all__ = [
     "DuplicateEnvelope",
     "EnvVarSetRequirement",
     "EnvelopeResult",
+    "EventHandler",
     "EventRecord",
     "EventReplayError",
     "EventStore",
@@ -229,6 +233,7 @@ __all__ = [
     "Strategy",
     "StrategyContext",
     "StrategyResult",
+    "Subscription",
     "Task",
     "TaskLoadError",
     "ToolInteraction",
@@ -261,5 +266,6 @@ __all__ = [
     "run_task",
     "run_transcript_graders",
     "stream",
+    "subscribe",
     "total_tokens_from_usage",
 ]

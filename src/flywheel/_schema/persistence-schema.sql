@@ -152,6 +152,22 @@ CREATE TABLE IF NOT EXISTS run_sequence (
   next_seq  INTEGER NOT NULL
 );
 
+-- task_claims: multi-worker mutual exclusion. At most one row per task_id;
+-- a worker acquires the row (when free, expired, or already its own) before
+-- running the task and releases it on completion. lease_expires_at is the
+-- liveness signal: a crashed worker's claim is reclaimable once its lease
+-- lapses. version drives optimistic concurrency for renew/release so a
+-- worker whose claim was stolen (lease expired, another worker took over)
+-- learns it lost. Added additively — CREATE TABLE IF NOT EXISTS materializes
+-- it on existing databases without a schema_version bump.
+CREATE TABLE IF NOT EXISTS task_claims (
+  task_id          TEXT PRIMARY KEY,
+  worker_id        TEXT NOT NULL,
+  claimed_at       DATETIME NOT NULL,
+  lease_expires_at DATETIME NOT NULL,
+  version          INTEGER NOT NULL
+);
+
 -- schema_version pins the on-disk schema. The CHECK clause forces a
 -- single sentinel row at id = 1 so ``INSERT OR IGNORE`` is a true upsert
 -- against re-bootstrap; stores compare ``version`` on open and refuse

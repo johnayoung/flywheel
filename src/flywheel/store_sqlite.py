@@ -35,7 +35,7 @@ import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
 from pathlib import Path
@@ -55,6 +55,7 @@ from flywheel.notifier import RunNotifier
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
+    ClaimLostError,
     ClaudeSessionEntry,
     EventRecord,
     GraderResultRecord,
@@ -64,6 +65,7 @@ from flywheel.store_protocols import (
     OptimisticConcurrencyError,
     SdkMessageRecord,
     StoreSchemaError,
+    TaskClaim,
 )
 
 # Page size for ``read_audit_since``: a cursor-based reader can keep
@@ -770,6 +772,119 @@ class SqliteStore:
             (project_key, session_id, subpath),
         ).fetchall()
         return [_row_to_session_entry(r) for r in rows]
+
+    # --- ClaimStore -------------------------------------------------------
+
+    def acquire_claim(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        now: datetime,
+        lease_seconds: float,
+    ) -> TaskClaim | None:
+        lease_expires = now + timedelta(seconds=lease_seconds)
+        # BEGIN IMMEDIATE so the read-then-write is atomic: two workers
+        # racing the same task cannot both observe it free.
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT worker_id, lease_expires_at, version "
+                "FROM task_claims WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                self._connection.execute(
+                    "INSERT INTO task_claims (task_id, worker_id, "
+                    "claimed_at, lease_expires_at, version) "
+                    "VALUES (?, ?, ?, ?, 1)",
+                    (task_id, worker_id, _iso(now), _iso(lease_expires)),
+                )
+                return TaskClaim(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    claimed_at=now,
+                    lease_expires_at=lease_expires,
+                    version=1,
+                )
+            existing_expires = _parse_iso(row["lease_expires_at"])
+            assert existing_expires is not None
+            if existing_expires > now and row["worker_id"] != worker_id:
+                return None
+            new_version = int(row["version"]) + 1
+            self._connection.execute(
+                "UPDATE task_claims SET worker_id = ?, claimed_at = ?, "
+                "lease_expires_at = ?, version = ? WHERE task_id = ?",
+                (
+                    worker_id,
+                    _iso(now),
+                    _iso(lease_expires),
+                    new_version,
+                    task_id,
+                ),
+            )
+            return TaskClaim(
+                task_id=task_id,
+                worker_id=worker_id,
+                claimed_at=now,
+                lease_expires_at=lease_expires,
+                version=new_version,
+            )
+
+    def renew_claim(
+        self,
+        claim: TaskClaim,
+        *,
+        now: datetime,
+        lease_seconds: float,
+    ) -> TaskClaim:
+        lease_expires = now + timedelta(seconds=lease_seconds)
+        new_version = claim.version + 1
+        cursor = self._connection.execute(
+            "UPDATE task_claims SET lease_expires_at = ?, version = ? "
+            "WHERE task_id = ? AND version = ? AND worker_id = ?",
+            (
+                _iso(lease_expires),
+                new_version,
+                claim.task_id,
+                claim.version,
+                claim.worker_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ClaimLostError(claim.task_id)
+        return TaskClaim(
+            task_id=claim.task_id,
+            worker_id=claim.worker_id,
+            claimed_at=claim.claimed_at,
+            lease_expires_at=lease_expires,
+            version=new_version,
+        )
+
+    def release_claim(self, claim: TaskClaim) -> None:
+        self._connection.execute(
+            "DELETE FROM task_claims "
+            "WHERE task_id = ? AND version = ? AND worker_id = ?",
+            (claim.task_id, claim.version, claim.worker_id),
+        )
+
+    def load_claim(self, task_id: str) -> TaskClaim | None:
+        row = self._connection.execute(
+            "SELECT task_id, worker_id, claimed_at, lease_expires_at, "
+            "version FROM task_claims WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        claimed = _parse_iso(row["claimed_at"])
+        expires = _parse_iso(row["lease_expires_at"])
+        assert claimed is not None and expires is not None
+        return TaskClaim(
+            task_id=row["task_id"],
+            worker_id=row["worker_id"],
+            claimed_at=claimed,
+            lease_expires_at=expires,
+            version=int(row["version"]),
+        )
 
 
 # --- Row -> dataclass converters --------------------------------------------

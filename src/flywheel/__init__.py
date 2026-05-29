@@ -108,6 +108,8 @@ from flywheel.store_protocols import (
     AttemptStore,
     AuditRecord,
     AuditStore,
+    ClaimLostError,
+    ClaimStore,
     ClaudeSessionEntry,
     DomainEventStore,
     EventRecord,
@@ -123,6 +125,7 @@ from flywheel.store_protocols import (
     SdkMessageStore,
     StoreConflictError,
     StoreSchemaError,
+    TaskClaim,
 )
 from flywheel.task import (
     KNOWN_GRADER_TYPES,
@@ -179,6 +182,8 @@ __all__ = [
     "CLOSING_FENCE",
     "CURRENT_SCHEMA_VERSION",
     "ClaudeSessionEntry",
+    "ClaimLostError",
+    "ClaimStore",
     "CommandGrader",
     "CommandGraderRequirement",
     "Context",
@@ -242,6 +247,7 @@ __all__ = [
     "StrategyResult",
     "Subscription",
     "Task",
+    "TaskClaim",
     "TaskLoadError",
     "ToolInteraction",
     "ToolResultObservation",

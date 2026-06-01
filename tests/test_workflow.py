@@ -1989,7 +1989,8 @@ def test_make_claude_code_invoke_forwards_on_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The default invoker threads ``on_message`` into ``invoke_iteration``
-    so the agent's turns can be observed live."""
+    so the agent's turns can be observed live (legacy fallback when no
+    control store is wired in)."""
     import asyncio
 
     import flywheel.workflow as workflow
@@ -2018,3 +2019,221 @@ def test_make_claude_code_invoke_forwards_on_message(
     asyncio.run(_drive())
     assert captured["on_message"] is _observer
     assert captured["prompt"] == "go"
+
+
+def test_make_claude_code_invoke_uses_client_path_when_control_store_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When ``control_store`` and ``run_id`` are wired in, the production
+    invoker routes through :func:`invoke_iteration_with_client` so the
+    watcher runs against the open ClaudeSDKClient session."""
+    import asyncio
+
+    import flywheel.workflow as workflow
+    from flywheel.store_memory import InMemoryStore
+
+    captured: dict[str, object] = {}
+
+    async def _fake_with_client(**kwargs: object) -> IterationResult:
+        captured.update(kwargs)
+        return _verify_iteration()
+
+    monkeypatch.setattr(
+        workflow, "invoke_iteration_with_client", _fake_with_client
+    )
+
+    store = InMemoryStore()
+
+    invoker = workflow._make_claude_code_invoke(
+        tmp_path / "sb",
+        model=None,
+        max_turns=5,
+        on_message=None,
+        control_store=store,
+        run_id="run-1",
+        audit_store=None,
+    )
+    request = InvocationRequest(
+        prompt="go",
+        transcript_graders=(),
+        attempt_number=1,
+        iteration_number=1,
+    )
+
+    async def _drive() -> None:
+        await invoker(request)
+
+    asyncio.run(_drive())
+    assert captured["prompt"] == "go"
+    assert captured["control_store"] is store
+    assert captured["run_id"] == "run-1"
+
+
+# ---------- Steering CLI subcommands ----------
+
+
+def test_cmd_interrupt_enqueues_control_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel interrupt RUN_ID`` persists a kind=interrupt row."""
+    db = tmp_path / "db.sqlite"
+    # Seed a running lifecycle so the in-flight check passes silently.
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-a")
+    finally:
+        store.close()
+
+    rc = main(
+        ["interrupt", "run-task-a-running", "--db", str(db)]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "kind=interrupt" in out
+    assert "run-task-a-running" in out
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-a-running", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "interrupt"
+    assert claimed[0].payload == {}
+
+
+def test_cmd_steer_enqueues_say_with_message_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel steer RUN_ID MESSAGE`` persists kind=say with the text."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-b")
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "steer",
+            "run-task-b-running",
+            "please double-check the rubric finding",
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    assert "kind=say" in capsys.readouterr().out
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-b-running", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "say"
+    assert claimed[0].payload == {
+        "text": "please double-check the rubric finding"
+    }
+
+
+def test_cmd_set_model_enqueues_set_model_with_model_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel set-model RUN_ID MODEL`` persists kind=set_model."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-c")
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "set-model",
+            "run-task-c-running",
+            "claude-opus-4-1-20250805",
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    assert "kind=set_model" in capsys.readouterr().out
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-c-running", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "set_model"
+    assert claimed[0].payload == {"model": "claude-opus-4-1-20250805"}
+
+
+def test_cmd_interrupt_for_unknown_run_errors_without_enqueue(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown ``run_id`` is a producer-side error: SQLite's FK to
+    ``lifecycles(run_id)`` makes the row unpersistable. The CLI reports
+    that clearly (exit 2) rather than crash on the IntegrityError."""
+    db = tmp_path / "db.sqlite"
+    rc = main(["interrupt", "run-ghost", "--db", str(db)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown" in err
+    assert "run-ghost" in err
+    store = SqliteStore(db)
+    try:
+        # SqliteStore won't even create the lifecycles row at open, so no
+        # control_commands row exists either.
+        claimed = store.claim_commands(
+            "run-ghost", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert claimed == []
+
+
+def test_cmd_interrupt_for_not_in_flight_run_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lifecycle in DONE/FAILED/INTERRUPTED still accepts an enqueue but
+    a stderr note flags that the command will sit pending."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_interrupted(store, "task-d")
+    finally:
+        store.close()
+
+    rc = main(
+        ["interrupt", "run-task-d-interrupted", "--db", str(db)]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "not in-flight" in err
+    assert "interrupted" in err
+
+
+def test_cmd_steer_rejects_empty_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty operator message is a usage error; nothing is persisted."""
+    db = tmp_path / "db.sqlite"
+    rc = main(["steer", "run-x", "", "--db", str(db)])
+    assert rc == 2
+    assert "non-empty" in capsys.readouterr().err
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-x", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert claimed == []

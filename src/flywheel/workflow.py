@@ -94,9 +94,11 @@ from flywheel.invoker import (
     _serialize_sdk_message,
     invoke_iteration,
 )
+from flywheel.invoker_client import invoke_iteration_with_client
 from flywheel.lifecycle import Attempt, Lifecycle, Status
 from flywheel.loaders import TaskLoadError, load_task_file
 from flywheel.store_protocols import (
+    ControlCommandStore,
     EventRecord,
     GraderResultRecord,
     SdkMessageRecord,
@@ -716,11 +718,26 @@ def _make_claude_code_invoke(
     model: str | None,
     max_turns: int,
     on_message: Callable[[Message], None] | None = None,
+    control_store: ControlCommandStore | None = None,
+    run_id: str | None = None,
+    audit_store: HarnessStore | None = None,
 ) -> InvokeFunc:
     """Production invoker: real Claude Code spawned in ``sandbox``.
 
-    Mirrors :func:`flywheel.examples.hello.example.make_claude_code_invoke`
-    but with the broader tool surface a real engineering task needs.
+    Drives one iteration through :class:`claude_agent_sdk.ClaudeSDKClient`
+    so the in-process watcher coroutine, running concurrently with the
+    agent's message stream, can claim operator-issued control commands
+    from ``control_store`` (interrupt / set_model / say) and apply them
+    live against the open session. Each applied command lands as a
+    ``harness.control_command_applied`` event on ``audit_store``; a
+    failed dispatch emits ``harness.control_command_failed`` and the
+    iteration continues, mirroring the per-message persistence contract.
+
+    ``control_store``, ``run_id``, and ``audit_store`` are required for
+    the bidirectional path — when ``control_store`` is ``None`` the
+    invoker falls back to the one-shot :func:`invoke_iteration` (used by
+    legacy callers that have no run identity yet, e.g. the on_message
+    forwarding test).
 
     ``on_message`` is the static stdout renderer composed with the
     per-request persistence observer the harness threads through
@@ -737,10 +754,54 @@ def _make_claude_code_invoke(
         model=model,
     )
 
+    if control_store is None or run_id is None:
+        async def _invoke_legacy(request: InvocationRequest) -> IterationResult:
+            composed = _compose_message_observers(
+                on_message, request.on_message
+            )
+            return await invoke_iteration(
+                prompt=request.prompt,
+                options=options,
+                on_message=composed,
+            )
+
+        return _invoke_legacy
+
+    pinned_run_id = run_id
+    pinned_audit_store = audit_store
+
     async def _invoke(request: InvocationRequest) -> IterationResult:
         composed = _compose_message_observers(on_message, request.on_message)
-        return await invoke_iteration(
-            prompt=request.prompt, options=options, on_message=composed
+        emit: Callable[[str, Mapping[str, Any]], None] | None = None
+        if pinned_audit_store is not None:
+            # Bind a non-Optional reference so the inner closure does not
+            # need to re-prove the None-check on every call.
+            audit_sink: HarnessStore = pinned_audit_store
+            attempt_number = request.attempt_number
+
+            def _audit_emit(kind: str, payload: Mapping[str, Any]) -> None:
+                # Route control-plane events through the same store the
+                # harness writes to so the wrapped streaming wrapper
+                # (if any) sees them and a live operator sees them on
+                # stdout exactly like harness.* events.
+                audit_sink.append_event(
+                    EventRecord(
+                        run_id=pinned_run_id,
+                        ts=datetime.now(timezone.utc),
+                        kind=kind,
+                        payload=dict(payload),
+                        attempt_number=attempt_number,
+                    )
+                )
+
+            emit = _audit_emit
+        return await invoke_iteration_with_client(
+            prompt=request.prompt,
+            options=options,
+            control_store=control_store,
+            run_id=pinned_run_id,
+            audit_emit=emit,
+            on_message=composed,
         )
 
     return _invoke
@@ -861,18 +922,6 @@ async def run_task_object(
         else Lifecycle(task_id=task.id, run_id=run_id)
     )
 
-    # The default invoker surfaces the agent's turns live via on_message;
-    # an injected invoke (tests, alternative agents) owns its own transport.
-    if invoke is not None:
-        invoker = invoke
-    else:
-        invoker = _make_claude_code_invoke(
-            sandbox,
-            model=model,
-            max_turns=max_turns,
-            on_message=_make_message_observer(events, out=sys.stdout),
-        )
-
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox.mkdir(parents=True, exist_ok=True)
 
@@ -883,6 +932,26 @@ async def run_task_object(
         if emitter is None
         else _EventStreamingStore(backend, emit=emitter)
     )
+
+    # The default invoker surfaces the agent's turns live via on_message
+    # and runs the control-command watcher against the open ClaudeSDKClient
+    # session; an injected invoke (tests, alternative agents) owns its own
+    # transport and the watcher is its responsibility. ``backend`` is the
+    # ControlCommandStore the watcher claims from; ``store`` is the wrapped
+    # audit sink so control-plane events flow through the same live-stream
+    # path as harness.* events.
+    if invoke is not None:
+        invoker = invoke
+    else:
+        invoker = _make_claude_code_invoke(
+            sandbox,
+            model=model,
+            max_turns=max_turns,
+            on_message=_make_message_observer(events, out=sys.stdout),
+            control_store=backend,
+            run_id=lifecycle.run_id,
+            audit_store=store,
+        )
     try:
         # Recover any prior lifecycle for this task that was killed
         # mid-attempt before we create a new one. Keeps the audit trail
@@ -1854,6 +1923,108 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Steering / control commands -----------------------------------------
+#
+# Producers for the cross-process control plane. Each subcommand enqueues
+# exactly one row into ``control_commands`` keyed by ``run_id``; the
+# in-process watcher inside the worker's :func:`invoke_iteration_with_client`
+# claims and applies it on its next tick. The CLI never talks to the live
+# session directly — the store is the channel — so steering works against a
+# detached worker daemon. A command is persisted unconditionally; if the
+# named run is not currently in-flight the row sits pending and is recorded
+# as stale per claim semantics.
+
+
+def _enqueue_control_command(
+    db_path: Path,
+    run_id: str,
+    kind: str,
+    payload: Mapping[str, Any],
+) -> int:
+    """Persist one control command into ``db_path`` and report the id.
+
+    Returns ``0`` after printing the enqueue receipt (``<id> kind=...``)
+    plus, when the lifecycle is not currently in-flight, a stderr note
+    explaining the row stays pending per claim semantics. An unknown
+    ``run_id`` is a producer-side error: the SQLite backend enforces the
+    foreign key on ``lifecycles(run_id)``, so we surface that as exit
+    code ``2`` with a clear message rather than crash on the
+    :class:`sqlite3.IntegrityError`.
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        lifecycle = store.load_lifecycle(run_id)
+        if lifecycle is None:
+            print(
+                f"error: run {run_id!r} is unknown to this store; "
+                f"no command enqueued",
+                file=sys.stderr,
+            )
+            return 2
+        in_flight = lifecycle.status in (Status.RUNNING, Status.VALIDATING)
+        record = store.enqueue_command(
+            run_id, kind, payload, now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    print(f"enqueued #{record.id} kind={kind} run_id={run_id}")
+    if not in_flight:
+        status_value = lifecycle.status.value
+        print(
+            f"  note: run {run_id} is not in-flight (status={status_value}); "
+            f"the command stays pending and is recorded as stale per claim "
+            f"semantics",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_interrupt(args: argparse.Namespace) -> int:
+    """``flywheel interrupt RUN_ID`` — enqueue an interrupt command.
+
+    The watcher's apply drives the lifecycle to INTERRUPTED via the same
+    in-band finalization SIGINT/SIGTERM use (the harness's
+    ``_run_attempt`` boundary routes through ``_handle_interrupt``);
+    additionally a ``harness.control_command_applied`` event records the
+    store-triggered origin in the audit stream.
+    """
+    return _enqueue_control_command(
+        _resolve_db(args.db), args.run_id, "interrupt", {}
+    )
+
+
+def _cmd_steer(args: argparse.Namespace) -> int:
+    """``flywheel steer RUN_ID MESSAGE`` — inject an operator message.
+
+    The watcher dispatches via :meth:`ClaudeSDKClient.query`, appending
+    one user turn to the live conversation. The task definition is not
+    mutated — only the running session sees the message.
+    """
+    text = args.message
+    if not text:
+        print("error: steer message must be non-empty", file=sys.stderr)
+        return 2
+    return _enqueue_control_command(
+        _resolve_db(args.db), args.run_id, "say", {"text": text}
+    )
+
+
+def _cmd_set_model(args: argparse.Namespace) -> int:
+    """``flywheel set-model RUN_ID MODEL`` — switch the live session's model.
+
+    Dispatches via :meth:`ClaudeSDKClient.set_model`. An invalid model id
+    surfaces as a ``harness.control_command_failed`` event when the SDK
+    rejects it; the run continues on the prior model.
+    """
+    return _enqueue_control_command(
+        _resolve_db(args.db),
+        args.run_id,
+        "set_model",
+        {"model": args.model},
+    )
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)
@@ -2146,6 +2317,67 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_recover.set_defaults(func=_cmd_recover)
+
+    p_interrupt = sub.add_parser(
+        "interrupt",
+        help=(
+            "Enqueue an interrupt control command against RUN_ID. The "
+            "in-process watcher claims and applies it on its next tick, "
+            "driving the lifecycle to INTERRUPTED via the same finalization "
+            "SIGINT/SIGTERM use."
+        ),
+    )
+    p_interrupt.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Lifecycle run_id of the in-flight run to interrupt.",
+    )
+    _add_common_db(p_interrupt)
+    p_interrupt.set_defaults(func=_cmd_interrupt)
+
+    p_steer = sub.add_parser(
+        "steer",
+        help=(
+            "Inject an operator MESSAGE into the live conversation for "
+            "RUN_ID. The watcher dispatches via ClaudeSDKClient.query so "
+            "the running session sees a new user turn. The task definition "
+            "is not mutated."
+        ),
+    )
+    p_steer.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Lifecycle run_id of the in-flight run to steer.",
+    )
+    p_steer.add_argument(
+        "message",
+        metavar="MESSAGE",
+        help="Operator message text to inject as a user turn.",
+    )
+    _add_common_db(p_steer)
+    p_steer.set_defaults(func=_cmd_steer)
+
+    p_set_model = sub.add_parser(
+        "set-model",
+        help=(
+            "Switch the live session for RUN_ID to MODEL. Dispatched via "
+            "ClaudeSDKClient.set_model. An invalid model id lands as a "
+            "harness.control_command_failed event; the run continues on "
+            "the prior model."
+        ),
+    )
+    p_set_model.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Lifecycle run_id of the in-flight run to retarget.",
+    )
+    p_set_model.add_argument(
+        "model",
+        metavar="MODEL",
+        help="Model identifier to switch the live session to.",
+    )
+    _add_common_db(p_set_model)
+    p_set_model.set_defaults(func=_cmd_set_model)
 
     return parser
 

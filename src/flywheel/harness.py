@@ -47,6 +47,7 @@ heuristics.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -547,6 +548,119 @@ def _handle_audit_failure(
             Status.INTERNAL_ERROR,
             store=store,
             error=error,
+            now=clock,
+        )
+    except Exception:
+        pass
+
+
+# Statuses from which the operator-interrupt finalizer can land cleanly on
+# INTERRUPTED via a single transition. RUNNING covers cancellation mid-stream
+# (invoker iterator); VALIDATING covers cancellation between invoke and
+# graders or inside the rubric judge's await. Other statuses (READY between
+# attempts, terminal, or already INTERRUPTED) leave the finalizer a no-op so
+# a second signal during shutdown cannot corrupt the prior finalization.
+_INTERRUPTIBLE_STATUSES: frozenset[Status] = frozenset(
+    {Status.RUNNING, Status.VALIDATING}
+)
+
+
+def _handle_interrupt(
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """In-band finalization for an operator-driven SIGINT/SIGTERM.
+
+    Mirrors :func:`_handle_audit_failure`: closes the open attempt as
+    :attr:`Outcome.INTERNAL_ERROR`, emits a ``harness.interrupted``
+    telemetry event, and transitions the lifecycle to
+    :attr:`Status.INTERRUPTED`. INTERRUPTED is not a retry-source state, so
+    the retry budget is preserved and the next worker start can resume the
+    run through ``ready``.
+
+    Idempotent: when the lifecycle is not in :data:`_INTERRUPTIBLE_STATUSES`
+    (already finalized, between attempts, or terminal) the function is a
+    no-op. This makes a second signal during shutdown safe — the cancel is
+    scheduled at the next await point, but the synchronous finalization has
+    already completed by then, so re-entering this helper just exits early.
+
+    Best-effort emit / append: a store-side failure inside the audit emit or
+    the AttemptFinalized append is swallowed (the audit path itself must not
+    loop, mirroring :func:`_handle_audit_failure`). The status transition
+    remains the source of truth.
+    """
+    if lifecycle.status not in _INTERRUPTIBLE_STATUSES:
+        return
+    reason = "operator interrupted mid-attempt"
+    from_status = lifecycle.status.value
+    try:
+        _emit(
+            store,
+            run_id=lifecycle.run_id,
+            kind="harness.interrupted",
+            payload={
+                "classification": "worker_interrupted",
+                "from_status": from_status,
+                "message": reason,
+            },
+            attempt_number=attempt.number if attempt is not None else None,
+            now=clock,
+            best_effort=True,
+        )
+    except _AuditWriteError:
+        # best_effort=True swallows store errors already; this except is a
+        # belt-and-braces guard so the interrupt finalizer can never itself
+        # raise back into the caller.
+        pass
+    if attempt is not None and attempt.ended_at is None:
+        ended_at = clock()
+        attempt.ended_at = ended_at
+        attempt.outcome = Outcome.INTERNAL_ERROR
+        attempt.error = reason
+        try:
+            _append(
+                lifecycle,
+                AttemptFinalized(
+                    run_id=lifecycle.run_id,
+                    ts=ended_at,
+                    attempt_number=attempt.number,
+                    number=attempt.number,
+                    outcome=Outcome.INTERNAL_ERROR,
+                    ended_at=ended_at,
+                    agent_output=attempt.agent_output,
+                    error=reason,
+                ),
+                store=store,
+            )
+        except Exception:
+            pass
+        # Mirror finalize_stranded_lifecycle's telemetry shape so the
+        # in-band path and the out-of-band recovery sweep produce the
+        # same audit-stream signature for an operator-interrupted attempt.
+        try:
+            _emit(
+                store,
+                run_id=lifecycle.run_id,
+                kind="harness.attempt_finalized",
+                payload={
+                    "number": attempt.number,
+                    "outcome": Outcome.INTERNAL_ERROR.value,
+                    "error": reason,
+                },
+                attempt_number=attempt.number,
+                now=clock,
+                best_effort=True,
+            )
+        except _AuditWriteError:
+            pass
+    try:
+        _transition(
+            lifecycle,
+            Status.INTERRUPTED,
+            store=store,
             now=clock,
         )
     except Exception:
@@ -1081,10 +1195,14 @@ async def run_task(
     non-zero with the original traceback intact (we re-raise after
     recording). :exc:`asyncio.CancelledError` and
     :exc:`KeyboardInterrupt` are deliberately *not* caught here:
-    operator-driven shutdown remains the existing
-    :func:`finalize_stranded_lifecycle` path in
-    :mod:`flywheel.workflow`. If a concurrent harness lands a
-    transition first, the loser's
+    operator-driven shutdown is handled in-band one level down, at the
+    :func:`_run_attempt` boundary, which routes the cancellation
+    through :func:`_handle_interrupt` (closes the open attempt as
+    ``INTERNAL_ERROR``, emits ``harness.interrupted``, transitions to
+    :attr:`Status.INTERRUPTED`) before re-raising so the worker stops
+    cleanly. :func:`finalize_stranded_lifecycle` remains the backstop
+    for SIGKILL/OOM/reboot, where no in-process handler runs at all. If
+    a concurrent harness lands a transition first, the loser's
     :class:`~flywheel.store_protocols.OptimisticConcurrencyError`
     surfaces to the caller verbatim — not swallowed — so the worker
     learns its run_id is racing.
@@ -1251,11 +1369,14 @@ async def run_task(
     except Exception as exc:
         # asyncio.CancelledError and KeyboardInterrupt inherit from
         # BaseException (Python 3.8+), so this except deliberately
-        # cannot catch them — operator shutdown stays on the existing
-        # finalize_stranded_lifecycle path in workflow.py. Everything
-        # else is internal failure: record one harness.crash event and
-        # walk the lifecycle to FAILED before re-raising so the worker
-        # subshell still exits non-zero with the original traceback.
+        # cannot catch them -- operator shutdown is handled in-band at
+        # the _run_attempt boundary via _handle_interrupt (which finalizes
+        # the open attempt to INTERRUPTED and re-raises the cancellation),
+        # with finalize_stranded_lifecycle remaining as the
+        # SIGKILL/OOM/reboot backstop. Everything else is internal
+        # failure: record one harness.crash event and walk the lifecycle
+        # to FAILED before re-raising so the worker subshell still exits
+        # non-zero with the original traceback.
         _record_entry_crash(
             store, lifecycle, exc, clock=clock
         )
@@ -1337,6 +1458,23 @@ async def _run_attempt(
             attempt=attempt,
             clock=clock,
         )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Operator-driven shutdown surfaced as cancellation. Close the
+        # in-flight attempt to INTERRUPTED in-band so the audit stream
+        # carries the exogenous stop and no lifecycle is left wedged in
+        # RUNNING/VALIDATING. We then re-raise so run_task_object's
+        # outer handler (and orchestrate above it) propagate the
+        # cancellation and the worker actually stops -- the finalize
+        # itself is purely additional bookkeeping, not a replacement
+        # for the shutdown signal. recover_stranded_lifecycles remains
+        # the SIGKILL/OOM/reboot backstop.
+        _handle_interrupt(
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            clock=clock,
+        )
+        raise
 
 
 async def _run_attempt_body(

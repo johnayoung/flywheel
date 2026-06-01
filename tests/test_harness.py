@@ -58,6 +58,7 @@ from flywheel.grader_rubric import (
 from flywheel.harness import (
     _build_observation,
     _build_usage_breakdown,
+    _handle_interrupt,
     finalize_stranded_lifecycle,
 )
 from flywheel.loaders import task_digest
@@ -1509,6 +1510,307 @@ class TestOperatorInterruption:
         assert outcome.lifecycle.status == Status.FAILED
         attempt = outcome.attempts[0]
         assert attempt.outcome == Outcome.VALIDATION_FAILED
+
+
+class TestIterationAwareInterrupt:
+    """Spec 00012: an operator SIGINT/SIGTERM while the agent is mid-
+    iteration deterministically finalizes the in-flight lifecycle to
+    INTERRUPTED, no stranded `running` state, and the run is resumable.
+
+    The invoker's stream loop raises :exc:`asyncio.CancelledError` (the
+    signal-handler-cancelled-task shape used in :func:`run_task_object`).
+    The harness catches this at the :func:`_run_attempt` boundary,
+    finalizes through :func:`_handle_interrupt`, and re-raises so the
+    worker stops cleanly. :func:`finalize_stranded_lifecycle` remains the
+    SIGKILL/OOM/reboot backstop -- this in-band path closes the graceful
+    SIGINT/SIGTERM gap documented in
+    ``.workflow/audits/02-harness-resilience.md``.
+    """
+
+    def _cancelling_invoker(
+        self,
+        *,
+        pre_messages: tuple[Message, ...] = (),
+    ) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
+        """Build an invoker that persists ``pre_messages`` via on_message,
+        then raises :exc:`asyncio.CancelledError` -- the asyncio cancellation
+        a SIGINT/SIGTERM-cancelled task produces inside the invoker's
+        stream loop."""
+
+        async def _invoke(request: InvocationRequest) -> IterationResult:
+            if request.on_message is not None:
+                for msg in pre_messages:
+                    request.on_message(msg)
+            raise asyncio.CancelledError()
+
+        return _invoke
+
+    def test_cancelled_mid_stream_finalizes_interrupted(self) -> None:
+        # FR-1: mid-stream cancellation leaves the lifecycle in INTERRUPTED
+        # rather than stranded `running`.
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-mid")
+        invoke = self._cancelling_invoker(pre_messages=(_assistant(),))
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        # No retry consumed -- INTERRUPTED is not a retry-source state.
+        assert reloaded.retries == 0
+
+    def test_cancelled_attempt_finalizes_as_internal_error(self) -> None:
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-attempt")
+        invoke = self._cancelling_invoker()
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        attempts = store.list_attempts(lifecycle.run_id)
+        assert len(attempts) == 1
+        attempt = attempts[0]
+        assert attempt.ended_at is not None
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "operator interrupted" in attempt.error
+
+    def test_pre_interrupt_messages_preserved(self) -> None:
+        # FR-2: messages persisted before the interrupt (live via 00010)
+        # remain in the store after finalization.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-msgs")
+        pre = (
+            _assistant(text="pre-1"),
+            _assistant(text="pre-2"),
+        )
+        invoke = self._cancelling_invoker(pre_messages=pre)
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        rows = store.list_sdk_messages(lifecycle.run_id)
+        # Both assistant messages observed before cancellation must still be
+        # in the audit trail; on_message persists immediately.
+        assert len(rows) == 2
+        assert rows[0].payload.get("message_type") == "AssistantMessage"
+        assert rows[1].payload.get("message_type") == "AssistantMessage"
+
+    def test_harness_interrupted_event_emitted(self) -> None:
+        # FR-4: an observability event records the exogenous stop.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-event")
+        invoke = self._cancelling_invoker()
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        interrupted = [e for e in events if e.kind == "harness.interrupted"]
+        assert len(interrupted) == 1
+        payload = interrupted[0].payload
+        assert payload["classification"] == "worker_interrupted"
+        # mid-stream cancellation lands while still in RUNNING.
+        assert payload["from_status"] == "running"
+        assert interrupted[0].attempt_number == 1
+        # The attempt's terminal event ordering: attempt_finalized lands
+        # before the lifecycle transitions to INTERRUPTED so the audit
+        # stream is internally consistent.
+        kinds = [e.kind for e in events]
+        assert "harness.attempt_started" in kinds
+        assert "harness.attempt_finalized" in kinds
+
+    def test_interrupted_lifecycle_is_resumable(self) -> None:
+        # FR-3: an INTERRUPTED lifecycle can return to READY and run
+        # again without losing prior execution history.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-resume")
+        invoke_cancel = self._cancelling_invoker(pre_messages=(_assistant(),))
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke_cancel))
+
+        # Sanity: first attempt interrupted, lifecycle parked at INTERRUPTED.
+        first = store.load_lifecycle(lifecycle.run_id)
+        assert first is not None
+        assert first.status == Status.INTERRUPTED
+        first_messages = store.list_sdk_messages(lifecycle.run_id)
+        assert len(first_messages) == 1
+
+        # Resume on the same run_id with a fresh, non-cancelling invoker;
+        # the harness's entry-time normalization carries INTERRUPTED -> READY
+        # before the next attempt starts.
+        invoke_ok = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(text="resumed"), _result_msg()),
+                )
+            ]
+        )
+        # Stale in-memory copy: replace_from inside run_task reconciles it
+        # against the persisted INTERRUPTED row.
+        resume_lifecycle = Lifecycle(
+            task_id="t1", run_id=lifecycle.run_id
+        )
+        outcome = _run(
+            run_task(task, resume_lifecycle, store, invoke=invoke_ok)
+        )
+        assert outcome.lifecycle.status == Status.DONE
+        attempts = store.list_attempts(lifecycle.run_id)
+        # Two attempts: the interrupted one plus the resumed one. Prior
+        # execution history is preserved -- the interrupt did not clobber
+        # the first attempt's row.
+        assert len(attempts) == 2
+        assert attempts[0].outcome == Outcome.INTERNAL_ERROR
+        assert attempts[1].outcome == Outcome.SUCCEEDED
+        # SDK messages from both attempts remain.
+        all_messages = store.list_sdk_messages(lifecycle.run_id)
+        assert len(all_messages) >= 2
+
+    def test_no_stranded_running_after_interrupt(self) -> None:
+        # FR-5 (in-band guarantee): after an interrupt the in-band finalizer
+        # leaves no lifecycle in `running` -- finalize_stranded_lifecycle is
+        # a no-op because there is nothing left to finalize.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-clean")
+        invoke = self._cancelling_invoker()
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        # finalize_stranded_lifecycle should find nothing to do.
+        assert finalize_stranded_lifecycle(store, lifecycle.run_id) is False
+        # Status untouched by the no-op backstop call.
+        still = store.load_lifecycle(lifecycle.run_id)
+        assert still is not None
+        assert still.status == Status.INTERRUPTED
+
+    def test_handle_interrupt_is_idempotent(self) -> None:
+        # FR-5 idempotency: a second signal during shutdown must not corrupt
+        # the finalization or raise. _handle_interrupt is the sole writer of
+        # the interruption path, so calling it twice on the same lifecycle
+        # is the unit-level test of the idempotency contract.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-idemp")
+        invoke = self._cancelling_invoker()
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        # Capture state after first finalization.
+        first_events = store.list_events(lifecycle.run_id)
+        first_attempts = store.list_attempts(lifecycle.run_id)
+        first_version = store.load_lifecycle(lifecycle.run_id).version  # type: ignore[union-attr]
+        first_interrupted_count = sum(
+            1 for e in first_events if e.kind == "harness.interrupted"
+        )
+
+        # Simulate a second signal arriving during shutdown by calling the
+        # helper again on the now-INTERRUPTED lifecycle. Must not raise,
+        # must not double-write events, must not advance state.
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        _handle_interrupt(
+            store=store,
+            lifecycle=reloaded,
+            attempt=None,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+
+        second_events = store.list_events(lifecycle.run_id)
+        second_attempts = store.list_attempts(lifecycle.run_id)
+        second_version = store.load_lifecycle(lifecycle.run_id).version  # type: ignore[union-attr]
+        second_interrupted_count = sum(
+            1 for e in second_events if e.kind == "harness.interrupted"
+        )
+        assert len(second_events) == len(first_events)
+        assert len(second_attempts) == len(first_attempts)
+        assert second_version == first_version
+        assert second_interrupted_count == first_interrupted_count == 1
+
+    def test_interrupt_during_validating_finalizes_interrupted(
+        self, tmp_path: Path
+    ) -> None:
+        # Edge case from the spec: interrupt during `validating` (after
+        # invoke, before / inside graders) finalizes INTERRUPTED; graders
+        # do not get an opportunity to mark the attempt validation_failed.
+        # The rubric judge's await is the only cancellation point inside
+        # validating -- command graders are synchronous, so cancellation
+        # cannot land between _transition(VALIDATING) and the judge call.
+        store = InMemoryStore()
+
+        async def _cancelling_judge(
+            prompt: str, grader: RubricGrader, worktree: Any
+        ) -> str:
+            raise asyncio.CancelledError()
+
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+            ],
+        )
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-interrupt-validating"
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(
+                run_task(
+                    task,
+                    lifecycle,
+                    store,
+                    config=HarnessConfig(
+                        worktree=str(tmp_path),
+                        rubric_judge_invoke=_cancelling_judge,
+                    ),
+                    invoke=invoke,
+                )
+            )
+
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        attempt = store.list_attempts(lifecycle.run_id)[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        interrupted_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.interrupted"
+        ]
+        assert len(interrupted_events) == 1
+        # Cancellation landed after the harness had advanced to VALIDATING
+        # to run graders.
+        assert interrupted_events[0].payload["from_status"] == "validating"
 
 
 class TestFinalizeStranded:

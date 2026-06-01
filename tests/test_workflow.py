@@ -1686,16 +1686,20 @@ def test_run_task_object_finalizes_lifecycle_on_signal(
     tmp_path: Path, signum: int
 ) -> None:
     """A SIGTERM/SIGINT mid-run cancels the in-flight task and finalizes its
-    lifecycle to INTERRUPTED with a harness.crash receipt -- it must not be
-    stranded in `running`.
+    lifecycle to INTERRUPTED with a harness.interrupted receipt -- it must not
+    be stranded in `running`.
 
     SIGTERM is the production stop signal (``docker stop``, ``kubectl delete
     pod``, ``systemctl stop``); its default disposition would terminate the
     interpreter before run_task reaches its finalizer, which is the exact
     stranding the bash worker had to reconcile out-of-band
-    (``.workflow/audits/02-harness-resilience.md``). run_task_object now
-    installs a loop signal handler that routes both signals into the
-    existing finalize_stranded_lifecycle path.
+    (``.workflow/audits/02-harness-resilience.md``). run_task_object installs
+    a loop signal handler that converts both signals into asyncio task
+    cancellation, which the harness's :func:`_run_attempt` boundary catches
+    and routes through :func:`_handle_interrupt` (emits ``harness.interrupted``
+    and transitions to INTERRUPTED in-band). ``finalize_stranded_lifecycle``
+    in ``run_task_object``'s except branch is then a no-op safety net for
+    the rare case where the cancellation lands outside an attempt.
     """
     import asyncio
     import os
@@ -1733,8 +1737,17 @@ def test_run_task_object_finalizes_lifecycle_on_signal(
         ).fetchall()
         assert len(rows) == 1
         assert rows[0]["status"] == Status.INTERRUPTED.value
-        kinds = [e.kind for e in store.list_events(rows[0]["run_id"])]
-        assert "harness.crash" in kinds
+        events = store.list_events(rows[0]["run_id"])
+        kinds = [e.kind for e in events]
+        # The in-band path (00012) emits harness.interrupted at the
+        # _run_attempt boundary; finalize_stranded_lifecycle's
+        # harness.crash signature is reserved for the SIGKILL/OOM/reboot
+        # backstop.
+        assert "harness.interrupted" in kinds
+        interrupted = next(
+            e for e in events if e.kind == "harness.interrupted"
+        )
+        assert interrupted.payload["classification"] == "worker_interrupted"
     finally:
         store.close()
 

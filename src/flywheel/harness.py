@@ -26,6 +26,17 @@ dispatches for:
 * ``rate_limited`` events (observed and surfaced via emitted events;
   classification stays transient per the spec)
 
+Each ``harness.iteration_completed`` event also carries the iteration's
+raw context-pressure signals: a ``usage`` breakdown (input / output /
+cache-creation / cache-read tokens plus the summed ``total_tokens``), the
+SDK-reported ``total_cost_usd``, and ``num_turns``. Token fields are
+per-iteration deltas — consumers cumulate by summing the audit stream;
+the harness keeps no running counter. ``total_cost_usd`` and ``num_turns``
+are emitted verbatim from :class:`InvocationSignals` and are
+session-cumulative as the SDK reports them. Utilization% and the 50 / 75
+/ 90 threshold-crossing signals listed in ``docs/vision.md`` remain
+future work (no window-capacity source today).
+
 The TODO subsystems from ``docs/loop.md`` — thrash detection, hang
 threshold defaults, context-recovery policy, fine-grained crash
 classification, and ``blocked_implicit`` semantic similarity — are
@@ -68,6 +79,7 @@ from flywheel.grader_rubric import (
     run_rubric_graders,
 )
 from flywheel.grader_transcript import (
+    _USAGE_TOKEN_KEYS,
     TranscriptObservation,
     first_breach,
     run_transcript_graders,
@@ -522,6 +534,51 @@ def _ensure_attempt_dir(
     path = Path(base) / f"attempt-{attempt_number:03d}"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _build_usage_breakdown(messages: Sequence[Message]) -> dict[str, int]:
+    """Aggregate the iteration's per-field token usage breakdown.
+
+    Mirrors :func:`_build_observation`'s ``total_tokens`` algorithm
+    field-by-field so the emitted ``harness.iteration_completed`` payload's
+    ``total_tokens`` equals ``observation.total_tokens`` for the same
+    iteration (FR-3 of the context-pressure-telemetry spec).
+
+    Semantics, per field:
+
+    - Sum the value across every :class:`AssistantMessage` whose ``usage``
+      dict carries the key.
+    - When a :class:`ResultMessage` reports a *larger* aggregate (sum of all
+      four fields) than the running breakdown, the ResultMessage's
+      breakdown wins — the SDK sometimes leaves AssistantMessage usage
+      empty and only reports totals at the end. This mirrors the
+      ``max(running, total_tokens_from_usage(rm.usage))`` reconciliation in
+      :func:`_build_observation`.
+    """
+    breakdown: dict[str, int] = {k: 0 for k in _USAGE_TOKEN_KEYS}
+    for msg in messages:
+        if isinstance(msg, AssistantMessage) and msg.usage:
+            for key in _USAGE_TOKEN_KEYS:
+                value = msg.usage.get(key)
+                if value is None:
+                    continue
+                try:
+                    breakdown[key] += int(value)
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(msg, ResultMessage) and msg.usage:
+            rm_breakdown: dict[str, int] = {k: 0 for k in _USAGE_TOKEN_KEYS}
+            for key in _USAGE_TOKEN_KEYS:
+                value = msg.usage.get(key)
+                if value is None:
+                    continue
+                try:
+                    rm_breakdown[key] += int(value)
+                except (TypeError, ValueError):
+                    continue
+            if sum(rm_breakdown.values()) > sum(breakdown.values()):
+                breakdown = rm_breakdown
+    return breakdown
 
 
 def _build_observation(
@@ -1640,6 +1697,14 @@ async def _drive_iterations(
             messages=iteration_result.messages,
         )
 
+        # Context-pressure telemetry: token fields are per-iteration deltas
+        # — consumers cumulate by summing the audit stream; the harness
+        # holds no running counter. ``total_cost_usd`` and ``num_turns`` are
+        # forwarded verbatim from the SDK's ResultMessage and are
+        # session-cumulative as the SDK reports them; do NOT delta them.
+        usage_breakdown = _build_usage_breakdown(iteration_result.messages)
+        usage_payload: dict[str, Any] = dict(usage_breakdown)
+        usage_payload["total_tokens"] = total_tokens_from_usage(usage_breakdown)
         _emit(
             store,
             run_id=lifecycle.run_id,
@@ -1660,6 +1725,9 @@ async def _drive_iterations(
                     iteration_result.signals.rate_limit_events
                 )
                 > 0,
+                "usage": usage_payload,
+                "total_cost_usd": iteration_result.signals.total_cost_usd,
+                "num_turns": iteration_result.signals.num_turns,
             },
             attempt_number=attempt_number,
             now=clock,

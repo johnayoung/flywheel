@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -55,7 +55,11 @@ from flywheel.grader_rubric import (
 from flywheel.grader_rubric import (
     RubricJudgeError,
 )
-from flywheel.harness import finalize_stranded_lifecycle
+from flywheel.harness import (
+    _build_observation,
+    _build_usage_breakdown,
+    finalize_stranded_lifecycle,
+)
 from flywheel.loaders import task_digest
 from flywheel.envelope import (
     CLOSING_FENCE,
@@ -1051,6 +1055,332 @@ class TestRateLimitSurface:
             if e.kind == "harness.iteration_completed"
         ]
         assert completed_events[0].payload["rate_limited"] is True
+
+
+# --- Context-pressure telemetry ------------------------------------------
+
+
+class TestIterationCompletedTelemetry:
+    """Per-iteration token / cost / turn signals on
+    ``harness.iteration_completed``.
+
+    Covers FR-1..FR-4 of ``00009-FEATURE-context-pressure-telemetry``:
+    the payload carries a full token breakdown that matches the
+    transcript-grader breach math, plus the SDK-reported cost and turn
+    counts; token fields are per-iteration deltas, never a running sum.
+    """
+
+    def _completed_payload(
+        self, store: InMemoryStore, run_id: str
+    ) -> Mapping[str, Any]:
+        events = [
+            e
+            for e in store.list_events(run_id)
+            if e.kind == "harness.iteration_completed"
+        ]
+        assert len(events) == 1, events
+        return events[0].payload
+
+    def _completed_payloads(
+        self, store: InMemoryStore, run_id: str
+    ) -> list[Mapping[str, Any]]:
+        return [
+            e.payload
+            for e in store.list_events(run_id)
+            if e.kind == "harness.iteration_completed"
+        ]
+
+    def _passing_task(self) -> Task:
+        return Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+
+    # FR-1: per-iteration token breakdown is present with all five fields.
+    def test_usage_breakdown_attached_to_payload(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr1")
+        usage = {
+            "input_tokens": 12,
+            "output_tokens": 7,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 100,
+        }
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(usage=usage), _result_msg(num_turns=1)),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        assert payload["usage"] == {
+            "input_tokens": 12,
+            "output_tokens": 7,
+            "cache_creation_input_tokens": 3,
+            "cache_read_input_tokens": 100,
+            "total_tokens": 122,
+        }
+
+    # FR-2: cost + turns surfaced verbatim from InvocationSignals.
+    def test_cost_and_turns_surfaced_from_signals(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr2")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg(num_turns=4)),
+                    signals=_make_signals(
+                        num_turns=4,
+                        total_cost_usd=0.42,
+                    ),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        assert payload["num_turns"] == 4
+        assert payload["total_cost_usd"] == 0.42
+
+    # FR-2 edge: when the SDK never produced a ResultMessage, cost / turns
+    # are absent — surface as null, not zero.
+    def test_cost_and_turns_null_when_signals_lack_them(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr2-null")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                    signals=_make_signals(
+                        num_turns=None,
+                        total_cost_usd=None,
+                    ),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        assert payload["num_turns"] is None
+        assert payload["total_cost_usd"] is None
+
+    # FR-3: emitted total_tokens equals the transcript-grader breach figure
+    # (the same _build_observation pipes feed both code paths).
+    def test_total_tokens_matches_observation(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr3")
+        messages: tuple[Message, ...] = (
+            _assistant(usage={"input_tokens": 30, "output_tokens": 20}),
+            _assistant(usage={"input_tokens": 11, "output_tokens": 4}),
+            _result_msg(num_turns=2),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=messages,
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        observation = _build_observation(messages, wall_seconds=0.0)
+        assert payload["usage"]["total_tokens"] == observation.total_tokens
+        # Sanity: total_tokens equals the field-wise sum.
+        assert payload["usage"]["total_tokens"] == sum(
+            payload["usage"][k]
+            for k in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            )
+        )
+
+    # FR-4: token fields are per-iteration deltas, never a running sum.
+    # Each iteration's event must carry only that iteration's usage; the
+    # run total is the sum of the deltas.
+    def test_two_iterations_each_carry_own_usage_not_running_sum(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr4")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(
+                            usage={"input_tokens": 10, "output_tokens": 5}
+                        ),
+                    ),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(
+                        _assistant(
+                            usage={"input_tokens": 7, "output_tokens": 3}
+                        ),
+                        _result_msg(num_turns=2),
+                    ),
+                ),
+            ]
+        )
+        config = HarnessConfig(max_iterations_per_attempt=2)
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        payloads = self._completed_payloads(store, lifecycle.run_id)
+        assert len(payloads) == 2
+        # First iteration carries only its own 15 tokens.
+        assert payloads[0]["usage"]["input_tokens"] == 10
+        assert payloads[0]["usage"]["output_tokens"] == 5
+        assert payloads[0]["usage"]["total_tokens"] == 15
+        # Second iteration carries only its own 10 tokens — NOT 25.
+        assert payloads[1]["usage"]["input_tokens"] == 7
+        assert payloads[1]["usage"]["output_tokens"] == 3
+        assert payloads[1]["usage"]["total_tokens"] == 10
+        # Run total is the sum of the per-iteration deltas.
+        assert (
+            payloads[0]["usage"]["total_tokens"]
+            + payloads[1]["usage"]["total_tokens"]
+            == 25
+        )
+
+    # Edge: an iteration with no usage data anywhere — fields are zero,
+    # cost / turns reflect whatever the signals say (here: None).
+    def test_iteration_without_usage_data_yields_zero_breakdown(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-empty")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                    signals=_make_signals(
+                        num_turns=None,
+                        total_cost_usd=None,
+                    ),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        assert payload["usage"] == {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "total_tokens": 0,
+        }
+        assert payload["num_turns"] is None
+        assert payload["total_cost_usd"] is None
+
+    # Edge: failed iteration (invoker raised before ResultMessage) still
+    # emits the event with whatever pre-failure usage was observed.
+    def test_failed_iteration_still_carries_breakdown(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=MissingEnvelope(),
+                    messages=(
+                        _assistant(
+                            usage={
+                                "input_tokens": 9,
+                                "output_tokens": 4,
+                            }
+                        ),
+                    ),
+                    failure=InvocationFailure(
+                        error_type="ProcessError",
+                        message="agent crashed",
+                    ),
+                    signals=_make_signals(
+                        num_turns=None,
+                        total_cost_usd=None,
+                    ),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        payload = self._completed_payload(store, lifecycle.run_id)
+        assert payload["failure"] is not None
+        assert payload["failure"]["error_type"] == "ProcessError"
+        # Breakdown survives the failed iteration.
+        assert payload["usage"]["input_tokens"] == 9
+        assert payload["usage"]["output_tokens"] == 4
+        assert payload["usage"]["total_tokens"] == 13
+
+    # The _build_usage_breakdown helper agrees with _build_observation on
+    # total_tokens for the same messages — a unit-level pinpoint for FR-3
+    # so a regression localizes to the helper rather than the event path.
+    def test_build_usage_breakdown_total_matches_build_observation(
+        self,
+    ) -> None:
+        messages: tuple[Message, ...] = (
+            _assistant(usage={"input_tokens": 12, "output_tokens": 8}),
+            _assistant(
+                usage={
+                    "input_tokens": 5,
+                    "cache_read_input_tokens": 100,
+                }
+            ),
+            _result_msg(num_turns=2),
+        )
+        breakdown = _build_usage_breakdown(messages)
+        observation = _build_observation(messages, wall_seconds=0.0)
+        assert sum(breakdown.values()) == observation.total_tokens
+
+    # Edge: when a ResultMessage reports a larger aggregate than the summed
+    # AssistantMessages, its breakdown wins — matches _build_observation's
+    # max(running, total_tokens_from_usage(rm.usage)) reconciliation.
+    def test_result_message_breakdown_wins_when_larger(self) -> None:
+        messages: tuple[Message, ...] = (
+            _assistant(usage={"input_tokens": 5, "output_tokens": 5}),
+            _result_msg(
+                num_turns=1,
+                usage={
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 10,
+                },
+            ),
+        )
+        breakdown = _build_usage_breakdown(messages)
+        assert breakdown == {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 10,
+        }
 
 
 # --- Operator interruption ------------------------------------------------

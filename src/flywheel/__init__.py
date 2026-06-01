@@ -90,6 +90,10 @@ from flywheel.notifier import RunNotifier
 from flywheel.orchestrator import (
     OrchestratorReport,
     RunRecord,
+    SandboxProvider,
+    SandboxRequest,
+    SubmitRequest,
+    Submitter,
     orchestrate,
 )
 from flywheel.prompt import IterationInputs, build_iteration_prompt
@@ -235,6 +239,8 @@ __all__ = [
     "RubricGrader",
     "RunNotifier",
     "RunRecord",
+    "SandboxProvider",
+    "SandboxRequest",
     "SdkMessageRecord",
     "SdkMessageStore",
     "SessionRecorded",
@@ -245,6 +251,8 @@ __all__ = [
     "Strategy",
     "StrategyContext",
     "StrategyResult",
+    "SubmitRequest",
+    "Submitter",
     "Subscription",
     "Task",
     "TaskClaim",

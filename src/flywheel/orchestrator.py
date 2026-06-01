@@ -6,10 +6,11 @@ task runs next is a layer above it. This module is that layer. It only
 *reads* authoritative lifecycle state and *decides what to run next*; it
 never calls ``transition_to`` and holds no special harness privilege.
 
-It replaces the poll loops a shell driver (``.workflow/task-worker.sh``)
-otherwise runs — repeatedly shelling ``workflow next`` / ``workflow run`` /
-``workflow recheck-blocked`` — with one in-process driver that re-evaluates
-after each run it drives.
+It replaces the poll loops a shell driver otherwise runs — repeatedly shelling
+``workflow next`` / ``workflow run`` / ``workflow recheck-blocked`` — with one
+in-process driver that re-evaluates after each run it drives. The git-worktree
+consumer ``.workflow/worker.py`` wraps it, injecting worktree submit through
+the ``prepare_sandbox`` / ``submit`` seam below.
 
 Scheduling, reusing the exact predicates the pull-based CLI already uses
 (:func:`flywheel.workflow.select_next_task` /
@@ -38,9 +39,11 @@ projection, so the worst failure mode is wasted latency, never a wrong
 schedule. Termination is guaranteed by two per-session guards — at most one
 fresh run per task id and at most one resume per run id.
 
-Sandboxing: each task runs in ``sandbox_root/<task-id>``. Real
-worktree/branch/merge mechanics remain a consumer "submit" concern layered
-on top (out of scope here); this module owns selection and execution order.
+Sandboxing: each task runs in ``sandbox_root/<task-id>`` by default. Real
+worktree/branch/merge mechanics remain a consumer "submit" concern, injected
+through the optional ``prepare_sandbox`` / ``submit`` callbacks (see
+:func:`orchestrate`); this module owns selection and execution order, never
+git.
 """
 
 from __future__ import annotations
@@ -118,6 +121,49 @@ class OrchestratorReport:
     worker_id: str
     recovered: tuple[str, ...]
     runs: tuple[RunRecord, ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxRequest:
+    """What the orchestrator needs a consumer to provision a run's sandbox.
+
+    Handed to a :data:`SandboxProvider` so a git-aware consumer can create or
+    reuse a worktree (and derive the branch from ``task_file``'s phase) and
+    return the directory the task should run in. ``run_id`` is ``None`` for a
+    fresh run; for a resume/recheck it is the lifecycle being continued.
+    ``mode`` distinguishes the two so the provider can rebase a parked
+    worktree on resume.
+    """
+
+    task_id: str
+    task_file: Path
+    run_id: str | None
+    mode: Literal["fresh", "resume"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SubmitRequest:
+    """The terminal outcome of one run, handed to a consumer's submit step.
+
+    A git-aware consumer uses this to FF-merge the task branch on ``done`` or
+    park the ``sandbox`` worktree on a non-done terminal status. ``sandbox``
+    is exactly the path the matching :data:`SandboxProvider` returned.
+    """
+
+    task_id: str
+    task_file: Path
+    run_id: str
+    status: Status
+    sandbox: Path
+
+
+# A consumer maps a SandboxRequest to the directory the task runs in (default:
+# ``sandbox_root/<task-id>``), and is handed a SubmitRequest after each run
+# finalizes — while the lease is still held — to merge or park. ``submit`` MUST
+# NOT raise: it records its own park/merge outcome and swallows git errors, so
+# a submit failure never unwinds the orchestrator and abandons peer tasks.
+SandboxProvider = Callable[[SandboxRequest], Path]
+Submitter = Callable[[SubmitRequest], None]
 
 
 def _is_blocked_interrupted(row: TaskStatusRow) -> bool:
@@ -246,6 +292,8 @@ async def orchestrate(
     lease_seconds: float = DEFAULT_LEASE_SECONDS,
     stream: TextIO | None = None,
     now: Callable[[], datetime] | None = None,
+    prepare_sandbox: SandboxProvider | None = None,
+    submit: Submitter | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task in ``tasks_dir`` to quiescence.
 
@@ -254,10 +302,38 @@ async def orchestrate(
     claimable. Safe to run as several concurrent workers against one store —
     per-task leases keep them from double-running a task. ``invoke`` defaults
     to the real Claude Code invoker; tests inject a fake callable.
+
+    ``prepare_sandbox`` and ``submit`` are the optional consumer submit seam.
+    By default each task runs in a plain ``sandbox_root/<task-id>`` dir and
+    nothing happens on completion (the historical behavior, unchanged). A
+    consumer supplies ``prepare_sandbox`` to provision the run's working
+    directory (e.g. a git worktree) and ``submit`` to act on the terminal
+    status (e.g. FF-merge or park). Both run while the task's lease is held,
+    so two workers never merge the same task concurrently; all consumer
+    git/strategy code stays in these callbacks, never in flywheel.
     """
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
+
+    def resolve_sandbox(
+        task_id: str,
+        task_file: Path,
+        run_id: str | None,
+        mode: Literal["fresh", "resume"],
+    ) -> Path:
+        """The directory a task runs in: consumer-provisioned or the default
+        ``sandbox_root/<task-id>``."""
+        if prepare_sandbox is None:
+            return sandbox_root / task_id
+        return prepare_sandbox(
+            SandboxRequest(
+                task_id=task_id,
+                task_file=task_file,
+                run_id=run_id,
+                mode=mode,
+            )
+        )
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox_root.mkdir(parents=True, exist_ok=True)
@@ -301,12 +377,37 @@ async def orchestrate(
                 if claim is None:
                     continue  # another worker owns this task right now
                 try:
+                    # Provision the sandbox before recheck so the blocked
+                    # predicates are evaluated in the same (consumer-prepared,
+                    # e.g. rebased-onto-base) tree the resumed run will use.
+                    # Only the claim-holder reaches here, so prepares stay
+                    # bounded. A failing provider skips this task for the
+                    # session (it never starves peers) rather than unwinding
+                    # the worker; the finally releases the claim.
+                    try:
+                        sandbox = resolve_sandbox(
+                            row.task.id,
+                            file_by_id[row.task.id],
+                            run_id,
+                            "resume",
+                        )
+                    except Exception as exc:  # noqa: BLE001 - consumer code
+                        attempted_resume.add(run_id)
+                        if stream is not None:
+                            print(
+                                f"[orchestrate] {row.task.id}: prepare "
+                                f"failed ({type(exc).__name__}: {exc}); "
+                                f"skipping",
+                                file=stream,
+                                flush=True,
+                            )
+                        continue
                     try:
                         outcome = recheck_blocked_lifecycle(
                             control,
                             run_id,
                             task_by_id[row.task.id],
-                            cwd=sandbox_root / row.task.id,
+                            cwd=sandbox,
                         )
                     except OptimisticConcurrencyError:
                         # Another worker transitioned it first; let go.
@@ -319,7 +420,8 @@ async def orchestrate(
                         claim,
                         file_by_id[row.task.id],
                         db_path=db_path,
-                        sandbox_root=sandbox_root,
+                        sandbox=sandbox,
+                        submit=submit,
                         task_id=row.task.id,
                         run_id=run_id,
                         worker_id=wid,
@@ -367,12 +469,30 @@ async def orchestrate(
                     held.add(pick.task.id)
                     continue
                 attempted_fresh.add(pick.task.id)
+                try:
+                    sandbox = resolve_sandbox(
+                        pick.task.id, pick.task_file, None, "fresh"
+                    )
+                except Exception as exc:  # noqa: BLE001 - consumer code
+                    # A failing provider skips this task for the session
+                    # (already in attempted_fresh) and keeps draining the
+                    # rest, rather than unwinding the whole worker.
+                    control.release_claim(claim)
+                    if stream is not None:
+                        print(
+                            f"[orchestrate] {pick.task.id}: prepare failed "
+                            f"({type(exc).__name__}: {exc}); skipping",
+                            file=stream,
+                            flush=True,
+                        )
+                    continue
                 record = await _drive_or_relinquish(
                     control,
                     claim,
                     pick.task_file,
                     db_path=db_path,
-                    sandbox_root=sandbox_root,
+                    sandbox=sandbox,
+                    submit=submit,
                     task_id=pick.task.id,
                     run_id=None,
                     worker_id=wid,
@@ -408,7 +528,8 @@ async def _drive_under_lease(
     task_file: Path,
     *,
     db_path: Path,
-    sandbox_root: Path,
+    sandbox: Path,
+    submit: Submitter | None,
     task_id: str,
     run_id: str | None,
     worker_id: str,
@@ -421,14 +542,20 @@ async def _drive_under_lease(
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
-    """Run (or resume) one task while a heartbeat holds its lease, then
-    release the lease.
+    """Run (or resume) one task while a heartbeat holds its lease, hand the
+    terminal status to ``submit``, then release the lease.
 
     ``run_task_file`` opens and closes its own store, so its writes are
     committed and visible to the orchestrator's control store on the next
     query (separate SQLite connections under WAL). The control store is
     touched only by the heartbeat thread for the duration of the run, never
     concurrently with the main thread.
+
+    ``submit`` (when provided) runs after the task finalizes but *before* the
+    lease is released, so a consumer's merge/park acts under the same
+    exclusivity that kept peers off the task. It must not raise; a graceful
+    SIGTERM cancels the run before this point, so an interrupted task's
+    sandbox is left untouched (parked) for the next attempt to reuse.
     """
     heartbeat = _ClaimHeartbeat(
         store=control,
@@ -441,7 +568,7 @@ async def _drive_under_lease(
         outcome = await run_task_file(
             task_file,
             db_path=db_path,
-            sandbox=sandbox_root / task_id,
+            sandbox=sandbox,
             model=model,
             max_turns=max_turns,
             max_retries=max_retries,
@@ -449,6 +576,16 @@ async def _drive_under_lease(
             stream=stream,
             run_id=run_id,
         )
+        if submit is not None:
+            submit(
+                SubmitRequest(
+                    task_id=task_id,
+                    task_file=task_file,
+                    run_id=outcome.lifecycle.run_id,
+                    status=outcome.lifecycle.status,
+                    sandbox=sandbox,
+                )
+            )
     finally:
         latest = heartbeat.stop()
         control.release_claim(latest)
@@ -510,5 +647,9 @@ __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "OrchestratorReport",
     "RunRecord",
+    "SandboxProvider",
+    "SandboxRequest",
+    "SubmitRequest",
+    "Submitter",
     "orchestrate",
 ]

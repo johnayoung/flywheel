@@ -10,6 +10,7 @@ harness tests already cover.
 from __future__ import annotations
 
 import json
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1339,6 +1340,64 @@ def test_run_task_object_graderless_reaches_done_and_streams_events(
     # The unverified-run note lands on stderr, not in the event stream.
     assert "unverified run" in captured.err
     assert "unverified run" not in captured.out
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+def test_run_task_object_finalizes_lifecycle_on_signal(
+    tmp_path: Path, signum: int
+) -> None:
+    """A SIGTERM/SIGINT mid-run cancels the in-flight task and finalizes its
+    lifecycle to INTERRUPTED with a harness.crash receipt -- it must not be
+    stranded in `running`.
+
+    SIGTERM is the production stop signal (``docker stop``, ``kubectl delete
+    pod``, ``systemctl stop``); its default disposition would terminate the
+    interpreter before run_task reaches its finalizer, which is the exact
+    stranding the bash worker had to reconcile out-of-band
+    (``.workflow/audits/02-harness-resilience.md``). run_task_object now
+    installs a loop signal handler that routes both signals into the
+    existing finalize_stranded_lifecycle path.
+    """
+    import asyncio
+    import os
+
+    db = tmp_path / "db.sqlite"
+    sandbox = tmp_path / "sb"
+    task = build_inline_task("long running thing")
+
+    async def _signaling_invoke(
+        _request: InvocationRequest,
+    ) -> IterationResult:
+        # Deliver the stop signal to ourselves, then block. The loop handler
+        # run_task_object installed cancels the running task, raising
+        # CancelledError into this await before the sleep resolves.
+        os.kill(os.getpid(), signum)
+        await asyncio.sleep(30)
+        return _verify_iteration()  # pragma: no cover - cancelled first
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            run_task_object(
+                task,
+                db_path=db,
+                sandbox=sandbox,
+                invoke=_signaling_invoke,
+                source="(inline goal)",
+            )
+        )
+
+    store = SqliteStore(db)
+    try:
+        rows = store._connection.execute(  # noqa: SLF001 — inspecting rows
+            "SELECT run_id, status FROM lifecycles WHERE task_id = ?",
+            (task.id,),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["status"] == Status.INTERRUPTED.value
+        kinds = [e.kind for e in store.list_events(rows[0]["run_id"])]
+        assert "harness.crash" in kinds
+    finally:
+        store.close()
 
 
 def test_run_task_object_json_events_are_ndjson(

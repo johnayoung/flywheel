@@ -56,6 +56,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -731,6 +732,50 @@ def _make_event_emitter(
     return emit_plain
 
 
+def _install_cancel_on_signal(
+    loop: asyncio.AbstractEventLoop, target: asyncio.Task[Any]
+) -> list[int]:
+    """Route SIGTERM/SIGINT through ``target.cancel()`` for the run's duration.
+
+    Production shutdown — ``docker stop``, ``kubectl delete pod``,
+    ``systemctl stop`` — sends SIGTERM, whose default disposition terminates
+    the interpreter *without raising*, so the in-flight :func:`run_task`
+    never reaches its finalizer and its lifecycle is stranded in ``running``
+    (see ``.workflow/audits/02-harness-resilience.md``). Cancelling the
+    running task instead funnels operator shutdown into the same
+    :class:`asyncio.CancelledError` path the caller already drains via
+    :func:`finalize_stranded_lifecycle`, so a graceful terminate leaves a
+    clean, resumable ``interrupted`` lifecycle. SIGINT is routed the same way
+    for uniformity (previously it surfaced as ``KeyboardInterrupt``).
+
+    Returns the signal numbers actually installed so the caller removes
+    exactly those. ``add_signal_handler`` is unavailable off the main thread
+    and on some platforms (e.g. Windows); when it raises we degrade to the
+    prior behavior rather than fail the run. SIGKILL, OOM, and host reboot
+    remain uncatchable — the startup recovery sweep is their backstop.
+    """
+    installed: list[int] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, target.cancel)
+        except (NotImplementedError, RuntimeError, ValueError):
+            continue
+        installed.append(sig)
+    return installed
+
+
+def _remove_cancel_on_signal(
+    loop: asyncio.AbstractEventLoop, signals: list[int]
+) -> None:
+    """Restore default disposition for the signals :func:`_install_cancel_on_signal`
+    took over, so they do not leak past this run (e.g. between orchestrator tasks)."""
+    for sig in signals:
+        try:
+            loop.remove_signal_handler(sig)
+        except (NotImplementedError, ValueError):
+            pass
+
+
 async def run_task_object(
     task: Task,
     *,
@@ -837,6 +882,19 @@ async def run_task_object(
             file=out,
             flush=True,
         )
+        # Take over SIGTERM/SIGINT for the duration of the run so an
+        # operator-driven shutdown cancels the in-flight task and lands in
+        # the finalize path below, instead of terminating the interpreter
+        # with the lifecycle stranded in `running`. Cancelling the current
+        # task (rather than a child task) keeps run_task running inline, so
+        # an externally-cancelled orchestrator still propagates into it.
+        loop = asyncio.get_running_loop()
+        current_task = asyncio.current_task()
+        installed_signals = (
+            _install_cancel_on_signal(loop, current_task)
+            if current_task is not None
+            else []
+        )
         try:
             outcome = await run_task(
                 task,
@@ -854,10 +912,11 @@ async def run_task_object(
                 invoke=invoker,
             )
         except (asyncio.CancelledError, KeyboardInterrupt):
-            # Operator killed the worker mid-attempt. Finalize the open
-            # attempt as INTERNAL_ERROR and transition the lifecycle to
-            # INTERRUPTED so the next worker start sees a clean slate
-            # rather than a lifecycle wedged in `running`.
+            # Operator killed the worker mid-attempt (SIGTERM/SIGINT routed
+            # here by the handler above, or an external task cancellation).
+            # Finalize the open attempt as INTERNAL_ERROR and transition the
+            # lifecycle to INTERRUPTED so the next worker start sees a clean
+            # slate rather than a lifecycle wedged in `running`.
             finalize_stranded_lifecycle(backend, lifecycle.run_id)
             print(
                 f"[workflow] status  : interrupted (worker received signal)",
@@ -865,6 +924,8 @@ async def run_task_object(
                 flush=True,
             )
             raise
+        finally:
+            _remove_cancel_on_signal(loop, installed_signals)
         print(
             f"[workflow] status  : {outcome.lifecycle.status.value}",
             file=out,
@@ -1088,7 +1149,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
 # `live` answers "what is the agent doing right now, and is it still moving?"
 # by joining the in-flight lifecycles to the most recent sdk_message and event
 # rows. The output is intentionally one line per run -- it is meant to be
-# tail-friendly inside task-worker.sh's heartbeat as well as readable on its
+# tail-friendly inside the worker's heartbeat as well as readable on its
 # own. Stale-after threshold is heuristic: a healthy turn can take 30-60s on a
 # slow read or API call, so we wait past that before flagging.
 

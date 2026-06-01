@@ -52,10 +52,13 @@ from flywheel import (
     LifecycleStore,
     OptimisticConcurrencyError,
     Outcome,
+    CommandGrader,
     SdkMessageRecord,
     SdkMessageStore,
     SqliteStore,
     Status,
+    Task,
+    TaskStore,
     TransitionedTo,
     replay,
 )
@@ -192,6 +195,7 @@ def test_store_satisfies_every_protocol(store: object) -> None:
     assert isinstance(store, AgentSessionStore)
     assert isinstance(store, SdkMessageStore)
     assert isinstance(store, AuditStore)
+    assert isinstance(store, TaskStore)
 
 
 def test_store_exposes_no_grader_result_mutators(store: object) -> None:
@@ -1345,3 +1349,66 @@ def test_claims_are_independent_per_task(store: object) -> None:
 def test_load_missing_claim_returns_none(store: object) -> None:
     assert isinstance(store, ClaimStore)
     assert store.load_claim("nope") is None
+
+
+# --- TaskStore --------------------------------------------------------------
+
+
+def _task(task_id: str = "t", goal: str = "Do the thing.") -> Task:
+    return Task(id=task_id, goal=goal, graders=[CommandGrader(run="true")])
+
+
+def test_save_task_returns_digest_and_is_idempotent(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    task = _task()
+    first = store.save_task(task, now=_t(0))
+    second = store.save_task(task, now=_t(5))
+    assert first == second
+    loaded = store.load_task(task.id)
+    assert loaded == task
+
+
+def test_load_task_missing_returns_none(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    assert store.load_task("absent") is None
+    assert store.load_task("absent", "deadbeef") is None
+
+
+def test_save_task_edit_creates_new_version(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    original = _task(goal="Original goal.")
+    edited = _task(goal="Edited goal.")
+    h_original = store.save_task(original, now=_t(0))
+    h_edited = store.save_task(edited, now=_t(10))
+    assert h_original != h_edited
+    # Latest (no hash) resolves to the most recently created version.
+    assert store.load_task("t") == edited
+    # Each exact version is still retrievable by its content hash.
+    assert store.load_task("t", h_original) == original
+    assert store.load_task("t", h_edited) == edited
+
+
+def test_load_task_for_run_resolves_pinned_version(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    assert isinstance(store, DomainEventStore)
+    original = _task(goal="Original goal.")
+    edited = _task(goal="Edited goal.")
+    h_original = store.save_task(original, now=_t(0))
+    store.save_task(edited, now=_t(10))
+    # Seed a run pinned to the ORIGINAL version, then edit the catalog.
+    store.append_domain_event(
+        LifecycleInitialized(
+            run_id="run-pin",
+            ts=_t(0),
+            task_id="t",
+            task_content_hash=h_original,
+        ),
+        expected_version=0,
+    )
+    # The run resolves to exactly what it executed, not the latest edit.
+    assert store.load_task_for_run("run-pin") == original
+
+
+def test_load_task_for_run_missing_run_returns_none(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    assert store.load_task_for_run("never-ran") is None

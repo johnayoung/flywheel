@@ -3,13 +3,15 @@
 -- Mirror of docs/persistence-schema.sql translated to Postgres-native types:
 -- JSONB for *_json columns, TIMESTAMPTZ for timestamp columns, BIGSERIAL for
 -- autoincrement ids, BOOLEAN for grader_results.passed. Tables span the
--- conceptual model: lifecycles is the row that mutates (with a version column
--- for optimistic concurrency), attempts is the per-execution history, events
--- is the timeline of harness-emitted events, grader_results is the per-grader
--- receipt log produced during validation, claude_session_store persists
--- Claude Code agent transcripts, sdk_messages is the verbatim agent message
--- stream captured per iteration, and run_sequence is the per-run monotonic
--- counter that orders events and sdk_messages into a single audit stream.
+-- conceptual model: tasks is the content-addressed catalog of task
+-- definitions a run can reference, lifecycles is the row that mutates (with a
+-- version column for optimistic concurrency), attempts is the per-execution
+-- history, events is the timeline of harness-emitted events, grader_results
+-- is the per-grader receipt log produced during validation,
+-- claude_session_store persists Claude Code agent transcripts, sdk_messages
+-- is the verbatim agent message stream captured per iteration, and
+-- run_sequence is the per-run monotonic counter that orders events and
+-- sdk_messages into a single audit stream.
 --
 -- grader_results is append-only by contract: rows are written once when a
 -- grader finishes and must not be updated or deleted. The append-only
@@ -41,6 +43,28 @@
 -- by substituting a `${schema}.` qualifier prefix in front of every
 -- object name at bootstrap).
 
+-- tasks: content-addressed catalog of task definitions. Keyed by
+-- (id, content_hash) where content_hash is flywheel.loaders.task_digest over
+-- the definition (everything except id). Storage is immutable and deduped:
+-- re-saving an unchanged task is a no-op, editing it adds a new version row.
+-- The column layout mirrors docs/task-schema.md — goal is a first-class
+-- column; the list/nested fields (graders, prerequisites, tags, context) are
+-- JSONB. A run pins the exact version it ran via lifecycles.task_content_hash;
+-- there is deliberately no foreign key (task_id stays a denormalized,
+-- untrusted reference, consistent with the rest of the schema).
+CREATE TABLE IF NOT EXISTS tasks (
+  id                  TEXT NOT NULL,
+  content_hash        TEXT NOT NULL,
+  goal                TEXT NOT NULL,
+  graders_json        JSONB NOT NULL,
+  prerequisites_json  JSONB NOT NULL,
+  tags_json           JSONB NOT NULL,
+  context_json        JSONB NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_id_created ON tasks(id, created_at);
+
 CREATE TABLE IF NOT EXISTS lifecycles (
   run_id               TEXT PRIMARY KEY,
   task_id              TEXT NOT NULL,
@@ -54,7 +78,8 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   worker_id            TEXT,
   timestamps_json      JSONB NOT NULL,
   updated_at           TIMESTAMPTZ NOT NULL,
-  blocked_requires_json TEXT
+  blocked_requires_json TEXT,
+  task_content_hash    TEXT
 );
 
 -- agent_context_json captures the agent identity for this attempt so the run
@@ -190,7 +215,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version (id, version) VALUES (1, 2)
+INSERT INTO schema_version (id, version) VALUES (1, 3)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

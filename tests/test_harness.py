@@ -56,6 +56,7 @@ from flywheel.grader_rubric import (
     RubricJudgeError,
 )
 from flywheel.harness import finalize_stranded_lifecycle
+from flywheel.loaders import task_digest
 from flywheel.envelope import (
     CLOSING_FENCE,
     CommandGraderRequirement,
@@ -2308,3 +2309,33 @@ class TestHarnessConfigDefaults:
         assert cfg.rubric_judge_max_turns == 8
         assert cfg.worktree is None
         assert cfg.rubric_judge_invoke is None
+
+
+class TestTaskPersistence:
+    def test_run_persists_task_and_pins_content_hash(self) -> None:
+        store = InMemoryStore()
+        task = Task(id="persist-me", goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="persist-me", run_id="run-persist")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(_assistant(), _result_msg(num_turns=1)),
+                    transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                    signals=_make_signals(num_turns=1),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        # Graderless run reaches DONE on the agent's own claim.
+        assert outcome.lifecycle.status == Status.DONE
+        # The run pins the exact task version it executed, and that version
+        # is retrievable both by hash and via the run.
+        digest = task_digest(task)
+        assert outcome.lifecycle.task_content_hash == digest
+        assert store.load_task("persist-me", digest) == task
+        assert store.load_task_for_run("run-persist") == task

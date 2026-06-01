@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Any
 
@@ -185,3 +187,105 @@ def _task_from_dict(data: Any, source: str) -> Task:
         raise TaskLoadError(f"{source}: {exc}") from exc
 
     return task
+
+
+# --- Serialization (Task -> dict / digest) ----------------------------------
+#
+# The inverse of ``_task_from_dict``. Lives here, not in ``flywheel.task``,
+# because that module is purity-enforced (no json/io). Concrete stores call
+# these to persist a Task and to content-address it for the ``tasks`` table.
+
+
+def _grader_to_dict(grader: Grader) -> dict[str, Any]:
+    """Project a grader back into the JSON object ``_build_grader`` consumes.
+
+    Optional fields that are ``None`` are omitted so the output matches the
+    on-disk file shape; ``serialize_task`` -> ``deserialize_task`` round-trips
+    to an equal :class:`Task`.
+    """
+    if isinstance(grader, CommandGrader):
+        spec: dict[str, Any] = {"type": "command", "run": grader.run}
+        if grader.name is not None:
+            spec["name"] = grader.name
+        return spec
+    if isinstance(grader, RubricGrader):
+        spec = {
+            "type": "rubric",
+            "assertions": list(grader.assertions),
+            "retry_on_fail": grader.retry_on_fail,
+        }
+        if grader.rubric is not None:
+            spec["rubric"] = grader.rubric
+        if grader.name is not None:
+            spec["name"] = grader.name
+        if grader.judge_model is not None:
+            spec["judge_model"] = grader.judge_model
+        return spec
+    if isinstance(grader, ManualGrader):
+        spec = {"type": "manual", "instruction": grader.instruction}
+        if grader.name is not None:
+            spec["name"] = grader.name
+        return spec
+    if isinstance(grader, TranscriptGrader):
+        spec = {"type": "transcript"}
+        if grader.max_turns is not None:
+            spec["max_turns"] = grader.max_turns
+        if grader.max_total_tokens is not None:
+            spec["max_total_tokens"] = grader.max_total_tokens
+        if grader.max_wall_seconds is not None:
+            spec["max_wall_seconds"] = grader.max_wall_seconds
+        if grader.name is not None:
+            spec["name"] = grader.name
+        return spec
+    raise TypeError(f"cannot serialize unknown grader {type(grader)!r}")
+
+
+def _context_to_dict(context: Context) -> dict[str, Any]:
+    return {
+        "relevant": list(context.relevant),
+        "references": list(context.references),
+        "constraints": list(context.constraints),
+        "non_goals": list(context.non_goals),
+        "edge_cases": list(context.edge_cases),
+        "notes": context.notes,
+    }
+
+
+def serialize_task(task: Task) -> dict[str, Any]:
+    """Return the JSON-compatible dict form of ``task``.
+
+    Exact inverse of :func:`_task_from_dict`: feeding the result to
+    :func:`deserialize_task` reconstructs an equal :class:`Task`.
+    """
+    return {
+        "id": task.id,
+        "goal": task.goal,
+        "graders": [_grader_to_dict(g) for g in task.graders],
+        "prerequisites": list(task.prerequisites),
+        "tags": list(task.tags),
+        "context": _context_to_dict(task.context),
+    }
+
+
+def deserialize_task(data: Mapping[str, Any]) -> Task:
+    """Reconstruct a validated :class:`Task` from its serialized dict form."""
+    return _task_from_dict(dict(data), "<serialized task>")
+
+
+def task_digest(task: Task) -> str:
+    """Content hash of a task's definition (everything except ``id``).
+
+    Two tasks with identical definitions share a digest regardless of ``id``;
+    any edit to goal, graders, prerequisites, tags, or context yields a new
+    digest. Used as the version discriminator in the content-addressed
+    ``tasks`` store, so a run can pin the exact definition it executed.
+    """
+    definition = {
+        "goal": task.goal,
+        "graders": [_grader_to_dict(g) for g in task.graders],
+        "prerequisites": list(task.prerequisites),
+        "tags": list(task.tags),
+        "context": _context_to_dict(task.context),
+    }
+    canonical = json.dumps(definition, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

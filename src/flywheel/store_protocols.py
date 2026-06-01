@@ -19,6 +19,7 @@ from typing import Any, Literal, Protocol, Union, runtime_checkable
 
 from flywheel.events import DomainEvent
 from flywheel.lifecycle import Attempt, Lifecycle
+from flywheel.task import Task
 
 
 # --- Typed conflict signals -------------------------------------------------
@@ -90,7 +91,7 @@ class ClaimLostError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 2
+CURRENT_SCHEMA_VERSION: int = 3
 
 
 class StoreSchemaError(Exception):
@@ -277,6 +278,40 @@ class LifecycleStore(Protocol):
     ) -> None: ...
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+
+@runtime_checkable
+class TaskStore(Protocol):
+    """Persistence contract for ``Task`` definitions, content-addressed.
+
+    A task is stored under the composite key ``(id, content_hash)`` where
+    ``content_hash`` is :func:`flywheel.loaders.task_digest` over the task's
+    definition (everything except ``id``). This makes storage immutable and
+    deduplicated: re-saving an unchanged task is a no-op, while editing it
+    produces a new version row. A run pins the exact version it executed via
+    ``Lifecycle.task_content_hash``, so historical truth survives later edits
+    — the same guarantee ``grader_results`` provides for graders, extended to
+    the whole task.
+
+    * ``save_task`` is idempotent. It serializes the task, computes its
+      digest, and inserts a row keyed by ``(task.id, digest)`` only if absent;
+      it returns the digest. ``created_at`` is set from the injected ``now``
+      on first insert and never mutated thereafter.
+    * ``load_task`` returns the exact version when ``content_hash`` is given,
+      else the most recently created version for ``task_id``; ``None`` when no
+      matching row exists.
+    * ``load_task_for_run`` resolves the run's lifecycle ``task_id`` +
+      ``task_content_hash`` to the precise task that run executed; ``None``
+      when the run or its pinned task is unknown.
+    """
+
+    def save_task(self, task: Task, *, now: datetime) -> str: ...
+
+    def load_task(
+        self, task_id: str, content_hash: str | None = None
+    ) -> Task | None: ...
+
+    def load_task_for_run(self, run_id: str) -> Task | None: ...
 
 
 @runtime_checkable
@@ -514,4 +549,5 @@ __all__ = [
     "StoreConflictError",
     "StoreSchemaError",
     "TaskClaim",
+    "TaskStore",
 ]

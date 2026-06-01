@@ -102,6 +102,10 @@ class Lifecycle:
     session_id: str = ""
     artifacts_dir: str = ""
     blocked_requires_json: str | None = None
+    # Content hash of the exact Task definition this run executed; pins the
+    # run to a row in the content-addressed `tasks` store. Identity-shaping
+    # like task_id/run_id: set once at seed, never copied by replace_from.
+    task_content_hash: str = ""
 
     def apply_transition(
         self,

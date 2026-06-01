@@ -93,6 +93,7 @@ from flywheel.store_protocols import (
     GraderResultRecord,
     LifecycleAlreadyExistsError,
 )
+from flywheel.loaders import task_digest
 from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
 
 
@@ -127,6 +128,8 @@ class HarnessStore(Protocol):
     ) -> None: ...
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+    def save_task(self, task: Task, *, now: datetime) -> str: ...
 
     def append_domain_event(
         self,
@@ -1017,6 +1020,16 @@ async def run_task(
     # which events could exist before the row (the silent pre-lifecycle
     # crash shape that .workflow/audits/08-recoverable-blocked-lifecycles.md
     # documents). Append-then-swallow is the defensive resume shape.
+    # Persist the task definition before seeding the lifecycle so every run
+    # records the exact task it executed (end-to-end traceability). save_task
+    # is content-addressed and idempotent, so resumes and retries re-saving
+    # the same task are no-ops. The returned digest pins this run to its task
+    # version via LifecycleInitialized -> Lifecycle.task_content_hash.
+    task_content_hash = store.save_task(task, now=clock())
+    # Reflect the pinned version on the in-memory lifecycle too. replace_from
+    # treats task_content_hash as identity-shaping and won't copy it from the
+    # persisted row on resume, so set it here from the digest we just computed.
+    lifecycle.task_content_hash = task_content_hash
     try:
         _append(
             lifecycle,
@@ -1026,6 +1039,7 @@ async def run_task(
                 task_id=lifecycle.task_id,
                 worker_id=lifecycle.worker_id,
                 artifacts_dir=lifecycle.artifacts_dir,
+                task_content_hash=task_content_hash,
             ),
             store=store,
         )

@@ -15,6 +15,7 @@ from flywheel import (
     load_task_file,
     load_tasks_jsonl,
 )
+from flywheel.loaders import deserialize_task, serialize_task, task_digest
 
 
 def _well_formed() -> dict:
@@ -340,6 +341,71 @@ def test_load_task_file_rejects_retry_on_fail_string(tmp_path: Path) -> None:
     msg = str(exc.value)
     assert "graders[0]" in msg
     assert "retry_on_fail" in msg
+
+
+# ---------- serialize_task / deserialize_task / task_digest ----------
+
+
+def _minimal_task() -> Task:
+    return Task(
+        id="demo",
+        goal="Demo goal.",
+        graders=[CommandGrader(run="true")],
+    )
+
+
+def _briefed_task() -> Task:
+    return deserialize_task(_fully_briefed())
+
+
+def test_serialize_then_deserialize_round_trips_minimal() -> None:
+    task = _minimal_task()
+    assert deserialize_task(serialize_task(task)) == task
+
+
+def test_serialize_then_deserialize_round_trips_fully_briefed() -> None:
+    task = _briefed_task()
+    restored = deserialize_task(serialize_task(task))
+    assert restored == task
+    # Every grader variant survives the round trip with its concrete type.
+    assert [type(g) for g in restored.graders] == [
+        CommandGrader,
+        RubricGrader,
+        TranscriptGrader,
+        ManualGrader,
+    ]
+
+
+def test_serialize_task_matches_loader_input_shape() -> None:
+    # The dict serialize_task emits is itself loadable, so it is the same
+    # shape task files use.
+    task = _briefed_task()
+    assert deserialize_task(serialize_task(task)) == task
+
+
+def test_task_digest_is_stable_across_reserialization() -> None:
+    task = _briefed_task()
+    assert task_digest(task) == task_digest(deserialize_task(serialize_task(task)))
+
+
+def test_task_digest_ignores_id() -> None:
+    a = Task(id="one", goal="g", graders=[CommandGrader(run="true")])
+    b = Task(id="two", goal="g", graders=[CommandGrader(run="true")])
+    assert task_digest(a) == task_digest(b)
+
+
+def test_task_digest_changes_when_definition_changes() -> None:
+    base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
+    digest = task_digest(base)
+    assert task_digest(Task(id="x", goal="g2", graders=base.graders)) != digest
+    assert (
+        task_digest(Task(id="x", goal="g", graders=[CommandGrader(run="false")]))
+        != digest
+    )
+    assert (
+        task_digest(Task(id="x", goal="g", graders=base.graders, tags=["a"]))
+        != digest
+    )
 
 
 def test_load_task_file_rejects_non_string_judge_model(tmp_path: Path) -> None:

@@ -54,6 +54,7 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
         ).fetchall()
         names = {r["name"] for r in rows}
         assert names == {
+            "tasks",
             "lifecycles",
             "attempts",
             "events",

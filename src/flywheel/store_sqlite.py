@@ -51,7 +51,9 @@ from flywheel.events import (
     apply,
 )
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel.loaders import deserialize_task, serialize_task, task_digest
 from flywheel.notifier import RunNotifier
+from flywheel.task import Task
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
@@ -275,8 +277,9 @@ class SqliteStore:
                 INSERT INTO lifecycles (
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
-                    timestamps_json, updated_at, blocked_requires_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timestamps_json, updated_at, blocked_requires_json,
+                    task_content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lifecycle.run_id,
@@ -292,6 +295,7 @@ class SqliteStore:
                     _serialize_timestamps(lifecycle.timestamps),
                     _utcnow_iso(),
                     lifecycle.blocked_requires_json,
+                    lifecycle.task_content_hash or None,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -319,7 +323,8 @@ class SqliteStore:
                 worker_id = ?,
                 timestamps_json = ?,
                 updated_at = ?,
-                blocked_requires_json = ?
+                blocked_requires_json = ?,
+                task_content_hash = ?
             WHERE run_id = ? AND version = ?
             """,
             (
@@ -335,6 +340,7 @@ class SqliteStore:
                 _serialize_timestamps(lifecycle.timestamps),
                 _utcnow_iso(),
                 lifecycle.blocked_requires_json,
+                lifecycle.task_content_hash or None,
                 lifecycle.run_id,
                 expected_version,
             ),
@@ -359,7 +365,7 @@ class SqliteStore:
             """
             SELECT run_id, task_id, status, version, retries, error,
                    agent_output, session_id, artifacts_dir, worker_id,
-                   timestamps_json, blocked_requires_json
+                   timestamps_json, blocked_requires_json, task_content_hash
             FROM lifecycles
             WHERE run_id = ?
             """,
@@ -380,9 +386,68 @@ class SqliteStore:
             session_id=row["session_id"] or "",
             artifacts_dir=row["artifacts_dir"] or "",
             blocked_requires_json=row["blocked_requires_json"],
+            task_content_hash=row["task_content_hash"] or "",
         )
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    # --- TaskStore --------------------------------------------------------
+
+    def save_task(self, task: Task, *, now: datetime) -> str:
+        content_hash = task_digest(task)
+        data = serialize_task(task)
+        # INSERT OR IGNORE makes the (id, content_hash) write idempotent:
+        # re-saving an unchanged task is a no-op and created_at is preserved.
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO tasks (
+                id, content_hash, goal, graders_json, prerequisites_json,
+                tags_json, context_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task.id,
+                content_hash,
+                data["goal"],
+                json.dumps(data["graders"]),
+                json.dumps(data["prerequisites"]),
+                json.dumps(data["tags"]),
+                json.dumps(data["context"]),
+                _iso(now),
+            ),
+        )
+        return content_hash
+
+    def load_task(
+        self, task_id: str, content_hash: str | None = None
+    ) -> Task | None:
+        if content_hash is not None:
+            row = self._connection.execute(
+                "SELECT id, goal, graders_json, prerequisites_json, "
+                "tags_json, context_json FROM tasks "
+                "WHERE id = ? AND content_hash = ?",
+                (task_id, content_hash),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT id, goal, graders_json, prerequisites_json, "
+                "tags_json, context_json FROM tasks "
+                "WHERE id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_task(row)
+
+    def load_task_for_run(self, run_id: str) -> Task | None:
+        row = self._connection.execute(
+            "SELECT task_id, task_content_hash FROM lifecycles "
+            "WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.load_task(row["task_id"], row["task_content_hash"] or None)
 
     # --- DomainEventStore -------------------------------------------------
 
@@ -908,6 +973,19 @@ def _row_to_attempt(row: sqlite3.Row) -> Attempt:
         agent_output=row["agent_output"] or "",
         error=row["error"] or "",
         agent_context=json.loads(row["agent_context_json"] or "{}"),
+    )
+
+
+def _row_to_task(row: sqlite3.Row) -> Task:
+    return deserialize_task(
+        {
+            "id": row["id"],
+            "goal": row["goal"],
+            "graders": json.loads(row["graders_json"]),
+            "prerequisites": json.loads(row["prerequisites_json"]),
+            "tags": json.loads(row["tags_json"]),
+            "context": json.loads(row["context_json"]),
+        }
     )
 
 

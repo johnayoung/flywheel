@@ -56,6 +56,7 @@ def test_lifecycle_fields_match_spec_table() -> None:
         "session_id",
         "artifacts_dir",
         "blocked_requires_json",
+        "task_content_hash",
     }
     assert {f.name for f in fields(Lifecycle)} == expected
 

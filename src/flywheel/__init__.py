@@ -130,6 +130,7 @@ from flywheel.store_protocols import (
     StoreConflictError,
     StoreSchemaError,
     TaskClaim,
+    TaskStore,
 )
 from flywheel.task import (
     KNOWN_GRADER_TYPES,
@@ -257,6 +258,7 @@ __all__ = [
     "Task",
     "TaskClaim",
     "TaskLoadError",
+    "TaskStore",
     "ToolInteraction",
     "ToolResultObservation",
     "TranscriptCounter",

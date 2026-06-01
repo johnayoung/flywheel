@@ -28,6 +28,7 @@ import os
 import shlex
 import sys
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -180,6 +181,9 @@ class _EventStreamingStore:
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None:
         return self._wrapped.load_lifecycle(run_id)
+
+    def save_task(self, task: Task, *, now: datetime) -> str:
+        return self._wrapped.save_task(task, now=now)
 
     def append_domain_event(
         self,

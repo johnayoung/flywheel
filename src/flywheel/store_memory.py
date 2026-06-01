@@ -38,7 +38,9 @@ from flywheel.events import (
     apply,
 )
 from flywheel.lifecycle import Attempt, Lifecycle
+from flywheel.loaders import deserialize_task, serialize_task, task_digest
 from flywheel.notifier import RunNotifier
+from flywheel.task import Task
 from flywheel.store_protocols import (
     AuditRecord,
     ClaimLostError,
@@ -76,6 +78,7 @@ def _clone_lifecycle_row(lc: Lifecycle) -> Lifecycle:
         session_id=lc.session_id,
         artifacts_dir=lc.artifacts_dir,
         blocked_requires_json=lc.blocked_requires_json,
+        task_content_hash=lc.task_content_hash,
     )
 
 
@@ -174,6 +177,13 @@ class InMemoryStore:
         # ascending audit ordering per run_id.
         self._run_sequence: dict[str, int] = {}
         self._claims: dict[str, TaskClaim] = {}
+        # Content-addressed task catalog keyed by (id, content_hash). Value is
+        # the serialized dict plus a (created_at, insertion-seq) ordering key
+        # so "latest version" resolution is deterministic on ties.
+        self._tasks: dict[
+            tuple[str, str], tuple[dict[str, Any], datetime, int]
+        ] = {}
+        self._task_seq: int = 0
 
     def _next_run_sequence(self, run_id: str) -> int:
         nxt = self._run_sequence.get(run_id, 0) + 1
@@ -211,6 +221,41 @@ class InMemoryStore:
         lc = _clone_lifecycle_row(stored)
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    # --- TaskStore ---------------------------------------------------------
+
+    def save_task(self, task: Task, *, now: datetime) -> str:
+        content_hash = task_digest(task)
+        key = (task.id, content_hash)
+        if key not in self._tasks:
+            self._task_seq += 1
+            self._tasks[key] = (serialize_task(task), now, self._task_seq)
+        return content_hash
+
+    def load_task(
+        self, task_id: str, content_hash: str | None = None
+    ) -> Task | None:
+        if content_hash is not None:
+            entry = self._tasks.get((task_id, content_hash))
+            return deserialize_task(entry[0]) if entry is not None else None
+        candidates = [
+            value
+            for (tid, _ch), value in self._tasks.items()
+            if tid == task_id
+        ]
+        if not candidates:
+            return None
+        # Most recent by created_at, breaking ties on insertion order.
+        data, _created, _seq = max(candidates, key=lambda v: (v[1], v[2]))
+        return deserialize_task(data)
+
+    def load_task_for_run(self, run_id: str) -> Task | None:
+        stored = self._lifecycles.get(run_id)
+        if stored is None:
+            return None
+        return self.load_task(
+            stored.task_id, stored.task_content_hash or None
+        )
 
     # --- DomainEventStore --------------------------------------------------
 

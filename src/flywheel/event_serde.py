@@ -51,6 +51,7 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
             "task_id": event.task_id,
             "worker_id": event.worker_id,
             "artifacts_dir": event.artifacts_dir,
+            "task_content_hash": event.task_content_hash,
         }
     if isinstance(event, TransitionedTo):
         return {"target": event.target.value, "error": event.error}
@@ -121,6 +122,7 @@ def event_from_record(
             task_id=payload["task_id"],
             worker_id=payload.get("worker_id", ""),
             artifacts_dir=payload.get("artifacts_dir", ""),
+            task_content_hash=payload.get("task_content_hash", ""),
             **common,
         )
     if event_kind_enum is DomainEventKind.TRANSITIONED_TO:

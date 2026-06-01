@@ -646,6 +646,44 @@ class SqliteStore:
 
     # --- SdkMessageStore --------------------------------------------------
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        payload = dict(message.payload)
+        message_type = message.message_type or str(
+            payload.get("message_type", payload.get("type", ""))
+        )
+        ts = message.ts
+        sequence = self._next_run_sequence(message.run_id)
+        cursor = self._connection.execute(
+            """
+            INSERT INTO sdk_messages (
+                run_id, attempt_number, iteration_number, sequence,
+                message_type, payload_json, ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.run_id,
+                message.attempt_number,
+                message.iteration_number,
+                sequence,
+                message_type,
+                json.dumps(payload),
+                _iso(ts),
+            ),
+        )
+        self.notifier.notify(message.run_id, sequence)
+        return SdkMessageRecord(
+            run_id=message.run_id,
+            attempt_number=message.attempt_number,
+            iteration_number=message.iteration_number,
+            message_type=message_type,
+            payload=payload,
+            ts=ts,
+            sequence=sequence,
+            id=cursor.lastrowid,
+        )
+
     def save_sdk_messages(
         self,
         run_id: str,
@@ -659,39 +697,15 @@ class SqliteStore:
             message_type = str(
                 payload.get("message_type", payload.get("type", ""))
             )
-            ts = datetime.now(timezone.utc)
-            sequence = self._next_run_sequence(run_id)
-            cursor = self._connection.execute(
-                """
-                INSERT INTO sdk_messages (
-                    run_id, attempt_number, iteration_number, sequence,
-                    message_type, payload_json, ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    attempt_number,
-                    iteration_number,
-                    sequence,
-                    message_type,
-                    json.dumps(payload),
-                    _iso(ts),
-                ),
+            record = SdkMessageRecord(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+                message_type=message_type,
+                payload=payload,
+                ts=datetime.now(timezone.utc),
             )
-            persisted.append(
-                SdkMessageRecord(
-                    run_id=run_id,
-                    attempt_number=attempt_number,
-                    iteration_number=iteration_number,
-                    message_type=message_type,
-                    payload=payload,
-                    ts=ts,
-                    sequence=sequence,
-                    id=cursor.lastrowid,
-                )
-            )
-        if persisted and persisted[-1].sequence is not None:
-            self.notifier.notify(run_id, persisted[-1].sequence)
+            persisted.append(self.append_sdk_message(record))
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

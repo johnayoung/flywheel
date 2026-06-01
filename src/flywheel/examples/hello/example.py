@@ -220,6 +220,11 @@ class _EventStreamingStore:
         print(f"event {line}", flush=True)
         return persisted
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        return self._wrapped.append_sdk_message(message)
+
     def save_sdk_messages(
         self,
         run_id: str,

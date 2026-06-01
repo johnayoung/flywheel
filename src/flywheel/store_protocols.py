@@ -379,7 +379,7 @@ class EventStore(Protocol):
     Append-only chronological log keyed by an autoincrement ``id`` and
     foreign-keyed to ``lifecycles(run_id)`` per the schema. ``append_event``
     assigns both ``id`` and the per-run monotonic ``sequence`` value (the
-    same counter feeds :meth:`SdkMessageStore.save_sdk_messages` so events
+    same counter feeds :meth:`SdkMessageStore.append_sdk_message` so events
     and SDK messages share one strict ordering) and returns the persisted
     record. ``list_events`` returns events for a ``run_id`` in ``(ts, id)``
     order, matching the ``idx_events_run`` ordering implied by the schema.
@@ -394,16 +394,23 @@ class EventStore(Protocol):
 class SdkMessageStore(Protocol):
     """Persistence contract for captured agent SDK messages.
 
-    Append-only per ``(run_id, attempt_number, iteration_number)`` batch.
-    ``save_sdk_messages`` assigns each row a per-run monotonic
-    ``sequence`` value drawn from the same counter as
-    :meth:`EventStore.append_event`, so interleaved event and SDK-message
-    writes against the same ``run_id`` produce strictly ascending sequence
-    numbers across both record types. The store returns the persisted
-    records (with ``id`` and ``sequence`` populated) in the same order
-    the payloads were supplied. ``list_sdk_messages`` returns every
-    persisted record for ``run_id`` in ascending ``sequence`` order.
+    Append-only. ``append_sdk_message`` is the live, per-message write
+    path: it accepts one :class:`SdkMessageRecord`, allocates one tick
+    from the per-run monotonic ``sequence`` counter (the same counter
+    that feeds :meth:`EventStore.append_event`, so interleaved event and
+    SDK-message writes against the same ``run_id`` produce strictly
+    ascending sequence numbers across both record types), inserts the
+    row, and returns the persisted record with ``id`` and ``sequence``
+    populated. ``save_sdk_messages`` is retained for backward
+    compatibility — it persists a per-iteration batch and is now a thin
+    loop over ``append_sdk_message``; the harness no longer calls it.
+    ``list_sdk_messages`` returns every persisted record for ``run_id``
+    in ascending ``sequence`` order.
     """
+
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord: ...
 
     def save_sdk_messages(
         self,

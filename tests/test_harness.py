@@ -158,13 +158,26 @@ def _scripted_invoker(
 
     Each call pops the next IterationResult. Tests can inspect the
     accumulated ``InvocationRequest`` list via the function's ``.calls``
-    attribute.
+    attribute. Honors the per-message observer contract: before
+    returning, the scripted invoker calls ``request.on_message`` once
+    per :class:`Message` in ``IterationResult.messages``, matching what
+    :func:`invoke_iteration` does for a real SDK transport so the
+    harness's persistence observer fires identically in tests.
     """
     calls: list[InvocationRequest] = []
 
     async def _invoker(request: InvocationRequest) -> IterationResult:
         calls.append(request)
-        return results.pop(0)
+        result = results.pop(0)
+        if request.on_message is not None:
+            for msg in result.messages:
+                try:
+                    request.on_message(msg)
+                except Exception:  # noqa: BLE001 - the production
+                    # invoker swallows observer exceptions; mirror it
+                    # here so test seams stay faithful to that contract.
+                    pass
+        return result
 
     _invoker.calls = calls  # type: ignore[attr-defined]
     return _invoker
@@ -1771,10 +1784,10 @@ class _RaisingStore(InMemoryStore):
     """In-memory store with selectively-raising audit write paths.
 
     Used by the strict-audit tests to assert the harness routes both
-    ``append_event`` failures and ``save_sdk_messages`` failures through
+    ``append_event`` failures and ``append_sdk_message`` failures through
     the same ``harness.audit_write_failed`` / ``INTERNAL_ERROR``
     finalization path. Callers configure which method raises by setting
-    the ``raise_on_append_event`` / ``raise_on_save_sdk_messages``
+    the ``raise_on_append_event_kind`` / ``raise_on_append_sdk_message``
     attributes; failures are emitted by the harness via the
     best-effort secondary emit, which on this store SUCCEEDS by
     design (so we can assert exactly one audit_write_failed event was
@@ -1783,17 +1796,13 @@ class _RaisingStore(InMemoryStore):
 
     def __init__(self) -> None:
         super().__init__()
-        self.raise_on_save_sdk_messages: bool = False
+        self.raise_on_append_sdk_message: bool = False
         self.raise_on_append_event_kind: str | None = None
 
-    def save_sdk_messages(
-        self, run_id, attempt_number, iteration_number, messages
-    ):  # type: ignore[override]
-        if self.raise_on_save_sdk_messages:
+    def append_sdk_message(self, message):  # type: ignore[override]
+        if self.raise_on_append_sdk_message:
             raise RuntimeError("simulated sdk persistence failure")
-        return super().save_sdk_messages(
-            run_id, attempt_number, iteration_number, messages
-        )
+        return super().append_sdk_message(message)
 
     def append_event(self, event):  # type: ignore[override]
         if (
@@ -1977,11 +1986,11 @@ class TestInterleavedAuditSequence:
 
 
 class TestStrictAuditFailure:
-    def test_save_sdk_messages_failure_finalizes_attempt_as_internal_error(
+    def test_append_sdk_message_failure_finalizes_attempt_as_internal_error(
         self,
     ) -> None:
         store = _RaisingStore()
-        store.raise_on_save_sdk_messages = True
+        store.raise_on_append_sdk_message = True
         task = Task(
             goal="g",
             graders=[
@@ -2019,7 +2028,7 @@ class TestStrictAuditFailure:
         ]
         assert len(audit_failures) == 1
         payload = audit_failures[0].payload
-        assert payload["failing_method"] == "save_sdk_messages"
+        assert payload["failing_method"] == "append_sdk_message"
         assert payload["error_type"] == "RuntimeError"
         assert "simulated sdk persistence failure" in payload["message"]
         # iteration_number is known at the failure site.

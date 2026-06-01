@@ -624,6 +624,11 @@ class _EventStreamingStore:
         self._emit(persisted)
         return persisted
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        return self._wrapped.append_sdk_message(message)
+
     def save_sdk_messages(
         self,
         run_id: str,
@@ -677,6 +682,34 @@ def build_inline_task(
     return task
 
 
+def _compose_message_observers(
+    *observers: Callable[[Message], None] | None,
+) -> Callable[[Message], None] | None:
+    """Combine multiple ``on_message`` callbacks into a single observer.
+
+    Each callback fires independently and is wrapped in its own
+    ``try/except`` so a raising renderer cannot break the persistence
+    observer (and vice versa). ``None`` entries are filtered. Returns
+    ``None`` when no observer remains, ``observers[0]`` when only one is
+    set (no wrapping overhead), and a composed callable otherwise.
+    """
+    callbacks = tuple(o for o in observers if o is not None)
+    if not callbacks:
+        return None
+    if len(callbacks) == 1:
+        return callbacks[0]
+
+    def _combined(msg: Message) -> None:
+        for cb in callbacks:
+            try:
+                cb(msg)
+            except Exception:  # noqa: BLE001 - one observer must not
+                # break the others; observation is best-effort.
+                pass
+
+    return _combined
+
+
 def _make_claude_code_invoke(
     sandbox: Path,
     *,
@@ -689,9 +722,11 @@ def _make_claude_code_invoke(
     Mirrors :func:`flywheel.examples.hello.example.make_claude_code_invoke`
     but with the broader tool surface a real engineering task needs.
 
-    ``on_message`` is forwarded to :func:`invoke_iteration` so the agent's
-    turns surface live as they arrive — the workflow CLI passes a renderer
-    here to stream them to stdout interleaved with harness events.
+    ``on_message`` is the static stdout renderer composed with the
+    per-request persistence observer the harness threads through
+    :attr:`InvocationRequest.on_message`. Both fire for every SDK message
+    the instant it arrives, each isolated by its own ``try/except`` so a
+    raising renderer cannot break per-message persistence and vice versa.
     """
     options = ClaudeAgentOptions(
         cwd=str(sandbox),
@@ -703,8 +738,9 @@ def _make_claude_code_invoke(
     )
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
+        composed = _compose_message_observers(on_message, request.on_message)
         return await invoke_iteration(
-            prompt=request.prompt, options=options, on_message=on_message
+            prompt=request.prompt, options=options, on_message=composed
         )
 
     return _invoke

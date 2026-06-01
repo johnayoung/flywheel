@@ -102,6 +102,11 @@ class _AgentSessionStub:
 
 
 class _SdkMessageStub:
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        return message
+
     def save_sdk_messages(
         self,
         run_id: str,

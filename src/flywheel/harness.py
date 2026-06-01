@@ -104,6 +104,7 @@ from flywheel.store_protocols import (
     EventRecord,
     GraderResultRecord,
     LifecycleAlreadyExistsError,
+    SdkMessageRecord,
 )
 from flywheel.loaders import task_digest
 from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
@@ -158,6 +159,10 @@ class HarnessStore(Protocol):
 
     def append_event(self, event: EventRecord) -> EventRecord: ...
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord: ...
+
     def save_sdk_messages(
         self,
         run_id: str,
@@ -186,12 +191,24 @@ class InvocationRequest:
     wraps via :func:`enforce_transcript_limits`) plus the attempt /
     iteration context to a substitutable transport, without each
     invoker having to re-derive that context from the transcript text.
+
+    ``on_message`` is the harness's per-message persistence observer.
+    Invokers must call it once for every SDK :class:`Message` they
+    observe, the instant it arrives, before returning the
+    :class:`IterationResult` — the SDK-backed default invoker does this
+    by forwarding it to :func:`invoke_iteration`, and test invokers
+    that construct an :class:`IterationResult` directly must call it
+    explicitly over ``IterationResult.messages``. The observer is
+    expected to swallow its own exceptions (the harness captures the
+    first error into a per-iteration sentinel and re-raises after the
+    invoker returns), so invokers do not need to wrap it.
     """
 
     prompt: str
     transcript_graders: tuple[TranscriptGrader, ...]
     attempt_number: int
     iteration_number: int
+    on_message: Callable[[Message], None] | None = None
 
 
 InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]
@@ -288,9 +305,13 @@ async def _default_invoke(request: InvocationRequest) -> IterationResult:
     Hard-cap enforcement via :func:`enforce_transcript_limits` is the
     invoker's job, not the harness's. This default keeps a clean test
     seam: tests pass a stub invoke, production passes ``None`` and gets
-    the SDK-backed default.
+    the SDK-backed default. ``request.on_message`` is forwarded to the
+    SDK invoker so the harness's per-message persistence observer fires
+    as messages arrive.
     """
-    return await invoke_iteration(prompt=request.prompt)
+    return await invoke_iteration(
+        prompt=request.prompt, on_message=request.on_message
+    )
 
 
 def _append(
@@ -420,31 +441,44 @@ def _emit(
         ) from exc
 
 
-def _persist_sdk_messages(
+def _persist_sdk_message(
     store: HarnessStore,
     *,
     run_id: str,
     attempt_number: int,
     iteration_number: int,
-    messages: Sequence[Message],
+    message: Message,
+    now: Callable[[], datetime] | None = None,
 ) -> None:
-    """Persist every SDK :class:`Message` observed during one iteration.
+    """Persist one SDK :class:`Message` the instant it is observed.
 
-    Serializes each message via :func:`_serialize_sdk_message` and hands
-    the payload sequence to ``store.save_sdk_messages``. Empty batches
-    are forwarded unchanged so the store can record an
-    iteration-with-no-messages without assigning sequence numbers. On
-    failure raises :class:`_AuditWriteError` carrying the failing method
-    and the attempt/iteration context.
+    Serializes ``message`` via :func:`_serialize_sdk_message`, builds a
+    :class:`SdkMessageRecord`, and hands it to
+    ``store.append_sdk_message`` — which allocates one tick from the
+    per-run audit sequence counter, inserts the row, and notifies any
+    listeners. On store failure raises :class:`_AuditWriteError` carrying
+    the failing method and the attempt / iteration context so the
+    harness can route the failure through the strict-audit policy
+    (FR-5). The per-iteration batch write that
+    :func:`save_sdk_messages` used to do is gone — sdk_messages rows
+    are themselves the live progress signal.
     """
-    payloads = [_serialize_sdk_message(m) for m in messages]
+    clock = now or _utcnow
+    payload = _serialize_sdk_message(message)
+    message_type = str(payload.get("message_type", payload.get("type", "")))
+    record = SdkMessageRecord(
+        run_id=run_id,
+        attempt_number=attempt_number,
+        iteration_number=iteration_number,
+        message_type=message_type,
+        payload=payload,
+        ts=clock(),
+    )
     try:
-        store.save_sdk_messages(
-            run_id, attempt_number, iteration_number, payloads
-        )
+        store.append_sdk_message(record)
     except Exception as exc:
         raise _AuditWriteError(
-            failing_method="save_sdk_messages",
+            failing_method="append_sdk_message",
             inner=exc,
             attempt_number=attempt_number,
             iteration_number=iteration_number,
@@ -1322,9 +1356,10 @@ async def _run_attempt_body(
     sentinel exception can be caught at one boundary.
 
     Every store-write inside this function (either ``append_event`` via
-    :func:`_emit` or ``save_sdk_messages`` via :func:`_persist_sdk_messages`)
-    raises :class:`_AuditWriteError` on failure; the caller routes that
-    through :func:`_handle_audit_failure`.
+    :func:`_emit` or ``append_sdk_message`` via the per-message observer
+    built in :func:`_drive_iterations`) raises :class:`_AuditWriteError`
+    on failure; the caller routes that through
+    :func:`_handle_audit_failure`.
     """
     attempt_number = attempt.number
     iteration_result, _iterations_run, wall_seconds = await _drive_iterations(
@@ -1680,22 +1715,43 @@ async def _drive_iterations(
                 prior_rubric_findings=prior_rubric_findings,
             ),
         )
+
+        # Per-iteration sentinel: a failing per-message store write
+        # captures into this slot rather than propagating out through the
+        # invoker's on_message wrapper (which swallows exceptions so a
+        # faulty live renderer cannot break the agent run). The harness
+        # re-raises after the invoker returns so the strict-audit policy
+        # (FR-5) still routes failures through INTERNAL_ERROR.
+        captured_iteration = iteration_number
+        first_audit_error: _AuditWriteError | None = None
+
+        def _on_message(msg: Message) -> None:
+            nonlocal first_audit_error
+            try:
+                _persist_sdk_message(
+                    store,
+                    run_id=lifecycle.run_id,
+                    attempt_number=attempt_number,
+                    iteration_number=captured_iteration,
+                    message=msg,
+                    now=clock,
+                )
+            except _AuditWriteError as exc:
+                if first_audit_error is None:
+                    first_audit_error = exc
+
         request = InvocationRequest(
             prompt=prompt,
             transcript_graders=transcript_graders,
             attempt_number=attempt_number,
             iteration_number=iteration_number,
+            on_message=_on_message,
         )
         iteration_result = await invoker(request)
         wall_seconds = mclock() - started_monotonic
 
-        _persist_sdk_messages(
-            store,
-            run_id=lifecycle.run_id,
-            attempt_number=attempt_number,
-            iteration_number=iteration_number,
-            messages=iteration_result.messages,
-        )
+        if first_audit_error is not None:
+            raise first_audit_error
 
         # Context-pressure telemetry: token fields are per-iteration deltas
         # — consumers cumulate by summing the audit stream; the harness

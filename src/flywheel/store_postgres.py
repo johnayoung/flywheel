@@ -1058,6 +1058,50 @@ class PostgresStore:
 
     # --- SdkMessageStore --------------------------------------------------
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        payload = dict(message.payload)
+        message_type = message.message_type or str(
+            payload.get("message_type", payload.get("type", ""))
+        )
+        ts = message.ts
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                sequence = self._next_run_sequence(cur, message.run_id)
+                cur.execute(
+                    """
+                    INSERT INTO sdk_messages (
+                        run_id, attempt_number, iteration_number,
+                        sequence, message_type, payload_json, ts
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        message.run_id,
+                        message.attempt_number,
+                        message.iteration_number,
+                        sequence,
+                        message_type,
+                        Jsonb(payload),
+                        ts,
+                    ),
+                )
+                row = cur.fetchone()
+                self._notify_pg(cur, message.run_id, sequence)
+        assert row is not None
+        self.notifier.notify(message.run_id, sequence)
+        return SdkMessageRecord(
+            run_id=message.run_id,
+            attempt_number=message.attempt_number,
+            iteration_number=message.iteration_number,
+            message_type=message_type,
+            payload=payload,
+            ts=ts,
+            sequence=sequence,
+            id=int(row[0]),
+        )
+
     def save_sdk_messages(
         self,
         run_id: str,
@@ -1066,52 +1110,20 @@ class PostgresStore:
         messages: Sequence[Mapping[str, Any]],
     ) -> list[SdkMessageRecord]:
         persisted: list[SdkMessageRecord] = []
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                for msg in messages:
-                    payload = dict(msg)
-                    message_type = str(
-                        payload.get("message_type", payload.get("type", ""))
-                    )
-                    ts = datetime.now(timezone.utc)
-                    sequence = self._next_run_sequence(cur, run_id)
-                    cur.execute(
-                        """
-                        INSERT INTO sdk_messages (
-                            run_id, attempt_number, iteration_number,
-                            sequence, message_type, payload_json, ts
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        (
-                            run_id,
-                            attempt_number,
-                            iteration_number,
-                            sequence,
-                            message_type,
-                            Jsonb(payload),
-                            ts,
-                        ),
-                    )
-                    row = cur.fetchone()
-                    assert row is not None
-                    persisted.append(
-                        SdkMessageRecord(
-                            run_id=run_id,
-                            attempt_number=attempt_number,
-                            iteration_number=iteration_number,
-                            message_type=message_type,
-                            payload=payload,
-                            ts=ts,
-                            sequence=sequence,
-                            id=int(row[0]),
-                        )
-                    )
-                last = persisted[-1].sequence if persisted else None
-                if last is not None:
-                    self._notify_pg(cur, run_id, last)
-        if persisted and persisted[-1].sequence is not None:
-            self.notifier.notify(run_id, persisted[-1].sequence)
+        for msg in messages:
+            payload = dict(msg)
+            message_type = str(
+                payload.get("message_type", payload.get("type", ""))
+            )
+            record = SdkMessageRecord(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+                message_type=message_type,
+                payload=payload,
+                ts=datetime.now(timezone.utc),
+            )
+            persisted.append(self.append_sdk_message(record))
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

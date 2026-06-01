@@ -395,6 +395,29 @@ class InMemoryStore:
 
     # --- SdkMessageStore ---------------------------------------------------
 
+    def append_sdk_message(
+        self, message: SdkMessageRecord
+    ) -> SdkMessageRecord:
+        self._sdk_message_seq += 1
+        sequence = self._next_run_sequence(message.run_id)
+        payload = dict(message.payload)
+        message_type = message.message_type or str(
+            payload.get("message_type", payload.get("type", ""))
+        )
+        record = SdkMessageRecord(
+            run_id=message.run_id,
+            attempt_number=message.attempt_number,
+            iteration_number=message.iteration_number,
+            message_type=message_type,
+            payload=payload,
+            ts=message.ts,
+            sequence=sequence,
+            id=self._sdk_message_seq,
+        )
+        self._sdk_messages.append(record)
+        self.notifier.notify(message.run_id, sequence)
+        return _clone_sdk_message(record)
+
     def save_sdk_messages(
         self,
         run_id: str,
@@ -404,8 +427,6 @@ class InMemoryStore:
     ) -> list[SdkMessageRecord]:
         persisted: list[SdkMessageRecord] = []
         for msg in messages:
-            self._sdk_message_seq += 1
-            sequence = self._next_run_sequence(run_id)
             payload = dict(msg)
             message_type = str(
                 payload.get("message_type", payload.get("type", ""))
@@ -417,13 +438,8 @@ class InMemoryStore:
                 message_type=message_type,
                 payload=payload,
                 ts=datetime.now(timezone.utc),
-                sequence=sequence,
-                id=self._sdk_message_seq,
             )
-            self._sdk_messages.append(record)
-            persisted.append(_clone_sdk_message(record))
-        if persisted and persisted[-1].sequence is not None:
-            self.notifier.notify(run_id, persisted[-1].sequence)
+            persisted.append(self.append_sdk_message(record))
         return persisted
 
     def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:

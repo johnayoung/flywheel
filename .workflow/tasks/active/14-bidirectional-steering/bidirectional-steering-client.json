@@ -1,0 +1,47 @@
+{
+  "id": "bidirectional-steering-client",
+  "goal": "Drive the production invoker via the SDK `ClaudeSDKClient` with a watcher coroutine that claims and applies control commands (interrupt/say/set_model) live against the open session, emits each application as an audit event, and exposes the producers through `flywheel steer/interrupt/set-model` CLI subcommands.",
+  "prerequisites": ["control-commands-store"],
+  "tags": ["invoker", "cli", "interactivity"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00013-FEATURE-bidirectional-steering.md",
+      "src/flywheel/invoker.py — invoke_iteration (lines 135-200), the one-shot query() call at :188, and the on_message observation/persistence seam to preserve",
+      "src/flywheel/workflow.py — subcommand registration; mirror existing _cmd_* patterns for steer / interrupt / set-model",
+      "src/flywheel/store_protocols.py — the control-command verbs (enqueue_command / claim_commands) the watcher and CLI consume"
+    ],
+    "references": [
+      "claude_agent_sdk ClaudeSDKClient — query(), interrupt(), set_model(), set_permission_mode(), receive_response(): the bidirectional API to adopt in place of the one-shot query() at invoker.py:188",
+      "src/flywheel/workflow.py — _cmd_* subcommand patterns to mirror for the new producers",
+      "src/flywheel/invoker.py:135-200 — preserve the on_message seam (00010) while opening a persistent ClaudeSDKClient connection per iteration"
+    ],
+    "constraints": [
+      "Preserve the on_message persistence/observation seam from 00010 and the cancellation/INTERRUPTED finalization semantics from 00012; the store-triggered interrupt shares that finalization path.",
+      "The watcher is best-effort: a failed command application is recorded as a failed-application audit event but never aborts the run, mirroring the on_message best-effort contract.",
+      "Commands are applied claim-once in enqueue order; each applied command emits its own telemetry audit event into the run's stream.",
+      "Cross-process only via the store: producers and the consuming watcher share no process state, so flywheel steer works against a detached worker daemon.",
+      "The task definition stays immutable; steering affects the running session only.",
+      "Keep flywheel.task and flywheel.lifecycle purity untouched.",
+      "Run mcp__ide__getDiagnostics on every .py file touched and fix all Pylance errors in the same turn.",
+      "Commit with a Conventional Commits `feat:` message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No auto-steering or policy-driven intervention; operator-driven CLI only.",
+      "No web/socket transport; the channel is the store.",
+      "No changes to graders or validation.",
+      "No edits to the immutable task definition."
+    ],
+    "edge_cases": [
+      "Command targets a run that is not currently in-flight: it is never applied to a different run and does not crash.",
+      "client.interrupt() / set_model() raises: record a failed-application audit event; do not abort the stream.",
+      "Watcher briefly loses the store connection: retry on the next tick; claim-once prevents double-apply.",
+      "Command enqueued after the iteration ended: not applied to a completed iteration; remains for the next eligible iteration or is recorded as stale per claim semantics.",
+      "set_model to an invalid model: application fails -> failed-application audit event; the run continues on the prior model.",
+      "interrupt via this channel vs SIGINT (00012): both reach INTERRUPTED via the same finalization; the store-triggered path additionally records a control event."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^feat'", "name": "commit-landed" }
+  ]
+}

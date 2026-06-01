@@ -1,0 +1,47 @@
+{
+  "id": "enrich-live-operator-surface",
+  "goal": "`flywheel.workflow live` and the worker heartbeat render a lifecycle-position breadcrumb, the current agent action, and running tokens/cost/turns per in-flight run.",
+  "prerequisites": ["append-sdk-message-live"],
+  "tags": ["cli", "observability"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00011-FEATURE-live-operator-surface.md",
+      "src/flywheel/workflow.py — the `live` command and `collect_live_rows`",
+      ".workflow/worker.py — `_format_heartbeat` and the `Heartbeat` thread",
+      "tests/test_workflow.py"
+    ],
+    "references": [
+      "src/flywheel/workflow.py:1268 — the `live` command",
+      "src/flywheel/workflow.py:1311 — `collect_live_rows` and the `LiveRunRow` shape to extend",
+      ".workflow/worker.py:502 — `_format_heartbeat`",
+      ".workflow/worker.py:515 — the `Heartbeat` thread",
+      "Token/cost/turn totals come from the post-00009 `harness.iteration_completed` payload (`usage.total_tokens`, `total_cost_usd`, `num_turns`)"
+    ],
+    "constraints": [
+      "Enrich the EXISTING CLI surfaces only — no new TUI, dashboard, or dependency; rendering uses stdlib only.",
+      "Machine-readable / `--json` output must stay an additive superset: no existing keys removed or renamed.",
+      "Totals are summed at query time from the run's `harness.iteration_completed` events; do not add a harness counter.",
+      "Leave `flywheel.audit --follow` unchanged; it remains the raw, unsummarized firehose.",
+      "Run `mcp__ide__getDiagnostics` on every .py file touched and fix Pylance errors before reporting done.",
+      "Commit with a Conventional Commits `feat:` message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No new dashboard, TUI, or dependency.",
+      "No change to what is persisted — no new event kind, no store-write changes.",
+      "No change to the `flywheel.audit` module's output.",
+      "No cross-run aggregation or historical charts.",
+      "No interactivity or controls in the view."
+    ],
+    "edge_cases": [
+      "A run with no iteration-completed events yet renders totals as zero / `--` while breadcrumb and action line still render.",
+      "Latest message of an unknown/unrenderable type falls back to the message-type label; never crash the view.",
+      "A totals payload missing a field (older event) treats the missing field as zero / null and renders the rest.",
+      "Very long tool args are truncated to a fixed width; never wrap unboundedly.",
+      "Multiple concurrent in-flight runs render one block/line per run with stable ordering (e.g. by task id)."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^feat'", "name": "commit-landed" }
+  ]
+}

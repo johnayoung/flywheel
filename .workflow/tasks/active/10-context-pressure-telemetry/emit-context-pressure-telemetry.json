@@ -1,0 +1,49 @@
+{
+  "id": "emit-context-pressure-telemetry",
+  "goal": "The `harness.iteration_completed` event payload carries a per-iteration `usage` breakdown (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `total_tokens`) plus the iteration's `total_cost_usd` and `num_turns`.",
+  "tags": ["harness", "observability", "telemetry"],
+  "context": {
+    "relevant": [
+      "src/flywheel/harness.py",
+      "src/flywheel/grader_transcript.py",
+      "src/flywheel/invoker.py",
+      ".workflow/specs/00009-FEATURE-context-pressure-telemetry.md",
+      "tests/test_harness.py",
+      "tests/test_audit.py"
+    ],
+    "references": [
+      "src/flywheel/harness.py:1643-1666 -- the harness.iteration_completed emit site to enrich (additive only)",
+      "src/flywheel/harness.py:1477-1491 -- harness.budget_exceeded payload; precedent for emitting numeric observability fields",
+      "src/flywheel/grader_transcript.py:72-90 -- total_tokens_from_usage; reuse for the total_tokens sum",
+      "src/flywheel/invoker.py:99-107 -- InvocationSignals carries num_turns and total_cost_usd"
+    ],
+    "constraints": [
+      "Purely additive: do not rename or remove the existing payload keys (iteration, envelope, failure, stop_reason, rate_limited) -- existing consumers must be unaffected.",
+      "Derive total_tokens via total_tokens_from_usage over the iteration's usage so the emitted total matches the transcript-grader breach math (FR-3).",
+      "Token fields are per-iteration deltas: do NOT add any cumulative/running counter to the harness; consumers sum the stream (FR-4).",
+      "Do not touch flywheel.task, flywheel.lifecycle, or flywheel.events -- no new event kind; the purity invariants must stay intact.",
+      "Emit total_cost_usd and num_turns verbatim from the iteration's InvocationSignals; these are SDK session-cumulative, not deltas -- do not attempt to delta them, and document that semantic where the payload is assembled.",
+      "Add a short doc touch-up (in docs/vision.md or the harness module docstring) noting the raw signals are now emitted and that utilization% / threshold-crossings remain future work.",
+      "Run mcp__ide__getDiagnostics on every .py file touched and fix Pylance errors before reporting done.",
+      "Commit the change with a Conventional Commits `feat:` message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No utilization% or 50/75/90 threshold-crossing events -- deferred (no window-capacity source).",
+      "No automated action on pressure (compaction, reset, halt, retry).",
+      "No new domain or telemetry event kind; no changes to src/flywheel/events.py.",
+      "No stored cumulative state on the lifecycle or in a running harness counter.",
+      "No growth-rate derivation."
+    ],
+    "edge_cases": [
+      "Iteration produced no usage data at all: all usage fields 0, total_tokens 0, cost/turns null; event still emitted.",
+      "Failed iteration (iteration_result.failure set): usage reflects pre-failure messages; event still carries the breakdown.",
+      "InvocationSignals lacks cost/turns (failed before ResultMessage): emit total_cost_usd: null and num_turns: null.",
+      "Resumed session re-sends prior context as cache_read_input_tokens: record as-is, no de-duplication.",
+      "A store-write failure during the enriched emit follows the existing harness.audit_write_failed path -- a telemetry failure must not abort the run."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^feat'", "name": "commit-landed" }
+  ]
+}

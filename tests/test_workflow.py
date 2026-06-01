@@ -642,6 +642,345 @@ def test_main_live_empty_prints_placeholder(
     assert capsys.readouterr().out.strip() == "(no in-flight runs)"
 
 
+# ---------- Live enrichment: breadcrumb + running totals ----------
+
+
+def _iteration_completed_payload(
+    *,
+    iteration: int,
+    total_tokens: int,
+    total_cost_usd: float | None,
+    num_turns: int | None,
+) -> dict[str, object]:
+    """Build a ``harness.iteration_completed`` payload matching the
+    post-00009 shape (usage breakdown + cost + turns)."""
+    return {
+        "iteration": iteration,
+        "envelope": {"kind": "valid", "intent": "continue"},
+        "failure": None,
+        "stop_reason": "end_turn",
+        "rate_limited": False,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "total_tokens": total_tokens,
+        },
+        "total_cost_usd": total_cost_usd,
+        "num_turns": num_turns,
+    }
+
+
+def test_live_sums_running_totals_across_iteration_events(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-totals")
+        for i, (tt, cost, turns) in enumerate(
+            [(100, 0.01, 2), (250, 0.05, 3), (50, 0.005, 1)], start=1
+        ):
+            store.append_event(
+                EventRecord(
+                    run_id=running.run_id,
+                    ts=datetime.now(timezone.utc),
+                    kind="harness.iteration_completed",
+                    payload=_iteration_completed_payload(
+                        iteration=i,
+                        total_tokens=tt,
+                        total_cost_usd=cost,
+                        num_turns=turns,
+                    ),
+                    attempt_number=1,
+                )
+            )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.iterations_completed == 3
+    assert row.tokens_total == 400
+    assert row.turns_total == 6
+    # float sum; tolerate fp rounding.
+    assert abs(row.cost_usd_total - 0.065) < 1e-9
+
+
+def test_live_treats_missing_totals_fields_as_zero(tmp_path: Path) -> None:
+    """Older / partial iteration events render the rest of the row instead
+    of crashing — missing field = zero."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-partial")
+        # Event 1: only usage.total_tokens; cost / turns null.
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_completed",
+                payload=_iteration_completed_payload(
+                    iteration=1,
+                    total_tokens=200,
+                    total_cost_usd=None,
+                    num_turns=None,
+                ),
+                attempt_number=1,
+            )
+        )
+        # Event 2: a legacy / partial payload missing every total.
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_completed",
+                payload={"iteration": 2, "envelope": {"kind": "valid"}},
+                attempt_number=1,
+            )
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    row = rows[0]
+    assert row.iterations_completed == 2
+    assert row.tokens_total == 200
+    assert row.cost_usd_total == 0.0
+    assert row.turns_total == 0
+
+
+def test_live_renders_zero_totals_when_no_iteration_completed_yet(
+    tmp_path: Path,
+) -> None:
+    """A run that has not completed an iteration still renders breadcrumb
+    + action line; totals display as zero / ``--``."""
+    from flywheel.workflow import _format_live_line
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-empty")
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=1,
+            iteration_number=1,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [{"type": "text", "text": "starting"}],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    row = rows[0]
+    assert row.iterations_completed == 0
+    assert row.tokens_total == 0
+    assert row.cost_usd_total == 0.0
+    assert row.turns_total == 0
+    line = _format_live_line(row, datetime.now(timezone.utc))
+    assert "tokens=0" in line
+    assert "cost=--" in line
+    assert "turns=0" in line
+    # Breadcrumb and action line both present.
+    assert "attempt=1" in line
+    assert "iter=1" in line
+    assert "ASSISTANT" in line
+
+
+def test_live_breadcrumb_renders_attempt_and_iter_from_latest_activity(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-bc")
+        # Earlier event; the sdk_message below has a higher sequence and
+        # therefore drives the breadcrumb.
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.attempt_started",
+                payload={},
+                attempt_number=1,
+            )
+        )
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=2,
+            iteration_number=4,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [{"type": "text", "text": "go"}],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    assert rows[0].attempt == 2
+    assert rows[0].iteration == 4
+
+
+def test_live_breadcrumb_unknown_when_no_activity(tmp_path: Path) -> None:
+    from flywheel.workflow import _format_live_line
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-na")
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    row = rows[0]
+    assert row.attempt is None
+    assert row.iteration is None
+    line = _format_live_line(row, datetime.now(timezone.utc))
+    assert "attempt=?" in line
+    assert "iter=?" in line
+
+
+def test_live_truncates_overlong_detail(tmp_path: Path) -> None:
+    """Very long tool args never wrap unboundedly — the assembled detail is
+    capped (00011 edge case)."""
+    from flywheel.workflow import _LIVE_DETAIL_MAX_WIDTH, _format_live_line
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-long")
+        long_value = "y" * 5000
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=1,
+            iteration_number=1,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Write",
+                            "input": {"content": long_value},
+                        }
+                    ],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    line = _format_live_line(rows[0], datetime.now(timezone.utc))
+    # The line is bounded — the detail portion ends at the cap; no 5000-char
+    # blowup. We compare against the cap with a generous overhead allowance
+    # for the prefix fields (task_id, status, breadcrumb, totals, age, kind).
+    assert len(line) < _LIVE_DETAIL_MAX_WIDTH + 200
+
+
+def test_live_unknown_message_type_falls_back_to_label(tmp_path: Path) -> None:
+    """An sdk_message of a type the summarizer does not special-case still
+    renders — using the upper-cased type as the label — and does not crash."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-unknown")
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=1,
+            iteration_number=1,
+            messages=[
+                {
+                    "message_type": "WeirdNewMessage",
+                    "content": [{"foo": "bar"}],
+                }
+            ],
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    row = rows[0]
+    assert row.last_kind == "WEIRDNEWMESSAGE"
+
+
+def test_live_orders_runs_by_task_id(tmp_path: Path) -> None:
+    """Multiple concurrent in-flight runs render in stable task-id order
+    (00011 edge case)."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-zeta")
+        _seed_running(store, "task-alpha")
+        _seed_running(store, "task-mu")
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+    assert [r.task_id for r in rows] == [
+        "task-alpha",
+        "task-mu",
+        "task-zeta",
+    ]
+
+
+def test_main_live_includes_totals_and_breadcrumb_in_rendered_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        running = _seed_running(store, "task-render")
+        store.save_sdk_messages(
+            run_id=running.run_id,
+            attempt_number=3,
+            iteration_number=5,
+            messages=[
+                {
+                    "message_type": "AssistantMessage",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "x.py"},
+                        }
+                    ],
+                }
+            ],
+        )
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_completed",
+                payload=_iteration_completed_payload(
+                    iteration=5,
+                    total_tokens=1234,
+                    total_cost_usd=0.0567,
+                    num_turns=4,
+                ),
+                attempt_number=3,
+            )
+        )
+    finally:
+        store.close()
+    rc = main(["live", "--db", str(db)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "task-render" in ln)
+    assert "attempt=3" in line
+    # The iteration_completed event was written after the sdk_message, so
+    # it carries the freshest sequence — iter is folded out of its payload.
+    assert "iter=5" in line
+    assert "tokens=1234" in line
+    assert "cost=$0.0567" in line
+    assert "turns=4" in line
+    # Latest activity is the iteration-end event itself.
+    assert "EVENT" in line
+    assert "harness.iteration_completed" in line
+
+
 def test_main_status_json_emits_machine_readable(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

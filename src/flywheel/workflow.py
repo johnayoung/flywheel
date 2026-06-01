@@ -1194,18 +1194,39 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
 
 _LIVE_STALE_AFTER_SECONDS: int = 90
 
+# Hard cap on the rendered "action" detail so a runaway tool-call payload can
+# never wrap the live/heartbeat line unboundedly. The per-field summarizers
+# (`_summarize_*`) already truncate individual values; this is a belt-and-
+# braces ceiling on the assembled string.
+_LIVE_DETAIL_MAX_WIDTH: int = 120
+
 
 @dataclass(frozen=True, kw_only=True)
 class LiveRunRow:
-    """Per-in-flight-run snapshot used by ``live`` reporting."""
+    """Per-in-flight-run snapshot used by ``live`` reporting.
+
+    ``attempt`` / ``iteration`` form the lifecycle-position breadcrumb
+    (``attempt=N iter=K``). ``last_kind`` + ``last_detail`` are the
+    current agent action. ``tokens_total``/``cost_usd_total``/
+    ``turns_total`` are running totals summed from this run's
+    ``harness.iteration_completed`` events (per the 00011 spec —
+    summed at query time, no harness counter). ``iterations_completed``
+    is the count of those events; zero means "no totals yet" and the
+    totals fields are all zero by definition.
+    """
 
     run_id: str
     task_id: str
     status: Status
+    attempt: int | None
     iteration: int | None
     last_kind: str
     last_detail: str
     last_ts: datetime | None
+    tokens_total: int
+    cost_usd_total: float
+    turns_total: int
+    iterations_completed: int
 
 
 _SDK_KIND_LABELS: dict[str, str] = {
@@ -1301,14 +1322,94 @@ def _parse_db_ts(value: str | None) -> datetime | None:
         return None
 
 
+_EVENT_KINDS_WITH_ITERATION: frozenset[str] = frozenset(
+    {"harness.iteration_completed"}
+)
+
+
+def _iteration_from_event_payload(
+    kind: str, payload_json: str | None
+) -> int | None:
+    """Best-effort extract of the iteration number from an event payload.
+
+    Only ``harness.iteration_completed`` (the only iteration-bearing
+    telemetry event today) is parsed. Any decode / shape failure
+    silently returns ``None`` — the breadcrumb falls back to ``iter=?``
+    rather than crashing the view.
+    """
+    if kind not in _EVENT_KINDS_WITH_ITERATION:
+        return None
+    if not payload_json:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get("iteration")
+    return value if isinstance(value, int) else None
+
+
+def _sum_run_totals(
+    conn: Any, run_id: str
+) -> tuple[int, float, int, int]:
+    """Aggregate this run's iteration-completed telemetry.
+
+    Returns ``(tokens, cost_usd, turns, iterations_completed)``. Missing
+    fields on an older payload are treated as zero / null and skipped —
+    the remaining fields still aggregate. ``cost_usd``/``turns`` are
+    SDK-reported as session-cumulative per iteration; the 00011 spec
+    explicitly summed them at query time, accepting the known
+    overcount when the SDK reuses a session across iterations.
+    """
+    rows = conn.execute(
+        """
+        SELECT payload_json
+        FROM events
+        WHERE run_id = ? AND kind = 'harness.iteration_completed'
+        """,
+        (run_id,),
+    ).fetchall()
+    tokens = 0
+    cost = 0.0
+    turns = 0
+    count = 0
+    for row in rows:
+        count += 1
+        try:
+            payload = json.loads(row["payload_json"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        usage = payload.get("usage")
+        if isinstance(usage, Mapping):
+            tt = usage.get("total_tokens")
+            if isinstance(tt, int):
+                tokens += tt
+        cost_val = payload.get("total_cost_usd")
+        if isinstance(cost_val, (int, float)):
+            cost += float(cost_val)
+        turns_val = payload.get("num_turns")
+        if isinstance(turns_val, int):
+            turns += turns_val
+    return tokens, cost, turns, count
+
+
 def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
-    """Snapshot every in-flight run with its latest activity, newest last.
+    """Snapshot every in-flight run with its latest activity.
 
     Reads ``lifecycles`` for status in ``{running, validating}`` and joins
     each row to the freshest ``sdk_messages``/``events`` entry by
     per-run sequence. The two tables share a monotonic counter (see
     ``run_sequence``), so picking the higher sequence is correct even
-    when the timestamps are within microseconds of each other.
+    when the timestamps are within microseconds of each other. The
+    same join also pins the latest ``attempt_number`` so the
+    breadcrumb stays accurate across retries. Totals are summed from
+    the run's ``harness.iteration_completed`` events at query time
+    (no harness counter). Output is sorted by ``task_id`` for stable
+    multi-run rendering per the 00011 spec.
     """
     conn = store._connection  # noqa: SLF001
     lifecycles = conn.execute(
@@ -1316,7 +1417,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         SELECT run_id, task_id, status
         FROM lifecycles
         WHERE status IN ('running', 'validating')
-        ORDER BY updated_at
+        ORDER BY task_id, run_id
         """
     ).fetchall()
     rows: list[LiveRunRow] = []
@@ -1324,7 +1425,8 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         run_id = lc["run_id"]
         sdk = conn.execute(
             """
-            SELECT iteration_number, sequence, message_type, payload_json, ts
+            SELECT iteration_number, attempt_number, sequence, message_type,
+                   payload_json, ts
             FROM sdk_messages
             WHERE run_id = ?
             ORDER BY sequence DESC
@@ -1334,7 +1436,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         ).fetchone()
         evt = conn.execute(
             """
-            SELECT attempt_number, sequence, kind, ts
+            SELECT attempt_number, sequence, kind, payload_json, ts
             FROM events
             WHERE run_id = ?
             ORDER BY sequence DESC
@@ -1345,11 +1447,16 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         sdk_seq = sdk["sequence"] if sdk is not None else -1
         evt_seq = evt["sequence"] if evt is not None else -1
         iteration: int | None = None
+        attempt: int | None = None
         last_kind = "(none)"
         last_detail = "(no activity yet)"
         last_ts: datetime | None = None
         if sdk_seq >= 0 and sdk_seq >= evt_seq and sdk is not None:
             iteration = sdk["iteration_number"]
+            attempt_raw = sdk["attempt_number"]
+            attempt = (
+                int(attempt_raw) if isinstance(attempt_raw, int) else None
+            )
             # sqlite3.Row indexing is typed Any; pin to str so last_kind stays
             # str (dict.get over an Any key/default otherwise widens to
             # str | None).
@@ -1362,21 +1469,64 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
             )
             last_ts = _parse_db_ts(sdk["ts"])
         elif evt is not None and evt_seq >= 0:
+            attempt_raw = evt["attempt_number"]
+            attempt = (
+                int(attempt_raw) if isinstance(attempt_raw, int) else None
+            )
             last_kind = "EVENT"
             last_detail = str(evt["kind"])
             last_ts = _parse_db_ts(evt["ts"])
+            # Iteration-bearing harness events carry the iteration in the
+            # payload — fold it into the breadcrumb so the position stays
+            # accurate when the freshest activity is the iteration-end
+            # event, not an sdk_message.
+            iteration = _iteration_from_event_payload(
+                str(evt["kind"]), evt["payload_json"]
+            )
+        tokens, cost, turns, iters_completed = _sum_run_totals(conn, run_id)
         rows.append(
             LiveRunRow(
                 run_id=run_id,
                 task_id=lc["task_id"],
                 status=Status(lc["status"]),
+                attempt=attempt,
                 iteration=iteration,
                 last_kind=last_kind,
                 last_detail=last_detail,
                 last_ts=last_ts,
+                tokens_total=tokens,
+                cost_usd_total=cost,
+                turns_total=turns,
+                iterations_completed=iters_completed,
             )
         )
     return rows
+
+
+def _format_breadcrumb(row: LiveRunRow) -> str:
+    """Lifecycle-position breadcrumb: ``attempt=N iter=K`` (``?`` when
+    unknown). The macro position (status) is rendered separately."""
+    attempt_str = (
+        f"attempt={row.attempt}" if row.attempt is not None else "attempt=?"
+    )
+    iter_str = (
+        f"iter={row.iteration}" if row.iteration is not None else "iter=?"
+    )
+    return f"{attempt_str} {iter_str}"
+
+
+def _format_totals(row: LiveRunRow) -> str:
+    """Compact ``tokens=… cost=$… turns=…`` rollup of the run's
+    ``harness.iteration_completed`` events. Renders zero/`--` when the
+    run has not completed an iteration yet (so the breadcrumb and
+    action line still render — 00011 edge case)."""
+    if row.iterations_completed == 0:
+        return "tokens=0 cost=-- turns=0"
+    return (
+        f"tokens={row.tokens_total} "
+        f"cost=${row.cost_usd_total:.4f} "
+        f"turns={row.turns_total}"
+    )
 
 
 def _format_live_line(row: LiveRunRow, now: datetime) -> str:
@@ -1391,12 +1541,12 @@ def _format_live_line(row: LiveRunRow, now: datetime) -> str:
             age_s = 0
         age_str = f"{age_s}s"
         stale = "  STALE" if age_s > _LIVE_STALE_AFTER_SECONDS else ""
-    iter_str = (
-        f"iter={row.iteration}" if row.iteration is not None else "iter=?"
-    )
+    detail = _short(row.last_detail, _LIVE_DETAIL_MAX_WIDTH)
     return (
-        f"{row.task_id}  {row.status.value}  {iter_str}  "
-        f"age={age_str}  {row.last_kind}  {row.last_detail}{stale}"
+        f"{row.task_id}  {row.status.value}  "
+        f"{_format_breadcrumb(row)}  "
+        f"{_format_totals(row)}  "
+        f"age={age_str}  {row.last_kind}  {detail}{stale}"
     )
 
 

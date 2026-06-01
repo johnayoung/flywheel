@@ -382,3 +382,111 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
         assert cur.fetchone()["status"] == Status.DONE.value
     finally:
         store.close()
+
+
+# --- heartbeat rendering ----------------------------------------------------
+
+
+_LIVE_TS_DEFAULT = object()
+
+
+def _live_row(
+    *,
+    task_id: str = "task-x",
+    attempt: int | None = 1,
+    iteration: int | None = 2,
+    last_kind: str = "ASSISTANT",
+    last_detail: str = "Edit(file_path=x.py)",
+    last_ts: object = _LIVE_TS_DEFAULT,
+    tokens_total: int = 0,
+    cost_usd_total: float = 0.0,
+    turns_total: int = 0,
+    iterations_completed: int = 0,
+) -> object:
+    """Build a ``flywheel.workflow.LiveRunRow`` without spinning a store."""
+    from datetime import datetime, timezone
+
+    from flywheel.workflow import LiveRunRow
+
+    if last_ts is _LIVE_TS_DEFAULT:
+        ts_val = datetime.now(timezone.utc)
+    else:
+        ts_val = last_ts  # type: ignore[assignment]
+    return LiveRunRow(
+        run_id=f"run-{task_id}",
+        task_id=task_id,
+        status=Status.RUNNING,
+        attempt=attempt,
+        iteration=iteration,
+        last_kind=last_kind,
+        last_detail=last_detail,
+        last_ts=ts_val,  # type: ignore[arg-type]
+        tokens_total=tokens_total,
+        cost_usd_total=cost_usd_total,
+        turns_total=turns_total,
+        iterations_completed=iterations_completed,
+    )
+
+
+def test_heartbeat_renders_breadcrumb_totals_and_action() -> None:
+    from datetime import datetime, timezone
+
+    row = _live_row(
+        task_id="task-h",
+        attempt=2,
+        iteration=3,
+        tokens_total=2500,
+        cost_usd_total=0.123456,
+        turns_total=7,
+        iterations_completed=3,
+    )
+    line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
+    assert "task-h" in line
+    assert "attempt=2" in line
+    assert "iter=3" in line
+    assert "tokens=2500" in line
+    assert "cost=$0.1235" in line  # 4dp rendering
+    assert "turns=7" in line
+    assert "ASSISTANT" in line
+
+
+def test_heartbeat_renders_dashes_when_no_iteration_event_yet() -> None:
+    from datetime import datetime, timezone
+
+    row = _live_row(
+        attempt=1,
+        iteration=1,
+        iterations_completed=0,
+        tokens_total=0,
+        cost_usd_total=0.0,
+        turns_total=0,
+    )
+    line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
+    assert "cost=--" in line
+    assert "tokens=0" in line
+    assert "turns=0" in line
+
+
+def test_heartbeat_unknown_breadcrumb_renders_question_marks() -> None:
+    from datetime import datetime, timezone
+
+    row = _live_row(
+        attempt=None,
+        iteration=None,
+        last_kind="(none)",
+        last_detail="(no activity yet)",
+        last_ts=None,
+    )
+    line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
+    assert "attempt=?" in line
+    assert "iter=?" in line
+    assert "age=—" in line
+
+
+def test_heartbeat_truncates_overlong_detail() -> None:
+    from datetime import datetime, timezone
+
+    row = _live_row(last_detail="z" * 5000)
+    line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
+    # Belt-and-braces cap: the heartbeat constant + reasonable prefix.
+    assert len(line) < worker._HEARTBEAT_DETAIL_MAX_WIDTH + 200

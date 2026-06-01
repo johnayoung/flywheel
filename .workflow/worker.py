@@ -499,16 +499,43 @@ def retention_sweep(
                 _git(repo_root, "branch", "-D", branch.strip())
 
 
+# Hard ceiling on the rendered action so a runaway tool-call payload can
+# never wrap the single-line heartbeat unboundedly. The per-field
+# summarizers in `flywheel.workflow` already truncate individual values;
+# this is the belt-and-braces final cap.
+_HEARTBEAT_DETAIL_MAX_WIDTH: int = 100
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(limit - 1, 1)] + "…"
+
+
 def _format_heartbeat(row: LiveRunRow, now: datetime) -> str:
+    """Single-line per-in-flight-run progress: lifecycle-position
+    breadcrumb (``attempt=N iter=K``), running tokens/cost/turns rolled
+    up from the run's ``harness.iteration_completed`` events, age of the
+    latest activity, and the current agent action."""
     if row.last_ts is None:
         age = "—"
     else:
         secs = int((now - row.last_ts).total_seconds())
         age = f"{max(secs, 0)}s"
+    attempt_str = (
+        f"attempt={row.attempt}" if row.attempt is not None else "attempt=?"
+    )
     iter_str = f"iter={row.iteration}" if row.iteration is not None else "iter=?"
+    if row.iterations_completed == 0:
+        totals = "tokens=0 cost=-- turns=0"
+    else:
+        totals = (
+            f"tokens={row.tokens_total} "
+            f"cost=${row.cost_usd_total:.4f} "
+            f"turns={row.turns_total}"
+        )
+    detail = _truncate(row.last_detail, _HEARTBEAT_DETAIL_MAX_WIDTH)
     return (
-        f"{row.task_id} {row.status.value} {iter_str} age={age} "
-        f"{row.last_kind} {row.last_detail}"
+        f"{row.task_id} {row.status.value} {attempt_str} {iter_str} "
+        f"{totals} age={age} {row.last_kind} {detail}"
     )
 
 

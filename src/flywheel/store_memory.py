@@ -45,6 +45,7 @@ from flywheel.store_protocols import (
     AuditRecord,
     ClaimLostError,
     ClaudeSessionEntry,
+    ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
     GraderType,
@@ -148,6 +149,17 @@ def _clone_session_entry(e: ClaudeSessionEntry) -> ClaudeSessionEntry:
     )
 
 
+def _clone_control_command(c: ControlCommandRecord) -> ControlCommandRecord:
+    return ControlCommandRecord(
+        run_id=c.run_id,
+        kind=c.kind,
+        payload=dict(c.payload),
+        enqueued_at=c.enqueued_at,
+        claimed_at=c.claimed_at,
+        id=c.id,
+    )
+
+
 class InMemoryStore:
     """In-memory implementation of every store protocol.
 
@@ -184,6 +196,11 @@ class InMemoryStore:
             tuple[str, str], tuple[dict[str, Any], datetime, int]
         ] = {}
         self._task_seq: int = 0
+        # Control-command queue. Rows are kept in a single list with a
+        # monotonic ``id`` (the enqueue-order key) so claim_commands can
+        # surface them in ascending order without a separate index.
+        self._control_commands: list[ControlCommandRecord] = []
+        self._control_command_seq: int = 0
 
     def _next_run_sequence(self, run_id: str) -> int:
         nxt = self._run_sequence.get(run_id, 0) + 1
@@ -602,6 +619,60 @@ class InMemoryStore:
 
     def load_claim(self, task_id: str) -> TaskClaim | None:
         return self._claims.get(task_id)
+
+    # --- ControlCommandStore -----------------------------------------------
+
+    def enqueue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> ControlCommandRecord:
+        # Snapshot the payload up front so a caller mutating the input
+        # dict after enqueue cannot poison the stored row, matching the
+        # defensive-copy pattern used everywhere else in this store.
+        self._control_command_seq += 1
+        record = ControlCommandRecord(
+            run_id=run_id,
+            kind=kind,
+            payload=dict(payload),
+            enqueued_at=now,
+            claimed_at=None,
+            id=self._control_command_seq,
+        )
+        self._control_commands.append(record)
+        return _clone_control_command(record)
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]:
+        # Claim-once: every still-pending row for ``run_id`` flips to
+        # claimed_at = now in this single call. A second call for the same
+        # run skips already-claimed rows so the consumer never double-
+        # applies a command. The list itself is already in enqueue order
+        # (we append on each enqueue and never reorder), so iterating it
+        # in storage order is equivalent to ascending by id.
+        claimed: list[ControlCommandRecord] = []
+        for idx, cmd in enumerate(self._control_commands):
+            if cmd.run_id != run_id or cmd.claimed_at is not None:
+                continue
+            updated = ControlCommandRecord(
+                run_id=cmd.run_id,
+                kind=cmd.kind,
+                payload=dict(cmd.payload),
+                enqueued_at=cmd.enqueued_at,
+                claimed_at=now,
+                id=cmd.id,
+            )
+            self._control_commands[idx] = updated
+            claimed.append(updated)
+        claimed.sort(key=lambda c: c.id if c.id is not None else 0)
+        return [_clone_control_command(c) for c in claimed]
 
 
 __all__ = ["InMemoryStore"]

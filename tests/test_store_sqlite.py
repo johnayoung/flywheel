@@ -64,6 +64,7 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
             "run_sequence",
             "schema_version",
             "task_claims",
+            "control_commands",
         }
     finally:
         store.close()
@@ -533,6 +534,93 @@ def test_fresh_store_records_current_schema_version(tmp_path: Path) -> None:
         assert int(row["version"]) == CURRENT_SCHEMA_VERSION
     finally:
         store.close()
+
+
+def _downgrade_to_v3_without_control_commands(db: Path) -> None:
+    """Strip the v4 additions from a bootstrapped store so it looks like a
+    pre-feature v3 database: drop ``control_commands`` (table + index) and
+    pin ``schema_version`` back to 3. The store's bootstrap then exercises
+    the forward migration path on reopen."""
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_control_commands_pending")
+        conn.execute("DROP TABLE IF EXISTS control_commands")
+        conn.execute(
+            "UPDATE schema_version SET version = 3 WHERE id = 1"
+        )
+    finally:
+        conn.close()
+
+
+def test_v3_store_upgrades_to_v4_with_control_commands_table(
+    tmp_path: Path,
+) -> None:
+    """Existing v3 stores must forward-migrate cleanly on reopen: the
+    ``control_commands`` table appears, schema_version bumps to v4, and
+    pre-existing lifecycle data survives untouched."""
+    db = tmp_path / "v3-upgrade.db"
+    s_initial = SqliteStore(db)
+    payload = '[{"type": "command_grader", "name": "ok"}]'
+    s_initial.create_lifecycle(
+        Lifecycle(
+            task_id="t",
+            run_id="run-pre-migration",
+            blocked_requires_json=payload,
+        )
+    )
+    s_initial.close()
+
+    _downgrade_to_v3_without_control_commands(db)
+
+    # Sanity-check the downgrade: control_commands really is gone and the
+    # version row is back at 3.
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "control_commands" not in tables
+        (version,) = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == 3
+    finally:
+        conn.close()
+
+    s_migrated = SqliteStore(db)
+    try:
+        rows = s_migrated._connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='control_commands'"
+        ).fetchall()
+        assert rows, "v3 -> v4 migration must create control_commands"
+        (version,) = s_migrated._connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == CURRENT_SCHEMA_VERSION
+        # Pre-migration data survives untouched.
+        loaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert loaded is not None
+        assert loaded.blocked_requires_json == payload
+        # New verbs are wired in and work end-to-end against the upgraded
+        # store; the migration is not just DDL-only.
+        enqueued = s_migrated.enqueue_command(
+            "run-pre-migration",
+            "interrupt",
+            {},
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        assert enqueued.id is not None
+        claimed = s_migrated.claim_commands(
+            "run-pre-migration",
+            now=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+        )
+        assert [c.kind for c in claimed] == ["interrupt"]
+    finally:
+        s_migrated.close()
 
 
 def test_opening_v2_store_without_blocked_requires_json_adds_column(

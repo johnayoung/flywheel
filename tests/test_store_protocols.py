@@ -10,8 +10,10 @@ will depend on.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -23,6 +25,8 @@ from flywheel import (
     AuditRecord,
     AuditStore,
     ClaudeSessionEntry,
+    ControlCommandRecord,
+    ControlCommandStore,
     EventRecord,
     EventStore,
     GraderResultRecord,
@@ -127,6 +131,31 @@ class _AuditStub:
         return []
 
 
+class _ControlCommandStub:
+    def enqueue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> ControlCommandRecord:
+        return ControlCommandRecord(
+            run_id=run_id,
+            kind=kind,
+            payload=dict(payload),
+            enqueued_at=now,
+        )
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]:
+        return []
+
+
 def test_lifecycle_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_LifecycleStub(), LifecycleStore)
 
@@ -153,6 +182,10 @@ def test_sdk_message_store_protocol_is_satisfiable_by_stub() -> None:
 
 def test_audit_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_AuditStub(), AuditStore)
+
+
+def test_control_command_store_protocol_is_satisfiable_by_stub() -> None:
+    assert isinstance(_ControlCommandStub(), ControlCommandStore)
 
 
 # --- Append-only contract on grader_results --------------------------------
@@ -282,6 +315,30 @@ def test_claude_session_entry_is_dataclass_with_schema_fields() -> None:
         "entry",
         "mtime",
     }
+
+
+def test_control_command_record_is_dataclass_with_schema_fields() -> None:
+    assert is_dataclass(ControlCommandRecord)
+    names = {f.name for f in fields(ControlCommandRecord)}
+    assert names == {
+        "id",
+        "run_id",
+        "kind",
+        "payload",
+        "enqueued_at",
+        "claimed_at",
+    }
+
+
+def test_control_command_record_defaults_id_and_claimed_at_to_none() -> None:
+    rec = ControlCommandRecord(
+        run_id="r1",
+        kind="say",
+        payload={"text": "focus on graders"},
+        enqueued_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    assert rec.id is None
+    assert rec.claimed_at is None
 
 
 def test_claude_session_entry_subpath_defaults_to_empty_string() -> None:

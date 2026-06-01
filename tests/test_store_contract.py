@@ -38,6 +38,7 @@ from flywheel import (
     ClaimLostError,
     ClaimStore,
     ClaudeSessionEntry,
+    ControlCommandStore,
     DomainEventStore,
     EventRecord,
     EventStore,
@@ -196,6 +197,7 @@ def test_store_satisfies_every_protocol(store: object) -> None:
     assert isinstance(store, SdkMessageStore)
     assert isinstance(store, AuditStore)
     assert isinstance(store, TaskStore)
+    assert isinstance(store, ControlCommandStore)
 
 
 def test_store_exposes_no_grader_result_mutators(store: object) -> None:
@@ -1412,3 +1414,145 @@ def test_load_task_for_run_resolves_pinned_version(store: object) -> None:
 def test_load_task_for_run_missing_run_returns_none(store: object) -> None:
     assert isinstance(store, TaskStore)
     assert store.load_task_for_run("never-ran") is None
+
+
+# --- Control command channel (00013 store layer) ---------------------------
+
+
+def test_enqueue_command_persists_pending_row(store: object) -> None:
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    enqueued = store.enqueue_command(
+        "r1",
+        "say",
+        {"text": "focus on the failing grader first"},
+        now=_t(0),
+    )
+    assert enqueued.run_id == "r1"
+    assert enqueued.kind == "say"
+    assert dict(enqueued.payload) == {
+        "text": "focus on the failing grader first"
+    }
+    assert enqueued.enqueued_at == _t(0)
+    assert enqueued.claimed_at is None
+    assert enqueued.id is not None
+
+
+def test_enqueue_command_assigns_monotonic_id(store: object) -> None:
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    first = store.enqueue_command("r1", "interrupt", {}, now=_t(0))
+    second = store.enqueue_command(
+        "r1", "say", {"text": "hello"}, now=_t(1)
+    )
+    assert first.id is not None and second.id is not None
+    assert second.id > first.id
+
+
+def test_claim_commands_returns_pending_rows_in_enqueue_order(
+    store: object,
+) -> None:
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    store.enqueue_command("r1", "say", {"text": "first"}, now=_t(0))
+    store.enqueue_command("r1", "interrupt", {}, now=_t(1))
+    store.enqueue_command(
+        "r1", "set_model", {"target": "claude-opus-4-8"}, now=_t(2)
+    )
+
+    claimed = store.claim_commands("r1", now=_t(3))
+    assert [c.kind for c in claimed] == ["say", "interrupt", "set_model"]
+    for record in claimed:
+        assert record.claimed_at == _t(3)
+        assert record.id is not None
+
+
+def test_claim_commands_is_claim_once(store: object) -> None:
+    """FR-2: enqueue two commands, claim once (both returned), claim
+    again (none returned)."""
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    store.enqueue_command("r1", "say", {"text": "one"}, now=_t(0))
+    store.enqueue_command("r1", "interrupt", {}, now=_t(1))
+
+    first_claim = store.claim_commands("r1", now=_t(2))
+    assert len(first_claim) == 2
+
+    second_claim = store.claim_commands("r1", now=_t(3))
+    assert second_claim == []
+
+
+def test_claim_commands_only_returns_unclaimed_rows_added_since(
+    store: object,
+) -> None:
+    """A second batch enqueued after the first claim must be the only
+    rows the next claim returns; earlier-claimed rows must not reappear."""
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    store.enqueue_command("r1", "say", {"text": "one"}, now=_t(0))
+    first_claim = store.claim_commands("r1", now=_t(1))
+    assert [c.kind for c in first_claim] == ["say"]
+
+    store.enqueue_command(
+        "r1", "set_model", {"target": "claude-opus-4-8"}, now=_t(2)
+    )
+    second_claim = store.claim_commands("r1", now=_t(3))
+    assert [c.kind for c in second_claim] == ["set_model"]
+    assert second_claim[0].claimed_at == _t(3)
+
+
+def test_claim_commands_with_empty_queue_returns_empty_list(
+    store: object,
+) -> None:
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    assert store.claim_commands("r1", now=_t(0)) == []
+
+
+def test_claim_commands_is_scoped_by_run_id(store: object) -> None:
+    """A command enqueued for one run must not be claimed by another."""
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    _ensure_lifecycle(store, "r2")
+
+    store.enqueue_command("r1", "say", {"text": "to r1"}, now=_t(0))
+    store.enqueue_command("r2", "say", {"text": "to r2"}, now=_t(1))
+
+    r1_claim = store.claim_commands("r1", now=_t(2))
+    assert len(r1_claim) == 1
+    assert dict(r1_claim[0].payload) == {"text": "to r1"}
+
+    r2_claim = store.claim_commands("r2", now=_t(2))
+    assert len(r2_claim) == 1
+    assert dict(r2_claim[0].payload) == {"text": "to r2"}
+
+
+def test_control_command_payload_isolated_from_caller_mutations(
+    store: object,
+) -> None:
+    """Mutating the payload after enqueue must not corrupt the stored row,
+    matching the defensive-copy contract every other store record honors."""
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    payload: dict[str, object] = {"text": "original"}
+    store.enqueue_command("r1", "say", payload, now=_t(0))
+    payload["text"] = "MUTATED"
+    payload["new"] = "field"
+
+    claimed = store.claim_commands("r1", now=_t(1))
+    assert len(claimed) == 1
+    assert dict(claimed[0].payload) == {"text": "original"}

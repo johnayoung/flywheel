@@ -59,6 +59,7 @@ from flywheel.store_protocols import (
     AuditRecord,
     ClaimLostError,
     ClaudeSessionEntry,
+    ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
     GraderType,
@@ -211,6 +212,19 @@ class SqliteStore:
                 "ALTER TABLE events ADD COLUMN category TEXT NOT NULL "
                 "DEFAULT 'telemetry'"
             )
+        # Forward migration from schema_version 3 -> 4: the
+        # ``control_commands`` table (and its pending-row index) ships in
+        # schema_version 4. CREATE TABLE IF NOT EXISTS above already
+        # materialized it on the existing database; INSERT OR IGNORE in the
+        # schema script no-ops against the pre-existing v3 row, so explicitly
+        # bump the row when it is still at 3. The bump is guarded on the
+        # current version so re-bootstrap of a v4 store is a no-op and a
+        # mismatched future version still fails the final pin below.
+        conn.execute(
+            "UPDATE schema_version SET version = ? "
+            "WHERE id = 1 AND version = ?",
+            (CURRENT_SCHEMA_VERSION, 3),
+        )
         # Final version pin: any row mismatch is fatal regardless of how
         # the database got here. The schema_version table has a CHECK
         # (id = 1) so there is at most one row to read.
@@ -970,6 +984,65 @@ class SqliteStore:
             version=int(row["version"]),
         )
 
+    # --- ControlCommandStore ----------------------------------------------
+
+    def enqueue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> ControlCommandRecord:
+        # Persist verbatim. ``claimed_at`` is left NULL so the row joins the
+        # pending queue immediately; ``id`` is assigned by AUTOINCREMENT and
+        # becomes the per-run enqueue-order key consumed by claim_commands.
+        payload_copy = dict(payload)
+        cursor = self._connection.execute(
+            """
+            INSERT INTO control_commands (
+                run_id, kind, payload_json, enqueued_at, claimed_at
+            ) VALUES (?, ?, ?, ?, NULL)
+            """,
+            (run_id, kind, json.dumps(payload_copy), _iso(now)),
+        )
+        return ControlCommandRecord(
+            run_id=run_id,
+            kind=kind,
+            payload=payload_copy,
+            enqueued_at=now,
+            claimed_at=None,
+            id=cursor.lastrowid,
+        )
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]:
+        # Claim-once is one atomic UPDATE: every still-pending row for the
+        # run is flipped to claimed_at = now in a single statement, so a
+        # racing claim_commands call (different worker, watcher restart)
+        # sees no rows to take. ``BEGIN IMMEDIATE`` forces the writer lock
+        # up front, which matches the optimistic-concurrency pattern used
+        # by acquire_claim above. RETURNING yields rows in arbitrary order;
+        # we sort by id afterwards to match the enqueue-order contract.
+        with self._transaction():
+            rows = self._connection.execute(
+                """
+                UPDATE control_commands
+                SET claimed_at = ?
+                WHERE run_id = ? AND claimed_at IS NULL
+                RETURNING id, run_id, kind, payload_json, enqueued_at,
+                          claimed_at
+                """,
+                (_iso(now), run_id),
+            ).fetchall()
+        records = [_row_to_control_command(r) for r in rows]
+        records.sort(key=lambda r: r.id if r.id is not None else 0)
+        return records
+
 
 # --- Row -> dataclass converters --------------------------------------------
 
@@ -1101,6 +1174,19 @@ def _row_to_session_entry(row: sqlite3.Row) -> ClaudeSessionEntry:
         mtime=int(row["mtime"]),
         subpath=row["subpath"],
         seq=int(row["seq"]),
+    )
+
+
+def _row_to_control_command(row: sqlite3.Row) -> ControlCommandRecord:
+    enqueued = _parse_iso(row["enqueued_at"])
+    assert enqueued is not None  # NOT NULL in schema
+    return ControlCommandRecord(
+        run_id=row["run_id"],
+        kind=row["kind"],
+        payload=json.loads(row["payload_json"]),
+        enqueued_at=enqueued,
+        claimed_at=_parse_iso(row["claimed_at"]),
+        id=int(row["id"]),
     )
 
 

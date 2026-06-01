@@ -74,6 +74,7 @@ from flywheel.store_protocols import (
     AuditRecord,
     ClaimLostError,
     ClaudeSessionEntry,
+    ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
     GraderType,
@@ -334,6 +335,20 @@ class PostgresStore:
                         "ALTER TABLE events ADD COLUMN category TEXT "
                         "NOT NULL DEFAULT 'telemetry'"
                     )
+                # Forward migration from schema_version 3 -> 4: the
+                # ``control_commands`` table ships in schema_version 4.
+                # CREATE TABLE IF NOT EXISTS above already materialized it
+                # on the existing schema; the INSERT ... ON CONFLICT DO
+                # NOTHING in the script no-ops against the pre-existing
+                # v3 row, so bump the row explicitly when it is still at
+                # 3. Guarded on the prior version so re-bootstrap of a v4
+                # schema is a no-op and a future version still fails the
+                # final pin below.
+                cur.execute(
+                    "UPDATE schema_version SET version = %s "
+                    "WHERE id = 1 AND version = %s",
+                    (CURRENT_SCHEMA_VERSION, 3),
+                )
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
                 )
@@ -1409,6 +1424,77 @@ class PostgresStore:
             version=int(row["version"]),
         )
 
+    # --- ControlCommandStore ----------------------------------------------
+
+    def enqueue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> ControlCommandRecord:
+        # Persist verbatim. ``claimed_at`` stays NULL so the row joins the
+        # pending queue immediately; BIGSERIAL assigns ``id``, which is the
+        # per-run enqueue-order key consumed by claim_commands.
+        payload_copy = dict(payload)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO control_commands (
+                        run_id, kind, payload_json, enqueued_at, claimed_at
+                    ) VALUES (%s, %s, %s, %s, NULL)
+                    RETURNING id
+                    """,
+                    (run_id, kind, Jsonb(payload_copy), now),
+                )
+                row = cur.fetchone()
+        assert row is not None
+        return ControlCommandRecord(
+            run_id=run_id,
+            kind=kind,
+            payload=payload_copy,
+            enqueued_at=now,
+            claimed_at=None,
+            id=int(row[0]),
+        )
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]:
+        # Claim-once across concurrent workers: the inner SELECT pins each
+        # pending row with FOR UPDATE SKIP LOCKED, so a second worker
+        # running claim_commands at the same time sees no overlap with
+        # this caller's slice. The outer UPDATE then flips claimed_at and
+        # returns the row. Sorted ascending by id so callers consume
+        # commands in enqueue order regardless of RETURNING's row order.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    UPDATE control_commands
+                    SET claimed_at = %s
+                    WHERE id IN (
+                        SELECT id
+                        FROM control_commands
+                        WHERE run_id = %s AND claimed_at IS NULL
+                        ORDER BY id
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, run_id, kind, payload_json, enqueued_at,
+                              claimed_at
+                    """,
+                    (now, run_id),
+                )
+                rows = cur.fetchall()
+        records = [_row_to_control_command(r) for r in rows]
+        records.sort(key=lambda r: r.id if r.id is not None else 0)
+        return records
+
 
 # --- Row -> dataclass converters --------------------------------------------
 
@@ -1494,6 +1580,17 @@ def _row_to_session_entry(row: dict[str, Any]) -> ClaudeSessionEntry:
         mtime=int(row["mtime"]),
         subpath=row["subpath"],
         seq=int(row["seq"]),
+    )
+
+
+def _row_to_control_command(row: dict[str, Any]) -> ControlCommandRecord:
+    return ControlCommandRecord(
+        run_id=row["run_id"],
+        kind=row["kind"],
+        payload=dict(row["payload_json"]),
+        enqueued_at=row["enqueued_at"],
+        claimed_at=row["claimed_at"],
+        id=int(row["id"]),
     )
 
 

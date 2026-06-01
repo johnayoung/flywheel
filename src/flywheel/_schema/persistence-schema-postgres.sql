@@ -207,15 +207,40 @@ CREATE TABLE IF NOT EXISTS task_claims (
   version          INTEGER NOT NULL
 );
 
+-- control_commands: operator-issued steering commands routed through the
+-- store. A producer (the CLI) enqueues a row; the in-process watcher in
+-- the running worker periodically claims pending rows for its run and
+-- applies them to the live SDK client. claimed_at flips from NULL to the
+-- claim moment in a single atomic UPDATE (with FOR UPDATE SKIP LOCKED on
+-- the inner SELECT) so a command applies exactly once across watcher
+-- restarts and concurrent workers. Enqueue order is the autoincrement id;
+-- claim_commands returns rows in ascending id order. Added in
+-- schema_version 4 via the forward migration the store applies on
+-- bootstrap.
+CREATE TABLE IF NOT EXISTS control_commands (
+  id            BIGSERIAL PRIMARY KEY,
+  run_id        TEXT        NOT NULL,
+  kind          TEXT        NOT NULL,
+  payload_json  JSONB       NOT NULL,
+  enqueued_at   TIMESTAMPTZ NOT NULL,
+  claimed_at    TIMESTAMPTZ,
+  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_control_commands_pending
+  ON control_commands(run_id, id) WHERE claimed_at IS NULL;
+
 -- schema_version pins the on-disk schema. The CHECK clause forces a
 -- single sentinel row at id = 1 so ``ON CONFLICT DO NOTHING`` is a true
 -- upsert against re-bootstrap; stores compare ``version`` on open and
--- refuse mismatched databases with StoreSchemaError.
+-- refuse mismatched databases with StoreSchemaError. Forward migrations
+-- from earlier schema versions are applied by the concrete store's
+-- bootstrap (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT
+-- EXISTS above materializes control_commands on an existing database).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version (id, version) VALUES (1, 3)
+INSERT INTO schema_version (id, version) VALUES (1, 4)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

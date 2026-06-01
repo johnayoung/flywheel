@@ -91,7 +91,7 @@ class ClaimLostError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 3
+CURRENT_SCHEMA_VERSION: int = 4
 
 
 class StoreSchemaError(Exception):
@@ -228,6 +228,37 @@ class TaskClaim:
     claimed_at: datetime
     lease_expires_at: datetime
     version: int
+
+
+@dataclass(kw_only=True)
+class ControlCommandRecord:
+    """One row in the ``control_commands`` table.
+
+    Mirrors the ``control_commands`` table in
+    ``flywheel/_schema/persistence-schema.sql``. A control command is an
+    operator-issued intervention against a live run (``interrupt``, ``say``,
+    ``set_model``, ...) routed through the store so producers and the
+    in-process watcher coordinate across the worker-daemon boundary.
+
+    ``payload`` is opaque per-kind execution detail (e.g. the operator
+    message for ``say``, the target identifier for ``set_model``); the
+    protocol persists it verbatim the same way :attr:`EventRecord.payload`
+    is handled.
+
+    ``id`` is assigned by the store on ``enqueue_command`` and is the
+    canonical enqueue-order key — ``claim_commands`` returns pending rows
+    ascending by ``id``. ``claimed_at`` is ``None`` while pending and
+    populated with the claim moment by ``claim_commands``; the column
+    drives claim-once semantics so a single command applies at most one
+    time across watcher restarts and concurrent workers.
+    """
+
+    run_id: str
+    kind: str
+    payload: Mapping[str, Any]
+    enqueued_at: datetime
+    claimed_at: datetime | None = None
+    id: int | None = None
 
 
 @dataclass(kw_only=True)
@@ -510,6 +541,52 @@ class ClaimStore(Protocol):
 
 
 @runtime_checkable
+class ControlCommandStore(Protocol):
+    """Persistence contract for operator-issued control commands.
+
+    A control command is a store-routed intervention against a live run:
+    ``enqueue_command`` persists a pending row, ``claim_commands`` returns
+    and atomically marks every pending row for one run exactly once, in
+    enqueue order. The producer (a CLI subcommand) and the consuming
+    in-process watcher communicate only through the store so steering
+    works across the worker-daemon boundary.
+
+    * ``enqueue_command(run_id, kind, payload, *, now)`` writes a fresh
+      row with ``claimed_at = None`` and ``enqueued_at = now``, assigns
+      the store-side ``id`` (the enqueue-order key), and returns the
+      persisted record. The command is persisted unconditionally — a
+      command targeting a run that is not currently in-flight is kept
+      pending rather than silently dropped. Concrete stores that enforce
+      a foreign key to ``lifecycles`` require the run to be known; if
+      enforcement is missing on a particular backend the protocol still
+      accepts unknown runs and they remain pending.
+    * ``claim_commands(run_id, *, now)`` is the claim-once primitive: it
+      atomically selects every pending row for ``run_id``, sets
+      ``claimed_at = now`` on each, and returns the claimed rows in
+      ascending ``id`` order. A second call (or a concurrent worker's
+      call) returns nothing for the same rows — the claim never
+      double-applies. An empty pending queue returns an empty list with
+      no error.
+    """
+
+    def enqueue_command(
+        self,
+        run_id: str,
+        kind: str,
+        payload: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> ControlCommandRecord: ...
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]: ...
+
+
+@runtime_checkable
 class AgentSessionStore(Protocol):
     """Persistence contract for the ``claude_session_store`` transcript log.
 
@@ -541,6 +618,8 @@ __all__ = [
     "ClaimLostError",
     "ClaimStore",
     "ClaudeSessionEntry",
+    "ControlCommandRecord",
+    "ControlCommandStore",
     "DomainEventStore",
     "EventRecord",
     "EventStore",

@@ -193,15 +193,41 @@ CREATE TABLE IF NOT EXISTS task_claims (
   version          INTEGER NOT NULL
 );
 
+-- control_commands: operator-issued steering commands routed through the
+-- store. A producer (the CLI) enqueues a row; the in-process watcher in
+-- the running worker periodically claims pending rows for its run and
+-- applies them to the live SDK client (interrupt, inject a message,
+-- change the model). Each row carries the run scope, the kind
+-- discriminator, an opaque JSON payload, and the enqueue timestamp.
+-- claimed_at flips from NULL to the claim moment in a single atomic
+-- UPDATE so a command applies exactly once even across watcher restarts
+-- or concurrent workers (claim-once semantics). Enqueue order is the
+-- autoincrement id, which claim_commands uses as the canonical ordering
+-- key. Added in schema_version 4 via the forward migration below.
+CREATE TABLE IF NOT EXISTS control_commands (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  payload_json  TEXT NOT NULL,
+  enqueued_at   DATETIME NOT NULL,
+  claimed_at    DATETIME,
+  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_control_commands_pending
+  ON control_commands(run_id, id) WHERE claimed_at IS NULL;
+
 -- schema_version pins the on-disk schema. The CHECK clause forces a
 -- single sentinel row at id = 1 so ``INSERT OR IGNORE`` is a true upsert
 -- against re-bootstrap; stores compare ``version`` on open and refuse
--- mismatched databases with StoreSchemaError.
+-- mismatched databases with StoreSchemaError. Forward migrations from
+-- earlier schema versions are applied by the concrete store's bootstrap
+-- (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT EXISTS above
+-- materializes control_commands on an existing database).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 3);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 4);
 
 -- claude_session_store: Claude Code agent transcript persistence.
 -- One row per transcript entry; seq orders entries within a

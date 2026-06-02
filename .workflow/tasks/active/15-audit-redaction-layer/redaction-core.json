@@ -1,0 +1,41 @@
+{
+  "id": "redaction-core",
+  "goal": "Add a pure `flywheel.redaction` module exposing a `Redactor` protocol, a deep-traversing type-preserving `redact` transform over `AuditRecord`, a `PatternRedactor`, and a `compose` combinator.",
+  "tags": ["redaction", "audit", "purity"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00014-FEATURE-audit-redaction-layer.md",
+      "src/flywheel/store_protocols.py",
+      "src/flywheel/task.py",
+      "tests/test_task_module_purity.py"
+    ],
+    "references": [
+      "src/flywheel/task.py -- mirror the pure-module discipline (no json/pathlib/io, no open())",
+      "tests/test_task_module_purity.py -- copy this structure for tests/test_redaction_module_purity.py"
+    ],
+    "constraints": [
+      "flywheel.redaction imports no json/pathlib/io and never calls open(); the core transform performs no I/O (FR-1).",
+      "redact(record) returns a NEW record of the same concrete type with sequence/id/ts/run_id and all non-payload fields unchanged; never mutate the input (FR-2).",
+      "Traversal reaches into arbitrarily nested dicts and lists inside payload; non-string leaves (int/bool/None) pass through untouched.",
+      "compose(*redactors) returns a Redactor applying each in order, the output of one feeding the next, deterministically (FR-7).",
+      "Define Redactor as a pure transform over a single AuditRecord with no reference to the store, stream, or read path (FR-13).",
+      "Placeholder token format is bare `[REDACTED:<label>]` for this task; the salted HMAC digest variant lands in redaction-builtins.",
+      "Add tests/test_redaction_module_purity.py mirroring tests/test_task_module_purity.py; its FORBIDDEN_IMPORTS must be exactly {json, pathlib, io} (plus open()) -- do NOT forbid os/re/hmac/hashlib, which redaction-builtins needs.",
+      "Call mcp__ide__getDiagnostics on every .py file touched and fix all Pylance/type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No EnvValueRedactor, FieldPathRedactor, ToolDenylistRedactor, or default_policy() yet (redaction-builtins).",
+      "No changes to flywheel.audit or the CLI (later tasks).",
+      "No HMAC/salted tokens yet."
+    ],
+    "edge_cases": [
+      "Empty payloads, empty strings, and records with no match pass through unchanged (same type, equal value).",
+      "A secret inside a larger string is replaced in-place, leaving surrounding text intact."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_redaction.py tests/test_redaction_module_purity.py", "name": "tests" },
+    { "type": "command", "run": "uv run python -c \"import flywheel.redaction as r; assert all(hasattr(r, n) for n in ('Redactor', 'PatternRedactor', 'compose'))\"", "name": "public-surface" }
+  ]
+}

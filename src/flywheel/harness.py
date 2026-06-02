@@ -37,12 +37,18 @@ session-cumulative as the SDK reports them. Utilization% and the 50 / 75
 / 90 threshold-crossing signals listed in ``docs/vision.md`` remain
 future work (no window-capacity source today).
 
-The TODO subsystems from ``docs/loop.md`` — thrash detection, hang
-threshold defaults, context-recovery policy, fine-grained crash
-classification, and ``blocked_implicit`` semantic similarity — are
-**explicitly deferred** here. See :data:`_DEFERRED_LOOP_SUBSYSTEMS` for
-the canonical list. The harness does not paper over them with stub
-heuristics.
+The mechanical cases the safety-net work landed — repeated-failure
+``STUCK`` and tuple-repetition ``THRASH`` via :mod:`flywheel.loop_guard`,
+plus the in-harness hang watchdog mechanism — already run; see
+:func:`_drive_iterations` for the wiring. What genuinely remains TODO
+from ``docs/loop.md`` is **explicitly deferred** here: thrash sub-problems
+(b) net-diff and (c) input-novelty, the still-ungrounded
+``hang_timeout_seconds`` default value (the mechanism ships, the
+threshold is operator-supplied until research grounds one), the
+context-recovery policy, fine-grained crash classification, and
+``blocked_implicit`` "same question re-asked" semantic detection. See
+:data:`_DEFERRED_LOOP_SUBSYSTEMS` for the canonical list. The harness
+does not paper over deferred items with stub heuristics.
 """
 
 from __future__ import annotations
@@ -117,14 +123,19 @@ from flywheel.loaders import task_digest
 from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
 
 
-# Loop.md flags these subsystems as TODO. They are intentionally not
-# implemented here so the rubric's "not silently faked" assertion holds.
+# Loop.md flags these subsystems as still-TODO after the safety-net work
+# landed. They are intentionally not implemented here so the rubric's
+# "not silently faked" assertion holds. The mechanical detectors that
+# did ship (repeated-failure STUCK, tuple-repetition THRASH, the hang
+# watchdog mechanism) live in flywheel.loop_guard and _drive_iterations
+# and are deliberately NOT in this list.
 _DEFERRED_LOOP_SUBSYSTEMS: tuple[str, ...] = (
-    "thrash detection",
-    "hang threshold defaults",
+    "thrash net-diff detection (sub-problem b)",
+    "thrash input-novelty score (sub-problem c)",
+    "hang threshold default value (mechanism shipped, value ungrounded)",
     "context-recovery policy",
     "fine-grained crash classification",
-    "blocked_implicit semantic similarity",
+    "blocked_implicit same-question-re-asked detection",
 )
 
 

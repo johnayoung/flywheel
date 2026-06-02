@@ -2432,11 +2432,12 @@ class TestDeferredSubsystems:
         from flywheel import harness as harness_module
 
         expected = {
-            "thrash detection",
-            "hang threshold defaults",
+            "thrash net-diff detection (sub-problem b)",
+            "thrash input-novelty score (sub-problem c)",
+            "hang threshold default value (mechanism shipped, value ungrounded)",
             "context-recovery policy",
             "fine-grained crash classification",
-            "blocked_implicit semantic similarity",
+            "blocked_implicit same-question-re-asked detection",
         }
         assert set(harness_module._DEFERRED_LOOP_SUBSYSTEMS) == expected
 

@@ -491,6 +491,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "secrets can still pass through, and the store remains the "
             "unredacted source of truth."
         ),
+        epilog=(
+            "Redaction usage (on by default; best-effort -- the store "
+            "remains the unredacted source of truth):\n"
+            "  --redact                   explicit opt-in (already the default)\n"
+            "  --redact-policy NAME|PATH  'default' | 'strict' | "
+            "'module.sub:factory'\n"
+            "  --redact-salt SALT         stable [REDACTED:label:digest] "
+            "tokens for correlation\n"
+            "  --dry-run                  coverage report only; no payload "
+            "content printed\n"
+            "  --raw                      verbatim output for authorized "
+            "forensics (disables redaction)\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "run_id",

@@ -43,7 +43,9 @@ The loop is not merely a reporter. It is the controller for a single task’s ex
 
 Every harness event and every SDK message the agent emits is persisted under a single per-run monotonic sequence, exposed through `flywheel.audit.stream(run_id, follow=...)` as the programmatic API and `python -m flywheel.audit` as the operator CLI. Replay and live tailing share one iterator; this is the canonical inspection surface for "what did the agent actually do?".
 
-The store is sensitive-by-default: payloads are captured verbatim with no truncation or redaction, so audit records may contain prompts, tool inputs, and tool outputs in the clear. A redaction layer is future work that will sit on top of this stream.
+The store is sensitive-by-default: payloads are captured verbatim with no truncation, so audit records may contain prompts, tool inputs, and tool outputs in the clear. A read-time redaction layer (`flywheel.redaction.Redactor`) sits on top of the stream and is applied by `flywheel.audit.stream(redactor=...)`, `subscribe`, `attach_logger`, and the `python -m flywheel.audit` CLI (`--redact-policy`, `--raw`, `--dry-run`). Redaction is best-effort — unmatched secrets can still pass through, and the store remains the unredacted, sensitive-by-default source of truth.
+
+Write-time redaction at the persistence seam (`append_sdk_message` / `append_event`) is a designed-for follow-up that reuses the same `Redactor` abstraction — not built in this feature. It trades forensic completeness for no-cleartext-at-rest and is the consumer's deliberate opt-in; the MVP ships the read-time wiring only.
 
 ### Claim-based signaling
 

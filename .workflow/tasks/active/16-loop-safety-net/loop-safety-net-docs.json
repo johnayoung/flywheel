@@ -1,0 +1,34 @@
+{
+  "id": "loop-safety-net-docs",
+  "goal": "Update docs/loop.md and the harness module to reflect the three now-implemented detectors, pruning them from the TODO framing and from _DEFERRED_LOOP_SUBSYSTEMS.",
+  "prerequisites": ["harness-hang-watchdog"],
+  "tags": ["loop-safety", "docs"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00015-FEATURE-loop-safety-net.md",
+      "docs/loop.md",
+      "src/flywheel/harness.py"
+    ],
+    "references": [
+      "docs/loop.md:38-42 -- the detection-map rows (blocked_implicit mechanical case, thrashing sub-problem (a), hanging mechanism) whose TODO framing is now implemented",
+      "src/flywheel/harness.py:114-122 -- _DEFERRED_LOOP_SUBSYSTEMS tuple + the module docstring naming the deferred subsystems"
+    ],
+    "constraints": [
+      "Remove 'thrash detection', 'hang threshold defaults', and 'blocked_implicit semantic similarity' from the _DEFERRED_LOOP_SUBSYSTEMS tuple where now implemented; what genuinely remains deferred (net-diff/novelty thrash sub-problems (b)/(c), the still-ungrounded hang default value, context-recovery policy, fine-grained crash classification, semantic 'same question re-asked') stays and is named accurately.",
+      "Update the docs/loop.md detection-map rows for blocked_implicit, thrashing, and hanging so the implemented mechanical/deterministic cases read as shipped and only the researched sub-problems remain marked TODO.",
+      "Keep edits tight and factual -- do not restructure docs/loop.md or invent behavior beyond what the three landed tasks implement.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No code/behavior changes -- documentation and the deferred-subsystems tuple/docstring only.",
+      "No new .md files."
+    ],
+    "edge_cases": [
+      "hang_timeout_seconds still has no grounded default -- the mechanism ships but the threshold value remains deferred; the docs must say exactly that, not claim a default exists."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "! grep -q '\"thrash detection\"' src/flywheel/harness.py && ! grep -q '\"hang threshold defaults\"' src/flywheel/harness.py && ! grep -q '\"blocked_implicit semantic similarity\"' src/flywheel/harness.py", "name": "deferred-pruned" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

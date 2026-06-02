@@ -1,0 +1,46 @@
+{
+  "id": "loop-guard-module",
+  "goal": "Add a pure flywheel.loop_guard module exposing LoopGuardConfig, LoopGuard, and LoopGuardVerdict that detect repeated-failure (STUCK) and thrash from a fed sequence of ToolInteraction tuples.",
+  "tags": ["loop-safety", "loop-guard", "pure-module"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00015-FEATURE-loop-safety-net.md",
+      "src/flywheel/invoker.py",
+      "tests/test_lifecycle_module_purity.py"
+    ],
+    "references": [
+      "src/flywheel/invoker.py:50-64 -- ToolInteraction (tool_name, tool_input, result.is_error) is the detector input",
+      "tests/test_lifecycle_module_purity.py -- mirror this AST-based purity test exactly for the new module"
+    ],
+    "constraints": [
+      "LoopGuard.observe(interactions: Sequence[ToolInteraction]) -> LoopGuardVerdict | None is the only method; it is fed each iteration's signals.tool_interactions in arrival order and accumulates state across calls within one attempt.",
+      "LoopGuardVerdict is a frozen dataclass with: kind (an enum/literal STUCK | THRASH), a human-readable reason, the offending tool_name, and the input digest.",
+      "FR-1 repeated-failure: when the same (tool_name, input-digest) tuple yields is_error == True results repeated_tool_failure_threshold times CONSECUTIVELY (across observe calls), return a STUCK verdict.",
+      "FR-2 thrash: when an identical (tool_name, input-digest) tuple recurs >= thrash_repeat_threshold times within the trailing thrash_window tool calls (regardless of is_error), return a THRASH verdict.",
+      "FR-6 precedence: within a single observe call, evaluate repeated-failure (STUCK) BEFORE thrash (THRASH); a call that is both failing-and-repeating and thrashing returns STUCK.",
+      "LoopGuardConfig holds all knobs, each independently disablable via None/0: repeated_tool_failure_threshold, thrash_repeat_threshold, thrash_window, and hang_timeout_seconds (pure data field consumed later by the harness watchdog, NOT by observe). hang_timeout_seconds defaults to None (disabled). The thrash/repeated-failure thresholds default to conservative on-by-default values (they key on byte-identical digests, so a false positive requires the agent to literally repeat itself).",
+      "When a threshold is disabled (None/0), that detector early-returns and never trips.",
+      "Compute the input digest WITHOUT json (forbidden by the purity test): use hashlib.sha256 over a deterministic structural encoding of tool_input (e.g. a recursively key-sorted repr) so byte-identical inputs collide and key-order noise does not split them.",
+      "PURITY: flywheel.loop_guard must import none of json, pathlib, io, asyncio, time and must never call open(); hashlib is permitted. Add tests/test_loop_guard_module_purity.py mirroring tests/test_lifecycle_module_purity.py but with FORBIDDEN_IMPORTS = {json, pathlib, io, asyncio, time}.",
+      "Add tests/test_loop_guard.py covering: 3 consecutive identical failing calls trip STUCK at threshold 3; identical successful call repeated past thrash_repeat_threshold within thrash_window trips THRASH; A,B,A,B alternating failures do NOT trip STUCK (consecutive on same digest); identical tuple spread wider than thrash_window does NOT trip THRASH; empty interactions are a no-op; a both-failing-and-thrashing stream returns STUCK (precedence); each disabled threshold never trips.",
+      "Call mcp__ide__getDiagnostics on src/flywheel/loop_guard.py and the two new test files and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No harness wiring (harness-loop-guard-wiring).",
+      "No hang watchdog logic -- only the hang_timeout_seconds config field lives here as pure data.",
+      "No net-diff or input-novelty thrash sub-problems; only literal (tool, digest) repetition.",
+      "No semantic 'same question re-asked' detection.",
+      "No persisted/cross-attempt state -- the guard is per-attempt in-memory."
+    ],
+    "edge_cases": [
+      "A tool call with result is None (no matching result block) is not a failure for the repeated-failure counter but still counts toward thrash repetition.",
+      "Distinct tools failing alternately (A,B,A,B) breaks the consecutive run -- STUCK must not trip.",
+      "Within a single observe call carrying many tool calls (one agent turn), the within-call sequence can itself trip a detector."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_loop_guard.py tests/test_loop_guard_module_purity.py", "name": "loop-guard-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

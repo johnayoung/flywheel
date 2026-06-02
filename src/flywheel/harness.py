@@ -100,6 +100,12 @@ from flywheel.invoker import (
     invoke_iteration,
 )
 from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel.loop_guard import (
+    LoopGuard,
+    LoopGuardConfig,
+    LoopGuardVerdict,
+    LoopGuardVerdictKind,
+)
 from flywheel.prompt import IterationInputs, RubricFindings, build_iteration_prompt
 from flywheel.store_protocols import (
     EventRecord,
@@ -266,6 +272,14 @@ class HarnessConfig:
     it to ``run_rubric_graders`` instead of the runner's default fresh
     ``claude_agent_sdk.query`` invoker. Production callers leave it
     ``None``.
+
+    ``loop_guard`` carries the thresholds for the repeated-failure (STUCK)
+    and identical-tuple-repeat (THRASH) detectors in
+    :mod:`flywheel.loop_guard`. A fresh :class:`LoopGuard` is constructed
+    per attempt from this config; each iteration's
+    ``signals.tool_interactions`` is fed into it in arrival order. Each
+    threshold disables independently via ``None`` / ``0``; default values
+    keep the detectors on without tripping the existing harness suite.
     """
 
     max_retries: int = 0
@@ -276,6 +290,7 @@ class HarnessConfig:
     rubric_judge_model: str | None = None
     rubric_judge_max_turns: int = 8
     rubric_judge_invoke: JudgeInvoke | None = None
+    loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1500,7 +1515,15 @@ async def _run_attempt_body(
     :func:`_handle_audit_failure`.
     """
     attempt_number = attempt.number
-    iteration_result, _iterations_run, wall_seconds = await _drive_iterations(
+    # Fresh LoopGuard per attempt: each attempt is a new agent context,
+    # so repeated-failure / thrash counters must not bleed across.
+    loop_guard = LoopGuard(config.loop_guard)
+    (
+        iteration_result,
+        _iterations_run,
+        wall_seconds,
+        loop_guard_verdict,
+    ) = await _drive_iterations(
         task=task,
         lifecycle=lifecycle,
         store=store,
@@ -1510,6 +1533,7 @@ async def _run_attempt_body(
         mclock=mclock,
         attempt_number=attempt_number,
         transcript_graders=transcript_graders,
+        loop_guard=loop_guard,
     )
 
     if iteration_result is None:
@@ -1572,6 +1596,38 @@ async def _run_attempt_body(
             now=clock,
         )
         return
+
+    # LoopGuard verdicts preempt envelope interpretation. A STUCK verdict
+    # routes through the explicit-blocked shape (Outcome.CANCELLED,
+    # Blocked domain event, running -> interrupted) so the retry budget is
+    # preserved and an operator transition to READY clears the
+    # blocked_requires_json snapshot. A THRASH verdict routes through the
+    # cap-reached agent-error shape (Outcome.AGENT_ERROR,
+    # running -> validating -> failed_validation) so the existing retry arm
+    # applies ``is_retry_eligible``.
+    if loop_guard_verdict is not None:
+        if loop_guard_verdict.kind is LoopGuardVerdictKind.STUCK:
+            _handle_loop_guard_stuck(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                attempt_number=attempt_number,
+                verdict=loop_guard_verdict,
+                transcript=iteration_result.transcript,
+                clock=clock,
+            )
+            return
+        if loop_guard_verdict.kind is LoopGuardVerdictKind.THRASH:
+            _handle_loop_guard_thrash(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                attempt_number=attempt_number,
+                verdict=loop_guard_verdict,
+                transcript=iteration_result.transcript,
+                clock=clock,
+            )
+            return
 
     envelope = iteration_result.envelope
 
@@ -1813,6 +1869,143 @@ async def _run_attempt_body(
     )
 
 
+def _loop_guard_requires_payload(
+    verdict: LoopGuardVerdict,
+) -> list[dict[str, Any]]:
+    """Render the STUCK verdict as a structured ``requires_json`` payload.
+
+    The harness records a :class:`Blocked` domain event for the
+    repeated-failure path so the existing recoverable-blocked recovery
+    flow (operator transition to READY clears ``blocked_requires_json``)
+    applies unchanged. The synthesized list shape mirrors the parser
+    input contract (each entry is ``{type, ...fields}``) and names the
+    offending tool plus the input digest so an operator can identify
+    which call kept failing.
+    """
+    return [
+        {
+            "type": "tool_loop_block",
+            "tool_name": verdict.tool_name,
+            "input_digest": verdict.input_digest,
+        }
+    ]
+
+
+def _handle_loop_guard_stuck(
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    attempt_number: int,
+    verdict: LoopGuardVerdict,
+    transcript: str,
+    clock: Callable[[], datetime],
+) -> None:
+    """Route a STUCK verdict through the recoverable-blocked path.
+
+    Mirrors the explicit ``intent=blocked`` flow: finalize the attempt as
+    :attr:`Outcome.CANCELLED`, append a :class:`Blocked` domain event with
+    a synthesized ``requires_json`` describing the failing tool, emit a
+    ``harness.stuck`` audit event, and transition ``running -> interrupted``.
+    The retry budget is **not** consumed — INTERRUPTED is not a
+    retry-source state, so :meth:`Lifecycle.is_retry_eligible` is
+    unchanged and an operator transition to READY clears
+    ``blocked_requires_json``.
+    """
+    reason = verdict.reason
+    requires_payload = _loop_guard_requires_payload(verdict)
+    _finalize_attempt(
+        store=store,
+        lifecycle=lifecycle,
+        attempt=attempt,
+        outcome=Outcome.CANCELLED,
+        error=reason,
+        agent_output=transcript,
+        clock=clock,
+    )
+    _append(
+        lifecycle,
+        Blocked(
+            run_id=lifecycle.run_id,
+            ts=clock(),
+            attempt_number=attempt_number,
+            requires_json=json.dumps(requires_payload),
+        ),
+        store=store,
+    )
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.stuck",
+        payload={
+            "reason": reason,
+            "tool_name": verdict.tool_name,
+            "input_digest": verdict.input_digest,
+            "requires": requires_payload,
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+    _transition(
+        lifecycle,
+        Status.INTERRUPTED,
+        store=store,
+        now=clock,
+    )
+
+
+def _handle_loop_guard_thrash(
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    attempt_number: int,
+    verdict: LoopGuardVerdict,
+    transcript: str,
+    clock: Callable[[], datetime],
+) -> None:
+    """Route a THRASH verdict through the cap-reached agent-error path.
+
+    Mirrors the ``intent=continue`` past-cap flow: emit a
+    ``harness.thrash_detected`` audit event, transition through VALIDATING
+    so the FAILED_VALIDATION edge is legal, finalize the attempt as
+    :attr:`Outcome.AGENT_ERROR`, and transition into FAILED_VALIDATION.
+    The outer retry arm then applies :meth:`Lifecycle.is_retry_eligible`:
+    READY when retries remain (with ``harness.retry_scheduled``), else
+    FAILED.
+    """
+    reason = verdict.reason
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.thrash_detected",
+        payload={
+            "reason": reason,
+            "tool_name": verdict.tool_name,
+            "input_digest": verdict.input_digest,
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+    _transition(lifecycle, Status.VALIDATING, store=store, now=clock)
+    _finalize_attempt(
+        store=store,
+        lifecycle=lifecycle,
+        attempt=attempt,
+        outcome=Outcome.AGENT_ERROR,
+        error=reason,
+        agent_output=transcript,
+        clock=clock,
+    )
+    _transition(
+        lifecycle,
+        Status.FAILED_VALIDATION,
+        store=store,
+        error=reason,
+        now=clock,
+    )
+
+
 async def _drive_iterations(
     *,
     task: Task,
@@ -1824,19 +2017,25 @@ async def _drive_iterations(
     mclock: Callable[[], float],
     attempt_number: int,
     transcript_graders: tuple[TranscriptGrader, ...],
-) -> tuple[IterationResult | None, int, float]:
+    loop_guard: LoopGuard,
+) -> tuple[IterationResult | None, int, float, LoopGuardVerdict | None]:
     """Run iterations until a non-``continue`` envelope, crash, or cap.
 
     Returns the last :class:`IterationResult` produced, the number of
-    iterations that ran, and the wall-seconds elapsed across them. The
-    wall-seconds value is what feeds the
-    :class:`TranscriptObservation` so transcript graders see the same
+    iterations that ran, the wall-seconds elapsed across them, and any
+    :class:`LoopGuardVerdict` that tripped the safety net (FR-1 STUCK /
+    FR-2 THRASH). The verdict is non-``None`` only when ``loop_guard``
+    observed a repeating-tool pattern in the iteration's
+    ``signals.tool_interactions``; the caller then routes the attempt
+    through the matching transition. The wall-seconds value is what feeds
+    the :class:`TranscriptObservation` so transcript graders see the same
     elapsed time regardless of which iteration sets the envelope.
     """
     iteration_result: IterationResult | None = None
     iteration_number = 0
     started_monotonic = mclock()
     wall_seconds = 0.0
+    loop_guard_verdict: LoopGuardVerdict | None = None
 
     prior_rubric_findings = _collect_prior_rubric_findings(
         store, lifecycle.run_id, attempt_number
@@ -1929,6 +2128,20 @@ async def _drive_iterations(
 
         if iteration_result.failure is not None:
             break
+
+        # Feed the iteration's tool tuples to the per-attempt LoopGuard
+        # before deciding whether to continue. A STUCK / THRASH verdict
+        # preempts the cap-reached and even the final-iteration outcomes
+        # so the safety-net transition fires regardless of where the
+        # repeating pattern lands. ``observe`` is pure and never silently
+        # swallows errors -- if it raises we let it propagate to
+        # ``_run_attempt``'s crash path.
+        loop_guard_verdict = loop_guard.observe(
+            iteration_result.signals.tool_interactions
+        )
+        if loop_guard_verdict is not None:
+            break
+
         if (
             isinstance(iteration_result.envelope, ValidEnvelope)
             and iteration_result.envelope.intent == Intent.CONTINUE
@@ -1936,7 +2149,7 @@ async def _drive_iterations(
             continue
         break
 
-    return iteration_result, iteration_number, wall_seconds
+    return iteration_result, iteration_number, wall_seconds, loop_guard_verdict
 
 
 async def _validate(

@@ -61,6 +61,8 @@ from flywheel.harness import (
     _handle_interrupt,
     finalize_stranded_lifecycle,
 )
+from flywheel.invoker import ToolInteraction, ToolResultObservation
+from flywheel.loop_guard import LoopGuardConfig
 from flywheel.loaders import task_digest
 from flywheel.envelope import (
     CLOSING_FENCE,
@@ -2980,3 +2982,555 @@ class TestTaskPersistence:
         assert outcome.lifecycle.task_content_hash == digest
         assert store.load_task("persist-me", digest) == task
         assert store.load_task_for_run("run-persist") == task
+
+
+# --- LoopGuard wiring (FR-1 STUCK / FR-2 THRASH / FR-5 / FR-6 / FR-7) -----
+
+
+def _tool_call(
+    *,
+    tool_use_id: str,
+    tool_name: str = "Bash",
+    tool_input: dict[str, Any] | None = None,
+    is_error: bool | None = False,
+) -> ToolInteraction:
+    """Build one :class:`ToolInteraction` for a loop-guard stream.
+
+    Mirrors what the SDK-backed invoker projects from a paired
+    ``ToolUseBlock`` / ``ToolResultBlock``. ``tool_input`` defaults to a
+    stable command so byte-identical repeats collide on the digest.
+    """
+    if tool_input is None:
+        tool_input = {"command": "ls"}
+    return ToolInteraction(
+        tool_use_id=tool_use_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        result=ToolResultObservation(
+            tool_use_id=tool_use_id,
+            is_error=is_error,
+            content=None,
+        ),
+    )
+
+
+def _signals_with_tools(
+    interactions: tuple[ToolInteraction, ...],
+) -> InvocationSignals:
+    """Default-shaped signals carrying the supplied tool tuples."""
+    return _make_signals(tool_interactions=interactions)
+
+
+class TestLoopGuardStuck:
+    """FR-1: repeated-failure -> interrupted, retry budget preserved."""
+
+    def test_three_consecutive_failing_calls_route_to_interrupted(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-loop-stuck")
+        interactions = (
+            _tool_call(tool_use_id="t1", is_error=True),
+            _tool_call(tool_use_id="t2", is_error=True),
+            _tool_call(tool_use_id="t3", is_error=True),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Lifecycle paused in INTERRUPTED with the retry budget unspent
+        # (INTERRUPTED is not a retry-source state, so an operator must
+        # transition through READY -- mirrors the explicit-blocked path).
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.lifecycle.retries == 0
+        # Attempt finalized as cancelled, mirroring the explicit-blocked
+        # path's outcome.
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.CANCELLED
+        # No grader rows -- validation never ran.
+        assert store.list_grader_results(lifecycle.run_id, 1) == []
+        # Exactly one harness.stuck event naming the tool and the digest.
+        stuck_events = [
+            e for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.stuck"
+        ]
+        assert len(stuck_events) == 1
+        payload = stuck_events[0].payload
+        assert payload["tool_name"] == "Bash"
+        assert isinstance(payload["input_digest"], str)
+        assert len(payload["input_digest"]) == 64  # sha256 hex
+        assert payload["requires"] == [
+            {
+                "type": "tool_loop_block",
+                "tool_name": "Bash",
+                "input_digest": payload["input_digest"],
+            }
+        ]
+        # blocked_requires_json carries the synthesized predicate so
+        # operator recovery semantics apply.
+        assert outcome.lifecycle.blocked_requires_json == json.dumps(
+            payload["requires"]
+        )
+
+    def test_operator_transition_to_ready_clears_blocked_requires_json(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-stuck-recover")
+        interactions = (
+            _tool_call(tool_use_id="t1", is_error=True),
+            _tool_call(tool_use_id="t2", is_error=True),
+            _tool_call(tool_use_id="t3", is_error=True),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.lifecycle.blocked_requires_json is not None
+
+        # Operator-style transition to READY mirrors the recoverable path
+        # used by recheck_blocked_lifecycle: the lifecycle reducer clears
+        # blocked_requires_json on the -> READY edge.
+        now = datetime.now(timezone.utc)
+        reloaded = store.load_lifecycle("run-stuck-recover")
+        assert reloaded is not None
+        reloaded.transition_to(Status.READY, now=now)
+        assert reloaded.blocked_requires_json is None
+
+    def test_stuck_trips_on_final_iteration_and_preempts_cap(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-stuck-on-cap")
+        # Two CONTINUE iterations with the final one carrying the trip.
+        good = _tool_call(tool_use_id="g1", is_error=False)
+        bad_block = (
+            _tool_call(tool_use_id="b1", is_error=True),
+            _tool_call(tool_use_id="b2", is_error=True),
+            _tool_call(tool_use_id="b3", is_error=True),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools((good,)),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(bad_block),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=2,
+            max_iterations_per_attempt=2,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Cap-reached would route to FAILED_VALIDATION; STUCK preempts it.
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.attempts[0].outcome == Outcome.CANCELLED
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.stuck" in kinds
+        # No protocol-failure / continue-past-cap routing.
+        assert "harness.protocol_failure" not in kinds
+
+
+class TestLoopGuardThrash:
+    """FR-2: identical-tuple repetition -> failed_validation + retry arm."""
+
+    def test_thrash_routes_to_ready_when_retries_remain(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-thrash-retry")
+        # Four identical successful calls trip thrash at threshold 4.
+        interactions = tuple(
+            _tool_call(tool_use_id=f"t{i}") for i in range(4)
+        )
+        # After the retry transition to READY the run schedules a fresh
+        # attempt; supply a clean VERIFY result for that one so the run
+        # terminates deterministically.
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                    signals=_make_signals(),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=4,
+                thrash_window=12,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Second attempt's VERIFY result + passing command grader -> DONE.
+        assert outcome.lifecycle.status == Status.DONE
+        # The retry was consumed exactly once.
+        assert outcome.lifecycle.retries == 1
+        # First attempt was the thrash trip.
+        first = outcome.attempts[0]
+        assert first.outcome == Outcome.AGENT_ERROR
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.thrash_detected" in kinds
+        assert "harness.retry_scheduled" in kinds
+        # Exactly one thrash event with the tool name + digest in payload.
+        thrash_events = [
+            e for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.thrash_detected"
+        ]
+        assert len(thrash_events) == 1
+        payload = thrash_events[0].payload
+        assert payload["tool_name"] == "Bash"
+        assert len(payload["input_digest"]) == 64
+
+    def test_thrash_routes_to_failed_when_no_retries_remain(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-thrash-final")
+        interactions = tuple(
+            _tool_call(tool_use_id=f"t{i}") for i in range(4)
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=4,
+                thrash_window=12,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # No retries budget -> terminal FAILED via the standard retry arm.
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.AGENT_ERROR
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.thrash_detected" in kinds
+        assert "harness.retry_scheduled" not in kinds
+
+
+class TestLoopGuardPrecedence:
+    """FR-6: a stream that satisfies both detectors lands STUCK."""
+
+    def test_failing_repeats_satisfy_both_but_route_to_interrupted(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-both")
+        # Four identical failing calls satisfy threshold=3 STUCK and
+        # threshold=4 THRASH simultaneously; STUCK must win.
+        interactions = tuple(
+            _tool_call(tool_use_id=f"t{i}", is_error=True) for i in range(4)
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=4,
+                thrash_window=12,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.attempts[0].outcome == Outcome.CANCELLED
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.stuck" in kinds
+        # THRASH never emits when STUCK wins on the same observation.
+        assert "harness.thrash_detected" not in kinds
+
+
+class TestLoopGuardDisabled:
+    """FR-5: detectors disabled -> normal cap-reached behavior."""
+
+    def test_thrashing_stream_runs_to_cap_when_detectors_disabled(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-loop-off")
+        # Would trip thrash at threshold 4 if enabled; with detectors off
+        # the run continues past the cap and lands in FAILED_VALIDATION.
+        interactions = tuple(
+            _tool_call(tool_use_id=f"t{i}") for i in range(4)
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            max_iterations_per_attempt=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # No safety-net detection means the iteration's CONTINUE intent
+        # past the cap drives the standard agent-error finalize path.
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.AGENT_ERROR
+        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        assert "harness.stuck" not in kinds
+        assert "harness.thrash_detected" not in kinds
+
+
+class TestLoopGuardAuditStream:
+    """FR-7: harness.stuck / harness.thrash_detected round-trip via audit."""
+
+    def test_stuck_event_round_trips_through_audit_stream(self) -> None:
+        from flywheel.audit import stream as audit_stream
+        from flywheel.store_protocols import EventRecord
+
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-stuck")
+        interactions = (
+            _tool_call(tool_use_id="t1", is_error=True),
+            _tool_call(tool_use_id="t2", is_error=True),
+            _tool_call(tool_use_id="t3", is_error=True),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        # Reading via audit.stream returns the same event records ordered
+        # by the per-run monotonic sequence.
+        records = list(audit_stream("run-audit-stuck", store=store))
+        stuck = [
+            r for r in records
+            if isinstance(r, EventRecord) and r.kind == "harness.stuck"
+        ]
+        assert len(stuck) == 1
+        seqs = [r.sequence for r in records if r.sequence is not None]
+        assert seqs == sorted(seqs)
+        assert stuck[0].payload["tool_name"] == "Bash"
+        assert len(stuck[0].payload["input_digest"]) == 64
+
+    def test_thrash_event_round_trips_through_audit_stream(self) -> None:
+        from flywheel.audit import stream as audit_stream
+        from flywheel.store_protocols import EventRecord
+
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-thrash")
+        interactions = tuple(
+            _tool_call(tool_use_id=f"t{i}") for i in range(4)
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(_assistant(),),
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=4,
+                thrash_window=12,
+            ),
+        )
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        records = list(audit_stream("run-audit-thrash", store=store))
+        thrash = [
+            r for r in records
+            if isinstance(r, EventRecord) and r.kind == "harness.thrash_detected"
+        ]
+        assert len(thrash) == 1
+        seqs = [r.sequence for r in records if r.sequence is not None]
+        assert seqs == sorted(seqs)
+        assert thrash[0].payload["tool_name"] == "Bash"
+        assert len(thrash[0].payload["input_digest"]) == 64
+
+
+class TestLoopGuardDefaultConfig:
+    """SHARED-INVARIANT: defaults are tuned so existing fixtures don't trip."""
+
+    def test_default_loop_guard_config_has_detectors_enabled(self) -> None:
+        cfg = HarnessConfig()
+        # The deterministic detectors ship on by default (the cap is the
+        # operator-set threshold). Hang watchdog stays None per FR-5.
+        assert cfg.loop_guard.repeated_tool_failure_threshold == 3
+        assert cfg.loop_guard.thrash_repeat_threshold == 4
+        assert cfg.loop_guard.thrash_window == 12
+        assert cfg.loop_guard.hang_timeout_seconds is None

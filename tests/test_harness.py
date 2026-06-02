@@ -3534,3 +3534,400 @@ class TestLoopGuardDefaultConfig:
         assert cfg.loop_guard.thrash_repeat_threshold == 4
         assert cfg.loop_guard.thrash_window == 12
         assert cfg.loop_guard.hang_timeout_seconds is None
+
+
+# --- Hang watchdog (FR-3 / FR-4 / FR-7) -----------------------------------
+
+
+def _ratelimit_event(uuid_: str) -> RateLimitEvent:
+    """Build a RateLimitEvent for the watchdog-liveness round-trip.
+
+    The watchdog treats every SDK message as liveness (FR-3 + Out of
+    Scope: "RateLimitInfo.ResetsAt-driven ETA suppression"); a steady
+    rate-limit stream must not trip even though no agent progress is
+    happening, because the underlying connection is alive.
+    """
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="allowed_warning",
+            resets_at=1_700_000_000,
+            rate_limit_type="five_hour",
+            utilization=0.5,
+        ),
+        uuid=uuid_,
+        session_id="sess-1",
+    )
+
+
+class TestHangWatchdog:
+    """FR-3: hang watchdog -> internal_error; FR-4: disambiguated from the
+    operator-interrupt path; FR-7: harness.hang_detected round-trips
+    through ``flywheel.audit.stream``.
+
+    Drives the timing comparison via a controllable monotonic clock and
+    the existing ``on_message`` seam rather than real wall-clock sleeps,
+    so the assertions are deterministic. The only real wall-clock cost is
+    the watchdog's own tick floor (``_HANG_WATCHDOG_MIN_TICK_SECONDS``);
+    each test completes in well under a second.
+    """
+
+    def _fake_mclock(self) -> tuple[Callable[[], float], dict[str, float]]:
+        """A controllable monotonic clock.
+
+        Returns a ``(mclock, state)`` pair: ``mclock()`` reads
+        ``state['t']``; the test mutates the dict to drive the watchdog
+        comparison without waiting for wall-clock time.
+        """
+        state: dict[str, float] = {"t": 0.0}
+
+        def mclock() -> float:
+            return state["t"]
+
+        return mclock, state
+
+    def test_stalled_stream_routes_to_internal_error(self) -> None:
+        # FR-3: a message-stream stall past the threshold finalizes the
+        # attempt as INTERNAL_ERROR and emits exactly one
+        # harness.hang_detected event. FR-4: no harness.interrupted event
+        # is emitted -- the watchdog cancel does NOT reach
+        # _handle_interrupt.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-hang-stall")
+        mclock, state = self._fake_mclock()
+        hang_timeout = 0.04  # tick = max(0.01, min(0.01, 0.5)) = 0.01s
+
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+                hang_timeout_seconds=hang_timeout,
+            ),
+        )
+
+        async def main() -> HarnessOutcome:
+            invocation_started = asyncio.Event()
+
+            async def stalling_invoker(
+                request: InvocationRequest,
+            ) -> IterationResult:
+                # Signal that we have entered the invocation, then stall
+                # forever; the watchdog must cancel us.
+                invocation_started.set()
+                await asyncio.Future()
+                raise RuntimeError("unreachable")  # pragma: no cover
+
+            async def advance_clock_when_ready() -> None:
+                # Once the invocation is in flight, advance the fake
+                # clock past the threshold so the next watchdog tick trips.
+                # Real wall-clock has not advanced; the watchdog comparison
+                # is against mclock() only.
+                await invocation_started.wait()
+                state["t"] = 1000.0
+
+            advance = asyncio.create_task(advance_clock_when_ready())
+            try:
+                return await run_task(
+                    task,
+                    lifecycle,
+                    store,
+                    config=config,
+                    invoke=stalling_invoker,
+                    monotonic=mclock,
+                )
+            finally:
+                if not advance.done():
+                    advance.cancel()
+                    try:
+                        await advance
+                    except BaseException:
+                        pass
+
+        outcome = asyncio.run(main())
+
+        # max_retries=0: INTERNAL_ERROR is not retry-eligible, so the
+        # outer retry arm walks the lifecycle to FAILED.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 1
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "hang watchdog" in attempt.error
+
+        events = store.list_events(lifecycle.run_id)
+        hang_events = [
+            e for e in events if e.kind == "harness.hang_detected"
+        ]
+        # FR-3 acceptance: exactly one hang event with the threshold and
+        # iteration captured in the payload.
+        assert len(hang_events) == 1
+        payload = hang_events[0].payload
+        assert payload["iteration"] == 1
+        assert payload["hang_timeout_seconds"] == hang_timeout
+        assert payload["silence_seconds"] >= hang_timeout
+        assert hang_events[0].attempt_number == 1
+
+        # FR-4 acceptance: zero harness.interrupted events; a watchdog
+        # cancel must NOT reach the operator-interrupt path.
+        interrupted = [e for e in events if e.kind == "harness.interrupted"]
+        assert interrupted == []
+
+    def test_heartbeat_under_threshold_runs_to_completion(self) -> None:
+        # FR-3 acceptance: a stream that produces a heartbeat message
+        # whose mclock delta stays under hang_timeout each tick reaches
+        # normal completion; the watchdog never trips.
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-hang-heartbeat")
+        mclock, state = self._fake_mclock()
+        hang_timeout = 0.1
+
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+                hang_timeout_seconds=hang_timeout,
+            ),
+        )
+
+        async def heartbeating_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            msgs: tuple[Message, ...] = (
+                _assistant(text="m1"),
+                _assistant(text="m2"),
+                _assistant(text="m3"),
+                _assistant(text="m4"),
+                _assistant(),
+                _result_msg(),
+            )
+            for msg in msgs:
+                # Real-time yield so the watchdog can tick between
+                # heartbeats. Each heartbeat advances the fake clock by
+                # well under hang_timeout, then calls on_message -- which
+                # the watchdog wrapper uses to reset last_activity to the
+                # new mclock value.
+                await asyncio.sleep(0.005)
+                state["t"] += hang_timeout * 0.5
+                if request.on_message is not None:
+                    request.on_message(msg)
+            return _iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY),
+                messages=msgs,
+            )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                config=config,
+                invoke=heartbeating_invoker,
+                monotonic=mclock,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.hang_detected" for e in events)
+        assert all(e.kind != "harness.interrupted" for e in events)
+
+    def test_steady_rate_limit_stream_never_trips_watchdog(self) -> None:
+        # FR-3 + Out of Scope: a RateLimitEvent is an SDK message and so
+        # counts as liveness. A steady rate-limit stream must not trip
+        # the watchdog even though no agent text is produced.
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-hang-ratelimit")
+        mclock, state = self._fake_mclock()
+        hang_timeout = 0.1
+
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+                hang_timeout_seconds=hang_timeout,
+            ),
+        )
+
+        rate_events = tuple(_ratelimit_event(f"evt-{i}") for i in range(6))
+        terminal = (_assistant(), _result_msg())
+        all_msgs: tuple[Message, ...] = rate_events + terminal
+
+        async def rate_limit_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            for msg in all_msgs:
+                await asyncio.sleep(0.005)
+                state["t"] += hang_timeout * 0.5
+                if request.on_message is not None:
+                    request.on_message(msg)
+            return _iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY),
+                messages=all_msgs,
+                signals=_make_signals(rate_limit_events=rate_events),
+            )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                config=config,
+                invoke=rate_limit_invoker,
+                monotonic=mclock,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        events = store.list_events(lifecycle.run_id)
+        # Rate-limit-driven liveness must be visible: the
+        # iteration_completed payload's rate_limited flag is True (the
+        # observable that "rate-limit counted as a message" holds).
+        completed = [
+            e for e in events if e.kind == "harness.iteration_completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0].payload["rate_limited"] is True
+        # And the watchdog never declared a hang.
+        assert all(e.kind != "harness.hang_detected" for e in events)
+
+    def test_operator_cancel_with_watchdog_disabled_is_unchanged(
+        self,
+    ) -> None:
+        # FR-4 acceptance: an operator cancel with the watchdog disabled
+        # (hang_timeout_seconds is None) must route to the existing
+        # INTERRUPTED behavior with a harness.interrupted event -- and no
+        # harness.hang_detected event because the watchdog never started.
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-cancel-watchdog-off"
+        )
+
+        async def cancelling_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            raise asyncio.CancelledError()
+
+        # Default LoopGuardConfig leaves hang_timeout_seconds None.
+        config = HarnessConfig(max_retries=0)
+        assert config.loop_guard.hang_timeout_seconds is None
+
+        with pytest.raises(asyncio.CancelledError):
+            _run(
+                run_task(
+                    task,
+                    lifecycle,
+                    store,
+                    config=config,
+                    invoke=cancelling_invoker,
+                )
+            )
+
+        # Existing operator-interrupt path holds: lifecycle INTERRUPTED,
+        # exactly one harness.interrupted event, retries preserved.
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.INTERRUPTED
+        assert reloaded.retries == 0
+
+        events = store.list_events(lifecycle.run_id)
+        interrupted = [
+            e for e in events if e.kind == "harness.interrupted"
+        ]
+        assert len(interrupted) == 1
+        # Watchdog never started, so no hang event surfaces.
+        assert all(e.kind != "harness.hang_detected" for e in events)
+
+    def test_hang_detected_round_trips_through_audit_stream(self) -> None:
+        # FR-7 acceptance: harness.hang_detected persists through the
+        # store and reads back via flywheel.audit.stream under the per-run
+        # monotonic sequence.
+        from flywheel.audit import stream as audit_stream
+        from flywheel.store_protocols import EventRecord
+
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-hang")
+        mclock, state = self._fake_mclock()
+        hang_timeout = 0.04
+
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+                hang_timeout_seconds=hang_timeout,
+            ),
+        )
+
+        async def main() -> None:
+            invocation_started = asyncio.Event()
+
+            async def stalling_invoker(
+                request: InvocationRequest,
+            ) -> IterationResult:
+                invocation_started.set()
+                await asyncio.Future()
+                raise RuntimeError("unreachable")  # pragma: no cover
+
+            async def advance_clock_when_ready() -> None:
+                await invocation_started.wait()
+                state["t"] = 1000.0
+
+            advance = asyncio.create_task(advance_clock_when_ready())
+            try:
+                await run_task(
+                    task,
+                    lifecycle,
+                    store,
+                    config=config,
+                    invoke=stalling_invoker,
+                    monotonic=mclock,
+                )
+            finally:
+                if not advance.done():
+                    advance.cancel()
+                    try:
+                        await advance
+                    except BaseException:
+                        pass
+
+        asyncio.run(main())
+
+        records = list(audit_stream("run-audit-hang", store=store))
+        hang = [
+            r
+            for r in records
+            if isinstance(r, EventRecord) and r.kind == "harness.hang_detected"
+        ]
+        assert len(hang) == 1
+        # Audit-stream invariant: records are ordered by the per-run
+        # monotonic sequence.
+        seqs = [r.sequence for r in records if r.sequence is not None]
+        assert seqs == sorted(seqs)
+        assert hang[0].payload["iteration"] == 1
+        assert hang[0].payload["hang_timeout_seconds"] == hang_timeout

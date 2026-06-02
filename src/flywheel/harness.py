@@ -417,6 +417,38 @@ class _AuditWriteError(Exception):
         self.iteration_number = iteration_number
 
 
+class _HangDetected(Exception):
+    """Sentinel raised when the hang watchdog cancels an invocation.
+
+    Carries the context needed for the FR-3 finalization shape
+    (``Outcome.INTERNAL_ERROR`` / ``running -> internal_error``). The
+    ``harness.hang_detected`` audit event is emitted inside
+    :func:`_invoke_with_watchdog` before this is raised; the
+    :func:`_run_attempt` boundary catches this BEFORE
+    :exc:`asyncio.CancelledError` so a watchdog-induced cancellation never
+    reaches the operator-interrupt path (:func:`_handle_interrupt`).
+    See ``.workflow/specs/00015-FEATURE-loop-safety-net.md`` FR-4.
+    """
+
+    def __init__(
+        self,
+        *,
+        attempt_number: int,
+        iteration_number: int,
+        timeout_seconds: float,
+        silence_seconds: float,
+    ) -> None:
+        super().__init__(
+            f"hang watchdog: no SDK message for "
+            f"{silence_seconds:.3f}s (threshold "
+            f"{timeout_seconds:.3f}s)"
+        )
+        self.attempt_number = attempt_number
+        self.iteration_number = iteration_number
+        self.timeout_seconds = timeout_seconds
+        self.silence_seconds = silence_seconds
+
+
 def _emit(
     store: HarnessStore,
     *,
@@ -680,6 +712,47 @@ def _handle_interrupt(
         )
     except Exception:
         pass
+
+
+def _handle_hang_detected(
+    exc: _HangDetected,
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    clock: Callable[[], datetime],
+) -> None:
+    """Finalize an attempt whose invocation the hang watchdog cancelled.
+
+    Mirrors the crash path: closes the open attempt as
+    :attr:`Outcome.INTERNAL_ERROR` and transitions the lifecycle to
+    :attr:`Status.INTERNAL_ERROR` (the infrastructure class, per FR-3 of
+    ``.workflow/specs/00015-FEATURE-loop-safety-net.md``).
+
+    The ``harness.hang_detected`` audit event was emitted inside
+    :func:`_invoke_with_watchdog` before the cancel — this helper does not
+    re-emit it. Idempotent against ``attempt.ended_at is not None`` so a
+    near-simultaneous normal completion that already finalized the attempt
+    cannot be double-written.
+    """
+    error = str(exc)
+    if attempt.ended_at is None:
+        _finalize_attempt(
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.INTERNAL_ERROR,
+            error=error,
+            clock=clock,
+        )
+    if lifecycle.status != Status.INTERNAL_ERROR:
+        _transition(
+            lifecycle,
+            Status.INTERNAL_ERROR,
+            store=store,
+            error=error,
+            now=clock,
+        )
 
 
 def _ensure_attempt_dir(
@@ -1473,6 +1546,21 @@ async def _run_attempt(
             attempt=attempt,
             clock=clock,
         )
+    except _HangDetected as exc:
+        # Hang watchdog tripped: route to the FR-3 internal_error path
+        # (mirrors the crash transition) rather than the operator-interrupt
+        # path. The disambiguation gate is FR-4: only a watchdog-induced
+        # CancelledError surfaces as _HangDetected; an unrelated cancel
+        # leaves the flag clear and falls through to _handle_interrupt
+        # below. The harness.hang_detected audit event was already emitted
+        # inside _invoke_with_watchdog before the cancel.
+        _handle_hang_detected(
+            exc,
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            clock=clock,
+        )
     except (asyncio.CancelledError, KeyboardInterrupt):
         # Operator-driven shutdown surfaced as cancellation. Close the
         # in-flight attempt to INTERRUPTED in-band so the audit stream
@@ -2006,6 +2094,145 @@ def _handle_loop_guard_thrash(
     )
 
 
+# Default tick floor for the hang watchdog (seconds). The tick is
+# ``min(hang_timeout / 4, 0.5)`` clamped to this floor so the watchdog
+# adds no measurable overhead for long thresholds while still resolving
+# subsecond timeouts quickly in tests. When the watchdog is disabled
+# (``hang_timeout_seconds is None`` or ``<= 0``) the early return in
+# :func:`_drive_iterations` skips this code path entirely.
+_HANG_WATCHDOG_MIN_TICK_SECONDS: float = 0.01
+_HANG_WATCHDOG_MAX_TICK_SECONDS: float = 0.5
+
+
+async def _invoke_with_watchdog(
+    *,
+    invoker: InvokeFunc,
+    request: InvocationRequest,
+    hang_timeout: float,
+    mclock: Callable[[], float],
+    store: HarnessStore,
+    run_id: str,
+    attempt_number: int,
+    iteration_number: int,
+    clock: Callable[[], datetime],
+) -> IterationResult:
+    """Race ``invoker(request)`` against a hang watchdog.
+
+    FR-3: when the invocation produces no SDK message for longer than
+    ``hang_timeout`` seconds, the watchdog cancels the invocation task,
+    emits ``harness.hang_detected``, and raises :class:`_HangDetected` so
+    the :func:`_run_attempt` boundary routes the attempt to the FR-3
+    ``internal_error`` path.
+
+    The watchdog reads its heartbeat from ``request.on_message``: the
+    caller (``_drive_iterations``) wraps its persistence observer with a
+    closure that updates a ``last_activity`` slot on every SDK message,
+    so any message — including a :class:`RateLimitEvent` or a
+    :class:`ThinkingBlock`-bearing :class:`AssistantMessage` — counts as
+    liveness. This reuses the seam already wired for per-message
+    persistence so the watchdog adds no second subscription.
+
+    FR-4: only a watchdog-induced cancel raises :class:`_HangDetected`. A
+    cancel that arrives from outside (operator SIGINT/SIGTERM, parent
+    task cancellation) leaves ``hang_tripped`` ``False`` and the
+    :exc:`asyncio.CancelledError` propagates unchanged so the existing
+    operator-interrupt path runs as today.
+
+    Race handling: when the invocation result is already produced as the
+    cancel races in, ``await invocation_task`` returns the result and we
+    honor it; ``hang_tripped`` is consulted only when the await actually
+    raised :exc:`asyncio.CancelledError`. This means a near-simultaneous
+    normal completion finalizes exactly once.
+    """
+    last_activity = mclock()
+    hang_tripped = False
+
+    base_on_message = request.on_message
+
+    def watchdog_on_message(msg: Message) -> None:
+        nonlocal last_activity
+        last_activity = mclock()
+        if base_on_message is not None:
+            base_on_message(msg)
+
+    watched_request = InvocationRequest(
+        prompt=request.prompt,
+        transcript_graders=request.transcript_graders,
+        attempt_number=request.attempt_number,
+        iteration_number=request.iteration_number,
+        on_message=watchdog_on_message,
+    )
+
+    # Wrap the invoker call in a coroutine so asyncio.create_task gets a
+    # Coroutine[Any, Any, IterationResult] (InvokeFunc returns Awaitable
+    # by contract).
+    async def _drive_invocation() -> IterationResult:
+        return await invoker(watched_request)
+
+    invocation_task: asyncio.Task[IterationResult] = asyncio.create_task(
+        _drive_invocation()
+    )
+
+    tick = max(
+        _HANG_WATCHDOG_MIN_TICK_SECONDS,
+        min(hang_timeout / 4.0, _HANG_WATCHDOG_MAX_TICK_SECONDS),
+    )
+
+    async def watchdog() -> None:
+        nonlocal hang_tripped
+        while True:
+            try:
+                await asyncio.sleep(tick)
+            except asyncio.CancelledError:
+                return
+            if invocation_task.done():
+                return
+            if mclock() - last_activity > hang_timeout:
+                hang_tripped = True
+                invocation_task.cancel()
+                return
+
+    watchdog_task = asyncio.create_task(watchdog())
+
+    try:
+        try:
+            return await invocation_task
+        except asyncio.CancelledError:
+            if hang_tripped:
+                silence = mclock() - last_activity
+                _emit(
+                    store,
+                    run_id=run_id,
+                    kind="harness.hang_detected",
+                    payload={
+                        "iteration": iteration_number,
+                        "hang_timeout_seconds": hang_timeout,
+                        "silence_seconds": silence,
+                    },
+                    attempt_number=attempt_number,
+                    now=clock,
+                )
+                raise _HangDetected(
+                    attempt_number=attempt_number,
+                    iteration_number=iteration_number,
+                    timeout_seconds=hang_timeout,
+                    silence_seconds=silence,
+                )
+            raise
+    finally:
+        if not watchdog_task.done():
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except BaseException:
+                # Drain the watchdog. We never need its result and a
+                # cancellation propagating from this finally would mask
+                # the outgoing exception (hang, operator interrupt, or
+                # successful return). Suppressing it preserves the
+                # caller-visible control flow.
+                pass
+
+
 async def _drive_iterations(
     *,
     task: Task,
@@ -2084,7 +2311,29 @@ async def _drive_iterations(
             iteration_number=iteration_number,
             on_message=_on_message,
         )
-        iteration_result = await invoker(request)
+        # Hang watchdog gate (FR-3 / FR-5): when the threshold is unset or
+        # non-positive the watchdog never starts and the call path is
+        # exactly as today -- no asyncio.Task is created and no second
+        # subscription is registered, so the disabled-default adds no
+        # measurable overhead. When set, _invoke_with_watchdog wraps
+        # _on_message so any SDK message resets the timer and a watchdog
+        # cancel routes through _HangDetected to the FR-3 internal_error
+        # path rather than _handle_interrupt (FR-4).
+        hang_timeout = config.loop_guard.hang_timeout_seconds
+        if hang_timeout is None or hang_timeout <= 0:
+            iteration_result = await invoker(request)
+        else:
+            iteration_result = await _invoke_with_watchdog(
+                invoker=invoker,
+                request=request,
+                hang_timeout=hang_timeout,
+                mclock=mclock,
+                store=store,
+                run_id=lifecycle.run_id,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+                clock=clock,
+            )
         wall_seconds = mclock() - started_monotonic
 
         if first_audit_error is not None:

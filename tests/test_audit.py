@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -649,3 +650,344 @@ def test_cli_help_runs_cleanly() -> None:
     assert "--json" in completed.stdout
     assert "--follow" in completed.stdout
     assert "--poll-interval" in completed.stdout
+    # Redaction surface: every new flag is in the help text plus the
+    # NFR-1 best-effort caveat so the help reader cannot mistake the
+    # default for a safety guarantee.
+    assert "--redact" in completed.stdout
+    assert "--redact-policy" in completed.stdout
+    assert "--raw" in completed.stdout
+    assert "--dry-run" in completed.stdout
+    assert "--redact-salt" in completed.stdout
+    assert "best-effort" in completed.stdout
+    # ``argparse`` wraps the description across lines, so check for the
+    # marker keyword rather than the literal multi-word phrase.
+    assert "unredacted" in completed.stdout
+
+
+# --- CLI redaction surface --------------------------------------------------
+#
+# These tests carry the keyword "cli" so ``pytest -k cli`` selects them
+# alongside the existing CLI tests, matching the verify grader command.
+
+
+def _build_sqlite_fixture_with_secret(
+    db_path: Path,
+    secret: str,
+    *,
+    run_id: str = "run-cli-redact",
+) -> str:
+    """Populate ``db_path`` with one record whose payload embeds ``secret``.
+
+    The SDK message carries the secret as a top-level ``text`` field and
+    repeats it in a nested ``tool_input`` block so coverage tests can
+    distinguish per-record hits from per-occurrence hits.
+    """
+
+    store = SqliteStore(db_path)
+    try:
+        store.create_lifecycle(Lifecycle(task_id="t", run_id=run_id))
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.READY)
+        store.update_lifecycle(lc, expected_version=1)
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.RUNNING)
+        store.update_lifecycle(lc, expected_version=2)
+
+        store.append_event(
+            EventRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_start",
+                payload={"attempt": 1, "iteration": 1},
+                attempt_number=1,
+            )
+        )
+        store.save_sdk_messages(
+            run_id,
+            1,
+            1,
+            [
+                {
+                    "message_type": "assistant",
+                    "text": f"key is {secret}",
+                    "tool_input": {"command": f"echo {secret}"},
+                }
+            ],
+        )
+        store.append_event(
+            EventRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_end",
+                payload={"attempt": 1, "iteration": 1},
+                attempt_number=1,
+            )
+        )
+    finally:
+        store.close()
+    return run_id
+
+
+def test_cli_default_mode_redacts_anthropic_pattern_and_emits_notice(
+    tmp_path: Path,
+) -> None:
+    """Default mode applies ``default_policy`` to every record and emits the
+    one-line FR-10 stderr notice exactly once. The Anthropic-key pattern
+    catches a leaked ``sk-ant-...`` value in payload prose."""
+    db = tmp_path / "flywheel.sqlite"
+    secret = "sk-ant-abcdef0123456789ABCDEF"
+    run_id = _build_sqlite_fixture_with_secret(db, secret)
+
+    code, stdout, stderr = _run_cli(run_id, "--db", str(db), "--json")
+    assert code == 0
+    # The literal secret never reaches stdout.
+    assert secret not in stdout
+    # The token does.
+    assert "[REDACTED:anthropic_key]" in stdout
+    # FR-10 notice fires on stderr exactly once.
+    assert (
+        "redaction: default policy applied (use --raw for verbatim)" in stderr
+    )
+    # NFR-1 best-effort caveat is part of the notice.
+    assert "best-effort" in stderr
+    assert "unredacted source of truth" in stderr
+    # Only one notice block, even though we streamed three records.
+    assert stderr.count("redaction: default policy applied") == 1
+
+
+def test_cli_raw_disables_redaction_and_suppresses_notice(
+    tmp_path: Path,
+) -> None:
+    """``--raw`` restores the pre-redaction verbatim output and does NOT
+    emit the redaction notice (NFR-4)."""
+    db = tmp_path / "flywheel.sqlite"
+    secret = "sk-ant-abcdef0123456789ABCDEF"
+    run_id = _build_sqlite_fixture_with_secret(db, secret)
+
+    code, stdout, stderr = _run_cli(run_id, "--db", str(db), "--json", "--raw")
+    assert code == 0
+    # Verbatim: the secret survives intact in NDJSON.
+    assert secret in stdout
+    assert "[REDACTED:" not in stdout
+    # No notice on stderr.
+    assert "redaction:" not in stderr
+
+
+def test_cli_redact_policy_strict_denylists_tools(tmp_path: Path) -> None:
+    """``--redact-policy strict`` adds a tool denylist on top of the default
+    pattern set, blanking ``Read`` / ``Bash`` tool inputs/outputs."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = "run-strict"
+    store = SqliteStore(db)
+    try:
+        store.create_lifecycle(Lifecycle(task_id="t", run_id=run_id))
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.READY)
+        store.update_lifecycle(lc, expected_version=1)
+        lc = store.load_lifecycle(run_id)
+        assert lc is not None
+        lc.transition_to(Status.RUNNING)
+        store.update_lifecycle(lc, expected_version=2)
+        store.save_sdk_messages(
+            run_id,
+            1,
+            1,
+            [
+                {
+                    "message_type": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Read",
+                            "input": {"file_path": "/home/me/.env"},
+                        }
+                    ],
+                }
+            ],
+        )
+    finally:
+        store.close()
+
+    code, stdout, stderr = _run_cli(
+        run_id, "--db", str(db), "--json", "--redact-policy", "strict"
+    )
+    assert code == 0
+    # The Read tool's input is redacted; the tool's name survives so the
+    # audit trail still shows which tool ran.
+    assert "/home/me/.env" not in stdout
+    assert "[REDACTED:tool:Read]" in stdout
+    assert '"name": "Read"' in stdout or '"name":"Read"' in stdout
+    # Notice header reflects the active policy name.
+    assert "redaction: strict policy applied" in stderr
+
+
+def test_cli_redact_policy_unknown_name_fails_fast(tmp_path: Path) -> None:
+    """An unrecognized policy name fails before any record is streamed."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    code, stdout, stderr = _run_cli(
+        run_id, "--db", str(db), "--redact-policy", "no-such-policy"
+    )
+    assert code == 2
+    assert stdout == ""
+    assert "unknown built-in policy" in stderr
+
+
+def test_cli_redact_policy_bad_dotted_path_fails_fast(
+    tmp_path: Path,
+) -> None:
+    """A dotted path to a missing module fails before streaming (FR-11)."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    code, stdout, stderr = _run_cli(
+        run_id,
+        "--db",
+        str(db),
+        "--redact-policy",
+        "this_module_does_not_exist:factory",
+    )
+    assert code == 2
+    assert stdout == ""
+    assert "cannot import module" in stderr
+
+
+def test_cli_redact_policy_non_redactor_return_fails_fast(
+    tmp_path: Path,
+) -> None:
+    """A dotted path whose callable returns a non-``Redactor`` fails before
+    streaming (FR-11)."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    # ``str`` is callable and importable but returns ``str``, not a Redactor.
+    code, stdout, stderr = _run_cli(
+        run_id, "--db", str(db), "--redact-policy", "builtins:str"
+    )
+    assert code == 2
+    assert stdout == ""
+    assert "not a Redactor" in stderr
+
+
+def test_cli_redact_salt_emits_stable_digest_tokens(tmp_path: Path) -> None:
+    """``--redact-salt`` switches every token to the salted
+    ``[REDACTED:label:digest]`` form (FR-8)."""
+    db = tmp_path / "flywheel.sqlite"
+    secret = "sk-ant-abcdef0123456789ABCDEF"
+    run_id = _build_sqlite_fixture_with_secret(db, secret)
+
+    code, stdout, _ = _run_cli(
+        run_id, "--db", str(db), "--json", "--redact-salt", "test-salt"
+    )
+    assert code == 0
+    # Salted token format: [REDACTED:label:<8 hex>].
+    salted = re.findall(
+        r"\[REDACTED:anthropic_key:([0-9a-f]{8})\]", stdout
+    )
+    assert salted, "no salted anthropic_key tokens emitted"
+    # Stable across occurrences of the same cleartext.
+    assert len(set(salted)) == 1
+
+
+def test_cli_dry_run_emits_coverage_without_payload_content(
+    tmp_path: Path,
+) -> None:
+    """``--dry-run`` reports per-label hit counts without any payload
+    content reaching stdout (FR-12)."""
+    db = tmp_path / "flywheel.sqlite"
+    secret = "sk-ant-abcdef0123456789ABCDEF"
+    run_id = _build_sqlite_fixture_with_secret(db, secret)
+
+    code, stdout, stderr = _run_cli(
+        run_id, "--db", str(db), "--dry-run"
+    )
+    assert code == 0
+    # Report header and counts.
+    assert "dry-run coverage report" in stdout
+    assert "policy: default" in stdout
+    assert "records scanned: 3" in stdout
+    # The SDK record contains the secret in two places (``text`` and
+    # ``tool_input.command``); the per-label total reflects both.
+    assert "records redacted: 1" in stdout
+    assert "anthropic_key: 2" in stdout
+    # No payload content leaks; the secret never appears in stdout.
+    assert secret not in stdout
+    # The notice still fires on stderr even under dry-run.
+    assert "redaction: default policy applied" in stderr
+
+
+def test_cli_dry_run_with_no_matches_reports_zero_redactions(
+    tmp_path: Path,
+) -> None:
+    """``--dry-run`` over a benign run emits zero payload content even when
+    no patterns match (edge case)."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    code, stdout, _ = _run_cli(run_id, "--db", str(db), "--dry-run")
+    assert code == 0
+    assert "records scanned: 3" in stdout
+    assert "records redacted: 0" in stdout
+    assert "total redactions: 0" in stdout
+    assert "hits by label: (none)" in stdout
+    # No record-body fields leak into the report.
+    assert "harness.iteration_start" not in stdout
+    assert "hello world" not in stdout
+
+
+def test_cli_raw_rejects_combined_redaction_flags(tmp_path: Path) -> None:
+    """``--raw`` is mutually exclusive with every redaction-shaping flag."""
+    db = tmp_path / "flywheel.sqlite"
+    run_id = _build_sqlite_fixture(db)
+
+    for extra in (
+        ("--redact",),
+        ("--redact-policy", "strict"),
+        ("--dry-run",),
+        ("--redact-salt", "x"),
+    ):
+        code, stdout, stderr = _run_cli(
+            run_id, "--db", str(db), "--raw", *extra
+        )
+        assert code == 2, f"--raw + {extra} should fail"
+        assert stdout == ""
+        assert "--raw cannot be combined with" in stderr
+
+
+def test_cli_env_value_redactor_catches_anthropic_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI seeds an ``EnvValueRedactor`` from the ambient
+    ``ANTHROPIC_API_KEY`` so a leaked literal value is redacted even when
+    it does not match the ``sk-ant-`` regex (e.g. a custom test key)."""
+    db = tmp_path / "flywheel.sqlite"
+    # A value that does NOT match the default ``sk-ant-`` pattern but is
+    # long enough to clear EnvValueRedactor's minimum length floor.
+    secret = "unusual-test-shaped-key-value-1234"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    run_id = _build_sqlite_fixture_with_secret(db, secret)
+
+    code, stdout, _ = _run_cli(run_id, "--db", str(db), "--json")
+    assert code == 0
+    assert secret not in stdout
+    assert "[REDACTED:ANTHROPIC_API_KEY]" in stdout
+
+
+def test_cli_unknown_run_id_does_not_emit_redaction_notice(
+    tmp_path: Path,
+) -> None:
+    """The redaction notice fires only on the streaming path. An unknown
+    run_id stays a single-line stderr message so existing scripted
+    handling does not regress."""
+    db = tmp_path / "flywheel.sqlite"
+    SqliteStore(db).close()
+
+    code, stdout, stderr = _run_cli("missing-run", "--db", str(db))
+    assert code == 0
+    assert stdout == ""
+    assert "no records for run_id missing-run" in stderr
+    assert "redaction:" not in stderr

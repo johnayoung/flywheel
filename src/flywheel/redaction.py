@@ -577,6 +577,36 @@ def default_policy(*, salt: bytes | str | None = None) -> Redactor:
     return PatternRedactor(_DEFAULT_PATTERNS, salt=salt)
 
 
+# Tools whose outputs commonly contain credentials (``.env`` files, AWS
+# credential files, ``~/.ssh`` material, decoded JWTs, etc.). ``Read`` is
+# the direct filesystem-read tool; ``Bash`` is a general shell that is
+# routinely used to ``cat`` credential files. The ``strict`` named policy
+# suppresses these tools' inputs and outputs entirely (FR-6) -- only the
+# tool name is preserved so a reader can still follow the agent's actions.
+_CREDENTIAL_READING_TOOLS: tuple[str, ...] = ("Read", "Bash")
+
+
+def strict_policy(*, salt: bytes | str | None = None) -> Redactor:
+    """Return a :class:`Redactor` equal to :func:`default_policy` plus a
+    :class:`ToolDenylistRedactor` over ``Read`` and ``Bash``.
+
+    Suitable for runs where an agent may have ``cat``-ed or read a
+    credential file: ``ToolDenylistRedactor`` blanks the input and result
+    blocks for those tools while leaving every record's envelope (sequence,
+    type, ids) intact, so the audit trail still shows *which* tool was
+    invoked without leaking *what* it read.
+
+    Like :func:`default_policy`, this is best-effort — secrets emitted by
+    other tools (e.g. an ``Edit`` that echoes a token back) still rely on
+    the pattern set to catch them.
+    """
+
+    return compose(
+        default_policy(salt=salt),
+        ToolDenylistRedactor(_CREDENTIAL_READING_TOOLS, salt=salt),
+    )
+
+
 __all__ = [
     "EnvValueRedactor",
     "FieldPathRedactor",
@@ -585,4 +615,5 @@ __all__ = [
     "ToolDenylistRedactor",
     "compose",
     "default_policy",
+    "strict_policy",
 ]

@@ -41,6 +41,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from flywheel.lifecycle import Status
 from flywheel.notifier import RunNotifier
+from flywheel.redaction import Redactor
 from flywheel.store_protocols import (
     AuditRecord,
     AuditStore,
@@ -226,6 +227,7 @@ def stream(
     store: AuditStore,
     follow: bool = False,
     poll_interval: float = 0.25,
+    redactor: Redactor | None = None,
 ) -> Iterator[AuditRecord]:
     """Yield audit records for ``run_id`` in ascending sequence order.
 
@@ -240,11 +242,19 @@ def stream(
     observing a terminal status the loop performs one more drain so the
     final write committed alongside the terminal transition is never
     dropped.
+
+    When ``redactor`` is supplied, every record passes through
+    ``redactor.redact`` at the single yield seam — *after* the internal
+    cursor/watermark math has read the original ``record.sequence`` — so
+    follow semantics, ordering, and cursor advancement are unchanged.
+    A redactor exception propagates to the caller (the iterator surfaces
+    other errors the same way). ``redactor=None`` (the default) is
+    verbatim and byte-for-byte identical to the pre-redaction behavior.
     """
     cursor = 0
     drained, cursor = _drain(store, run_id, cursor)
     for record in drained:
-        yield record
+        yield record if redactor is None else redactor.redact(record)
     if not follow:
         return
     if not _lifecycle_exists(store, run_id):
@@ -253,9 +263,10 @@ def stream(
         # follow loop would spin forever waiting on a lifecycle that
         # will never exist.
         return
-    yield from _follow(
+    for record in _follow(
         store, run_id, cursor=cursor, poll_interval=poll_interval
-    )
+    ):
+        yield record if redactor is None else redactor.redact(record)
 
 
 class Subscription:
@@ -293,12 +304,14 @@ class Subscription:
         handler: Callable[[AuditRecord], None],
         poll_interval: float = 0.25,
         on_error: Callable[[AuditRecord, BaseException], None] | None = None,
+        redactor: Redactor | None = None,
     ) -> None:
         self._run_id = run_id
         self._store = store
         self._handler = handler
         self._poll_interval = poll_interval
         self._on_error = on_error
+        self._redactor = redactor
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -329,7 +342,12 @@ class Subscription:
 
     def _dispatch(self, record: AuditRecord) -> None:
         try:
-            self._handler(record)
+            visible = (
+                record
+                if self._redactor is None
+                else self._redactor.redact(record)
+            )
+            self._handler(visible)
         except Exception as exc:  # noqa: BLE001 - isolation is the point
             if self._on_error is not None:
                 try:
@@ -375,6 +393,7 @@ def subscribe(
     store: AuditStore,
     poll_interval: float = 0.25,
     on_error: Callable[[AuditRecord, BaseException], None] | None = None,
+    redactor: Redactor | None = None,
 ) -> Subscription:
     """Subscribe ``handler`` to ``run_id``'s audit stream.
 
@@ -384,6 +403,12 @@ def subscribe(
     ``sequence`` order, and is isolated: a raising handler is reported and
     the stream continues. Returns a :class:`Subscription` whose
     ``unsubscribe()`` stops and joins the thread.
+
+    When ``redactor`` is supplied, every record passes through
+    ``redactor.redact`` before the handler sees it, applied inside the
+    same per-record isolation that wraps the handler — a raising redactor
+    is reported (via ``on_error`` or the module logger) and the stream
+    continues. ``redactor=None`` is verbatim.
 
     Plugins register here without touching the harness and cannot corrupt
     lifecycle state — they only read committed records.
@@ -403,6 +428,7 @@ def subscribe(
         handler=callback,
         poll_interval=poll_interval,
         on_error=on_error,
+        redactor=redactor,
     )
 
 
@@ -422,6 +448,7 @@ class AuditLoggerHandle(Subscription):
         store: AuditStore,
         logger: logging.Logger,
         poll_interval: float,
+        redactor: Redactor | None = None,
     ) -> None:
         self._logger = logger
         super().__init__(
@@ -429,6 +456,7 @@ class AuditLoggerHandle(Subscription):
             store=store,
             handler=self._emit,
             poll_interval=poll_interval,
+            redactor=redactor,
         )
 
     def _emit(self, record: AuditRecord) -> None:
@@ -453,6 +481,7 @@ def attach_logger(
     run_id: str,
     store: AuditStore,
     poll_interval: float = 0.25,
+    redactor: Redactor | None = None,
 ) -> AuditLoggerHandle:
     """Emit every audit record for ``run_id`` through ``logger``.
 
@@ -462,6 +491,11 @@ def attach_logger(
     human-readable label of the form ``audit run=<id> seq=<n> kind=<k>``;
     structured fields live in the ``extra`` dict so handlers can route
     them to JSON sinks.
+
+    When ``redactor`` is supplied, every record passes through
+    ``redactor.redact`` before it is emitted to ``logger``; redactor
+    exceptions are isolated per-record exactly like a raising handler
+    (reported and the stream continues). ``redactor=None`` is verbatim.
 
     The returned handle's ``detach()`` stops emission and joins the
     thread. There are no global side effects: calling ``attach_logger``
@@ -473,6 +507,7 @@ def attach_logger(
         store=store,
         logger=logger,
         poll_interval=poll_interval,
+        redactor=redactor,
     )
 
 

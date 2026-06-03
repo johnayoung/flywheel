@@ -43,7 +43,7 @@ Each entry in `graders` is a typed object. The `type` field selects which other 
 
 In Python, `Grader` is a discriminated union of `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at construction, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON shape is unchanged: loaders dispatch on `type` to build the right variant.
 
-The harness runs graders cost-cheapest-first: `command` → `transcript` → `rubric` → `manual`. Within a type, list order is respected. A failure inside one type aborts the rest of that type and skips later (more expensive) types.
+The harness runs graders cost-cheapest-first: `command` → `transcript` → `rubric` → `manual`. Within a type, list order is respected. A failure inside one type aborts the rest of that type and skips later (more expensive) types. `manual` graders are executed as a human-approval gate: when the automated types all pass, the harness finalizes the attempt `succeeded` and parks the lifecycle at `awaiting_approval` (one gate at a time, in `task.graders` order) instead of promoting to `done`. See [task-lifecycle.md](task-lifecycle.md) for the state and [loop.md](loop.md) for the `approve`/`reject` resolution model.
 
 ### `command` — deterministic shell check
 
@@ -91,7 +91,7 @@ Natural-language assertions evaluated by a separate LLM call against the goal, d
 
 ### `manual` — human approval
 
-Pauses the loop and surfaces an instruction for an operator. Pass = operator approves.
+Declared human-approval gate. When the automated grader types all pass, the harness finalizes the attempt `succeeded` and parks the lifecycle at `awaiting_approval` on the first manual gate; an operator resolves each gate out-of-band via `flywheel approve RUN_ID` / `flywheel reject RUN_ID [--feedback TEXT]`. Approve advances to the next gate (or `done` if none remain); reject writes a `passed=false` receipt with the operator's feedback, routes the lifecycle to `failed_validation`, and the feedback flows into the next attempt's `# Reviewer feedback` prompt section. Pass = operator approves.
 
 | Field         | Required | Description                                |
 | ------------- | -------- | ------------------------------------------ |

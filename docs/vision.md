@@ -143,7 +143,7 @@ For MVP, a rubric failure auto-retries by default (`retry_on_fail=True` on each 
 
 For checks where automated verification is insufficient, the loop pauses and surfaces a summary, relevant artifacts, and change context for human approval. This is the escape hatch for work that is risky, ambiguous, or too dependent on product and architectural judgment to verify safely in a fully automated way.
 
-For MVP, a manual rejection does not auto-retry. The task remains paused until an operator decides whether to retry, revise, or terminate.
+The harness executes manual gates as a first-class lifecycle state. When the automated graders all pass, the attempt is finalized `succeeded` and the lifecycle parks at `awaiting_approval` instead of reaching `done`. An operator resolves each gate via `flywheel approve` or `flywheel reject [--feedback TEXT]`; approve advances to the next gate or `done`, while reject writes a `passed=false` receipt and routes through `failed_validation` to a retry that carries the operator's feedback into the next attempt's prompt (or to `failed` once the retry budget is exhausted).
 
 ### Execution order
 
@@ -154,7 +154,7 @@ Within an attempt, graders run in cost order:
 3. `rubric`
 4. `manual`
 
-Within a type, list order is respected. The first failure inside a type skips the remainder of that type and all later types. A failed grader records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, `command`, `transcript`, and `rubric` failures retry automatically (rubric carries the auto-retry default per-grader via `retry_on_fail=True`; flipping it to `false` opts a specific rubric back into the original pause-for-review behavior). `manual` failures still pause for operator intervention.
+Within a type, list order is respected. The first failure inside a type skips the remainder of that type and all later types. A failed grader records a `validation_failed` outcome; what happens next is a separate policy decision. For MVP, `command`, `transcript`, and `rubric` failures retry automatically (rubric carries the auto-retry default per-grader via `retry_on_fail=True`; flipping it to `false` opts a specific rubric back into the original pause-for-review behavior). `manual` gates park the lifecycle at `awaiting_approval` and wait for an operator's `approve` or `reject`; a reject then follows the same retry-with-feedback arm as a failing rubric.
 
 Future versions may add richer validation-failure categories, smarter retry policy, stuck detection, and structured repair hints. For MVP, the policy stays intentionally narrow.
 

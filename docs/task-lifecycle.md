@@ -4,22 +4,26 @@ The lifecycle tracks a task's execution state from creation to terminal outcome.
 
 ## States
 
-| Status              | Meaning                                             |
-| ------------------- | --------------------------------------------------- |
-| `pending`           | Task exists but prerequisites not met               |
-| `ready`             | All prerequisites satisfied, eligible for execution |
-| `running`           | Agent is actively working                           |
-| `validating`        | Agent finished, validation checks running           |
-| `failed_validation` | Validation failed (retryable)                       |
-| `internal_error`    | Agent invocation crashed (retryable)                |
-| `done`              | Terminal: work completed successfully               |
-| `failed`            | Terminal: unrecoverable failure                     |
-| `interrupted`       | Execution halted externally (resumable)             |
+| Status               | Meaning                                             |
+| -------------------- | --------------------------------------------------- |
+| `pending`            | Task exists but prerequisites not met               |
+| `ready`              | All prerequisites satisfied, eligible for execution |
+| `running`            | Agent is actively working                           |
+| `validating`         | Agent finished, validation checks running           |
+| `awaiting_approval`  | Parked at a manual-approval gate (resumable)        |
+| `failed_validation`  | Validation failed (retryable)                       |
+| `internal_error`     | Agent invocation crashed (retryable)                |
+| `done`               | Terminal: work completed successfully               |
+| `failed`             | Terminal: unrecoverable failure                     |
+| `interrupted`        | Execution halted externally (resumable)             |
 
 ## State machine
 
 ```
 pending -> ready -> running -> validating -> done
+                      |           |
+                      |           +-> awaiting_approval -> done (approve)
+                      |           |                    -> failed_validation (reject) -> ready (retry) or failed
                       |           |
                       |      failed_validation -> ready (retry) or failed
                       |           |
@@ -37,6 +41,8 @@ Key rules:
 - `done` and `failed` are terminal — no transitions out
 - `failed_validation` and `internal_error` can transition back to `ready` (consuming retry budget)
 - `interrupted` always resumes via `ready` and does **not** consume retry budget
+- `awaiting_approval` (`Status.AWAITING_APPROVAL`) parks the lifecycle at a manual-approval gate; entering it does **not** consume retry budget, and the awaiting attempt is finalized `succeeded` at gate entry (the human wait is not part of attempt duration). Resolution is out-of-band via `approve` / `reject` control commands. The `awaiting_manual_ordinal` column records which gate is pending and is cleared centrally inside `Lifecycle.transition_to` on every `-> ready`, `-> done`, and `-> failed_validation` edge — the same set of edges that clear `blocked_requires_json`. The SIGKILL/OOM/reboot backstop (`finalize_stranded_lifecycle`) treats `AWAITING_APPROVAL` as a legitimate park and does not finalize it.
+- **`Outcome.SUCCEEDED` ⟹ all automated graders passed, not that the lifecycle reaches `done`.** A lifecycle reaches `done` iff its attempt is `succeeded` *and* every manual gate is approved. A `succeeded` attempt may therefore precede a retry when an operator rejects a gate: the rejection is recorded as a `passed=false` manual `GraderResultRecord` and a `validating -> awaiting_approval -> failed_validation` transition, while the attempt's outcome continues to reflect that the agent passed automated verification.
 - Transitioning to `failed`, `failed_validation`, or `internal_error` requires the `Error` field to be set
 - Operator interruption routes through `interrupted` so the retry budget is preserved; the attempt's `Outcome` is `internal_error`. Worker-process SIGINT/SIGTERM emits `harness.interrupted` (classification `worker_interrupted`) from the in-band finalizer at the harness attempt boundary; command-grader SIGINT/SIGTERM emits `harness.crash` (classification `grader_signaled`); the SIGKILL/OOM/reboot backstop `finalize_stranded_lifecycle` still emits `harness.crash` (classification `worker_interrupted`) on the next orchestrate startup
 - `interrupted -> ready` can be driven by three callers: `run_task` entry-time normalization (SIGINT-pause resume), explicit operator promotion, and `flywheel.harness.recheck_blocked_lifecycle` (envelope-blocked recovery once every persisted `requires` predicate is satisfied). Every `-> ready` edge clears `blocked_requires_json` centrally inside `Lifecycle.transition_to`.

@@ -62,7 +62,9 @@ from flywheel.harness import (
     InvocationRequest,
     InvokeFunc,
     RecheckOutcome,
+    ResolveApprovalOutcome,
     recheck_blocked_lifecycle,
+    resolve_manual_approval,
     run_task,
 )
 from flywheel.invoker import (
@@ -240,6 +242,7 @@ __all__ = [
     "Outcome",
     "PostgresStore",
     "RecheckOutcome",
+    "ResolveApprovalOutcome",
     "RetryScheduled",
     "RubricGrader",
     "RunNotifier",
@@ -290,6 +293,7 @@ __all__ = [
     "parse_envelope",
     "recheck_blocked_lifecycle",
     "replay",
+    "resolve_manual_approval",
     "run_command_graders",
     "run_task",
     "run_transcript_graders",

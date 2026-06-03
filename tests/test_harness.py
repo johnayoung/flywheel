@@ -3213,6 +3213,593 @@ class TestManualGateEntry:
         assert events == []
 
 
+class TestResolveManualApproval:
+    """``resolve_manual_approval`` claims the oldest pending approve /
+    reject command on an ``AWAITING_APPROVAL`` lifecycle and drives the
+    follow-on transition (re-park / DONE / FAILED_VALIDATION + retry arm)
+    per spec 00016 FR-5 and FR-6.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _worktree(self, tmp_path: Path) -> None:
+        self._wt = str(tmp_path)
+
+    def _park_single_gate(
+        self,
+        *,
+        run_id: str = "run-resolver",
+        gate_name: str = "confirm-migration",
+        gate_instruction: str = "Confirm the migration is safe.",
+    ) -> tuple[InMemoryStore, Task, Lifecycle]:
+        """Drive a one-iteration task with command + rubric + one manual
+        gate to its parked ``AWAITING_APPROVAL`` state.
+
+        Centralizes the harness fixture so every resolver test starts
+        from the same FR-4 entry shape: the attempt is finalized
+        ``SUCCEEDED``, ``awaiting_manual_ordinal`` is set, and exactly one
+        ``harness.awaiting_approval`` event has been emitted.
+        """
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+                ManualGrader(
+                    instruction=gate_instruction,
+                    name=gate_name,
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id=run_id)
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+        assert outcome.lifecycle.status == Status.AWAITING_APPROVAL
+        return store, task, outcome.lifecycle
+
+    def _park_two_gates(
+        self,
+        *,
+        run_id: str = "run-resolver-multi",
+        first_name: str = "review-migration",
+        second_name: str = "review-rollout",
+    ) -> tuple[InMemoryStore, Task, Lifecycle]:
+        """Drive a one-iteration task with two manual gates to its
+        first-gate ``AWAITING_APPROVAL`` park."""
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+                ManualGrader(
+                    instruction="Confirm the migration is safe.",
+                    name=first_name,
+                ),
+                ManualGrader(
+                    instruction="Confirm the rollout cadence.",
+                    name=second_name,
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id=run_id)
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+        assert outcome.lifecycle.status == Status.AWAITING_APPROVAL
+        assert outcome.lifecycle.awaiting_manual_ordinal == 2
+        return store, task, outcome.lifecycle
+
+    # --- FR-5: approve ---------------------------------------------------
+
+    def test_approve_single_gate_reaches_done_with_passed_receipt(
+        self,
+    ) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_APPROVE
+
+        store, task, lifecycle = self._park_single_gate()
+        # Snapshot the attempt outcome the gate-entry path finalized so
+        # the resolver's no-second-finalize claim can be asserted.
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+        assert attempt.outcome == Outcome.SUCCEEDED
+
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(lifecycle, store, task)
+
+        # The resolver applied the approve and promoted to DONE.
+        assert result.applied is True
+        assert result.reason == "approved_done"
+        assert result.command_id is not None
+
+        # Lifecycle is DONE with the awaiting-ordinal cleared on the
+        # -> DONE edge (centralized clear in Lifecycle.transition_to).
+        assert lifecycle.status == Status.DONE
+        assert lifecycle.awaiting_manual_ordinal is None
+
+        # Exactly one passed=True manual receipt was appended for the
+        # gate; the rubric and command receipts from the validation
+        # seat are unchanged. Manual rows are append-only — one per
+        # approve.
+        rows = store.list_grader_results(lifecycle.run_id, attempt.number)
+        manual_rows = [r for r in rows if r.grader_type == "manual"]
+        assert len(manual_rows) == 1
+        manual_row = manual_rows[0]
+        assert manual_row.passed is True
+        assert manual_row.grader_name == "confirm-migration"
+        assert manual_row.ordinal == 2
+        assert manual_row.attempt_number == attempt.number
+
+        # Attempt was NOT re-finalized: outcome and ended_at survive
+        # unchanged from gate entry (no second AttemptFinalized event,
+        # no second harness.attempt_finalized).
+        reloaded = store.list_attempts(lifecycle.run_id)
+        assert len(reloaded) == 1
+        assert reloaded[0].outcome == Outcome.SUCCEEDED
+        assert reloaded[0].ended_at == attempt.ended_at
+
+        events = store.list_events(lifecycle.run_id)
+        finalized_events = [
+            e for e in events if e.kind == "harness.attempt_finalized"
+        ]
+        assert len(finalized_events) == 1
+
+        # Audit event shape carries the documented {grader_name,
+        # awaiting_ordinal} keys plus the harness.control_command_applied
+        # row attributing the operator decision.
+        approved = [e for e in events if e.kind == "harness.manual_approved"]
+        assert len(approved) == 1
+        assert approved[0].payload == {
+            "grader_name": "confirm-migration",
+            "awaiting_ordinal": 2,
+        }
+        applied = [
+            e for e in events if e.kind == "harness.control_command_applied"
+        ]
+        assert len(applied) == 1
+        assert applied[0].payload["kind"] == "approve"
+        assert applied[0].payload["command_id"] == result.command_id
+
+    def test_approve_multi_gate_reparks_then_final_approve_reaches_done(
+        self,
+    ) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_APPROVE
+
+        store, task, lifecycle = self._park_two_gates()
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+
+        # First approve: applies to gate A (ordinal 2), re-parks on B
+        # (ordinal 3), stays AWAITING_APPROVAL.
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        first = resolve_manual_approval(lifecycle, store, task)
+        assert first.applied is True
+        assert first.reason == "approved_next_gate"
+        assert lifecycle.status == Status.AWAITING_APPROVAL
+        assert lifecycle.awaiting_manual_ordinal == 3
+
+        # Exactly one manual receipt so far, for gate A.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 1
+        assert manual_rows[0].passed is True
+        assert manual_rows[0].grader_name == "review-migration"
+        assert manual_rows[0].ordinal == 2
+
+        # A fresh harness.awaiting_approval event was emitted for B so
+        # operators learn the next decision is owed.
+        awaiting_events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert len(awaiting_events) == 2  # initial + re-park
+        assert awaiting_events[-1].payload["awaiting_ordinal"] == 3
+        assert awaiting_events[-1].payload["grader_name"] == "review-rollout"
+
+        # Second approve: applies to gate B, no further gate -> DONE.
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        second = resolve_manual_approval(lifecycle, store, task)
+        assert second.applied is True
+        assert second.reason == "approved_done"
+        assert lifecycle.status == Status.DONE
+        assert lifecycle.awaiting_manual_ordinal is None
+
+        # Two manual receipts total — one per approve, append-only.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 2
+        assert all(r.passed for r in manual_rows)
+        assert [r.ordinal for r in manual_rows] == [2, 3]
+        assert [r.grader_name for r in manual_rows] == [
+            "review-migration",
+            "review-rollout",
+        ]
+
+        # Attempt still SUCCEEDED — finalized once at gate entry, never
+        # re-finalized.
+        attempts = store.list_attempts(lifecycle.run_id)
+        assert len(attempts) == 1
+        assert attempts[0].outcome == Outcome.SUCCEEDED
+
+    def test_resolver_noop_when_no_pending_command_keeps_park(self) -> None:
+        from flywheel import resolve_manual_approval
+
+        store, task, lifecycle = self._park_single_gate(
+            run_id="run-resolver-idle"
+        )
+        before = lifecycle.version
+
+        result = resolve_manual_approval(lifecycle, store, task)
+
+        assert result.applied is False
+        assert result.reason == "no_pending_command"
+        assert result.command_id is None
+        assert lifecycle.status == Status.AWAITING_APPROVAL
+        assert lifecycle.awaiting_manual_ordinal == 2
+        assert lifecycle.version == before
+
+        # No manual receipt, no new events emitted for the no-op tick.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(
+                lifecycle.run_id, lifecycle.attempts[-1].number
+            )
+            if r.grader_type == "manual"
+        ]
+        assert manual_rows == []
+        approved = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.manual_approved"
+        ]
+        assert approved == []
+
+    def test_resolver_noop_when_lifecycle_not_awaiting(self) -> None:
+        from flywheel import resolve_manual_approval
+
+        # Drive an automated-pass-no-manual lifecycle straight to DONE
+        # so the resolver sees a non-AWAITING_APPROVAL status.
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[_ok_command(), RubricGrader(assertions=["a"], name="r")],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-resolver-done")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(worktree=self._wt, rubric_judge_invoke=judge)
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+        assert outcome.lifecycle.status == Status.DONE
+
+        result = resolve_manual_approval(outcome.lifecycle, store, task)
+        assert result.applied is False
+        assert result.reason == "not_awaiting"
+
+    # --- FR-6: reject ----------------------------------------------------
+
+    def test_reject_with_retries_remaining_transitions_to_ready(self) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store, task, lifecycle = self._park_single_gate(
+            run_id="run-reject-retry"
+        )
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+        assert attempt.outcome == Outcome.SUCCEEDED
+        retries_before = lifecycle.retries
+
+        feedback = (
+            "The migration drops a column still read by the billing service."
+        )
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": feedback},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(
+            lifecycle, store, task, max_retries=1
+        )
+
+        # The reject lands FAILED_VALIDATION -> READY (the retry arm
+        # consumes one retry on the second edge, matching
+        # Lifecycle.apply_transition's retry-counter logic).
+        assert result.applied is True
+        assert result.reason == "rejected_retry"
+        assert lifecycle.status == Status.READY
+        assert lifecycle.retries == retries_before + 1
+        # The READY edge centralizes the awaiting-ordinal clear.
+        assert lifecycle.awaiting_manual_ordinal is None
+        # READY clears the FAILED_VALIDATION error inherited on the
+        # earlier edge (per the retry-counter clear in
+        # Lifecycle.apply_transition).
+        assert lifecycle.error == ""
+
+        # The rejected attempt's outcome stays SUCCEEDED — the agent
+        # passed every automated grader; the human rejection is
+        # captured by the manual receipt + the transition, NOT by
+        # mutating the attempt outcome.
+        attempts = store.list_attempts(lifecycle.run_id)
+        assert len(attempts) == 1
+        assert attempts[0].outcome == Outcome.SUCCEEDED
+        assert attempts[0].ended_at == attempt.ended_at
+
+        # The manual receipt carries the operator feedback verbatim
+        # as its summary, keyed to the SUCCEEDED attempt.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 1
+        assert manual_rows[0].passed is False
+        assert manual_rows[0].payload["summary"] == feedback
+        assert manual_rows[0].grader_name == "confirm-migration"
+
+        # harness.manual_rejected carries the documented payload shape;
+        # harness.retry_scheduled witnesses the budget consumption;
+        # harness.control_command_applied attributes the operator action.
+        events = store.list_events(lifecycle.run_id)
+        rejected = [e for e in events if e.kind == "harness.manual_rejected"]
+        assert len(rejected) == 1
+        assert rejected[0].payload == {
+            "grader_name": "confirm-migration",
+            "awaiting_ordinal": 2,
+            "feedback": feedback,
+        }
+        retry_events = [
+            e for e in events if e.kind == "harness.retry_scheduled"
+        ]
+        assert len(retry_events) == 1
+        applied_events = [
+            e for e in events if e.kind == "harness.control_command_applied"
+        ]
+        assert len(applied_events) == 1
+        assert applied_events[0].payload["kind"] == "reject"
+
+    def test_reject_with_retries_exhausted_reaches_failed(self) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store, task, lifecycle = self._park_single_gate(
+            run_id="run-reject-fail"
+        )
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": "not good enough"},
+            now=datetime.now(timezone.utc),
+        )
+
+        # max_retries=0 -> retries exhausted on the first reject.
+        result = resolve_manual_approval(
+            lifecycle, store, task, max_retries=0
+        )
+
+        assert result.applied is True
+        assert result.reason == "rejected_failed"
+        assert lifecycle.status == Status.FAILED
+        # The terminal error preserves the rejection reason so consumers
+        # can audit why the lifecycle failed without joining the
+        # grader_results table.
+        assert (
+            lifecycle.error
+            == "manual grader 'confirm-migration' rejected by operator"
+        )
+
+        # No retry_scheduled audit event when retries are exhausted.
+        events = store.list_events(lifecycle.run_id)
+        retry_events = [
+            e for e in events if e.kind == "harness.retry_scheduled"
+        ]
+        assert retry_events == []
+
+        # Attempt still SUCCEEDED — never re-finalized on a reject.
+        attempts = store.list_attempts(lifecycle.run_id)
+        assert len(attempts) == 1
+        assert attempts[0].outcome == Outcome.SUCCEEDED
+
+        # Manual receipt carries the feedback text and keys to the
+        # SUCCEEDED attempt.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 1
+        assert manual_rows[0].passed is False
+        assert manual_rows[0].payload["summary"] == "not good enough"
+
+    def test_reject_on_first_gate_skips_subsequent_gates(self) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store, task, lifecycle = self._park_two_gates(
+            run_id="run-reject-short-circuit"
+        )
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+        assert lifecycle.awaiting_manual_ordinal == 2
+
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": "halt"},
+            now=datetime.now(timezone.utc),
+        )
+
+        # Retries exhausted so the resolver terminates on the first
+        # reject; the second gate (ordinal 3) is never evaluated.
+        result = resolve_manual_approval(
+            lifecycle, store, task, max_retries=0
+        )
+
+        assert result.applied is True
+        assert result.reason == "rejected_failed"
+        assert lifecycle.status == Status.FAILED
+
+        # Only one manual receipt landed — for gate A. Gate B's
+        # ordinal (3) never produced a receipt because the reject
+        # short-circuited the chain.
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 1
+        assert manual_rows[0].ordinal == 2
+        assert manual_rows[0].grader_name == "review-migration"
+        assert manual_rows[0].passed is False
+
+        # The rejection error names the first gate (the parked one), not
+        # the unevaluated second.
+        assert (
+            lifecycle.error
+            == "manual grader 'review-migration' rejected by operator"
+        )
+
+    def test_reject_with_absent_feedback_records_placeholder(self) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store, task, lifecycle = self._park_single_gate(
+            run_id="run-reject-no-feedback"
+        )
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+
+        # No feedback key in the payload (the CLI producer permits
+        # this when the operator omits --feedback).
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(
+            lifecycle, store, task, max_retries=0
+        )
+        assert result.applied is True
+        assert result.reason == "rejected_failed"
+
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert len(manual_rows) == 1
+        # The documented placeholder substitutes for absent / empty
+        # feedback so the reviewer-feedback prompt section still has a
+        # rendering hook.
+        assert manual_rows[0].payload["summary"] == "(no feedback provided)"
+        rejected = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.manual_rejected"
+        ]
+        assert len(rejected) == 1
+        assert rejected[0].payload["feedback"] == "(no feedback provided)"
+
+    def test_reject_with_empty_feedback_records_placeholder(self) -> None:
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store, task, lifecycle = self._park_single_gate(
+            run_id="run-reject-empty-feedback"
+        )
+        attempt = store.list_attempts(lifecycle.run_id)[-1]
+
+        # Empty string feedback should be treated as no feedback, per
+        # the spec error-handling table's empty-summary handling.
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": ""},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(
+            lifecycle, store, task, max_retries=0
+        )
+        assert result.applied is True
+
+        manual_rows = [
+            r
+            for r in store.list_grader_results(lifecycle.run_id, attempt.number)
+            if r.grader_type == "manual"
+        ]
+        assert manual_rows[0].payload["summary"] == "(no feedback provided)"
+
+
 class TestHarnessConfigDefaults:
     def test_default_rubric_config_fields(self) -> None:
         cfg = HarnessConfig()

@@ -80,6 +80,10 @@ from flywheel.envelope import (
     ValidEnvelope,
 )
 from flywheel.grader_command import run_command_graders
+from flywheel.invoker_client import (
+    CONTROL_COMMAND_APPROVE,
+    CONTROL_COMMAND_REJECT,
+)
 from flywheel.grader_rubric import (
     JudgeInvoke,
     RubricJudgeError,
@@ -115,12 +119,17 @@ from flywheel.loop_guard import (
 )
 from flywheel.prompt import IterationInputs, RubricFindings, build_iteration_prompt
 from flywheel.store_protocols import (
+    ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
     LifecycleAlreadyExistsError,
     SdkMessageRecord,
 )
-from flywheel.grader_manual import ManualGate, next_pending_manual_gate
+from flywheel.grader_manual import (
+    ManualGate,
+    build_manual_result,
+    next_pending_manual_gate,
+)
 from flywheel.loaders import task_digest
 from flywheel.task import (
     CommandGrader,
@@ -206,6 +215,13 @@ class HarnessStore(Protocol):
         run_id: str,
         attempt_number: int,
     ) -> list[GraderResultRecord]: ...
+
+    def claim_commands(
+        self,
+        run_id: str,
+        *,
+        now: datetime,
+    ) -> list[ControlCommandRecord]: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -3184,6 +3200,342 @@ def recheck_blocked_lifecycle(
     )
 
 
+@dataclass(frozen=True, kw_only=True)
+class ResolveApprovalOutcome:
+    """Return value of :func:`resolve_manual_approval`.
+
+    ``applied`` is ``True`` only when an ``approve`` / ``reject`` command
+    was claimed for the parked gate and an effect landed on the
+    lifecycle. ``reason`` is a short stable token for programmatic
+    consumers:
+
+    * ``"not_awaiting"`` -- lifecycle missing, not in
+      :attr:`Status.AWAITING_APPROVAL`, or missing an
+      ``awaiting_manual_ordinal``.
+    * ``"missing_gate"`` -- defensive: the persisted ordinal does not
+      resolve to a :class:`ManualGrader` on ``task.graders`` (task drift
+      between the parked run and the resolver call).
+    * ``"no_attempt"`` -- defensive: an ``AWAITING_APPROVAL`` lifecycle
+      with no finalized attempt; the resolver cannot key a manual
+      receipt without one.
+    * ``"no_pending_command"`` -- the claim batch carried no
+      ``approve`` / ``reject`` row; the lifecycle stays parked.
+    * ``"approved_done"`` -- approve landed on the last gate;
+      lifecycle reached :attr:`Status.DONE`.
+    * ``"approved_next_gate"`` -- approve landed on a non-final gate;
+      lifecycle re-parked on the next gate's ordinal.
+    * ``"rejected_retry"`` -- reject landed with retries remaining;
+      lifecycle transitioned ``AWAITING_APPROVAL -> FAILED_VALIDATION
+      -> READY`` (consuming one retry on the second edge).
+    * ``"rejected_failed"`` -- reject landed with retries exhausted;
+      lifecycle reached :attr:`Status.FAILED` retaining the rejection
+      error.
+
+    ``command_id`` is the id of the applied control command when
+    ``applied`` is ``True``; ``None`` otherwise.
+    """
+
+    applied: bool
+    reason: str
+    command_id: int | None = None
+
+
+def _reject_feedback_text(payload: Mapping[str, Any]) -> str:
+    """Coerce a ``reject`` payload's optional ``feedback`` field for the
+    manual receipt summary.
+
+    Producer-side validation already constrains ``feedback`` to a string
+    when present (see ``flywheel.invoker_client._payload_feedback``), so
+    the resolver only needs to substitute the documented placeholder for
+    the absent / empty cases per the spec error-handling table.
+    """
+    raw = payload.get("feedback")
+    if isinstance(raw, str) and raw:
+        return raw
+    return "(no feedback provided)"
+
+
+def _emit_control_applied(
+    store: HarnessStore,
+    command: ControlCommandRecord,
+    *,
+    attempt_number: int | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """Record the resolver's claim via the existing
+    ``harness.control_command_applied`` event so the audit stream
+    attributes the operator decision to the same telemetry shape the
+    live in-session watcher uses (``EVENT_CONTROL_APPLIED`` in
+    :mod:`flywheel.invoker_client`).
+    """
+    _emit(
+        store,
+        run_id=command.run_id,
+        kind="harness.control_command_applied",
+        payload={
+            "command_id": command.id,
+            "kind": command.kind,
+            "payload": dict(command.payload),
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+
+
+def resolve_manual_approval(
+    lifecycle: Lifecycle,
+    store: HarnessStore,
+    task: Task,
+    *,
+    max_retries: int = 0,
+    now: Callable[[], datetime] | None = None,
+) -> ResolveApprovalOutcome:
+    """Apply the oldest pending approve/reject command to a parked gate.
+
+    Structural sibling of :func:`recheck_blocked_lifecycle`: out-of-band
+    resolution of a parked, non-running lifecycle, driven by the
+    orchestrator's reactive sweep. The caller hands in the lifecycle
+    snapshot it loaded for the sweep tick; this function mutates that
+    snapshot in place (status, version, ``awaiting_manual_ordinal``,
+    retry counter) so the caller's view stays aligned with the
+    persisted projection across the resolver's appends.
+
+    Per spec FR-5 and FR-6:
+
+    * approve: writes a ``passed=True`` manual
+      :class:`GraderResultRecord` (keyed to the already-finalized
+      ``SUCCEEDED`` attempt) for the gate at
+      ``lifecycle.awaiting_manual_ordinal`` via
+      :func:`flywheel.grader_manual.build_manual_result`; selects the
+      next manual gate via
+      :func:`flywheel.grader_manual.next_pending_manual_gate`; if one
+      exists, re-parks (appends an :class:`AwaitingApproval` domain
+      event with the new ordinal and emits a fresh
+      ``harness.awaiting_approval`` so operators learn another decision
+      is owed); if none remain, transitions
+      ``AWAITING_APPROVAL -> DONE`` (the attempt was finalized at gate
+      entry per FR-4 -- there is no second attempt-finalize). Emits
+      ``harness.manual_approved`` with ``{grader_name, awaiting_ordinal}``.
+    * reject: writes a ``passed=False`` manual
+      :class:`GraderResultRecord` whose summary is the command's
+      ``feedback`` payload (or the documented ``"(no feedback provided)"``
+      placeholder for the absent / empty cases); transitions
+      ``AWAITING_APPROVAL -> FAILED_VALIDATION`` with
+      ``error = "manual grader '<name>' rejected by operator"`` and **no**
+      attempt re-finalize (the attempt's ``SUCCEEDED`` outcome accurately
+      records that the agent passed every automated grader; the rejection
+      is captured by the manual receipt). The resolver then drives the
+      same retry arm :func:`run_task` uses: when
+      :meth:`Lifecycle.is_retry_eligible` is ``True`` it emits
+      ``harness.retry_scheduled`` and transitions
+      ``FAILED_VALIDATION -> READY`` (consuming one retry on that edge);
+      otherwise it transitions ``-> FAILED`` retaining the rejection
+      error. A reject short-circuits any later gates (a fresh attempt on
+      retry will re-evaluate them from the top). Emits
+      ``harness.manual_rejected`` with
+      ``{grader_name, awaiting_ordinal, feedback}``.
+
+    Claim semantics: the resolver calls
+    :meth:`ControlCommandStore.claim_commands` and selects the first
+    ``approve`` / ``reject`` row in enqueue order. The single-claim
+    primitive (``idx_control_commands_pending``) ensures two workers
+    cannot double-apply the same command. When the claim batch carries
+    no ``approve`` / ``reject`` row, the lifecycle stays parked and the
+    caller learns via ``reason="no_pending_command"``. The applied
+    command is recorded via the existing
+    ``harness.control_command_applied`` event so the resolver's audit
+    surface matches the live in-session watcher's.
+
+    Concurrent callers race on ``lifecycle.version`` exactly as the
+    rest of the harness does; the loser surfaces
+    :class:`flywheel.store_protocols.OptimisticConcurrencyError` to its
+    caller -- this function does not swallow it.
+    """
+    clock = now or _utcnow
+
+    if lifecycle.status != Status.AWAITING_APPROVAL:
+        return ResolveApprovalOutcome(applied=False, reason="not_awaiting")
+    ordinal = lifecycle.awaiting_manual_ordinal
+    if ordinal is None:
+        return ResolveApprovalOutcome(applied=False, reason="not_awaiting")
+    if ordinal < 0 or ordinal >= len(task.graders):
+        return ResolveApprovalOutcome(applied=False, reason="missing_gate")
+    grader = task.graders[ordinal]
+    if not isinstance(grader, ManualGrader):
+        return ResolveApprovalOutcome(applied=False, reason="missing_gate")
+
+    gate = ManualGate(
+        ordinal=ordinal,
+        instruction=grader.instruction,
+        grader_name=grader.name,
+    )
+
+    # Claim every pending row for the run. The single-claim primitive
+    # (idx_control_commands_pending) prevents two workers from grabbing
+    # the same row; per the spec's "claim the oldest approve/reject" we
+    # apply the first approve/reject in id order and leave any other
+    # rows in the claim batch to the resolver's audit surface (the
+    # in-session watcher owns interrupt/say/set_model; against an
+    # AWAITING_APPROVAL lifecycle those rows are orphans either way
+    # because no live session is running).
+    claimed = store.claim_commands(lifecycle.run_id, now=clock())
+
+    target: ControlCommandRecord | None = None
+    for cmd in claimed:
+        if cmd.kind in (CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT):
+            target = cmd
+            break
+
+    if target is None:
+        return ResolveApprovalOutcome(
+            applied=False, reason="no_pending_command"
+        )
+
+    # The manual receipt is keyed to the attempt already finalized
+    # SUCCEEDED at gate entry. With no attempt at all the parked state
+    # is structurally impossible (FR-4 finalizes before transitioning);
+    # bail defensively so the parked state survives for diagnosis.
+    attempts = store.list_attempts(lifecycle.run_id)
+    if not attempts:
+        return ResolveApprovalOutcome(applied=False, reason="no_attempt")
+    attempt_number = attempts[-1].number
+
+    if target.kind == CONTROL_COMMAND_APPROVE:
+        store.append_grader_result(
+            build_manual_result(
+                gate,
+                run_id=lifecycle.run_id,
+                attempt_number=attempt_number,
+                passed=True,
+                summary="approved",
+                now=clock(),
+            )
+        )
+
+        next_gate = next_pending_manual_gate(task, after_ordinal=ordinal)
+        if next_gate is not None:
+            _append(
+                lifecycle,
+                AwaitingApproval(
+                    run_id=lifecycle.run_id,
+                    ts=clock(),
+                    attempt_number=attempt_number,
+                    awaiting_ordinal=next_gate.ordinal,
+                ),
+                store=store,
+            )
+            artifacts_dir = lifecycle.artifacts_dir or ""
+            _emit(
+                store,
+                run_id=lifecycle.run_id,
+                kind="harness.awaiting_approval",
+                payload={
+                    "instructions": next_gate.instruction,
+                    "awaiting_ordinal": next_gate.ordinal,
+                    "grader_name": next_gate.grader_name,
+                    "run_id": lifecycle.run_id,
+                    "attempt_number": attempt_number,
+                    "artifacts_dir": artifacts_dir,
+                },
+                attempt_number=attempt_number,
+                now=clock,
+            )
+            reason = "approved_next_gate"
+        else:
+            _transition(lifecycle, Status.DONE, store=store, now=clock)
+            reason = "approved_done"
+
+        _emit(
+            store,
+            run_id=lifecycle.run_id,
+            kind="harness.manual_approved",
+            payload={
+                "grader_name": gate.grader_name,
+                "awaiting_ordinal": ordinal,
+            },
+            attempt_number=attempt_number,
+            now=clock,
+        )
+        _emit_control_applied(
+            store, target, attempt_number=attempt_number, clock=clock
+        )
+        return ResolveApprovalOutcome(
+            applied=True, reason=reason, command_id=target.id
+        )
+
+    # Reject path.
+    feedback_text = _reject_feedback_text(target.payload)
+    store.append_grader_result(
+        build_manual_result(
+            gate,
+            run_id=lifecycle.run_id,
+            attempt_number=attempt_number,
+            passed=False,
+            summary=feedback_text,
+            now=clock(),
+        )
+    )
+
+    grader_label = gate.grader_name or "manual"
+    error = f"manual grader '{grader_label}' rejected by operator"
+
+    _transition(
+        lifecycle,
+        Status.FAILED_VALIDATION,
+        store=store,
+        error=error,
+        now=clock,
+    )
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.manual_rejected",
+        payload={
+            "grader_name": gate.grader_name,
+            "awaiting_ordinal": ordinal,
+            "feedback": feedback_text,
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+    _emit_control_applied(
+        store, target, attempt_number=attempt_number, clock=clock
+    )
+
+    # Reuse the same retry arm run_task drives so a reject reaches the
+    # same FAILED_VALIDATION -> READY (consuming budget) / -> FAILED
+    # (exhausted) decision regardless of which entry point lands the
+    # parked-lifecycle resolution. The retry-counter increment lives on
+    # the FAILED_VALIDATION -> READY edge in Lifecycle.apply_transition.
+    if lifecycle.is_retry_eligible(max_retries):
+        _emit(
+            store,
+            run_id=lifecycle.run_id,
+            kind="harness.retry_scheduled",
+            payload={
+                "retries_used": lifecycle.retries,
+                "max_retries": max_retries,
+            },
+            attempt_number=attempt_number,
+            now=clock,
+        )
+        _transition(lifecycle, Status.READY, store=store, now=clock)
+        return ResolveApprovalOutcome(
+            applied=True, reason="rejected_retry", command_id=target.id
+        )
+
+    _transition(
+        lifecycle,
+        Status.FAILED,
+        store=store,
+        error=error,
+        now=clock,
+    )
+    return ResolveApprovalOutcome(
+        applied=True, reason="rejected_failed", command_id=target.id
+    )
+
+
 __all__ = [
     "HarnessConfig",
     "HarnessOutcome",
@@ -3191,7 +3543,9 @@ __all__ = [
     "InvocationRequest",
     "InvokeFunc",
     "RecheckOutcome",
+    "ResolveApprovalOutcome",
     "finalize_stranded_lifecycle",
     "recheck_blocked_lifecycle",
+    "resolve_manual_approval",
     "run_task",
 ]

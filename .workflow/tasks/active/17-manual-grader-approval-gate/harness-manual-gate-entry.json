@@ -1,0 +1,35 @@
+{
+  "id": "harness-manual-gate-entry",
+  "goal": "At the harness validation seat, when command/transcript/rubric all pass and the task declares any ManualGrader, finalize the attempt SUCCEEDED, persist awaiting_manual_ordinal for the first gate, transition VALIDATING->AWAITING_APPROVAL, and emit harness.awaiting_approval instead of transitioning to DONE.",
+  "prerequisites": ["lifecycle-awaiting-approval-state", "persist-awaiting-manual-ordinal", "grader-manual-module"],
+  "tags": ["manual-gate", "harness"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/harness.py",
+      "src/flywheel/grader_manual.py",
+      "tests/test_harness.py"
+    ],
+    "references": [
+      "src/flywheel/harness.py:2462-2540 -- the validation seat; the gate-entry branch slots in after the rubric block (~:2527) and before the VALIDATING->DONE transition (~:2539)",
+      "src/flywheel/harness.py:123 -- the flywheel.task import line; add ManualGrader"
+    ],
+    "constraints": [
+      "Only enter the gate when command_passed and transcript_passed and rubric_passed AND task declares at least one ManualGrader; otherwise the existing VALIDATING->DONE path is byte-identical to today (no new events, no column write).",
+      "Finalize the attempt SUCCEEDED at gate entry (no attempt stays open across the human wait); select the first gate via next_pending_manual_gate(task, after_ordinal=None); persist awaiting_manual_ordinal; transition VALIDATING->AWAITING_APPROVAL.",
+      "Emit harness.awaiting_approval carrying {instructions, awaiting_ordinal, grader_name, run_id, attempt_number, artifacts_dir}.",
+      "Import ManualGrader from flywheel.task at harness.py:123.",
+      "Add tests/test_harness.py cases: (a) all-automated-pass + one manual gate reaches AWAITING_APPROVAL (not DONE) with the attempt finalized SUCCEEDED, awaiting_manual_ordinal set to the gate ordinal, and harness.awaiting_approval emitted; (b) all-automated-pass + zero manual gates still reaches DONE with no new events; (c) a command/transcript/rubric failure never reaches the gate.",
+      "Call mcp__ide__getDiagnostics on src/flywheel/harness.py and touched test files and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No resolver (resolve-manual-approval owns approve/reject application).",
+      "No control verbs, no orchestrator sweep, no prompt rendering."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_harness.py", "name": "harness-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

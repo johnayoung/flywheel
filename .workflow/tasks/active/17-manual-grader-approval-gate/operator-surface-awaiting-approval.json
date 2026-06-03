@@ -1,0 +1,33 @@
+{
+  "id": "operator-surface-awaiting-approval",
+  "goal": "Render AWAITING_APPROVAL runs with the pending gate's instruction in flywheel status and flywheel live so an operator sees the owed decision.",
+  "prerequisites": ["harness-manual-gate-entry", "control-verbs-approve-reject"],
+  "tags": ["manual-gate", "cli", "observability"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/workflow.py",
+      "tests/test_workflow.py",
+      "tests/test_audit.py"
+    ],
+    "references": [
+      "src/flywheel/workflow.py:255-272 -- task_state classifier; an AWAITING_APPROVAL run currently falls into the else IN_PROGRESS fallback and would be mislabeled, so add an explicit classification arm",
+      "src/flywheel/workflow.py:199 -- _ACTIVE_STATUSES; decide whether AWAITING_APPROVAL belongs in any active/parked status set used by the renderers",
+      "src/flywheel/workflow.py:1750-1782 -- the status-row print loop (the spot that prints blocked_on for INTERRUPTED rows); print the pending gate instruction for AWAITING_APPROVAL rows the same way",
+      "src/flywheel/harness.py -- harness.awaiting_approval event payload {instructions, awaiting_ordinal, grader_name, run_id, attempt_number, artifacts_dir}"
+    ],
+    "constraints": [
+      "flywheel status and flywheel live both display AWAITING_APPROVAL runs and the pending gate's instruction text; classify AWAITING_APPROVAL distinctly (likely a new TaskState arm) so it is not rendered as generic IN_PROGRESS.",
+      "Add tests/test_workflow.py cases that status and live render the awaiting state and instruction for a parked lifecycle; add an audit test asserting the harness.awaiting_approval payload shape carries instructions, awaiting_ordinal, grader_name, run_id, attempt_number, and artifacts_dir.",
+      "Call mcp__ide__getDiagnostics on every touched .py file and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No web/dashboard surface (out of scope).",
+      "No diff/artifact rendering inside the gate event."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_workflow.py tests/test_audit.py", "name": "surfacing-tests" }
+  ]
+}

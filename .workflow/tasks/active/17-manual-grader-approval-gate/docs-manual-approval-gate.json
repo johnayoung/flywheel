@@ -1,0 +1,35 @@
+{
+  "id": "docs-manual-approval-gate",
+  "goal": "Update docs/task-lifecycle.md, docs/loop.md, docs/task-schema.md, and docs/vision.md to document AWAITING_APPROVAL, the approve/reject verbs, the clarified SUCCEEDED invariant, and to retract the manual-grader TODO.",
+  "prerequisites": ["resolve-manual-approval", "reject-feedback-into-prompt", "orchestrator-reactive-resolve", "operator-surface-awaiting-approval"],
+  "tags": ["manual-gate", "docs"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "docs/task-lifecycle.md",
+      "docs/loop.md",
+      "docs/task-schema.md",
+      "docs/vision.md"
+    ],
+    "references": [
+      "docs/task-lifecycle.md:5-42 -- states, diagram, and rules to extend with the new state row, edges, and the SUCCEEDED invariant",
+      "docs/loop.md:35 -- the manual-grader TODO to retract; docs/loop.md:109 -- the grader-type note to update with the gate and verbs"
+    ],
+    "constraints": [
+      "docs/task-lifecycle.md: add the AWAITING_APPROVAL state row, diagram, and edges; note it does not consume retry and clears awaiting_manual_ordinal on the same edges as blocked_requires_json; state the clarified invariant -- Outcome.SUCCEEDED means all automated graders passed, and a lifecycle reaches DONE iff SUCCEEDED and all manual gates are approved, so a SUCCEEDED attempt may precede a retry after a reject.",
+      "docs/loop.md: retract the manual-grader TODO at line 35; document the gate, the approve/reject verbs, and the parked-resolution model.",
+      "docs/task-schema.md: note the manual grader is now executed and pauses to AWAITING_APPROVAL (around the cost-order note and the manual grader shape).",
+      "docs/vision.md: mark the manual approval surface implemented (remove it from the open grader-taxonomy gap).",
+      "Be concise: engineers scan. No emojis.",
+      "Commit with a Conventional Commits (docs:) message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No code changes -- this task is docs-only.",
+      "No spec file edits."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "grep -q 'AWAITING_APPROVAL' docs/task-lifecycle.md && grep -q 'AWAITING_APPROVAL' docs/loop.md && grep -q 'approve' docs/loop.md", "name": "docs-mention-state" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

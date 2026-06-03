@@ -1,0 +1,42 @@
+{
+  "id": "persist-awaiting-manual-ordinal",
+  "goal": "Persist and load the nullable awaiting_manual_ordinal lifecycle column across the memory, sqlite, and postgres stores and both schema files, bumping CURRENT_SCHEMA_VERSION 4->5 with a forward migration that leaves a v4 database readable.",
+  "prerequisites": ["lifecycle-awaiting-approval-state"],
+  "tags": ["manual-gate", "persistence", "schema"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/store_protocols.py",
+      "src/flywheel/store_memory.py",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/store_postgres.py",
+      "src/flywheel/_schema/persistence-schema.sql",
+      "src/flywheel/_schema/persistence-schema-postgres.sql",
+      "tests/test_store_contract.py",
+      "tests/test_store_sqlite.py",
+      "tests/test_store_postgres.py"
+    ],
+    "references": [
+      "src/flywheel/store_protocols.py:94 -- CURRENT_SCHEMA_VERSION: int = 4, becomes 5",
+      "src/flywheel/store_sqlite.py:224-226 -- the UPDATE schema_version ... WHERE version = 3 forward-migration step; add the 4->5 step and the ALTER TABLE for the new column",
+      "src/flywheel/store_postgres.py:348-350 -- the postgres mirror of the same forward-migration step",
+      "src/flywheel/_schema/persistence-schema.sql:206,230 -- the prior nullable-column-add comment and the INSERT OR IGNORE schema_version version = 4; mirror this pattern for the new column and bump to 5"
+    ],
+    "constraints": [
+      "Add a nullable awaiting_manual_ordinal column to the lifecycles table in BOTH _schema/persistence-schema.sql and _schema/persistence-schema-postgres.sql, and update the schema_version CHECK clause and the seed INSERT version to 5 in both.",
+      "Bump CURRENT_SCHEMA_VERSION to 5 in src/flywheel/store_protocols.py; this is a shared invariant. The existing forward migration is a SINGLE guarded step (store_sqlite.py:224-226, store_postgres.py:348-350: UPDATE schema_version SET version=? WHERE id=1 AND version=3). Add a NEW, additional v4->5 step (ALTER TABLE lifecycles ADD the nullable column, then a guarded UPDATE ... WHERE version=4) rather than editing the existing version=3 guard, so both a v3 and a v4 database migrate forward and a v4 database reads NULL for the new column.",
+      "All three stores (store_memory, store_sqlite, store_postgres) must round-trip awaiting_manual_ordinal on save and load.",
+      "Enumerate and update every test that pins schema_version 4 or the lifecycle column set: store contract tests must assert round-trip of awaiting_manual_ordinal and that it clears on ->READY/->DONE/->FAILED_VALIDATION; add a migration test asserting a v4 database opens and reads NULL for the new column.",
+      "Postgres tests skip without a live database -- do not make them hard-fail; the sqlite, memory, and contract tests are the authoritative graders here.",
+      "Call mcp__ide__getDiagnostics on every touched .py file and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No harness logic that sets the column (harness-manual-gate-entry owns that).",
+      "No new lifecycle edges (already added by the prerequisite)."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_store_sqlite.py tests/test_store_memory.py tests/test_store_contract.py tests/test_store_protocols.py tests/test_store_postgres.py", "name": "store-tests" }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "id": "grader-manual-module",
+  "goal": "Add a pure src/flywheel/grader_manual.py exposing next_pending_manual_gate(task, *, after_ordinal) -> ManualGate | None and build_manual_result(...) -> GraderResultRecord for approve/reject decisions.",
+  "tags": ["manual-gate", "grader"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/grader_command.py",
+      "src/flywheel/task.py",
+      "tests/test_grader_command.py"
+    ],
+    "references": [
+      "src/flywheel/grader_command.py -- structural template for GraderResultRecord assembly and module shape",
+      "src/flywheel/task.py:46-52 -- ManualGrader (instruction, name); already complete, do not change it"
+    ],
+    "constraints": [
+      "ManualGate is a small frozen dataclass carrying (ordinal, instruction, grader_name).",
+      "next_pending_manual_gate returns the first ManualGrader in task.graders order whose index is strictly greater than after_ordinal (or the first manual gate when after_ordinal is None), preserving each manual grader's task.graders index as its ordinal and skipping non-manual graders; returns None when no manual gate remains.",
+      "build_manual_result(gate, *, run_id, attempt_number, passed, summary, now) assembles a grader_type=\"manual\" GraderResultRecord; no store writes inside the module (the harness/resolver appends the record).",
+      "The module imports no json/pathlib/io/SDK -- pure data plus record assembly.",
+      "Write tests/test_grader_manual.py covering: first gate when after_ordinal=None; next gate strictly after a given ordinal; None when none remain; non-manual graders skipped while ordinals stay aligned to task.graders; build_manual_result payload for both approve (passed=True) and reject (passed=False) cases.",
+      "Call mcp__ide__getDiagnostics on src/flywheel/grader_manual.py and tests/test_grader_manual.py and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No harness wiring, no store calls, no control-command handling.",
+      "No change to task.py or loaders.py -- the ManualGrader dataclass and parser are already complete."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_grader_manual.py", "name": "grader-manual-tests" },
+    { "type": "command", "run": "! grep -nE '^\\s*(import|from)\\s+(json|io|pathlib|claude)' src/flywheel/grader_manual.py", "name": "purity-guard" }
+  ]
+}

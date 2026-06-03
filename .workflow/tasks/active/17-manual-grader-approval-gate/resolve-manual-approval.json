@@ -1,0 +1,37 @@
+{
+  "id": "resolve-manual-approval",
+  "goal": "Add resolve_manual_approval(lifecycle, store, task, *, now) that claims the oldest pending approve/reject command on an AWAITING_APPROVAL lifecycle, writes the manual GraderResultRecord, and either re-parks on the next gate, transitions to DONE, or routes a reject to FAILED_VALIDATION with the operator feedback as the receipt summary.",
+  "prerequisites": ["grader-manual-module", "harness-manual-gate-entry", "control-verbs-approve-reject"],
+  "tags": ["manual-gate", "harness", "resolver"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/harness.py",
+      "src/flywheel/grader_manual.py",
+      "tests/test_harness.py",
+      "tests/test_harness_recheck.py"
+    ],
+    "references": [
+      "src/flywheel/harness.py:1011-1130 -- recheck_blocked_lifecycle and the blocked_requires_json round-trip; resolve_manual_approval is its structural sibling (out-of-band resolution of a parked, non-running lifecycle)",
+      "src/flywheel/harness.py -- the existing harness.control_command_applied event used to record the claimed command"
+    ],
+    "constraints": [
+      "approve: write a passed=True manual GraderResultRecord (keyed to the already-finalized SUCCEEDED attempt) for the gate at awaiting_manual_ordinal via build_manual_result; select next_pending_manual_gate(task, after_ordinal=<current>); if one exists, update awaiting_manual_ordinal, stay AWAITING_APPROVAL, emit a fresh harness.awaiting_approval; if none remain, transition AWAITING_APPROVAL->DONE with no second attempt-finalize; emit harness.manual_approved with {grader_name, awaiting_ordinal}.",
+      "reject: write a passed=False manual GraderResultRecord whose summary is the command feedback (or \"(no feedback provided)\" when absent/empty); transition AWAITING_APPROVAL->FAILED_VALIDATION with error = \"manual grader '<name>' rejected by operator\" and NO attempt re-finalize (the attempt keeps its SUCCEEDED outcome); a reject short-circuits later gates; emit harness.manual_rejected with {grader_name, awaiting_ordinal, feedback}.",
+      "After the reject reaches FAILED_VALIDATION, reuse the existing retry arm: FAILED_VALIDATION->READY when is_retry_eligible (consuming one retry on that edge), else ->FAILED retaining the rejection error.",
+      "Claim commands via the existing single-claim semantics (idx_control_commands_pending) so two workers cannot double-apply; record the applied command via harness.control_command_applied. When no approve/reject is pending the lifecycle stays parked.",
+      "Manual receipts are append-only, written once at resolution time; the AWAITING_APPROVAL park itself writes no receipt.",
+      "Add tests/test_harness.py cases for FR-5 (single-gate approve->DONE with a passed=True receipt and ordinal cleared, outcome stays SUCCEEDED; multi-gate sequential approve re-parks per gate and only the final approve reaches DONE; each approve appends exactly one manual receipt) and FR-6 (reject with retries remaining -> FAILED_VALIDATION then READY consuming one retry, rejected attempt stays SUCCEEDED; reject with retries exhausted -> FAILED with the rejection error; reject on the first of multiple gates skips later gates; the receipt carries the feedback text).",
+      "Call mcp__ide__getDiagnostics on src/flywheel/harness.py and touched test files and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No orchestrator wiring (orchestrator-reactive-resolve calls this).",
+      "No prompt rendering of the feedback (reject-feedback-into-prompt owns that)."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_harness.py tests/test_harness_recheck.py", "name": "resolver-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

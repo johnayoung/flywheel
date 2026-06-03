@@ -1,0 +1,35 @@
+{
+  "id": "control-verbs-approve-reject",
+  "goal": "Add CONTROL_COMMAND_APPROVE and CONTROL_COMMAND_REJECT verbs (reject with an optional {feedback: str} payload) plus flywheel approve RUN_ID and flywheel reject RUN_ID [--feedback TEXT] CLI producers that enqueue one control_commands row and treat AWAITING_APPROVAL as the valid in-flight status.",
+  "prerequisites": ["lifecycle-awaiting-approval-state"],
+  "tags": ["manual-gate", "control-commands", "cli"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00016-FEATURE-manual-grader-approval-gate.md",
+      "src/flywheel/invoker_client.py",
+      "src/flywheel/workflow.py",
+      "tests/test_invoker_client.py",
+      "tests/test_workflow.py"
+    ],
+    "references": [
+      "src/flywheel/invoker_client.py:57-61 -- recognized control-verb constants; add approve/reject here",
+      "src/flywheel/invoker_client.py:88-109 -- _payload_text / _payload_model validator templates; reject's feedback validator mirrors these",
+      "src/flywheel/workflow.py:1926-2010 -- _enqueue_control_command, _cmd_interrupt, _cmd_steer; the template for _cmd_approve / _cmd_reject"
+    ],
+    "constraints": [
+      "reject validates an optional {\"feedback\": str} payload: absent is allowed; a non-string feedback is a payload validation error mirroring _payload_model.",
+      "The live in-session watcher records approve/reject as not-applied (no live session in AWAITING_APPROVAL) rather than dispatching them to a session or crashing.",
+      "The producers build on _enqueue_control_command (workflow.py:1938); the not-in-flight check at workflow.py:1965 (in_flight = lifecycle.status in (Status.RUNNING, Status.VALIDATING)) must treat AWAITING_APPROVAL as a valid in-flight status for these two verbs so the producer does not warn when enqueuing against a correctly-parked run.",
+      "Add tests: tests/test_invoker_client.py for the new verb constants and reject-payload validation; tests/test_workflow.py for (a) flywheel approve enqueues a kind=approve row, (b) flywheel reject --feedback X enqueues kind=reject with the feedback payload, (c) enqueuing against a non-AWAITING_APPROVAL run prints the pending/stale note, (d) an unknown run_id exits 2.",
+      "Call mcp__ide__getDiagnostics on every touched .py file and fix all type errors before verify.",
+      "Commit with a Conventional Commits message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No resolver application (resolve-manual-approval consumes these rows).",
+      "No status/live rendering (operator-surface-awaiting-approval owns that)."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_invoker_client.py tests/test_workflow.py", "name": "verbs-and-producers-tests" }
+  ]
+}

@@ -439,6 +439,120 @@ def test_claim_lost_mid_run_relinquishes_without_killing_worker(
     assert all(r.status is Status.DONE for r in report.runs)
 
 
+# --- reactive resolve of AWAITING_APPROVAL gates ---------------------------
+
+
+def _write_task_with_manual_gate(
+    phase: Path,
+    task_id: str,
+    *,
+    gate_name: str = "operator-confirm",
+    gate_instruction: str = "Confirm the rollout.",
+) -> None:
+    """Write a task whose validation passes the command grader and
+    parks on a single manual gate, so a verifying agent drives the
+    lifecycle straight to ``AWAITING_APPROVAL`` (spec 00016 FR-4)."""
+    phase.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "id": task_id,
+        "goal": f"Goal for {task_id}.",
+        "graders": [
+            {"type": "command", "run": "true"},
+            {
+                "type": "manual",
+                "instruction": gate_instruction,
+                "name": gate_name,
+            },
+        ],
+    }
+    (phase / f"{task_id}.json").write_text(json.dumps(payload))
+
+
+def test_awaiting_approval_pending_approve_resolves_on_next_tick(
+    tmp_path: Path,
+) -> None:
+    """Spec 00016 FR-9 acceptance (a): a pending ``approve`` is applied
+    on the next reactive tick and the lifecycle advances. The first
+    session drives the task to ``AWAITING_APPROVAL``; the operator
+    enqueues ``approve`` out-of-band; the second session's reactive
+    sweep resolves it in place (no follow-on drive) and the lifecycle
+    reaches ``DONE``."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task_with_manual_gate(phase, "gated")
+
+    first = _orchestrate(tmp_path, _always_verify())
+    gated_first = [r for r in first.runs if r.task_id == "gated"]
+    assert len(gated_first) == 1
+    assert gated_first[0].status is Status.AWAITING_APPROVAL
+    run_id = gated_first[0].run_id
+
+    # The operator enqueues an approve out-of-band against the parked run.
+    db_path = tmp_path / "flywheel.sqlite"
+    store = SqliteStore(db_path)
+    try:
+        store.enqueue_command(
+            run_id,
+            "approve",
+            {},
+            now=datetime.now(timezone.utc),
+        )
+    finally:
+        store.close()
+
+    # Second session: the reactive resolve pass claims the pending
+    # approve, writes the manual receipt, and transitions the
+    # lifecycle to DONE. No new RunRecord is created — resolution is
+    # in-place, not a fresh drive.
+    second = _orchestrate(tmp_path, _always_verify())
+    assert second.runs == ()
+
+    store = SqliteStore(db_path)
+    try:
+        final = store.load_lifecycle(run_id)
+        assert final is not None
+        assert final.status is Status.DONE
+        # The -> DONE edge centralizes the awaiting-ordinal clear.
+        assert final.awaiting_manual_ordinal is None
+    finally:
+        store.close()
+
+
+def test_awaiting_approval_with_no_pending_command_stays_parked(
+    tmp_path: Path,
+) -> None:
+    """Spec 00016 FR-9 acceptance (b): with no pending command, the
+    reactive resolve pass is a no-op and the lifecycle remains
+    ``AWAITING_APPROVAL``. Also exercises the
+    ``finalize_stranded_lifecycle`` exemption — a parked gate is not
+    recovered as stranded on entry."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task_with_manual_gate(phase, "gated")
+
+    first = _orchestrate(tmp_path, _always_verify())
+    gated_first = [r for r in first.runs if r.task_id == "gated"]
+    assert len(gated_first) == 1
+    assert gated_first[0].status is Status.AWAITING_APPROVAL
+    run_id = gated_first[0].run_id
+
+    # No approve / reject is enqueued. The reactive sweep finds no
+    # pending command, marks the run attempted-this-session, and the
+    # lifecycle stays parked.
+    second = _orchestrate(tmp_path, _always_verify())
+    assert second.runs == ()
+    # AWAITING_APPROVAL is exempt from the stranded-recovery backstop.
+    assert second.recovered == ()
+
+    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    try:
+        loaded = store.load_lifecycle(run_id)
+        assert loaded is not None
+        assert loaded.status is Status.AWAITING_APPROVAL
+        # The persisted ordinal still points at the parked gate.
+        assert loaded.awaiting_manual_ordinal is not None
+    finally:
+        store.close()
+
+
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
     from flywheel.orchestrator import _ClaimHeartbeat
 

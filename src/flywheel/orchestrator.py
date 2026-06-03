@@ -59,6 +59,7 @@ from flywheel.harness import (
     InvokeFunc,
     finalize_stranded_lifecycle,
     recheck_blocked_lifecycle,
+    resolve_manual_approval,
 )
 from flywheel.lifecycle import Status
 from flywheel.store_protocols import (
@@ -176,6 +177,19 @@ def _is_blocked_interrupted(row: TaskStatusRow) -> bool:
         row.latest_status == Status.INTERRUPTED
         and row.blocked_requires is not None
     )
+
+
+def _is_awaiting_approval(row: TaskStatusRow) -> bool:
+    """A lifecycle parked on a manual-approval gate.
+
+    Routed through the reactive sweep alongside blocked recheck so a
+    pending ``approve`` / ``reject`` command is applied on the next tick.
+    Keyed off ``latest_status`` directly because ``AWAITING_APPROVAL`` is
+    a status the harness owns end-to-end (unlike ``INTERRUPTED``, which
+    also covers bare operator pauses and so requires the
+    ``blocked_requires`` secondary check).
+    """
+    return row.latest_status == Status.AWAITING_APPROVAL
 
 
 def _recover_claimable_stranded(
@@ -346,6 +360,7 @@ async def orchestrate(
         runs: list[RunRecord] = []
         attempted_fresh: set[str] = set()
         attempted_resume: set[str] = set()
+        attempted_approve: set[str] = set()
 
         while True:
             rows = build_status_rows(tasks_dir, control)
@@ -444,6 +459,59 @@ async def orchestrate(
                 finally:
                     if claim is not None:
                         control.release_claim(claim)
+            if progressed:
+                continue
+
+            # 1b. Reactive resolve of AWAITING_APPROVAL gates, claim-gated
+            #     so only one worker drives a given parked run. The
+            #     resolver advances the lifecycle in place — no follow-on
+            #     drive is needed: ``approved_next_gate`` re-parks on the
+            #     next ordinal (the next loop iteration picks up any
+            #     further pending approve), ``rejected_retry`` leaves the
+            #     lifecycle ``READY`` for the fresh-selection pass below,
+            #     and ``approved_done`` / ``rejected_failed`` are terminal.
+            #     With no pending command the lifecycle stays parked and
+            #     the run_id is marked so we do not tight-loop on the
+            #     no-op for the rest of this session.
+            for row in rows:
+                if not _is_awaiting_approval(row):
+                    continue
+                run_id = row.latest_run_id
+                if run_id is None or run_id in attempted_approve:
+                    continue
+                claim = control.acquire_claim(
+                    row.task.id,
+                    wid,
+                    now=clock(),
+                    lease_seconds=lease_seconds,
+                )
+                if claim is None:
+                    continue  # another worker owns this task right now
+                try:
+                    lifecycle = control.load_lifecycle(run_id)
+                    if lifecycle is None:
+                        attempted_approve.add(run_id)
+                        continue
+                    try:
+                        approval_outcome = resolve_manual_approval(
+                            lifecycle,
+                            control,
+                            task_by_id[row.task.id],
+                            max_retries=max_retries,
+                            now=clock,
+                        )
+                    except OptimisticConcurrencyError:
+                        # Another worker resolved it first; let go.
+                        continue
+                    if not approval_outcome.applied:
+                        attempted_approve.add(run_id)
+                        continue
+                    # Lifecycle advanced in place; restart so the
+                    # changed state is re-read on the next pass.
+                    progressed = True
+                    break
+                finally:
+                    control.release_claim(claim)
             if progressed:
                 continue
 

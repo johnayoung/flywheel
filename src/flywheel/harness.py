@@ -2895,11 +2895,20 @@ def finalize_stranded_lifecycle(
 
     No-op (returns ``False``) when the lifecycle is missing or already
     in a status the harness considers final or quiescent.
+    :attr:`Status.AWAITING_APPROVAL` is one such quiescent status (spec
+    00016 FR-9): the attempt was finalized ``SUCCEEDED`` at gate entry
+    per FR-4, so the open-attempt strand rule is unaffected; only the
+    parked status needs exempting so the manual gate survives worker
+    restart untouched.
     """
     clock = now or _utcnow
     lifecycle = store.load_lifecycle(run_id)
     if lifecycle is None:
         return False
+    # AWAITING_APPROVAL is a durable park, not a stranded mid-attempt;
+    # explicitly absent from the stranded set (alongside terminal /
+    # interrupted / retry-source statuses) so a parked manual gate
+    # survives a worker restart untouched.
     if lifecycle.status not in (Status.RUNNING, Status.VALIDATING):
         return False
 

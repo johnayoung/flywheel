@@ -1892,6 +1892,63 @@ class TestFinalizeStranded:
         ok = finalize_stranded_lifecycle(store, "run-does-not-exist")
         assert ok is False
 
+    def test_finalize_awaiting_approval_lifecycle_is_noop(self) -> None:
+        """An ``AWAITING_APPROVAL`` lifecycle is a durable park, not a
+        stranded mid-attempt — the attempt was finalized ``SUCCEEDED``
+        at gate entry per spec 00016 FR-4. ``finalize_stranded_lifecycle``
+        must leave the parked status, the awaiting-gate ordinal, and the
+        already-finalized attempt untouched so a manual gate survives
+        worker restart (FR-9)."""
+        store = InMemoryStore()
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id="run-strand-awaiting")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        lc.transition_to(Status.AWAITING_APPROVAL, now=now)
+        # The harness's gate-entry path sets this via an AwaitingApproval
+        # domain event; the seed bypasses event sourcing and writes it
+        # directly so the persisted column matches what the resolver
+        # would later read.
+        lc.awaiting_manual_ordinal = 1
+        store.create_lifecycle(lc)
+        # The attempt was finalized SUCCEEDED at gate entry (FR-4), so
+        # the open-attempt strand rule is unaffected — only the parked
+        # status needs exempting.
+        store.save_attempt(
+            lc.run_id,
+            Attempt(
+                number=1,
+                started_at=now,
+                run_id=lc.run_id,
+                ended_at=now,
+                outcome=Outcome.SUCCEEDED,
+            ),
+        )
+
+        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        assert ok is False
+
+        reloaded = store.load_lifecycle(lc.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.AWAITING_APPROVAL
+        assert reloaded.awaiting_manual_ordinal == 1
+
+        # The finalized attempt is not re-finalized: ended_at and
+        # outcome are preserved verbatim from gate entry.
+        attempts = store.list_attempts(lc.run_id)
+        assert len(attempts) == 1
+        assert attempts[0].outcome == Outcome.SUCCEEDED
+        assert attempts[0].ended_at == now
+
+        # No crash event was emitted — the no-op returns before any
+        # _emit / _transition / _finalize_attempt call.
+        crash = [
+            e for e in store.list_events(lc.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert crash == []
+
 
 # --- Entry-time crash recording ------------------------------------------
 

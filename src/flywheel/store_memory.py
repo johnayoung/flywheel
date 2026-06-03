@@ -79,6 +79,7 @@ def _clone_lifecycle_row(lc: Lifecycle) -> Lifecycle:
         session_id=lc.session_id,
         artifacts_dir=lc.artifacts_dir,
         blocked_requires_json=lc.blocked_requires_json,
+        awaiting_manual_ordinal=lc.awaiting_manual_ordinal,
         task_content_hash=lc.task_content_hash,
     )
 

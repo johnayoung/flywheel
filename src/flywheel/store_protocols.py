@@ -91,7 +91,7 @@ class ClaimLostError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 4
+CURRENT_SCHEMA_VERSION: int = 5
 
 
 class StoreSchemaError(Exception):

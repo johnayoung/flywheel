@@ -223,7 +223,25 @@ class SqliteStore:
         conn.execute(
             "UPDATE schema_version SET version = ? "
             "WHERE id = 1 AND version = ?",
-            (CURRENT_SCHEMA_VERSION, 3),
+            (4, 3),
+        )
+        # Forward migration from schema_version 4 -> 5: the
+        # ``lifecycles.awaiting_manual_ordinal`` nullable column ships in
+        # schema_version 5. CREATE TABLE IF NOT EXISTS in the schema script
+        # only creates the table when absent, so an existing v4 database
+        # needs an explicit ALTER to materialize the column; the column is
+        # nullable so a v4 row reads NULL (the post-migration sentinel for
+        # "not parked on a manual gate"). The version bump is guarded on
+        # the prior version so re-bootstrap of a v5 store is a no-op.
+        if not _lifecycles_has_awaiting_manual_ordinal(conn):
+            conn.execute(
+                "ALTER TABLE lifecycles "
+                "ADD COLUMN awaiting_manual_ordinal INTEGER"
+            )
+        conn.execute(
+            "UPDATE schema_version SET version = ? "
+            "WHERE id = 1 AND version = ?",
+            (CURRENT_SCHEMA_VERSION, 4),
         )
         # Final version pin: any row mismatch is fatal regardless of how
         # the database got here. The schema_version table has a CHECK
@@ -292,8 +310,8 @@ class SqliteStore:
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
                     timestamps_json, updated_at, blocked_requires_json,
-                    task_content_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_content_hash, awaiting_manual_ordinal
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lifecycle.run_id,
@@ -310,6 +328,7 @@ class SqliteStore:
                     _utcnow_iso(),
                     lifecycle.blocked_requires_json,
                     lifecycle.task_content_hash or None,
+                    lifecycle.awaiting_manual_ordinal,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -338,7 +357,8 @@ class SqliteStore:
                 timestamps_json = ?,
                 updated_at = ?,
                 blocked_requires_json = ?,
-                task_content_hash = ?
+                task_content_hash = ?,
+                awaiting_manual_ordinal = ?
             WHERE run_id = ? AND version = ?
             """,
             (
@@ -355,6 +375,7 @@ class SqliteStore:
                 _utcnow_iso(),
                 lifecycle.blocked_requires_json,
                 lifecycle.task_content_hash or None,
+                lifecycle.awaiting_manual_ordinal,
                 lifecycle.run_id,
                 expected_version,
             ),
@@ -379,7 +400,8 @@ class SqliteStore:
             """
             SELECT run_id, task_id, status, version, retries, error,
                    agent_output, session_id, artifacts_dir, worker_id,
-                   timestamps_json, blocked_requires_json, task_content_hash
+                   timestamps_json, blocked_requires_json, task_content_hash,
+                   awaiting_manual_ordinal
             FROM lifecycles
             WHERE run_id = ?
             """,
@@ -387,6 +409,7 @@ class SqliteStore:
         ).fetchone()
         if row is None:
             return None
+        awaiting_raw = row["awaiting_manual_ordinal"]
         lc = Lifecycle(
             task_id=row["task_id"],
             run_id=row["run_id"],
@@ -400,6 +423,9 @@ class SqliteStore:
             session_id=row["session_id"] or "",
             artifacts_dir=row["artifacts_dir"] or "",
             blocked_requires_json=row["blocked_requires_json"],
+            awaiting_manual_ordinal=(
+                int(awaiting_raw) if awaiting_raw is not None else None
+            ),
             task_content_hash=row["task_content_hash"] or "",
         )
         lc.attempts = self.list_attempts(run_id)
@@ -1146,6 +1172,11 @@ def _events_has_category(conn: sqlite3.Connection) -> bool:
 def _lifecycles_has_blocked_requires_json(conn: sqlite3.Connection) -> bool:
     rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
     return any(r["name"] == "blocked_requires_json" for r in rows)
+
+
+def _lifecycles_has_awaiting_manual_ordinal(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
+    return any(r["name"] == "awaiting_manual_ordinal" for r in rows)
 
 
 def _row_to_grader_result(row: sqlite3.Row) -> GraderResultRecord:

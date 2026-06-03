@@ -347,7 +347,36 @@ class PostgresStore:
                 cur.execute(
                     "UPDATE schema_version SET version = %s "
                     "WHERE id = 1 AND version = %s",
-                    (CURRENT_SCHEMA_VERSION, 3),
+                    (4, 3),
+                )
+                # Forward migration from schema_version 4 -> 5: the
+                # ``lifecycles.awaiting_manual_ordinal`` nullable column
+                # ships in schema_version 5. The CREATE TABLE IF NOT EXISTS
+                # in the script no-ops on an existing schema, so an existing
+                # v4 schema needs an explicit ALTER to materialize the
+                # column; the column is nullable so a v4 row reads NULL
+                # (the post-migration sentinel for "not parked on a manual
+                # gate"). Guarded on the prior version so re-bootstrap of
+                # a v5 schema is a no-op.
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                      AND table_name = 'lifecycles'
+                      AND column_name = 'awaiting_manual_ordinal'
+                    """,
+                    (self._schema,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "ALTER TABLE lifecycles "
+                        "ADD COLUMN awaiting_manual_ordinal INTEGER"
+                    )
+                cur.execute(
+                    "UPDATE schema_version SET version = %s "
+                    "WHERE id = 1 AND version = %s",
+                    (CURRENT_SCHEMA_VERSION, 4),
                 )
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
@@ -484,10 +513,11 @@ class PostgresStore:
                             run_id, task_id, status, version, retries,
                             error, agent_output, session_id, artifacts_dir,
                             worker_id, timestamps_json, updated_at,
-                            blocked_requires_json, task_content_hash
+                            blocked_requires_json, task_content_hash,
+                            awaiting_manual_ordinal
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s
+                            %s, %s, %s, %s
                         )
                         """,
                         (
@@ -505,6 +535,7 @@ class PostgresStore:
                             _utcnow(),
                             lifecycle.blocked_requires_json,
                             lifecycle.task_content_hash or None,
+                            lifecycle.awaiting_manual_ordinal,
                         ),
                     )
         except psycopg.errors.UniqueViolation as exc:
@@ -533,7 +564,8 @@ class PostgresStore:
                         timestamps_json = %s,
                         updated_at = %s,
                         blocked_requires_json = %s,
-                        task_content_hash = %s
+                        task_content_hash = %s,
+                        awaiting_manual_ordinal = %s
                     WHERE run_id = %s AND version = %s
                     """,
                     (
@@ -550,6 +582,7 @@ class PostgresStore:
                         _utcnow(),
                         lifecycle.blocked_requires_json,
                         lifecycle.task_content_hash or None,
+                        lifecycle.awaiting_manual_ordinal,
                         lifecycle.run_id,
                         expected_version,
                     ),
@@ -578,7 +611,7 @@ class PostgresStore:
                     SELECT run_id, task_id, status, version, retries, error,
                            agent_output, session_id, artifacts_dir, worker_id,
                            timestamps_json, blocked_requires_json,
-                           task_content_hash
+                           task_content_hash, awaiting_manual_ordinal
                     FROM lifecycles
                     WHERE run_id = %s
                     """,
@@ -587,6 +620,7 @@ class PostgresStore:
                 row = cur.fetchone()
         if row is None:
             return None
+        awaiting_raw = row["awaiting_manual_ordinal"]
         lc = Lifecycle(
             task_id=row["task_id"],
             run_id=row["run_id"],
@@ -600,6 +634,9 @@ class PostgresStore:
             session_id=row["session_id"] or "",
             artifacts_dir=row["artifacts_dir"] or "",
             blocked_requires_json=row["blocked_requires_json"],
+            awaiting_manual_ordinal=(
+                int(awaiting_raw) if awaiting_raw is not None else None
+            ),
             task_content_hash=row["task_content_hash"] or "",
         )
         lc.attempts = self.list_attempts(run_id)
@@ -728,9 +765,10 @@ class PostgresStore:
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
                     timestamps_json, updated_at, blocked_requires_json,
-                    task_content_hash
+                    task_content_hash, awaiting_manual_ordinal
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s
                 )
                 """,
                 (
@@ -748,6 +786,7 @@ class PostgresStore:
                     _utcnow(),
                     lc.blocked_requires_json,
                     lc.task_content_hash or None,
+                    lc.awaiting_manual_ordinal,
                 ),
             )
 
@@ -770,7 +809,8 @@ class PostgresStore:
                     timestamps_json = %s,
                     updated_at = %s,
                     blocked_requires_json = %s,
-                    task_content_hash = %s
+                    task_content_hash = %s,
+                    awaiting_manual_ordinal = %s
                 WHERE run_id = %s
                 """,
                 (
@@ -787,6 +827,7 @@ class PostgresStore:
                     _utcnow(),
                     lc.blocked_requires_json,
                     lc.task_content_hash or None,
+                    lc.awaiting_manual_ordinal,
                     lc.run_id,
                 ),
             )
@@ -800,7 +841,7 @@ class PostgresStore:
                 SELECT run_id, task_id, status, version, retries, error,
                        agent_output, session_id, artifacts_dir, worker_id,
                        timestamps_json, blocked_requires_json,
-                       task_content_hash
+                       task_content_hash, awaiting_manual_ordinal
                 FROM lifecycles
                 WHERE run_id = %s
                 FOR UPDATE
@@ -810,6 +851,7 @@ class PostgresStore:
             row = cur.fetchone()
             if row is None:
                 return None
+            awaiting_raw = row["awaiting_manual_ordinal"]
             lc = Lifecycle(
                 task_id=row["task_id"],
                 run_id=row["run_id"],
@@ -823,6 +865,9 @@ class PostgresStore:
                 session_id=row["session_id"] or "",
                 artifacts_dir=row["artifacts_dir"] or "",
                 blocked_requires_json=row["blocked_requires_json"],
+                awaiting_manual_ordinal=(
+                    int(awaiting_raw) if awaiting_raw is not None else None
+                ),
                 task_content_hash=row["task_content_hash"] or "",
             )
             cur.execute(

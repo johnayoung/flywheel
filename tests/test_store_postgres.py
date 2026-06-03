@@ -609,6 +609,98 @@ def test_fresh_postgres_records_current_schema_version(
     assert int(rows[0][0]) == CURRENT_SCHEMA_VERSION
 
 
+def test_v4_postgres_upgrades_to_v5_with_awaiting_manual_ordinal_column(
+    fresh_schema: str,
+) -> None:
+    """Existing v4 Postgres schemas must forward-migrate cleanly on
+    reopen: the ``awaiting_manual_ordinal`` column appears (as nullable
+    INTEGER), schema_version bumps to v5, and pre-existing lifecycle data
+    survives untouched. A pre-migration row reads ``None`` for the new
+    column."""
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    s_initial = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    )
+    s_initial.create_lifecycle(
+        Lifecycle(
+            task_id="t",
+            run_id="run-pre-migration",
+            blocked_requires_json='[{"type": "command_grader", "name": "ok"}]',
+        )
+    )
+    s_initial.close()
+
+    import psycopg
+    from psycopg import sql
+
+    schema_ident = sql.Identifier(fresh_schema)
+    with psycopg.connect(dsn) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(schema_ident)
+            )
+            cur.execute(
+                "ALTER TABLE lifecycles "
+                "DROP COLUMN awaiting_manual_ordinal"
+            )
+            cur.execute(
+                "UPDATE schema_version SET version = 4 WHERE id = 1"
+            )
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'lifecycles'
+                  AND column_name = 'awaiting_manual_ordinal'
+                """,
+                (fresh_schema,),
+            )
+            assert cur.fetchone() is None
+
+    s_migrated = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    )
+    try:
+        rows = _query(
+            s_migrated,
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = %s
+              AND table_name = 'lifecycles'
+              AND column_name = 'awaiting_manual_ordinal'
+            """,
+            (fresh_schema,),
+        )
+        assert len(rows) == 1
+        version_rows = _query(
+            s_migrated,
+            "SELECT version FROM schema_version WHERE id = 1",
+        )
+        assert int(version_rows[0][0]) == CURRENT_SCHEMA_VERSION
+        # Pre-migration data survives untouched; the new column reads NULL.
+        loaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert loaded is not None
+        assert loaded.blocked_requires_json == (
+            '[{"type": "command_grader", "name": "ok"}]'
+        )
+        assert loaded.awaiting_manual_ordinal is None
+        # New writes can set the column end-to-end against the upgraded
+        # store.
+        loaded.transition_to(Status.READY)
+        loaded.awaiting_manual_ordinal = 2
+        s_migrated.update_lifecycle(loaded, expected_version=1)
+        reloaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert reloaded is not None
+        assert reloaded.awaiting_manual_ordinal == 2
+    finally:
+        s_migrated.close()
+
+
 def test_opening_v2_postgres_without_blocked_requires_json_adds_column(
     fresh_schema: str,
 ) -> None:

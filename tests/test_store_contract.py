@@ -379,6 +379,131 @@ def test_blocked_requires_json_round_trips_through_create_update_load(
     )
 
 
+def test_awaiting_manual_ordinal_round_trips_through_create_update_load(
+    store: object,
+) -> None:
+    """awaiting_manual_ordinal must persist verbatim on create, survive
+    update (including clearing back to NULL/None), and default to None
+    when unset. Mirrors the contract across every backend so no store can
+    silently drop the column (the same shape as the
+    ``blocked_requires_json`` test above)."""
+    assert isinstance(store, LifecycleStore)
+
+    # 1. Default is None on a freshly-created lifecycle.
+    lc_default = Lifecycle(task_id="t", run_id="r-default")
+    store.create_lifecycle(lc_default)
+    loaded_default = store.load_lifecycle("r-default")
+    assert loaded_default is not None
+    assert loaded_default.awaiting_manual_ordinal is None
+
+    # 2. A non-zero ordinal round-trips on create.
+    lc = Lifecycle(
+        task_id="t",
+        run_id="r-set",
+        awaiting_manual_ordinal=3,
+    )
+    store.create_lifecycle(lc)
+    loaded = store.load_lifecycle("r-set")
+    assert loaded is not None
+    assert loaded.awaiting_manual_ordinal == 3
+
+    # 3. An ordinal of 0 is a real value, not the NULL sentinel.
+    lc_zero = Lifecycle(
+        task_id="t",
+        run_id="r-zero",
+        awaiting_manual_ordinal=0,
+    )
+    store.create_lifecycle(lc_zero)
+    loaded_zero = store.load_lifecycle("r-zero")
+    assert loaded_zero is not None
+    assert loaded_zero.awaiting_manual_ordinal == 0
+
+    # 4. Update can carry the column through a version bump.
+    loaded.version = 2
+    loaded.awaiting_manual_ordinal = 7
+    store.update_lifecycle(loaded, expected_version=1)
+    reloaded = store.load_lifecycle("r-set")
+    assert reloaded is not None
+    assert reloaded.awaiting_manual_ordinal == 7
+    assert reloaded.version == 2
+
+    # 5. Update can clear the column back to None.
+    reloaded.version = 3
+    reloaded.awaiting_manual_ordinal = None
+    store.update_lifecycle(reloaded, expected_version=2)
+    cleared = store.load_lifecycle("r-set")
+    assert cleared is not None
+    assert cleared.awaiting_manual_ordinal is None
+
+
+def test_awaiting_manual_ordinal_cleared_on_ready_done_failed_validation(
+    store: object,
+) -> None:
+    """Lifecycle.transition_to nulls ``awaiting_manual_ordinal`` on every
+    -> READY / -> DONE / -> FAILED_VALIDATION edge (mirroring the
+    blocked_requires_json clear on -> READY). The contract test pushes the
+    cleared value through the store so a backend that drops the column
+    during persistence is caught here, not at harness wiring time.
+    """
+    assert isinstance(store, LifecycleStore)
+
+    # --- -> READY clears -------------------------------------------------
+    # Drive a lifecycle far enough that it can land back on READY via the
+    # FAILED_VALIDATION retry edge; set the ordinal mid-flight to prove
+    # the next -> READY edge nulls it.
+    lc_ready = Lifecycle(task_id="t", run_id="r-clear-ready")
+    lc_ready.transition_to(Status.READY)  # v=2
+    lc_ready.transition_to(Status.RUNNING)  # v=3
+    lc_ready.transition_to(Status.VALIDATING)  # v=4
+    lc_ready.transition_to(
+        Status.FAILED_VALIDATION, error="grader failed"
+    )  # v=5
+    # Stash an ordinal on the parked-then-retried lifecycle so the next
+    # -> READY edge has something to clear (the harness would never set the
+    # column from FAILED_VALIDATION, but the clearing rule must not depend
+    # on the source state).
+    lc_ready.awaiting_manual_ordinal = 2
+    store.create_lifecycle(lc_ready)
+    lc_ready.transition_to(Status.READY)  # v=6, retry edge clears
+    assert lc_ready.awaiting_manual_ordinal is None
+    store.update_lifecycle(lc_ready, expected_version=5)
+    reloaded_ready = store.load_lifecycle("r-clear-ready")
+    assert reloaded_ready is not None
+    assert reloaded_ready.awaiting_manual_ordinal is None
+
+    # --- -> DONE clears (via AWAITING_APPROVAL approve) ------------------
+    lc_done = Lifecycle(task_id="t", run_id="r-clear-done")
+    lc_done.transition_to(Status.READY)
+    lc_done.transition_to(Status.RUNNING)
+    lc_done.transition_to(Status.VALIDATING)
+    lc_done.transition_to(Status.AWAITING_APPROVAL)
+    lc_done.awaiting_manual_ordinal = 4
+    store.create_lifecycle(lc_done)
+    lc_done.transition_to(Status.DONE)
+    assert lc_done.awaiting_manual_ordinal is None
+    store.update_lifecycle(lc_done, expected_version=5)
+    reloaded_done = store.load_lifecycle("r-clear-done")
+    assert reloaded_done is not None
+    assert reloaded_done.status is Status.DONE
+    assert reloaded_done.awaiting_manual_ordinal is None
+
+    # --- -> FAILED_VALIDATION clears (via AWAITING_APPROVAL reject) ------
+    lc_fv = Lifecycle(task_id="t", run_id="r-clear-fv")
+    lc_fv.transition_to(Status.READY)
+    lc_fv.transition_to(Status.RUNNING)
+    lc_fv.transition_to(Status.VALIDATING)
+    lc_fv.transition_to(Status.AWAITING_APPROVAL)
+    lc_fv.awaiting_manual_ordinal = 5
+    store.create_lifecycle(lc_fv)
+    lc_fv.transition_to(Status.FAILED_VALIDATION, error="reviewer rejected")
+    assert lc_fv.awaiting_manual_ordinal is None
+    store.update_lifecycle(lc_fv, expected_version=5)
+    reloaded_fv = store.load_lifecycle("r-clear-fv")
+    assert reloaded_fv is not None
+    assert reloaded_fv.status is Status.FAILED_VALIDATION
+    assert reloaded_fv.awaiting_manual_ordinal is None
+
+
 def test_load_lifecycle_attaches_attempts_in_number_order(
     store: object,
 ) -> None:

@@ -623,6 +623,93 @@ def test_v3_store_upgrades_to_v4_with_control_commands_table(
         s_migrated.close()
 
 
+def _downgrade_to_v4_without_awaiting_manual_ordinal(db: Path) -> None:
+    """Strip the v5 additions from a bootstrapped store so it looks like a
+    pre-feature v4 database: drop ``lifecycles.awaiting_manual_ordinal``
+    and pin ``schema_version`` back to 4. The store's bootstrap then
+    exercises the forward migration path on reopen."""
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute(
+            "ALTER TABLE lifecycles DROP COLUMN awaiting_manual_ordinal"
+        )
+        conn.execute(
+            "UPDATE schema_version SET version = 4 WHERE id = 1"
+        )
+    finally:
+        conn.close()
+
+
+def test_v4_store_upgrades_to_v5_with_awaiting_manual_ordinal_column(
+    tmp_path: Path,
+) -> None:
+    """Existing v4 stores must forward-migrate cleanly on reopen: the
+    ``awaiting_manual_ordinal`` column appears (as nullable INTEGER),
+    schema_version bumps to v5, and pre-existing lifecycle data survives
+    untouched. A pre-migration row reads ``None`` for the new column."""
+    db = tmp_path / "v4-upgrade.db"
+    s_initial = SqliteStore(db)
+    s_initial.create_lifecycle(
+        Lifecycle(
+            task_id="t",
+            run_id="run-pre-migration",
+            blocked_requires_json='[{"type": "command_grader", "name": "ok"}]',
+        )
+    )
+    s_initial.close()
+
+    _downgrade_to_v4_without_awaiting_manual_ordinal(db)
+
+    # Sanity-check the downgrade: the new column really is gone and the
+    # version row is back at 4.
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        cols = {
+            r[1]
+            for r in conn.execute("PRAGMA table_info(lifecycles)").fetchall()
+        }
+        assert "awaiting_manual_ordinal" not in cols
+        (version,) = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == 4
+    finally:
+        conn.close()
+
+    s_migrated = SqliteStore(db)
+    try:
+        cols = {
+            r["name"]
+            for r in s_migrated._connection.execute(
+                "PRAGMA table_info(lifecycles)"
+            ).fetchall()
+        }
+        assert "awaiting_manual_ordinal" in cols, (
+            "v4 -> v5 migration must add awaiting_manual_ordinal"
+        )
+        (version,) = s_migrated._connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == CURRENT_SCHEMA_VERSION
+        # Pre-migration data survives untouched; the new column reads NULL.
+        loaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert loaded is not None
+        assert loaded.blocked_requires_json == (
+            '[{"type": "command_grader", "name": "ok"}]'
+        )
+        assert loaded.awaiting_manual_ordinal is None
+        # New writes can set + clear the column end-to-end against the
+        # upgraded store.
+        loaded.transition_to(Status.READY)
+        loaded.awaiting_manual_ordinal = 2
+        s_migrated.update_lifecycle(loaded, expected_version=1)
+        reloaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert reloaded is not None
+        assert reloaded.awaiting_manual_ordinal == 2
+    finally:
+        s_migrated.close()
+
+
 def test_opening_v2_store_without_blocked_requires_json_adds_column(
     tmp_path: Path,
 ) -> None:

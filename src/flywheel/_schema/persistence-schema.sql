@@ -54,20 +54,27 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_id_created ON tasks(id, created_at);
 
 CREATE TABLE IF NOT EXISTS lifecycles (
-  run_id               TEXT PRIMARY KEY,
-  task_id              TEXT NOT NULL,
-  status               TEXT NOT NULL,
-  version              INTEGER NOT NULL,
-  retries              INTEGER NOT NULL,
-  error                TEXT,
-  agent_output         TEXT,
-  session_id           TEXT,
-  artifacts_dir        TEXT,
-  worker_id            TEXT,
-  timestamps_json      TEXT NOT NULL,
-  updated_at           DATETIME NOT NULL,
-  blocked_requires_json TEXT,
-  task_content_hash    TEXT
+  run_id                  TEXT PRIMARY KEY,
+  task_id                 TEXT NOT NULL,
+  status                  TEXT NOT NULL,
+  version                 INTEGER NOT NULL,
+  retries                 INTEGER NOT NULL,
+  error                   TEXT,
+  agent_output            TEXT,
+  session_id              TEXT,
+  artifacts_dir           TEXT,
+  worker_id               TEXT,
+  timestamps_json         TEXT NOT NULL,
+  updated_at              DATETIME NOT NULL,
+  blocked_requires_json   TEXT,
+  task_content_hash       TEXT,
+  -- ordinal (index in task.graders) of the manual gate the lifecycle is
+  -- currently parked on. NULL in every state except AWAITING_APPROVAL; the
+  -- column is cleared on every -> READY/-> DONE/-> FAILED_VALIDATION edge
+  -- in Lifecycle.transition_to (the same back-compat path as
+  -- blocked_requires_json). Added in schema_version 5 via the forward
+  -- migration each concrete store applies on bootstrap.
+  awaiting_manual_ordinal INTEGER
 );
 
 -- agent_context_json captures the agent identity for this attempt so the run
@@ -222,12 +229,13 @@ CREATE INDEX IF NOT EXISTS idx_control_commands_pending
 -- mismatched databases with StoreSchemaError. Forward migrations from
 -- earlier schema versions are applied by the concrete store's bootstrap
 -- (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT EXISTS above
--- materializes control_commands on an existing database).
+-- materializes control_commands on an existing database; v4 -> v5 adds
+-- the lifecycles.awaiting_manual_ordinal nullable column).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 4);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 5);
 
 -- claude_session_store: Claude Code agent transcript persistence.
 -- One row per transcript entry; seq orders entries within a

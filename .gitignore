@@ -50,5 +50,6 @@ Thumbs.db
 .workflow/worktrees/
 .workflow/.merge.lock
 
-# Claude Code local config
-.claude/
+# Claude Code local config (commands are tracked; the rest is local)
+.claude/*
+!.claude/commands/

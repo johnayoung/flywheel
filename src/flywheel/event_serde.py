@@ -22,6 +22,7 @@ from typing import Any
 from flywheel.events import (
     AttemptFinalized,
     AttemptStarted,
+    AwaitingApproval,
     Blocked,
     DomainEvent,
     DomainEventKind,
@@ -59,6 +60,8 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
         return {"requires_json": event.requires_json}
     if isinstance(event, Unblocked):
         return {}
+    if isinstance(event, AwaitingApproval):
+        return {"awaiting_ordinal": event.awaiting_ordinal}
     if isinstance(event, RetryScheduled):
         return {
             "retries_used": event.retries_used,
@@ -135,6 +138,10 @@ def event_from_record(
         return Blocked(requires_json=payload["requires_json"], **common)
     if event_kind_enum is DomainEventKind.UNBLOCKED:
         return Unblocked(**common)
+    if event_kind_enum is DomainEventKind.AWAITING_APPROVAL:
+        return AwaitingApproval(
+            awaiting_ordinal=payload["awaiting_ordinal"], **common
+        )
     if event_kind_enum is DomainEventKind.RETRY_SCHEDULED:
         return RetryScheduled(
             retries_used=payload["retries_used"],

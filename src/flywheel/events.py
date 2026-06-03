@@ -40,6 +40,7 @@ class DomainEventKind(str, Enum):
     TRANSITIONED_TO = "transitioned_to"
     BLOCKED = "blocked"
     UNBLOCKED = "unblocked"
+    AWAITING_APPROVAL = "awaiting_approval"
     RETRY_SCHEDULED = "retry_scheduled"
     ATTEMPT_STARTED = "attempt_started"
     ATTEMPT_FINALIZED = "attempt_finalized"
@@ -113,6 +114,23 @@ class Unblocked(_DomainEventBase):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AwaitingApproval(_DomainEventBase):
+    """Records which manual-grader gate a lifecycle is parking on.
+
+    Always paired with a subsequent ``TransitionedTo(AWAITING_APPROVAL)``
+    (or, on re-park to a later gate, a re-emit while the lifecycle is
+    already in ``AWAITING_APPROVAL``). The reducer folds ``awaiting_ordinal``
+    onto the lifecycle's ``awaiting_manual_ordinal`` field; the centralized
+    clear on ``-> READY`` / ``-> DONE`` / ``-> FAILED_VALIDATION`` later
+    nulls it again.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.AWAITING_APPROVAL
+
+    awaiting_ordinal: int
+
+
+@dataclass(frozen=True, kw_only=True)
 class RetryScheduled(_DomainEventBase):
     """Audit witness of the harness's decision to retry. The retry-counter
     bump is applied by the paired ``TransitionedTo(READY)`` from a retry-source
@@ -182,6 +200,7 @@ DomainEvent = (
     | TransitionedTo
     | Blocked
     | Unblocked
+    | AwaitingApproval
     | RetryScheduled
     | AttemptStarted
     | AttemptFinalized
@@ -221,6 +240,7 @@ def _clone(state: Lifecycle) -> Lifecycle:
         session_id=state.session_id,
         artifacts_dir=state.artifacts_dir,
         blocked_requires_json=state.blocked_requires_json,
+        awaiting_manual_ordinal=state.awaiting_manual_ordinal,
         task_content_hash=state.task_content_hash,
     )
 
@@ -274,6 +294,8 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
         new.apply_transition(event.target, error=event.error, now=event.ts)
     elif isinstance(event, Blocked):
         new.blocked_requires_json = event.requires_json
+    elif isinstance(event, AwaitingApproval):
+        new.awaiting_manual_ordinal = event.awaiting_ordinal
     elif isinstance(event, AttemptStarted):
         new.attempts.append(
             Attempt(

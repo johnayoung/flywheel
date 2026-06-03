@@ -38,6 +38,7 @@ from flywheel import (
     InvocationSignals,
     IterationResult,
     Lifecycle,
+    ManualGrader,
     Outcome,
     RubricGrader,
     Status,
@@ -2944,6 +2945,272 @@ class TestRubricIntegration:
         # Attempt #1's prompt must NOT include the section.
         first_prompt = invoke.calls[0].prompt  # type: ignore[attr-defined]
         assert "# Reviewer feedback" not in first_prompt
+
+
+class TestManualGateEntry:
+    """Validation seat enters the manual-approval gate after all automated
+    graders pass when the task declares any :class:`ManualGrader`."""
+
+    @pytest.fixture(autouse=True)
+    def _worktree(self, tmp_path: Path) -> None:
+        self._wt = str(tmp_path)
+
+    def test_all_pass_with_manual_gate_parks_at_awaiting_approval(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+                ManualGrader(
+                    instruction="Confirm the migration is safe.",
+                    name="confirm-migration",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-manual-park")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Lifecycle parks at AWAITING_APPROVAL pinned to the manual gate.
+        assert outcome.lifecycle.status == Status.AWAITING_APPROVAL
+        assert outcome.lifecycle.awaiting_manual_ordinal == 2
+
+        # Attempt is finalized SUCCEEDED — the agent passed every
+        # automated grader; the human wait is a lifecycle-level gate.
+        assert len(outcome.attempts) == 1
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.SUCCEEDED
+        assert attempt.ended_at is not None
+        assert attempt.error == ""
+
+        # The harness.awaiting_approval audit event carries the gate
+        # instruction plus the documented context pointers.
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert len(events) == 1
+        payload = events[0].payload
+        assert payload["instructions"] == "Confirm the migration is safe."
+        assert payload["awaiting_ordinal"] == 2
+        assert payload["grader_name"] == "confirm-migration"
+        assert payload["run_id"] == lifecycle.run_id
+        assert payload["attempt_number"] == 1
+        # artifacts_dir is the per-attempt directory string when set,
+        # the empty string otherwise; here no artifacts root is
+        # configured so it is empty.
+        assert payload["artifacts_dir"] == ""
+
+        # No DONE event fires while the gate is parked.
+        assert Status.DONE not in outcome.lifecycle.timestamps
+
+        # The awaiting_manual_ordinal persists across a reload (the
+        # AwaitingApproval domain event is event-sourced so loaded ==
+        # folded, matching the audit-stream oracle).
+        loaded = store.load_lifecycle(lifecycle.run_id)
+        assert loaded is not None
+        assert loaded.status == Status.AWAITING_APPROVAL
+        assert loaded.awaiting_manual_ordinal == 2
+        folded = replay(store.list_domain_events(lifecycle.run_id))
+        assert folded.awaiting_manual_ordinal == 2
+        assert loaded == folded
+
+    def test_all_pass_with_no_manual_gate_still_reaches_done(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-no-manual")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": true, "summary": "ok"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Byte-identical to today's all-pass-no-manual path: DONE with no
+        # awaiting_approval audit event and the ordinal column untouched.
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.lifecycle.awaiting_manual_ordinal is None
+        assert outcome.attempts[-1].outcome == Outcome.SUCCEEDED
+
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert events == []
+
+        # No AWAITING_APPROVAL state ever entered.
+        assert Status.AWAITING_APPROVAL not in outcome.lifecycle.timestamps
+
+    def test_rubric_failure_never_enters_manual_gate(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(
+                    assertions=["a"], name="strict", retry_on_fail=False
+                ),
+                ManualGrader(
+                    instruction="Should never be reached.",
+                    name="never",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-fail-no-gate")
+        judge = _ScriptedJudge(
+            [_rubric_wrap('{"passed": false, "summary": "bad"}')]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Rubric failure with retry_on_fail=False routes to INTERRUPTED
+        # and short-circuits the manual gate entirely.
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        assert outcome.lifecycle.awaiting_manual_ordinal is None
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert events == []
+
+    def test_command_failure_never_enters_manual_gate(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(1)'",
+                    name="bad",
+                ),
+                ManualGrader(
+                    instruction="Should never be reached.",
+                    name="never",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-cmd-fail-no-gate")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(worktree=self._wt)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Command grader failure exhausts retries and reaches FAILED
+        # without ever entering AWAITING_APPROVAL.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert outcome.lifecycle.awaiting_manual_ordinal is None
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert events == []
+
+    def test_transcript_failure_never_enters_manual_gate(self) -> None:
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                TranscriptGrader(max_turns=0, name="caps"),
+                ManualGrader(
+                    instruction="Should never be reached.",
+                    name="never",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-transcript-fail-no-gate"
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg(num_turns=5)),
+                    signals=_make_signals(num_turns=5),
+                )
+            ]
+        )
+        config = HarnessConfig(worktree=self._wt, max_retries=0)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Transcript breach drives FAILED_VALIDATION -> FAILED with no
+        # manual gate ever evaluated.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert outcome.lifecycle.awaiting_manual_ordinal is None
+        events = [
+            e
+            for e in store.list_events(lifecycle.run_id)
+            if e.kind == "harness.awaiting_approval"
+        ]
+        assert events == []
 
 
 class TestHarnessConfigDefaults:

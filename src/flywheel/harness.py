@@ -95,6 +95,7 @@ from flywheel.grader_transcript import (
 from flywheel.events import (
     AttemptFinalized,
     AttemptStarted,
+    AwaitingApproval,
     Blocked,
     DomainEvent,
     LifecycleInitialized,
@@ -119,8 +120,15 @@ from flywheel.store_protocols import (
     LifecycleAlreadyExistsError,
     SdkMessageRecord,
 )
+from flywheel.grader_manual import ManualGate, next_pending_manual_gate
 from flywheel.loaders import task_digest
-from flywheel.task import CommandGrader, RubricGrader, Task, TranscriptGrader
+from flywheel.task import (
+    CommandGrader,
+    ManualGrader,
+    RubricGrader,
+    Task,
+    TranscriptGrader,
+)
 
 
 # Loop.md flags these subsystems as still-TODO after the safety-net work
@@ -1379,6 +1387,13 @@ async def run_task(
             if lifecycle.status == Status.INTERRUPTED:
                 # Paused this run; caller resumes by invoking run_task again.
                 break
+            if lifecycle.status == Status.AWAITING_APPROVAL:
+                # Parked on a manual-grader gate; the attempt was finalized
+                # SUCCEEDED at gate entry. The resolver (spec 00016) applies
+                # the operator's approve/reject decision out-of-band on the
+                # orchestrator's reactive sweep, so this run_task call
+                # returns here exactly like the INTERRUPTED park does.
+                break
 
             if lifecycle.status == Status.READY:
                 await _run_attempt(
@@ -2527,6 +2542,34 @@ async def _validate(
         rubric_passed = all(r.passed for r in rubric_results)
 
     if command_passed and transcript_passed and rubric_passed:
+        # When the task declares any ManualGrader, the attempt has passed
+        # every automated grader but still owes a human decision. Finalize
+        # the attempt SUCCEEDED (the agent's clock measures the agent, not
+        # the unbounded human wait — see the SUCCEEDED-semantics NFR in
+        # spec 00016) and park the lifecycle on the first manual gate
+        # instead of promoting straight to DONE. The byte-identical
+        # ``-> DONE`` path is preserved below for the zero-manual-gate
+        # case.
+        first_gate = next_pending_manual_gate(task, after_ordinal=None)
+        if first_gate is not None:
+            _finalize_attempt(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.SUCCEEDED,
+                error="",
+                agent_output=agent_output,
+                clock=clock,
+            )
+            _enter_manual_gate(
+                store=store,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                gate=first_gate,
+                attempt_dir=attempt_dir,
+                clock=clock,
+            )
+            return
         _finalize_attempt(
             store=store,
             lifecycle=lifecycle,
@@ -2651,6 +2694,59 @@ async def _validate(
             error=error,
             now=clock,
         )
+
+
+def _enter_manual_gate(
+    *,
+    store: HarnessStore,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    gate: ManualGate,
+    attempt_dir: Path | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """Park a lifecycle on a manual-grader gate after automated graders pass.
+
+    Persists the awaiting gate ordinal via an ``AwaitingApproval`` domain
+    event (so the column survives event-replay parity) and transitions
+    ``VALIDATING -> AWAITING_APPROVAL``. Then emits the audit-stream
+    ``harness.awaiting_approval`` event so operators (and the live surface)
+    learn a decision is owed. The attempt is expected to have been
+    finalized ``SUCCEEDED`` immediately before this call; the human wait
+    is a lifecycle-level gate that does not extend attempt duration.
+    """
+    _append(
+        lifecycle,
+        AwaitingApproval(
+            run_id=lifecycle.run_id,
+            ts=clock(),
+            attempt_number=attempt.number,
+            awaiting_ordinal=gate.ordinal,
+        ),
+        store=store,
+    )
+    _transition(
+        lifecycle,
+        Status.AWAITING_APPROVAL,
+        store=store,
+        now=clock,
+    )
+    artifacts_dir = str(attempt_dir) if attempt_dir is not None else ""
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.awaiting_approval",
+        payload={
+            "instructions": gate.instruction,
+            "awaiting_ordinal": gate.ordinal,
+            "grader_name": gate.grader_name,
+            "run_id": lifecycle.run_id,
+            "attempt_number": attempt.number,
+            "artifacts_dir": artifacts_dir,
+        },
+        attempt_number=attempt.number,
+        now=clock,
+    )
 
 
 def _emit_rubric_events(

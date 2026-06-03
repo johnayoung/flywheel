@@ -9,6 +9,7 @@ class Status(str, Enum):
     READY = "ready"
     RUNNING = "running"
     VALIDATING = "validating"
+    AWAITING_APPROVAL = "awaiting_approval"
     FAILED_VALIDATION = "failed_validation"
     INTERNAL_ERROR = "internal_error"
     DONE = "done"
@@ -42,10 +43,14 @@ _VALID_EDGES: dict[Status, frozenset[Status]] = {
     Status.VALIDATING: frozenset(
         {
             Status.DONE,
+            Status.AWAITING_APPROVAL,
             Status.FAILED_VALIDATION,
             Status.INTERRUPTED,
             Status.INTERNAL_ERROR,
         }
+    ),
+    Status.AWAITING_APPROVAL: frozenset(
+        {Status.DONE, Status.FAILED_VALIDATION}
     ),
     Status.FAILED_VALIDATION: frozenset({Status.READY, Status.FAILED}),
     Status.INTERNAL_ERROR: frozenset({Status.READY, Status.FAILED}),
@@ -102,6 +107,7 @@ class Lifecycle:
     session_id: str = ""
     artifacts_dir: str = ""
     blocked_requires_json: str | None = None
+    awaiting_manual_ordinal: int | None = None
     # Content hash of the exact Task definition this run executed; pins the
     # run to a row in the content-addressed `tasks` store. Identity-shaping
     # like task_id/run_id: set once at seed, never copied by replace_from.
@@ -152,6 +158,17 @@ class Lifecycle:
         # normalization for interrupted lifecycles.
         if target == Status.READY:
             self.blocked_requires_json = None
+        # Centralized clear for the manual-approval gate ordinal: the
+        # awaiting_manual_ordinal pins a parked AWAITING_APPROVAL lifecycle
+        # to a specific gate in task.graders. Any edge that exits the gate
+        # (-> DONE on the last approve, -> FAILED_VALIDATION on a reject) or
+        # restarts the lifecycle from READY (entry-time normalization /
+        # retry / recheck) must drop the snapshot so it can never survive
+        # into a state where it would be meaningless. Mirrors the
+        # blocked_requires_json clear above and stays pure (the harness
+        # writes the ordinal; this module only nulls it).
+        if target in (Status.READY, Status.DONE, Status.FAILED_VALIDATION):
+            self.awaiting_manual_ordinal = None
 
     def transition_to(
         self,
@@ -185,6 +202,7 @@ class Lifecycle:
         self.error = persisted.error
         self.timestamps = dict(persisted.timestamps)
         self.blocked_requires_json = persisted.blocked_requires_json
+        self.awaiting_manual_ordinal = persisted.awaiting_manual_ordinal
         self.agent_output = persisted.agent_output
         self.session_id = persisted.session_id
         self.artifacts_dir = persisted.artifacts_dir

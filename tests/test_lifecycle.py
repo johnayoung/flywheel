@@ -15,12 +15,13 @@ from flywheel import (
 # --- Type fidelity ---------------------------------------------------------
 
 
-def test_status_enumerates_exactly_the_nine_spec_states() -> None:
+def test_status_enumerates_exactly_the_ten_spec_states() -> None:
     expected = {
         "pending",
         "ready",
         "running",
         "validating",
+        "awaiting_approval",
         "failed_validation",
         "internal_error",
         "done",
@@ -56,6 +57,7 @@ def test_lifecycle_fields_match_spec_table() -> None:
         "session_id",
         "artifacts_dir",
         "blocked_requires_json",
+        "awaiting_manual_ordinal",
         "task_content_hash",
     }
     assert {f.name for f in fields(Lifecycle)} == expected
@@ -64,6 +66,11 @@ def test_lifecycle_fields_match_spec_table() -> None:
 def test_default_lifecycle_blocked_requires_json_is_none() -> None:
     lc = Lifecycle(task_id="t1")
     assert lc.blocked_requires_json is None
+
+
+def test_default_lifecycle_awaiting_manual_ordinal_is_none() -> None:
+    lc = Lifecycle(task_id="t1")
+    assert lc.awaiting_manual_ordinal is None
 
 
 def test_attempt_fields_match_spec_table() -> None:
@@ -136,6 +143,37 @@ def test_validating_to_done() -> None:
     lc = Lifecycle(task_id="t", status=Status.VALIDATING)
     lc.transition_to(Status.DONE)
     assert lc.status is Status.DONE
+
+
+def test_validating_to_awaiting_approval_no_error_required() -> None:
+    lc = Lifecycle(task_id="t", status=Status.VALIDATING)
+    lc.transition_to(Status.AWAITING_APPROVAL)
+    assert lc.status is Status.AWAITING_APPROVAL
+    assert Status.AWAITING_APPROVAL in lc.timestamps
+    assert lc.error == ""
+
+
+def test_awaiting_approval_to_done() -> None:
+    lc = Lifecycle(task_id="t", status=Status.AWAITING_APPROVAL)
+    lc.transition_to(Status.DONE)
+    assert lc.status is Status.DONE
+
+
+def test_awaiting_approval_to_failed_validation_requires_error() -> None:
+    lc = Lifecycle(task_id="t", status=Status.AWAITING_APPROVAL)
+    lc.transition_to(
+        Status.FAILED_VALIDATION,
+        error="manual grader 'confirm-migration' rejected by operator",
+    )
+    assert lc.status is Status.FAILED_VALIDATION
+    assert lc.error == "manual grader 'confirm-migration' rejected by operator"
+
+
+def test_awaiting_approval_to_failed_validation_without_error_rejected() -> None:
+    lc = Lifecycle(task_id="t", status=Status.AWAITING_APPROVAL)
+    with pytest.raises(LifecycleTransitionError, match="requires a non-empty error"):
+        lc.transition_to(Status.FAILED_VALIDATION)
+    assert lc.status is Status.AWAITING_APPROVAL
 
 
 def test_validating_to_failed_validation_requires_error() -> None:
@@ -269,6 +307,19 @@ def test_validating_cannot_go_back_to_running() -> None:
         lc.transition_to(Status.RUNNING)
 
 
+def test_awaiting_approval_other_transitions_rejected() -> None:
+    """AWAITING_APPROVAL is non-terminal but only exits to DONE or
+    FAILED_VALIDATION. Every other target — including reflexive
+    AWAITING_APPROVAL — must raise LifecycleTransitionError."""
+    allowed = {Status.DONE, Status.FAILED_VALIDATION}
+    for target in Status:
+        if target in allowed:
+            continue
+        lc = Lifecycle(task_id="t", status=Status.AWAITING_APPROVAL)
+        with pytest.raises(LifecycleTransitionError, match="illegal transition"):
+            lc.transition_to(target, error="x")
+
+
 # --- Error requirement -----------------------------------------------------
 
 
@@ -368,6 +419,97 @@ def test_is_retry_eligible_false_when_budget_exhausted() -> None:
 def test_is_retry_eligible_false_when_both_conditions_wrong() -> None:
     lc = Lifecycle(task_id="t", status=Status.DONE, retries=5)
     assert lc.is_retry_eligible(max_retries=3) is False
+
+
+def test_is_retry_eligible_false_in_awaiting_approval() -> None:
+    """AWAITING_APPROVAL is a parked, non-terminal state; it is not a
+    retry source. is_retry_eligible must report False regardless of
+    remaining budget so the harness never schedules a fresh attempt
+    while a human gate is pending."""
+    lc = Lifecycle(task_id="t", status=Status.AWAITING_APPROVAL, retries=0)
+    assert lc.is_retry_eligible(max_retries=3) is False
+
+
+def test_entering_awaiting_approval_does_not_consume_retry_budget() -> None:
+    """Entering AWAITING_APPROVAL from VALIDATING is an automated-graders-
+    passed park, not a failure. It must not bump `retries` and must not
+    clear `error` as a retry edge would."""
+    lc = Lifecycle(task_id="t", status=Status.VALIDATING, retries=2)
+    lc.transition_to(Status.AWAITING_APPROVAL)
+    assert lc.status is Status.AWAITING_APPROVAL
+    assert lc.retries == 2
+
+
+def test_awaiting_approval_to_failed_validation_does_not_consume_retry_budget() -> None:
+    """The rejection edge itself does not consume budget; the
+    subsequent FAILED_VALIDATION -> READY edge is the retry-source
+    edge. Confirm budget is unchanged on the rejection step."""
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.AWAITING_APPROVAL,
+        retries=1,
+    )
+    lc.transition_to(Status.FAILED_VALIDATION, error="rejected")
+    assert lc.retries == 1
+
+
+# --- awaiting_manual_ordinal centralized clear ----------------------------
+
+
+def test_awaiting_approval_to_done_clears_awaiting_manual_ordinal() -> None:
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.AWAITING_APPROVAL,
+        awaiting_manual_ordinal=3,
+    )
+    lc.transition_to(Status.DONE)
+    assert lc.awaiting_manual_ordinal is None
+
+
+def test_awaiting_approval_to_failed_validation_clears_awaiting_manual_ordinal() -> None:
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.AWAITING_APPROVAL,
+        awaiting_manual_ordinal=2,
+    )
+    lc.transition_to(Status.FAILED_VALIDATION, error="rejected")
+    assert lc.awaiting_manual_ordinal is None
+
+
+def test_failed_validation_retry_clears_awaiting_manual_ordinal() -> None:
+    """A leaked ordinal on a FAILED_VALIDATION row (e.g. inherited via
+    replace_from from a prior parked snapshot) must not survive the
+    retry edge into READY."""
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.FAILED_VALIDATION,
+        error="x",
+        awaiting_manual_ordinal=4,
+    )
+    lc.transition_to(Status.READY)
+    assert lc.awaiting_manual_ordinal is None
+
+
+def test_pending_to_ready_clears_awaiting_manual_ordinal() -> None:
+    """Entry-time normalization edge — a never-cleared ordinal on a
+    fresh lifecycle must not survive the first transition into the
+    active state machine."""
+    lc = Lifecycle(task_id="t", awaiting_manual_ordinal=7)
+    lc.transition_to(Status.READY)
+    assert lc.awaiting_manual_ordinal is None
+
+
+def test_validating_to_awaiting_approval_preserves_awaiting_manual_ordinal() -> None:
+    """The harness writes awaiting_manual_ordinal at gate entry; the
+    transition into AWAITING_APPROVAL must not clobber it. Only the
+    three exit edges (-> READY, -> DONE, -> FAILED_VALIDATION) clear it."""
+    lc = Lifecycle(
+        task_id="t",
+        status=Status.VALIDATING,
+        awaiting_manual_ordinal=2,
+    )
+    lc.transition_to(Status.AWAITING_APPROVAL)
+    assert lc.awaiting_manual_ordinal == 2
 
 
 # --- consecutive_failed_runs ----------------------------------------------

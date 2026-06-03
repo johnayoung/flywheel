@@ -1950,6 +1950,14 @@ def _enqueue_control_command(
     foreign key on ``lifecycles(run_id)``, so we surface that as exit
     code ``2`` with a clear message rather than crash on the
     :class:`sqlite3.IntegrityError`.
+
+    ``approve`` / ``reject`` are out-of-band verbs that target a
+    correctly-parked ``AWAITING_APPROVAL`` lifecycle (the
+    ``resolve_manual_approval`` sweep consumes them), so the in-flight
+    check accepts ``AWAITING_APPROVAL`` for those verbs and the standard
+    ``RUNNING`` / ``VALIDATING`` set for everything else — that way an
+    operator who runs ``flywheel approve`` against a parked run does not
+    see the stale-pending warning.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
@@ -1962,7 +1970,11 @@ def _enqueue_control_command(
                 file=sys.stderr,
             )
             return 2
-        in_flight = lifecycle.status in (Status.RUNNING, Status.VALIDATING)
+        if kind in ("approve", "reject"):
+            in_flight_statuses: tuple[Status, ...] = (Status.AWAITING_APPROVAL,)
+        else:
+            in_flight_statuses = (Status.RUNNING, Status.VALIDATING)
+        in_flight = lifecycle.status in in_flight_statuses
         record = store.enqueue_command(
             run_id, kind, payload, now=datetime.now(timezone.utc)
         )
@@ -2022,6 +2034,42 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         args.run_id,
         "set_model",
         {"model": args.model},
+    )
+
+
+def _cmd_approve(args: argparse.Namespace) -> int:
+    """``flywheel approve RUN_ID`` — approve the awaiting manual gate.
+
+    Enqueues a ``kind=approve`` row against ``RUN_ID``. The out-of-band
+    ``resolve_manual_approval`` sweep claims it on the next reactive tick,
+    writes a ``passed=True`` manual ``GraderResultRecord`` for the
+    parked gate, and either re-parks on the next gate or transitions
+    ``AWAITING_APPROVAL -> DONE``. The producer accepts
+    ``AWAITING_APPROVAL`` as the valid in-flight status for this verb so
+    the operator does not see the stale-pending warning when approving a
+    correctly-parked run.
+    """
+    return _enqueue_control_command(
+        _resolve_db(args.db), args.run_id, "approve", {}
+    )
+
+
+def _cmd_reject(args: argparse.Namespace) -> int:
+    """``flywheel reject RUN_ID [--feedback TEXT]`` — reject the awaiting gate.
+
+    Enqueues a ``kind=reject`` row carrying an optional
+    ``{"feedback": TEXT}`` payload. The out-of-band resolver writes a
+    ``passed=False`` manual ``GraderResultRecord`` whose summary is the
+    feedback text (or a ``"(no feedback provided)"`` placeholder when
+    absent), transitions ``AWAITING_APPROVAL -> FAILED_VALIDATION``, and
+    surfaces the feedback in the next attempt's reviewer-feedback section.
+    The in-flight check accepts ``AWAITING_APPROVAL`` for this verb.
+    """
+    payload: dict[str, Any] = {}
+    if args.feedback is not None:
+        payload["feedback"] = args.feedback
+    return _enqueue_control_command(
+        _resolve_db(args.db), args.run_id, "reject", payload
     )
 
 
@@ -2378,6 +2426,52 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_common_db(p_set_model)
     p_set_model.set_defaults(func=_cmd_set_model)
+
+    p_approve = sub.add_parser(
+        "approve",
+        help=(
+            "Enqueue an approve control command against RUN_ID. The "
+            "out-of-band manual-approval resolver claims it on the next "
+            "reactive tick, writes a passing manual grader receipt for the "
+            "parked gate, and advances the lifecycle (next gate or DONE)."
+        ),
+    )
+    p_approve.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Lifecycle run_id of the AWAITING_APPROVAL run to approve.",
+    )
+    _add_common_db(p_approve)
+    p_approve.set_defaults(func=_cmd_approve)
+
+    p_reject = sub.add_parser(
+        "reject",
+        help=(
+            "Enqueue a reject control command against RUN_ID, optionally "
+            "carrying operator feedback. The out-of-band resolver writes a "
+            "failing manual grader receipt and routes the lifecycle through "
+            "FAILED_VALIDATION; --feedback flows into the next attempt's "
+            "reviewer-feedback section."
+        ),
+    )
+    p_reject.add_argument(
+        "run_id",
+        metavar="RUN_ID",
+        help="Lifecycle run_id of the AWAITING_APPROVAL run to reject.",
+    )
+    p_reject.add_argument(
+        "--feedback",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Optional operator critique to attach to the rejection. Renders "
+            "in the next attempt's # Reviewer feedback section so the agent "
+            "can address it. Absent feedback is recorded as "
+            '"(no feedback provided)".'
+        ),
+    )
+    _add_common_db(p_reject)
+    p_reject.set_defaults(func=_cmd_reject)
 
     return parser
 

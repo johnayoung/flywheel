@@ -2237,3 +2237,236 @@ def test_cmd_steer_rejects_empty_message(
     finally:
         store.close()
     assert claimed == []
+
+
+# ---------- approve / reject CLI subcommands ----------
+
+
+def _seed_awaiting_approval(store: SqliteStore, task_id: str) -> Lifecycle:
+    """Drive a lifecycle through to AWAITING_APPROVAL for producer tests.
+
+    Mirrors the path the harness takes when every automated grader passes
+    against a task that declares at least one ManualGrader:
+    PENDING -> READY -> RUNNING -> VALIDATING -> AWAITING_APPROVAL.
+    """
+    now = datetime.now(timezone.utc)
+    lc = Lifecycle(task_id=task_id, run_id=f"run-{task_id}-awaiting")
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.VALIDATING, now=now)
+    lc.transition_to(Status.AWAITING_APPROVAL, now=now)
+    store.create_lifecycle(lc)
+    return lc
+
+
+def test_cmd_approve_enqueues_kind_approve_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel approve RUN_ID`` persists a kind=approve row and is silent
+    about staleness when the lifecycle is correctly parked at
+    AWAITING_APPROVAL."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_approval(store, "task-approve")
+    finally:
+        store.close()
+
+    rc = main(["approve", "run-task-approve-awaiting", "--db", str(db)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "kind=approve" in captured.out
+    assert "run-task-approve-awaiting" in captured.out
+    # AWAITING_APPROVAL is the valid in-flight status for approve, so no
+    # stale-pending warning is emitted.
+    assert "not in-flight" not in captured.err
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-approve-awaiting", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "approve"
+    assert claimed[0].payload == {}
+
+
+def test_cmd_reject_with_feedback_enqueues_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel reject RUN_ID --feedback X`` persists kind=reject with
+    the feedback in the payload."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_approval(store, "task-reject")
+    finally:
+        store.close()
+
+    feedback = (
+        "The migration drops a column still read by the billing service. "
+        "Gate it behind a feature flag first."
+    )
+    rc = main(
+        [
+            "reject",
+            "run-task-reject-awaiting",
+            "--feedback",
+            feedback,
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "kind=reject" in captured.out
+    # AWAITING_APPROVAL is the valid in-flight status for reject as well.
+    assert "not in-flight" not in captured.err
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-reject-awaiting", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "reject"
+    assert claimed[0].payload == {"feedback": feedback}
+
+
+def test_cmd_reject_without_feedback_enqueues_empty_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel reject RUN_ID`` (no --feedback) persists an empty
+    payload; the resolver records ``"(no feedback provided)"``."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_approval(store, "task-reject-bare")
+    finally:
+        store.close()
+
+    rc = main(
+        ["reject", "run-task-reject-bare-awaiting", "--db", str(db)]
+    )
+    assert rc == 0
+    assert "kind=reject" in capsys.readouterr().out
+
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-task-reject-bare-awaiting", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert len(claimed) == 1
+    assert claimed[0].kind == "reject"
+    assert claimed[0].payload == {}
+
+
+def test_cmd_approve_for_non_awaiting_run_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Enqueuing approve against a run that is not AWAITING_APPROVAL still
+    persists the row but prints the pending/stale stderr note: the
+    resolver only acts on AWAITING_APPROVAL lifecycles, so the row will
+    sit unprocessed until the lifecycle reaches that state (if ever)."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        # RUNNING is a valid in-flight status for interrupt/steer/set_model
+        # but NOT for approve, which requires AWAITING_APPROVAL.
+        _seed_running(store, "task-running")
+    finally:
+        store.close()
+
+    rc = main(["approve", "run-task-running-running", "--db", str(db)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "kind=approve" in captured.out
+    err = captured.err
+    assert "not in-flight" in err
+    assert "running" in err
+
+
+def test_cmd_reject_for_non_awaiting_run_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reject against a non-AWAITING_APPROVAL run also warns."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_interrupted(store, "task-interrupted")
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "reject",
+            "run-task-interrupted-interrupted",
+            "--feedback",
+            "no longer needed",
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "kind=reject" in captured.out
+    err = captured.err
+    assert "not in-flight" in err
+    assert "interrupted" in err
+
+
+def test_cmd_approve_for_unknown_run_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown ``run_id`` is a producer-side error (exit 2); no row
+    is persisted, matching the existing interrupt/steer behavior."""
+    db = tmp_path / "db.sqlite"
+    rc = main(["approve", "run-ghost", "--db", str(db)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown" in err
+    assert "run-ghost" in err
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-ghost", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert claimed == []
+
+
+def test_cmd_reject_for_unknown_run_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown ``run_id`` is a producer-side error (exit 2) for
+    reject too — including when --feedback is supplied."""
+    db = tmp_path / "db.sqlite"
+    rc = main(
+        [
+            "reject",
+            "run-ghost",
+            "--feedback",
+            "ignored",
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown" in err
+    assert "run-ghost" in err
+    store = SqliteStore(db)
+    try:
+        claimed = store.claim_commands(
+            "run-ghost", now=datetime.now(timezone.utc)
+        )
+    finally:
+        store.close()
+    assert claimed == []

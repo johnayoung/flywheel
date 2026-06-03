@@ -29,12 +29,15 @@ from claude_agent_sdk import (
 
 from flywheel.envelope import CLOSING_FENCE, OPENING_FENCE, Intent, ValidEnvelope
 from flywheel.invoker_client import (
+    CONTROL_COMMAND_APPROVE,
     CONTROL_COMMAND_INTERRUPT,
+    CONTROL_COMMAND_REJECT,
     CONTROL_COMMAND_SAY,
     CONTROL_COMMAND_SET_MODEL,
     EVENT_CONTROL_APPLIED,
     EVENT_CONTROL_CLAIM_FAILED,
     EVENT_CONTROL_FAILED,
+    EVENT_CONTROL_NOT_APPLICABLE,
     invoke_iteration_with_client,
 )
 from flywheel.store_memory import InMemoryStore
@@ -673,3 +676,237 @@ class TestEnqueueOrderApply:
             "m-1",
             "second",
         ]
+
+
+class TestApproveRejectVerbConstants:
+    """The new manual-approval verbs are exposed with the documented values."""
+
+    def test_approve_constant_matches_wire_value(self) -> None:
+        # The wire value is the source of truth for the persisted
+        # ``control_commands.kind`` column and the
+        # ``resolve_manual_approval`` matcher.
+        assert CONTROL_COMMAND_APPROVE == "approve"
+
+    def test_reject_constant_matches_wire_value(self) -> None:
+        assert CONTROL_COMMAND_REJECT == "reject"
+
+
+class TestApproveVerbInLiveWatcher:
+    """``approve`` is owned by the out-of-band resolver, not the live watcher.
+
+    The live watcher claims the row to record it on the audit stream but
+    does not call any SDK method — the AWAITING_APPROVAL lifecycle has
+    no live ``ClaudeSDKClient`` for the watcher to drive. The watcher
+    must not crash on the verb, and must surface a not-applicable event
+    distinct from the dispatched-to-SDK ``applied`` event.
+    """
+
+    def test_approve_is_not_dispatched_and_emits_not_applicable(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        # No SDK method was called for approve.
+        assert client.injected == []
+        assert client.set_models == []
+        assert client.interrupt_calls == 0
+        # A not-applicable event lands; no applied or failed event for
+        # this row.
+        not_applicable = [
+            p for k, p in audit_log if k == EVENT_CONTROL_NOT_APPLICABLE
+        ]
+        assert len(not_applicable) == 1
+        assert not_applicable[0]["kind"] == CONTROL_COMMAND_APPROVE
+        assert not_applicable[0]["payload"] == {}
+        assert [k for k, _ in audit_log if k == EVENT_CONTROL_APPLIED] == []
+        assert [k for k, _ in audit_log if k == EVENT_CONTROL_FAILED] == []
+
+
+class TestRejectVerbInLiveWatcher:
+    """``reject`` mirrors ``approve`` for live-watcher semantics.
+
+    Additionally the reject payload's optional ``feedback`` field is
+    validated eagerly: an absent feedback is permitted, a non-string
+    feedback raises before the row reaches the out-of-band resolver.
+    """
+
+    def test_reject_without_feedback_is_not_dispatched(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_REJECT,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        not_applicable = [
+            p for k, p in audit_log if k == EVENT_CONTROL_NOT_APPLICABLE
+        ]
+        assert len(not_applicable) == 1
+        assert not_applicable[0]["kind"] == CONTROL_COMMAND_REJECT
+        assert not_applicable[0]["payload"] == {}
+        assert [k for k, _ in audit_log if k == EVENT_CONTROL_FAILED] == []
+
+    def test_reject_with_string_feedback_is_not_dispatched(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_REJECT,
+            {"feedback": "gate it behind a feature flag first"},
+            now=datetime.now(timezone.utc),
+        )
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        not_applicable = [
+            p for k, p in audit_log if k == EVENT_CONTROL_NOT_APPLICABLE
+        ]
+        assert len(not_applicable) == 1
+        assert not_applicable[0]["kind"] == CONTROL_COMMAND_REJECT
+        # The feedback payload round-trips so the audit stream records
+        # what the resolver will eventually see.
+        assert not_applicable[0]["payload"] == {
+            "feedback": "gate it behind a feature flag first"
+        }
+        assert [k for k, _ in audit_log if k == EVENT_CONTROL_FAILED] == []
+
+    def test_reject_with_non_string_feedback_records_failed_event(self) -> None:
+        """A non-string ``feedback`` is a payload validation error.
+
+        Mirrors :func:`_payload_model`'s behavior: the malformed row
+        lands as a failed-application event in the live watcher's audit
+        stream so an out-of-band consumer never reads a poisoned payload.
+        """
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_REJECT,
+            {"feedback": 42},  # not a string
+            now=datetime.now(timezone.utc),
+        )
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        failed = [p for k, p in audit_log if k == EVENT_CONTROL_FAILED]
+        assert len(failed) == 1
+        assert failed[0]["kind"] == CONTROL_COMMAND_REJECT
+        assert failed[0]["error_type"] == "ValueError"
+        # No not-applicable / applied events for this malformed row.
+        assert [
+            k
+            for k, _ in audit_log
+            if k in (EVENT_CONTROL_NOT_APPLICABLE, EVENT_CONTROL_APPLIED)
+        ] == []
+        # No SDK calls regardless.
+        assert client.injected == []

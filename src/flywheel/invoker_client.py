@@ -54,21 +54,33 @@ from flywheel.store_protocols import ControlCommandRecord, ControlCommandStore
 DEFAULT_CONTROL_POLL_INTERVAL: float = 0.25
 
 
-# Recognized control-command verbs. Each maps to a single dispatch on the
-# live :class:`ClaudeSDKClient` session.
+# Recognized control-command verbs. ``interrupt`` / ``set_model`` / ``say``
+# each map to a single dispatch on the live :class:`ClaudeSDKClient`
+# session. ``approve`` / ``reject`` are out-of-band verbs that resolve a
+# parked ``AWAITING_APPROVAL`` lifecycle via the harness's
+# ``resolve_manual_approval`` sweep; the live in-session watcher treats
+# them as not-applicable rather than dispatching them to a session.
 CONTROL_COMMAND_INTERRUPT: str = "interrupt"
 CONTROL_COMMAND_SET_MODEL: str = "set_model"
 CONTROL_COMMAND_SAY: str = "say"
+CONTROL_COMMAND_APPROVE: str = "approve"
+CONTROL_COMMAND_REJECT: str = "reject"
 
 
 # Audit-event kinds emitted by the watcher. ``applied`` lands on every
 # successful dispatch (the store-triggered control plane's authoritative
 # audit signal); ``failed`` lands when the dispatch raised but the run
 # continues; ``claim_failed`` lands when the store call itself raised
-# (the watcher swallowed the error and will retry on the next tick).
+# (the watcher swallowed the error and will retry on the next tick);
+# ``not_applicable`` lands when the watcher claims a verb that has no
+# live-session semantics (``approve`` / ``reject`` belong to the
+# out-of-band ``resolve_manual_approval`` sweep, not the live SDK
+# session), so the audit stream records that the watcher saw the row but
+# left it for the out-of-band resolver.
 EVENT_CONTROL_APPLIED: str = "harness.control_command_applied"
 EVENT_CONTROL_FAILED: str = "harness.control_command_failed"
 EVENT_CONTROL_CLAIM_FAILED: str = "harness.control_command_claim_failed"
+EVENT_CONTROL_NOT_APPLICABLE: str = "harness.control_command_not_applicable"
 
 
 AuditEmit = Callable[[str, Mapping[str, Any]], None]
@@ -111,28 +123,69 @@ def _payload_model(payload: Mapping[str, Any]) -> str | None:
     return model
 
 
+def _payload_feedback(payload: Mapping[str, Any]) -> str | None:
+    """Coerce a ``reject`` payload's optional ``feedback`` field.
+
+    A reject row may carry an operator-authored critique that flows into
+    the next attempt's prompt via the reviewer-feedback retry path. The
+    field is optional (absent means "(no feedback provided)"); any
+    non-string value is rejected as a payload validation error mirroring
+    :func:`_payload_model` so a malformed enqueue is recorded before the
+    resolver writes a manual receipt.
+    """
+    if "feedback" not in payload:
+        return None
+    feedback = payload["feedback"]
+    if not isinstance(feedback, str):
+        raise ValueError(
+            "control command 'reject' payload 'feedback' must be str if provided"
+        )
+    return feedback
+
+
 async def _apply_command(
     client: ClaudeSDKClient,
     command: ControlCommandRecord,
-) -> None:
+) -> bool:
     """Dispatch one claimed control command against the live SDK session.
+
+    Returns ``True`` when the verb was dispatched to the SDK and
+    ``False`` when the verb has no live-session semantics (``approve`` /
+    ``reject`` are resolved by the out-of-band ``resolve_manual_approval``
+    sweep against an ``AWAITING_APPROVAL`` lifecycle; the live watcher
+    only records that the claim was seen, leaving the row for the
+    resolver to interpret).
 
     Raises whatever the SDK raises; the watcher converts the exception
     into a ``harness.control_command_failed`` event. ``interrupt`` is
     surfaced via :meth:`ClaudeSDKClient.interrupt`; the watcher's caller
     decides whether to escalate the dispatch into iteration cancellation.
+    A non-string ``reject`` payload raises :class:`ValueError` from
+    :func:`_payload_feedback` and lands as a failed-application event
+    before any out-of-band consumer sees the malformed row.
     """
     kind = command.kind
     payload = dict(command.payload)
     if kind == CONTROL_COMMAND_INTERRUPT:
         await client.interrupt()
-        return
+        return True
     if kind == CONTROL_COMMAND_SET_MODEL:
         await client.set_model(_payload_model(payload))
-        return
+        return True
     if kind == CONTROL_COMMAND_SAY:
         await client.query(_payload_text(payload))
-        return
+        return True
+    if kind == CONTROL_COMMAND_APPROVE:
+        # The live watcher has no AWAITING_APPROVAL session to act on;
+        # the out-of-band resolver owns this verb. Recorded as
+        # not-applicable so the audit stream attributes the no-op.
+        return False
+    if kind == CONTROL_COMMAND_REJECT:
+        # Validate the optional feedback payload eagerly so a malformed
+        # enqueue lands as a failed event in the live watcher's audit
+        # stream rather than reaching the resolver as a poisoned row.
+        _payload_feedback(payload)
+        return False
     raise ValueError(f"unknown control command kind: {kind!r}")
 
 
@@ -175,7 +228,7 @@ async def _drain_pending(
 
     for command in pending:
         try:
-            await _apply_command(client, command)
+            dispatched = await _apply_command(client, command)
         except Exception as exc:  # noqa: BLE001 — best-effort apply.
             if audit_emit is not None:
                 _emit_safe(
@@ -193,7 +246,7 @@ async def _drain_pending(
         if audit_emit is not None:
             _emit_safe(
                 audit_emit,
-                EVENT_CONTROL_APPLIED,
+                EVENT_CONTROL_APPLIED if dispatched else EVENT_CONTROL_NOT_APPLICABLE,
                 {
                     "command_id": command.id,
                     "kind": command.kind,
@@ -335,12 +388,15 @@ async def invoke_iteration_with_client(
 
 __all__ = [
     "AuditEmit",
+    "CONTROL_COMMAND_APPROVE",
     "CONTROL_COMMAND_INTERRUPT",
+    "CONTROL_COMMAND_REJECT",
     "CONTROL_COMMAND_SAY",
     "CONTROL_COMMAND_SET_MODEL",
     "DEFAULT_CONTROL_POLL_INTERVAL",
     "EVENT_CONTROL_APPLIED",
     "EVENT_CONTROL_CLAIM_FAILED",
     "EVENT_CONTROL_FAILED",
+    "EVENT_CONTROL_NOT_APPLICABLE",
     "invoke_iteration_with_client",
 ]

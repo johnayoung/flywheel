@@ -47,11 +47,42 @@ class RubricFindings:
     store) and consumed by :func:`build_iteration_prompt` to render the
     ``# Reviewer feedback`` section. The dataclass is frozen so the prompt
     builder cannot mutate it and remains deterministic.
+
+    ``ordinal`` mirrors the grader's index in ``task.graders`` so the
+    renderer can deterministically interleave rubric and manual findings
+    by ``(attempt_number, ordinal)``. Defaults to ``0`` so existing
+    callers that only build rubric tuples in their preferred order
+    continue to work — Python's stable sort then preserves that order.
     """
 
     grader_name: str
     attempt_number: int
     summary: str
+    ordinal: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class ManualFinding:
+    """A single manual-grader rejection carried forward into the next
+    iteration.
+
+    Pure data sibling of :class:`RubricFindings`: built by the harness
+    from failing ``grader_type='manual'`` receipts (operator rejections,
+    per spec 00016 FR-6) and rendered in the ``# Reviewer feedback``
+    section with an operator-distinguishing label so the agent can tell
+    a human "no" apart from a rubric verdict.
+
+    ``ordinal`` is the grader's index in ``task.graders`` (matching the
+    :class:`flywheel.grader_manual.ManualGate.ordinal` the resolver
+    persisted to the receipt) and feeds the renderer's
+    ``(attempt_number, ordinal)`` ordering when rubric and manual
+    findings appear on the same attempt.
+    """
+
+    grader_name: str
+    attempt_number: int
+    summary: str
+    ordinal: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -65,6 +96,7 @@ class IterationInputs:
 
     max_retries: int
     prior_rubric_findings: tuple[RubricFindings, ...] = ()
+    prior_manual_findings: tuple[ManualFinding, ...] = ()
 
 
 def build_iteration_prompt(
@@ -86,9 +118,15 @@ def build_iteration_prompt(
     if context_section is not None:
         sections.append(context_section)
 
-    if iteration_inputs.prior_rubric_findings:
+    if (
+        iteration_inputs.prior_rubric_findings
+        or iteration_inputs.prior_manual_findings
+    ):
         sections.append(
-            _section_reviewer_feedback(iteration_inputs.prior_rubric_findings)
+            _section_reviewer_feedback(
+                iteration_inputs.prior_rubric_findings,
+                iteration_inputs.prior_manual_findings,
+            )
         )
 
     sections.append(_section_graders(task))
@@ -127,18 +165,36 @@ def _bulleted(heading: str, items: list[str]) -> str:
     return f"## {heading}\n\n{bullets}"
 
 
-def _section_reviewer_feedback(findings: tuple[RubricFindings, ...]) -> str:
-    """Render the ``# Reviewer feedback`` section from rubric findings.
+def _section_reviewer_feedback(
+    rubric_findings: tuple[RubricFindings, ...],
+    manual_findings: tuple[ManualFinding, ...],
+) -> str:
+    """Render the ``# Reviewer feedback`` section from rubric and manual
+    findings.
 
     Findings are grouped under ``## attempt #N`` subheadings in ascending
-    ``attempt_number`` order; within each attempt, bullets appear in the
-    same order they were supplied in the tuple — they are NOT re-sorted by
-    grader name. This ordering is the module's deterministic-output
-    contract: the harness controls the tuple it supplies, and the renderer
-    only walks it.
+    ``attempt_number`` order; within each attempt, bullets are emitted in
+    ascending ``ordinal`` order so a mixed list of rubric + manual
+    findings sorts deterministically by ``(attempt_number, ordinal)``.
+    Python's sort is stable, so when two findings share an ordinal (the
+    default ``0`` for rubric-only callers that don't set it) the renderer
+    preserves the order in which they were supplied. This keeps the
+    pre-existing harness behavior — "the harness controls the tuple it
+    supplies, and the renderer only walks it" — byte-identical for
+    rubric-only inputs while letting mixed inputs interleave by the
+    grader-list position the harness already knows.
+
+    Rubric findings render as ``- rubric `name`: <summary>``; manual
+    findings render as ``- manual `name` (operator): <feedback>`` so
+    the agent can tell a rubric verdict from an operator rejection.
+    Manual findings substitute the documented
+    ``"(no feedback provided)"`` placeholder for an empty summary
+    (matching the resolver's substitution for an absent ``feedback``
+    payload); rubric findings keep their ``"(no summary provided)"``
+    placeholder for symmetry.
     """
-    grouped: dict[int, list[RubricFindings]] = {}
-    for finding in findings:
+    grouped: dict[int, list[RubricFindings | ManualFinding]] = {}
+    for finding in (*rubric_findings, *manual_findings):
         grouped.setdefault(finding.attempt_number, []).append(finding)
 
     lines: list[str] = ["# Reviewer feedback"]
@@ -146,9 +202,15 @@ def _section_reviewer_feedback(findings: tuple[RubricFindings, ...]) -> str:
         lines.append("")
         lines.append(f"## attempt #{attempt_number}")
         lines.append("")
-        for finding in grouped[attempt_number]:
-            summary = finding.summary or "(no summary provided)"
-            lines.append(f"- rubric `{finding.grader_name}`: {summary}")
+        for finding in sorted(grouped[attempt_number], key=lambda f: f.ordinal):
+            if isinstance(finding, ManualFinding):
+                summary = finding.summary or "(no feedback provided)"
+                lines.append(
+                    f"- manual `{finding.grader_name}` (operator): {summary}"
+                )
+            else:
+                summary = finding.summary or "(no summary provided)"
+                lines.append(f"- rubric `{finding.grader_name}`: {summary}")
     return "\n".join(lines)
 
 

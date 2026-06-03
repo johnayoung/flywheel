@@ -22,7 +22,7 @@ from flywheel import (
     build_iteration_prompt,
 )
 from flywheel.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
-from flywheel.prompt import RubricFindings
+from flywheel.prompt import ManualFinding, RubricFindings
 
 
 def _minimal_task() -> Task:
@@ -509,3 +509,177 @@ def test_rubric_findings_is_frozen() -> None:
     except Exception:
         return
     raise AssertionError("RubricFindings should be frozen")
+
+
+def test_iteration_inputs_prior_manual_findings_defaults_to_empty_tuple() -> None:
+    inputs = IterationInputs(max_retries=2)
+
+    assert inputs.prior_manual_findings == ()
+
+
+def test_manual_finding_renders_in_reviewer_feedback_with_operator_label() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_manual_findings=(
+            ManualFinding(
+                grader_name="confirm-migration",
+                attempt_number=1,
+                summary=(
+                    "The migration drops a column still read by the "
+                    "billing service. Gate it behind a feature flag first."
+                ),
+                ordinal=3,
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert "# Reviewer feedback" in prompt
+    assert "## attempt #1" in prompt
+    # The operator label distinguishes a manual rejection from a rubric
+    # verdict so the agent does not confuse the two.
+    assert (
+        "- manual `confirm-migration` (operator): The migration drops a "
+        "column still read by the billing service. Gate it behind a "
+        "feature flag first."
+    ) in prompt
+    # Without rubric findings the section still appears — the trigger is
+    # any non-empty reviewer-finding tuple, not specifically rubric.
+    assert "- rubric" not in prompt
+
+
+def test_empty_manual_findings_omits_reviewer_feedback_section() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_manual_findings=(),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    assert "# Reviewer feedback" not in prompt
+
+
+def test_empty_rubric_and_manual_findings_byte_identical_to_default_inputs() -> None:
+    """Pin: an explicit empty tuple for either field must not perturb the
+    first-attempt prompt (so a no-op harness sweep is byte-stable)."""
+
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+
+    without_field = build_iteration_prompt(
+        task, lifecycle, IterationInputs(max_retries=3)
+    )
+    with_empty_tuples = build_iteration_prompt(
+        task,
+        lifecycle,
+        IterationInputs(
+            max_retries=3,
+            prior_rubric_findings=(),
+            prior_manual_findings=(),
+        ),
+    )
+
+    assert without_field == with_empty_tuples
+
+
+def test_mixed_rubric_and_manual_findings_render_in_attempt_then_ordinal_order() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    # Supply findings in deliberately scrambled order — across attempts
+    # AND within each attempt by ordinal — to prove the renderer sorts
+    # by (attempt_number, ordinal), not by tuple position.
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_rubric_findings=(
+            RubricFindings(
+                grader_name="semantics-attempt-2",
+                attempt_number=2,
+                summary="attempt-2 rubric",
+                ordinal=1,
+            ),
+            RubricFindings(
+                grader_name="semantics-attempt-1",
+                attempt_number=1,
+                summary="attempt-1 rubric",
+                ordinal=1,
+            ),
+        ),
+        prior_manual_findings=(
+            ManualFinding(
+                grader_name="confirm-attempt-2",
+                attempt_number=2,
+                summary="attempt-2 manual",
+                ordinal=3,
+            ),
+            ManualFinding(
+                grader_name="confirm-attempt-1",
+                attempt_number=1,
+                summary="attempt-1 manual",
+                ordinal=3,
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    # Attempt headings are emitted in ascending attempt_number order.
+    attempt_1_idx = prompt.index("## attempt #1")
+    attempt_2_idx = prompt.index("## attempt #2")
+    assert attempt_1_idx < attempt_2_idx
+
+    # Within attempt #1: rubric (ordinal 1) precedes manual (ordinal 3).
+    attempt_1_rubric_idx = prompt.index("- rubric `semantics-attempt-1`")
+    attempt_1_manual_idx = prompt.index(
+        "- manual `confirm-attempt-1` (operator):"
+    )
+    assert attempt_1_idx < attempt_1_rubric_idx < attempt_1_manual_idx
+    assert attempt_1_manual_idx < attempt_2_idx
+
+    # Within attempt #2: same (attempt_number, ordinal) ordering applies.
+    attempt_2_rubric_idx = prompt.index("- rubric `semantics-attempt-2`")
+    attempt_2_manual_idx = prompt.index(
+        "- manual `confirm-attempt-2` (operator):"
+    )
+    assert attempt_2_idx < attempt_2_rubric_idx < attempt_2_manual_idx
+
+
+def test_manual_finding_with_empty_summary_renders_no_feedback_placeholder() -> None:
+    task = _briefed_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+    inputs = IterationInputs(
+        max_retries=3,
+        prior_manual_findings=(
+            ManualFinding(
+                grader_name="confirm-migration",
+                attempt_number=1,
+                summary="",
+                ordinal=3,
+            ),
+        ),
+    )
+
+    prompt = build_iteration_prompt(task, lifecycle, inputs)
+
+    # The reject-with-absent-feedback path substitutes this placeholder
+    # at the resolver so the gate name still appears in the prompt; the
+    # renderer falls back to the same placeholder when handed an empty
+    # summary directly (defense in depth).
+    assert (
+        "- manual `confirm-migration` (operator): (no feedback provided)"
+    ) in prompt
+
+
+def test_manual_finding_is_frozen() -> None:
+    finding = ManualFinding(
+        grader_name="confirm-migration", attempt_number=1, summary="x"
+    )
+    try:
+        finding.summary = "y"  # type: ignore[misc]
+    except Exception:
+        return
+    raise AssertionError("ManualFinding should be frozen")

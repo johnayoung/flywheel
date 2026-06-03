@@ -3856,6 +3856,131 @@ class TestResolveManualApproval:
         ]
         assert manual_rows[0].payload["summary"] == "(no feedback provided)"
 
+    # --- FR-7: rejection feedback flows into the retry prompt ----------
+
+    def test_retry_after_manual_reject_carries_operator_feedback_into_prompt(
+        self,
+    ) -> None:
+        """End-to-end: a rejected attempt #1 retries, and attempt #2's
+        prompt carries the operator feedback in the reviewer-feedback
+        section with the documented ``manual <name> (operator):`` label.
+
+        Drives the full pipeline:
+
+        1. Run attempt #1 to ``AWAITING_APPROVAL`` (all automated
+           graders pass, the manual gate parks the lifecycle).
+        2. Enqueue a reject with operator feedback.
+        3. ``resolve_manual_approval`` writes the ``passed=False`` manual
+           receipt and drives ``AWAITING_APPROVAL -> FAILED_VALIDATION
+           -> READY`` (one retry consumed).
+        4. Re-enter ``run_task`` on the now-READY lifecycle; the
+           prompt-collection step picks up the manual receipt via
+           ``_collect_prior_manual_findings`` and the renderer emits the
+           operator-labeled bullet.
+        """
+        from flywheel import resolve_manual_approval
+        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+
+        store = InMemoryStore()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="r0"),
+                ManualGrader(
+                    instruction="Confirm the migration is safe.",
+                    name="confirm-migration",
+                ),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-reject-retry-prompt")
+        judge = _ScriptedJudge(
+            [
+                # Both attempts pass the rubric — the rejection is
+                # operator-driven, not a rubric verdict.
+                _rubric_wrap('{"passed": true, "summary": "ok"}'),
+                _rubric_wrap('{"passed": true, "summary": "ok"}'),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=1,
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        # --- attempt #1: drive to AWAITING_APPROVAL --------------------
+        first_outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+        assert first_outcome.lifecycle.status == Status.AWAITING_APPROVAL
+        assert first_outcome.attempts[-1].outcome == Outcome.SUCCEEDED
+
+        # --- reject with feedback --------------------------------------
+        feedback = (
+            "The migration drops a column still read by the billing "
+            "service. Gate it behind a feature flag first."
+        )
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": feedback},
+            now=datetime.now(timezone.utc),
+        )
+
+        # Reuse the same mutated lifecycle the harness handed back so
+        # the in-memory ``version`` stays aligned with the persisted row
+        # when the resolver applies its transitions.
+        live = first_outcome.lifecycle
+        resolve_result = resolve_manual_approval(
+            live, store, task, max_retries=config.max_retries
+        )
+        assert resolve_result.applied is True
+        assert resolve_result.reason == "rejected_retry"
+        assert live.status == Status.READY
+
+        # --- attempt #2: re-enter run_task, capture the prompt ---------
+        second_outcome = _run(
+            run_task(task, live, store, config=config, invoke=invoke)
+        )
+
+        # The second attempt ran and (with the manual gate still
+        # un-approved) parks again at AWAITING_APPROVAL.
+        assert len(second_outcome.attempts) == 2
+        assert second_outcome.lifecycle.status == Status.AWAITING_APPROVAL
+
+        # Two scripted invocations consumed: one per attempt.
+        calls = invoke.calls  # type: ignore[attr-defined]
+        assert len(calls) == 2
+
+        first_prompt = calls[0].prompt
+        second_prompt = calls[1].prompt
+
+        # Attempt #1 had no prior findings -> no reviewer-feedback
+        # section. Attempt #2 carries the operator feedback verbatim
+        # under the documented label.
+        assert "# Reviewer feedback" not in first_prompt
+        assert "# Reviewer feedback" in second_prompt
+        assert "## attempt #1" in second_prompt
+        assert (
+            "- manual `confirm-migration` (operator): "
+            + feedback
+        ) in second_prompt
+        # No rubric bullet — the rubric passed on attempt #1, so the
+        # collector should pick up only the manual rejection.
+        assert "- rubric `r0`" not in second_prompt
+
 
 class TestHarnessConfigDefaults:
     def test_default_rubric_config_fields(self) -> None:

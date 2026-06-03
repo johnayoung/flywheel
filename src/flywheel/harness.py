@@ -117,7 +117,12 @@ from flywheel.loop_guard import (
     LoopGuardVerdict,
     LoopGuardVerdictKind,
 )
-from flywheel.prompt import IterationInputs, RubricFindings, build_iteration_prompt
+from flywheel.prompt import (
+    IterationInputs,
+    ManualFinding,
+    RubricFindings,
+    build_iteration_prompt,
+)
 from flywheel.store_protocols import (
     ControlCommandRecord,
     EventRecord,
@@ -988,6 +993,60 @@ def _collect_prior_rubric_findings(
                     grader_name=row.grader_name or "<unnamed>",
                     attempt_number=row.attempt_number,
                     summary=summary,
+                    ordinal=row.ordinal,
+                )
+            )
+        return tuple(findings)
+    return ()
+
+
+def _collect_prior_manual_findings(
+    store: HarnessStore,
+    run_id: str,
+    current_attempt_number: int,
+) -> tuple[ManualFinding, ...]:
+    """Build ``IterationInputs.prior_manual_findings`` from prior attempts.
+
+    Sibling of :func:`_collect_prior_rubric_findings` for the manual
+    grader receipts spec 00016 introduces. Walks attempts backwards from
+    ``current_attempt_number - 1`` to find the most recent attempt that
+    has failing manual records (operator rejections, per FR-6) and
+    returns those rows in ordinal order so the renderer's
+    ``(attempt_number, ordinal)`` ordering interleaves them with rubric
+    findings from the same attempt.
+
+    Manual receipts are keyed to the ``SUCCEEDED`` attempt that passed
+    every automated grader (the rejection is a lifecycle-level gate, not
+    an agent failure — see spec 00016's ``SUCCEEDED`` semantics NFR), so
+    the same backwards walk that drives the rubric collector lands on
+    the rejected-but-succeeded attempt and surfaces its operator
+    feedback into the retry's prompt.
+
+    Returns an empty tuple when no prior attempt carried any failing
+    manual record (including the first attempt of a lifecycle, when the
+    rubric collector returns empty for the same reason).
+    """
+    if current_attempt_number <= 1:
+        return ()
+    for prior in range(current_attempt_number - 1, 0, -1):
+        rows = store.list_grader_results(run_id, prior)
+        failing = [
+            r
+            for r in rows
+            if r.grader_type == "manual" and not r.passed
+        ]
+        if not failing:
+            continue
+        findings: list[ManualFinding] = []
+        for row in sorted(failing, key=lambda r: r.ordinal):
+            summary_raw = row.payload.get("summary")
+            summary = summary_raw if isinstance(summary_raw, str) else ""
+            findings.append(
+                ManualFinding(
+                    grader_name=row.grader_name or "<unnamed>",
+                    attempt_number=row.attempt_number,
+                    summary=summary,
+                    ordinal=row.ordinal,
                 )
             )
         return tuple(findings)
@@ -2309,6 +2368,9 @@ async def _drive_iterations(
     prior_rubric_findings = _collect_prior_rubric_findings(
         store, lifecycle.run_id, attempt_number
     )
+    prior_manual_findings = _collect_prior_manual_findings(
+        store, lifecycle.run_id, attempt_number
+    )
 
     while iteration_number < config.max_iterations_per_attempt:
         iteration_number += 1
@@ -2319,6 +2381,7 @@ async def _drive_iterations(
             IterationInputs(
                 max_retries=config.max_retries,
                 prior_rubric_findings=prior_rubric_findings,
+                prior_manual_findings=prior_manual_findings,
             ),
         )
 

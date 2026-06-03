@@ -394,6 +394,81 @@ def test_stream_is_lazy_iterator() -> None:
         next(it)
 
 
+def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
+    tmp_path: Path,
+) -> None:
+    """The ``harness.awaiting_approval`` event surfaces through the audit
+    stream with every field the operator-surfacing path consumes —
+    ``instructions``, ``awaiting_ordinal``, ``grader_name``, ``run_id``,
+    ``attempt_number``, and ``artifacts_dir``. This is the audit-level
+    oracle for spec 00016 FR-10; the harness-level test asserts the
+    same shape against the persisted event, this one asserts it through
+    the public ``stream`` reader operators actually consume.
+    """
+
+    from flywheel.grader_manual import ManualGate
+    from flywheel.harness import _enter_manual_gate
+    from flywheel.lifecycle import Attempt, Outcome
+
+    store = _make_store_with_lifecycle("run-await")
+    # Drive RUNNING -> VALIDATING so the in-memory version matches the
+    # store's persisted version before _enter_manual_gate appends.
+    lc = store.load_lifecycle("run-await")
+    assert lc is not None
+    lc.transition_to(Status.VALIDATING)
+    store.update_lifecycle(lc, expected_version=lc.version - 1)
+    lc = store.load_lifecycle("run-await")
+    assert lc is not None
+
+    # The manual gate parks the lifecycle after the attempt is closed
+    # (SUCCEEDED semantics, per spec 00016): persist a finalized attempt
+    # so the gate event is keyed to a real attempt number.
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    attempt = Attempt(
+        number=1,
+        started_at=now,
+        run_id=lc.run_id,
+        ended_at=now,
+        outcome=Outcome.SUCCEEDED,
+    )
+    store.save_attempt(lc.run_id, attempt)
+
+    gate = ManualGate(
+        ordinal=3,
+        instruction="Confirm the migration is safe.",
+        grader_name="confirm-migration",
+    )
+    artifacts_dir = tmp_path / "artifacts" / "run-await" / "attempt-1"
+    _enter_manual_gate(
+        store=store,
+        lifecycle=lc,
+        attempt=attempt,
+        gate=gate,
+        attempt_dir=artifacts_dir,
+        clock=lambda: now,
+    )
+
+    records = list(stream("run-await", store=store))
+    awaiting = [
+        r
+        for r in records
+        if isinstance(r, EventRecord) and r.kind == "harness.awaiting_approval"
+    ]
+    assert len(awaiting) == 1
+    payload = awaiting[0].payload
+    assert payload == {
+        "instructions": "Confirm the migration is safe.",
+        "awaiting_ordinal": 3,
+        "grader_name": "confirm-migration",
+        "run_id": "run-await",
+        "attempt_number": 1,
+        "artifacts_dir": str(artifacts_dir),
+    }
+    # The event is keyed to the attempt that just finalized so audit
+    # consumers can group it with the SUCCEEDED attempt's events.
+    assert awaiting[0].attempt_number == 1
+
+
 # --- python -m flywheel.audit CLI -------------------------------------------
 #
 # These tests carry the keyword "cli" so ``pytest -k cli`` selects only

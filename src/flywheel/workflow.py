@@ -107,6 +107,7 @@ from flywheel.store_sqlite import SqliteStore
 from flywheel.task import (
     CommandGrader,
     Grader,
+    ManualGrader,
     RubricGrader,
     Task,
     ValidationError,
@@ -127,6 +128,7 @@ class TaskState(str, Enum):
     IN_PROGRESS = "in_progress"  # active lifecycle exists
     RETRYABLE = "retryable"  # last lifecycle failed
     INTERRUPTED = "interrupted"  # last lifecycle paused for operator
+    AWAITING_APPROVAL = "awaiting_approval"  # parked on a manual gate
     DONE = "done"  # at least one lifecycle reached DONE
 
 
@@ -139,6 +141,12 @@ class TaskStatusRow:
     either the lifecycle never blocked with structured requires, or the
     lifecycle is in a state where the snapshot was cleared (e.g. resumed
     READY/RUNNING/DONE). The status surface decodes it lazily.
+
+    ``awaiting_manual_ordinal`` mirrors the latest lifecycle column of the
+    same name verbatim. It is the index in ``task.graders`` of the manual
+    gate the lifecycle is currently parked on; ``None`` in every state
+    except ``AWAITING_APPROVAL``. Surfaces use it (together with the
+    in-row ``task``) to render the pending gate's instruction.
     """
 
     task_file: Path
@@ -148,6 +156,7 @@ class TaskStatusRow:
     latest_status: Status | None
     latest_error: str
     blocked_requires: str | None = None
+    awaiting_manual_ordinal: int | None = None
 
 
 # --- Filesystem walking -----------------------------------------------------
@@ -202,20 +211,24 @@ _ACTIVE_STATUSES: frozenset[Status] = frozenset(
 
 def _latest_lifecycle_row(
     store: SqliteStore, task_id: str
-) -> tuple[str, Status, str, str | None] | None:
-    """Return ``(run_id, status, error, blocked_requires_json)`` of the
-    most recent lifecycle for ``task_id``, or ``None`` if no lifecycle
-    exists.
+) -> tuple[str, Status, str, str | None, int | None] | None:
+    """Return ``(run_id, status, error, blocked_requires_json,
+    awaiting_manual_ordinal)`` of the most recent lifecycle for
+    ``task_id``, or ``None`` if no lifecycle exists.
 
     Uses the SQLite connection directly because no Protocol method exposes
     a by-task-id lookup — and adding one would leak workflow concerns into
     the store contract. ``blocked_requires_json`` is returned verbatim so
     callers can decide whether to parse it (text status flattens, JSON
-    status emits the decoded list).
+    status emits the decoded list). ``awaiting_manual_ordinal`` is the
+    index in ``task.graders`` of the manual gate a parked
+    ``AWAITING_APPROVAL`` lifecycle is pinned to; ``NULL`` in every
+    other state.
     """
     cursor = store._connection.execute(  # noqa: SLF001 — intentional
         """
-        SELECT run_id, status, error, blocked_requires_json
+        SELECT run_id, status, error, blocked_requires_json,
+               awaiting_manual_ordinal
         FROM lifecycles
         WHERE task_id = ?
         ORDER BY updated_at DESC, run_id DESC
@@ -231,6 +244,7 @@ def _latest_lifecycle_row(
         Status(row["status"]),
         row["error"] or "",
         row["blocked_requires_json"],
+        row["awaiting_manual_ordinal"],
     )
 
 
@@ -254,13 +268,19 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
             latest_status=None,
             latest_error="",
             blocked_requires=None,
+            awaiting_manual_ordinal=None,
         )
-    run_id, status, error, blocked_requires = latest
+    run_id, status, error, blocked_requires, awaiting_ordinal = latest
 
     if _has_done_lifecycle(store, task.id):
         state = TaskState.DONE
     elif status in _ACTIVE_STATUSES:
         state = TaskState.IN_PROGRESS
+    elif status == Status.AWAITING_APPROVAL:
+        # Distinct classification: a parked manual gate is not generic
+        # IN_PROGRESS — an operator owes a decision, and the renderer
+        # surfaces the gate's instruction so the owed action is visible.
+        state = TaskState.AWAITING_APPROVAL
     elif status == Status.INTERRUPTED:
         state = TaskState.INTERRUPTED
     elif status in (Status.FAILED, Status.FAILED_VALIDATION):
@@ -278,6 +298,7 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
         latest_status=status,
         latest_error=error,
         blocked_requires=blocked_requires,
+        awaiting_manual_ordinal=awaiting_ordinal,
     )
 
 
@@ -297,6 +318,7 @@ def build_status_rows(
                 latest_status=snapshot.latest_status,
                 latest_error=snapshot.latest_error,
                 blocked_requires=snapshot.blocked_requires,
+                awaiting_manual_ordinal=snapshot.awaiting_manual_ordinal,
             )
         )
     return rows
@@ -1282,6 +1304,11 @@ class LiveRunRow:
     summed at query time, no harness counter). ``iterations_completed``
     is the count of those events; zero means "no totals yet" and the
     totals fields are all zero by definition.
+
+    ``awaiting_instruction`` carries the pending manual gate's
+    instruction text when the run is parked on ``AWAITING_APPROVAL``;
+    ``None`` for every other status. Resolved at snapshot time from the
+    task definition pinned to the run via ``load_task_for_run``.
     """
 
     run_id: str
@@ -1296,6 +1323,7 @@ class LiveRunRow:
     cost_usd_total: float
     turns_total: int
     iterations_completed: int
+    awaiting_instruction: str | None = None
 
 
 _SDK_KIND_LABELS: dict[str, str] = {
@@ -1469,23 +1497,28 @@ def _sum_run_totals(
 def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     """Snapshot every in-flight run with its latest activity.
 
-    Reads ``lifecycles`` for status in ``{running, validating}`` and joins
-    each row to the freshest ``sdk_messages``/``events`` entry by
-    per-run sequence. The two tables share a monotonic counter (see
-    ``run_sequence``), so picking the higher sequence is correct even
-    when the timestamps are within microseconds of each other. The
-    same join also pins the latest ``attempt_number`` so the
-    breadcrumb stays accurate across retries. Totals are summed from
-    the run's ``harness.iteration_completed`` events at query time
-    (no harness counter). Output is sorted by ``task_id`` for stable
-    multi-run rendering per the 00011 spec.
+    Reads ``lifecycles`` for status in ``{running, validating,
+    awaiting_approval}`` and joins each row to the freshest
+    ``sdk_messages``/``events`` entry by per-run sequence. The two tables
+    share a monotonic counter (see ``run_sequence``), so picking the
+    higher sequence is correct even when the timestamps are within
+    microseconds of each other. The same join also pins the latest
+    ``attempt_number`` so the breadcrumb stays accurate across retries.
+    Totals are summed from the run's ``harness.iteration_completed``
+    events at query time (no harness counter). Output is sorted by
+    ``task_id`` for stable multi-run rendering per the 00011 spec.
+
+    ``awaiting_approval`` rows have no live worker but are still owed
+    operator attention; including them lets ``flywheel live`` surface
+    the pending manual-gate instruction. The instruction is resolved
+    from the task definition pinned to the run.
     """
     conn = store._connection  # noqa: SLF001
     lifecycles = conn.execute(
         """
-        SELECT run_id, task_id, status
+        SELECT run_id, task_id, status, awaiting_manual_ordinal
         FROM lifecycles
-        WHERE status IN ('running', 'validating')
+        WHERE status IN ('running', 'validating', 'awaiting_approval')
         ORDER BY task_id, run_id
         """
     ).fetchall()
@@ -1553,11 +1586,18 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 str(evt["kind"]), evt["payload_json"]
             )
         tokens, cost, turns, iters_completed = _sum_run_totals(conn, run_id)
+        status = Status(lc["status"])
+        awaiting_instruction = _resolve_awaiting_instruction(
+            store,
+            run_id=run_id,
+            status=status,
+            awaiting_ordinal=lc["awaiting_manual_ordinal"],
+        )
         rows.append(
             LiveRunRow(
                 run_id=run_id,
                 task_id=lc["task_id"],
-                status=Status(lc["status"]),
+                status=status,
                 attempt=attempt,
                 iteration=iteration,
                 last_kind=last_kind,
@@ -1567,9 +1607,41 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 cost_usd_total=cost,
                 turns_total=turns,
                 iterations_completed=iters_completed,
+                awaiting_instruction=awaiting_instruction,
             )
         )
     return rows
+
+
+def _resolve_awaiting_instruction(
+    store: SqliteStore,
+    *,
+    run_id: str,
+    status: Status,
+    awaiting_ordinal: Any,
+) -> str | None:
+    """Look up the pending manual gate's instruction for a parked run.
+
+    Returns ``None`` unless the lifecycle is at ``AWAITING_APPROVAL``
+    with a recorded ordinal that addresses a :class:`ManualGrader` in
+    the task definition pinned to the run. A pointer that does not
+    resolve (forward-compat, data-skew, archived task) is absorbed
+    silently rather than crashing the live view; the surface still
+    renders the status line, just without the instruction.
+    """
+    if status != Status.AWAITING_APPROVAL:
+        return None
+    if not isinstance(awaiting_ordinal, int):
+        return None
+    task = store.load_task_for_run(run_id)
+    if task is None:
+        return None
+    if awaiting_ordinal < 0 or awaiting_ordinal >= len(task.graders):
+        return None
+    grader = task.graders[awaiting_ordinal]
+    if not isinstance(grader, ManualGrader):
+        return None
+    return grader.instruction
 
 
 def _format_breadcrumb(row: LiveRunRow) -> str:
@@ -1611,12 +1683,19 @@ def _format_live_line(row: LiveRunRow, now: datetime) -> str:
         age_str = f"{age_s}s"
         stale = "  STALE" if age_s > _LIVE_STALE_AFTER_SECONDS else ""
     detail = _short(row.last_detail, _LIVE_DETAIL_MAX_WIDTH)
-    return (
+    head = (
         f"{row.task_id}  {row.status.value}  "
         f"{_format_breadcrumb(row)}  "
         f"{_format_totals(row)}  "
         f"age={age_str}  {row.last_kind}  {detail}{stale}"
     )
+    if row.awaiting_instruction is not None:
+        # The owed decision is rendered as an indented follow-up line —
+        # mirrors ``flywheel status``'s ``awaiting_on:`` / ``blocked_on:``
+        # pattern so operators have one consistent shape for "this run
+        # needs you" surfacing across both views.
+        return f"{head}\n    awaiting_on: {row.awaiting_instruction}"
+    return head
 
 
 def _cmd_live(args: argparse.Namespace) -> int:
@@ -1727,6 +1806,33 @@ def _format_unsatisfied(
     return ", ".join(parts)
 
 
+def _awaiting_instruction_for_row(row: TaskStatusRow) -> str | None:
+    """Resolve the pending manual gate's instruction text for ``row``.
+
+    Returns the instruction string when the row's latest lifecycle is
+    parked at ``AWAITING_APPROVAL`` with a recorded ordinal pointing at a
+    :class:`ManualGrader` in the task definition; ``None`` otherwise.
+
+    The lookup is the task itself (not the persisted column) because the
+    instruction is part of the immutable task definition the run pinned
+    to; the column is only the pointer into ``task.graders``. A pointer
+    that does not address a manual grader is a forward-compat / data-skew
+    case the surface absorbs silently rather than crashing.
+    """
+    if row.latest_status != Status.AWAITING_APPROVAL:
+        return None
+    ordinal = row.awaiting_manual_ordinal
+    if ordinal is None:
+        return None
+    graders = row.task.graders
+    if ordinal < 0 or ordinal >= len(graders):
+        return None
+    grader = graders[ordinal]
+    if not isinstance(grader, ManualGrader):
+        return None
+    return grader.instruction
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)
@@ -1755,6 +1861,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 # Spec: omit the key entirely when null; emit the parsed
                 # list (list of dicts) when present.
                 entry["blocked_requires"] = parsed
+            instruction = _awaiting_instruction_for_row(row)
+            if instruction is not None:
+                # Mirrors the blocked_requires convention: emit the
+                # awaiting-gate context only when the lifecycle is
+                # actually parked on a manual gate, omit otherwise.
+                entry["awaiting_on"] = {
+                    "ordinal": row.awaiting_manual_ordinal,
+                    "instruction": instruction,
+                }
             out.append(entry)
         print(json.dumps(out, indent=2))
         return 0
@@ -1769,7 +1884,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             suffix = f"  -- {row.latest_error}"
         print(
             f"  {phase}/{row.task.id:<{width}}  "
-            f"{row.state.value:<12}{suffix}"
+            f"{row.state.value:<17}{suffix}"
         )
         if (
             row.latest_status == Status.INTERRUPTED
@@ -1778,6 +1893,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
             parsed = _parse_blocked_requires(row.blocked_requires)
             if parsed:
                 print(f"    blocked_on: {_format_blocked_on(parsed)}")
+        instruction = _awaiting_instruction_for_row(row)
+        if instruction is not None:
+            # The owed decision is rendered as a follow-up line, mirroring
+            # ``blocked_on:`` for INTERRUPTED rows. Operators reading
+            # ``flywheel status`` see the gate's instruction without
+            # cross-referencing the task file or the audit stream.
+            print(f"    awaiting_on: {instruction}")
     return 0
 
 

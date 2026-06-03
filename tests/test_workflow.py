@@ -2470,3 +2470,292 @@ def test_cmd_reject_for_unknown_run_exits_two(
     finally:
         store.close()
     assert claimed == []
+
+
+# ---------- Operator surfacing: AWAITING_APPROVAL in status / live ----------
+
+
+def _write_manual_task(
+    path: Path,
+    task_id: str,
+    *,
+    instruction: str,
+    grader_name: str | None = None,
+) -> Path:
+    """Write a task file declaring one command + one manual gate.
+
+    The cost-ordered chain runs the command grader first, then the
+    manual gate parks the lifecycle in ``AWAITING_APPROVAL`` after the
+    automated grader passes. The manual gate's ordinal in
+    ``task.graders`` is ``1`` for tasks built by this helper.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manual: dict[str, object] = {
+        "type": "manual",
+        "instruction": instruction,
+    }
+    if grader_name is not None:
+        manual["name"] = grader_name
+    payload: dict[str, object] = {
+        "id": task_id,
+        "goal": f"Goal for {task_id}.",
+        "graders": [
+            {"type": "command", "run": "true"},
+            manual,
+        ],
+    }
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _seed_awaiting_with_task(
+    store: SqliteStore,
+    task_id: str,
+    *,
+    instruction: str,
+    grader_name: str | None = None,
+    awaiting_ordinal: int = 1,
+    run_id: str | None = None,
+) -> tuple[Lifecycle, str]:
+    """Drive a lifecycle to AWAITING_APPROVAL with the task pinned in store.
+
+    Mirrors the harness's gate-entry path: persist the task (so
+    ``load_task_for_run`` resolves it), seed the lifecycle through
+    PENDING -> READY -> RUNNING -> VALIDATING -> AWAITING_APPROVAL,
+    and pin the parked gate's ordinal via ``awaiting_manual_ordinal``.
+
+    Returns ``(lifecycle, content_hash)`` so callers can both reload
+    the run and reach back into the tasks table when they need to.
+    """
+    from flywheel.task import CommandGrader, ManualGrader, Task
+
+    now = datetime.now(timezone.utc)
+    task = Task(
+        id=task_id,
+        goal=f"Goal for {task_id}.",
+        graders=[
+            CommandGrader(run="true"),
+            ManualGrader(instruction=instruction, name=grader_name),
+        ],
+    )
+    content_hash = store.save_task(task, now=now)
+
+    rid = run_id or f"run-{task_id}-awaiting"
+    lc = Lifecycle(
+        task_id=task_id,
+        run_id=rid,
+        task_content_hash=content_hash,
+    )
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.VALIDATING, now=now)
+    lc.awaiting_manual_ordinal = awaiting_ordinal
+    lc.transition_to(Status.AWAITING_APPROVAL, now=now)
+    store.create_lifecycle(lc)
+    return lc, content_hash
+
+
+def test_build_status_rows_classifies_awaiting_approval_distinctly(
+    tmp_path: Path,
+) -> None:
+    """A parked manual-gate lifecycle classifies as AWAITING_APPROVAL —
+    not the generic IN_PROGRESS fallback — so renderers can surface the
+    owed decision and ``select_next_task`` does not pick it up as a
+    fresh/retryable candidate."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_manual_task(
+        phase / "parked.json",
+        "parked",
+        instruction="Confirm the migration is safe.",
+        grader_name="confirm-migration",
+    )
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_with_task(
+            store,
+            "parked",
+            instruction="Confirm the migration is safe.",
+            grader_name="confirm-migration",
+        )
+        rows = build_status_rows(tmp_path, store)
+    finally:
+        store.close()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.state == TaskState.AWAITING_APPROVAL
+    assert row.latest_status == Status.AWAITING_APPROVAL
+    assert row.awaiting_manual_ordinal == 1
+
+
+def test_main_status_renders_awaiting_on_line_with_instruction(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel status`` prints an ``awaiting_on: <instruction>``
+    follow-up line for a parked lifecycle so an operator sees what
+    decision is owed without consulting the task file or audit stream."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_manual_task(
+        phase / "parked.json",
+        "parked",
+        instruction="Confirm the migration is safe.",
+        grader_name="confirm-migration",
+    )
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_with_task(
+            store,
+            "parked",
+            instruction="Confirm the migration is safe.",
+            grader_name="confirm-migration",
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "status",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "awaiting_approval" in out
+    assert "awaiting_on: Confirm the migration is safe." in out
+
+
+def test_main_status_json_emits_awaiting_on_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel status --json`` carries an ``awaiting_on`` entry with
+    the gate ordinal and instruction so machine readers can surface the
+    same information as the human-readable view."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_manual_task(
+        phase / "parked.json",
+        "parked",
+        instruction="Confirm the migration is safe.",
+        grader_name="confirm-migration",
+    )
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_with_task(
+            store,
+            "parked",
+            instruction="Confirm the migration is safe.",
+            grader_name="confirm-migration",
+        )
+    finally:
+        store.close()
+
+    rc = main(
+        [
+            "status",
+            "--tasks-dir",
+            str(tmp_path),
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload) == 1
+    entry = payload[0]
+    assert entry["state"] == "awaiting_approval"
+    assert entry["latest_status"] == "awaiting_approval"
+    assert entry["awaiting_on"] == {
+        "ordinal": 1,
+        "instruction": "Confirm the migration is safe.",
+    }
+
+
+def test_collect_live_rows_includes_awaiting_approval_with_instruction(
+    tmp_path: Path,
+) -> None:
+    """``collect_live_rows`` surfaces AWAITING_APPROVAL runs alongside
+    running/validating ones and resolves the pending gate's instruction
+    from the task pinned to the run via ``task_content_hash``."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_with_task(
+            store,
+            "parked",
+            instruction="Confirm the migration is safe.",
+            grader_name="confirm-migration",
+        )
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.task_id == "parked"
+    assert row.status == Status.AWAITING_APPROVAL
+    assert row.awaiting_instruction == "Confirm the migration is safe."
+
+
+def test_main_live_renders_awaiting_on_followup_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel live`` prints the awaiting state in the headline and
+    the instruction on an indented follow-up line — matching the shape
+    ``flywheel status`` uses so operators have one consistent surface."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_awaiting_with_task(
+            store,
+            "parked",
+            instruction="Confirm the migration is safe.",
+            grader_name="confirm-migration",
+        )
+    finally:
+        store.close()
+    rc = main(["live", "--db", str(db)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    # Two lines: the status headline plus the awaiting_on follow-up.
+    assert len(lines) == 2
+    head, tail = lines
+    assert "parked" in head
+    assert "awaiting_approval" in head
+    assert tail.strip() == "awaiting_on: Confirm the migration is safe."
+
+
+def test_collect_live_rows_omits_awaiting_instruction_when_task_missing(
+    tmp_path: Path,
+) -> None:
+    """Edge case: an AWAITING_APPROVAL lifecycle whose pinned task is
+    not in the tasks table (data skew / archive) still renders — the
+    instruction is just absent rather than crashing the view."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        # Park the lifecycle without saving the task into the tasks
+        # table — ``load_task_for_run`` returns None on this skew.
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="orphan", run_id="run-orphan-awaiting")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        lc.awaiting_manual_ordinal = 1
+        lc.transition_to(Status.AWAITING_APPROVAL, now=now)
+        store.create_lifecycle(lc)
+        rows = collect_live_rows(store)
+    finally:
+        store.close()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == Status.AWAITING_APPROVAL
+    assert row.awaiting_instruction is None

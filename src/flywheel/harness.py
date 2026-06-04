@@ -89,6 +89,7 @@ from flywheel.grader_rubric import (
     RubricJudgeError,
     run_rubric_graders,
 )
+from flywheel.recovery_summarizer import SummarizerInvoke
 from flywheel.grader_transcript import (
     _USAGE_TOKEN_KEYS,
     TranscriptObservation,
@@ -320,6 +321,31 @@ class HarnessConfig:
     ``signals.tool_interactions`` is fed into it in arrival order. Each
     threshold disables independently via ``None`` / ``0``; default values
     keep the detectors on without tripping the existing harness suite.
+
+    ``context_window_tokens`` is the operator-supplied agent context-window
+    capacity used by the context-recovery policy (spec 00018). When
+    ``None`` (the default) the recovery policy is disabled and the harness
+    behaves exactly as today; the SDK exposes no capacity source so the
+    value is operator-supplied, mirroring the hang-watchdog pattern. When
+    set, the harness compares the iteration's input-side occupancy against
+    this capacity and recovers above
+    ``context_recovery_trigger_ratio``.
+
+    ``context_recovery_trigger_ratio`` is the occupancy fraction at which
+    recovery fires (default ``0.9``). Must satisfy ``0 < ratio <= 1``;
+    out-of-range values are rejected at construction rather than silently
+    clamped (spec 00018 Error Handling).
+
+    ``max_context_recoveries`` is the recovery budget per ``run_task``
+    call (default ``1``), independent of ``max_retries``. Recovery is
+    skipped once the budget is exhausted and the iteration loop follows
+    its normal termination path.
+
+    ``recovery_summarizer_invoke`` is a test seam mirroring
+    ``rubric_judge_invoke``: when set, the harness passes it to the
+    recovery summarizer instead of the runner's default fresh
+    ``claude_agent_sdk.query`` invoker. Production callers leave it
+    ``None``.
     """
 
     max_retries: int = 0
@@ -331,6 +357,38 @@ class HarnessConfig:
     rubric_judge_max_turns: int = 8
     rubric_judge_invoke: JudgeInvoke | None = None
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
+    context_window_tokens: int | None = None
+    context_recovery_trigger_ratio: float = 0.9
+    max_context_recoveries: int = 1
+    recovery_summarizer_invoke: SummarizerInvoke | None = None
+
+    def __post_init__(self) -> None:
+        # Reject out-of-range ratio: must be in (0, 1]. Spec 00018
+        # Error Handling requires construction-time rejection rather
+        # than silent clamping.
+        ratio = self.context_recovery_trigger_ratio
+        if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+            raise ValueError(
+                "context_recovery_trigger_ratio must be a number in (0, 1], "
+                f"got {ratio!r}"
+            )
+        if ratio <= 0 or ratio > 1:
+            raise ValueError(
+                "context_recovery_trigger_ratio must be in (0, 1], "
+                f"got {ratio!r}"
+            )
+        # Reject non-positive capacity (None is the disabled sentinel).
+        capacity = self.context_window_tokens
+        if capacity is not None:
+            if (
+                not isinstance(capacity, int)
+                or isinstance(capacity, bool)
+                or capacity <= 0
+            ):
+                raise ValueError(
+                    "context_window_tokens must be a positive int or None, "
+                    f"got {capacity!r}"
+                )
 
 
 @dataclass(frozen=True, kw_only=True)

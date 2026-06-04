@@ -3990,6 +3990,51 @@ class TestHarnessConfigDefaults:
         assert cfg.worktree is None
         assert cfg.rubric_judge_invoke is None
 
+    def test_default_context_recovery_fields(self) -> None:
+        # Recovery is disabled by default (capacity None) so existing
+        # consumers see no behavior change; the other knobs carry the
+        # spec-mandated defaults.
+        cfg = HarnessConfig()
+        assert cfg.context_window_tokens is None
+        assert cfg.context_recovery_trigger_ratio == 0.9
+        assert cfg.max_context_recoveries == 1
+        assert cfg.recovery_summarizer_invoke is None
+
+    def test_context_window_tokens_accepts_positive_int(self) -> None:
+        cfg = HarnessConfig(context_window_tokens=200_000)
+        assert cfg.context_window_tokens == 200_000
+
+    def test_context_recovery_trigger_ratio_accepts_boundary_one(self) -> None:
+        # Edge case: ratio of exactly 1.0 is valid.
+        cfg = HarnessConfig(context_recovery_trigger_ratio=1.0)
+        assert cfg.context_recovery_trigger_ratio == 1.0
+
+    @pytest.mark.parametrize("bad_ratio", [0.0, -0.1, 1.0001, 2.0])
+    def test_rejects_out_of_range_trigger_ratio(
+        self, bad_ratio: float
+    ) -> None:
+        with pytest.raises(ValueError, match="trigger_ratio"):
+            HarnessConfig(context_recovery_trigger_ratio=bad_ratio)
+
+    @pytest.mark.parametrize("bad_capacity", [0, -1, -100_000])
+    def test_rejects_non_positive_context_window_tokens(
+        self, bad_capacity: int
+    ) -> None:
+        with pytest.raises(ValueError, match="context_window_tokens"):
+            HarnessConfig(context_window_tokens=bad_capacity)
+
+    def test_context_window_tokens_none_constructs_cleanly(self) -> None:
+        # None is the disabled sentinel and must not raise.
+        cfg = HarnessConfig(context_window_tokens=None)
+        assert cfg.context_window_tokens is None
+
+    def test_recovery_summarizer_invoke_seam_accepted(self) -> None:
+        async def fake_invoke(prompt: str, worktree: object) -> str:
+            return ""
+
+        cfg = HarnessConfig(recovery_summarizer_invoke=fake_invoke)
+        assert cfg.recovery_summarizer_invoke is fake_invoke
+
 
 class TestTaskPersistence:
     def test_run_persists_task_and_pins_content_hash(self) -> None:

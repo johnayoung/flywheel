@@ -86,6 +86,30 @@ class ManualFinding:
 
 
 @dataclass(frozen=True, kw_only=True)
+class RecoveryHandoff:
+    """Structured handoff summary from a prior attempt that was terminated
+    by the harness's context-recovery policy (spec 00018 FR-3).
+
+    Pure data: produced from a fresh-context summarizer call when the
+    working attempt approaches the agent's context-window capacity, then
+    consumed by :func:`build_iteration_prompt` to render the
+    ``# Recovery handoff`` section on the recovery attempt's prompt so
+    the resuming agent rebuilds situational context from the summary
+    rather than re-discovering it.
+
+    The four fields mirror the spec's structured-handoff shape exactly
+    (work done, work remaining, key decisions, suggested next step); the
+    dataclass is frozen so the prompt builder cannot mutate it and
+    remains byte-deterministic.
+    """
+
+    work_done: str
+    work_remaining: str
+    key_decisions: str
+    suggested_next_step: str
+
+
+@dataclass(frozen=True, kw_only=True)
 class IterationInputs:
     """Per-iteration parameters not carried by the Task or Lifecycle.
 
@@ -97,6 +121,7 @@ class IterationInputs:
     max_retries: int
     prior_rubric_findings: tuple[RubricFindings, ...] = ()
     prior_manual_findings: tuple[ManualFinding, ...] = ()
+    recovery_handoff: RecoveryHandoff | None = None
 
 
 def build_iteration_prompt(
@@ -117,6 +142,11 @@ def build_iteration_prompt(
     context_section = _section_context(task)
     if context_section is not None:
         sections.append(context_section)
+
+    if iteration_inputs.recovery_handoff is not None:
+        sections.append(
+            _section_recovery_handoff(iteration_inputs.recovery_handoff)
+        )
 
     if (
         iteration_inputs.prior_rubric_findings
@@ -163,6 +193,38 @@ def _section_context(task: Task) -> str | None:
 def _bulleted(heading: str, items: list[str]) -> str:
     bullets = "\n".join(f"- {item}" for item in items)
     return f"## {heading}\n\n{bullets}"
+
+
+def _section_recovery_handoff(handoff: RecoveryHandoff) -> str:
+    """Render the ``# Recovery handoff`` section from a structured summary
+    produced by the harness's context-recovery summarizer (spec 00018
+    FR-3).
+
+    The section appears on a recovery attempt scheduled after the prior
+    attempt approached the agent's context-window capacity. Four fixed
+    subsections — work done, work remaining, key decisions, suggested
+    next step — let the resuming agent rebuild situational context on a
+    fresh window without re-running the prior attempt's discovery.
+
+    Field order and headings are fixed for byte-determinism. An empty
+    field renders as the ``"(none recorded)"`` placeholder so a missing
+    subsection is explicit in the prompt instead of collapsing into
+    adjacent text — the agent can see that a slot was deliberately left
+    blank rather than guess what the summarizer intended.
+    """
+    placeholder = "(none recorded)"
+    return (
+        "# Recovery handoff\n\n"
+        "A prior attempt approached the agent's context-window capacity "
+        "and was finalized by the harness. The structured summary below "
+        "is your starting point on a fresh context — continue from here "
+        "rather than re-running the prior attempt's discovery.\n\n"
+        f"## Work done\n\n{handoff.work_done or placeholder}\n\n"
+        f"## Work remaining\n\n{handoff.work_remaining or placeholder}\n\n"
+        f"## Key decisions\n\n{handoff.key_decisions or placeholder}\n\n"
+        "## Suggested next step\n\n"
+        f"{handoff.suggested_next_step or placeholder}"
+    )
 
 
 def _section_reviewer_feedback(

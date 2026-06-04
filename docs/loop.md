@@ -110,6 +110,30 @@ Triggered when the agent claims `completed`. Driven by the task's `graders` list
 
 A failed grader records `failed_validation`. What happens next is policy.
 
+## In-loop verification gate
+
+A phase that adds a new loop path cannot archive until that path has run end-to-end against real `orchestrate` and a real migrated store. `archive_completed_phases` derives a loop-path marker from the phase's cumulative diff vs base and refuses to archive a marked phase without a DONE `in-loop-verification` task or a recorded opt-out. Closes the "graders pass" vs "shipped path ever ran" gap that detonated phase 08 (schema column never migrated into the live store) and phase 17 (`AWAITING_APPROVAL` path never entered).
+
+### Trigger set
+
+Any of the following symbol-level signals in the phase diff marks it loop-path-bearing:
+
+| # | Signal | Decidable test |
+| - | ------ | -------------- |
+| 1 | New `Status`/`Outcome` member or transition-rule entry | added enum member / new `_VALID_EDGES` entry in `lifecycle.py` |
+| 2 | New `ADD COLUMN` / table in `_schema/*.sql` | DDL on lifecycles, grader_results, events, attempts, control_commands |
+| 3 | New `Grader` union variant | new variant in `task.py`'s `Grader` union or new `grader_*.py` dispatched by the harness |
+| 4 | New store-contract / resolver entry | new method on a `store_protocols.py` Protocol AND a dispatch registration |
+| 5 | New control-command verb | new `CONTROL_COMMAND_*` constant in `invoker_client.py` |
+
+### in-loop-verification task
+
+A `command` grader that drives a fixture through the real `orchestrate`/harness via the injectable invoker seam with a scripted envelope. Must exercise both ends of the new path (e.g. harness park AND reactive-sweep apply) and, for schema-touching features, seed a `v(N-1)` store fixture and assert via `SqliteStore` after running the real forward migration — a fresh current-schema store does NOT satisfy the gate (phase 08's exact blind spot). Never touches `.workflow/flywheel.sqlite`.
+
+### Opt-out artifact
+
+A false-positive marker (e.g. docstring fix in a watched file, reverted-within-phase column) is downgraded by committing `active/<phase>/loop-path-exempt.md` with structured front-matter recording phase, author, and reason. `/audit-phase` re-derives the marker from the diff and flags opt-outs whose diff in fact added a watched symbol.
+
 ## Intervention
 
 Agent-reported:

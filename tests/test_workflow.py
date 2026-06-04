@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import signal
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,7 @@ from flywheel.workflow import (
     EVENTS_JSON,
     EVENTS_NONE,
     EVENTS_PLAIN,
+    LOOP_BASE_FILENAME,
     TaskState,
     archive_completed_phases,
     build_inline_task,
@@ -36,9 +38,12 @@ from flywheel.workflow import (
     iter_active_phase_dirs,
     iter_active_task_files,
     main,
+    phase_diff_vs_base,
+    read_phase_base,
     recover_stranded_lifecycles,
     run_task_object,
     select_next_task,
+    write_phase_base_if_missing,
 )
 
 
@@ -414,6 +419,175 @@ def test_archive_is_idempotent(tmp_path: Path) -> None:
         store.close()
     assert len(first) == 1
     assert second == []
+
+
+def test_archive_ignores_loop_base_dotfile(tmp_path: Path) -> None:
+    """A ``.loop-base`` dotfile alongside DONE tasks must not block archive.
+
+    The ``archive_completed_phases`` task-file iteration already filters
+    non-``.json`` and dot-prefixed entries (workflow.py task-file filter);
+    this test pins that behavior so the loop-base capture cannot
+    accidentally regress phase archiving.
+    """
+    phase = tmp_path / "active" / "01-done"
+    _write_task(phase / "a.json", "done-a")
+    # The committed-base dotfile lives alongside the task JSON.
+    (phase / LOOP_BASE_FILENAME).write_text("abc123def456\n")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "done-a")
+        moved = archive_completed_phases(tmp_path, store)
+    finally:
+        store.close()
+
+    assert [d.name for d in moved] == ["01-done"]
+    assert not phase.exists()
+    archived = tmp_path / "archive" / "01-done"
+    assert archived.is_dir()
+    # The dotfile travels with the phase into archive/ so an auditor can
+    # re-derive the diff signal.
+    assert (archived / LOOP_BASE_FILENAME).read_text().strip() == "abc123def456"
+
+
+# ---------- Phase base capture / diff helpers (real git repo) ----------
+
+
+def _git_init_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "init", "-b", "main"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "wf-test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "wf test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"],
+        check=True,
+        capture_output=True,
+    )
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_commit_file(repo: Path, name: str, body: str, message: str) -> None:
+    (repo / name).write_text(body)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", message],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _git_head(repo: Path) -> str:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return out
+
+
+def test_write_phase_base_if_missing_captures_head_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Real-git-repo test for FR-1 base capture.
+
+    Two invariants:
+
+    * The first call writes the current ``HEAD`` SHA into ``.loop-base``
+      and returns ``True``.
+    * A re-run after ``.loop-base`` already exists must not move the
+      recorded base forward -- the first-seen SHA is the true base. The
+      re-run returns ``False`` and the recorded SHA is unchanged even if
+      ``HEAD`` has advanced.
+    """
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+
+    head_before = _git_head(repo)
+
+    assert write_phase_base_if_missing(repo, phase_dir) is True
+    recorded = read_phase_base(phase_dir)
+    assert recorded == head_before
+
+    # Advance HEAD to simulate the phase's tasks merging into base.
+    _git_commit_file(repo, "advance.txt", "x\n", "advance base")
+    assert _git_head(repo) != head_before
+
+    # Re-run must be a no-op: the dotfile already exists, the recorded
+    # SHA must not move forward.
+    assert write_phase_base_if_missing(repo, phase_dir) is False
+    assert read_phase_base(phase_dir) == head_before
+
+
+def test_phase_diff_vs_base_returns_added_lines(tmp_path: Path) -> None:
+    """The diff helper returns the phase's added lines as unified-diff text.
+
+    Reproduces the production sequence: capture the base, commit the
+    dotfile, then land a task commit -- the diff against the recorded base
+    must include the task's added file content.
+    """
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+
+    assert write_phase_base_if_missing(repo, phase_dir) is True
+    # Mimic the worker: commit the freshly-written .loop-base dotfile.
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "chore: record phase base sha"],
+        check=True,
+        capture_output=True,
+    )
+
+    # The phase's task lands a feature file.
+    _git_commit_file(repo, "feature.txt", "hello phase\n", "feat: task work")
+
+    diff = phase_diff_vs_base(repo, phase_dir)
+    assert "feature.txt" in diff
+    assert "+hello phase" in diff
+
+
+def test_phase_diff_vs_base_returns_empty_when_no_base_recorded(
+    tmp_path: Path,
+) -> None:
+    """No ``.loop-base`` => empty diff (degrades safely, never raises)."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+
+    # Advance HEAD so a buggy implementation that fell back to "HEAD..HEAD"
+    # would still differ from the spec'd empty-string contract.
+    _git_commit_file(repo, "advance.txt", "x\n", "advance")
+
+    assert phase_diff_vs_base(repo, phase_dir) == ""
 
 
 # ---------- CLI integration ----------

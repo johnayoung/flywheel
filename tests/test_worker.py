@@ -384,6 +384,53 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
         store.close()
 
 
+def test_record_phase_bases_captures_once_and_idempotent(tmp_path: Path) -> None:
+    """The worker's per-cycle base-capture step records the pre-merge HEAD
+    once per phase dir and never moves it forward on re-run.
+
+    Mirrors the production sequence: after ``commit_task_files`` lands new
+    task JSON, the worker captures the resulting ``HEAD`` SHA into
+    ``.loop-base`` for each active phase that lacks one, then commits the
+    dotfile. The recorded SHA is the base the future archive gate diffs
+    against -- it must be locked in at phase entry, not derived later when
+    task branches have already been merged.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tasks_dir = repo / ".workflow" / "tasks"
+    phase_dir = tasks_dir / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+    lock_path = repo / ".workflow" / ".merge.lock"
+
+    head_at_capture = _rev(repo, "main")
+
+    worker.record_phase_bases(repo, tasks_dir, lock_path, lambda _m: None)
+
+    base_file = phase_dir / ".loop-base"
+    assert base_file.is_file()
+    # The recorded SHA is the pre-merge HEAD (the captured commit itself
+    # advances HEAD past it, which is fine -- the captured SHA must be
+    # what HEAD pointed at *before* the capture).
+    assert base_file.read_text().strip() == head_at_capture
+    # The dotfile was committed (no untracked entry remains).
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain", "--", str(base_file)],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert status == ""
+
+    # Advance base by an unrelated commit (simulating a task FF-merge).
+    _commit(repo, "advance.txt", "x", "advance main")
+    assert _rev(repo, "main") != head_at_capture
+
+    # Re-run: the dotfile already exists. Must NOT move the recorded base
+    # forward -- the first-seen SHA is the true base.
+    worker.record_phase_bases(repo, tasks_dir, lock_path, lambda _m: None)
+    assert base_file.read_text().strip() == head_at_capture
+
+
 def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
     """A full ``run_once`` cycle must drop a per-run forensics file keyed to
     the executed run_id under ``log_dir``. Restoration of the behavior the

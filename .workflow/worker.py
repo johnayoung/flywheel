@@ -57,10 +57,13 @@ from flywheel.workflow import (
     DEFAULT_LOG_DIR,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
+    LOOP_BASE_FILENAME,
     LiveRunRow,
     _format_event_line,
     archive_completed_phases,
     collect_live_rows,
+    iter_active_phase_dirs,
+    write_phase_base_if_missing,
 )
 
 DEFAULT_RETENTION_DAYS = 7
@@ -453,6 +456,36 @@ def commit_task_files(
         log("Committed new task files so worktrees can access them")
 
 
+def record_phase_bases(
+    repo_root: Path, tasks_dir: Path, lock_path: Path, log: Logger
+) -> None:
+    """Capture each active phase's base SHA into a committed ``.loop-base``.
+
+    Runs once per cycle, after :func:`commit_task_files` (so the recorded
+    SHA includes any newly-dropped task JSON) and before any task branch is
+    merged. For each ``active/<phase>`` lacking a ``.loop-base``, writes the
+    current ``HEAD`` SHA into the dotfile and stages+commits it under the
+    merge lock. Idempotent: a phase whose ``.loop-base`` already exists is
+    left untouched (the first-seen SHA is the true base; re-runs must never
+    move it forward).
+    """
+    if not (tasks_dir / "active").is_dir():
+        return
+    with merge_lock(lock_path):
+        written: list[Path] = []
+        for phase_dir in iter_active_phase_dirs(tasks_dir):
+            if write_phase_base_if_missing(repo_root, phase_dir):
+                written.append(phase_dir / LOOP_BASE_FILENAME)
+        if not written:
+            return
+        for path in written:
+            _git(repo_root, "add", "--", str(path))
+        if _git(repo_root, "diff", "--cached", "--quiet").returncode == 0:
+            return
+        _git(repo_root, "commit", "-m", "chore: record phase base sha")
+        log(f"Recorded base sha for {len(written)} phase(s)")
+
+
 def archive_phases(tasks_dir: Path, db_path: Path, log: Logger) -> None:
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``."""
     store = SqliteStore(db_path)
@@ -725,6 +758,9 @@ def run_once(
         log_dir if log_dir is not None else submitter.repo_root / DEFAULT_LOG_DIR
     )
     commit_task_files(submitter.repo_root, tasks_dir, submitter.lock_path, log)
+    record_phase_bases(
+        submitter.repo_root, tasks_dir, submitter.lock_path, log
+    )
     report = asyncio.run(
         orchestrate(
             tasks_dir=tasks_dir,

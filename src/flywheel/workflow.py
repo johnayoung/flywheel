@@ -57,6 +57,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -1144,6 +1145,108 @@ def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
         shutil.move(str(phase_dir), str(dest))
         moved.append(dest)
     return moved
+
+
+# --- Phase base-SHA capture + diff-vs-base ----------------------------------
+#
+# To compute a phase's cumulative diff at archive-evaluation time the worker
+# must record the base SHA at *phase entry* -- by archive time the phase's
+# task branches have already been FF-merged into the base, so a "diff vs
+# current base" would always be empty. The recorded base lives in a committed
+# ``.loop-base`` dotfile inside ``active/<phase>/``:
+#
+#   * The worker captures it once per phase, the first cycle that processes
+#     that phase, right after ``commit_task_files`` commits any new task JSON
+#     and before any task branch merges into the base. Re-runs must not move
+#     the recorded base forward (the first-seen SHA is the true base).
+#   * The file is a dotfile so the existing dot-prefix filters in
+#     :func:`iter_active_task_files` and :func:`archive_completed_phases`
+#     skip it -- it is never treated as a task.
+#   * :func:`phase_diff_vs_base` returns ``git diff <recorded-base> HEAD``
+#     as unified-diff text; a phase with no recorded base degrades safely
+#     to an empty diff rather than raising, so callers (the loop-path
+#     marker, future archive gate) can treat "no base" as "no signal."
+
+LOOP_BASE_FILENAME = ".loop-base"
+
+
+def _git_capture(repo_root: Path, *args: str) -> tuple[int, str]:
+    """Run ``git -C <repo_root> <args>`` and return ``(returncode, stdout)``.
+
+    Helper used by the loop-base capture and diff helpers. ``stderr`` is
+    discarded -- failure here is data (the diff degrades to empty) rather
+    than an operator-actionable error.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return proc.returncode, proc.stdout
+
+
+def read_phase_base(phase_dir: Path) -> str | None:
+    """Return the SHA recorded in ``phase_dir/.loop-base`` or ``None``.
+
+    Missing file, empty file, or unreadable file all map to ``None`` so the
+    diff helper can degrade safely without raising.
+    """
+    base_file = phase_dir / LOOP_BASE_FILENAME
+    if not base_file.is_file():
+        return None
+    try:
+        sha = base_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return sha or None
+
+
+def write_phase_base_if_missing(repo_root: Path, phase_dir: Path) -> bool:
+    """Write the current ``HEAD`` SHA into ``phase_dir/.loop-base`` if absent.
+
+    Idempotent: returns ``True`` when a fresh ``.loop-base`` was written,
+    ``False`` when one already existed (so the first-seen SHA is preserved
+    -- a re-run must not move the recorded base forward). The caller owns
+    staging/committing the new file under the worker's merge lock; this
+    helper only touches the working tree so the logic is testable without
+    the worker.
+
+    Returns ``False`` (no write) when ``phase_dir`` does not exist or when
+    ``git rev-parse HEAD`` fails -- both signal "no usable base to record."
+    """
+    if not phase_dir.is_dir():
+        return False
+    base_file = phase_dir / LOOP_BASE_FILENAME
+    if base_file.exists():
+        return False
+    rc, out = _git_capture(repo_root, "rev-parse", "HEAD")
+    if rc != 0:
+        return False
+    sha = out.strip()
+    if not sha:
+        return False
+    base_file.write_text(sha + "\n", encoding="utf-8")
+    return True
+
+
+def phase_diff_vs_base(repo_root: Path, phase_dir: Path) -> str:
+    """Return ``git diff <recorded-base> HEAD`` for ``repo_root`` as text.
+
+    Returns ``""`` when no ``.loop-base`` has been recorded for the phase
+    (degrades safely rather than raising -- callers can treat an empty
+    diff as "no signal"), or when the underlying ``git diff`` exits
+    non-zero (e.g. the recorded SHA has been garbage-collected). The
+    returned text is the raw unified-diff payload from git, suitable for
+    feeding the loop-path marker's symbol-level scans.
+    """
+    base = read_phase_base(phase_dir)
+    if base is None:
+        return ""
+    rc, out = _git_capture(repo_root, "diff", base, "HEAD")
+    if rc != 0:
+        return ""
+    return out
 
 
 # --- Loop-path opt-out artifact ---------------------------------------------
@@ -2758,6 +2861,7 @@ __all__ = [
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_TURNS",
     "DEFAULT_TASKS_DIR",
+    "LOOP_BASE_FILENAME",
     "LOOP_PATH_OPTOUT_FILENAME",
     "LiveRunRow",
     "LoopPathOptOut",
@@ -2773,11 +2877,14 @@ __all__ = [
     "load_active_tasks",
     "load_loop_path_optout",
     "main",
+    "phase_diff_vs_base",
+    "read_phase_base",
     "recover_stranded_lifecycles",
     "run_task_file",
     "run_task_object",
     "select_next_task",
     "task_state",
+    "write_phase_base_if_missing",
 ]
 
 

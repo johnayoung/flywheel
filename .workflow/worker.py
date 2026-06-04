@@ -46,6 +46,7 @@ from typing import Callable, Iterator, Sequence, TextIO
 from flywheel import (
     InvokeFunc,
     OrchestratorReport,
+    RunRecord,
     SandboxRequest,
     Status,
     SubmitRequest,
@@ -53,9 +54,11 @@ from flywheel import (
 )
 from flywheel.store_sqlite import SqliteStore
 from flywheel.workflow import (
+    DEFAULT_LOG_DIR,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     LiveRunRow,
+    _format_event_line,
     archive_completed_phases,
     collect_live_rows,
 )
@@ -461,6 +464,109 @@ def archive_phases(tasks_dir: Path, db_path: Path, log: Logger) -> None:
         log(f"Archived phase: {dest}")
 
 
+# --- per-run log files ------------------------------------------------------
+#
+# The legacy bash worker (.workflow/task-worker.sh) redirected each per-task
+# subprocess to ``logs/worker/${task_id}_${hash}_$(date +%Y%m%dT%H%M%S).log``.
+# The Python worker runs all tasks in-process via orchestrate and streams to
+# one shared sys.stderr, so we restore the per-run forensics file by rendering
+# the store's persisted telemetry to disk after each run. The filename mirrors
+# the old <task>_<hash>_<ts>.log shape, keyed on the run_id (which uniquely
+# identifies the lifecycle attempt) plus a UTC timestamp so multiple
+# resumes/attempts of the same task never clobber each other.
+
+
+def _run_id_hash(run_id: str) -> str:
+    """Short, filesystem-safe slice of ``run_id`` for the log filename.
+
+    Mirrors the ``hash`` slot in the old ``<task>_<hash>_<ts>.log`` shape.
+    Run ids are of the form ``run-<32-hex>``; we keep the first 12 hex chars
+    after the prefix (unique enough across a worker's lifetime, short enough
+    to keep filenames greppable). Falls back to the raw value if the prefix
+    is absent (forward-compat).
+    """
+    body = run_id[len("run-") :] if run_id.startswith("run-") else run_id
+    return body[:12] or "run"
+
+
+def _per_run_log_path(
+    log_dir: Path, *, task_id: str, run_id: str, now: datetime
+) -> Path:
+    """Compose ``<log_dir>/<task_id>_<run_hash>_<utc_ts>.log``."""
+    ts = now.strftime("%Y%m%dT%H%M%S")
+    return log_dir / f"{task_id}_{_run_id_hash(run_id)}_{ts}.log"
+
+
+def write_run_log(
+    log_dir: Path,
+    record: RunRecord,
+    store: SqliteStore,
+    *,
+    now: datetime | None = None,
+) -> Path:
+    """Render the run's persisted telemetry into a per-run forensics file.
+
+    Produces ``<log_dir>/<task_id>_<run_hash>_<ts>.log`` containing a header
+    (task_id / run_id / mode / status) followed by one ``_format_event_line``
+    per persisted telemetry event for the run, in store order. The directory
+    is created on demand so a fresh checkout's first run does not fail.
+
+    Called for every :class:`RunRecord` the orchestrator returns — including
+    failed and interrupted runs, since those are exactly the runs an operator
+    needs forensics for.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    moment = now if now is not None else datetime.now(timezone.utc)
+    path = _per_run_log_path(
+        log_dir, task_id=record.task_id, run_id=record.run_id, now=moment
+    )
+    events = store.list_events(record.run_id)
+    lines: list[str] = [
+        f"# task_id={record.task_id}",
+        f"# run_id={record.run_id}",
+        f"# mode={record.mode}",
+        f"# status={record.status.value}",
+        f"# worker_id={record.worker_id}",
+        f"# written_at={moment.isoformat()}",
+        "",
+    ]
+    lines.extend(_format_event_line(event) for event in events)
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def write_run_logs(
+    log_dir: Path, report: OrchestratorReport, db_path: Path, log: Logger
+) -> list[Path]:
+    """Persist a per-run log for every run the orchestrator drove this cycle.
+
+    Opens its own short-lived :class:`SqliteStore` (the orchestrate call has
+    already closed its handle by the time this runs). Returns the list of
+    written paths, in the same order as ``report.runs``. Any per-run write
+    error is logged and skipped — losing a forensics file must never abort
+    the daemon loop.
+    """
+    written: list[Path] = []
+    if not report.runs:
+        return written
+    store = SqliteStore(db_path)
+    try:
+        for record in report.runs:
+            try:
+                path = write_run_log(log_dir, record, store)
+            except OSError as exc:
+                log(
+                    f"failed to write per-run log for {record.run_id} "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                continue
+            written.append(path)
+            log(f"wrote run log {path} ({record.status.value})")
+    finally:
+        store.close()
+    return written
+
+
 def retention_sweep(
     repo_root: Path,
     worktrees_dir: Path,
@@ -602,11 +708,22 @@ def run_once(
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     log: Logger | None = None,
+    log_dir: Path | None = None,
 ) -> OrchestratorReport:
     """One cycle: commit new task files, drain every eligible task to
-    quiescence through the git-submit seam, archive completed phases. ``invoke``
-    defaults to the real Claude Code invoker; tests inject a fake."""
+    quiescence through the git-submit seam, write a per-run forensics log for
+    each run the orchestrator drove, archive completed phases. ``invoke``
+    defaults to the real Claude Code invoker; tests inject a fake.
+
+    ``log_dir`` defaults to ``submitter.repo_root / DEFAULT_LOG_DIR`` so the
+    files always land at ``logs/worker/`` under the active repo regardless of
+    the caller's cwd. Pass an explicit path to override (e.g. tests, the
+    ``--log-dir`` CLI flag).
+    """
     log = log or submitter.log
+    resolved_log_dir = (
+        log_dir if log_dir is not None else submitter.repo_root / DEFAULT_LOG_DIR
+    )
     commit_task_files(submitter.repo_root, tasks_dir, submitter.lock_path, log)
     report = asyncio.run(
         orchestrate(
@@ -624,6 +741,7 @@ def run_once(
             stream=stream,
         )
     )
+    write_run_logs(resolved_log_dir, report, db_path, log)
     archive_phases(tasks_dir, db_path, log)
     return report
 
@@ -685,6 +803,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-id", default=None)
     parser.add_argument("--lease-seconds", type=float, default=300.0)
     parser.add_argument(
+        "--log-dir",
+        default=None,
+        help=(
+            "Directory for per-run forensics logs. Defaults to "
+            "<repo_root>/logs/worker/."
+        ),
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run a single drain cycle and exit (no daemon loop).",
@@ -723,6 +849,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     worktrees_dir = repo_root / ".workflow" / "worktrees"
     lock_path = repo_root / ".workflow" / ".merge.lock"
+    log_dir = Path(args.log_dir) if args.log_dir else repo_root / DEFAULT_LOG_DIR
 
     log = make_logger("[worker]")
     submitter = GitWorktreeSubmitter(
@@ -736,9 +863,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"started pid={os.getpid()} base={phase_base} db={db_path}")
-    log(f"tasks={tasks_dir} worktrees={worktrees_dir}")
+    log(f"tasks={tasks_dir} worktrees={worktrees_dir} logs={log_dir}")
 
     retention_sweep(
         repo_root, worktrees_dir, args.worktree_retention_days, time.time(), log
@@ -772,6 +900,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     lease_seconds=args.lease_seconds,
                     stream=sys.stderr,
                     log=log,
+                    log_dir=log_dir,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log(

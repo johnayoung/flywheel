@@ -384,6 +384,59 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
         store.close()
 
 
+def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
+    """A full ``run_once`` cycle must drop a per-run forensics file keyed to
+    the executed run_id under ``log_dir``. Restoration of the behavior the
+    legacy bash worker lost when ``.workflow/task-worker.sh`` was collapsed
+    into the in-process Python worker."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    tf = _task_file(repo, "01-phase", "t1", grader="true")
+    worktree = repo / ".workflow" / "worktrees" / "t1"
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        _commit(worktree, "work.txt", "agent output", "agent work")
+        return IterationResult(
+            transcript="ok",
+            messages=_messages(),  # type: ignore[arg-type]
+            envelope=ValidEnvelope(intent=Intent.VERIFY),
+            signals=_signals(),
+            failure=None,
+        )
+
+    db_path = repo / ".workflow" / "flywheel.sqlite"
+    log_dir = repo / "logs" / "worker"
+    assert not log_dir.exists()  # fresh checkout: dir does not exist yet
+
+    report = worker.run_once(
+        s,
+        tasks_dir=repo / ".workflow" / "tasks",
+        db_path=db_path,
+        worktrees_dir=repo / ".workflow" / "worktrees",
+        model=None,
+        max_turns=4,
+        max_retries=0,
+        invoke=_invoke,
+        log_dir=log_dir,
+    )
+
+    assert len(report.runs) == 1
+    run_id = report.runs[0].run_id
+
+    # The directory was created on demand and a log file keyed to the
+    # executed run_id exists, is non-empty, and contains the run header.
+    assert log_dir.is_dir()
+    short_hash = worker._run_id_hash(run_id)
+    matches = sorted(log_dir.glob(f"t1_{short_hash}_*.log"))
+    assert len(matches) == 1, f"expected one log file, got {matches}"
+    log_file = matches[0]
+    body = log_file.read_text()
+    assert body
+    assert f"run_id={run_id}" in body
+    assert "task_id=t1" in body
+
+
 # --- heartbeat rendering ----------------------------------------------------
 
 

@@ -23,6 +23,7 @@ class Outcome(str, Enum):
     AGENT_ERROR = "agent_error"
     CANCELLED = "cancelled"
     INTERNAL_ERROR = "internal_error"
+    RECOVERED = "recovered"
 
 
 class LifecycleTransitionError(ValueError):

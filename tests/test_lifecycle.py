@@ -31,13 +31,14 @@ def test_status_enumerates_exactly_the_ten_spec_states() -> None:
     assert {member.value for member in Status} == expected
 
 
-def test_outcome_enumerates_exactly_the_five_spec_outcomes() -> None:
+def test_outcome_enumerates_exactly_the_six_spec_outcomes() -> None:
     expected = {
         "succeeded",
         "validation_failed",
         "agent_error",
         "cancelled",
         "internal_error",
+        "recovered",
     }
     assert {member.value for member in Outcome} == expected
 

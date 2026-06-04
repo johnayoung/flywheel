@@ -1146,6 +1146,147 @@ def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
     return moved
 
 
+# --- Loop-path opt-out artifact ---------------------------------------------
+#
+# A phase that has been auto-flagged as loop-path-bearing (see
+# ``flywheel.loop_path_marker``) but whose author can attest the diff added
+# no new path downgrades the marker by committing
+# ``active/<phase>/loop-path-exempt.md`` with a structured front-matter
+# block. The artifact records *who*, *which phase*, and *why no new path*
+# so the claim is falsifiable -- ``/audit-phase`` re-derives the diff
+# signals and emits a finding when an opt-out covers a diff that did add a
+# watched symbol (FR-5, FR-6b of
+# ``.workflow/specs/00017-FEATURE-in-loop-verification-gate.md``).
+#
+# Format is intentionally minimal: a leading ``---`` ... ``---`` block of
+# ``key: value`` lines, parsed with stdlib only. Required keys are
+# ``phase``, ``author``, ``reason``; a silently-empty opt-out must not
+# pass as valid. The artifact lives inside the phase dir so it travels
+# into ``archive/`` when the phase is archived -- ``/audit-phase`` can
+# re-check the recorded claim against the same diff that motivated it.
+
+LOOP_PATH_OPTOUT_FILENAME = "loop-path-exempt.md"
+
+_LOOP_PATH_OPTOUT_REQUIRED_KEYS: tuple[str, ...] = (
+    "phase",
+    "author",
+    "reason",
+)
+
+
+class LoopPathOptOutError(ValueError):
+    """Raised when an opt-out artifact exists but its front-matter is invalid.
+
+    The message identifies the offending file path so callers see actionable
+    errors. Absent files are NOT an error -- :func:`load_loop_path_optout`
+    returns ``None`` in that case (the phase has simply not opted out).
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class LoopPathOptOut:
+    """One parsed ``loop-path-exempt.md`` artifact.
+
+    The three required fields map to the spec's FR-5 attestation:
+    ``phase`` names which phase opted out, ``author`` records who made
+    the claim, and ``reason`` is the human justification for "no new
+    loop path." All three are required and non-empty -- a silently-empty
+    opt-out is rejected at load time so the audit re-check has something
+    falsifiable to evaluate.
+    """
+
+    phase: str
+    author: str
+    reason: str
+
+
+def load_loop_path_optout(phase_dir: Path) -> LoopPathOptOut | None:
+    """Locate and parse the opt-out artifact for ``phase_dir``.
+
+    Returns ``None`` when no ``loop-path-exempt.md`` exists inside
+    ``phase_dir`` (the common case -- a phase has not opted out).
+    Returns a parsed :class:`LoopPathOptOut` when the artifact exists
+    with valid, complete front-matter. Raises
+    :class:`LoopPathOptOutError` when the artifact exists but its
+    front-matter is missing, malformed, or missing a required key --
+    a silently-empty opt-out must not pass.
+
+    Probing a non-existent ``phase_dir`` also returns ``None`` so callers
+    may safely test arbitrary candidate paths; the loader only errors on
+    a real artifact whose front-matter does not validate.
+    """
+    artifact = phase_dir / LOOP_PATH_OPTOUT_FILENAME
+    if not artifact.is_file():
+        return None
+    text = artifact.read_text(encoding="utf-8")
+    fields = _parse_optout_frontmatter(text, source=str(artifact))
+    missing = [
+        key
+        for key in _LOOP_PATH_OPTOUT_REQUIRED_KEYS
+        if not fields.get(key)
+    ]
+    if missing:
+        raise LoopPathOptOutError(
+            f"{artifact}: opt-out front-matter is missing required "
+            f"key(s): {', '.join(missing)}"
+        )
+    return LoopPathOptOut(
+        phase=fields["phase"],
+        author=fields["author"],
+        reason=fields["reason"],
+    )
+
+
+def _parse_optout_frontmatter(text: str, *, source: str) -> dict[str, str]:
+    """Parse a leading ``---`` ... ``---`` block into a ``{key: value}`` dict.
+
+    Each line inside the block is ``key: value``; blank lines and lines
+    whose first non-whitespace character is ``#`` are skipped. Anything
+    after the closing ``---`` is treated as free-form prose and ignored.
+    Unknown keys are tolerated so the format can grow forward-compat
+    fields; required-key enforcement happens in the caller.
+
+    Raises :class:`LoopPathOptOutError` when the file does not start with
+    a ``---`` line, when the front-matter block is never closed by a
+    matching ``---`` line, or when a non-blank/non-comment line inside
+    the block is not in ``key: value`` shape (including an empty key).
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise LoopPathOptOutError(
+            f"{source}: opt-out must start with a '---' front-matter "
+            f"delimiter"
+        )
+    fields: dict[str, str] = {}
+    closed = False
+    for raw in lines[1:]:
+        if raw.strip() == "---":
+            closed = True
+            break
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in raw:
+            raise LoopPathOptOutError(
+                f"{source}: malformed front-matter line "
+                f"(expected 'key: value'): {raw!r}"
+            )
+        key, _, value = raw.partition(":")
+        key = key.strip()
+        if not key:
+            raise LoopPathOptOutError(
+                f"{source}: malformed front-matter line "
+                f"(empty key): {raw!r}"
+            )
+        fields[key] = value.strip()
+    if not closed:
+        raise LoopPathOptOutError(
+            f"{source}: opt-out front-matter is not closed by a "
+            f"matching '---' line"
+        )
+    return fields
+
+
 # --- CLI plumbing -----------------------------------------------------------
 
 
@@ -2617,7 +2758,10 @@ __all__ = [
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_TURNS",
     "DEFAULT_TASKS_DIR",
+    "LOOP_PATH_OPTOUT_FILENAME",
     "LiveRunRow",
+    "LoopPathOptOut",
+    "LoopPathOptOutError",
     "TaskState",
     "TaskStatusRow",
     "archive_completed_phases",
@@ -2627,6 +2771,7 @@ __all__ = [
     "iter_active_phase_dirs",
     "iter_active_task_files",
     "load_active_tasks",
+    "load_loop_path_optout",
     "main",
     "recover_stranded_lifecycles",
     "run_task_file",

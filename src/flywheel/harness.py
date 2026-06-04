@@ -89,7 +89,11 @@ from flywheel.grader_rubric import (
     RubricJudgeError,
     run_rubric_graders,
 )
-from flywheel.recovery_summarizer import SummarizerInvoke
+from flywheel.recovery_summarizer import (
+    RecoverySummarizerError,
+    SummarizerInvoke,
+    run_recovery_summarizer,
+)
 from flywheel.grader_transcript import (
     _USAGE_TOKEN_KEYS,
     TranscriptObservation,
@@ -121,6 +125,7 @@ from flywheel.loop_guard import (
 from flywheel.prompt import (
     IterationInputs,
     ManualFinding,
+    RecoveryHandoff,
     RubricFindings,
     build_iteration_prompt,
 )
@@ -156,7 +161,6 @@ _DEFERRED_LOOP_SUBSYSTEMS: tuple[str, ...] = (
     "thrash net-diff detection (sub-problem b)",
     "thrash input-novelty score (sub-problem c)",
     "hang threshold default value (mechanism shipped, value ungrounded)",
-    "context-recovery policy",
     "fine-grained crash classification",
     "blocked_implicit same-question-re-asked detection",
 )
@@ -484,6 +488,68 @@ def _transition(
         ),
         store=store,
     )
+
+
+# Input-side context-occupancy keys: the model's resent conversation plus
+# the cached prefix it reads. Mirrors the spec 00018 FR-1 occupancy
+# definition (input + cache-read + cache-creation tokens) -- output_tokens
+# are NOT input-side and are excluded.
+_OCCUPANCY_USAGE_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
+def _occupancy_from_usage(usage_payload: Mapping[str, Any]) -> int:
+    """Sum the input-side token fields from an iteration's usage payload.
+
+    The latest iteration's input-side tokens *are* the current context
+    sent to the model; summing per-iteration deltas would double-count
+    the re-sent conversation (spec 00018 Decisions Log). A missing or
+    non-integer field contributes zero so a sparse payload (no usage
+    data) yields zero and stays below any positive threshold -- the
+    "no usage data" case in the spec Error Handling table.
+    """
+    total = 0
+    for key in _OCCUPANCY_USAGE_KEYS:
+        value = usage_payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            total += value
+    return total
+
+
+@dataclass(frozen=True, kw_only=True)
+class _RecoveryTrigger:
+    """Sentinel raised by :func:`_drive_iterations` when an iteration
+    crosses the context-recovery threshold.
+
+    Carries the occupancy and the transcript text the summarizer needs
+    so the caller (:func:`_run_attempt_body`) can route the attempt
+    through the summarize-restart action without re-deriving them. Pure
+    data; only flywheel.harness builds and consumes it.
+    """
+
+    occupancy_tokens: int
+    transcript_tail: str
+
+
+@dataclass
+class _RecoveryState:
+    """Mutable per-``run_task`` recovery accounting.
+
+    ``recoveries_used`` is the in-process counter that enforces FR-4's
+    budget cap; the spec deliberately scopes it to the single
+    ``run_task`` call (cross-process persistence is deferred).
+    ``pending_handoff`` is the summary the harness must thread into the
+    next attempt's :class:`IterationInputs`; once that attempt's
+    :func:`_drive_iterations` consumes it the field returns to ``None``
+    so subsequent attempts on the same run do not re-render the same
+    section.
+    """
+
+    recoveries_used: int = 0
+    pending_handoff: RecoveryHandoff | None = None
 
 
 class _AuditWriteError(Exception):
@@ -1462,6 +1528,12 @@ async def run_task(
     invoker = invoke or _default_invoke
     clock = now or _utcnow
     mclock = monotonic or _default_monotonic
+    # In-process recovery accounting (spec 00018 FR-4). Scoped to this
+    # ``run_task`` call so the budget is independent of ``max_retries``
+    # and resets on a fresh process; carries the most recently produced
+    # handoff so the next ``_run_attempt`` renders ``# Recovery handoff``
+    # on its first iteration prompt.
+    recovery_state = _RecoveryState()
 
     # Seed the lifecycle by appending the first domain event. Under event
     # sourcing the lifecycle row *is* the projection of this event, so the
@@ -1537,6 +1609,7 @@ async def run_task(
                     invoker=invoker,
                     clock=clock,
                     mclock=mclock,
+                    recovery_state=recovery_state,
                 )
                 continue
 
@@ -1642,6 +1715,7 @@ async def _run_attempt(
     invoker: InvokeFunc,
     clock: Callable[[], datetime],
     mclock: Callable[[], float],
+    recovery_state: _RecoveryState,
 ) -> None:
     """Run one Attempt: invoke -> envelope -> intent -> graders -> finalize."""
     _transition(lifecycle, Status.RUNNING, store=store, now=clock)
@@ -1696,6 +1770,7 @@ async def _run_attempt(
             attempt=attempt,
             attempt_dir=attempt_dir,
             transcript_graders=transcript_graders,
+            recovery_state=recovery_state,
         )
     except _AuditWriteError as exc:
         _handle_audit_failure(
@@ -1751,6 +1826,7 @@ async def _run_attempt_body(
     attempt: Attempt,
     attempt_dir: Path | None,
     transcript_graders: tuple[TranscriptGrader, ...],
+    recovery_state: _RecoveryState,
 ) -> None:
     """Inner body of :func:`_run_attempt`, split out so the audit-write
     sentinel exception can be caught at one boundary.
@@ -1770,6 +1846,7 @@ async def _run_attempt_body(
         _iterations_run,
         wall_seconds,
         loop_guard_verdict,
+        recovery_trigger,
     ) = await _drive_iterations(
         task=task,
         lifecycle=lifecycle,
@@ -1781,6 +1858,7 @@ async def _run_attempt_body(
         attempt_number=attempt_number,
         transcript_graders=transcript_graders,
         loop_guard=loop_guard,
+        recovery_state=recovery_state,
     )
 
     if iteration_result is None:
@@ -1875,6 +1953,30 @@ async def _run_attempt_body(
                 clock=clock,
             )
             return
+
+    # Context-recovery action (spec 00018 FR-3). The trigger fires only
+    # for a validly-continuing iteration (intent=continue) with budget
+    # remaining and no loop-guard verdict -- the precedence checks above
+    # have already exited. The summarize-restart action finalizes this
+    # attempt with Outcome.RECOVERED, emits harness.context_recovery
+    # before scheduling the recovery attempt, and transitions
+    # running -> interrupted -> ready so the outer ``run_task`` loop
+    # picks up a fresh attempt with the handoff threaded into its
+    # IterationInputs.
+    if recovery_trigger is not None:
+        await _handle_context_recovery(
+            task=task,
+            lifecycle=lifecycle,
+            store=store,
+            config=config,
+            attempt=attempt,
+            attempt_number=attempt_number,
+            iteration_result=iteration_result,
+            recovery_trigger=recovery_trigger,
+            recovery_state=recovery_state,
+            clock=clock,
+        )
+        return
 
     envelope = iteration_result.envelope
 
@@ -2253,6 +2355,179 @@ def _handle_loop_guard_thrash(
     )
 
 
+def _handoff_digest(handoff: RecoveryHandoff) -> dict[str, int]:
+    """Build the audit-event digest of a recovery handoff.
+
+    Records only the per-field character lengths -- enough to confirm
+    the structured handoff was non-empty without copying its full
+    contents into the audit event a second time (the handoff renders in
+    the next attempt's prompt, which already lives in the store via the
+    persisted SDK messages).
+    """
+    return {
+        "work_done_length": len(handoff.work_done),
+        "work_remaining_length": len(handoff.work_remaining),
+        "key_decisions_length": len(handoff.key_decisions),
+        "suggested_next_step_length": len(handoff.suggested_next_step),
+    }
+
+
+def _cumulative_prior_outputs(
+    store: HarnessStore, run_id: str
+) -> str:
+    """Concatenate every prior attempt's final transcript for the
+    summarizer's ``cumulative_diff`` argument.
+
+    The summarizer needs the work-so-far context; prior attempts'
+    ``agent_output`` fields are the most-canonical work-so-far record
+    the store carries. The current (about-to-be-finalized-RECOVERED)
+    attempt's transcript is supplied separately as ``transcript_tail``.
+    """
+    prior = [
+        a.agent_output
+        for a in store.list_attempts(run_id)
+        if a.agent_output
+    ]
+    return "\n\n---\n\n".join(prior)
+
+
+async def _handle_context_recovery(
+    *,
+    task: Task,
+    lifecycle: Lifecycle,
+    store: HarnessStore,
+    config: HarnessConfig,
+    attempt: Attempt,
+    attempt_number: int,
+    iteration_result: IterationResult,
+    recovery_trigger: _RecoveryTrigger,
+    recovery_state: _RecoveryState,
+    clock: Callable[[], datetime],
+) -> None:
+    """Execute the summarize-restart action (spec 00018 FR-3).
+
+    Drives the production-grade recovery sequence:
+
+    1. Invoke the summarizer (via the config seam in tests, fresh SDK
+       query in production) to produce a structured handoff.
+    2. On summarizer failure, route through ``INTERNAL_ERROR`` -- mirrors
+       the RubricJudgeError handling so the retry policy decides whether
+       another attempt runs. Recovery does NOT silently restart with an
+       empty handoff (spec Error Handling table).
+    3. On success, emit ``harness.context_recovery`` BEFORE the next
+       AttemptStarted (FR-5), finalize this attempt with
+       ``Outcome.RECOVERED``, and walk the lifecycle
+       ``running -> interrupted -> ready`` so the outer ``run_task``
+       loop schedules the recovery attempt. The retry counter is not
+       touched -- the recovery budget is independent of ``max_retries``
+       (FR-4).
+    """
+    cumulative_diff = _cumulative_prior_outputs(store, lifecycle.run_id)
+    worktree: str = (
+        str(config.worktree) if config.worktree is not None else ""
+    )
+    try:
+        handoff = await run_recovery_summarizer(
+            task,
+            transcript_tail=recovery_trigger.transcript_tail,
+            cumulative_diff=cumulative_diff,
+            worktree=worktree,
+            summarizer_invoke=config.recovery_summarizer_invoke,
+        )
+    except RecoverySummarizerError as exc:
+        # Mirrors RubricJudgeError routing -- the summarizer is the
+        # same class of infrastructure as the rubric judge (a separate
+        # LLM call distinct from the working agent), so an
+        # invoke-raise / parse-failure is classified the same way.
+        error = f"recovery summarizer failed: {exc.reason}"
+        _emit(
+            store,
+            run_id=lifecycle.run_id,
+            kind="harness.crash",
+            payload={
+                "classification": "recovery_summarizer_error",
+                "reason": exc.reason,
+                "message": error,
+            },
+            attempt_number=attempt_number,
+            now=clock,
+        )
+        _finalize_attempt(
+            store=store,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.INTERNAL_ERROR,
+            error=error,
+            agent_output=iteration_result.transcript,
+            clock=clock,
+        )
+        _transition(
+            lifecycle,
+            Status.INTERNAL_ERROR,
+            store=store,
+            error=error,
+            now=clock,
+        )
+        return
+
+    # Reserve the budget slot before the audit event so the
+    # ``recoveries_used`` / ``recoveries_remaining`` figures in the
+    # event reflect the count *after* this recovery (the count an
+    # operator sees when reading the audit stream matches the count
+    # the in-process counter holds afterwards).
+    recovery_state.recoveries_used += 1
+    recoveries_used = recovery_state.recoveries_used
+    recoveries_remaining = max(
+        0, config.max_context_recoveries - recoveries_used
+    )
+
+    # FR-5 ordering: the recovery audit event precedes the recovery
+    # attempt's AttemptStarted. We emit it before finalizing the prior
+    # attempt for the same reason -- the attempt_finalized event is
+    # the cleanest "prior attempt closed" marker, but the spec frames
+    # context_recovery as the recovery signal itself, so emit it first
+    # and the finalize / transitions follow.
+    _emit(
+        store,
+        run_id=lifecycle.run_id,
+        kind="harness.context_recovery",
+        payload={
+            "iteration": iteration_result.signals.num_turns,
+            "attempt_number": attempt_number,
+            "occupancy_tokens": recovery_trigger.occupancy_tokens,
+            "context_window_tokens": config.context_window_tokens,
+            "context_recovery_trigger_ratio": (
+                config.context_recovery_trigger_ratio
+            ),
+            "recoveries_used": recoveries_used,
+            "recoveries_remaining": recoveries_remaining,
+            "summary_digest": _handoff_digest(handoff),
+        },
+        attempt_number=attempt_number,
+        now=clock,
+    )
+    _finalize_attempt(
+        store=store,
+        lifecycle=lifecycle,
+        attempt=attempt,
+        outcome=Outcome.RECOVERED,
+        error="",
+        agent_output=iteration_result.transcript,
+        clock=clock,
+    )
+    # Park the lifecycle in INTERRUPTED briefly to walk the legal edge
+    # set back to READY without consuming a validation retry (RUNNING
+    # has no direct edge to READY). The reducer clears
+    # ``blocked_requires_json`` on the -> READY edge; we never set it
+    # for recovery, so the clear is a harmless no-op.
+    _transition(lifecycle, Status.INTERRUPTED, store=store, now=clock)
+    _transition(lifecycle, Status.READY, store=store, now=clock)
+    # Thread the handoff into the next attempt; _drive_iterations
+    # consumes and clears this slot before the next iteration prompt
+    # builds.
+    recovery_state.pending_handoff = handoff
+
+
 # Default tick floor for the hang watchdog (seconds). The tick is
 # ``min(hang_timeout / 4, 0.5)`` clamped to this floor so the watchdog
 # adds no measurable overhead for long thresholds while still resolving
@@ -2404,24 +2679,38 @@ async def _drive_iterations(
     attempt_number: int,
     transcript_graders: tuple[TranscriptGrader, ...],
     loop_guard: LoopGuard,
-) -> tuple[IterationResult | None, int, float, LoopGuardVerdict | None]:
+    recovery_state: _RecoveryState,
+) -> tuple[
+    IterationResult | None,
+    int,
+    float,
+    LoopGuardVerdict | None,
+    _RecoveryTrigger | None,
+]:
     """Run iterations until a non-``continue`` envelope, crash, or cap.
 
     Returns the last :class:`IterationResult` produced, the number of
-    iterations that ran, the wall-seconds elapsed across them, and any
+    iterations that ran, the wall-seconds elapsed across them, any
     :class:`LoopGuardVerdict` that tripped the safety net (FR-1 STUCK /
-    FR-2 THRASH). The verdict is non-``None`` only when ``loop_guard``
-    observed a repeating-tool pattern in the iteration's
-    ``signals.tool_interactions``; the caller then routes the attempt
-    through the matching transition. The wall-seconds value is what feeds
-    the :class:`TranscriptObservation` so transcript graders see the same
-    elapsed time regardless of which iteration sets the envelope.
+    FR-2 THRASH), and any :class:`_RecoveryTrigger` produced when an
+    iteration crosses the context-recovery threshold (spec 00018 FR-1).
+    The verdict is non-``None`` only when ``loop_guard`` observed a
+    repeating-tool pattern; the recovery trigger is non-``None`` only
+    when a validly-continuing iteration's input-side occupancy crosses
+    the configured ratio with recovery budget remaining. At most one of
+    ``loop_guard_verdict`` / ``recovery_trigger`` is set per
+    ``_drive_iterations`` call -- loop-guard precedence (FR-6) ensures a
+    verdict short-circuits the recovery check. The wall-seconds value is
+    what feeds the :class:`TranscriptObservation` so transcript graders
+    see the same elapsed time regardless of which iteration sets the
+    envelope.
     """
     iteration_result: IterationResult | None = None
     iteration_number = 0
     started_monotonic = mclock()
     wall_seconds = 0.0
     loop_guard_verdict: LoopGuardVerdict | None = None
+    recovery_trigger: _RecoveryTrigger | None = None
 
     prior_rubric_findings = _collect_prior_rubric_findings(
         store, lifecycle.run_id, attempt_number
@@ -2429,6 +2718,12 @@ async def _drive_iterations(
     prior_manual_findings = _collect_prior_manual_findings(
         store, lifecycle.run_id, attempt_number
     )
+    # Consume any pending handoff exactly once -- the recovery attempt
+    # gets it on its first iteration prompt and subsequent attempts on
+    # the same run do not re-render the same section. Recovery on a
+    # later attempt overwrites this slot before the next call.
+    pending_handoff = recovery_state.pending_handoff
+    recovery_state.pending_handoff = None
 
     while iteration_number < config.max_iterations_per_attempt:
         iteration_number += 1
@@ -2440,6 +2735,9 @@ async def _drive_iterations(
                 max_retries=config.max_retries,
                 prior_rubric_findings=prior_rubric_findings,
                 prior_manual_findings=prior_manual_findings,
+                recovery_handoff=(
+                    pending_handoff if iteration_number == 1 else None
+                ),
             ),
         )
 
@@ -2554,6 +2852,34 @@ async def _drive_iterations(
         if loop_guard_verdict is not None:
             break
 
+        # Context-recovery trigger (spec 00018 FR-1). Evaluated AFTER
+        # the loop-guard verdict check so loop-guard precedence (FR-6)
+        # is enforced: a STUCK / THRASH verdict halts the run without
+        # recovery. The trigger fires only for a validly-continuing
+        # iteration (intent=continue) with recovery budget remaining
+        # whose input-side occupancy crosses the operator-supplied
+        # ratio. A completion claim (intent=verify / abort / blocked)
+        # does NOT recover -- those iterations break to the caller's
+        # classification arm below.
+        if (
+            config.context_window_tokens is not None
+            and recovery_state.recoveries_used
+            < config.max_context_recoveries
+            and isinstance(iteration_result.envelope, ValidEnvelope)
+            and iteration_result.envelope.intent == Intent.CONTINUE
+        ):
+            occupancy = _occupancy_from_usage(usage_payload)
+            threshold = (
+                config.context_window_tokens
+                * config.context_recovery_trigger_ratio
+            )
+            if occupancy >= threshold:
+                recovery_trigger = _RecoveryTrigger(
+                    occupancy_tokens=occupancy,
+                    transcript_tail=iteration_result.transcript,
+                )
+                break
+
         if (
             isinstance(iteration_result.envelope, ValidEnvelope)
             and iteration_result.envelope.intent == Intent.CONTINUE
@@ -2561,7 +2887,13 @@ async def _drive_iterations(
             continue
         break
 
-    return iteration_result, iteration_number, wall_seconds, loop_guard_verdict
+    return (
+        iteration_result,
+        iteration_number,
+        wall_seconds,
+        loop_guard_verdict,
+        recovery_trigger,
+    )
 
 
 async def _validate(

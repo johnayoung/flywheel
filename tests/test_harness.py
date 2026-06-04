@@ -2493,7 +2493,6 @@ class TestDeferredSubsystems:
             "thrash net-diff detection (sub-problem b)",
             "thrash input-novelty score (sub-problem c)",
             "hang threshold default value (mechanism shipped, value ungrounded)",
-            "context-recovery policy",
             "fine-grained crash classification",
             "blocked_implicit same-question-re-asked detection",
         }
@@ -5013,3 +5012,479 @@ class TestHangWatchdog:
         assert seqs == sorted(seqs)
         assert hang[0].payload["iteration"] == 1
         assert hang[0].payload["hang_timeout_seconds"] == hang_timeout
+
+
+# --- Context-recovery policy (spec 00018) ---------------------------------
+
+
+from flywheel.prompt import RecoveryHandoff
+from flywheel.recovery_summarizer import (
+    CLOSING_FENCE as RECOVERY_CLOSING_FENCE,
+    OPENING_FENCE as RECOVERY_OPENING_FENCE,
+)
+
+
+def _usage_dict(input_tokens: int = 0) -> dict[str, int]:
+    """Build a usage breakdown dict where the iteration's input-side
+    occupancy equals ``input_tokens``."""
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+
+
+def _scripted_summarizer(
+    handoff: RecoveryHandoff | Exception,
+) -> Callable[[str, Any], Awaitable[str]]:
+    """Build a recovery_summarizer_invoke seam that returns one envelope."""
+    calls: list[tuple[str, Any]] = []
+
+    async def _invoke(prompt: str, worktree: Any) -> str:
+        calls.append((prompt, worktree))
+        if isinstance(handoff, Exception):
+            raise handoff
+        envelope = {
+            "work_done": handoff.work_done,
+            "work_remaining": handoff.work_remaining,
+            "key_decisions": handoff.key_decisions,
+            "suggested_next_step": handoff.suggested_next_step,
+        }
+        return (
+            f"{RECOVERY_OPENING_FENCE}\n"
+            f"{json.dumps(envelope)}\n"
+            f"{RECOVERY_CLOSING_FENCE}\n"
+        )
+
+    _invoke.calls = calls  # type: ignore[attr-defined]
+    return _invoke
+
+
+class TestContextRecovery:
+    """Spec 00018: summarize-restart context recovery."""
+
+    def test_over_ratio_continue_triggers_recovery_and_fresh_attempt(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-1 / FR-3 happy path: an over-ratio CONTINUE iteration
+        finalizes RECOVERED and schedules a fresh attempt whose prompt
+        carries the # Recovery handoff section."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-recover-happy")
+        handoff = RecoveryHandoff(
+            work_done="probed handler X",
+            work_remaining="implement handler Y",
+            key_decisions="use approach Z",
+            suggested_next_step="open handler.py and patch dispatch",
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="iteration-one transcript",
+                    signals=_make_signals(num_turns=1),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+                    messages=(_assistant(), _result_msg(num_turns=1)),
+                    transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        # Attempt #1 finalized RECOVERED, attempt #2 is the recovery
+        # attempt that succeeded.
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.RECOVERED
+        assert outcome.attempts[1].outcome == Outcome.SUCCEEDED
+        # Recovery does NOT consume max_retries.
+        assert outcome.lifecycle.retries == 0
+        # Exactly one harness.context_recovery event with the expected payload.
+        events = store.list_events(lifecycle.run_id)
+        recoveries = [
+            e for e in events if e.kind == "harness.context_recovery"
+        ]
+        assert len(recoveries) == 1
+        payload = recoveries[0].payload
+        assert payload["occupancy_tokens"] == 95
+        assert payload["context_window_tokens"] == 100
+        assert payload["context_recovery_trigger_ratio"] == 0.9
+        assert payload["recoveries_used"] == 1
+        assert payload["recoveries_remaining"] == 0
+        assert payload["attempt_number"] == 1
+        # Digest carries per-field lengths so audit consumers can
+        # confirm the handoff was structurally non-empty.
+        digest = payload["summary_digest"]
+        assert digest["work_done_length"] == len(handoff.work_done)
+        assert digest["suggested_next_step_length"] == len(
+            handoff.suggested_next_step
+        )
+        # FR-5 ordering: the context_recovery event precedes the
+        # recovery attempt's attempt_started.
+        recovery_seq = recoveries[0].sequence
+        started_seqs = [
+            e.sequence
+            for e in events
+            if e.kind == "harness.attempt_started"
+            and e.payload.get("number") == 2
+        ]
+        assert started_seqs
+        assert recovery_seq is not None
+        first_started_seq = started_seqs[0]
+        assert first_started_seq is not None
+        assert recovery_seq < first_started_seq
+        # FR-3: the recovery attempt's prompt carries the # Recovery
+        # handoff section assembled from the summarizer's structured
+        # output.
+        recovery_prompt = invoke.calls[1].prompt  # type: ignore[attr-defined]
+        assert "# Recovery handoff" in recovery_prompt
+        assert handoff.work_done in recovery_prompt
+        assert handoff.suggested_next_step in recovery_prompt
+        # First-attempt prompt has no recovery section.
+        first_prompt = invoke.calls[0].prompt  # type: ignore[attr-defined]
+        assert "# Recovery handoff" not in first_prompt
+        # Summarizer seam was used once.
+        assert len(summarizer.calls) == 1  # type: ignore[attr-defined]
+
+    def test_below_ratio_does_not_recover(self, tmp_path: Path) -> None:
+        """FR-1 acceptance: a below-ratio iteration does not recover."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-recover-below")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=10)),
+                        _result_msg(num_turns=1, usage=_usage_dict(10)),
+                    ),
+                    transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        summarizer = _scripted_summarizer(
+            RecoveryHandoff(
+                work_done="",
+                work_remaining="",
+                key_decisions="",
+                suggested_next_step="",
+            )
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 1
+        assert outcome.attempts[0].outcome == Outcome.SUCCEEDED
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        # Summarizer was never invoked.
+        assert summarizer.calls == []  # type: ignore[attr-defined]
+
+    def test_disabled_when_capacity_none(self) -> None:
+        """FR-2: capacity None disables recovery; massive usage does not fire."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-recover-disabled")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(
+                            usage=_usage_dict(input_tokens=999_999_999)
+                        ),
+                        _result_msg(
+                            num_turns=1,
+                            usage=_usage_dict(999_999_999),
+                        ),
+                    ),
+                    transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        # No context_window_tokens, no summarizer seam set.
+        config = HarnessConfig()
+        assert config.context_window_tokens is None
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+
+    def test_recovery_budget_caps_at_max(self, tmp_path: Path) -> None:
+        """FR-4: with max_context_recoveries=1, a run whose every
+        iteration is over-ratio recovers exactly once."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-recover-budget")
+        handoff = RecoveryHandoff(
+            work_done="a",
+            work_remaining="b",
+            key_decisions="c",
+            suggested_next_step="d",
+        )
+        # Iteration #1 (attempt 1): over-ratio, intent=continue ->
+        # recovery fires. Iteration #2 (attempt 2): over-ratio,
+        # intent=continue -> budget exhausted, no recovery; normal
+        # cap-reached path -> AGENT_ERROR -> FAILED_VALIDATION
+        # (max_retries=0 so the run terminates FAILED).
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="t1",
+                    signals=_make_signals(num_turns=1),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="t2",
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # The run terminates: attempt 1 RECOVERED, attempt 2 ran past
+        # cap-with-continue -> AGENT_ERROR -> FAILED_VALIDATION ->
+        # FAILED.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.RECOVERED
+        assert outcome.attempts[1].outcome == Outcome.AGENT_ERROR
+        # Exactly one recovery event.
+        events = store.list_events(lifecycle.run_id)
+        recoveries = [
+            e for e in events if e.kind == "harness.context_recovery"
+        ]
+        assert len(recoveries) == 1
+        assert recoveries[0].payload["recoveries_used"] == 1
+        assert recoveries[0].payload["recoveries_remaining"] == 0
+        # Summarizer was called exactly once.
+        assert len(summarizer.calls) == 1  # type: ignore[attr-defined]
+
+    def test_loop_guard_verdict_preempts_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-6: a LoopGuard STUCK verdict + over-ratio iteration halts
+        with no recovery event."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-recover-precedence-stuck"
+        )
+        interactions = (
+            _tool_call(tool_use_id="t1", is_error=True),
+            _tool_call(tool_use_id="t2", is_error=True),
+            _tool_call(tool_use_id="t3", is_error=True),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="stuck-and-over-ratio",
+                    signals=_signals_with_tools(interactions),
+                )
+            ]
+        )
+        summarizer = _scripted_summarizer(
+            RecoveryHandoff(
+                work_done="",
+                work_remaining="",
+                key_decisions="",
+                suggested_next_step="",
+            )
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=3,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+            ),
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Loop-guard STUCK preempts recovery: lifecycle ends INTERRUPTED
+        # and the recovery event never emits.
+        assert outcome.lifecycle.status == Status.INTERRUPTED
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        assert summarizer.calls == []  # type: ignore[attr-defined]
+
+    def test_completion_claim_preempts_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-6: a VERIFY iteration + over-ratio occupancy validates
+        normally and does not recover."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-recover-precedence-verify"
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                    signals=_make_signals(num_turns=1),
+                )
+            ]
+        )
+        summarizer = _scripted_summarizer(
+            RecoveryHandoff(
+                work_done="",
+                work_remaining="",
+                key_decisions="",
+                suggested_next_step="",
+            )
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Completion claim wins: graderless task reaches DONE.
+        assert outcome.lifecycle.status == Status.DONE
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        assert summarizer.calls == []  # type: ignore[attr-defined]
+
+    def test_summarizer_failure_routes_to_internal_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Error Handling: a summarizer raise aborts recovery for the
+        iteration and routes through INTERNAL_ERROR. No recovery event
+        is emitted; no empty handoff is silently restarted."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-recover-summ-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="over-ratio-and-broken-summarizer",
+                    signals=_make_signals(num_turns=1),
+                )
+            ]
+        )
+        summarizer = _scripted_summarizer(RuntimeError("summarizer crashed"))
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # No recovery event; attempt finalized INTERNAL_ERROR; lifecycle
+        # reaches FAILED via the standard internal-error -> failed arm.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 1
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        crashes = [
+            e
+            for e in events
+            if e.kind == "harness.crash"
+            and e.payload.get("classification")
+            == "recovery_summarizer_error"
+        ]
+        assert len(crashes) == 1

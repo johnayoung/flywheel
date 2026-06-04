@@ -145,7 +145,70 @@ For each task, decide which buckets apply. **Skip tasks with no findings — the
 
 For each finding, pull the **exact** evidence: the row, the event payload JSON snippet, the log lines, the grader payload. Quote it verbatim in the report — do not paraphrase.
 
-## STEP 5: CROSS-TASK PATTERNS
+## STEP 5: LOOP-PATH MARKER RE-CHECK (FR-6)
+
+The archive gate (`archive_completed_phases`, spec `00017-FEATURE-in-loop-verification-gate.md`) refuses to move a loop-path-marked phase into `archive/` without a DONE `in-loop-verification` task or a valid `loop-path-exempt.md` opt-out. The audit's job here is the coverage check on the gate's trigger: re-derive the marker against the **archived** phase's recorded base and surface (a) a watched-symbol diff that slipped through without coverage, and (b) an opt-out whose "no new path" claim is contradicted by the diff.
+
+Do NOT guess signals from prose. The phase's `.loop-base` dotfile travels with the phase into `archive/` (it's a committed file inside the phase dir), so `git diff <.loop-base> HEAD` is the same input the gate would have seen. Re-derive mechanically by running `flywheel.loop_path_marker.detect_loop_path_signals` over `flywheel.workflow.phase_diff_vs_base`, and load the opt-out via `flywheel.workflow.load_loop_path_optout`:
+
+```bash
+uv run python - <<PY
+import json
+from pathlib import Path
+from flywheel.workflow import (
+    phase_diff_vs_base,
+    load_loop_path_optout,
+    read_phase_base,
+    LoopPathOptOutError,
+)
+from flywheel.loop_path_marker import detect_loop_path_signals
+
+phase_dir = Path("$PHASE_DIR")
+diff = phase_diff_vs_base(Path("."), phase_dir)
+signals = sorted(s.value for s in detect_loop_path_signals(diff))
+try:
+    opt = load_loop_path_optout(phase_dir)
+    opt_repr = None if opt is None else {"phase": opt.phase, "author": opt.author, "reason": opt.reason}
+    opt_error = None
+except LoopPathOptOutError as e:
+    opt_repr = None
+    opt_error = str(e)
+print(json.dumps({
+    "base": read_phase_base(phase_dir),
+    "signals": signals,
+    "opt_out": opt_repr,
+    "opt_out_error": opt_error,
+}, indent=2))
+PY
+```
+
+Then check the phase's tasks for a DONE `in-loop-verification`-tagged lifecycle (the same surface `_loop_path_gate_satisfied` uses):
+
+```bash
+# A task carries the marker iff "in-loop-verification" is in its tags JSON.
+for f in "$PHASE_DIR"/*.json; do
+  python -c "import json,sys; t=json.load(open(sys.argv[1])); print(sys.argv[1], 'in-loop-verification' in (t.get('tags') or []))" "$f"
+done
+```
+
+```sql
+-- DONE lifecycles for the candidate task ids from the step above
+SELECT task_id, run_id, status
+FROM lifecycles
+WHERE task_id IN (<verify-tagged task ids>)
+  AND status = 'done';
+```
+
+Emit findings:
+
+- **FR-6a — Loop-path diff archived with no coverage.** `signals` is non-empty AND no DONE `in-loop-verification` task AND `opt_out` is `null`. A `LoopPathOptOutError` (malformed opt-out shipped into archive) is itself an FR-6a finding: the artifact is unreadable, so the claim cannot be honored. Cite the base SHA, the tripped signal names, and the diff hunks that produced each signal.
+- **FR-6b — Opt-out covers a watched-symbol diff.** `opt_out` is non-null AND `signals` is non-empty. Quote the opt-out's `reason` verbatim, list the tripped signals, and cite the diff hunk for each. The audit surfaces the falsifiable contradiction; it does not overrule the opt-out.
+
+Skip both findings when `signals` is empty (pure refactor — e.g. a docstring/rename inside a watched file produces no added watched symbol) OR when a DONE `in-loop-verification` task exists. Acceptance to encode: a mis-tagged opt-out over a diff that adds a `Status` member yields an FR-6b finding; a correct opt-out over a pure refactor (no added watched symbol) yields none.
+
+Record both as **phase-level** findings under their own section in the report (Step 7), not under any individual task.
+
+## STEP 6: CROSS-TASK PATTERNS
 
 After per-task analysis, scan for:
 
@@ -155,7 +218,7 @@ After per-task analysis, scan for:
 - **Worker idle gaps** — large `updated_at` gaps between consecutive lifecycles (operator paused? deadlock?)
 - **Grader-class waste** — one grader type accounts for most of the retried attempts
 
-## STEP 6: WRITE THE REPORT
+## STEP 7: WRITE THE REPORT
 
 Output goes to `.workflow/audits/<phase>.md`. Create the dir if needed (`mkdir -p .workflow/audits`). Audits are committed, not gitignored — they're the historical record of flywheel-on-flywheel learnings.
 
@@ -201,12 +264,24 @@ One-line health verdict: _"Phase ran clean / friction in X areas / loop misbehav
 **Diagnosis** (what part of the loop caused this — not what to add)
 - <1-2 sentences naming the loop mechanism that failed and why, tied directly to the evidence above. Example: "The harness only emits `harness.crash` when its own handler catches the exception; SIGINT propagated through `asyncio.run` and killed the process before `_run_attempt` reached its finalizer." Stop there. Do not say "we should install X".>
 
+## Loop-path marker re-check (FR-6)
+
+- **Base SHA:** `<.loop-base contents>`
+- **Re-derived signals:** `[signal_a, signal_b]` (or `[]` for "clean")
+- **`in-loop-verification` task:** `<task-id>` lifecycle `<run_id>` status `done` (or "absent")
+- **Opt-out:** `<phase / author / reason>` (or "absent" / "malformed: <error>")
+
+**Finding** (only when one applies; omit the section if signals is empty AND a DONE verify task or valid opt-out is present)
+
+- FR-6a — loop-path diff archived with no DONE `in-loop-verification` task and no opt-out. Signals: `[...]`. Diff hunks: `<file:line>` ...
+- FR-6b — opt-out covers a watched-symbol diff. Opt-out `reason` (verbatim): `"..."`. Signals: `[...]`. Diff hunks: `<file:line>` ...
+
 ## Cross-task patterns
 
 - <pattern>: <evidence: list of run_ids/event ids>
 ```
 
-## STEP 7: PRESENT
+## STEP 8: PRESENT
 
 After writing the file:
 

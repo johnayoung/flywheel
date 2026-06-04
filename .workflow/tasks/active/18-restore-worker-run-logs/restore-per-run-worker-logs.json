@@ -1,0 +1,39 @@
+{
+  "id": "restore-per-run-worker-logs",
+  "goal": "The git-worktree worker writes a per-run log file under logs/worker/ for every run_id it executes.",
+  "tags": ["worker", "observability", "logging"],
+  "context": {
+    "relevant": [
+      ".workflow/worker.py",
+      "src/flywheel/workflow.py",
+      "tests/test_worker.py"
+    ],
+    "references": [
+      "Root cause: commit acb2aa3 collapsed .workflow/task-worker.sh into .workflow/worker.py. The bash worker redirected each per-task subprocess to a log file (run_workflow ... &> \"$logfile\"); worker.py runs all tasks in-process via orchestrate and streams to one shared sys.stderr, so no per-run file is written. flywheel.workflow.DEFAULT_LOG_DIR is dead (exported, never referenced).",
+      "Old naming convention (git show acb2aa3^:.workflow/task-worker.sh, line 289): logs/worker/${task_id}_${hash}_$(date +%Y%m%dT%H%M%S).log -- keep files greppable by task_id and keyed to the run.",
+      "run_once returns OrchestratorReport.runs; each RunRecord carries run_id, task_id, status (see src/flywheel/orchestrator.py).",
+      "Per-run content can be rendered from the store's persisted events: SqliteStore.list_domain_events(run_id) plus the existing flywheel.workflow._format_event_line helper.",
+      "tests/test_worker.py::test_run_once_merges_completed_task is the model for the regression test (real git repo + fake invoke + run_once)."
+    ],
+    "constraints": [
+      "The fix belongs in the consumer (.workflow/worker.py). Do NOT change orchestrate's single-stream contract or weaken any flywheel.task/flywheel.lifecycle purity test.",
+      "Reconcile the dead DEFAULT_LOG_DIR constant: either wire it up as the default log directory or remove it -- do not leave it dangling. Restore the worker's --log-dir override (the bash worker had one), defaulting to logs/worker/.",
+      "Multiple attempts/resumes of the same task must produce distinct, non-clobbering files (key on run_id and timestamp, mirroring the old <task>_<hash>_<ts>.log shape).",
+      "Add a regression test to tests/test_worker.py that runs a full run_once cycle (model test_run_once_merges_completed_task) and asserts a logs/worker/ file keyed to the executed run_id exists and is non-empty.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (fix: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not reintroduce .workflow/task-worker.sh or any bash worker.",
+      "Do not reformat or refactor unrelated code in worker.py or workflow.py."
+    ],
+    "edge_cases": [
+      "A run that ends in failed/interrupted should still get a log file (parked-for-forensics runs are exactly when the log matters most).",
+      "logs/worker/ may not exist yet on a fresh checkout -- create it."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_worker.py", "name": "worker-tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(fix|feat):'", "name": "commit-landed" }
+  ]
+}

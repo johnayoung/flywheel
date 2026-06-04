@@ -1,0 +1,34 @@
+{
+  "id": "context-recovery-config",
+  "goal": "HarnessConfig gains context_window_tokens, context_recovery_trigger_ratio (default 0.9), max_context_recoveries (default 1), and recovery_summarizer_invoke, rejecting an out-of-range ratio or non-positive capacity at construction.",
+  "prerequisites": ["recovery-summarizer"],
+  "tags": ["context-recovery", "harness", "config"],
+  "context": {
+    "relevant": [
+      "src/flywheel/harness.py",
+      "tests/test_harness.py",
+      ".workflow/specs/00018-FEATURE-context-recovery-policy.md"
+    ],
+    "references": [
+      "src/flywheel/harness.py:325 -- HarnessConfig field block (max_retries ... loop_guard); add the four new fields here",
+      "src/flywheel/recovery_summarizer.py -- import SummarizerInvoke for the recovery_summarizer_invoke field type (mirrors rubric_judge_invoke: JudgeInvoke | None at harness.py:332)"
+    ],
+    "constraints": [
+      "Defaults MUST preserve existing behavior: context_window_tokens defaults to None (recovery disabled), context_recovery_trigger_ratio=0.9, max_context_recoveries=1, recovery_summarizer_invoke=None.",
+      "Validate at construction (e.g. __post_init__ raising ValueError) per spec Error Handling: reject context_recovery_trigger_ratio <= 0 or > 1, and context_window_tokens <= 0 -- do not clamp silently.",
+      "recovery_summarizer_invoke is the SummarizerInvoke test seam mirroring rubric_judge_invoke -- None in production.",
+      "Commit with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do NOT wire trigger evaluation, occupancy computation, or summarize-restart orchestration -- fields + construction validation only; the action task consumes them.",
+      "Do not remove the _DEFERRED_LOOP_SUBSYSTEMS 'context-recovery policy' entry yet -- that belongs to the action task that actually ships the behavior."
+    ],
+    "edge_cases": [
+      "context_window_tokens=None must construct fine and leave the harness behaving exactly as today.",
+      "ratio exactly 1.0 is valid; ratio 0 or >1 is rejected; capacity 0 or negative is rejected."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_harness.py", "name": "tests" }
+  ]
+}

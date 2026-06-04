@@ -1,0 +1,34 @@
+{
+  "id": "recovery-summarizer",
+  "goal": "A recovery_summarizer.py runner produces a structured handoff via an injected SummarizerInvoke seam defaulting to a fresh claude_agent_sdk.query, mirroring grader_rubric.py's JudgeInvoke.",
+  "tags": ["context-recovery", "summarizer"],
+  "context": {
+    "relevant": [
+      "src/flywheel/grader_rubric.py",
+      ".workflow/specs/00018-FEATURE-context-recovery-policy.md"
+    ],
+    "references": [
+      "src/flywheel/grader_rubric.py:224 -- JudgeInvoke type alias; define a sibling SummarizerInvoke for the summarizer seam",
+      "src/flywheel/grader_rubric.py:294 -- _make_default_judge_invoke builds the production fresh claude_agent_sdk.query invoker; mirror this for the summarizer's production default",
+      "src/flywheel/grader_rubric.py RubricJudgeError -- model a typed summarizer-failure error so the harness can route a failed/raised summarize through INTERNAL_ERROR (spec Error Handling table)"
+    ],
+    "constraints": [
+      "Mirror the rubric seam exactly: an injectable SummarizerInvoke (scripted in tests) with a production default that issues a fresh claude_agent_sdk.query -- the summarizer is a separate fresh-context call, never the working-agent invoker.",
+      "The summarizer takes the task goal, the cumulative diff/artifacts, and the recent transcript tail and returns a structured handoff (work done, work remaining, key decisions, suggested next step) per spec FR-3.",
+      "On invoke raise/timeout, raise a typed summarizer error (do NOT return an empty handoff) so the caller can route to INTERNAL_ERROR.",
+      "Export SummarizerInvoke (and the error type) so harness.py and the config task can import them.",
+      "Author tests/test_recovery_summarizer.py driving the runner with a scripted SummarizerInvoke -- never call a paid/network agent.",
+      "Commit with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not add HarnessConfig fields or wire the harness loop -- that is the config and action tasks.",
+      "Do not invoke a real SDK/network agent in tests."
+    ],
+    "edge_cases": [
+      "Scripted invoke returning malformed/empty content -> typed error, not a silent empty handoff."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_recovery_summarizer.py", "name": "tests" }
+  ]
+}

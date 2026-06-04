@@ -1,0 +1,33 @@
+{
+  "id": "outcome-recovered",
+  "goal": "lifecycle.py gains an Outcome.RECOVERED member that round-trips through both store backends and is excluded from the failure-outcome set.",
+  "tags": ["context-recovery", "lifecycle"],
+  "context": {
+    "relevant": [
+      "src/flywheel/lifecycle.py",
+      "tests/test_lifecycle.py",
+      ".workflow/specs/00018-FEATURE-context-recovery-policy.md"
+    ],
+    "references": [
+      "src/flywheel/lifecycle.py:20 -- Outcome enum, add RECOVERED = \"recovered\" alongside the existing members",
+      "src/flywheel/event_serde.py:162 and src/flywheel/store_sqlite.py:1052 and src/flywheel/store_postgres.py:1527 -- Outcome(value) deserialization; the new string must round-trip"
+    ],
+    "constraints": [
+      "tests/test_lifecycle.py:34 (test_outcome_enumerates_exactly_the_five_spec_outcomes) pins the exact Outcome member set -- update its expected set AND its name to include 'recovered' in this same commit, or the suite goes red.",
+      "Do NOT add Outcome.RECOVERED to _FAILED_OUTCOMES (lifecycle.py:70): per spec it is neither success nor failure, so it must not count as a failed outcome.",
+      "lifecycle.py must stay pure (no json/pathlib/io/open) -- enforced by tests/test_lifecycle_module_purity.py.",
+      "Commit with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not add any harness trigger logic, config field, or store column -- this task only introduces the enum member and keeps every exhaustive Outcome consumer green.",
+      "Do not add a new Status member or transition edge -- RECOVERED is recorded via the existing retry arm (READY/RUNNING)."
+    ],
+    "edge_cases": [
+      "Outcome.RECOVERED must deserialize from the persisted 'recovered' string via event_serde and both SqliteStore and PostgresStore attempt loaders."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_lifecycle.py tests/test_lifecycle_module_purity.py tests/test_store_contract.py tests/test_events.py", "name": "tests" },
+    { "type": "command", "run": "uv run python -c \"from flywheel.lifecycle import Outcome, _FAILED_OUTCOMES; assert Outcome.RECOVERED.value == 'recovered'; assert Outcome.RECOVERED not in _FAILED_OUTCOMES\"", "name": "member" }
+  ]
+}

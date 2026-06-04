@@ -125,9 +125,9 @@ def test_new_create_table_fires_signal_2() -> None:
         diff --git a/src/flywheel/_schema/persistence-schema.sql b/src/flywheel/_schema/persistence-schema.sql
         --- a/src/flywheel/_schema/persistence-schema.sql
         +++ b/src/flywheel/_schema/persistence-schema.sql
-        @@ -250,3 +250,8 @@
-         CREATE INDEX IF NOT EXISTS claude_session_store_list_idx
-           ON claude_session_store (project_key, session_id) WHERE subpath = '';
+        @@ -235,3 +235,8 @@
+           version INTEGER NOT NULL
+         );
         +CREATE TABLE IF NOT EXISTS reviews (
         +  id    INTEGER PRIMARY KEY AUTOINCREMENT,
         +  run_id TEXT NOT NULL,

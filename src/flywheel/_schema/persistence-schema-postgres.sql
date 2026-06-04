@@ -7,8 +7,7 @@
 -- definitions a run can reference, lifecycles is the row that mutates (with a
 -- version column for optimistic concurrency), attempts is the per-execution
 -- history, events is the timeline of harness-emitted events, grader_results
--- is the per-grader receipt log produced during validation,
--- claude_session_store persists Claude Code agent transcripts, sdk_messages
+-- is the per-grader receipt log produced during validation, sdk_messages
 -- is the verbatim agent message stream captured per iteration, and
 -- run_sequence is the per-run monotonic counter that orders events and
 -- sdk_messages into a single audit stream.
@@ -243,12 +242,13 @@ CREATE INDEX IF NOT EXISTS idx_control_commands_pending
 -- from earlier schema versions are applied by the concrete store's
 -- bootstrap (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT
 -- EXISTS above materializes control_commands on an existing database;
--- v4 -> v5 adds the lifecycles.awaiting_manual_ordinal nullable column).
+-- v4 -> v5 adds the lifecycles.awaiting_manual_ordinal nullable column;
+-- v5 -> v6 drops the unused claude_session_store table — see bootstrap).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version (id, version) VALUES (1, 5)
+INSERT INTO schema_version (id, version) VALUES (1, 6)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a
@@ -288,20 +288,3 @@ BEGIN
   END IF;
 END
 $$;
-
--- claude_session_store: Claude Code agent transcript persistence.
--- One row per transcript entry; seq orders entries within a
--- (project_key, session_id, subpath) tuple. The empty string is the subpath
--- sentinel for the main transcript (subagent rows use a non-empty subpath).
-CREATE TABLE IF NOT EXISTS claude_session_store (
-  seq         BIGSERIAL PRIMARY KEY,
-  project_key TEXT   NOT NULL,
-  session_id  TEXT   NOT NULL,
-  subpath     TEXT   NOT NULL DEFAULT '',
-  entry       TEXT   NOT NULL,
-  mtime       BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS claude_session_store_lookup_idx
-  ON claude_session_store (project_key, session_id, subpath, seq);
-CREATE INDEX IF NOT EXISTS claude_session_store_list_idx
-  ON claude_session_store (project_key, session_id) WHERE subpath = '';

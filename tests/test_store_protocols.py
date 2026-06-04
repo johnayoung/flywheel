@@ -19,12 +19,10 @@ import pytest
 
 from flywheel import (
     CURRENT_SCHEMA_VERSION,
-    AgentSessionStore,
     Attempt,
     AttemptStore,
     AuditRecord,
     AuditStore,
-    ClaudeSessionEntry,
     ControlCommandRecord,
     ControlCommandStore,
     EventRecord,
@@ -87,21 +85,6 @@ class _GraderResultStub:
     def list_grader_results(
         self, run_id: str, attempt_number: int
     ) -> list[GraderResultRecord]:
-        return []
-
-
-class _AgentSessionStub:
-    def append_session_entry(
-        self, entry: ClaudeSessionEntry
-    ) -> ClaudeSessionEntry:
-        return entry
-
-    def list_session_entries(
-        self,
-        project_key: str,
-        session_id: str,
-        subpath: str = "",
-    ) -> list[ClaudeSessionEntry]:
         return []
 
 
@@ -170,10 +153,6 @@ def test_event_store_protocol_is_satisfiable_by_stub() -> None:
 
 def test_grader_result_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_GraderResultStub(), GraderResultStore)
-
-
-def test_agent_session_store_protocol_is_satisfiable_by_stub() -> None:
-    assert isinstance(_AgentSessionStub(), AgentSessionStore)
 
 
 def test_sdk_message_store_protocol_is_satisfiable_by_stub() -> None:
@@ -304,19 +283,6 @@ def test_grader_result_record_is_dataclass_with_schema_fields() -> None:
     }
 
 
-def test_claude_session_entry_is_dataclass_with_schema_fields() -> None:
-    assert is_dataclass(ClaudeSessionEntry)
-    names = {f.name for f in fields(ClaudeSessionEntry)}
-    assert names == {
-        "seq",
-        "project_key",
-        "session_id",
-        "subpath",
-        "entry",
-        "mtime",
-    }
-
-
 def test_control_command_record_is_dataclass_with_schema_fields() -> None:
     assert is_dataclass(ControlCommandRecord)
     names = {f.name for f in fields(ControlCommandRecord)}
@@ -339,16 +305,6 @@ def test_control_command_record_defaults_id_and_claimed_at_to_none() -> None:
     )
     assert rec.id is None
     assert rec.claimed_at is None
-
-
-def test_claude_session_entry_subpath_defaults_to_empty_string() -> None:
-    e = ClaudeSessionEntry(
-        project_key="proj",
-        session_id="sess",
-        entry="{}",
-        mtime=0,
-    )
-    assert e.subpath == ""
 
 
 def test_event_record_payload_defaults_to_empty_mapping() -> None:

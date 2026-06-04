@@ -230,26 +230,10 @@ CREATE INDEX IF NOT EXISTS idx_control_commands_pending
 -- earlier schema versions are applied by the concrete store's bootstrap
 -- (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT EXISTS above
 -- materializes control_commands on an existing database; v4 -> v5 adds
--- the lifecycles.awaiting_manual_ordinal nullable column).
+-- the lifecycles.awaiting_manual_ordinal nullable column; v5 -> v6 drops
+-- the unused claude_session_store table — see the store bootstrap).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 5);
-
--- claude_session_store: Claude Code agent transcript persistence.
--- One row per transcript entry; seq orders entries within a
--- (project_key, session_id, subpath) tuple. The empty string is the subpath
--- sentinel for the main transcript (subagent rows use a non-empty subpath).
-CREATE TABLE IF NOT EXISTS claude_session_store (
-  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_key TEXT    NOT NULL,
-  session_id  TEXT    NOT NULL,
-  subpath     TEXT    NOT NULL DEFAULT '',
-  entry       TEXT    NOT NULL,
-  mtime       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS claude_session_store_lookup_idx
-  ON claude_session_store (project_key, session_id, subpath, seq);
-CREATE INDEX IF NOT EXISTS claude_session_store_list_idx
-  ON claude_session_store (project_key, session_id) WHERE subpath = '';
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 6);

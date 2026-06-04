@@ -73,7 +73,6 @@ from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
     ClaimLostError,
-    ClaudeSessionEntry,
     ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
@@ -376,7 +375,20 @@ class PostgresStore:
                 cur.execute(
                     "UPDATE schema_version SET version = %s "
                     "WHERE id = 1 AND version = %s",
-                    (CURRENT_SCHEMA_VERSION, 4),
+                    (5, 4),
+                )
+                # Forward migration from schema_version 5 -> 6: the unused
+                # claude_session_store table is dropped. The schema script no
+                # longer creates it, so a fresh schema never has it, but an
+                # existing v5 schema still carries the (empty) table — drop
+                # it explicitly, then bump. DROP IF EXISTS is a no-op on a
+                # fresh v6 schema; the bump is guarded on the prior version
+                # so re-bootstrap of a v6 schema is a no-op.
+                cur.execute("DROP TABLE IF EXISTS claude_session_store")
+                cur.execute(
+                    "UPDATE schema_version SET version = %s "
+                    "WHERE id = 1 AND version = %s",
+                    (CURRENT_SCHEMA_VERSION, 5),
                 )
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
@@ -1307,61 +1319,6 @@ class PostgresStore:
                 rows = cur.fetchall()
         return [_row_to_grader_result(r) for r in rows]
 
-    # --- AgentSessionStore ------------------------------------------------
-
-    def append_session_entry(
-        self, entry: ClaudeSessionEntry
-    ) -> ClaudeSessionEntry:
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO claude_session_store
-                        (project_key, session_id, subpath, entry, mtime)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING seq
-                    """,
-                    (
-                        entry.project_key,
-                        entry.session_id,
-                        entry.subpath,
-                        entry.entry,
-                        entry.mtime,
-                    ),
-                )
-                row = cur.fetchone()
-        assert row is not None
-        return ClaudeSessionEntry(
-            project_key=entry.project_key,
-            session_id=entry.session_id,
-            entry=entry.entry,
-            mtime=entry.mtime,
-            subpath=entry.subpath,
-            seq=int(row[0]),
-        )
-
-    def list_session_entries(
-        self,
-        project_key: str,
-        session_id: str,
-        subpath: str = "",
-    ) -> list[ClaudeSessionEntry]:
-        with self._pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT seq, project_key, session_id, subpath, entry, mtime
-                    FROM claude_session_store
-                    WHERE project_key = %s
-                      AND session_id = %s
-                      AND subpath = %s
-                    ORDER BY seq
-                    """,
-                    (project_key, session_id, subpath),
-                )
-                rows = cur.fetchall()
-        return [_row_to_session_entry(r) for r in rows]
-
     # --- ClaimStore -------------------------------------------------------
 
     def acquire_claim(
@@ -1614,17 +1571,6 @@ def _row_to_grader_result(row: dict[str, Any]) -> GraderResultRecord:
         ts=row["ts"],
         grader_name=row["grader_name"],
         id=int(row["id"]),
-    )
-
-
-def _row_to_session_entry(row: dict[str, Any]) -> ClaudeSessionEntry:
-    return ClaudeSessionEntry(
-        project_key=row["project_key"],
-        session_id=row["session_id"],
-        entry=row["entry"],
-        mtime=int(row["mtime"]),
-        subpath=row["subpath"],
-        seq=int(row["seq"]),
     )
 
 

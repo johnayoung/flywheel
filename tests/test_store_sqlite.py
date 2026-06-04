@@ -59,7 +59,6 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
             "attempts",
             "events",
             "grader_results",
-            "claude_session_store",
             "sdk_messages",
             "run_sequence",
             "schema_version",
@@ -414,38 +413,6 @@ def test_blocked_requires_json_survives_close_and_reopen(
         s2.close()
 
 
-# --- Session ordering ------------------------------------------------------
-
-
-def test_session_entries_listed_in_seq_order_for_tuple_keying(
-    tmp_path: Path,
-) -> None:
-    """``claude_session_store`` rows must respect the
-    ``(project_key, session_id, subpath, seq)`` ordering when listed."""
-    store = SqliteStore(tmp_path / "sess.db")
-    try:
-        from flywheel import ClaudeSessionEntry
-
-        for i in range(5):
-            store.append_session_entry(
-                ClaudeSessionEntry(
-                    project_key="p",
-                    session_id="s",
-                    entry=f"e{i}",
-                    mtime=i,
-                )
-            )
-        listed = store.list_session_entries("p", "s")
-        seqs: list[int] = []
-        for e in listed:
-            assert e.seq is not None
-            seqs.append(e.seq)
-        assert seqs == sorted(seqs)
-        assert [e.entry for e in listed] == ["e0", "e1", "e2", "e3", "e4"]
-    finally:
-        store.close()
-
-
 # --- Schema-version pin: refuse pre-feature stores -------------------------
 
 
@@ -706,6 +673,82 @@ def test_v4_store_upgrades_to_v5_with_awaiting_manual_ordinal_column(
         reloaded = s_migrated.load_lifecycle("run-pre-migration")
         assert reloaded is not None
         assert reloaded.awaiting_manual_ordinal == 2
+    finally:
+        s_migrated.close()
+
+
+def _downgrade_to_v5_with_claude_session_store(db: Path) -> None:
+    """Re-create the v5 ``claude_session_store`` table (dropped in v6) on a
+    bootstrapped store and pin ``schema_version`` back to 5, so the store's
+    bootstrap exercises the v5 -> v6 drop migration on reopen."""
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE claude_session_store (
+                seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_key TEXT    NOT NULL,
+                session_id  TEXT    NOT NULL,
+                subpath     TEXT    NOT NULL DEFAULT '',
+                entry       TEXT    NOT NULL,
+                mtime       INTEGER NOT NULL
+            );
+            """
+        )
+        conn.execute("UPDATE schema_version SET version = 5 WHERE id = 1")
+    finally:
+        conn.close()
+
+
+def test_v5_store_upgrades_to_v6_dropping_claude_session_store(
+    tmp_path: Path,
+) -> None:
+    """Existing v5 stores must forward-migrate cleanly on reopen: the unused
+    ``claude_session_store`` table is dropped, schema_version bumps to v6,
+    and pre-existing lifecycle data survives untouched."""
+    db = tmp_path / "v5-upgrade.db"
+    s_initial = SqliteStore(db)
+    s_initial.create_lifecycle(
+        Lifecycle(task_id="t", run_id="run-pre-migration")
+    )
+    s_initial.close()
+
+    _downgrade_to_v5_with_claude_session_store(db)
+
+    # Sanity-check the downgrade: the legacy table is back and the version
+    # row is at 5.
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "claude_session_store" in tables
+        (version,) = conn.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == 5
+    finally:
+        conn.close()
+
+    s_migrated = SqliteStore(db)
+    try:
+        rows = s_migrated._connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='claude_session_store'"
+        ).fetchall()
+        assert not rows, (
+            "v5 -> v6 migration must drop claude_session_store"
+        )
+        (version,) = s_migrated._connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert version == CURRENT_SCHEMA_VERSION
+        # Pre-migration data survives untouched.
+        loaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert loaded is not None
     finally:
         s_migrated.close()
 

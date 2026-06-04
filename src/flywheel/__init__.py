@@ -110,13 +110,11 @@ from flywheel.strategy import (
 )
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
-    AgentSessionStore,
     AttemptStore,
     AuditRecord,
     AuditStore,
     ClaimLostError,
     ClaimStore,
-    ClaudeSessionEntry,
     ControlCommandRecord,
     ControlCommandStore,
     DomainEventStore,
@@ -177,7 +175,6 @@ def hello() -> str:
 
 
 __all__ = [
-    "AgentSessionStore",
     "Attempt",
     "AttemptFinalized",
     "AttemptStarted",
@@ -190,7 +187,6 @@ __all__ = [
     "BreachedField",
     "CLOSING_FENCE",
     "CURRENT_SCHEMA_VERSION",
-    "ClaudeSessionEntry",
     "ClaimLostError",
     "ClaimStore",
     "CommandGrader",

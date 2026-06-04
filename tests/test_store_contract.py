@@ -29,7 +29,6 @@ from uuid import uuid4
 import pytest
 
 from flywheel import (
-    AgentSessionStore,
     Attempt,
     AttemptFinalized,
     AttemptStarted,
@@ -37,7 +36,6 @@ from flywheel import (
     AuditStore,
     ClaimLostError,
     ClaimStore,
-    ClaudeSessionEntry,
     ControlCommandStore,
     DomainEventStore,
     EventRecord,
@@ -193,7 +191,6 @@ def test_store_satisfies_every_protocol(store: object) -> None:
     assert isinstance(store, AttemptStore)
     assert isinstance(store, EventStore)
     assert isinstance(store, GraderResultStore)
-    assert isinstance(store, AgentSessionStore)
     assert isinstance(store, SdkMessageStore)
     assert isinstance(store, AuditStore)
     assert isinstance(store, TaskStore)
@@ -766,85 +763,6 @@ def test_grader_spec_and_payload_isolated_from_caller_mutations(
     listed = store.list_grader_results("r1", 1)
     assert dict(listed[0].grader_spec) == {"type": "command", "run": "true"}
     assert dict(listed[0].payload) == {"exit_code": 0}
-
-
-# --- Session round-trip ----------------------------------------------------
-
-
-def test_append_session_entry_assigns_monotonic_seq(store: object) -> None:
-    assert isinstance(store, AgentSessionStore)
-    e1 = store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="proj",
-            session_id="sess",
-            entry="a",
-            mtime=1,
-        )
-    )
-    e2 = store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="proj",
-            session_id="sess",
-            entry="b",
-            mtime=2,
-        )
-    )
-    assert e1.seq is not None and e2.seq is not None
-    assert e2.seq > e1.seq
-
-
-def test_list_session_entries_filters_by_subpath_and_orders_by_seq(
-    store: object,
-) -> None:
-    assert isinstance(store, AgentSessionStore)
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="proj", session_id="sess", entry="main-1", mtime=1
-        )
-    )
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="proj",
-            session_id="sess",
-            entry="sub-1",
-            mtime=2,
-            subpath="agent-a",
-        )
-    )
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="proj", session_id="sess", entry="main-2", mtime=3
-        )
-    )
-
-    main = store.list_session_entries("proj", "sess")
-    sub = store.list_session_entries("proj", "sess", subpath="agent-a")
-    assert [e.entry for e in main] == ["main-1", "main-2"]
-    assert [e.entry for e in sub] == ["sub-1"]
-
-
-def test_list_session_entries_scoped_by_project_and_session(
-    store: object,
-) -> None:
-    assert isinstance(store, AgentSessionStore)
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="p1", session_id="s1", entry="x", mtime=1
-        )
-    )
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="p2", session_id="s1", entry="y", mtime=1
-        )
-    )
-    store.append_session_entry(
-        ClaudeSessionEntry(
-            project_key="p1", session_id="s2", entry="z", mtime=1
-        )
-    )
-    assert [e.entry for e in store.list_session_entries("p1", "s1")] == ["x"]
-    assert [e.entry for e in store.list_session_entries("p2", "s1")] == ["y"]
-    assert [e.entry for e in store.list_session_entries("p1", "s2")] == ["z"]
 
 
 # --- SDK message persistence -----------------------------------------------

@@ -91,7 +91,7 @@ class ClaimLostError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 5
+CURRENT_SCHEMA_VERSION: int = 6
 
 
 class StoreSchemaError(Exception):
@@ -259,23 +259,6 @@ class ControlCommandRecord:
     enqueued_at: datetime
     claimed_at: datetime | None = None
     id: int | None = None
-
-
-@dataclass(kw_only=True)
-class ClaudeSessionEntry:
-    """One row in the ``claude_session_store`` table.
-
-    Append-only stream keyed by ``(project_key, session_id, subpath, seq)``.
-    ``entry`` is an opaque payload; the protocol does not parse it. The
-    empty string is the subpath sentinel for the main transcript.
-    """
-
-    project_key: str
-    session_id: str
-    entry: str
-    mtime: int
-    subpath: str = ""
-    seq: int | None = None
 
 
 # --- Store protocols --------------------------------------------------------
@@ -586,38 +569,13 @@ class ControlCommandStore(Protocol):
     ) -> list[ControlCommandRecord]: ...
 
 
-@runtime_checkable
-class AgentSessionStore(Protocol):
-    """Persistence contract for the ``claude_session_store`` transcript log.
-
-    Append-only, keyed by ``(project_key, session_id, subpath, seq)``.
-    ``append_session_entry`` assigns the ``seq`` and returns the persisted
-    record. ``list_session_entries`` returns entries for one
-    ``(project_key, session_id, subpath)`` tuple in ascending ``seq``
-    order; the empty-string ``subpath`` selects the main transcript.
-    """
-
-    def append_session_entry(
-        self, entry: ClaudeSessionEntry
-    ) -> ClaudeSessionEntry: ...
-
-    def list_session_entries(
-        self,
-        project_key: str,
-        session_id: str,
-        subpath: str = "",
-    ) -> list[ClaudeSessionEntry]: ...
-
-
 __all__ = [
-    "AgentSessionStore",
     "AttemptStore",
     "AuditRecord",
     "AuditStore",
     "CURRENT_SCHEMA_VERSION",
     "ClaimLostError",
     "ClaimStore",
-    "ClaudeSessionEntry",
     "ControlCommandRecord",
     "ControlCommandStore",
     "DomainEventStore",

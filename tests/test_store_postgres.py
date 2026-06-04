@@ -701,6 +701,80 @@ def test_v4_postgres_upgrades_to_v5_with_awaiting_manual_ordinal_column(
         s_migrated.close()
 
 
+def test_v5_postgres_upgrades_to_v6_dropping_claude_session_store(
+    fresh_schema: str,
+) -> None:
+    """Existing v5 Postgres schemas must forward-migrate cleanly on reopen:
+    the unused ``claude_session_store`` table is dropped, schema_version
+    bumps to v6, and pre-existing lifecycle data survives untouched."""
+    dsn = _dsn_or_skip()
+    from flywheel import PostgresStore
+
+    s_initial = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    )
+    s_initial.create_lifecycle(
+        Lifecycle(task_id="t", run_id="run-pre-migration")
+    )
+    s_initial.close()
+
+    import psycopg
+    from psycopg import sql
+
+    schema_ident = sql.Identifier(fresh_schema)
+    with psycopg.connect(dsn) as conn:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SET search_path TO {}, public").format(schema_ident)
+            )
+            # Re-create the v5 table (dropped in v6) and pin the version back
+            # to 5 so reopen exercises the v5 -> v6 drop migration.
+            cur.execute(
+                """
+                CREATE TABLE claude_session_store (
+                    seq         BIGSERIAL PRIMARY KEY,
+                    project_key TEXT   NOT NULL,
+                    session_id  TEXT   NOT NULL,
+                    subpath     TEXT   NOT NULL DEFAULT '',
+                    entry       TEXT   NOT NULL,
+                    mtime       BIGINT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                "UPDATE schema_version SET version = 5 WHERE id = 1"
+            )
+
+    s_migrated = PostgresStore(
+        dsn, schema=fresh_schema, pool_min=1, pool_max=2
+    )
+    try:
+        rows = _query(
+            s_migrated,
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_name = 'claude_session_store'
+            """,
+            (fresh_schema,),
+        )
+        assert rows == [], (
+            "v5 -> v6 migration must drop claude_session_store"
+        )
+        version_rows = _query(
+            s_migrated,
+            "SELECT version FROM schema_version WHERE id = 1",
+        )
+        assert int(version_rows[0][0]) == CURRENT_SCHEMA_VERSION
+        # Pre-migration data survives untouched.
+        loaded = s_migrated.load_lifecycle("run-pre-migration")
+        assert loaded is not None
+    finally:
+        s_migrated.close()
+
+
 def test_opening_v2_postgres_without_blocked_requires_json_adds_column(
     fresh_schema: str,
 ) -> None:

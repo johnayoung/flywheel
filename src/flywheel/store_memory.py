@@ -19,7 +19,6 @@ Storage layout follows the table boundaries in
 * ``_run_sequence`` is the per-``run_id`` monotonic counter shared by
   ``append_event`` and ``save_sdk_messages`` so events and SDK messages
   form a single totally-ordered audit stream.
-* ``_sessions`` mirrors ``claude_session_store`` with a monotonic ``seq``.
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ from flywheel.task import Task
 from flywheel.store_protocols import (
     AuditRecord,
     ClaimLostError,
-    ClaudeSessionEntry,
     ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
@@ -139,17 +137,6 @@ def _clone_grader_result(r: GraderResultRecord) -> GraderResultRecord:
     )
 
 
-def _clone_session_entry(e: ClaudeSessionEntry) -> ClaudeSessionEntry:
-    return ClaudeSessionEntry(
-        project_key=e.project_key,
-        session_id=e.session_id,
-        entry=e.entry,
-        mtime=e.mtime,
-        subpath=e.subpath,
-        seq=e.seq,
-    )
-
-
 def _clone_control_command(c: ControlCommandRecord) -> ControlCommandRecord:
     return ControlCommandRecord(
         run_id=c.run_id,
@@ -181,8 +168,6 @@ class InMemoryStore:
         self._event_seq: int = 0
         self._grader_results: list[GraderResultRecord] = []
         self._grader_result_seq: int = 0
-        self._sessions: list[ClaudeSessionEntry] = []
-        self._session_seq: int = 0
         self._sdk_messages: list[SdkMessageRecord] = []
         self._sdk_message_seq: int = 0
         # Per-run monotonic sequence shared by append_event and
@@ -522,39 +507,6 @@ class InMemoryStore:
         ]
         rows.sort(key=lambda r: r.ordinal)
         return [_clone_grader_result(r) for r in rows]
-
-    # --- AgentSessionStore -------------------------------------------------
-
-    def append_session_entry(
-        self, entry: ClaudeSessionEntry
-    ) -> ClaudeSessionEntry:
-        self._session_seq += 1
-        record = ClaudeSessionEntry(
-            project_key=entry.project_key,
-            session_id=entry.session_id,
-            entry=entry.entry,
-            mtime=entry.mtime,
-            subpath=entry.subpath,
-            seq=self._session_seq,
-        )
-        self._sessions.append(record)
-        return _clone_session_entry(record)
-
-    def list_session_entries(
-        self,
-        project_key: str,
-        session_id: str,
-        subpath: str = "",
-    ) -> list[ClaudeSessionEntry]:
-        rows = [
-            e
-            for e in self._sessions
-            if e.project_key == project_key
-            and e.session_id == session_id
-            and e.subpath == subpath
-        ]
-        rows.sort(key=lambda e: e.seq if e.seq is not None else 0)
-        return [_clone_session_entry(e) for e in rows]
 
     # --- ClaimStore --------------------------------------------------------
 

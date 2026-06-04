@@ -64,6 +64,15 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_id_created ON tasks(id, created_at);
 
+-- lifecycles: the single mutable row per run, keyed by run_id. version drives
+-- optimistic concurrency — every update carries an expected version and a
+-- stale writer is rejected with OptimisticConcurrencyError. status, retries,
+-- error, and agent_output are the rolled-up current state; timestamps_json
+-- and blocked_requires_json hold structured state like the rest of the
+-- schema. task_id is a denormalized, untrusted reference (deliberately no
+-- FK); task_content_hash pins the exact tasks row the run executed.
+-- session_id carries the agent SDK session id used to resume the brain
+-- across iterations.
 CREATE TABLE IF NOT EXISTS lifecycles (
   run_id                  TEXT PRIMARY KEY,
   task_id                 TEXT NOT NULL,
@@ -156,9 +165,21 @@ CREATE TABLE IF NOT EXISTS grader_results (
   FOREIGN KEY (run_id, attempt_number) REFERENCES attempts(run_id, number)
 );
 
+-- events read paths. idx_events_run serves telemetry reads ordered by
+-- wall-clock; idx_events_run_sequence serves cursor-paginated audit-stream
+-- reads over the shared per-run sequence. idx_events_domain is a partial
+-- index over the domain minority so list_domain_events (the event-sourced
+-- state fold run on every lifecycle load) scans only the rows it folds
+-- instead of walking interleaved telemetry. The partial index is additive:
+-- CREATE INDEX IF NOT EXISTS materializes it on reopen of an existing
+-- schema, so it needs no schema_version bump (same path as task_claims).
+-- grader_results reads are always scoped to one attempt's graders in ordinal
+-- order.
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, ts);
 CREATE INDEX IF NOT EXISTS idx_events_run_sequence
   ON events(run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_events_domain
+  ON events(run_id, sequence) WHERE category = 'domain';
 CREATE INDEX IF NOT EXISTS idx_grader_results_run_attempt
   ON grader_results(run_id, attempt_number, ordinal);
 

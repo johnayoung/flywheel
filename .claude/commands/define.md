@@ -149,9 +149,24 @@ Before generating the spec, verify:
 - [ ] Error handling defined
 - [ ] Edge cases addressed
 - [ ] Integration points identified
+- [ ] Loop-path trigger checked (see below)
 - [ ] No remaining ambiguity
 
 If ANY checkbox is unchecked, return to STEP 3.
+
+### Loop-path trigger (in-loop-verification)
+
+Per `.workflow/specs/00017-FEATURE-in-loop-verification-gate.md`, a phase whose cumulative diff trips any of the **Trigger Set** signals below cannot be archived without a DONE task tagged `in-loop-verification`:
+
+| # | Signal |
+| - | ------ |
+| 1 | New `Status` / `Outcome` member or transition-rule entry in `lifecycle.py` |
+| 2 | New `ADD COLUMN` / table in `src/flywheel/_schema/*.sql` |
+| 3 | New `Grader` union variant in `task.py` (or new `grader_*.py` dispatched by the harness) |
+| 4 | New `def` on a `store_protocols.py` Protocol + reactive-sweep / transition dispatch entry |
+| 5 | New `CONTROL_COMMAND_*` constant in `invoker_client.py` |
+
+If the feature plausibly produces any of these, record it in the spec's **Decisions Log** (`Loop-path coverage | Required | Spec trips signal <N>`) and add a one-line note under **Out of Scope** that auto-generating the verify fixture is explicitly out of scope -- only the slot is auto-required, the test body is authored by hand. When `/task` runs on this spec it MUST emit a slot tagged `in-loop-verification` whose graders drive the real `orchestrate` loop with a scripted invoker (FR-3) and, for schema-touching features, seed a `v(N-1)` store migrated forward through the real `SqliteStore` (FR-4). See `.claude/commands/task.md` -> "Loop-path features: emit an in-loop-verification slot" for the slot template.
 
 ## STEP 6: GENERATE FEATURE SPEC
 

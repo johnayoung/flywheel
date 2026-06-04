@@ -132,6 +132,63 @@ Prefer `command` graders. A grader fails on non-zero exit; that is "done" for it
 - **`prerequisites` is the only ordering mechanism.** Files within a phase run alphabetically when no prerequisite forces order.
 - **Enumerate the dependents of a shared invariant.** When a task adds a new enum value, a new schema column, a new required field, or otherwise changes a shape that other tests/graders assert against, list every test and grader that pins down the old shape in `context.constraints` and require the agent to update them in the same commit. Otherwise the next task in the phase inherits a red suite and is forced to either block or ship `verify` against a known-failing grader (see `.workflow/audits/02-harness-resilience.md`).
 
+### Loop-path features: emit an in-loop-verification slot
+
+Spec `.workflow/specs/00017-FEATURE-in-loop-verification-gate.md` defines a mechanical archive gate (`archive_completed_phases`) that refuses to archive a phase whose cumulative diff trips any watched signal unless the phase contains a DONE task **tagged `in-loop-verification`** (or a recorded opt-out artifact). When the spec or the phase diff falls in the **Trigger Set**, the proposal MUST include one such slot.
+
+**Trigger Set (from the spec's Behavior Specification — emit the slot if the work plausibly produces any of these):**
+
+| # | Signal | Decidable test |
+| - | ------ | -------------- |
+| 1 | New `Status` / `Outcome` member or transition rule | added enum member / `_VALID_EDGES`-style entry in `lifecycle.py` |
+| 2 | New `ADD COLUMN` / table in `_schema/*.sql` the live store binds to | new column/table DDL (lifecycles, grader_results, events, attempts, control_commands) |
+| 3 | New `Grader` union variant | new variant in `task.py`'s `Grader` union or new `grader_*.py` module the harness dispatches |
+| 4 | New `store_protocols.py` Protocol method + dispatch registration | new `def` on a Protocol class + a reactive-sweep / transition-dispatch entry point |
+| 5 | New control-command verb | new `CONTROL_COMMAND_*` constant in `invoker_client.py` |
+
+If unsure, emit the slot — the gate's marker is an over-approximation; downgrade later via the opt-out artifact, not by silently skipping.
+
+**Slot template (do NOT auto-generate the fixture body — author writes the test):**
+
+```json
+{
+  "id": "in-loop-verify-<feature>",
+  "goal": "Drive a fixture through the real orchestrate loop with a scripted invoker so the new <Status/column/grader/Protocol method/control verb> is produced AND applied end-to-end by the real loop, and (for schema features) seeded from a v(N-1) store migrated forward via the real SqliteStore.",
+  "prerequisites": ["<every feature task id in this phase>"],
+  "tags": ["in-loop-verification"],
+  "context": {
+    "relevant": [
+      "tests/test_worker.py::test_run_once_merges_completed_task",
+      "src/flywheel/orchestrator.py",
+      "src/flywheel/harness.py",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/invoker_client.py"
+    ],
+    "references": [
+      ".workflow/specs/00017-FEATURE-in-loop-verification-gate.md FR-3 (both loop-produced ends) and FR-4 (v(N-1) seed + real forward migration + SqliteStore round-trip)",
+      "tests/test_worker.py::test_run_once_merges_completed_task -- model for driving a full real-loop cycle with a scripted invoke against a real store"
+    ],
+    "constraints": [
+      "FR-3: drive BOTH loop-produced ends -- the harness park AND the reactive-sweep apply. Stubbing either end fails the slot.",
+      "FR-4 (schema-touching features): seed a v(N-1) store fixture, run the real forward migration in store_sqlite.py to vN, then assert the new column/table round-trips through SqliteStore (e.g. load_lifecycle). A fresh current-schema-bootstrapped store does NOT satisfy this -- it reproduces phase 08's blind spot.",
+      "Use the existing injectable invoker seam fed a deterministic scripted envelope (the same seam tests/test_worker.py uses). Never call a paid/network agent.",
+      "Never read, write, or migrate .workflow/flywheel.sqlite -- fixture/temp stores only.",
+      "Tag MUST include `in-loop-verification` verbatim -- archive_completed_phases keys off this exact tag to recognize the verify task.",
+      "Commit with a Conventional Commits message (test: ... or feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not stub orchestrate, harness, or SqliteStore -- only the agent's text is scripted.",
+      "Do not auto-generate the fixture or assertions; the human authoring the slot writes the test body."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_<feature>_in_loop.py", "name": "in-loop-verify" }
+  ]
+}
+```
+
+Keep the slot's `goal` to one sentence, swap the bracketed signal name to whichever the feature actually adds, and list every feature task as a prerequisite so the verify slot runs last. Do NOT auto-fill the fixture body or the assertion text -- spec Out of Scope item: "Auto-generating the verify task's fixture/assertions content (authoring discipline remains human; only the task slot is auto-required)."
+
 ## STEP 5: PRESENT THE PROPOSAL
 
 Do not write anything yet. Show the proposed phase directory + task IDs + each full JSON for review:

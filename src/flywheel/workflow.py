@@ -98,6 +98,7 @@ from flywheel.invoker import (
 from flywheel.invoker_client import invoke_iteration_with_client
 from flywheel.lifecycle import Attempt, Lifecycle, Status
 from flywheel.loaders import TaskLoadError, load_task_file
+from flywheel.loop_path_marker import LoopPathSignal, detect_loop_path_signals
 from flywheel.store_protocols import (
     ControlCommandStore,
     EventRecord,
@@ -1112,11 +1113,32 @@ async def run_task_file(
 # --- Archive subcommand -----------------------------------------------------
 
 
-def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
+IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
+
+
+def archive_completed_phases(
+    tasks_dir: Path,
+    store: SqliteStore,
+    *,
+    repo_root: Path | None = None,
+    log: Callable[[str], None] | None = None,
+) -> list[Path]:
     """Move ``active/<phase>`` dirs to ``archive/`` when every task is done.
 
     Returns the list of moved phase directories (post-move paths). Idempotent:
     safe to call repeatedly. Phases with any non-done task are left in place.
+
+    When ``repo_root`` is supplied, the phase's cumulative diff vs its
+    recorded ``.loop-base`` is inspected for the watched loop-path signals
+    (see :mod:`flywheel.loop_path_marker`). A phase whose diff hits any
+    signal is gated: it archives only when it contains a DONE task tagged
+    ``in-loop-verification`` OR a valid ``loop-path-exempt.md`` opt-out
+    artifact lives alongside the task files. A gated phase stays in
+    ``active/`` and the refusal reason is reported via ``log`` (the same
+    ``Callable[[str], None]`` seam :func:`.workflow.worker.archive_phases`
+    uses). An empty marker (no watched signal, no recorded base, or
+    ``repo_root`` omitted) archives exactly as before -- the gate is a
+    pure addition for the loop-path case.
     """
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
@@ -1133,10 +1155,28 @@ def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
         ]
         if not task_files:
             continue
+        loaded_tasks: list[Task] = [load_task_file(p) for p in task_files]
         if not all(
-            _has_done_lifecycle(store, load_task_file(p).id) for p in task_files
+            _has_done_lifecycle(store, task.id) for task in loaded_tasks
         ):
             continue
+
+        # Loop-path archive gate (FR-2): a non-empty marker requires either
+        # a DONE in-loop-verification task or a recorded opt-out artifact.
+        # The marker is empty whenever no ``repo_root`` was threaded
+        # through or no ``.loop-base`` was recorded -- legacy callers and
+        # synthetic test phases keep their previous archive semantics.
+        if repo_root is not None:
+            signals = detect_loop_path_signals(
+                phase_diff_vs_base(repo_root, phase_dir)
+            )
+            if signals and not _loop_path_gate_satisfied(
+                phase_dir, loaded_tasks, store
+            ):
+                if log is not None:
+                    log(_format_gate_refusal(phase_dir, signals))
+                continue
+
         dest = archive_root / phase_dir.name
         # If a same-named archive exists, leave the active dir alone rather
         # than clobber prior history — operator can resolve manually.
@@ -1145,6 +1185,52 @@ def archive_completed_phases(tasks_dir: Path, store: SqliteStore) -> list[Path]:
         shutil.move(str(phase_dir), str(dest))
         moved.append(dest)
     return moved
+
+
+def _loop_path_gate_satisfied(
+    phase_dir: Path, tasks: Iterable[Task], store: SqliteStore
+) -> bool:
+    """Return ``True`` when ``phase_dir`` clears the loop-path archive gate.
+
+    The gate is satisfied by either a valid opt-out artifact or a DONE
+    task carrying the ``in-loop-verification`` tag. A malformed opt-out
+    artifact (``LoopPathOptOutError``) is treated as no opt-out -- the
+    refusal still fires and the operator must fix the artifact; the
+    audit re-check does the symbol-level second look on the claim. The
+    signature only takes a closed iterable of ``Task`` so the caller
+    can avoid re-reading task JSON.
+    """
+    try:
+        if load_loop_path_optout(phase_dir) is not None:
+            return True
+    except LoopPathOptOutError:
+        # Defer to the operator: a malformed opt-out is not a downgrade.
+        pass
+    for task in tasks:
+        if IN_LOOP_VERIFICATION_TAG in task.tags and _has_done_lifecycle(
+            store, task.id
+        ):
+            return True
+    return False
+
+
+def _format_gate_refusal(
+    phase_dir: Path, signals: frozenset[LoopPathSignal]
+) -> str:
+    """Render the human-readable refusal message for a gated phase.
+
+    Signal names are sorted so the message is stable across runs (the
+    underlying ``frozenset`` is order-independent). The message names
+    the offending phase, the tripped signals, and the two ways to
+    clear the gate so the operator's next step is unambiguous.
+    """
+    names = ", ".join(sorted(signal.value for signal in signals))
+    return (
+        f"Refusing to archive phase {phase_dir.name}: loop-path signal(s) "
+        f"[{names}] detected and neither a DONE "
+        f"{IN_LOOP_VERIFICATION_TAG} task nor a "
+        f"{LOOP_PATH_OPTOUT_FILENAME} opt-out is present"
+    )
 
 
 # --- Phase base-SHA capture + diff-vs-base ----------------------------------

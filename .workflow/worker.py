@@ -486,11 +486,28 @@ def record_phase_bases(
         log(f"Recorded base sha for {len(written)} phase(s)")
 
 
-def archive_phases(tasks_dir: Path, db_path: Path, log: Logger) -> None:
-    """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``."""
+def archive_phases(
+    tasks_dir: Path,
+    db_path: Path,
+    log: Logger,
+    *,
+    repo_root: Path | None = None,
+) -> None:
+    """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
+
+    ``repo_root`` enables the loop-path archive gate
+    (:func:`flywheel.workflow.archive_completed_phases` reads the phase's
+    cumulative diff vs ``.loop-base`` to derive the marker); omitting it
+    skips the gate entirely, which matches the legacy ``archive_phases``
+    contract. Refusal reasons are reported via the same ``log`` callable
+    that announces archived phases so a single log stream tells the
+    operator everything the sweep did.
+    """
     store = SqliteStore(db_path)
     try:
-        moved = archive_completed_phases(tasks_dir, store)
+        moved = archive_completed_phases(
+            tasks_dir, store, repo_root=repo_root, log=log
+        )
     finally:
         store.close()
     for dest in moved:
@@ -778,7 +795,7 @@ def run_once(
         )
     )
     write_run_logs(resolved_log_dir, report, db_path, log)
-    archive_phases(tasks_dir, db_path, log)
+    archive_phases(tasks_dir, db_path, log, repo_root=submitter.repo_root)
     return report
 
 

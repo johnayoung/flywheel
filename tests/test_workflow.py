@@ -52,6 +52,7 @@ def _write_task(
     task_id: str,
     *,
     prerequisites: list[str] | None = None,
+    tags: list[str] | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, object] = {
@@ -61,6 +62,8 @@ def _write_task(
     }
     if prerequisites:
         payload["prerequisites"] = prerequisites
+    if tags:
+        payload["tags"] = tags
     path.write_text(json.dumps(payload))
     return path
 
@@ -588,6 +591,377 @@ def test_phase_diff_vs_base_returns_empty_when_no_base_recorded(
     _git_commit_file(repo, "advance.txt", "x\n", "advance")
 
     assert phase_diff_vs_base(repo, phase_dir) == ""
+
+
+# ---------- Loop-path archive gate (FR-2) ----------
+#
+# The gate attaches at the operational "phase declared done" moment in
+# :func:`archive_completed_phases`. It derives the loop-path marker from
+# the phase's cumulative diff vs ``.loop-base`` and refuses to archive a
+# marked phase that has neither a DONE ``in-loop-verification`` task nor
+# a recorded ``loop-path-exempt.md`` opt-out artifact.
+#
+# The tests below build a real git repo so the diff helper has something
+# to walk; the phase ``.loop-base`` is captured before any feature lands
+# so the diff faithfully reflects the in-phase work. The watched signal
+# is a new ``Status`` enum member -- the spec's rock-solid signal 1.
+
+
+_LIFECYCLE_BASE_BODY = '''"""Stub lifecycle for the loop-path gate tests."""
+
+from enum import Enum
+
+
+class Status(str, Enum):
+    READY = "ready"
+    RUNNING = "running"
+    DONE = "done"
+'''
+
+_LIFECYCLE_WITH_NEW_STATUS = '''"""Stub lifecycle for the loop-path gate tests."""
+
+from enum import Enum
+
+
+class Status(str, Enum):
+    READY = "ready"
+    RUNNING = "running"
+    DONE = "done"
+    DEFERRED = "deferred"
+'''
+
+
+def _setup_loop_path_phase(
+    repo: Path, phase_name: str = "01-loop-path"
+) -> Path:
+    """Build a real-git phase whose cumulative diff hits a watched signal.
+
+    Lands a baseline ``src/flywheel/lifecycle.py``, records the phase's
+    base SHA into ``.loop-base``, commits the dotfile, then commits a
+    follow-up edit that adds a new ``Status`` enum member. The resulting
+    ``phase_diff_vs_base(repo, phase_dir)`` contains the new ``Status``
+    member -- signal 1 of the FR-1 trigger set -- so the gate fires.
+    """
+    _git_init_repo(repo)
+    lifecycle_path = repo / "src" / "flywheel" / "lifecycle.py"
+    lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_path.write_text(_LIFECYCLE_BASE_BODY)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "chore: stub lifecycle"],
+        check=True,
+        capture_output=True,
+    )
+
+    phase_dir = repo / ".workflow" / "tasks" / "active" / phase_name
+    phase_dir.mkdir(parents=True)
+    assert write_phase_base_if_missing(repo, phase_dir) is True
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "chore: record phase base"],
+        check=True,
+        capture_output=True,
+    )
+
+    # Land the loop-path-bearing change against the recorded base.
+    lifecycle_path.write_text(_LIFECYCLE_WITH_NEW_STATUS)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "feat: add DEFERRED status"],
+        check=True,
+        capture_output=True,
+    )
+    return phase_dir
+
+
+def _tasks_dir_of(phase_dir: Path) -> Path:
+    """Return the ``active/<phase>/..`` parent -- the tasks-dir root."""
+    return phase_dir.parent.parent
+
+
+def test_archive_gate_refuses_marked_phase_without_verify_or_optout(
+    tmp_path: Path,
+) -> None:
+    """FR-2: a loop-path-marked phase with no verify task / opt-out stays active.
+
+    All feature tasks reach DONE, but the phase's cumulative diff added a
+    new ``Status`` member. With neither a DONE in-loop-verification task
+    nor a ``loop-path-exempt.md`` artifact, the gate must refuse to
+    archive and log the refusal reason.
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+    _write_task(phase_dir / "feature-b.json", "feature-b")
+
+    logged: list[str] = []
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        _seed_done(store, "feature-b")
+        moved = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=logged.append
+        )
+    finally:
+        store.close()
+
+    assert moved == []
+    assert phase_dir.is_dir(), "gated phase must remain in active/"
+    assert not (tasks_dir / "archive" / phase_dir.name).exists()
+    assert any(
+        "Refusing to archive" in line and phase_dir.name in line
+        for line in logged
+    ), f"expected refusal log entry, got {logged!r}"
+    assert any(
+        "in-loop-verification" in line for line in logged
+    ), f"refusal must mention the verify-task remedy, got {logged!r}"
+
+
+def test_archive_gate_allows_marked_phase_with_done_verify_task(
+    tmp_path: Path,
+) -> None:
+    """FR-2: adding a DONE in-loop-verification task lets the next sweep archive.
+
+    Re-runs ``archive_completed_phases`` after the verify task is DONE
+    and asserts the phase moves into ``archive/`` (the same call shape
+    that was refused on the first run).
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+    _write_task(
+        phase_dir / "verify.json",
+        "verify-loop-path",
+        tags=["in-loop-verification"],
+    )
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        # First sweep: verify task is not yet DONE -- gate refuses.
+        logged_first: list[str] = []
+        first = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=logged_first.append
+        )
+        assert first == []
+        assert phase_dir.is_dir()
+
+        # Wait -- a not-yet-attempted verify task means
+        # ``_has_done_lifecycle`` returns False, so the all-tasks-done
+        # short-circuit fires before the gate even runs. The gate's
+        # spec-pinned shape -- "Verify task present but its lifecycle is
+        # not DONE -> gate refuses (same as missing)" -- requires that
+        # adding the verify task does not, by itself, unlock archive.
+        # Drive it to DONE and re-sweep.
+        _seed_done(store, "verify-loop-path")
+        logged_second: list[str] = []
+        second = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=logged_second.append
+        )
+    finally:
+        store.close()
+
+    assert [p.name for p in second] == [phase_dir.name]
+    assert not phase_dir.exists()
+    assert (tasks_dir / "archive" / phase_dir.name).is_dir()
+    assert logged_second == [], (
+        f"clean archive must not log refusal, got {logged_second!r}"
+    )
+
+
+def test_archive_gate_refuses_when_verify_task_lifecycle_not_done(
+    tmp_path: Path,
+) -> None:
+    """A verify task present but not DONE is treated identically to missing.
+
+    Pins the spec's "Verify task present but its lifecycle is not DONE
+    -> gate refuses (same as missing)" error-handling row.
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+    _write_task(
+        phase_dir / "verify.json",
+        "verify-loop-path",
+        tags=["in-loop-verification"],
+    )
+
+    logged: list[str] = []
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        _seed_failed(store, "verify-loop-path")
+        moved = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=logged.append
+        )
+    finally:
+        store.close()
+
+    # The feature task is DONE but the verify task is FAILED -- the
+    # all-tasks-done short-circuit alone keeps the phase in active/
+    # before the gate evaluates. The phase still stays active and no
+    # refusal is logged (the all-tasks-done check is silent).
+    assert moved == []
+    assert phase_dir.is_dir()
+
+
+def test_archive_gate_allows_marked_phase_with_optout_artifact(
+    tmp_path: Path,
+) -> None:
+    """FR-2 + FR-5: a valid opt-out artifact alone clears the gate.
+
+    The artifact downgrades the marker; an audit re-check (separate task)
+    is the FR-6b backstop. From the gate's perspective the phase is
+    eligible to archive even though the diff added a watched symbol.
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+    (phase_dir / "loop-path-exempt.md").write_text(
+        "---\n"
+        f"phase: {phase_dir.name}\n"
+        "author: john.young\n"
+        "reason: refactor only; no new lifecycle path\n"
+        "---\n"
+        "\nFree-form notes for the auditor.\n",
+        encoding="utf-8",
+    )
+
+    logged: list[str] = []
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        moved = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=logged.append
+        )
+    finally:
+        store.close()
+
+    assert [p.name for p in moved] == [phase_dir.name]
+    assert not phase_dir.exists()
+    archived = tasks_dir / "archive" / phase_dir.name
+    assert archived.is_dir()
+    # The opt-out travels into archive/ so an auditor can re-check it.
+    assert (archived / "loop-path-exempt.md").is_file()
+    assert logged == []
+
+
+def test_archive_gate_inert_without_repo_root(tmp_path: Path) -> None:
+    """Legacy callers (no ``repo_root``) keep their previous archive contract.
+
+    The synthetic phases in the existing archive tests don't pass a
+    ``repo_root``, so the gate must never fire for them. This test
+    exercises the same legacy call shape against a phase whose on-disk
+    diff would otherwise have hit a watched signal, to pin that the
+    skip-when-no-repo-root short-circuit is the load-bearing reason
+    those tests continue to pass.
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        moved = archive_completed_phases(tasks_dir, store)
+    finally:
+        store.close()
+
+    assert [p.name for p in moved] == [phase_dir.name]
+    assert not phase_dir.exists()
+    assert (tasks_dir / "archive" / phase_dir.name).is_dir()
+
+
+def test_archive_gate_inert_when_no_loop_base_recorded(
+    tmp_path: Path,
+) -> None:
+    """A phase with no ``.loop-base`` archives even with ``repo_root`` passed.
+
+    ``phase_diff_vs_base`` degrades to an empty string when the dotfile
+    is absent, so the marker is empty and the gate stays silent. This
+    matches the constraint that an empty marker archives exactly as
+    before.
+    """
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    # Land a diff that would otherwise hit signal 1, but never record a
+    # base SHA -- so ``phase_diff_vs_base`` returns "".
+    lifecycle_path = repo / "src" / "flywheel" / "lifecycle.py"
+    lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_path.write_text(_LIFECYCLE_WITH_NEW_STATUS)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "feat: add status"],
+        check=True,
+        capture_output=True,
+    )
+
+    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+    tasks_dir = _tasks_dir_of(phase_dir)
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        moved = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=lambda _msg: None
+        )
+    finally:
+        store.close()
+
+    assert [p.name for p in moved] == [phase_dir.name]
+    assert not phase_dir.exists()
+
+
+def test_archive_gate_stays_idempotent_on_refusal(tmp_path: Path) -> None:
+    """A second refused sweep must still report no moves and not raise.
+
+    The function is documented idempotent; the gate must preserve that:
+    re-running against the same gated phase yields the same outcome
+    (phase still active, no exception, refusal re-logged).
+    """
+    repo = tmp_path / "repo"
+    phase_dir = _setup_loop_path_phase(repo)
+    tasks_dir = _tasks_dir_of(phase_dir)
+    _write_task(phase_dir / "feature-a.json", "feature-a")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "feature-a")
+        log_a: list[str] = []
+        log_b: list[str] = []
+        first = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=log_a.append
+        )
+        second = archive_completed_phases(
+            tasks_dir, store, repo_root=repo, log=log_b.append
+        )
+    finally:
+        store.close()
+
+    assert first == []
+    assert second == []
+    assert phase_dir.is_dir()
+    assert len(log_a) == 1 and len(log_b) == 1
+    assert log_a == log_b
 
 
 # ---------- CLI integration ----------

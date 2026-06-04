@@ -1,0 +1,41 @@
+{
+  "id": "phase-base-diff",
+  "goal": "The git-worktree worker records each active phase's base commit SHA at phase entry (a committed .loop-base file in the phase dir), and flywheel.workflow exposes a helper returning that phase's cumulative git diff versus the recorded base.",
+  "tags": ["loop-path-gate", "worker", "git"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00017-FEATURE-in-loop-verification-gate.md",
+      ".workflow/worker.py",
+      "src/flywheel/workflow.py",
+      "tests/test_workflow.py",
+      "tests/test_worker.py"
+    ],
+    "references": [
+      ".workflow/worker.py:646 (_phase_base) -- the worker runs on a base branch and FF-merges flywheel/<phase>/<task> into it; by archive time the phase's commits are already in the base, so the base SHA must be captured at phase entry, not derived at archive.",
+      ".workflow/worker.py commit_task_files / run_once -- capture the base right after task files are committed, before any task merges.",
+      "src/flywheel/workflow.py:1114 (archive_completed_phases) -- the consumer of the diff helper (next task wires it in).",
+      "tests/test_worker.py:334 (test_run_once_merges_completed_task) -- model for a real-git-repo test."
+    ],
+    "constraints": [
+      "Record the base as a committed `.loop-base` file (the current HEAD SHA) inside active/<phase>/ the first time the worker processes the phase; never overwrite an existing .loop-base (the first-seen SHA is the true base).",
+      "Put the reusable logic (write-base-if-missing, diff-vs-base) in flywheel.workflow so it is testable without the worker; the worker only calls it. File/git I/O belongs in the workflow layer, never in flywheel.task/flywheel.lifecycle -- do not weaken either purity test.",
+      "The diff helper returns the unified-diff text of `git diff <base-sha> HEAD` for the repo; when a phase has no recorded .loop-base it must degrade safely to an empty diff (return empty string), not raise.",
+      ".loop-base is a dotfile: confirm archive_completed_phases' task-file iteration already skips dot-prefixed and non-.json entries so it is never treated as a task (workflow.py:1124-1132 already filters these) -- add a test asserting a phase with only a .loop-base plus done tasks still archives.",
+      "Add a test in tests/test_workflow.py (real git repo) asserting (a) base capture writes the pre-merge SHA once and is idempotent, and (b) the diff helper returns the phase's added lines.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not add the marker or the archive gate (separate tasks).",
+      "Do not ever read, write, or diff the production .workflow/flywheel.sqlite."
+    ],
+    "edge_cases": [
+      "Two phases entering in the same cycle each get their own .loop-base; capture is per-phase-dir.",
+      "A re-run after .loop-base already exists must not move the recorded base forward."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_workflow.py tests/test_worker.py", "name": "base-diff-tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|test):'", "name": "commit-landed" }
+  ]
+}

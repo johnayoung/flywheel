@@ -1,0 +1,41 @@
+{
+  "id": "archive-gate-loop-path",
+  "goal": "archive_completed_phases refuses to move a loop-path-marked phase to archive/ unless the phase contains a DONE task tagged in-loop-verification or a recorded opt-out artifact, leaving a blocked phase active and logging the refusal reason.",
+  "prerequisites": ["loop-path-diff-marker", "phase-base-diff", "loop-path-optout-artifact"],
+  "tags": ["loop-path-gate", "archive"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00017-FEATURE-in-loop-verification-gate.md",
+      "src/flywheel/workflow.py",
+      "src/flywheel/loop_path_marker.py",
+      "tests/test_workflow.py"
+    ],
+    "references": [
+      "src/flywheel/workflow.py:1114 (archive_completed_phases) -- the gate attaches here, just before shutil.move; existing all-tasks-done check is at 1135-1138.",
+      "flywheel.loop_path_marker (loop-path-diff-marker) -- derives signals from the phase's cumulative diff (phase-base-diff helper).",
+      "flywheel.workflow opt-out loader (loop-path-optout-artifact) -- the downgrade path.",
+      "load_task_file(p).tags and _has_done_lifecycle(store, id) -- how the gate recognizes a DONE in-loop-verification task."
+    ],
+    "constraints": [
+      "Derive the marker from the phase's cumulative diff-vs-base; a phase is gated ONLY when the marker is non-empty. An empty marker (no watched signal, or no recorded base) archives exactly as today.",
+      "The recognized verify-task marker is a phase task carrying the tag `in-loop-verification`; the gate passes when such a task has a DONE lifecycle OR an opt-out artifact is present for the phase.",
+      "A gated phase stays in active/ and the refusal reason is logged via the same logging seam archive_phases uses (.workflow/worker.py:453); the function stays idempotent.",
+      "SHARED-INVARIANT: existing archive tests in tests/test_workflow.py build synthetic phases with trivial tasks whose diffs carry no watched signal -- they must stay green (non-loop-path phases archive unchanged). Enumerate every archive test and confirm it still passes; do not weaken any of them to fit the gate.",
+      "Add tests for the FR-2 acceptance: a marked phase with all feature tasks DONE but no verify task and no opt-out is NOT archived; adding a DONE in-loop-verification task lets the next sweep archive it; an opt-out artifact alone also lets it archive.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not run a real agent; do not touch the production .workflow/flywheel.sqlite.",
+      "Do not implement the /task or /audit-phase command changes (separate tasks)."
+    ],
+    "edge_cases": [
+      "Verify task present but its lifecycle is not DONE -> gate refuses (same as missing).",
+      "Marker non-empty but opt-out present -> phase archives (the audit re-check, not the gate, catches a bad opt-out)."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_workflow.py", "name": "gate-tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|test):'", "name": "commit-landed" }
+  ]
+}

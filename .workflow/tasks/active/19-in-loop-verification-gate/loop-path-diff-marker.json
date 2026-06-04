@@ -1,0 +1,40 @@
+{
+  "id": "loop-path-diff-marker",
+  "goal": "Add a flywheel.loop_path_marker module that, given a unified-diff string, returns the set of watched loop-path signals it contains: a new Status/Outcome enum member or transition-rule entry, a new ADD COLUMN or table, a new Grader union variant, a new control-command verb, or a new store Protocol method.",
+  "tags": ["loop-path-gate", "marker"],
+  "context": {
+    "relevant": [
+      ".workflow/specs/00017-FEATURE-in-loop-verification-gate.md",
+      "src/flywheel/lifecycle.py",
+      "src/flywheel/task.py",
+      "src/flywheel/invoker_client.py",
+      "src/flywheel/store_protocols.py",
+      "src/flywheel/_schema/persistence-schema.sql"
+    ],
+    "references": [
+      "Spec Behavior Specification -> Trigger Set table (signals 1-5, ranked by trust) is the authoritative detection spec; the watched files per signal are listed there.",
+      "src/flywheel/invoker_client.py:63-67 -- CONTROL_COMMAND_* constants (signal 5 surface).",
+      "src/flywheel/store_protocols.py -- Protocol classes (DomainEventStore, ControlCommandStore, etc.); signal 4's decidable core is a new `def` on one of these Protocols."
+    ],
+    "constraints": [
+      "Pure string/diff analysis: the function takes the diff TEXT as input and returns the signals -- no git invocation, no file or JSON I/O in this module, so it is unit-testable in isolation.",
+      "Detect only added content (diff lines beginning with '+', excluding the '+++' file header); a watched symbol that merely appears in a context or removed line is not a hit.",
+      "Signal 4 must be scoped to its decidable core: a newly added `def` on a Protocol in store_protocols.py. Do NOT fire signal 4 on any-new-function-in-harness.py/orchestrator.py (spec line 80 -- that erodes the gate); the file-touch fallback is out of scope for this module.",
+      "Add tests/test_loop_path_marker.py with synthetic diffs covering each of the five signals plus the two FR-1 acceptance cases: a diff adding a Status enum member is marked; a diff that only renames a local variable in lifecycle.py is not.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting verify.",
+      "Commit the change with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not wire the marker into archive_completed_phases (archive-gate-loop-path owns that).",
+      "Do not compute the diff from git here (phase-base-diff owns diff acquisition)."
+    ],
+    "edge_cases": [
+      "A diff that adds then reverts the same column within one phase nets no new symbol -- operate on the cumulative diff text you are given; if the net added lines do not contain the symbol, do not fire.",
+      "A pure docstring/comment edit inside a watched file must not fire any symbol-level signal."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_loop_path_marker.py", "name": "marker-tests" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^(feat|test):'", "name": "commit-landed" }
+  ]
+}

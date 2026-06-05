@@ -826,6 +826,7 @@ def _make_claude_code_invoke(
             run_id=pinned_run_id,
             audit_emit=emit,
             on_message=composed,
+            context_observer=request.context_observer,
         )
 
     return _invoke

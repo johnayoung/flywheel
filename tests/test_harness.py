@@ -5488,3 +5488,410 @@ class TestContextRecovery:
             == "recovery_summarizer_error"
         ]
         assert len(crashes) == 1
+
+
+# --- Mid-turn context-occupancy observe (spec 00019) --------------------
+
+
+def _scripted_invoker_with_observer_pumps(
+    pairs: list[tuple[IterationResult, tuple[dict[str, Any], ...]]],
+) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
+    """Build a scripted invoker that also pumps SDK context readings.
+
+    Each call pops the next ``(IterationResult, readings)`` pair. The
+    ``readings`` tuple is delivered to ``request.context_observer`` (one
+    call per reading) BEFORE the iteration's messages are played through
+    ``request.on_message`` so a test can assert the SDK reading wins
+    over the accumulated ``AssistantMessage.usage`` estimate when both
+    sources arrive in the same iteration.
+    """
+    calls: list[InvocationRequest] = []
+
+    async def _invoker(request: InvocationRequest) -> IterationResult:
+        calls.append(request)
+        result, readings = pairs.pop(0)
+        if request.context_observer is not None:
+            for reading in readings:
+                try:
+                    request.context_observer(reading)  # type: ignore[arg-type]
+                except Exception:  # noqa: BLE001 - mirror the production swallow.
+                    pass
+        if request.on_message is not None:
+            for msg in result.messages:
+                try:
+                    request.on_message(msg)
+                except Exception:  # noqa: BLE001 - mirror the production swallow.
+                    pass
+        return result
+
+    _invoker.calls = calls  # type: ignore[attr-defined]
+    return _invoker
+
+
+class TestMidTurnContextObserve:
+    """Spec 00019 FR-1/FR-2/FR-3: mid-turn occupancy threshold observe."""
+
+    def test_three_tiers_fire_in_order_from_streamed_usage(self) -> None:
+        """FR-3: streamed usage that climbs through 50/75/90 fires three
+        events in tier order, each carrying iteration / tier / occupancy
+        / capacity / percentage / capacity_source."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-tiers")
+        # Capacity 100, occupancy climbs 40 -> 60 -> 80 -> 95. The
+        # 60 / 80 / 95 messages each first-cross the next tier; 40 is
+        # below the lowest tier and emits nothing.
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=40)),
+                        _assistant(usage=_usage_dict(input_tokens=60)),
+                        _assistant(usage=_usage_dict(input_tokens=80)),
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        config = HarnessConfig(context_window_tokens=100)
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        assert [c.payload["tier"] for c in crossings] == [0.5, 0.75, 0.9]
+        # All three fired mid-iteration (before harness.iteration_completed).
+        iter_done = next(
+            e for e in events if e.kind == "harness.iteration_completed"
+        )
+        assert all(
+            (c.sequence is not None)
+            and (iter_done.sequence is not None)
+            and (c.sequence < iter_done.sequence)
+            for c in crossings
+        )
+        # Payload shape: every required field present on every event.
+        for c in crossings:
+            assert c.payload["iteration"] == 1
+            assert c.payload["capacity_tokens"] == 100
+            assert c.payload["capacity_source"] == "operator"
+            assert isinstance(c.payload["occupancy_tokens"], int)
+            assert isinstance(c.payload["percentage"], float)
+        # Per-tier occupancy reflects the streamed AssistantMessage
+        # that first crossed it (60 -> 0.5, 80 -> 0.75, 95 -> 0.9).
+        assert crossings[0].payload["occupancy_tokens"] == 60
+        assert crossings[1].payload["occupancy_tokens"] == 80
+        assert crossings[2].payload["occupancy_tokens"] == 95
+        assert crossings[0].payload["percentage"] == 60.0
+        assert crossings[1].payload["percentage"] == 80.0
+        assert crossings[2].payload["percentage"] == 95.0
+
+    def test_no_capacity_no_events_even_with_huge_usage(self) -> None:
+        """FR-2 off-by-default: with no capacity from either source, an
+        oversize usage stream emits zero threshold events."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-disabled")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(
+                            usage=_usage_dict(input_tokens=999_999_999)
+                        ),
+                        _result_msg(
+                            num_turns=1, usage=_usage_dict(999_999_999)
+                        ),
+                    ),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        # Default config: context_window_tokens=None, no SDK reading
+        # (scripted invoker does not pump context_observer).
+        config = HarnessConfig()
+        assert config.context_window_tokens is None
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        assert all(
+            e.kind != "harness.context_threshold_crossed" for e in events
+        )
+        # And no recovery side-effect either.
+        assert all(e.kind != "harness.context_recovery" for e in events)
+
+    def test_re_cross_in_same_iteration_does_not_duplicate_event(
+        self,
+    ) -> None:
+        """FR-3: an oscillating estimate that re-crosses an already-emitted
+        tier within the same iteration does not produce a duplicate event."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-recross")
+        # Capacity 100. Estimate climbs to 60 (crosses 0.5), drops to 40
+        # (would re-arm naive logic), climbs to 60 again (re-cross 0.5),
+        # ends at 60. Only one 0.5 event must fire; 0.75 / 0.9 never
+        # reach.
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=60)),
+                        _assistant(usage=_usage_dict(input_tokens=40)),
+                        _assistant(usage=_usage_dict(input_tokens=60)),
+                        _result_msg(num_turns=1, usage=_usage_dict(60)),
+                    ),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        config = HarnessConfig(context_window_tokens=100)
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        assert [c.payload["tier"] for c in crossings] == [0.5]
+
+    def test_one_message_jumps_all_three_tiers_emits_three_events(
+        self,
+    ) -> None:
+        """FR-3: a single message that crosses 50 / 75 / 90 simultaneously
+        emits all three events in tier order on that message."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-jump")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        config = HarnessConfig(context_window_tokens=100)
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        assert [c.payload["tier"] for c in crossings] == [0.5, 0.75, 0.9]
+        # All three carry the same occupancy / capacity reading because
+        # they all crossed on the same message.
+        for c in crossings:
+            assert c.payload["occupancy_tokens"] == 95
+            assert c.payload["capacity_tokens"] == 100
+            assert c.payload["percentage"] == 95.0
+
+    def test_emitted_tiers_reset_per_iteration(self) -> None:
+        """FR-3: the per-tier emitted set resets at each new iteration so
+        a fresh iteration can re-emit tiers a prior iteration consumed."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-reset")
+        # Two iterations under one attempt (max_iterations_per_attempt=2).
+        # Each iteration's usage independently crosses all three tiers.
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="iteration-one",
+                    signals=_make_signals(num_turns=1),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        # max_context_recoveries=0 so the over-ratio iteration does not
+        # trigger spec 00018's boundary recovery (which would short-
+        # circuit the second iteration). This test only exercises
+        # observe behavior, not the recovery path.
+        config = HarnessConfig(
+            context_window_tokens=100,
+            max_iterations_per_attempt=2,
+            max_context_recoveries=0,
+        )
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        # Two iterations, each crossing all three tiers -> 6 events.
+        assert len(crossings) == 6
+        by_iter: dict[int, list[float]] = {}
+        for c in crossings:
+            by_iter.setdefault(int(c.payload["iteration"]), []).append(
+                float(c.payload["tier"])
+            )
+        assert by_iter[1] == [0.5, 0.75, 0.9]
+        assert by_iter[2] == [0.5, 0.75, 0.9]
+
+    def test_sdk_reading_wins_over_estimate_and_marks_source_sdk(
+        self,
+    ) -> None:
+        """FR-1: when the watcher pumps a ContextUsageResponse, its
+        ``totalTokens`` / ``maxTokens`` win over the accumulated estimate
+        and the operator capacity, and the event records capacity_source
+        ``sdk``."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-sdk-wins")
+        # The streamed message reports tiny usage (would not cross 0.5
+        # by itself); the SDK reading puts occupancy at 80 / 100 (0.8),
+        # crossing 0.5 and 0.75. Operator capacity is also set to 1000
+        # to prove the SDK maxTokens wins over it (an operator capacity
+        # of 1000 would put 80 tokens at 8%, no tier).
+        reading: dict[str, Any] = {
+            "totalTokens": 80,
+            "maxTokens": 100,
+            "rawMaxTokens": 100,
+            "percentage": 80.0,
+            "categories": [],
+            "model": "claude-test",
+            "isAutoCompactEnabled": False,
+            "memoryFiles": [],
+            "mcpTools": [],
+            "agents": [],
+            "gridRows": [],
+        }
+        invoke = _scripted_invoker_with_observer_pumps(
+            [
+                (
+                    _iteration(
+                        envelope=ValidEnvelope(
+                            intent=Intent.VERIFY, reason="done"
+                        ),
+                        messages=(
+                            _assistant(usage=_usage_dict(input_tokens=5)),
+                            _result_msg(num_turns=1, usage=_usage_dict(5)),
+                        ),
+                        transcript=_wrap(
+                            '{"intent": "verify", "reason": "done"}'
+                        ),
+                        signals=_make_signals(num_turns=1),
+                    ),
+                    (reading,),
+                ),
+            ]
+        )
+        config = HarnessConfig(context_window_tokens=1000)
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        # SDK reading at 80% fires 0.5 and 0.75 on the observer call.
+        assert [c.payload["tier"] for c in crossings] == [0.5, 0.75]
+        for c in crossings:
+            assert c.payload["capacity_source"] == "sdk"
+            assert c.payload["capacity_tokens"] == 100
+            assert c.payload["occupancy_tokens"] == 80
+            assert c.payload["percentage"] == 80.0
+
+    def test_sdk_reading_alone_provides_capacity_without_operator_knob(
+        self,
+    ) -> None:
+        """FR-1 hybrid capacity: with no operator knob set, a single SDK
+        reading is sufficient to enable threshold observation."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-observe-sdk-only")
+        reading: dict[str, Any] = {
+            "totalTokens": 60,
+            "maxTokens": 100,
+            "rawMaxTokens": 100,
+            "percentage": 60.0,
+            "categories": [],
+            "model": "claude-test",
+            "isAutoCompactEnabled": False,
+            "memoryFiles": [],
+            "mcpTools": [],
+            "agents": [],
+            "gridRows": [],
+        }
+        invoke = _scripted_invoker_with_observer_pumps(
+            [
+                (
+                    _iteration(
+                        envelope=ValidEnvelope(
+                            intent=Intent.VERIFY, reason="done"
+                        ),
+                        messages=(_assistant(), _result_msg(num_turns=1)),
+                        transcript=_wrap(
+                            '{"intent": "verify", "reason": "done"}'
+                        ),
+                        signals=_make_signals(num_turns=1),
+                    ),
+                    (reading,),
+                ),
+            ]
+        )
+        # No context_window_tokens -- the SDK reading alone supplies
+        # capacity.
+        config = HarnessConfig()
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        crossings = [
+            e for e in events if e.kind == "harness.context_threshold_crossed"
+        ]
+        assert [c.payload["tier"] for c in crossings] == [0.5]
+        assert crossings[0].payload["capacity_source"] == "sdk"
+        assert crossings[0].payload["capacity_tokens"] == 100
+        assert crossings[0].payload["occupancy_tokens"] == 60

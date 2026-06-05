@@ -64,7 +64,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from claude_agent_sdk import AssistantMessage, Message, ResultMessage
+from claude_agent_sdk import (
+    AssistantMessage,
+    ContextUsageResponse,
+    Message,
+    ResultMessage,
+)
 
 from flywheel.envelope import (
     BlockedRequirement,
@@ -254,6 +259,18 @@ class InvocationRequest:
     expected to swallow its own exceptions (the harness captures the
     first error into a per-iteration sentinel and re-raises after the
     invoker returns), so invokers do not need to wrap it.
+
+    ``context_observer`` is the harness's mid-turn occupancy seam
+    (spec 00019). When supplied, an invoker backed by a live
+    :class:`claude_agent_sdk.ClaudeSDKClient` reads
+    :meth:`ClaudeSDKClient.get_context_usage` once per watcher poll and
+    hands the resulting :class:`ContextUsageResponse` to the observer so
+    the harness can drive its 50 / 75 / 90 percent threshold checks off
+    the exact SDK reading. Invokers that have no live client (the plain
+    ``query`` path, scripted test invokers) leave it un-called; the
+    harness's accumulated :attr:`AssistantMessage.usage` estimate is the
+    always-available fallback. The observer is expected to swallow its
+    own exceptions, mirroring the ``on_message`` contract.
     """
 
     prompt: str
@@ -261,6 +278,7 @@ class InvocationRequest:
     attempt_number: int
     iteration_number: int
     on_message: Callable[[Message], None] | None = None
+    context_observer: Callable[[ContextUsageResponse], None] | None = None
 
 
 InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]
@@ -499,6 +517,24 @@ _OCCUPANCY_USAGE_KEYS: tuple[str, ...] = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
+
+
+# Mid-turn observe tiers (spec 00019 FR-3). Fixed 50 / 75 / 90 percent
+# fractions; ``_drive_iterations`` emits ``harness.context_threshold_crossed``
+# at the first mid-turn point occupancy reaches each tier, at most once
+# per tier per iteration. The act ratio (``context_recovery_trigger_ratio``,
+# default ``0.9``) stays separate -- these are observe-only legibility
+# markers ahead of the act point.
+_CONTEXT_OBSERVE_TIERS: tuple[float, ...] = (0.5, 0.75, 0.9)
+
+
+# Capacity source labels surfaced in the ``harness.context_threshold_crossed``
+# payload. ``sdk`` means the capacity came from
+# :meth:`ClaudeSDKClient.get_context_usage`'s ``maxTokens``; ``operator``
+# means it came from ``HarnessConfig.context_window_tokens``. The two are
+# the only sources spec 00019 admits.
+_CAPACITY_SOURCE_SDK: str = "sdk"
+_CAPACITY_SOURCE_OPERATOR: str = "operator"
 
 
 def _occupancy_from_usage(usage_payload: Mapping[str, Any]) -> int:
@@ -2750,6 +2786,99 @@ async def _drive_iterations(
         captured_iteration = iteration_number
         first_audit_error: _AuditWriteError | None = None
 
+        # Mid-turn occupancy state (spec 00019 FR-1/FR-3). All three
+        # slots are per-iteration: ``emitted_tiers`` enforces "at most
+        # once per tier", ``latest_sdk_reading`` holds the most recent
+        # ``ClaudeSDKClient.get_context_usage`` payload (when the
+        # invoker pumps one through ``context_observer``), and
+        # ``accumulated_estimate`` is the always-available fallback
+        # derived from streamed ``AssistantMessage.usage``. Lists wrap
+        # the mutable single-cell state so the nested closures can
+        # rebind without ``nonlocal`` chains.
+        emitted_tiers: list[float] = []
+        latest_sdk_reading: list[ContextUsageResponse | None] = [None]
+        accumulated_estimate: list[int] = [0]
+
+        def _check_context_thresholds() -> None:
+            """Emit ``harness.context_threshold_crossed`` for newly-crossed tiers.
+
+            Hybrid capacity: the SDK reading's ``maxTokens`` wins when a
+            reading is present and carries a positive value; otherwise
+            the operator-supplied ``HarnessConfig.context_window_tokens``
+            is the fallback. When neither yields a capacity the
+            iteration is left fully inert (FR-2 off-by-default) -- no
+            ratio is computed and no event fires.
+
+            Hybrid occupancy: the SDK reading's ``totalTokens`` wins
+            when a reading is present (the live client knows the exact
+            on-server context), with the accumulated
+            ``AssistantMessage.usage`` estimate as the fallback when
+            either no reading is available or its ``totalTokens`` is
+            absent / non-integer.
+
+            Audit-write failures route through ``first_audit_error``
+            the same way ``_persist_sdk_message`` failures do, so the
+            strict-audit policy (FR-5) catches a faulty event sink.
+            """
+            nonlocal first_audit_error
+            reading = latest_sdk_reading[0]
+            capacity: int | None = None
+            source: str | None = None
+            occupancy: int = accumulated_estimate[0]
+            if reading is not None:
+                sdk_capacity = reading.get("maxTokens")
+                if (
+                    isinstance(sdk_capacity, int)
+                    and not isinstance(sdk_capacity, bool)
+                    and sdk_capacity > 0
+                ):
+                    capacity = sdk_capacity
+                    source = _CAPACITY_SOURCE_SDK
+                sdk_occupancy = reading.get("totalTokens")
+                if (
+                    isinstance(sdk_occupancy, int)
+                    and not isinstance(sdk_occupancy, bool)
+                    and sdk_occupancy >= 0
+                ):
+                    occupancy = sdk_occupancy
+            if capacity is None:
+                if config.context_window_tokens is not None:
+                    capacity = config.context_window_tokens
+                    source = _CAPACITY_SOURCE_OPERATOR
+                else:
+                    # FR-2 off-by-default: no capacity from either
+                    # source, so no ratio and no event.
+                    return
+            assert source is not None  # for type-checkers; set with capacity.
+            if capacity <= 0:
+                return
+            ratio = occupancy / capacity
+            for tier in _CONTEXT_OBSERVE_TIERS:
+                if tier in emitted_tiers:
+                    continue
+                if ratio < tier:
+                    continue
+                emitted_tiers.append(tier)
+                try:
+                    _emit(
+                        store,
+                        run_id=lifecycle.run_id,
+                        kind="harness.context_threshold_crossed",
+                        payload={
+                            "iteration": captured_iteration,
+                            "tier": tier,
+                            "occupancy_tokens": occupancy,
+                            "capacity_tokens": capacity,
+                            "percentage": ratio * 100.0,
+                            "capacity_source": source,
+                        },
+                        attempt_number=attempt_number,
+                        now=clock,
+                    )
+                except _AuditWriteError as exc:
+                    if first_audit_error is None:
+                        first_audit_error = exc
+
         def _on_message(msg: Message) -> None:
             nonlocal first_audit_error
             try:
@@ -2764,6 +2893,30 @@ async def _drive_iterations(
             except _AuditWriteError as exc:
                 if first_audit_error is None:
                     first_audit_error = exc
+            # FR-1: update the fallback estimate from this streamed
+            # message's usage. Each ``AssistantMessage.usage`` carries
+            # the input-side context for THAT turn (input + cache_read +
+            # cache_creation, per ``_occupancy_from_usage``), not a
+            # delta -- the latest value supersedes prior estimates so
+            # the running occupancy tracks the most recent model call
+            # rather than double-counting the resent conversation
+            # (mirrors the spec 00018 occupancy semantic).
+            if isinstance(msg, AssistantMessage) and msg.usage is not None:
+                accumulated_estimate[0] = _occupancy_from_usage(msg.usage)
+                _check_context_thresholds()
+
+        def _context_observer(reading: ContextUsageResponse) -> None:
+            """Adopt the watcher's SDK reading and re-check thresholds.
+
+            Invoked from ``invoke_iteration_with_client``'s watcher
+            coroutine once per poll. Storing the reading wins the
+            occupancy / capacity check against the
+            ``AssistantMessage.usage`` estimate (FR-1 preference), so
+            a tier first reached on the SDK path fires off the exact
+            reading rather than the accumulated estimate.
+            """
+            latest_sdk_reading[0] = reading
+            _check_context_thresholds()
 
         request = InvocationRequest(
             prompt=prompt,
@@ -2771,6 +2924,7 @@ async def _drive_iterations(
             attempt_number=attempt_number,
             iteration_number=iteration_number,
             on_message=_on_message,
+            context_observer=_context_observer,
         )
         # Hang watchdog gate (FR-3 / FR-5): when the threshold is unset or
         # non-positive the watchdog never starts and the call path is

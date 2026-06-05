@@ -1,0 +1,39 @@
+{
+  "id": "in-loop-verify-midturn-recovery",
+  "goal": "Drive a fixture through the real orchestrate loop with a scripted invoker and summarizer seam so the new mid-turn interrupt-to-recovery path is produced AND applied end-to-end by the real loop: occupancy crosses the ratio mid-iteration, the iteration is interrupted, Outcome.RECOVERED is recorded, the recovery attempt starts with `# Recovery handoff`, and a harness.context_recovery event with trigger=\"mid_turn\" is persisted.",
+  "prerequisites": ["midturn-interrupt-seam", "midturn-occupancy-observe", "midturn-recovery-act"],
+  "tags": ["in-loop-verification"],
+  "context": {
+    "relevant": [
+      "tests/test_worker.py::test_run_once_merges_completed_task",
+      "tests/test_context_recovery_in_loop.py",
+      "src/flywheel/orchestrator.py",
+      "src/flywheel/harness.py",
+      "src/flywheel/invoker_client.py",
+      "src/flywheel/store_sqlite.py",
+      "src/flywheel/recovery_summarizer.py"
+    ],
+    "references": [
+      ".workflow/specs/00019-FEATURE-intra-iteration-context-safety-net.md FR-8 (real loop drives the full mid-turn summarize-restart) and FR-4/FR-6 (both loop-produced ends + persisted trigger=\"mid_turn\" event)",
+      "tests/test_context_recovery_in_loop.py -- the spec 00018 boundary in-loop slot; model the mid-turn slot on it, but cross the ratio MID-iteration via streamed AssistantMessage.usage rather than at the boundary",
+      "tests/test_worker.py::test_run_once_merges_completed_task -- model for driving a full real-loop cycle with a scripted invoke against a real store"
+    ],
+    "constraints": [
+      "FR-4/FR-6: drive BOTH loop-produced ends -- the harness PRODUCING the mid-turn recovery (the iteration is interrupted, RECOVERED finalize, harness.context_recovery with trigger=\"mid_turn\") AND APPLYING it (the next attempt actually starts and its prompt carries `# Recovery handoff`). Stubbing either end fails the slot.",
+      "Cross the ratio MID-iteration: feed the injectable client/invoker seam a scripted client whose get_context_usage()/streamed AssistantMessage.usage rises past context_recovery_trigger_ratio before the iteration would naturally complete (set context_window_tokens on the real HarnessConfig), plus a scripted recovery_summarizer_invoke -- never call a paid/network agent.",
+      "Assert against the real persisted store: the harness.context_recovery event present with trigger=\"mid_turn\" and ordered before the recovery attempt's AttemptStarted, Outcome.RECOVERED on the interrupted attempt, and the summarizer's content in the second attempt's prompt.",
+      "Do not stub orchestrate, harness, or SqliteStore -- only the agent's streamed text/usage and the summarizer's returned text are scripted.",
+      "Never read, write, or migrate .workflow/flywheel.sqlite -- fixture/temp stores only.",
+      "Tag MUST include `in-loop-verification` verbatim -- archive_completed_phases keys off this exact tag to recognize the verify task.",
+      "Commit with a Conventional Commits message (test: ... or feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "FR-4's v(N-1) store-seeding + forward-migration clause does NOT apply: this feature adds no schema column/table (spec Decisions Log) -- do not seed or migrate a prior-version store.",
+      "Do not auto-generate the fixture or assertions; the human authoring the slot writes the test body.",
+      "Do not test the boundary recovery path (covered by tests/test_context_recovery_in_loop.py), compact/fork, or a recover control verb -- all out of scope."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_intra_iteration_context_in_loop.py", "name": "in-loop-verify" }
+  ]
+}

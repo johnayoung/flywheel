@@ -1,0 +1,48 @@
+{
+  "id": "midturn-recovery-act",
+  "goal": "When mid-turn occupancy crosses context_recovery_trigger_ratio with recovery budget remaining, the harness interrupts the in-flight iteration and routes into the spec 00018 summarize-restart -- finalizing the attempt Outcome.RECOVERED, emitting harness.context_recovery with trigger=\"mid_turn\", and scheduling a fresh `# Recovery handoff` attempt drawn from the shared max_context_recoveries budget.",
+  "prerequisites": ["midturn-occupancy-observe"],
+  "tags": ["context-safety-net", "harness", "act"],
+  "context": {
+    "relevant": [
+      "src/flywheel/harness.py",
+      "src/flywheel/invoker_client.py",
+      "tests/test_harness.py",
+      "tests/test_invoker_client.py",
+      ".workflow/specs/00019-FEATURE-intra-iteration-context-safety-net.md"
+    ],
+    "references": [
+      "src/flywheel/harness.py:2394 -- _handle_context_recovery is the spec 00018 summarize-restart orchestration (finalize RECOVERED, emit harness.context_recovery, schedule the handoff attempt); reuse it verbatim for the mid-turn path, adding only the trigger marker",
+      "src/flywheel/harness.py:2490 -- the existing harness.context_recovery payload; mid-turn recovery adds trigger=\"mid_turn\" to this same payload, ordered BEFORE the recovery attempt's AttemptStarted (FR-6)",
+      "src/flywheel/harness.py:522 -- _RecoveryTrigger / _RecoveryState carry the occupancy + transcript tail and the shared recoveries_used counter; the mid-turn path produces the same _RecoveryTrigger and decrements the same counter (FR-5)",
+      "src/flywheel/harness.py:2864 -- the boundary recovery trigger (spec 00018 FR-1); the mid-turn interrupt must preempt this so the SAME crossing does not also recover at the boundary (FR-7 no double-fire)",
+      "src/flywheel/harness.py:2569 -- the _HangDetected-vs-external-cancel split; the harness-recovery interrupt routes to recovery while an operator/external cancel still routes through _handle_interrupt (FR-7)"
+    ],
+    "constraints": [
+      "FR-4: act ONLY when the live client exposes interrupt; on the plain no-client query path mid-turn act degrades to observe-only (the 00018 boundary recovery still covers that path between iterations) -- do not error when interrupt is unavailable.",
+      "FR-5 shared budget: mid-turn and boundary recovery decrement the SAME _RecoveryState.recoveries_used / max_context_recoveries counter -- with max_context_recoveries=1 a run that recovers mid-turn cannot also recover at a later boundary, and vice versa.",
+      "FR-6: emit exactly one harness.context_recovery for the mid-turn recovery carrying the existing spec 00018 fields PLUS trigger=\"mid_turn\", ordered before the recovery attempt's AttemptStarted.",
+      "FR-7 precedence: once an iteration is interrupted for mid-turn recovery the boundary recovery check (harness.py:2864) must NOT also fire for that crossing; an external cancel / SIGTERM during an over-ratio iteration still routes to interrupted, not recovery.",
+      "Error Handling: a summarizer raise/timeout during mid-turn recovery aborts recovery for that crossing and routes through INTERNAL_ERROR (same class as a failed boundary recovery) -- never restart with an empty handoff. If the iteration completes before the interrupt lands, honor the completion and fall through to the boundary check (which sees the same budget); finalize exactly once.",
+      "ENUMERATE DEPENDENTS: adding trigger to the harness.context_recovery payload changes its shape -- update every assertion in tests/test_harness.py (and any other test) that pins the boundary harness.context_recovery payload so the boundary path carries a consistent trigger marker and the suite stays green in the same commit.",
+      "Reuse Outcome.RECOVERED -- add NO new Status/Outcome member; flywheel.lifecycle stays pure and untouched (spec NFR Purity).",
+      "Commit with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No compact/fork recovery action and no action selection -- summarize-restart only (spec Out of Scope).",
+      "No recover control verb / CONTROL_COMMAND_*; mid-turn recovery is automatic only.",
+      "No thrash/hang mid-turn coverage; no cross-process recovery-budget persistence.",
+      "Do not auto-generate or alter the recovery_summarizer or prompt.py `# Recovery handoff` renderer -- both are reused verbatim from spec 00018."
+    ],
+    "edge_cases": [
+      "Over-ratio on the first streamed message of the first iteration -> recover normally; first attempt finalizes RECOVERED, second attempt is the working attempt.",
+      "Crossing 90% observe and the act ratio on the same message -> emit the 90% harness.context_threshold_crossed event first, then act; the observe event precedes harness.context_recovery.",
+      "Budget already exhausted when the ratio crosses mid-turn -> no interrupt, no recovery; observe events still fire and the iteration runs to its natural end.",
+      "Mid-turn recovery consumes only max_context_recoveries; validation-retry consumes only max_retries -- budgets stay independent."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_harness.py", "name": "harness" },
+    { "type": "command", "run": "uv run pytest tests/test_invoker_client.py", "name": "invoker" }
+  ]
+}

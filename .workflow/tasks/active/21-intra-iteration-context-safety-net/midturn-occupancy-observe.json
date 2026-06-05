@@ -1,0 +1,41 @@
+{
+  "id": "midturn-occupancy-observe",
+  "goal": "During an iteration the harness tracks input-side occupancy from each streamed AssistantMessage.usage (preferring the SDK get_context_usage() reading when the live client exposes it), divides it by a hybrid SDK-maxTokens/operator-context_window_tokens capacity, and emits harness.context_threshold_crossed at the first mid-turn point occupancy reaches 50%, 75%, and 90% -- staying fully inert when no capacity is available.",
+  "prerequisites": ["midturn-interrupt-seam"],
+  "tags": ["context-safety-net", "harness", "observe"],
+  "context": {
+    "relevant": [
+      "src/flywheel/harness.py",
+      "tests/test_harness.py",
+      "src/flywheel/invoker_client.py",
+      ".workflow/specs/00019-FEATURE-intra-iteration-context-safety-net.md"
+    ],
+    "references": [
+      "src/flywheel/harness.py:2586 -- watchdog_on_message is the existing mid-iteration on_message tap; accumulate occupancy in this same wrapper, adding NO second subscription (spec NFR Performance)",
+      "src/flywheel/harness.py:504 -- _occupancy_from_usage defines the input-side total (input + cache_read + cache_creation); reuse it on each streamed AssistantMessage.usage rather than redefining the occupancy rule",
+      "src/flywheel/harness.py:2855 -- the spec 00018 boundary recovery block reads config.context_window_tokens as the operator capacity; the mid-turn capacity is the same operator knob OR the SDK get_context_usage().maxTokens when present (hybrid)"
+    ],
+    "constraints": [
+      "FR-2 off by default: when NEITHER the SDK reading NOR config.context_window_tokens yields a capacity, compute no ratio, emit no events, and leave control flow byte-identical to today -- the existing tests/test_harness.py suite MUST pass unchanged.",
+      "FR-3: harness.context_threshold_crossed fires at the first message that pushes occupancy at/above each of 50%, 75%, 90%, AT MOST ONCE per tier per iteration; reset the per-tier emitted state at each new iteration. A re-cross of an already-emitted tier in the same iteration produces no duplicate.",
+      "Each event payload carries iteration, tier, occupancy tokens, capacity, computed percentage, and the capacity source ('sdk' or 'operator').",
+      "Prefer the SDK get_context_usage().totalTokens over the accumulated AssistantMessage.usage estimate for the check when the live client surfaces it (via the midturn-interrupt-seam observer); the accumulated estimate is the always-available fallback.",
+      "Emit the new event as a kind-string 'harness.context_threshold_crossed' via _emit -- do NOT add a typed events.py dataclass (spec Decisions Log).",
+      "Commit with a Conventional Commits message (feat: ...) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "Do not interrupt the iteration or perform any recovery here -- observe only; the midturn-recovery-act task wires the interrupt-to-summarize-restart.",
+      "Do not add new HarnessConfig fields -- capacity reuses context_window_tokens and the SDK reading; the 50/75/90 tiers are fixed constants.",
+      "Do not touch thrash/hang mid-turn coverage -- out of scope, stays in _DEFERRED_LOOP_SUBSYSTEMS."
+    ],
+    "edge_cases": [
+      "Capacity from operator knob only (plain query path, no client) -> observe still works via AssistantMessage.usage accumulation; source is 'operator'.",
+      "SDK reading and accumulated estimate disagree -> SDK reading wins when present, estimate is only the fallback.",
+      "Messages carry no usage and no SDK reading -> occupancy stays 0, no events (same as the 00018 'no usage data' case).",
+      "Capacity present but occupancy never reaches 50% -> no events, identical to disabled."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/test_harness.py", "name": "tests" }
+  ]
+}

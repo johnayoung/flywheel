@@ -40,6 +40,7 @@ from typing import Any
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ContextUsageResponse,
     Message,
 )
 
@@ -84,6 +85,45 @@ EVENT_CONTROL_NOT_APPLICABLE: str = "harness.control_command_not_applicable"
 
 
 AuditEmit = Callable[[str, Mapping[str, Any]], None]
+
+# Observer callback invoked once per watcher poll with the live client's
+# :meth:`ClaudeSDKClient.get_context_usage` reading. The harness uses this
+# seam (spec 00019) to feed exact mid-turn context occupancy into the
+# safety-net policy without piling a second SDK subscription onto the
+# message stream. The watcher calls the observer only when the live client
+# exposes ``get_context_usage`` AND the call returns a reading; absence or
+# error is silently swallowed so the harness's accumulated
+# ``AssistantMessage.usage`` estimate remains the fallback.
+ContextUsageObserver = Callable[[ContextUsageResponse], None]
+
+
+class HarnessRecoveryRequested(Exception):
+    """Sentinel raised when a harness-initiated mid-turn recovery interrupts.
+
+    The harness signals ``recovery_interrupt_event`` to ask the watcher
+    to interrupt the live :class:`ClaudeSDKClient` session for a mid-turn
+    summarize-restart recovery (spec 00019). Once
+    :meth:`ClaudeSDKClient.interrupt` has been dispatched, the watcher
+    cancels the iteration task and
+    :func:`invoke_iteration_with_client` translates the resulting
+    :exc:`asyncio.CancelledError` into this sentinel so the harness can
+    route the attempt into the spec 00018 recovery path.
+
+    Distinct from:
+
+    - the operator ``interrupt`` control command, which propagates as a
+      raw :exc:`asyncio.CancelledError` via the ``interrupt_flag`` path
+      so the harness's ``_run_attempt`` boundary routes through
+      ``_handle_interrupt`` (the SIGINT/SIGTERM-shaped shutdown);
+    - an external SIGINT/SIGTERM cancellation of the outer task, which
+      also propagates as a raw :exc:`asyncio.CancelledError`.
+
+    Only a harness-initiated mid-turn recovery raises this exception, so
+    the harness can tell the three channels apart at the
+    ``_run_attempt`` boundary the same way :class:`_HangDetected`
+    separates a watchdog cancel from an outside cancel
+    (``harness.py:2569``).
+    """
 
 
 def _utcnow() -> datetime:
@@ -274,6 +314,26 @@ def _emit_safe(
         pass
 
 
+async def _read_context_usage(
+    client: ClaudeSDKClient,
+) -> ContextUsageResponse | None:
+    """Read :meth:`ClaudeSDKClient.get_context_usage` for the observer seam.
+
+    Returns ``None`` when the live client does not expose the method
+    (plain query path, older SDK) or when the call itself raises -- both
+    are treated as "no SDK reading this poll" and surface nothing, so
+    the harness falls back silently to the accumulated
+    ``AssistantMessage.usage`` estimate (spec 00019 Error Handling).
+    """
+    get_usage = getattr(client, "get_context_usage", None)
+    if get_usage is None:
+        return None
+    try:
+        return await get_usage()
+    except Exception:  # noqa: BLE001 - fall back silently on any SDK error.
+        return None
+
+
 async def invoke_iteration_with_client(
     *,
     prompt: str,
@@ -287,6 +347,8 @@ async def invoke_iteration_with_client(
     client_factory: Callable[
         [ClaudeAgentOptions], ClaudeSDKClient
     ] = ClaudeSDKClient,
+    context_observer: ContextUsageObserver | None = None,
+    recovery_interrupt_event: asyncio.Event | None = None,
 ) -> IterationResult:
     """Drive one iteration through :class:`ClaudeSDKClient` with a watcher.
 
@@ -312,19 +374,54 @@ async def invoke_iteration_with_client(
     the default :class:`ClaudeSDKClient` constructor. The factory is
     invoked with ``options`` and the returned instance must satisfy the
     ``ClaudeSDKClient`` async-context-manager protocol.
-    """
-    iteration_task = asyncio.current_task()
-    if iteration_task is None:
-        raise RuntimeError(
-            "invoke_iteration_with_client must run inside an asyncio task"
-        )
 
+    Spec 00019 mid-turn seam parameters (both off-by-default; existing
+    callers and tests are unaffected when omitted):
+
+    - ``context_observer``: when supplied, the watcher calls
+      :meth:`ClaudeSDKClient.get_context_usage` at most once per
+      ``poll_interval`` and hands the reading to the observer. When the
+      live client does not expose ``get_context_usage`` or the call
+      raises, the observer is silently skipped so the harness falls back
+      to its accumulated ``AssistantMessage.usage`` estimate.
+    - ``recovery_interrupt_event``: when supplied and set by the
+      harness, the watcher dispatches :meth:`ClaudeSDKClient.interrupt`
+      and cancels the in-flight iteration. The resulting
+      :exc:`asyncio.CancelledError` is translated to
+      :class:`HarnessRecoveryRequested` so the harness can tell a
+      mid-turn recovery cancel apart from the operator ``interrupt``
+      control command and from external SIGINT/SIGTERM. The interrupt
+      dispatch is best-effort: an exception from ``client.interrupt``
+      is swallowed and the recovery signal is still raised so the
+      harness still routes the attempt into recovery.
+    """
     interrupt_flag: list[bool] = [False]
+    recovery_requested: list[bool] = [False]
     stop = asyncio.Event()
 
     client = client_factory(options)
     async with client:
         await client.query(prompt)
+
+        # Wrap the iteration in a child task so the watcher's cancel
+        # operates on a distinct task from the one this function is
+        # running in. This mirrors :func:`_invoke_with_watchdog`
+        # (``harness.py:2575``) and gives clean race semantics: if the
+        # iteration completes before a watcher-triggered cancel lands,
+        # awaiting the now-done task returns the result; only when the
+        # await actually raises :exc:`asyncio.CancelledError` do we
+        # consult the recovery flag and translate to
+        # :class:`HarnessRecoveryRequested`.
+        async def _drive_invocation() -> IterationResult:
+            return await invoke_iteration(
+                prompt=prompt,
+                message_stream=client.receive_response(),
+                on_message=on_message,
+            )
+
+        iteration_task: asyncio.Task[IterationResult] = asyncio.create_task(
+            _drive_invocation()
+        )
 
         async def _watcher() -> None:
             """Poll the store every ``poll_interval`` and drain.
@@ -333,6 +430,13 @@ async def invoke_iteration_with_client(
             was already pending when the watcher started fires on the
             first tick. ``stop`` lets the wait short-circuit when the
             iteration finishes (or cancellation propagates here).
+
+            After draining, the watcher reads
+            :meth:`ClaudeSDKClient.get_context_usage` for the
+            ``context_observer`` seam and checks
+            ``recovery_interrupt_event`` for a harness-initiated
+            mid-turn recovery (spec 00019). Both are off when the
+            corresponding parameter was not supplied.
             """
             while not stop.is_set():
                 await _drain_pending(
@@ -354,6 +458,38 @@ async def invoke_iteration_with_client(
                     # task while it is unwinding.
                     iteration_task.cancel()
                     return
+                if context_observer is not None:
+                    reading = await _read_context_usage(client)
+                    if reading is not None:
+                        try:
+                            context_observer(reading)
+                        except Exception:  # noqa: BLE001
+                            # Observer is best-effort: a faulty observer
+                            # must never abort the run or mask the
+                            # iteration outcome, mirroring the
+                            # ``on_message`` persistence contract.
+                            pass
+                if (
+                    recovery_interrupt_event is not None
+                    and recovery_interrupt_event.is_set()
+                ):
+                    # Harness-initiated mid-turn recovery: dispatch the
+                    # SDK interrupt (best-effort) and cancel the
+                    # iteration task. The ``recovery_requested`` flag
+                    # is the sole channel by which the outer try/except
+                    # tells a recovery cancel apart from operator
+                    # interrupt and external cancel.
+                    try:
+                        await client.interrupt()
+                    except Exception:  # noqa: BLE001
+                        # Best-effort: a failed interrupt dispatch must
+                        # not block the recovery -- the harness still
+                        # owns the recovery decision. Swallow and let
+                        # the cancel below run regardless.
+                        pass
+                    recovery_requested[0] = True
+                    iteration_task.cancel()
+                    return
                 try:
                     await asyncio.wait_for(
                         stop.wait(), timeout=poll_interval
@@ -363,13 +499,33 @@ async def invoke_iteration_with_client(
 
         watcher_task = asyncio.create_task(_watcher())
         try:
-            return await invoke_iteration(
-                prompt=prompt,
-                message_stream=client.receive_response(),
-                on_message=on_message,
-            )
+            try:
+                return await iteration_task
+            except asyncio.CancelledError:
+                if recovery_requested[0]:
+                    # Translate the watcher-induced cancel into the
+                    # distinguishable harness-recovery signal. Operator
+                    # interrupt (``interrupt_flag``) and external cancel
+                    # both leave ``recovery_requested`` False, so they
+                    # continue to propagate as raw CancelledError --
+                    # mirrors ``_HangDetected`` vs external cancel at
+                    # ``harness.py:2569``.
+                    raise HarnessRecoveryRequested() from None
+                raise
         finally:
             stop.set()
+            # Drain the iteration task if it is still running (e.g.,
+            # the outer task was cancelled from outside): cancel and
+            # await to a terminal state so no orphan keeps the SDK
+            # connection alive past ``async with client`` cleanup. A
+            # done task awaits to its already-produced result/exception
+            # without blocking.
+            if not iteration_task.done():
+                iteration_task.cancel()
+            try:
+                await iteration_task
+            except BaseException:  # noqa: BLE001 - already finalized.
+                pass
             # The watcher is best-effort: a CancelledError or exception
             # here must not mask the original outcome. asyncio.shield is
             # not needed because watcher_task does not own any state the
@@ -393,10 +549,12 @@ __all__ = [
     "CONTROL_COMMAND_REJECT",
     "CONTROL_COMMAND_SAY",
     "CONTROL_COMMAND_SET_MODEL",
+    "ContextUsageObserver",
     "DEFAULT_CONTROL_POLL_INTERVAL",
     "EVENT_CONTROL_APPLIED",
     "EVENT_CONTROL_CLAIM_FAILED",
     "EVENT_CONTROL_FAILED",
     "EVENT_CONTROL_NOT_APPLICABLE",
+    "HarnessRecoveryRequested",
     "invoke_iteration_with_client",
 ]

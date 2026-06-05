@@ -38,6 +38,7 @@ from flywheel.invoker_client import (
     EVENT_CONTROL_CLAIM_FAILED,
     EVENT_CONTROL_FAILED,
     EVENT_CONTROL_NOT_APPLICABLE,
+    HarnessRecoveryRequested,
     invoke_iteration_with_client,
 )
 from flywheel.store_memory import InMemoryStore
@@ -910,3 +911,426 @@ class TestRejectVerbInLiveWatcher:
         ] == []
         # No SDK calls regardless.
         assert client.injected == []
+
+
+# ---------------------------------------------------------------------------
+# Spec 00019 mid-turn seam: context observer + harness recovery interrupt.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClientWithContextUsage(_FakeClient):
+    """Variant that exposes :meth:`get_context_usage` for the observer seam.
+
+    The default ``_FakeClient`` deliberately omits ``get_context_usage`` so
+    the existing tests exercise the "client lacks the method" fallback
+    path; the spec 00019 seam tests use this subclass to feed scripted
+    readings to the watcher.
+    """
+
+    def __init__(
+        self,
+        messages: list[Message],
+        *,
+        hold_until_event: asyncio.Event | None = None,
+        interrupt_should_raise: BaseException | None = None,
+        set_model_should_raise: BaseException | None = None,
+        say_should_raise: BaseException | None = None,
+        usage_readings: list[dict[str, Any]] | None = None,
+        usage_should_raise: BaseException | None = None,
+    ) -> None:
+        super().__init__(
+            messages,
+            hold_until_event=hold_until_event,
+            interrupt_should_raise=interrupt_should_raise,
+            set_model_should_raise=set_model_should_raise,
+            say_should_raise=say_should_raise,
+        )
+        # When ``usage_readings`` is exhausted the fake keeps returning
+        # the last reading so a poll loop that ticks more often than the
+        # test scripted still gets a deterministic value.
+        self._usage_queue: list[dict[str, Any]] = list(usage_readings or [])
+        self._usage_default: dict[str, Any] = {
+            "categories": [],
+            "totalTokens": 0,
+            "maxTokens": 200_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 0.0,
+        }
+        self._usage_raises = usage_should_raise
+        self.usage_calls = 0
+
+    async def get_context_usage(self) -> dict[str, Any]:
+        self.usage_calls += 1
+        if self._usage_raises is not None:
+            raise self._usage_raises
+        if self._usage_queue:
+            return self._usage_queue.pop(0)
+        return dict(self._usage_default)
+
+
+class TestContextObserverSeam:
+    """``context_observer`` receives ``get_context_usage`` readings each poll.
+
+    The seam is off when ``context_observer`` is omitted (default
+    ``None``); the existing test class TestBasicDispatch already covers
+    that case end-to-end. These tests assert the seam behavior when the
+    harness opts in.
+    """
+
+    def test_observer_receives_readings_for_each_poll(self) -> None:
+        """At least one reading reaches the observer mid-iteration."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        reading_a = {
+            "categories": [],
+            "totalTokens": 50_000,
+            "maxTokens": 200_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 25.0,
+        }
+        reading_b = {
+            "categories": [],
+            "totalTokens": 100_000,
+            "maxTokens": 200_000,
+            "rawMaxTokens": 200_000,
+            "percentage": 50.0,
+        }
+        client = _FakeClientWithContextUsage(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+            usage_readings=[reading_a, reading_b],
+        )
+        store = InMemoryStore()
+        observed: list[dict[str, Any]] = []
+
+        def _observe(reading: Any) -> None:
+            observed.append(dict(reading))
+
+        async def _run() -> None:
+            async def _release() -> None:
+                # Hold the stream long enough for several watcher ticks.
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    context_observer=_observe,
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        # At least one reading reached the observer; the first reading
+        # must be the first scripted reading (queue is FIFO).
+        assert len(observed) >= 1
+        assert client.usage_calls >= 1
+        assert observed[0] == reading_a
+
+    def test_observer_not_called_when_client_lacks_get_context_usage(
+        self,
+    ) -> None:
+        """An older client without ``get_context_usage`` skips the seam."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        # _FakeClient (parent) has no get_context_usage method.
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        observed: list[Any] = []
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    context_observer=observed.append,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        # Observer was never called because the client lacks the method.
+        assert observed == []
+        # Sanity check that the parent fake really has no method bound.
+        assert not hasattr(client, "get_context_usage")
+
+    def test_get_context_usage_error_is_swallowed_silently(self) -> None:
+        """A raise from the SDK call surfaces nothing to the observer."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClientWithContextUsage(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+            usage_should_raise=RuntimeError("transport blip"),
+        )
+        store = InMemoryStore()
+        observed: list[Any] = []
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    context_observer=observed.append,
+                )
+                # The iteration still completes normally; the failed
+                # reading was swallowed.
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        # The fake was called (at least once), but the observer never saw
+        # a reading because every call raised.
+        assert client.usage_calls >= 1
+        assert observed == []
+
+    def test_observer_exception_does_not_abort_iteration(self) -> None:
+        """A faulty observer must never break the run."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClientWithContextUsage(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+
+        def _bad_observer(_reading: Any) -> None:
+            raise RuntimeError("observer crashed")
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    context_observer=_bad_observer,
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+
+
+class TestHarnessRecoveryInterrupt:
+    """``recovery_interrupt_event`` is a distinct cancellation channel.
+
+    The harness sets the event to ask the watcher to interrupt the
+    in-flight iteration for a mid-turn summarize-restart recovery
+    (spec 00019 FR-4). The watcher dispatches
+    :meth:`ClaudeSDKClient.interrupt` and translates the resulting
+    cancel into :class:`HarnessRecoveryRequested` so the
+    ``_run_attempt`` boundary can route the attempt into the spec 00018
+    recovery path rather than ``_handle_interrupt`` (operator-interrupt)
+    or the external-cancel path.
+    """
+
+    def test_event_set_raises_harness_recovery_requested(self) -> None:
+        """The event triggers ``client.interrupt`` and a distinct signal."""
+        gate = asyncio.Event()  # never set: stream blocks indefinitely
+        client = _FakeClient(
+            messages=[_assistant_text("never-emitted"), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        recovery_event = asyncio.Event()
+
+        async def _run() -> None:
+            async def _request_recovery() -> None:
+                # Let the watcher complete its first drain, then ask
+                # for recovery -- mirrors the harness flipping the
+                # event from its on_message tap after occupancy crosses
+                # the recovery ratio.
+                await asyncio.sleep(0.02)
+                recovery_event.set()
+
+            requester = asyncio.create_task(_request_recovery())
+            try:
+                with pytest.raises(HarnessRecoveryRequested):
+                    await invoke_iteration_with_client(
+                        prompt="go",
+                        options=ClaudeAgentOptions(),
+                        control_store=store,
+                        run_id="run-1",
+                        client_factory=_factory(client),
+                        poll_interval=0.005,
+                        recovery_interrupt_event=recovery_event,
+                    )
+            finally:
+                await requester
+
+        asyncio.run(_run())
+        # The SDK interrupt was dispatched exactly once before the cancel.
+        assert client.interrupt_calls == 1
+
+    def test_signal_is_distinct_from_operator_interrupt(self) -> None:
+        """Operator-interrupt still raises raw CancelledError, not the new signal."""
+        gate = asyncio.Event()  # never set
+        client = _FakeClient(
+            messages=[_assistant_text("never-emitted"), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        # An operator-interrupt control command flips the operator
+        # channel; the recovery event is supplied but never set.
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_INTERRUPT,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        recovery_event = asyncio.Event()
+
+        async def _run() -> None:
+            # Operator-interrupt must NOT raise HarnessRecoveryRequested.
+            with pytest.raises(asyncio.CancelledError):
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    recovery_interrupt_event=recovery_event,
+                )
+
+        asyncio.run(_run())
+        assert client.interrupt_calls == 1
+        # Recovery channel was never asserted.
+        assert not recovery_event.is_set()
+
+    def test_signal_is_distinct_from_external_cancel(self) -> None:
+        """An external cancel of the outer task still surfaces CancelledError."""
+        gate = asyncio.Event()  # never set
+        client = _FakeClient(
+            messages=[_assistant_text("never-emitted"), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        recovery_event = asyncio.Event()  # never set
+
+        async def _run() -> None:
+            async def _invoke() -> Any:
+                return await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.005,
+                    recovery_interrupt_event=recovery_event,
+                )
+
+            outer = asyncio.create_task(_invoke())
+            # Give the watcher a couple of ticks to wire up, then cancel
+            # from outside -- mirroring SIGINT/SIGTERM.
+            await asyncio.sleep(0.02)
+            outer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await outer
+
+        asyncio.run(_run())
+        # External cancel never went through the SDK interrupt path.
+        assert client.interrupt_calls == 0
+
+    def test_interrupt_dispatch_failure_still_raises_recovery_signal(
+        self,
+    ) -> None:
+        """A faulty ``client.interrupt`` must not block the recovery signal."""
+        gate = asyncio.Event()  # never set
+        client = _FakeClient(
+            messages=[_assistant_text("never-emitted"), _result()],
+            hold_until_event=gate,
+            interrupt_should_raise=RuntimeError("interrupt blew up"),
+        )
+        store = InMemoryStore()
+        recovery_event = asyncio.Event()
+
+        async def _run() -> None:
+            async def _request_recovery() -> None:
+                await asyncio.sleep(0.02)
+                recovery_event.set()
+
+            requester = asyncio.create_task(_request_recovery())
+            try:
+                with pytest.raises(HarnessRecoveryRequested):
+                    await invoke_iteration_with_client(
+                        prompt="go",
+                        options=ClaudeAgentOptions(),
+                        control_store=store,
+                        run_id="run-1",
+                        client_factory=_factory(client),
+                        poll_interval=0.005,
+                        recovery_interrupt_event=recovery_event,
+                    )
+            finally:
+                await requester
+
+        asyncio.run(_run())
+        # The interrupt was attempted exactly once even though it raised.
+        assert client.interrupt_calls == 1
+
+    def test_normal_completion_wins_race_against_recovery_event(self) -> None:
+        """If the iteration finishes naturally, no recovery signal fires."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        # No hold gate -- the stream completes immediately.
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+        )
+        store = InMemoryStore()
+        recovery_event = asyncio.Event()  # never set during the iteration
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.005,
+                recovery_interrupt_event=recovery_event,
+            )
+            # Normal IterationResult: the await never raised.
+            assert isinstance(result.envelope, ValidEnvelope)
+            # The watcher never asked for a recovery -- the event stays clear.
+            assert not recovery_event.is_set()
+            assert client.interrupt_calls == 0
+
+        asyncio.run(_run())

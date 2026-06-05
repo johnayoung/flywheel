@@ -5133,6 +5133,10 @@ class TestContextRecovery:
         assert payload["recoveries_used"] == 1
         assert payload["recoveries_remaining"] == 0
         assert payload["attempt_number"] == 1
+        # Spec 00019 FR-6: the trigger field attributes the recovery
+        # to its producing path -- a boundary crossing here, mid_turn
+        # in the spec 00019 mid-turn-recovery tests below.
+        assert payload["trigger"] == "boundary"
         # Digest carries per-field lengths so audit consumers can
         # confirm the handoff was structurally non-empty.
         digest = payload["summary_digest"]
@@ -5321,6 +5325,10 @@ class TestContextRecovery:
         assert len(recoveries) == 1
         assert recoveries[0].payload["recoveries_used"] == 1
         assert recoveries[0].payload["recoveries_remaining"] == 0
+        # Spec 00019 FR-6: the single recovery is attributed to the
+        # boundary path -- mid-turn act is not wired in the scripted
+        # invoker (it runs to natural completion on every iteration).
+        assert recoveries[0].payload["trigger"] == "boundary"
         # Summarizer was called exactly once.
         assert len(summarizer.calls) == 1  # type: ignore[attr-defined]
 
@@ -5895,3 +5903,526 @@ class TestMidTurnContextObserve:
         assert crossings[0].payload["capacity_source"] == "sdk"
         assert crossings[0].payload["capacity_tokens"] == 100
         assert crossings[0].payload["occupancy_tokens"] == 60
+
+
+# --- Mid-turn context-recovery act (spec 00019) --------------------------
+
+
+from flywheel.invoker_client import HarnessRecoveryRequested
+
+
+def _scripted_invoker_midturn_act(
+    pre_messages: tuple[Message, ...],
+    iteration_after_resume: IterationResult,
+) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
+    """Build an invoker that honors ``recovery_interrupt_event`` mid-stream.
+
+    On the first call, the invoker pumps ``pre_messages`` through
+    ``request.on_message`` (one message at a time) and, after each
+    delivery, checks whether the harness has set
+    ``request.recovery_interrupt_event``. The first set event causes
+    the invoker to raise :class:`HarnessRecoveryRequested` -- mirrors
+    the production :func:`invoke_iteration_with_client` translating a
+    watcher-induced cancel into the distinguishable mid-turn signal.
+
+    On subsequent calls (the recovery attempt), the invoker returns
+    ``iteration_after_resume`` after pumping its messages through
+    ``on_message`` for parity with :func:`_scripted_invoker`.
+    """
+    calls: list[InvocationRequest] = []
+
+    async def _invoker(request: InvocationRequest) -> IterationResult:
+        calls.append(request)
+        if len(calls) == 1:
+            if request.on_message is not None:
+                for msg in pre_messages:
+                    try:
+                        request.on_message(msg)
+                    except Exception:  # noqa: BLE001 - mirror invoker swallow.
+                        pass
+                    if (
+                        request.recovery_interrupt_event is not None
+                        and request.recovery_interrupt_event.is_set()
+                    ):
+                        raise HarnessRecoveryRequested()
+            # No event set after all messages: fall through (the test
+            # is exercising the natural-completion race). Return a
+            # plain result so the boundary check can still fire.
+            return iteration_after_resume
+        if request.on_message is not None:
+            for msg in iteration_after_resume.messages:
+                try:
+                    request.on_message(msg)
+                except Exception:  # noqa: BLE001 - mirror invoker swallow.
+                    pass
+        return iteration_after_resume
+
+    _invoker.calls = calls  # type: ignore[attr-defined]
+    return _invoker
+
+
+class TestMidTurnContextRecoveryAct:
+    """Spec 00019 FR-4 / FR-5 / FR-6 / FR-7: mid-turn act -> summarize-restart."""
+
+    def test_over_ratio_midturn_triggers_recovery_with_trigger_marker(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-4 / FR-6 happy path: an over-ratio mid-iteration crossing
+        interrupts the iteration, finalizes the attempt RECOVERED, emits
+        ``harness.context_recovery`` with ``trigger="mid_turn"`` ordered
+        BEFORE the recovery attempt's ``AttemptStarted``, and the recovery
+        attempt's prompt carries the ``# Recovery handoff`` section."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-happy")
+        handoff = RecoveryHandoff(
+            work_done="probed handler X mid-turn",
+            work_remaining="finish handler Y",
+            key_decisions="approach Z",
+            suggested_next_step="patch handler.py",
+        )
+        # First call pumps two messages: the first at 40% (no cross),
+        # the second at 95% (crosses 50/75/90 observe tiers AND the
+        # 0.9 act ratio). The act crossing sets the recovery event;
+        # the invoker raises HarnessRecoveryRequested on its next
+        # tick. The recovery attempt then completes normally.
+        invoke = _scripted_invoker_midturn_act(
+            pre_messages=(
+                _assistant(
+                    text="early-work ",
+                    usage=_usage_dict(input_tokens=40),
+                ),
+                _assistant(
+                    text="late-work-before-interrupt",
+                    usage=_usage_dict(input_tokens=95),
+                ),
+            ),
+            iteration_after_resume=_iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+                messages=(_assistant(), _result_msg(num_turns=1)),
+                transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                signals=_make_signals(num_turns=1),
+            ),
+        )
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Attempt #1 finalized RECOVERED (mid-turn), attempt #2 is the
+        # recovery attempt that succeeded.
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.RECOVERED
+        assert outcome.attempts[1].outcome == Outcome.SUCCEEDED
+        # Recovery does NOT consume max_retries (shared budget is its own).
+        assert outcome.lifecycle.retries == 0
+        # Exactly one harness.context_recovery event, mid_turn trigger.
+        events = store.list_events(lifecycle.run_id)
+        recoveries = [
+            e for e in events if e.kind == "harness.context_recovery"
+        ]
+        assert len(recoveries) == 1
+        payload = recoveries[0].payload
+        assert payload["trigger"] == "mid_turn"
+        assert payload["occupancy_tokens"] == 95
+        assert payload["context_window_tokens"] == 100
+        assert payload["context_recovery_trigger_ratio"] == 0.9
+        assert payload["recoveries_used"] == 1
+        assert payload["recoveries_remaining"] == 0
+        assert payload["attempt_number"] == 1
+        assert payload["iteration"] == 1
+        digest = payload["summary_digest"]
+        assert digest["work_done_length"] == len(handoff.work_done)
+        # FR-6 ordering: the harness.context_recovery event precedes
+        # the recovery attempt's AttemptStarted in the per-run audit
+        # sequence.
+        recovery_seq = recoveries[0].sequence
+        started_seqs = [
+            e.sequence
+            for e in events
+            if e.kind == "harness.attempt_started"
+            and e.payload.get("number") == 2
+        ]
+        assert started_seqs
+        assert recovery_seq is not None
+        first_started_seq = started_seqs[0]
+        assert first_started_seq is not None
+        assert recovery_seq < first_started_seq
+        # FR-7 no double-fire: no boundary recovery event on the
+        # same attempt (the mid-turn act preempts it).
+        assert len(recoveries) == 1
+        # FR-4: the recovery attempt's prompt carries the # Recovery
+        # handoff section, threaded from the summarizer's structured
+        # output.
+        recovery_prompt = invoke.calls[1].prompt  # type: ignore[attr-defined]
+        assert "# Recovery handoff" in recovery_prompt
+        assert handoff.work_done in recovery_prompt
+        assert handoff.suggested_next_step in recovery_prompt
+        # First-attempt prompt has no recovery section.
+        first_prompt = invoke.calls[0].prompt  # type: ignore[attr-defined]
+        assert "# Recovery handoff" not in first_prompt
+        # Summarizer seam was used once.
+        assert len(summarizer.calls) == 1  # type: ignore[attr-defined]
+
+    def test_observe_event_ordered_before_recovery_event(
+        self, tmp_path: Path
+    ) -> None:
+        """Spec edge case: when the same message crosses 90% observe and
+        the act ratio together, the 90% threshold_crossed event is
+        ordered BEFORE the harness.context_recovery event in the
+        per-run audit sequence (the observe event is emitted in the
+        same _check_context_thresholds call that arms the act)."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-ordering")
+        handoff = RecoveryHandoff(
+            work_done="x",
+            work_remaining="y",
+            key_decisions="z",
+            suggested_next_step="next",
+        )
+        # The single mid-turn message is at 95% -- it crosses 50, 75,
+        # AND 90 observe tiers AND the 0.9 act ratio simultaneously.
+        invoke = _scripted_invoker_midturn_act(
+            pre_messages=(
+                _assistant(
+                    text="big-jump",
+                    usage=_usage_dict(input_tokens=95),
+                ),
+            ),
+            iteration_after_resume=_iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+                messages=(_assistant(), _result_msg(num_turns=1)),
+                transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                signals=_make_signals(num_turns=1),
+            ),
+        )
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+
+        events = store.list_events(lifecycle.run_id)
+        observe_90 = next(
+            e
+            for e in events
+            if e.kind == "harness.context_threshold_crossed"
+            and e.payload.get("tier") == 0.9
+        )
+        recovery = next(
+            e for e in events if e.kind == "harness.context_recovery"
+        )
+        assert observe_90.sequence is not None
+        assert recovery.sequence is not None
+        assert observe_90.sequence < recovery.sequence
+
+    def test_budget_exhausted_skips_midturn_act(
+        self, tmp_path: Path
+    ) -> None:
+        """Spec edge case: when budget is already exhausted, no
+        interrupt arms; observe events still fire and the iteration
+        runs to its natural end. The invoker returns an
+        ``iteration_after_resume`` result on its first call because
+        the recovery event is never set."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-exhausted")
+        # max_context_recoveries=0 means the budget check
+        # (recoveries_used < max_context_recoveries) fails on the first
+        # crossing -> no event is set -> the invoker completes naturally.
+        invoke = _scripted_invoker_midturn_act(
+            pre_messages=(
+                _assistant(
+                    text="late-work",
+                    usage=_usage_dict(input_tokens=95),
+                ),
+            ),
+            iteration_after_resume=_iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+                messages=(_assistant(), _result_msg(num_turns=1)),
+                transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                signals=_make_signals(num_turns=1),
+            ),
+        )
+        summarizer = _scripted_summarizer(
+            RecoveryHandoff(
+                work_done="", work_remaining="",
+                key_decisions="", suggested_next_step="",
+            )
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=0,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # No recovery, no summarizer invocation, attempt reaches DONE
+        # via the natural-completion path.
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 1
+        assert outcome.attempts[0].outcome == Outcome.SUCCEEDED
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        # Observe events still fire -- act is gated, observe is not.
+        crossings = [
+            e
+            for e in events
+            if e.kind == "harness.context_threshold_crossed"
+        ]
+        assert {c.payload["tier"] for c in crossings} == {0.5, 0.75, 0.9}
+        # Summarizer never ran.
+        assert summarizer.calls == []  # type: ignore[attr-defined]
+
+    def test_shared_budget_blocks_followup_boundary_recovery(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-5: mid-turn and boundary recovery share
+        ``max_context_recoveries``. With the budget set to 1, a run
+        that recovers mid-turn cannot also recover at a later
+        boundary, even if the second attempt would itself be
+        over-ratio."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-midturn-shared-budget"
+        )
+        handoff = RecoveryHandoff(
+            work_done="midturn-done",
+            work_remaining="r",
+            key_decisions="d",
+            suggested_next_step="n",
+        )
+
+        # First call: mid-turn over-ratio (95) interrupts via the
+        # recovery event. Second call: returns an over-ratio CONTINUE
+        # iteration that WOULD trigger boundary recovery if budget
+        # remained -- it must not (budget consumed by the mid-turn
+        # recovery), so the run terminates AGENT_ERROR via the
+        # cap-reached path on the recovery attempt.
+        calls: list[InvocationRequest] = []
+
+        async def _invoker(request: InvocationRequest) -> IterationResult:
+            calls.append(request)
+            if len(calls) == 1:
+                if request.on_message is not None:
+                    msg = _assistant(
+                        text="late-work",
+                        usage=_usage_dict(input_tokens=95),
+                    )
+                    request.on_message(msg)
+                    if (
+                        request.recovery_interrupt_event is not None
+                        and request.recovery_interrupt_event.is_set()
+                    ):
+                        raise HarnessRecoveryRequested()
+                return _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(),
+                    transcript="unused",
+                )
+            # Second call: produce an over-ratio CONTINUE iteration.
+            second = _iteration(
+                envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                messages=(
+                    _assistant(usage=_usage_dict(input_tokens=95)),
+                    _result_msg(num_turns=1, usage=_usage_dict(95)),
+                ),
+                transcript="over-ratio-second",
+                signals=_make_signals(num_turns=1),
+            )
+            if request.on_message is not None:
+                for m in second.messages:
+                    request.on_message(m)
+            return second
+
+        _invoker.calls = calls  # type: ignore[attr-defined]
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=_invoker)
+        )
+
+        # Mid-turn recovery used the budget; boundary recovery is
+        # blocked. Attempt 2 hits the cap-with-continue path and
+        # finalizes AGENT_ERROR; the run terminates FAILED.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.RECOVERED
+        assert outcome.attempts[1].outcome == Outcome.AGENT_ERROR
+        events = store.list_events(lifecycle.run_id)
+        recoveries = [
+            e for e in events if e.kind == "harness.context_recovery"
+        ]
+        # Exactly one recovery event across BOTH paths.
+        assert len(recoveries) == 1
+        assert recoveries[0].payload["trigger"] == "mid_turn"
+        # Summarizer was called exactly once.
+        assert len(summarizer.calls) == 1  # type: ignore[attr-defined]
+
+    def test_midturn_summarizer_failure_routes_to_internal_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Error Handling: a summarizer raise during mid-turn recovery
+        aborts the recovery for this crossing and routes through
+        INTERNAL_ERROR. Same routing as a failed boundary recovery --
+        we never restart with an empty handoff."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-midturn-summ-fail"
+        )
+        invoke = _scripted_invoker_midturn_act(
+            pre_messages=(
+                _assistant(
+                    text="late-work",
+                    usage=_usage_dict(input_tokens=95),
+                ),
+            ),
+            iteration_after_resume=_iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY, reason="done"),
+                messages=(_assistant(), _result_msg(num_turns=1)),
+                transcript=_wrap('{"intent": "verify", "reason": "done"}'),
+                signals=_make_signals(num_turns=1),
+            ),
+        )
+        summarizer = _scripted_summarizer(
+            RuntimeError("midturn summarizer crashed")
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # No recovery event; attempt finalized INTERNAL_ERROR.
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 1
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        events = store.list_events(lifecycle.run_id)
+        assert all(e.kind != "harness.context_recovery" for e in events)
+        crashes = [
+            e
+            for e in events
+            if e.kind == "harness.crash"
+            and e.payload.get("classification")
+            == "recovery_summarizer_error"
+        ]
+        assert len(crashes) == 1
+        # The crash event records which trigger produced the failed
+        # recovery so an operator can attribute it to the mid-turn
+        # path rather than the boundary path.
+        assert crashes[0].payload.get("trigger") == "mid_turn"
+
+    def test_plain_path_invoker_degrades_to_observe_only(
+        self, tmp_path: Path
+    ) -> None:
+        """FR-4 plain-path degradation: when the invoker does NOT honor
+        ``recovery_interrupt_event`` (the plain ``query`` path, scripted
+        test invokers), mid-turn act simply does not fire. Observe
+        events still emit, the iteration completes naturally, and the
+        boundary recovery check covers the over-ratio tail."""
+        store = InMemoryStore()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(
+            task_id="t1", run_id="run-midturn-plain-degrade"
+        )
+        handoff = RecoveryHandoff(
+            work_done="boundary-done",
+            work_remaining="",
+            key_decisions="",
+            suggested_next_step="next",
+        )
+        # _scripted_invoker is the plain test invoker -- it pumps
+        # messages but never polls request.recovery_interrupt_event,
+        # so a set event is a no-op and the iteration completes
+        # normally. The boundary check then sees the over-ratio
+        # CONTINUE and recovers.
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(usage=_usage_dict(input_tokens=95)),
+                        _result_msg(num_turns=1, usage=_usage_dict(95)),
+                    ),
+                    transcript="over-ratio-plain",
+                    signals=_make_signals(num_turns=1),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(
+                        intent=Intent.VERIFY, reason="done"
+                    ),
+                    messages=(_assistant(), _result_msg(num_turns=1)),
+                    transcript=_wrap(
+                        '{"intent": "verify", "reason": "done"}'
+                    ),
+                    signals=_make_signals(num_turns=1),
+                ),
+            ]
+        )
+        summarizer = _scripted_summarizer(handoff)
+        config = HarnessConfig(
+            max_retries=0,
+            context_window_tokens=100,
+            context_recovery_trigger_ratio=0.9,
+            max_context_recoveries=1,
+            recovery_summarizer_invoke=summarizer,
+            worktree=tmp_path,
+        )
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        # Boundary recovery covered the over-ratio tail -- the run
+        # reaches DONE via attempt 2.
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 2
+        assert outcome.attempts[0].outcome == Outcome.RECOVERED
+        assert outcome.attempts[1].outcome == Outcome.SUCCEEDED
+        events = store.list_events(lifecycle.run_id)
+        recoveries = [
+            e for e in events if e.kind == "harness.context_recovery"
+        ]
+        # Exactly one boundary recovery, no mid-turn one.
+        assert len(recoveries) == 1
+        assert recoveries[0].payload["trigger"] == "boundary"

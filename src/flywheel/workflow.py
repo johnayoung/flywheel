@@ -827,6 +827,7 @@ def _make_claude_code_invoke(
             audit_emit=emit,
             on_message=composed,
             context_observer=request.context_observer,
+            recovery_interrupt_event=request.recovery_interrupt_event,
         )
 
     return _invoke

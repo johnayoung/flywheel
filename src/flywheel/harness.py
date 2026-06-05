@@ -69,6 +69,7 @@ from claude_agent_sdk import (
     ContextUsageResponse,
     Message,
     ResultMessage,
+    TextBlock,
 )
 
 from flywheel.envelope import (
@@ -88,6 +89,7 @@ from flywheel.grader_command import run_command_graders
 from flywheel.invoker_client import (
     CONTROL_COMMAND_APPROVE,
     CONTROL_COMMAND_REJECT,
+    HarnessRecoveryRequested,
 )
 from flywheel.grader_rubric import (
     JudgeInvoke,
@@ -271,6 +273,21 @@ class InvocationRequest:
     harness's accumulated :attr:`AssistantMessage.usage` estimate is the
     always-available fallback. The observer is expected to swallow its
     own exceptions, mirroring the ``on_message`` contract.
+
+    ``recovery_interrupt_event`` is the harness's mid-turn act seam
+    (spec 00019 FR-4). When supplied, the harness sets the event from
+    its threshold-checking closure the instant input-side occupancy
+    crosses ``context_recovery_trigger_ratio`` with recovery budget
+    remaining; an invoker backed by a live
+    :class:`claude_agent_sdk.ClaudeSDKClient` polls the event in its
+    watcher loop, dispatches :meth:`ClaudeSDKClient.interrupt`, cancels
+    the iteration, and translates the resulting cancel into
+    :class:`flywheel.invoker_client.HarnessRecoveryRequested` so the
+    harness can route the attempt into the summarize-restart action.
+    Invokers without a live client (the plain ``query`` path, scripted
+    test invokers) leave the event un-polled; mid-turn act on those
+    paths degrades to observe-only (FR-4 plain-path degradation), and
+    the spec 00018 boundary recovery still covers the iteration's tail.
     """
 
     prompt: str
@@ -279,6 +296,7 @@ class InvocationRequest:
     iteration_number: int
     on_message: Callable[[Message], None] | None = None
     context_observer: Callable[[ContextUsageResponse], None] | None = None
+    recovery_interrupt_event: asyncio.Event | None = None
 
 
 InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]
@@ -555,19 +573,32 @@ def _occupancy_from_usage(usage_payload: Mapping[str, Any]) -> int:
     return total
 
 
+# Recovery trigger markers surfaced in the ``harness.context_recovery``
+# audit payload (spec 00019 FR-6). ``boundary`` is the spec 00018
+# iteration-tail crossing; ``mid_turn`` is the spec 00019 in-flight
+# crossing that interrupts the iteration via
+# :class:`flywheel.invoker_client.HarnessRecoveryRequested`. Operators
+# read this field to attribute a recovery to the path that produced it.
+_RECOVERY_TRIGGER_BOUNDARY: str = "boundary"
+_RECOVERY_TRIGGER_MID_TURN: str = "mid_turn"
+
+
 @dataclass(frozen=True, kw_only=True)
 class _RecoveryTrigger:
     """Sentinel raised by :func:`_drive_iterations` when an iteration
     crosses the context-recovery threshold.
 
-    Carries the occupancy and the transcript text the summarizer needs
-    so the caller (:func:`_run_attempt_body`) can route the attempt
-    through the summarize-restart action without re-deriving them. Pure
-    data; only flywheel.harness builds and consumes it.
+    Carries the occupancy, the transcript text the summarizer needs, the
+    iteration number for the audit payload, and the ``trigger`` marker
+    distinguishing the boundary crossing (spec 00018) from the in-flight
+    mid-turn crossing (spec 00019). Pure data; only flywheel.harness
+    builds and consumes it.
     """
 
     occupancy_tokens: int
     transcript_tail: str
+    iteration_number: int
+    trigger: str
 
 
 @dataclass
@@ -1897,6 +1928,30 @@ async def _run_attempt_body(
         recovery_state=recovery_state,
     )
 
+    # Mid-turn recovery (spec 00019 FR-4): _drive_iterations interrupts
+    # the in-flight iteration via the recovery_interrupt_event seam,
+    # catches HarnessRecoveryRequested, and returns a recovery_trigger
+    # with no iteration_result attached. Route to the summarize-restart
+    # action before the iteration_result-None check below, which is the
+    # cap<=0 no-iterations-ran path. The mid-turn path uses the
+    # transcript_tail accumulated from streamed AssistantMessage text
+    # blocks as both the summarizer input and the attempt's
+    # ``agent_output`` (the iteration never produced a full transcript).
+    if iteration_result is None and recovery_trigger is not None:
+        lifecycle.agent_output = recovery_trigger.transcript_tail
+        await _handle_context_recovery(
+            task=task,
+            lifecycle=lifecycle,
+            store=store,
+            config=config,
+            attempt=attempt,
+            attempt_number=attempt_number,
+            recovery_trigger=recovery_trigger,
+            recovery_state=recovery_state,
+            clock=clock,
+        )
+        return
+
     if iteration_result is None:
         # No invocation happened (cap <= 0). Treat as a protocol-class
         # agent error so the retry policy can still kick in.
@@ -2007,7 +2062,6 @@ async def _run_attempt_body(
             config=config,
             attempt=attempt,
             attempt_number=attempt_number,
-            iteration_result=iteration_result,
             recovery_trigger=recovery_trigger,
             recovery_state=recovery_state,
             clock=clock,
@@ -2435,12 +2489,11 @@ async def _handle_context_recovery(
     config: HarnessConfig,
     attempt: Attempt,
     attempt_number: int,
-    iteration_result: IterationResult,
     recovery_trigger: _RecoveryTrigger,
     recovery_state: _RecoveryState,
     clock: Callable[[], datetime],
 ) -> None:
-    """Execute the summarize-restart action (spec 00018 FR-3).
+    """Execute the summarize-restart action (spec 00018 FR-3 / spec 00019 FR-4).
 
     Drives the production-grade recovery sequence:
 
@@ -2451,12 +2504,21 @@ async def _handle_context_recovery(
        another attempt runs. Recovery does NOT silently restart with an
        empty handoff (spec Error Handling table).
     3. On success, emit ``harness.context_recovery`` BEFORE the next
-       AttemptStarted (FR-5), finalize this attempt with
+       AttemptStarted (FR-5 / FR-6), finalize this attempt with
        ``Outcome.RECOVERED``, and walk the lifecycle
        ``running -> interrupted -> ready`` so the outer ``run_task``
        loop schedules the recovery attempt. The retry counter is not
        touched -- the recovery budget is independent of ``max_retries``
        (FR-4).
+
+    The recovery payload carries ``trigger=recovery_trigger.trigger``
+    so operators can tell a boundary recovery (spec 00018 -- iteration
+    finished, occupancy at its tail crossed the ratio) apart from a
+    mid-turn recovery (spec 00019 -- the iteration was interrupted in
+    flight because the live SDK reading crossed the ratio). The shared
+    ``recoveries_used`` counter decrements identically in either case
+    so a single ``max_context_recoveries`` budget covers both paths
+    (spec 00019 FR-5).
     """
     cumulative_diff = _cumulative_prior_outputs(store, lifecycle.run_id)
     worktree: str = (
@@ -2475,6 +2537,9 @@ async def _handle_context_recovery(
         # same class of infrastructure as the rubric judge (a separate
         # LLM call distinct from the working agent), so an
         # invoke-raise / parse-failure is classified the same way.
+        # Spec 00019 Error Handling: mid-turn and boundary recovery
+        # share this routing so a failed summarizer never restarts
+        # with an empty handoff regardless of which path triggered.
         error = f"recovery summarizer failed: {exc.reason}"
         _emit(
             store,
@@ -2484,6 +2549,7 @@ async def _handle_context_recovery(
                 "classification": "recovery_summarizer_error",
                 "reason": exc.reason,
                 "message": error,
+                "trigger": recovery_trigger.trigger,
             },
             attempt_number=attempt_number,
             now=clock,
@@ -2494,7 +2560,7 @@ async def _handle_context_recovery(
             attempt=attempt,
             outcome=Outcome.INTERNAL_ERROR,
             error=error,
-            agent_output=iteration_result.transcript,
+            agent_output=recovery_trigger.transcript_tail,
             clock=clock,
         )
         _transition(
@@ -2510,25 +2576,28 @@ async def _handle_context_recovery(
     # ``recoveries_used`` / ``recoveries_remaining`` figures in the
     # event reflect the count *after* this recovery (the count an
     # operator sees when reading the audit stream matches the count
-    # the in-process counter holds afterwards).
+    # the in-process counter holds afterwards). Spec 00019 FR-5: the
+    # boundary and mid-turn paths decrement the SAME counter so a run
+    # cannot recover twice when ``max_context_recoveries=1`` no matter
+    # which path produced each crossing.
     recovery_state.recoveries_used += 1
     recoveries_used = recovery_state.recoveries_used
     recoveries_remaining = max(
         0, config.max_context_recoveries - recoveries_used
     )
 
-    # FR-5 ordering: the recovery audit event precedes the recovery
-    # attempt's AttemptStarted. We emit it before finalizing the prior
-    # attempt for the same reason -- the attempt_finalized event is
-    # the cleanest "prior attempt closed" marker, but the spec frames
-    # context_recovery as the recovery signal itself, so emit it first
-    # and the finalize / transitions follow.
+    # FR-5 / FR-6 ordering: the recovery audit event precedes the
+    # recovery attempt's AttemptStarted. We emit it before finalizing
+    # the prior attempt for the same reason -- the attempt_finalized
+    # event is the cleanest "prior attempt closed" marker, but the
+    # spec frames context_recovery as the recovery signal itself, so
+    # emit it first and the finalize / transitions follow.
     _emit(
         store,
         run_id=lifecycle.run_id,
         kind="harness.context_recovery",
         payload={
-            "iteration": iteration_result.signals.num_turns,
+            "iteration": recovery_trigger.iteration_number,
             "attempt_number": attempt_number,
             "occupancy_tokens": recovery_trigger.occupancy_tokens,
             "context_window_tokens": config.context_window_tokens,
@@ -2538,6 +2607,7 @@ async def _handle_context_recovery(
             "recoveries_used": recoveries_used,
             "recoveries_remaining": recoveries_remaining,
             "summary_digest": _handoff_digest(handoff),
+            "trigger": recovery_trigger.trigger,
         },
         attempt_number=attempt_number,
         now=clock,
@@ -2548,7 +2618,7 @@ async def _handle_context_recovery(
         attempt=attempt,
         outcome=Outcome.RECOVERED,
         error="",
-        agent_output=iteration_result.transcript,
+        agent_output=recovery_trigger.transcript_tail,
         clock=clock,
     )
     # Park the lifecycle in INTERRUPTED briefly to walk the legal edge
@@ -2631,6 +2701,8 @@ async def _invoke_with_watchdog(
         attempt_number=request.attempt_number,
         iteration_number=request.iteration_number,
         on_message=watchdog_on_message,
+        context_observer=request.context_observer,
+        recovery_interrupt_event=request.recovery_interrupt_event,
     )
 
     # Wrap the invoker call in a coroutine so asyncio.create_task gets a
@@ -2786,28 +2858,55 @@ async def _drive_iterations(
         captured_iteration = iteration_number
         first_audit_error: _AuditWriteError | None = None
 
-        # Mid-turn occupancy state (spec 00019 FR-1/FR-3). All three
+        # Mid-turn occupancy state (spec 00019 FR-1 / FR-3 / FR-4). All
         # slots are per-iteration: ``emitted_tiers`` enforces "at most
         # once per tier", ``latest_sdk_reading`` holds the most recent
         # ``ClaudeSDKClient.get_context_usage`` payload (when the
-        # invoker pumps one through ``context_observer``), and
+        # invoker pumps one through ``context_observer``),
         # ``accumulated_estimate`` is the always-available fallback
-        # derived from streamed ``AssistantMessage.usage``. Lists wrap
-        # the mutable single-cell state so the nested closures can
+        # derived from streamed ``AssistantMessage.usage``,
+        # ``midturn_armed`` records whether the act-ratio crossing
+        # already armed the recovery event so the event is set at most
+        # once per iteration, ``midturn_occupancy`` captures the
+        # occupancy at the moment of arming so the audit payload
+        # reports the exact reading that triggered the interrupt, and
+        # ``partial_transcript_chunks`` accumulates streamed
+        # AssistantMessage TextBlock content so a mid-turn-interrupted
+        # iteration can hand the summarizer the work-so-far the agent
+        # produced before the interrupt landed (the iteration itself
+        # never returns a full transcript on the mid-turn path). Lists
+        # wrap the mutable single-cell state so the nested closures can
         # rebind without ``nonlocal`` chains.
         emitted_tiers: list[float] = []
         latest_sdk_reading: list[ContextUsageResponse | None] = [None]
         accumulated_estimate: list[int] = [0]
+        midturn_armed: list[bool] = [False]
+        midturn_occupancy: list[int] = [0]
+        partial_transcript_chunks: list[str] = []
+        # Per-iteration recovery interrupt event (spec 00019 FR-4). The
+        # event is wired into the invoker via ``InvocationRequest`` so a
+        # live :class:`ClaudeSDKClient`-backed invoker can poll it from
+        # its watcher loop and translate a set event into a
+        # :class:`HarnessRecoveryRequested` cancel. Test invokers and
+        # the plain ``query`` path do not poll the event, so mid-turn
+        # *act* simply does not fire on those paths (spec FR-4
+        # plain-path degradation) and the boundary recovery check
+        # below still catches an over-ratio tail. Always-allocated so
+        # the request's field type stays non-optional at the call
+        # site; the event is consulted only when ``_check_context_thresholds``
+        # decides to arm it.
+        recovery_interrupt_event = asyncio.Event()
 
         def _check_context_thresholds() -> None:
-            """Emit ``harness.context_threshold_crossed`` for newly-crossed tiers.
+            """Emit ``harness.context_threshold_crossed`` for newly-crossed
+            tiers and arm mid-turn recovery when the act ratio is crossed.
 
             Hybrid capacity: the SDK reading's ``maxTokens`` wins when a
             reading is present and carries a positive value; otherwise
             the operator-supplied ``HarnessConfig.context_window_tokens``
             is the fallback. When neither yields a capacity the
             iteration is left fully inert (FR-2 off-by-default) -- no
-            ratio is computed and no event fires.
+            ratio is computed, no event fires, and no interrupt arms.
 
             Hybrid occupancy: the SDK reading's ``totalTokens`` wins
             when a reading is present (the live client knows the exact
@@ -2819,6 +2918,20 @@ async def _drive_iterations(
             Audit-write failures route through ``first_audit_error``
             the same way ``_persist_sdk_message`` failures do, so the
             strict-audit policy (FR-5) catches a faulty event sink.
+
+            Mid-turn act (FR-4 / FR-5 / spec edge case "Crossing 90%
+            observe and the act ratio on the same message"): after
+            emitting observe events, if the same ratio also crosses
+            ``context_recovery_trigger_ratio`` AND recovery budget
+            remains AND the event was not already armed this iteration,
+            set the recovery event so the invoker's watcher
+            (when present) dispatches ``ClaudeSDKClient.interrupt`` and
+            raises :class:`HarnessRecoveryRequested`. Arming after the
+            tier emission keeps the observe event ordered before the
+            recovery event in the audit stream (FR-6 ordering).
+            Setting an already-set event is a no-op; the ``midturn_armed``
+            flag guards against re-arming on a re-cross / oscillation
+            and prevents double-firing for the same crossing.
             """
             nonlocal first_audit_error
             reading = latest_sdk_reading[0]
@@ -2878,6 +2991,22 @@ async def _drive_iterations(
                 except _AuditWriteError as exc:
                     if first_audit_error is None:
                         first_audit_error = exc
+            # Mid-turn act gate (FR-4 / FR-5). Budget check uses the
+            # same ``recoveries_used`` / ``max_context_recoveries``
+            # counter the boundary recovery consumes, so the mid-turn
+            # path cannot exceed the shared budget. When budget is
+            # already exhausted the event is not armed: observe events
+            # still fire (above) and the iteration runs to its natural
+            # end (spec edge case).
+            if (
+                not midturn_armed[0]
+                and ratio >= config.context_recovery_trigger_ratio
+                and recovery_state.recoveries_used
+                < config.max_context_recoveries
+            ):
+                midturn_armed[0] = True
+                midturn_occupancy[0] = occupancy
+                recovery_interrupt_event.set()
 
         def _on_message(msg: Message) -> None:
             nonlocal first_audit_error
@@ -2893,6 +3022,18 @@ async def _drive_iterations(
             except _AuditWriteError as exc:
                 if first_audit_error is None:
                     first_audit_error = exc
+            # Accumulate the work-so-far transcript from streamed
+            # AssistantMessage text blocks (FR-4). The iteration's
+            # full ``IterationResult.transcript`` covers the boundary
+            # path; the mid-turn path interrupts the invoker before
+            # ``invoke_iteration`` returns, so the summarizer would
+            # otherwise see no work-so-far at all. Mirrors the
+            # transcript-building algorithm in
+            # :func:`flywheel.invoker.invoke_iteration`.
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        partial_transcript_chunks.append(block.text)
             # FR-1: update the fallback estimate from this streamed
             # message's usage. Each ``AssistantMessage.usage`` carries
             # the input-side context for THAT turn (input + cache_read +
@@ -2925,6 +3066,7 @@ async def _drive_iterations(
             iteration_number=iteration_number,
             on_message=_on_message,
             context_observer=_context_observer,
+            recovery_interrupt_event=recovery_interrupt_event,
         )
         # Hang watchdog gate (FR-3 / FR-5): when the threshold is unset or
         # non-positive the watchdog never starts and the call path is
@@ -2935,20 +3077,49 @@ async def _drive_iterations(
         # cancel routes through _HangDetected to the FR-3 internal_error
         # path rather than _handle_interrupt (FR-4).
         hang_timeout = config.loop_guard.hang_timeout_seconds
-        if hang_timeout is None or hang_timeout <= 0:
-            iteration_result = await invoker(request)
-        else:
-            iteration_result = await _invoke_with_watchdog(
-                invoker=invoker,
-                request=request,
-                hang_timeout=hang_timeout,
-                mclock=mclock,
-                store=store,
-                run_id=lifecycle.run_id,
-                attempt_number=attempt_number,
+        try:
+            if hang_timeout is None or hang_timeout <= 0:
+                iteration_result = await invoker(request)
+            else:
+                iteration_result = await _invoke_with_watchdog(
+                    invoker=invoker,
+                    request=request,
+                    hang_timeout=hang_timeout,
+                    mclock=mclock,
+                    store=store,
+                    run_id=lifecycle.run_id,
+                    attempt_number=attempt_number,
+                    iteration_number=iteration_number,
+                    clock=clock,
+                )
+        except HarnessRecoveryRequested:
+            # Spec 00019 FR-4 / FR-7: the live-client invoker raised
+            # the distinguishable mid-turn recovery signal in response
+            # to ``recovery_interrupt_event`` being set above. Capture
+            # the work-so-far transcript and the occupancy that armed
+            # the interrupt into a mid_turn ``_RecoveryTrigger`` and
+            # break the iteration loop -- _run_attempt_body routes
+            # this through :func:`_handle_context_recovery` which
+            # finalizes the attempt RECOVERED and emits
+            # ``harness.context_recovery`` with ``trigger="mid_turn"``.
+            # Surface any per-message audit-write failure first so the
+            # strict-audit policy (FR-5) still routes through
+            # INTERNAL_ERROR (the same way the normal-completion arm
+            # below does).
+            if first_audit_error is not None:
+                raise first_audit_error
+            recovery_trigger = _RecoveryTrigger(
+                occupancy_tokens=midturn_occupancy[0],
+                transcript_tail="".join(partial_transcript_chunks),
                 iteration_number=iteration_number,
-                clock=clock,
+                trigger=_RECOVERY_TRIGGER_MID_TURN,
             )
+            iteration_result = None
+            # Update wall_seconds for parity with the normal-completion
+            # path even though the mid-turn route does not invoke
+            # transcript graders -- keeps the return shape uniform.
+            wall_seconds = mclock() - started_monotonic
+            break
         wall_seconds = mclock() - started_monotonic
 
         if first_audit_error is not None:
@@ -3031,6 +3202,8 @@ async def _drive_iterations(
                 recovery_trigger = _RecoveryTrigger(
                     occupancy_tokens=occupancy,
                     transcript_tail=iteration_result.transcript,
+                    iteration_number=iteration_number,
+                    trigger=_RECOVERY_TRIGGER_BOUNDARY,
                 )
                 break
 

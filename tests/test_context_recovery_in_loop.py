@@ -315,6 +315,10 @@ def test_real_loop_drives_full_summarize_restart(tmp_path: Path) -> None:
         assert rec_payload["context_recovery_trigger_ratio"] == 0.9
         assert rec_payload["recoveries_used"] == 1
         assert rec_payload["recoveries_remaining"] == 0
+        # Spec 00019 FR-6: the boundary path attributes the recovery
+        # to ``trigger="boundary"``; the mid-turn in-loop test asserts
+        # the matching ``trigger="mid_turn"`` marker on its side.
+        assert rec_payload["trigger"] == "boundary"
         digest = rec_payload["summary_digest"]
         assert digest["work_done_length"] == len(handoff.work_done)
         assert digest["work_remaining_length"] == len(

@@ -23,10 +23,12 @@ from flywheel import (
     InvocationRequest,
     InvocationSignals,
     IterationResult,
-    SandboxRequest,
     Status,
-    SubmitRequest,
     ValidEnvelope,
+)
+from flywheel_orchestrator import (
+    SandboxRequest,
+    SubmitRequest,
     orchestrate,
 )
 

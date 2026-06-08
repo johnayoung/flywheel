@@ -28,12 +28,11 @@ from flywheel import (
     InvocationRequest,
     InvocationSignals,
     IterationResult,
-    SandboxRequest,
     Status,
-    SubmitRequest,
     ValidEnvelope,
 )
 from flywheel.store_sqlite import SqliteStore
+from flywheel_orchestrator import SandboxRequest, SubmitRequest
 
 _WORKFLOW_DIR = Path(__file__).resolve().parents[1] / ".workflow"
 if str(_WORKFLOW_DIR) not in sys.path:

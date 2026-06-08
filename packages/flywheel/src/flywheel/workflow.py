@@ -1575,9 +1575,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_orchestrate(args: argparse.Namespace) -> int:
-    # Lazy import: flywheel.orchestrator imports this module, so importing it
-    # at module load would be circular.
-    from flywheel.orchestrator import orchestrate
+    # TEMPORARY bridge (core/consumer split, Phase 3): the orchestrate driver
+    # now lives in the flywheel-orchestrator package. This lazy import is the
+    # one remaining core -> consumer reference; it goes away in Phase 3b when
+    # the multi-task CLI moves to the orchestrator package.
+    from flywheel_orchestrator import orchestrate
 
     tasks_dir = _resolve_tasks_dir(args.tasks_dir)
     db_path = _resolve_db(args.db)

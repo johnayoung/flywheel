@@ -25,8 +25,8 @@ from flywheel import (
     Lifecycle,
     Status,
     ValidEnvelope,
-    orchestrate,
 )
+from flywheel_orchestrator import orchestrate
 from flywheel.store_sqlite import SqliteStore
 
 
@@ -406,7 +406,7 @@ def test_claim_lost_mid_run_relinquishes_without_killing_worker(
     # unwind out of orchestrate and abandon the worker's other tasks: the
     # losing task is relinquished (recorded as no run) and the loop carries
     # on to the next claimable task.
-    import flywheel.orchestrator as orch
+    import flywheel_orchestrator._orchestrate as orch
     from flywheel import OptimisticConcurrencyError
 
     phase = tmp_path / "tasks" / "active" / "01-phase"
@@ -554,7 +554,7 @@ def test_awaiting_approval_with_no_pending_command_stays_parked(
 
 
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
-    from flywheel.orchestrator import _ClaimHeartbeat
+    from flywheel_orchestrator._orchestrate import _ClaimHeartbeat
 
     store = SqliteStore(tmp_path / "flywheel.sqlite")
     try:

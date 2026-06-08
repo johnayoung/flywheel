@@ -5,7 +5,26 @@ above it: deciding *which* task runs next (selection over a prerequisite DAG),
 coordinating *several workers* over a shared store (claims + leases), and
 driving each chosen task through ``flywheel.run_task``. It depends on
 ``flywheel`` and never the other way around.
-
-Skeleton: the orchestration code is being relocated here from ``flywheel`` in a
-later phase of the core/consumer split.
 """
+
+from flywheel_orchestrator._orchestrate import (
+    DEFAULT_LEASE_SECONDS,
+    OrchestratorReport,
+    RunRecord,
+    SandboxProvider,
+    SandboxRequest,
+    SubmitRequest,
+    Submitter,
+    orchestrate,
+)
+
+__all__ = [
+    "DEFAULT_LEASE_SECONDS",
+    "OrchestratorReport",
+    "RunRecord",
+    "SandboxProvider",
+    "SandboxRequest",
+    "SubmitRequest",
+    "Submitter",
+    "orchestrate",
+]

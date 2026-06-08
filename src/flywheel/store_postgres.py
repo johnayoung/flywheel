@@ -263,133 +263,11 @@ class PostgresStore:
                         self._schema_ident
                     )
                 )
-                # Pre-feature detection: a legacy schema has an ``events``
-                # table without a ``sequence`` column. The new schema
-                # script's ``CREATE TABLE IF NOT EXISTS`` would no-op and
-                # silently leave the legacy shape in place, so we check
-                # explicitly before bootstrap and refuse with a clear
-                # StoreSchemaError.
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = %s AND table_name = 'events'
-                    """,
-                    (self._schema,),
-                )
-                events_exists = cur.fetchone() is not None
-                if events_exists:
-                    cur.execute(
-                        """
-                        SELECT 1
-                        FROM information_schema.columns
-                        WHERE table_schema = %s
-                          AND table_name = 'events'
-                          AND column_name = 'sequence'
-                        """,
-                        (self._schema,),
-                    )
-                    if cur.fetchone() is None:
-                        raise StoreSchemaError(
-                            observed_version=None,
-                            expected_version=CURRENT_SCHEMA_VERSION,
-                        )
                 cur.execute(_read_schema_sql())
-                # Back-compat migration: cf45b58 added blocked_requires_json
-                # to lifecycles without bumping schema_version. Existing
-                # schema_version=2 databases created before that commit lack
-                # the column; CREATE TABLE IF NOT EXISTS above no-ops on
-                # them, so add the column here when missing.
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = %s
-                      AND table_name = 'lifecycles'
-                      AND column_name = 'blocked_requires_json'
-                    """,
-                    (self._schema,),
-                )
-                if cur.fetchone() is None:
-                    cur.execute(
-                        "ALTER TABLE lifecycles "
-                        "ADD COLUMN blocked_requires_json TEXT"
-                    )
-                # Additive, same back-compat path as blocked_requires_json:
-                # events.category distinguishes domain (state-bearing) from
-                # telemetry rows. The DEFAULT makes pre-existing rows
-                # 'telemetry'. No schema_version bump.
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = %s
-                      AND table_name = 'events'
-                      AND column_name = 'category'
-                    """,
-                    (self._schema,),
-                )
-                if cur.fetchone() is None:
-                    cur.execute(
-                        "ALTER TABLE events ADD COLUMN category TEXT "
-                        "NOT NULL DEFAULT 'telemetry'"
-                    )
-                # Forward migration from schema_version 3 -> 4: the
-                # ``control_commands`` table ships in schema_version 4.
-                # CREATE TABLE IF NOT EXISTS above already materialized it
-                # on the existing schema; the INSERT ... ON CONFLICT DO
-                # NOTHING in the script no-ops against the pre-existing
-                # v3 row, so bump the row explicitly when it is still at
-                # 3. Guarded on the prior version so re-bootstrap of a v4
-                # schema is a no-op and a future version still fails the
-                # final pin below.
-                cur.execute(
-                    "UPDATE schema_version SET version = %s "
-                    "WHERE id = 1 AND version = %s",
-                    (4, 3),
-                )
-                # Forward migration from schema_version 4 -> 5: the
-                # ``lifecycles.awaiting_manual_ordinal`` nullable column
-                # ships in schema_version 5. The CREATE TABLE IF NOT EXISTS
-                # in the script no-ops on an existing schema, so an existing
-                # v4 schema needs an explicit ALTER to materialize the
-                # column; the column is nullable so a v4 row reads NULL
-                # (the post-migration sentinel for "not parked on a manual
-                # gate"). Guarded on the prior version so re-bootstrap of
-                # a v5 schema is a no-op.
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = %s
-                      AND table_name = 'lifecycles'
-                      AND column_name = 'awaiting_manual_ordinal'
-                    """,
-                    (self._schema,),
-                )
-                if cur.fetchone() is None:
-                    cur.execute(
-                        "ALTER TABLE lifecycles "
-                        "ADD COLUMN awaiting_manual_ordinal INTEGER"
-                    )
-                cur.execute(
-                    "UPDATE schema_version SET version = %s "
-                    "WHERE id = 1 AND version = %s",
-                    (5, 4),
-                )
-                # Forward migration from schema_version 5 -> 6: the unused
-                # claude_session_store table is dropped. The schema script no
-                # longer creates it, so a fresh schema never has it, but an
-                # existing v5 schema still carries the (empty) table — drop
-                # it explicitly, then bump. DROP IF EXISTS is a no-op on a
-                # fresh v6 schema; the bump is guarded on the prior version
-                # so re-bootstrap of a v6 schema is a no-op.
-                cur.execute("DROP TABLE IF EXISTS claude_session_store")
-                cur.execute(
-                    "UPDATE schema_version SET version = %s "
-                    "WHERE id = 1 AND version = %s",
-                    (CURRENT_SCHEMA_VERSION, 5),
-                )
+                # Version pin: a schema whose schema_version row does not
+                # match is refused with a "must be re-created" error. There
+                # is no in-place migration — the schema is pre-MVP, so an
+                # older on-disk shape is rejected rather than upgraded.
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
                 )
@@ -515,10 +393,32 @@ class PostgresStore:
 
     # --- LifecycleStore ---------------------------------------------------
 
+    @staticmethod
+    def _ensure_task_identity_cur(
+        cur: Any, task_id: str, now: datetime
+    ) -> None:
+        """Create the logical task identity row if absent (idempotent).
+
+        The FK anchor for task_versions, task_tags, task_prerequisites, and
+        lifecycles. ON CONFLICT DO NOTHING preserves the original
+        first_seen_at.
+        """
+        cur.execute(
+            "INSERT INTO tasks (id, first_seen_at, updated_at) "
+            "VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING",
+            (task_id, now, now),
+        )
+
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:
         try:
             with self._pool.connection() as conn:
                 with conn.cursor() as cur:
+                    # Auto-register the task identity so lifecycles.task_id ->
+                    # tasks(id) always holds. Idempotent — save_task (the
+                    # normal pre-seed path) has usually created it already.
+                    self._ensure_task_identity_cur(
+                        cur, lifecycle.task_id, _utcnow()
+                    )
                     cur.execute(
                         """
                         INSERT INTO lifecycles (
@@ -659,32 +559,83 @@ class PostgresStore:
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
         data = serialize_task(task)
-        # ON CONFLICT DO NOTHING makes the (id, content_hash) write
-        # idempotent: re-saving an unchanged task is a no-op and the
-        # original created_at is preserved.
+        # One transaction (one pooled connection) so identity, version, tags,
+        # and prerequisites land together. The version row is immutable
+        # (ON CONFLICT DO NOTHING keeps the original created_at); tags and
+        # prerequisites are mutable metadata, rewritten last-write-wins.
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                self._ensure_task_identity_cur(cur, task.id, now)
+                cur.execute(
+                    "UPDATE tasks SET updated_at = %s WHERE id = %s",
+                    (now, task.id),
+                )
+                # Bare identity for any not-yet-defined prerequisite so
+                # task_prerequisites.prereq_task_id -> tasks(id) holds
+                # regardless of DAG save order.
+                for prereq_id in data["prerequisites"]:
+                    self._ensure_task_identity_cur(cur, prereq_id, now)
                 cur.execute(
                     """
-                    INSERT INTO tasks (
-                        id, content_hash, goal, graders_json,
-                        prerequisites_json, tags_json, context_json,
-                        created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id, content_hash) DO NOTHING
+                    INSERT INTO task_versions (
+                        task_id, content_hash, goal, graders_json,
+                        context_json, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (task_id, content_hash) DO NOTHING
                     """,
                     (
                         task.id,
                         content_hash,
                         data["goal"],
                         Jsonb(data["graders"]),
-                        Jsonb(data["prerequisites"]),
-                        Jsonb(data["tags"]),
                         Jsonb(data["context"]),
                         now,
                     ),
                 )
+                cur.execute(
+                    "DELETE FROM task_tags WHERE task_id = %s", (task.id,)
+                )
+                if data["tags"]:
+                    cur.executemany(
+                        "INSERT INTO task_tags (task_id, tag, position) "
+                        "VALUES (%s, %s, %s)",
+                        [
+                            (task.id, tag, i)
+                            for i, tag in enumerate(data["tags"])
+                        ],
+                    )
+                cur.execute(
+                    "DELETE FROM task_prerequisites WHERE task_id = %s",
+                    (task.id,),
+                )
+                if data["prerequisites"]:
+                    cur.executemany(
+                        "INSERT INTO task_prerequisites "
+                        "(task_id, prereq_task_id, position) "
+                        "VALUES (%s, %s, %s)",
+                        [
+                            (task.id, prereq_id, i)
+                            for i, prereq_id in enumerate(
+                                data["prerequisites"]
+                            )
+                        ],
+                    )
         return content_hash
+
+    def _load_task_tags(self, cur: Any, task_id: str) -> list[str]:
+        cur.execute(
+            "SELECT tag FROM task_tags WHERE task_id = %s ORDER BY position",
+            (task_id,),
+        )
+        return [r["tag"] for r in cur.fetchall()]
+
+    def _load_task_prerequisites(self, cur: Any, task_id: str) -> list[str]:
+        cur.execute(
+            "SELECT prereq_task_id FROM task_prerequisites "
+            "WHERE task_id = %s ORDER BY position",
+            (task_id,),
+        )
+        return [r["prereq_task_id"] for r in cur.fetchall()]
 
     def load_task(
         self, task_id: str, content_hash: str | None = None
@@ -693,22 +644,35 @@ class PostgresStore:
             with conn.cursor(row_factory=dict_row) as cur:
                 if content_hash is not None:
                     cur.execute(
-                        "SELECT id, goal, graders_json, prerequisites_json, "
-                        "tags_json, context_json FROM tasks "
-                        "WHERE id = %s AND content_hash = %s",
+                        "SELECT goal, graders_json, context_json "
+                        "FROM task_versions "
+                        "WHERE task_id = %s AND content_hash = %s",
                         (task_id, content_hash),
                     )
                 else:
                     cur.execute(
-                        "SELECT id, goal, graders_json, prerequisites_json, "
-                        "tags_json, context_json FROM tasks "
-                        "WHERE id = %s ORDER BY created_at DESC LIMIT 1",
+                        "SELECT goal, graders_json, context_json "
+                        "FROM task_versions "
+                        "WHERE task_id = %s ORDER BY created_at DESC LIMIT 1",
                         (task_id,),
                     )
                 row = cur.fetchone()
-        if row is None:
-            return None
-        return _row_to_task(row)
+                if row is None:
+                    return None
+                # tags/prerequisites are reattached from their current rows —
+                # mutable metadata, not part of the pinned version.
+                prerequisites = self._load_task_prerequisites(cur, task_id)
+                tags = self._load_task_tags(cur, task_id)
+        return deserialize_task(
+            {
+                "id": task_id,
+                "goal": row["goal"],
+                "graders": list(row["graders_json"]),
+                "prerequisites": prerequisites,
+                "tags": tags,
+                "context": dict(row["context_json"]),
+            }
+        )
 
     def load_task_for_run(self, run_id: str) -> Task | None:
         with self._pool.connection() as conn:
@@ -771,6 +735,9 @@ class PostgresStore:
         self, conn: Connection[Any], lc: Lifecycle
     ) -> None:
         with conn.cursor() as cur:
+            # Auto-register the task identity on the same transaction so the
+            # lifecycles.task_id FK holds for the event-sourced seed path too.
+            self._ensure_task_identity_cur(cur, lc.task_id, _utcnow())
             cur.execute(
                 """
                 INSERT INTO lifecycles (
@@ -1499,20 +1466,6 @@ class PostgresStore:
 
 
 # --- Row -> dataclass converters --------------------------------------------
-
-
-def _row_to_task(row: dict[str, Any]) -> Task:
-    # JSONB columns arrive already parsed into Python objects under dict_row.
-    return deserialize_task(
-        {
-            "id": row["id"],
-            "goal": row["goal"],
-            "graders": list(row["graders_json"]),
-            "prerequisites": list(row["prerequisites_json"]),
-            "tags": list(row["tags_json"]),
-            "context": dict(row["context_json"]),
-        }
-    )
 
 
 def _row_to_attempt(row: dict[str, Any]) -> Attempt:

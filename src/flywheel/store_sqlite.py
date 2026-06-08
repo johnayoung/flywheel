@@ -169,16 +169,6 @@ class SqliteStore:
 
     def _bootstrap(self) -> None:
         conn = self._connection
-        # Pre-feature detection: a legacy database has an ``events`` table
-        # without a ``sequence`` column. Re-running the new schema script
-        # against it would silently no-op the ``CREATE TABLE IF NOT EXISTS``
-        # and leave the legacy shape in place, so we check explicitly
-        # before bootstrap and refuse with a clear error.
-        if _has_table(conn, "events") and not _events_has_sequence(conn):
-            raise StoreSchemaError(
-                observed_version=None,
-                expected_version=CURRENT_SCHEMA_VERSION,
-            )
         # The canonical schema script applies the pragmas (WAL +
         # foreign_keys) and creates every table. Executed verbatim so
         # the DDL is not re-derived here.
@@ -193,70 +183,10 @@ class SqliteStore:
         conn.execute("PRAGMA busy_timeout = 5000;")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
-        # Back-compat migration: cf45b58 added blocked_requires_json to
-        # lifecycles without bumping schema_version (per its commit msg,
-        # nullable-add is the spec's back-compat path). Existing v2 DBs
-        # created before that commit lack the column; CREATE TABLE IF NOT
-        # EXISTS above no-ops on them, so add the column here when missing.
-        if not _lifecycles_has_blocked_requires_json(conn):
-            conn.execute(
-                "ALTER TABLE lifecycles ADD COLUMN blocked_requires_json TEXT"
-            )
-        # Additive, same back-compat path as blocked_requires_json: the
-        # events.category column distinguishes domain (state-bearing) from
-        # telemetry rows. Existing v2 databases lack it; the DEFAULT means
-        # every pre-existing row is correctly 'telemetry'. No version bump.
-        if not _events_has_category(conn):
-            conn.execute(
-                "ALTER TABLE events ADD COLUMN category TEXT NOT NULL "
-                "DEFAULT 'telemetry'"
-            )
-        # Forward migration from schema_version 3 -> 4: the
-        # ``control_commands`` table (and its pending-row index) ships in
-        # schema_version 4. CREATE TABLE IF NOT EXISTS above already
-        # materialized it on the existing database; INSERT OR IGNORE in the
-        # schema script no-ops against the pre-existing v3 row, so explicitly
-        # bump the row when it is still at 3. The bump is guarded on the
-        # current version so re-bootstrap of a v4 store is a no-op and a
-        # mismatched future version still fails the final pin below.
-        conn.execute(
-            "UPDATE schema_version SET version = ? "
-            "WHERE id = 1 AND version = ?",
-            (4, 3),
-        )
-        # Forward migration from schema_version 4 -> 5: the
-        # ``lifecycles.awaiting_manual_ordinal`` nullable column ships in
-        # schema_version 5. CREATE TABLE IF NOT EXISTS in the schema script
-        # only creates the table when absent, so an existing v4 database
-        # needs an explicit ALTER to materialize the column; the column is
-        # nullable so a v4 row reads NULL (the post-migration sentinel for
-        # "not parked on a manual gate"). The version bump is guarded on
-        # the prior version so re-bootstrap of a v5 store is a no-op.
-        if not _lifecycles_has_awaiting_manual_ordinal(conn):
-            conn.execute(
-                "ALTER TABLE lifecycles "
-                "ADD COLUMN awaiting_manual_ordinal INTEGER"
-            )
-        conn.execute(
-            "UPDATE schema_version SET version = ? "
-            "WHERE id = 1 AND version = ?",
-            (5, 4),
-        )
-        # Forward migration from schema_version 5 -> 6: the unused
-        # claude_session_store table is dropped. The schema script no longer
-        # creates it, so a fresh database never has it, but an existing v5
-        # database still carries the (empty) table — drop it explicitly,
-        # then bump. DROP IF EXISTS is a no-op on a fresh v6 database; the
-        # bump is guarded on the prior version so re-bootstrap of a v6 store
-        # is a no-op.
-        conn.execute("DROP TABLE IF EXISTS claude_session_store")
-        conn.execute(
-            "UPDATE schema_version SET version = ? "
-            "WHERE id = 1 AND version = ?",
-            (CURRENT_SCHEMA_VERSION, 5),
-        )
-        # Final version pin: any row mismatch is fatal regardless of how
-        # the database got here. The schema_version table has a CHECK
+        # Version pin: a database whose schema_version row does not match is
+        # refused with a "must be re-created" error. There is no in-place
+        # migration — the schema is pre-MVP, so an older on-disk shape is
+        # rejected rather than upgraded. The schema_version table has a CHECK
         # (id = 1) so there is at most one row to read.
         row = conn.execute(
             "SELECT version FROM schema_version WHERE id = 1"
@@ -315,6 +245,12 @@ class SqliteStore:
     # --- LifecycleStore ---------------------------------------------------
 
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:
+        # Auto-register the task identity so lifecycles.task_id -> tasks(id)
+        # always holds: a run can never reference a task the catalog has
+        # never heard of. Idempotent — save_task (the normal pre-seed path)
+        # has usually created it already; this covers callers that seed a
+        # lifecycle directly.
+        self._ensure_task_identity(lifecycle.task_id, _utcnow_iso())
         try:
             self._connection.execute(
                 """
@@ -445,51 +381,121 @@ class SqliteStore:
 
     # --- TaskStore --------------------------------------------------------
 
+    def _ensure_task_identity(self, task_id: str, now_iso: str) -> None:
+        """Create the logical task identity row if absent (idempotent).
+
+        INSERT OR IGNORE preserves the original first_seen_at; the FK anchor
+        exists after this call so versions, tags, prerequisites, and
+        lifecycles can reference it.
+        """
+        self._connection.execute(
+            "INSERT OR IGNORE INTO tasks (id, first_seen_at, updated_at) "
+            "VALUES (?, ?, ?)",
+            (task_id, now_iso, now_iso),
+        )
+
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
         data = serialize_task(task)
-        # INSERT OR IGNORE makes the (id, content_hash) write idempotent:
-        # re-saving an unchanged task is a no-op and created_at is preserved.
-        self._connection.execute(
-            """
-            INSERT OR IGNORE INTO tasks (
-                id, content_hash, goal, graders_json, prerequisites_json,
-                tags_json, context_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task.id,
-                content_hash,
-                data["goal"],
-                json.dumps(data["graders"]),
-                json.dumps(data["prerequisites"]),
-                json.dumps(data["tags"]),
-                json.dumps(data["context"]),
-                _iso(now),
-            ),
-        )
+        now_iso = _iso(now)
+        # One transaction so identity, version, tags, and prerequisites land
+        # together. The version row is immutable (INSERT OR IGNORE keeps the
+        # original created_at); tags and prerequisites are mutable metadata,
+        # rewritten last-write-wins.
+        with self._transaction():
+            self._ensure_task_identity(task.id, now_iso)
+            self._connection.execute(
+                "UPDATE tasks SET updated_at = ? WHERE id = ?",
+                (now_iso, task.id),
+            )
+            # Register a bare identity for any not-yet-defined prerequisite so
+            # task_prerequisites.prereq_task_id -> tasks(id) holds regardless
+            # of the order tasks in a DAG are saved.
+            for prereq_id in data["prerequisites"]:
+                self._ensure_task_identity(prereq_id, now_iso)
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO task_versions (
+                    task_id, content_hash, goal, graders_json, context_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.id,
+                    content_hash,
+                    data["goal"],
+                    json.dumps(data["graders"]),
+                    json.dumps(data["context"]),
+                    now_iso,
+                ),
+            )
+            self._connection.execute(
+                "DELETE FROM task_tags WHERE task_id = ?", (task.id,)
+            )
+            self._connection.executemany(
+                "INSERT INTO task_tags (task_id, tag, position) "
+                "VALUES (?, ?, ?)",
+                [(task.id, tag, i) for i, tag in enumerate(data["tags"])],
+            )
+            self._connection.execute(
+                "DELETE FROM task_prerequisites WHERE task_id = ?",
+                (task.id,),
+            )
+            self._connection.executemany(
+                "INSERT INTO task_prerequisites "
+                "(task_id, prereq_task_id, position) VALUES (?, ?, ?)",
+                [
+                    (task.id, prereq_id, i)
+                    for i, prereq_id in enumerate(data["prerequisites"])
+                ],
+            )
         return content_hash
+
+    def _load_task_tags(self, task_id: str) -> list[str]:
+        rows = self._connection.execute(
+            "SELECT tag FROM task_tags WHERE task_id = ? ORDER BY position",
+            (task_id,),
+        ).fetchall()
+        return [r["tag"] for r in rows]
+
+    def _load_task_prerequisites(self, task_id: str) -> list[str]:
+        rows = self._connection.execute(
+            "SELECT prereq_task_id FROM task_prerequisites "
+            "WHERE task_id = ? ORDER BY position",
+            (task_id,),
+        ).fetchall()
+        return [r["prereq_task_id"] for r in rows]
 
     def load_task(
         self, task_id: str, content_hash: str | None = None
     ) -> Task | None:
         if content_hash is not None:
             row = self._connection.execute(
-                "SELECT id, goal, graders_json, prerequisites_json, "
-                "tags_json, context_json FROM tasks "
-                "WHERE id = ? AND content_hash = ?",
+                "SELECT goal, graders_json, context_json FROM task_versions "
+                "WHERE task_id = ? AND content_hash = ?",
                 (task_id, content_hash),
             ).fetchone()
         else:
             row = self._connection.execute(
-                "SELECT id, goal, graders_json, prerequisites_json, "
-                "tags_json, context_json FROM tasks "
-                "WHERE id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                "SELECT goal, graders_json, context_json FROM task_versions "
+                "WHERE task_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
         if row is None:
             return None
-        return _row_to_task(row)
+        # tags and prerequisites are reattached from their current relational
+        # rows — they are mutable metadata, not part of the pinned version.
+        return deserialize_task(
+            {
+                "id": task_id,
+                "goal": row["goal"],
+                "graders": json.loads(row["graders_json"]),
+                "prerequisites": self._load_task_prerequisites(task_id),
+                "tags": self._load_task_tags(task_id),
+                "context": json.loads(row["context_json"]),
+            }
+        )
 
     def load_task_for_run(self, run_id: str) -> Task | None:
         row = self._connection.execute(
@@ -1056,19 +1062,6 @@ def _row_to_attempt(row: sqlite3.Row) -> Attempt:
     )
 
 
-def _row_to_task(row: sqlite3.Row) -> Task:
-    return deserialize_task(
-        {
-            "id": row["id"],
-            "goal": row["goal"],
-            "graders": json.loads(row["graders_json"]),
-            "prerequisites": json.loads(row["prerequisites_json"]),
-            "tags": json.loads(row["tags_json"]),
-            "context": json.loads(row["context_json"]),
-        }
-    )
-
-
 def _row_to_event(row: sqlite3.Row) -> EventRecord:
     ts = _parse_iso(row["ts"])
     assert ts is not None
@@ -1113,37 +1106,6 @@ def _row_to_sdk_message(row: sqlite3.Row) -> SdkMessageRecord:
         sequence=int(row["sequence"]),
         id=int(row["id"]),
     )
-
-
-def _has_table(conn: sqlite3.Connection, table: str) -> bool:
-    return (
-        conn.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name=?",
-            (table,),
-        ).fetchone()
-        is not None
-    )
-
-
-def _events_has_sequence(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute("PRAGMA table_info(events)").fetchall()
-    return any(r["name"] == "sequence" for r in rows)
-
-
-def _events_has_category(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute("PRAGMA table_info(events)").fetchall()
-    return any(r["name"] == "category" for r in rows)
-
-
-def _lifecycles_has_blocked_requires_json(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
-    return any(r["name"] == "blocked_requires_json" for r in rows)
-
-
-def _lifecycles_has_awaiting_manual_ordinal(conn: sqlite3.Connection) -> bool:
-    rows = conn.execute("PRAGMA table_info(lifecycles)").fetchall()
-    return any(r["name"] == "awaiting_manual_ordinal" for r in rows)
 
 
 def _row_to_grader_result(row: sqlite3.Row) -> GraderResultRecord:

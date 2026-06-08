@@ -6,6 +6,7 @@ import pytest
 
 from flywheel import (
     CommandGrader,
+    Context,
     ManualGrader,
     RubricGrader,
     Task,
@@ -394,7 +395,8 @@ def test_task_digest_ignores_id() -> None:
     assert task_digest(a) == task_digest(b)
 
 
-def test_task_digest_changes_when_definition_changes() -> None:
+def test_task_digest_changes_when_executed_definition_changes() -> None:
+    # The digest covers the *executed* definition: goal, graders, context.
     base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
     digest = task_digest(base)
     assert task_digest(Task(id="x", goal="g2", graders=base.graders)) != digest
@@ -403,8 +405,33 @@ def test_task_digest_changes_when_definition_changes() -> None:
         != digest
     )
     assert (
-        task_digest(Task(id="x", goal="g", graders=base.graders, tags=["a"]))
+        task_digest(
+            Task(
+                id="x",
+                goal="g",
+                graders=base.graders,
+                context=Context(notes="changed"),
+            )
+        )
         != digest
+    )
+
+
+def test_task_digest_ignores_tags_and_prerequisites() -> None:
+    # tags and prerequisites are mutable orchestration metadata stored
+    # relationally, not part of the immutable definition — editing them must
+    # not fork the version a run pinned.
+    base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
+    digest = task_digest(base)
+    assert (
+        task_digest(Task(id="x", goal="g", graders=base.graders, tags=["a"]))
+        == digest
+    )
+    assert (
+        task_digest(
+            Task(id="x", goal="g", graders=base.graders, prerequisites=["dep"])
+        )
+        == digest
     )
 
 

@@ -175,12 +175,24 @@ class InMemoryStore:
         # ascending audit ordering per run_id.
         self._run_sequence: dict[str, int] = {}
         self._claims: dict[str, TaskClaim] = {}
-        # Content-addressed task catalog keyed by (id, content_hash). Value is
-        # the serialized dict plus a (created_at, insertion-seq) ordering key
-        # so "latest version" resolution is deterministic on ties.
-        self._tasks: dict[
+        # Three-tier task model mirroring the persistence schema:
+        #   _task_identities  -- logical task id -> first_seen_at (the FK
+        #                        anchor; a run/tag/edge can only reference a
+        #                        registered identity).
+        #   _task_versions    -- (id, content_hash) -> (definition dict,
+        #                        created_at, insertion-seq) for deterministic
+        #                        "latest version" resolution on ties. The
+        #                        definition dict holds goal/graders/context
+        #                        only (the hashed, immutable part).
+        #   _task_tags        -- id -> ordered tags (mutable metadata).
+        #   _task_prereqs     -- id -> ordered prerequisite ids (mutable DAG
+        #                        edges).
+        self._task_identities: dict[str, datetime] = {}
+        self._task_versions: dict[
             tuple[str, str], tuple[dict[str, Any], datetime, int]
         ] = {}
+        self._task_tags: dict[str, list[str]] = {}
+        self._task_prereqs: dict[str, list[str]] = {}
         self._task_seq: int = 0
         # Control-command queue. Rows are kept in a single list with a
         # monotonic ``id`` (the enqueue-order key) so claim_commands can
@@ -198,6 +210,12 @@ class InMemoryStore:
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:
         if lifecycle.run_id in self._lifecycles:
             raise LifecycleAlreadyExistsError(lifecycle.run_id)
+        # Auto-register the task identity so a run always references a
+        # catalogued task (mirrors the lifecycles.task_id -> tasks(id) FK the
+        # durable stores enforce). Idempotent: save_task usually created it.
+        self._task_identities.setdefault(
+            lifecycle.task_id, datetime.now(timezone.utc)
+        )
         self._lifecycles[lifecycle.run_id] = _clone_lifecycle_row(lifecycle)
 
     def update_lifecycle(
@@ -229,28 +247,60 @@ class InMemoryStore:
 
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
+        data = serialize_task(task)
+        # Register the task identity and a bare identity for each not-yet-
+        # defined prerequisite (the FK anchors in the durable stores).
+        self._task_identities.setdefault(task.id, now)
+        for prereq_id in data["prerequisites"]:
+            self._task_identities.setdefault(prereq_id, now)
         key = (task.id, content_hash)
-        if key not in self._tasks:
+        if key not in self._task_versions:
             self._task_seq += 1
-            self._tasks[key] = (serialize_task(task), now, self._task_seq)
+            definition = {
+                "goal": data["goal"],
+                "graders": data["graders"],
+                "context": data["context"],
+            }
+            self._task_versions[key] = (definition, now, self._task_seq)
+        # Tags and prerequisites are mutable metadata: last-write-wins.
+        self._task_tags[task.id] = list(data["tags"])
+        self._task_prereqs[task.id] = list(data["prerequisites"])
         return content_hash
+
+    def _assemble_task(
+        self, task_id: str, definition: dict[str, Any]
+    ) -> Task:
+        return deserialize_task(
+            {
+                "id": task_id,
+                "goal": definition["goal"],
+                "graders": definition["graders"],
+                "prerequisites": list(self._task_prereqs.get(task_id, [])),
+                "tags": list(self._task_tags.get(task_id, [])),
+                "context": definition["context"],
+            }
+        )
 
     def load_task(
         self, task_id: str, content_hash: str | None = None
     ) -> Task | None:
         if content_hash is not None:
-            entry = self._tasks.get((task_id, content_hash))
-            return deserialize_task(entry[0]) if entry is not None else None
+            entry = self._task_versions.get((task_id, content_hash))
+            if entry is None:
+                return None
+            return self._assemble_task(task_id, entry[0])
         candidates = [
             value
-            for (tid, _ch), value in self._tasks.items()
+            for (tid, _ch), value in self._task_versions.items()
             if tid == task_id
         ]
         if not candidates:
             return None
         # Most recent by created_at, breaking ties on insertion order.
-        data, _created, _seq = max(candidates, key=lambda v: (v[1], v[2]))
-        return deserialize_task(data)
+        definition, _created, _seq = max(
+            candidates, key=lambda v: (v[1], v[2])
+        )
+        return self._assemble_task(task_id, definition)
 
     def load_task_for_run(self, run_id: str) -> Task | None:
         stored = self._lifecycles.get(run_id)

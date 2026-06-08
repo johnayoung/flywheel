@@ -30,37 +30,100 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- tasks: content-addressed catalog of task definitions. Keyed by
--- (id, content_hash) where content_hash is flywheel.loaders.task_digest over
--- the definition (everything except id). Storage is immutable and deduped:
--- re-saving an unchanged task is a no-op, editing it adds a new version row.
--- The column layout mirrors docs/task-schema.md — goal is a first-class
--- column; the list/nested fields (graders, prerequisites, tags, context) are
--- JSON text, matching how lifecycles stores timestamps_json. A run pins the
--- exact version it ran via lifecycles.task_content_hash; there is
--- deliberately no foreign key (task_id stays a denormalized, untrusted
--- reference, consistent with the rest of the schema).
+-- Task identity, versions, and orchestration metadata are modeled as three
+-- tiers so every task reference in the store is a checkable foreign key
+-- rather than a free-floating string:
+--
+--   tasks               -- the logical task (stable id). The FK anchor.
+--   task_versions       -- immutable, content-addressed definitions.
+--   task_tags           -- mutable labels for grouping/filtering.
+--   task_prerequisites  -- mutable DAG edges for dependency scheduling.
+--
+-- A user thinks in all three tiers: a task is a durable thing they author,
+-- tag, depend on, and run repeatedly (tasks); each run pins the exact
+-- definition it executed (task_versions); and harnesses layered on flywheel
+-- read tags + prerequisites to build parallelizable task DAGs (task_tags,
+-- task_prerequisites). Splitting them lets the definition stay immutable
+-- while the orchestration metadata around it stays editable.
+
+-- tasks: the logical task identity. One row per id, created the first time a
+-- task is saved or referenced. Carries no definition — it exists so that
+-- task_versions, task_tags, task_prerequisites, and lifecycles can all
+-- foreign-key a real, catalogued identity. A row may exist with no
+-- task_versions yet (a task declared as a prerequisite before it is defined).
 CREATE TABLE IF NOT EXISTS tasks (
-  id                  TEXT NOT NULL,
-  content_hash        TEXT NOT NULL,
-  goal                TEXT NOT NULL,
-  graders_json        TEXT NOT NULL,
-  prerequisites_json  TEXT NOT NULL,
-  tags_json           TEXT NOT NULL,
-  context_json        TEXT NOT NULL,
-  created_at          DATETIME NOT NULL,
-  PRIMARY KEY (id, content_hash)
+  id            TEXT PRIMARY KEY,
+  first_seen_at DATETIME NOT NULL,
+  updated_at    DATETIME NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_tasks_id_created ON tasks(id, created_at);
+
+-- task_versions: immutable, content-addressed task definitions. Keyed by
+-- (task_id, content_hash) where content_hash is flywheel.loaders.task_digest
+-- over the *executed* definition — goal, graders, and context only. tags and
+-- prerequisites are deliberately excluded from the hash: they are mutable
+-- orchestration metadata (see task_tags / task_prerequisites), so retagging
+-- or rewiring the DAG never forks the definition a run pinned. Storage is
+-- immutable and deduped: re-saving an unchanged definition is a no-op,
+-- editing goal/graders/context adds a new version row. A run pins the exact
+-- version it ran via lifecycles.task_content_hash.
+CREATE TABLE IF NOT EXISTS task_versions (
+  task_id       TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  goal          TEXT NOT NULL,
+  graders_json  TEXT NOT NULL,
+  context_json  TEXT NOT NULL,
+  created_at    DATETIME NOT NULL,
+  PRIMARY KEY (task_id, content_hash),
+  FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_versions_id_created
+  ON task_versions(task_id, created_at);
+
+-- task_tags: mutable labels on a logical task. Not part of the content hash,
+-- so editing tags does not fork a definition. last-write-wins on save_task.
+-- position preserves authoring order on read; the idx over tag serves the
+-- reverse lookup ("every task labelled X") that grouping/filtering harnesses
+-- rely on.
+CREATE TABLE IF NOT EXISTS task_tags (
+  task_id   TEXT NOT NULL,
+  tag       TEXT NOT NULL,
+  position  INTEGER NOT NULL,
+  PRIMARY KEY (task_id, tag),
+  FOREIGN KEY (task_id) REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
+
+-- task_prerequisites: mutable DAG edges. Both endpoints foreign-key tasks(id)
+-- so a task can never depend on an uncatalogued id; save_task auto-registers
+-- a bare identity row for any prerequisite that has not been defined yet, so
+-- a DAG can be authored in any order without violating the FK. The CHECK
+-- mirrors the schema rule that a task cannot be its own prerequisite. The idx
+-- over prereq_task_id serves the dependents lookup ("everything waiting on
+-- X") that a parallel scheduler walks to release the ready frontier.
+CREATE TABLE IF NOT EXISTS task_prerequisites (
+  task_id         TEXT NOT NULL,
+  prereq_task_id  TEXT NOT NULL,
+  position        INTEGER NOT NULL,
+  PRIMARY KEY (task_id, prereq_task_id),
+  FOREIGN KEY (task_id) REFERENCES tasks(id),
+  FOREIGN KEY (prereq_task_id) REFERENCES tasks(id),
+  CHECK (task_id <> prereq_task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_prerequisites_prereq
+  ON task_prerequisites(prereq_task_id);
 
 -- lifecycles: the single mutable row per run, keyed by run_id. version drives
 -- optimistic concurrency — every update carries an expected version and a
 -- stale writer is rejected with OptimisticConcurrencyError. status, retries,
 -- error, and agent_output are the rolled-up current state; timestamps_json
 -- and blocked_requires_json are JSON text like the rest of the schema.
--- task_id is a denormalized, untrusted reference (deliberately no FK);
--- task_content_hash pins the exact tasks row the run executed. session_id
--- carries the agent SDK session id used to resume the brain across iterations.
+-- task_id foreign-keys tasks(id): every run references a real, catalogued
+-- task identity (the seed auto-registers it), so a run can never point at a
+-- task the store has never heard of. task_content_hash pins the exact
+-- task_versions row the run executed and is the recovery key
+-- load_task_for_run resolves; the harness always saves the definition before
+-- seeding, so the pinned version is present. session_id carries the agent SDK
+-- session id used to resume the brain across iterations.
 CREATE TABLE IF NOT EXISTS lifecycles (
   run_id                  TEXT PRIMARY KEY,
   task_id                 TEXT NOT NULL,
@@ -82,7 +145,8 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   -- in Lifecycle.transition_to (the same back-compat path as
   -- blocked_requires_json). Added in schema_version 5 via the forward
   -- migration each concrete store applies on bootstrap.
-  awaiting_manual_ordinal INTEGER
+  awaiting_manual_ordinal INTEGER,
+  FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
 -- agent_context_json captures the agent identity for this attempt so the run
@@ -210,8 +274,16 @@ CREATE TABLE IF NOT EXISTS run_sequence (
 -- liveness signal: a crashed worker's claim is reclaimable once its lease
 -- lapses. version drives optimistic concurrency for renew/release so a
 -- worker whose claim was stolen (lease expired, another worker took over)
--- learns it lost. Added additively — CREATE TABLE IF NOT EXISTS materializes
--- it on existing databases without a schema_version bump.
+-- learns it lost.
+--
+-- task_id here is intentionally NOT foreign-keyed to tasks(id) — the one
+-- task reference in the schema that stays a bare string. A claim is taken
+-- before the task definition is recorded (the orchestrator acquires the lease
+-- during selection, then run_task saves the task), and it is deleted on
+-- completion: this is transient coordination state, not part of the audit
+-- record, so it has no catalog row to anchor to and nothing reads it as
+-- history. That is the opposite of lifecycles.task_id, which is durable audit
+-- state and therefore does foreign-key tasks(id).
 CREATE TABLE IF NOT EXISTS task_claims (
   task_id          TEXT PRIMARY KEY,
   worker_id        TEXT NOT NULL,
@@ -256,4 +328,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 6);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 7);

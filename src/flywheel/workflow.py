@@ -100,6 +100,7 @@ from flywheel.lifecycle import Attempt, Lifecycle, Status
 from flywheel.loaders import TaskLoadError, load_task_file
 from flywheel.loop_path_marker import LoopPathSignal, detect_loop_path_signals
 from flywheel.store_protocols import (
+    ControlCommandRecord,
     ControlCommandStore,
     EventRecord,
     GraderResultRecord,
@@ -675,6 +676,11 @@ class _EventStreamingStore:
         self, run_id: str, attempt_number: int
     ) -> list[GraderResultRecord]:
         return self._wrapped.list_grader_results(run_id, attempt_number)
+
+    def claim_commands(
+        self, run_id: str, *, now: datetime
+    ) -> list[ControlCommandRecord]:
+        return self._wrapped.claim_commands(run_id, now=now)
 
 
 def build_inline_task(

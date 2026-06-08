@@ -398,101 +398,59 @@ class SqliteStore:
         content_hash = task_digest(task)
         data = serialize_task(task)
         now_iso = _iso(now)
-        # One transaction so identity, version, tags, and prerequisites land
+        # One transaction so the identity row and the version row land
         # together. The version row is immutable (INSERT OR IGNORE keeps the
-        # original created_at); tags and prerequisites are mutable metadata,
-        # rewritten last-write-wins.
+        # original created_at); the whole definition — goal, graders, tags,
+        # context — is part of the content hash.
         with self._transaction():
             self._ensure_task_identity(task.id, now_iso)
             self._connection.execute(
                 "UPDATE tasks SET updated_at = ? WHERE id = ?",
                 (now_iso, task.id),
             )
-            # Register a bare identity for any not-yet-defined prerequisite so
-            # task_prerequisites.prereq_task_id -> tasks(id) holds regardless
-            # of the order tasks in a DAG are saved.
-            for prereq_id in data["prerequisites"]:
-                self._ensure_task_identity(prereq_id, now_iso)
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO task_versions (
-                    task_id, content_hash, goal, graders_json, context_json,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    task_id, content_hash, goal, graders_json, tags_json,
+                    context_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.id,
                     content_hash,
                     data["goal"],
                     json.dumps(data["graders"]),
+                    json.dumps(data["tags"]),
                     json.dumps(data["context"]),
                     now_iso,
                 ),
             )
-            self._connection.execute(
-                "DELETE FROM task_tags WHERE task_id = ?", (task.id,)
-            )
-            self._connection.executemany(
-                "INSERT INTO task_tags (task_id, tag, position) "
-                "VALUES (?, ?, ?)",
-                [(task.id, tag, i) for i, tag in enumerate(data["tags"])],
-            )
-            self._connection.execute(
-                "DELETE FROM task_prerequisites WHERE task_id = ?",
-                (task.id,),
-            )
-            self._connection.executemany(
-                "INSERT INTO task_prerequisites "
-                "(task_id, prereq_task_id, position) VALUES (?, ?, ?)",
-                [
-                    (task.id, prereq_id, i)
-                    for i, prereq_id in enumerate(data["prerequisites"])
-                ],
-            )
         return content_hash
-
-    def _load_task_tags(self, task_id: str) -> list[str]:
-        rows = self._connection.execute(
-            "SELECT tag FROM task_tags WHERE task_id = ? ORDER BY position",
-            (task_id,),
-        ).fetchall()
-        return [r["tag"] for r in rows]
-
-    def _load_task_prerequisites(self, task_id: str) -> list[str]:
-        rows = self._connection.execute(
-            "SELECT prereq_task_id FROM task_prerequisites "
-            "WHERE task_id = ? ORDER BY position",
-            (task_id,),
-        ).fetchall()
-        return [r["prereq_task_id"] for r in rows]
 
     def load_task(
         self, task_id: str, content_hash: str | None = None
     ) -> Task | None:
         if content_hash is not None:
             row = self._connection.execute(
-                "SELECT goal, graders_json, context_json FROM task_versions "
-                "WHERE task_id = ? AND content_hash = ?",
+                "SELECT goal, graders_json, tags_json, context_json "
+                "FROM task_versions WHERE task_id = ? AND content_hash = ?",
                 (task_id, content_hash),
             ).fetchone()
         else:
             row = self._connection.execute(
-                "SELECT goal, graders_json, context_json FROM task_versions "
-                "WHERE task_id = ? "
+                "SELECT goal, graders_json, tags_json, context_json "
+                "FROM task_versions WHERE task_id = ? "
                 "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
         if row is None:
             return None
-        # tags and prerequisites are reattached from their current relational
-        # rows — they are mutable metadata, not part of the pinned version.
         return deserialize_task(
             {
                 "id": task_id,
                 "goal": row["goal"],
                 "graders": json.loads(row["graders_json"]),
-                "prerequisites": self._load_task_prerequisites(task_id),
-                "tags": self._load_task_tags(task_id),
+                "tags": json.loads(row["tags_json"]),
                 "context": json.loads(row["context_json"]),
             }
         )

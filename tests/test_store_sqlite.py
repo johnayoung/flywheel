@@ -56,8 +56,6 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
         assert names == {
             "tasks",
             "task_versions",
-            "task_tags",
-            "task_prerequisites",
             "lifecycles",
             "attempts",
             "events",

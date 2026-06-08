@@ -42,27 +42,23 @@
 -- by substituting a `${schema}.` qualifier prefix in front of every
 -- object name at bootstrap).
 
--- Task identity, versions, and orchestration metadata are modeled as three
--- tiers so every task reference in the store is a checkable foreign key
--- rather than a free-floating string:
+-- Task definitions are content-addressed across two tables so every task
+-- reference in the store is a checkable foreign key rather than a free-
+-- floating string:
 --
---   tasks               -- the logical task (stable id). The FK anchor.
---   task_versions       -- immutable, content-addressed definitions.
---   task_tags           -- mutable labels for grouping/filtering.
---   task_prerequisites  -- mutable DAG edges for dependency scheduling.
+--   tasks          -- the logical task (stable id). The FK anchor.
+--   task_versions  -- immutable, content-addressed definitions.
 --
--- A user thinks in all three tiers: a task is a durable thing they author,
--- tag, depend on, and run repeatedly (tasks); each run pins the exact
--- definition it executed (task_versions); and harnesses layered on flywheel
--- read tags + prerequisites to build parallelizable task DAGs (task_tags,
--- task_prerequisites). Splitting them lets the definition stay immutable
--- while the orchestration metadata around it stays editable.
+-- Flywheel owns the lifecycle of a *single* task, so the catalog records only
+-- what defines and verifies that one task: goal, graders, tags, context. The
+-- dependency DAG between tasks (prerequisites) is not a flywheel-core concept
+-- — it belongs to the orchestration layer built on top of flywheel, which
+-- keeps its own scheduling state — so it is deliberately absent here.
 
 -- tasks: the logical task identity. One row per id, created the first time a
--- task is saved or referenced. Carries no definition — it exists so that
--- task_versions, task_tags, task_prerequisites, and lifecycles can all
--- foreign-key a real, catalogued identity. A row may exist with no
--- task_versions yet (a task declared as a prerequisite before it is defined).
+-- task is saved or referenced by a run. Carries no definition — it exists so
+-- that task_versions and lifecycles can foreign-key a real, catalogued
+-- identity rather than a bare string.
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
   first_seen_at TIMESTAMPTZ NOT NULL,
@@ -71,17 +67,16 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 -- task_versions: immutable, content-addressed task definitions. Keyed by
 -- (task_id, content_hash) where content_hash is flywheel.loaders.task_digest
--- over the *executed* definition — goal, graders, and context only. tags and
--- prerequisites are deliberately excluded from the hash: they are mutable
--- orchestration metadata (see task_tags / task_prerequisites), so retagging
--- or rewiring the DAG never forks the definition a run pinned. Storage is
--- immutable and deduped; a run pins the exact version it ran via
--- lifecycles.task_content_hash.
+-- over the definition — goal, graders, tags, context. Storage is immutable
+-- and deduped: re-saving an unchanged definition is a no-op, editing any
+-- hashed field adds a new version row. A run pins the exact version it ran via
+-- lifecycles.task_content_hash, so historical truth survives later edits.
 CREATE TABLE IF NOT EXISTS task_versions (
   task_id       TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
   goal          TEXT NOT NULL,
   graders_json  JSONB NOT NULL,
+  tags_json     JSONB NOT NULL,
   context_json  JSONB NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL,
   PRIMARY KEY (task_id, content_hash),
@@ -89,39 +84,6 @@ CREATE TABLE IF NOT EXISTS task_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_task_versions_id_created
   ON task_versions(task_id, created_at);
-
--- task_tags: mutable labels on a logical task. Not part of the content hash,
--- so editing tags does not fork a definition. last-write-wins on save_task.
--- position preserves authoring order on read; the idx over tag serves the
--- reverse lookup ("every task labelled X") that grouping/filtering harnesses
--- rely on.
-CREATE TABLE IF NOT EXISTS task_tags (
-  task_id   TEXT NOT NULL,
-  tag       TEXT NOT NULL,
-  position  INTEGER NOT NULL,
-  PRIMARY KEY (task_id, tag),
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
-);
-CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag);
-
--- task_prerequisites: mutable DAG edges. Both endpoints foreign-key tasks(id)
--- so a task can never depend on an uncatalogued id; save_task auto-registers
--- a bare identity row for any prerequisite that has not been defined yet, so
--- a DAG can be authored in any order without violating the FK. The CHECK
--- mirrors the schema rule that a task cannot be its own prerequisite. The idx
--- over prereq_task_id serves the dependents lookup ("everything waiting on
--- X") that a parallel scheduler walks to release the ready frontier.
-CREATE TABLE IF NOT EXISTS task_prerequisites (
-  task_id         TEXT NOT NULL,
-  prereq_task_id  TEXT NOT NULL,
-  position        INTEGER NOT NULL,
-  PRIMARY KEY (task_id, prereq_task_id),
-  FOREIGN KEY (task_id) REFERENCES tasks(id),
-  FOREIGN KEY (prereq_task_id) REFERENCES tasks(id),
-  CHECK (task_id <> prereq_task_id)
-);
-CREATE INDEX IF NOT EXISTS idx_task_prerequisites_prereq
-  ON task_prerequisites(prereq_task_id);
 
 -- lifecycles: the single mutable row per run, keyed by run_id. version drives
 -- optimistic concurrency — every update carries an expected version and a
@@ -338,7 +300,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version (id, version) VALUES (1, 7)
+INSERT INTO schema_version (id, version) VALUES (1, 8)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

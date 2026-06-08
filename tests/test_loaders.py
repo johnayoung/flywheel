@@ -395,13 +395,17 @@ def test_task_digest_ignores_id() -> None:
     assert task_digest(a) == task_digest(b)
 
 
-def test_task_digest_changes_when_executed_definition_changes() -> None:
-    # The digest covers the *executed* definition: goal, graders, context.
+def test_task_digest_changes_when_definition_changes() -> None:
+    # The digest covers the definition: goal, graders, tags, context.
     base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
     digest = task_digest(base)
     assert task_digest(Task(id="x", goal="g2", graders=base.graders)) != digest
     assert (
         task_digest(Task(id="x", goal="g", graders=[CommandGrader(run="false")]))
+        != digest
+    )
+    assert (
+        task_digest(Task(id="x", goal="g", graders=base.graders, tags=["a"]))
         != digest
     )
     assert (
@@ -417,16 +421,11 @@ def test_task_digest_changes_when_executed_definition_changes() -> None:
     )
 
 
-def test_task_digest_ignores_tags_and_prerequisites() -> None:
-    # tags and prerequisites are mutable orchestration metadata stored
-    # relationally, not part of the immutable definition — editing them must
-    # not fork the version a run pinned.
+def test_task_digest_ignores_prerequisites() -> None:
+    # prerequisites is the inter-task DAG — an orchestration-layer concept, not
+    # part of the single-task definition this hash addresses.
     base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
     digest = task_digest(base)
-    assert (
-        task_digest(Task(id="x", goal="g", graders=base.graders, tags=["a"]))
-        == digest
-    )
     assert (
         task_digest(
             Task(id="x", goal="g", graders=base.graders, prerequisites=["dep"])

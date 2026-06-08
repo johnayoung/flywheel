@@ -273,23 +273,22 @@ def deserialize_task(data: Mapping[str, Any]) -> Task:
 
 
 def task_digest(task: Task) -> str:
-    """Content hash of a task's *executed* definition: goal, graders, context.
+    """Content hash of a task's definition: goal, graders, tags, context.
 
-    Two tasks with the same goal/graders/context share a digest regardless of
-    ``id``, ``tags``, or ``prerequisites``. Editing the goal, a grader, or the
-    context yields a new digest (a new immutable version a run can pin);
-    editing tags or prerequisites does not. That is deliberate: tags and
-    prerequisites are mutable orchestration metadata (grouping, filtering, and
-    DAG edges that harnesses layered on flywheel rewire freely), not part of
-    the work a run executed — so they are versioned out of the content hash
-    and stored relationally instead (see ``task_tags`` / ``task_prerequisites``
-    in the persistence schema). Used as the version discriminator in the
-    content-addressed ``task_versions`` store, so a run can pin the exact
-    definition it executed.
+    Two tasks with the same goal/graders/tags/context share a digest
+    regardless of ``id``. Editing the goal, a grader, a tag, or the context
+    yields a new digest (a new immutable version a run can pin). ``id`` is
+    excluded so identity does not shape the version. ``prerequisites`` is
+    excluded because it is not a flywheel-core concept at all — the dependency
+    DAG belongs to the orchestration layer built on top of flywheel, not to
+    the single-task definition this hash addresses. Used as the version
+    discriminator in the content-addressed ``task_versions`` store, so a run
+    can pin the exact definition it executed.
     """
     definition = {
         "goal": task.goal,
         "graders": [_grader_to_dict(g) for g in task.graders],
+        "tags": list(task.tags),
         "context": _context_to_dict(task.context),
     }
     canonical = json.dumps(definition, sort_keys=True, separators=(",", ":"))

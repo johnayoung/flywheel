@@ -559,10 +559,10 @@ class PostgresStore:
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
         data = serialize_task(task)
-        # One transaction (one pooled connection) so identity, version, tags,
-        # and prerequisites land together. The version row is immutable
-        # (ON CONFLICT DO NOTHING keeps the original created_at); tags and
-        # prerequisites are mutable metadata, rewritten last-write-wins.
+        # One transaction (one pooled connection) so the identity row and the
+        # version row land together. The version row is immutable (ON CONFLICT
+        # DO NOTHING keeps the original created_at); the whole definition —
+        # goal, graders, tags, context — is part of the content hash.
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 self._ensure_task_identity_cur(cur, task.id, now)
@@ -570,17 +570,12 @@ class PostgresStore:
                     "UPDATE tasks SET updated_at = %s WHERE id = %s",
                     (now, task.id),
                 )
-                # Bare identity for any not-yet-defined prerequisite so
-                # task_prerequisites.prereq_task_id -> tasks(id) holds
-                # regardless of DAG save order.
-                for prereq_id in data["prerequisites"]:
-                    self._ensure_task_identity_cur(cur, prereq_id, now)
                 cur.execute(
                     """
                     INSERT INTO task_versions (
-                        task_id, content_hash, goal, graders_json,
+                        task_id, content_hash, goal, graders_json, tags_json,
                         context_json, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (task_id, content_hash) DO NOTHING
                     """,
                     (
@@ -588,54 +583,12 @@ class PostgresStore:
                         content_hash,
                         data["goal"],
                         Jsonb(data["graders"]),
+                        Jsonb(data["tags"]),
                         Jsonb(data["context"]),
                         now,
                     ),
                 )
-                cur.execute(
-                    "DELETE FROM task_tags WHERE task_id = %s", (task.id,)
-                )
-                if data["tags"]:
-                    cur.executemany(
-                        "INSERT INTO task_tags (task_id, tag, position) "
-                        "VALUES (%s, %s, %s)",
-                        [
-                            (task.id, tag, i)
-                            for i, tag in enumerate(data["tags"])
-                        ],
-                    )
-                cur.execute(
-                    "DELETE FROM task_prerequisites WHERE task_id = %s",
-                    (task.id,),
-                )
-                if data["prerequisites"]:
-                    cur.executemany(
-                        "INSERT INTO task_prerequisites "
-                        "(task_id, prereq_task_id, position) "
-                        "VALUES (%s, %s, %s)",
-                        [
-                            (task.id, prereq_id, i)
-                            for i, prereq_id in enumerate(
-                                data["prerequisites"]
-                            )
-                        ],
-                    )
         return content_hash
-
-    def _load_task_tags(self, cur: Any, task_id: str) -> list[str]:
-        cur.execute(
-            "SELECT tag FROM task_tags WHERE task_id = %s ORDER BY position",
-            (task_id,),
-        )
-        return [r["tag"] for r in cur.fetchall()]
-
-    def _load_task_prerequisites(self, cur: Any, task_id: str) -> list[str]:
-        cur.execute(
-            "SELECT prereq_task_id FROM task_prerequisites "
-            "WHERE task_id = %s ORDER BY position",
-            (task_id,),
-        )
-        return [r["prereq_task_id"] for r in cur.fetchall()]
 
     def load_task(
         self, task_id: str, content_hash: str | None = None
@@ -644,14 +597,14 @@ class PostgresStore:
             with conn.cursor(row_factory=dict_row) as cur:
                 if content_hash is not None:
                     cur.execute(
-                        "SELECT goal, graders_json, context_json "
+                        "SELECT goal, graders_json, tags_json, context_json "
                         "FROM task_versions "
                         "WHERE task_id = %s AND content_hash = %s",
                         (task_id, content_hash),
                     )
                 else:
                     cur.execute(
-                        "SELECT goal, graders_json, context_json "
+                        "SELECT goal, graders_json, tags_json, context_json "
                         "FROM task_versions "
                         "WHERE task_id = %s ORDER BY created_at DESC LIMIT 1",
                         (task_id,),
@@ -659,17 +612,12 @@ class PostgresStore:
                 row = cur.fetchone()
                 if row is None:
                     return None
-                # tags/prerequisites are reattached from their current rows —
-                # mutable metadata, not part of the pinned version.
-                prerequisites = self._load_task_prerequisites(cur, task_id)
-                tags = self._load_task_tags(cur, task_id)
         return deserialize_task(
             {
                 "id": task_id,
                 "goal": row["goal"],
                 "graders": list(row["graders_json"]),
-                "prerequisites": prerequisites,
-                "tags": tags,
+                "tags": list(row["tags_json"]),
                 "context": dict(row["context_json"]),
             }
         )

@@ -1459,54 +1459,61 @@ def test_load_task_for_run_missing_run_returns_none(store: object) -> None:
     assert store.load_task_for_run("never-ran") is None
 
 
-def test_save_task_round_trips_tags_and_prerequisites(store: object) -> None:
+def test_save_task_round_trips_tags(store: object) -> None:
     assert isinstance(store, TaskStore)
     task = Task(
         id="t",
         goal="Do the thing.",
         graders=[CommandGrader(run="true")],
         tags=["http", "reliability"],
-        prerequisites=["dep-a", "dep-b"],
     )
     store.save_task(task, now=_t(0))
     loaded = store.load_task("t")
     assert loaded is not None
-    # Tags and prerequisites round-trip in authoring order through their
-    # relational tables.
+    # tags are part of the persisted definition and round-trip in order.
     assert loaded.tags == ["http", "reliability"]
-    assert loaded.prerequisites == ["dep-a", "dep-b"]
     assert loaded == task
 
 
-def test_editing_tags_or_prerequisites_does_not_fork_the_version(
-    store: object,
-) -> None:
+def test_editing_tags_forks_a_new_version(store: object) -> None:
     assert isinstance(store, TaskStore)
     base = Task(
         id="t",
         goal="Same goal.",
         graders=[CommandGrader(run="true")],
         tags=["a"],
-        prerequisites=["dep-a"],
     )
     retagged = Task(
         id="t",
         goal="Same goal.",
         graders=[CommandGrader(run="true")],
         tags=["b", "c"],
-        prerequisites=[],
     )
     h1 = store.save_task(base, now=_t(0))
     h2 = store.save_task(retagged, now=_t(10))
-    # Same executed definition -> same content hash; no new version forked.
-    assert h1 == h2
-    # The mutable metadata is updated last-write-wins.
+    # tags are part of the content hash, so editing them mints a new version.
+    assert h1 != h2
+    # Latest resolves to the retagged version; each version stays addressable.
+    latest = store.load_task("t")
+    assert latest is not None and latest.tags == ["b", "c"]
+    pinned = store.load_task("t", h1)
+    assert pinned is not None and pinned.tags == ["a"]
+
+
+def test_prerequisites_are_not_persisted_by_core(store: object) -> None:
+    assert isinstance(store, TaskStore)
+    # prerequisites is an orchestration-layer concept; flywheel core records
+    # only the single-task definition, so it round-trips empty.
+    task = Task(
+        id="t",
+        goal="Do the thing.",
+        graders=[CommandGrader(run="true")],
+        prerequisites=["dep-a", "dep-b"],
+    )
+    store.save_task(task, now=_t(0))
     loaded = store.load_task("t")
     assert loaded is not None
-    assert loaded.tags == ["b", "c"]
     assert loaded.prerequisites == []
-    # The pinned version (by hash) reflects the current metadata.
-    assert store.load_task("t", h1) == loaded
 
 
 # --- Control command channel (00013 store layer) ---------------------------

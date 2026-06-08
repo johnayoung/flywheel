@@ -175,24 +175,19 @@ class InMemoryStore:
         # ascending audit ordering per run_id.
         self._run_sequence: dict[str, int] = {}
         self._claims: dict[str, TaskClaim] = {}
-        # Three-tier task model mirroring the persistence schema:
+        # Task model mirroring the persistence schema:
         #   _task_identities  -- logical task id -> first_seen_at (the FK
-        #                        anchor; a run/tag/edge can only reference a
-        #                        registered identity).
+        #                        anchor; a run can only reference a registered
+        #                        identity).
         #   _task_versions    -- (id, content_hash) -> (definition dict,
         #                        created_at, insertion-seq) for deterministic
         #                        "latest version" resolution on ties. The
-        #                        definition dict holds goal/graders/context
-        #                        only (the hashed, immutable part).
-        #   _task_tags        -- id -> ordered tags (mutable metadata).
-        #   _task_prereqs     -- id -> ordered prerequisite ids (mutable DAG
-        #                        edges).
+        #                        definition dict holds the hashed, immutable
+        #                        fields: goal/graders/tags/context.
         self._task_identities: dict[str, datetime] = {}
         self._task_versions: dict[
             tuple[str, str], tuple[dict[str, Any], datetime, int]
         ] = {}
-        self._task_tags: dict[str, list[str]] = {}
-        self._task_prereqs: dict[str, list[str]] = {}
         self._task_seq: int = 0
         # Control-command queue. Rows are kept in a single list with a
         # monotonic ``id`` (the enqueue-order key) so claim_commands can
@@ -248,23 +243,18 @@ class InMemoryStore:
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
         data = serialize_task(task)
-        # Register the task identity and a bare identity for each not-yet-
-        # defined prerequisite (the FK anchors in the durable stores).
+        # Register the task identity (the FK anchor in the durable stores).
         self._task_identities.setdefault(task.id, now)
-        for prereq_id in data["prerequisites"]:
-            self._task_identities.setdefault(prereq_id, now)
         key = (task.id, content_hash)
         if key not in self._task_versions:
             self._task_seq += 1
             definition = {
                 "goal": data["goal"],
                 "graders": data["graders"],
+                "tags": data["tags"],
                 "context": data["context"],
             }
             self._task_versions[key] = (definition, now, self._task_seq)
-        # Tags and prerequisites are mutable metadata: last-write-wins.
-        self._task_tags[task.id] = list(data["tags"])
-        self._task_prereqs[task.id] = list(data["prerequisites"])
         return content_hash
 
     def _assemble_task(
@@ -275,8 +265,7 @@ class InMemoryStore:
                 "id": task_id,
                 "goal": definition["goal"],
                 "graders": definition["graders"],
-                "prerequisites": list(self._task_prereqs.get(task_id, [])),
-                "tags": list(self._task_tags.get(task_id, [])),
+                "tags": definition["tags"],
                 "context": definition["context"],
             }
         )

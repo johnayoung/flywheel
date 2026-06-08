@@ -91,7 +91,7 @@ class ClaimLostError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 7
+CURRENT_SCHEMA_VERSION: int = 8
 
 
 class StoreSchemaError(Exception):
@@ -296,38 +296,34 @@ class LifecycleStore(Protocol):
 
 @runtime_checkable
 class TaskStore(Protocol):
-    """Persistence contract for ``Task`` definitions, modeled in three tiers.
+    """Persistence contract for ``Task`` definitions, content-addressed.
 
-    A task is split across a logical identity, immutable content-addressed
-    *versions*, and mutable orchestration metadata (tags and prerequisites):
+    A task is stored across a logical identity and immutable, content-
+    addressed *versions*:
 
     * The logical task (its stable ``id``) is the identity every other task
-      reference foreign-keys, so a run, tag, or DAG edge can never point at a
-      task the store has never heard of.
+      reference foreign-keys, so a run can never point at a task the store has
+      never heard of.
     * A *version* is keyed ``(id, content_hash)`` where ``content_hash`` is
-      :func:`flywheel.loaders.task_digest` over the executed definition —
-      goal, graders, and context. Versions are immutable and deduplicated:
-      re-saving an unchanged definition is a no-op, while editing
-      goal/graders/context produces a new version. A run pins the exact
-      version it executed via ``Lifecycle.task_content_hash``, so historical
-      truth survives later edits — the same guarantee ``grader_results``
-      gives for graders, extended to the whole definition.
-    * ``tags`` and ``prerequisites`` are mutable metadata stored relationally,
-      *not* in the content hash. Retagging or rewiring the DAG never forks the
-      pinned definition; harnesses layered on flywheel read these as the
-      grouping/filtering and dependency-edge substrate for building
-      parallelizable task DAGs.
+      :func:`flywheel.loaders.task_digest` over the definition — goal,
+      graders, tags, and context. Versions are immutable and deduplicated:
+      re-saving an unchanged definition is a no-op, while editing any hashed
+      field produces a new version. A run pins the exact version it executed
+      via ``Lifecycle.task_content_hash``, so historical truth survives later
+      edits — the same guarantee ``grader_results`` gives for graders,
+      extended to the whole definition.
 
-    * ``save_task`` is idempotent. It registers the task identity (and a bare
-      identity for any not-yet-defined prerequisite), inserts the version row
-      keyed by ``(task.id, digest)`` only if absent, and replaces the task's
-      tags and prerequisites (last-write-wins, since they are mutable). It
+    Flywheel owns a single task's lifecycle; the dependency DAG between tasks
+    (``prerequisites``) is an orchestration-layer concern and is not persisted
+    here.
+
+    * ``save_task`` is idempotent. It registers the task identity and inserts
+      the version row keyed by ``(task.id, digest)`` only if absent; it
       returns the digest. A version's ``created_at`` is set from the injected
       ``now`` on first insert and never mutated thereafter.
     * ``load_task`` returns the exact version when ``content_hash`` is given,
-      else the most recently created version for ``task_id``, reassembled with
-      the task's *current* tags and prerequisites; ``None`` when no version
-      row exists.
+      else the most recently created version for ``task_id``; ``None`` when no
+      version row exists.
     * ``load_task_for_run`` resolves the run's lifecycle ``task_id`` +
       ``task_content_hash`` to the precise version that run executed; ``None``
       when the run or its pinned version is unknown.

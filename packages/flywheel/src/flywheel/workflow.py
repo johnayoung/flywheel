@@ -96,24 +96,7 @@ DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_RETRIES = 1
 
 
-
-
-
-
-# --- Filesystem walking -----------------------------------------------------
-
-
-
-
-
-
-
-
 # --- Status queries ---------------------------------------------------------
-
-
-
-
 
 
 def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
@@ -122,15 +105,6 @@ def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
         (task_id, Status.DONE.value),
     )
     return cursor.fetchone() is not None
-
-
-
-
-
-
-# --- Next-task selection ----------------------------------------------------
-
-
 
 
 # --- Stranded-lifecycle recovery -------------------------------------------
@@ -872,18 +846,6 @@ async def run_task_file(
     )
 
 
-# --- Archive subcommand -----------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-# --- Phase base-SHA capture + diff-vs-base ----------------------------------
 #
 # To compute a phase's cumulative diff at archive-evaluation time the worker
 # must record the base SHA at *phase entry* -- by archive time the phase's
@@ -904,16 +866,6 @@ async def run_task_file(
 #     marker, future archive gate) can treat "no base" as "no signal."
 
 
-
-
-
-
-
-
-
-
-
-# --- Loop-path opt-out artifact ---------------------------------------------
 #
 # A phase that has been auto-flagged as loop-path-bearing (see
 # ``flywheel.loop_path_marker``) but whose author can attest the diff added
@@ -933,25 +885,11 @@ async def run_task_file(
 # re-check the recorded claim against the same diff that motivated it.
 
 
-
-
-
-
-
-
-
-
-
-
 # --- CLI plumbing -----------------------------------------------------------
-
-
 
 
 def _resolve_db(arg: str | None) -> Path:
     return Path(arg) if arg else DEFAULT_DB_PATH
-
-
 
 
 def _resolve_events_mode(args: argparse.Namespace) -> str:
@@ -1017,16 +955,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0 if outcome.lifecycle.status == Status.DONE else 1
 
 
-
-
-# --- Live progress snapshot -------------------------------------------------
-#
-# `live` answers "what is the agent doing right now, and is it still moving?"
-# by joining the in-flight lifecycles to the most recent sdk_message and event
-# rows. The output is intentionally one line per run -- it is meant to be
-# tail-friendly inside the worker's heartbeat as well as readable on its
-# own. Stale-after threshold is heuristic: a healthy turn can take 30-60s on a
-# slow read or API call, so we wait past that before flagging.
+# --- Shared helpers + is-done -----------------------------------------------
 
 
 # Hard cap on the rendered "action" detail so a runaway tool-call payload can
@@ -1035,55 +964,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 # braces ceiling on the assembled string.
 
 
-
-
-
-
 def _short(value: object, limit: int = 60) -> str:
     text = str(value).replace("\n", " ").replace("\r", " ")
     return text if len(text) <= limit else text[: max(limit - 1, 1)] + "…"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _cmd_is_done(args: argparse.Namespace) -> int:
@@ -1096,14 +979,6 @@ def _cmd_is_done(args: argparse.Namespace) -> int:
     finally:
         store.close()
     return 0 if done else 1
-
-
-
-
-
-
-
-
 
 
 # --- Steering / control commands -----------------------------------------
@@ -1254,8 +1129,6 @@ def _cmd_reject(args: argparse.Namespace) -> int:
     return _enqueue_control_command(
         _resolve_db(args.db), args.run_id, "reject", payload
     )
-
-
 
 
 def _add_common_db(parser: argparse.ArgumentParser) -> None:

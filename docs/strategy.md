@@ -16,7 +16,7 @@ flywheel exposes three contract points the consumer wraps around. No `Strategy` 
 
 ## Reference implementation
 
-`.workflow/worker.py` is the current dogfooding strategy. It drives `flywheel.orchestrator.orchestrate` and injects git through orchestrate's `prepare_sandbox` / `submit` seam: each task runs in its own git worktree at `.workflow/worktrees/<task-id>/` on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `lifecycle.status=done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. The seam keeps all git in the consumer — flywheel core stays git-free.
+The `flywheel-worktree` package (`flywheel_worktree.worker`) is the reference strategy. It drives `flywheel_orchestrator.orchestrate` and injects git through orchestrate's `prepare_sandbox` / `submit` seam: each task runs in its own git worktree on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `lifecycle.status=done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. The seam keeps all git in the consumer — flywheel core stays git-free.
 
 ## Future strategies
 

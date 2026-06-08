@@ -2,6 +2,7 @@
 name = "flywheel-orchestrator"
 version = "0.1.0"
 description = "Multi-task orchestration layer built on flywheel: selection, dependency DAG, claims, multi-worker leasing."
+readme = "README.md"
 requires-python = ">=3.13"
 authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }

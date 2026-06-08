@@ -2,6 +2,7 @@
 name = "flywheel-worktree"
 version = "0.1.0"
 description = "Git-worktree submit strategy and reference worker for flywheel-orchestrator."
+readme = "README.md"
 requires-python = ">=3.13"
 authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }

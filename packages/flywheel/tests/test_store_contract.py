@@ -20,8 +20,7 @@ Fixture quirks:
 
 from __future__ import annotations
 
-import importlib.util
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -60,82 +59,33 @@ from flywheel import (
     replay,
 )
 
-# Postgres backend: gated by docker/testcontainers availability. The
-# container is session-scoped via a module-level cache so a single
-# Postgres instance backs every postgres-parametrized test.
-_PG_CONTAINER_STATE: dict[str, object] = {"checked": False}
+# Stores under test. The Postgres container is provided session-scoped by the
+# root ``conftest.py`` (``postgres_dsn``); a None DSN skips the postgres cases.
+_STORE_BACKENDS = ("memory", "sqlite", "postgres")
 
 
-def _get_postgres_dsn() -> str | None:
-    """Return a Postgres DSN backed by a session-scoped testcontainer,
-    or ``None`` when Docker/testcontainers is unavailable.
-
-    Caches both success and failure across calls so the container starts
-    exactly once per test run and probe failures don't bog down later
-    parametrized cases."""
-    if _PG_CONTAINER_STATE["checked"]:
-        return _PG_CONTAINER_STATE.get("dsn")  # type: ignore[return-value]
-    _PG_CONTAINER_STATE["checked"] = True
-    # The postgres backend needs the `flywheel[postgres]` extra (psycopg +
-    # psycopg_pool) at runtime. Without it, PostgresStore construction
-    # would raise ImportError mid-test; skip cleanly instead.
-    if importlib.util.find_spec("psycopg") is None:
-        _PG_CONTAINER_STATE["reason"] = (
-            "flywheel[postgres] extra not installed (psycopg missing)"
-        )
-        return None
-    try:
-        from testcontainers.postgres import PostgresContainer
-    except ImportError:
-        _PG_CONTAINER_STATE["reason"] = "testcontainers not installed"
-        return None
-    try:
-        container = PostgresContainer("postgres:16-alpine")
-        container.start()
-    except Exception as exc:  # docker daemon missing, image pull failure, etc.
-        _PG_CONTAINER_STATE["reason"] = f"Docker unavailable: {exc}"
-        return None
-    dsn: str = container.get_connection_url(driver=None)
-    _PG_CONTAINER_STATE["container"] = container
-    _PG_CONTAINER_STATE["dsn"] = dsn
-
-    import atexit
-
-    atexit.register(container.stop)
-    return dsn
-
-
-def _postgres_factory(tmp_path: Path) -> object:
-    dsn = _get_postgres_dsn()
-    if dsn is None:
-        pytest.skip(
-            "Postgres backend skipped: "
-            f"{_PG_CONTAINER_STATE.get('reason', 'unknown')}"
-        )
-    from flywheel import PostgresStore
-
-    schema = f"flywheel_test_{uuid4().hex[:12]}"
-    return PostgresStore(dsn, schema=schema, pool_min=1, pool_max=4)
-
-
-# Stores under test. Each value is a callable that, given the test's
-# ``tmp_path``, returns a fresh store. Using ``tmp_path`` for the SQLite
-# variant gives every parametrized case its own DB file. The postgres
-# factory acquires a shared session-scoped container and yields a store
-# bound to a per-test schema.
-_STORE_FACTORIES: dict[str, Callable[[Path], object]] = {
-    "memory": lambda tmp_path: InMemoryStore(),
-    "sqlite": lambda tmp_path: SqliteStore(tmp_path / "contract.db"),
-    "postgres": _postgres_factory,
-}
-
-
-@pytest.fixture(params=sorted(_STORE_FACTORIES), ids=sorted(_STORE_FACTORIES))
+@pytest.fixture(params=_STORE_BACKENDS, ids=_STORE_BACKENDS)
 def store(
-    request: pytest.FixtureRequest, tmp_path: Path
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    postgres_dsn: str | None,
 ) -> Iterator[object]:
-    factory = _STORE_FACTORIES[request.param]
-    instance = factory(tmp_path)
+    param = request.param
+    if param == "memory":
+        instance: object = InMemoryStore()
+    elif param == "sqlite":
+        instance = SqliteStore(tmp_path / "contract.db")
+    else:
+        if postgres_dsn is None:
+            pytest.skip("Postgres backend skipped: no database reachable")
+        from flywheel import PostgresStore
+
+        instance = PostgresStore(
+            postgres_dsn,
+            schema=f"flywheel_test_{uuid4().hex[:12]}",
+            pool_min=1,
+            pool_max=4,
+        )
     try:
         yield instance
     finally:

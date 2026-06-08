@@ -9,7 +9,7 @@ contract suite.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -23,40 +23,37 @@ from flywheel_orchestrator import (
     SqliteClaimStore,
 )
 
-# Reuse the core contract suite's Postgres container bootstrap so we don't
-# stand up a second container. Import works under either pytest import mode.
-try:
-    from tests.test_store_contract import _get_postgres_dsn
-except ImportError:  # pragma: no cover - import-mode dependent
-    from test_store_contract import _get_postgres_dsn
+# The Postgres container is provided session-scoped by the root conftest
+# (``postgres_dsn``); a None DSN skips the postgres cases.
+_STORE_BACKENDS = ("memory", "sqlite", "postgres")
 
 
 def _t(second: int) -> datetime:
     return datetime(2026, 5, 28, 12, 0, second, tzinfo=timezone.utc)
 
 
-def _postgres_factory(tmp_path: Path) -> object:
-    dsn = _get_postgres_dsn()
-    if dsn is None:
-        pytest.skip("Postgres backend skipped: no database reachable")
-    from flywheel_orchestrator import PostgresClaimStore
-
-    schema = f"flywheel_claims_test_{uuid4().hex[:12]}"
-    return PostgresClaimStore(dsn, schema=schema, pool_min=1, pool_max=4)
-
-
-_STORE_FACTORIES: dict[str, Callable[[Path], object]] = {
-    "memory": lambda tmp_path: InMemoryClaimStore(),
-    "sqlite": lambda tmp_path: SqliteClaimStore(tmp_path / "claims.db"),
-    "postgres": _postgres_factory,
-}
-
-
-@pytest.fixture(params=sorted(_STORE_FACTORIES), ids=sorted(_STORE_FACTORIES))
+@pytest.fixture(params=_STORE_BACKENDS, ids=_STORE_BACKENDS)
 def store(
-    request: pytest.FixtureRequest, tmp_path: Path
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    postgres_dsn: str | None,
 ) -> Iterator[object]:
-    instance = _STORE_FACTORIES[request.param](tmp_path)
+    param = request.param
+    if param == "memory":
+        instance: object = InMemoryClaimStore()
+    elif param == "sqlite":
+        instance = SqliteClaimStore(tmp_path / "claims.db")
+    else:
+        if postgres_dsn is None:
+            pytest.skip("Postgres backend skipped: no database reachable")
+        from flywheel_orchestrator import PostgresClaimStore
+
+        instance = PostgresClaimStore(
+            postgres_dsn,
+            schema=f"flywheel_claims_test_{uuid4().hex[:12]}",
+            pool_min=1,
+            pool_max=4,
+        )
     try:
         yield instance
     finally:

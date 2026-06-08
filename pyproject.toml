@@ -11,6 +11,14 @@
 #
 # Dependency arrows point one way only; core imports nothing downstream.
 
+[tool.pytest.ini_options]
+# Each package keeps its own tests/; shared fixtures live in the root conftest.
+testpaths = [
+    "packages/flywheel/tests",
+    "packages/flywheel-orchestrator/tests",
+    "packages/flywheel-worktree/tests",
+]
+
 [tool.uv.workspace]
 members = ["packages/*"]
 

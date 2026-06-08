@@ -69,7 +69,7 @@ def test_import_guard_names_the_postgres_extra(
 # ---------------------------------------------------------------------------
 
 
-from tests.test_store_contract import _get_postgres_dsn  # noqa: E402
+from conftest import _get_postgres_dsn  # noqa: E402
 
 
 def _dsn_or_skip() -> str:

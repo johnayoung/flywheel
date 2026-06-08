@@ -1,6 +1,6 @@
 # Persistence Tables
 
-Reference for the flywheel core store (schema_version **8**). Canonical DDL: `src/flywheel/_schema/persistence-schema.sql` (Postgres mirror alongside). An empty table means "nothing exercised it on this database," not "deprecated."
+Reference for the flywheel core store (schema_version **8**). Canonical DDL: `packages/flywheel/src/flywheel/_schema/persistence-schema.sql` (Postgres mirror alongside). An empty table means "nothing exercised it on this database," not "deprecated."
 
 Flywheel core owns the lifecycle of a **single task**. The catalog therefore records only what defines and verifies one task; cross-task concerns (the dependency DAG) live in the orchestration layer built on top, not here.
 

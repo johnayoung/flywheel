@@ -2,6 +2,22 @@ version = 1
 revision = 3
 requires-python = ">=3.13"
 
+[manifest]
+members = [
+    "flywheel",
+    "flywheel-orchestrator",
+    "flywheel-worktree",
+]
+
+[manifest.dependency-groups]
+dev = [
+    { name = "flywheel", extras = ["postgres"], editable = "packages/flywheel" },
+    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
+    { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "testcontainers", specifier = ">=4.0" },
+]
+
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -252,7 +268,7 @@ wheels = [
 [[package]]
 name = "flywheel"
 version = "0.1.0"
-source = { editable = "." }
+source = { editable = "packages/flywheel" }
 dependencies = [
     { name = "claude-agent-sdk" },
 ]
@@ -263,12 +279,6 @@ postgres = [
     { name = "psycopg-pool" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "testcontainers" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = ">=0.2.83" },
@@ -277,11 +287,27 @@ requires-dist = [
 ]
 provides-extras = ["postgres"]
 
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=9.0.3" },
-    { name = "testcontainers", specifier = ">=4.0" },
+[[package]]
+name = "flywheel-orchestrator"
+version = "0.1.0"
+source = { editable = "packages/flywheel-orchestrator" }
+dependencies = [
+    { name = "flywheel" },
 ]
+
+[package.metadata]
+requires-dist = [{ name = "flywheel", editable = "packages/flywheel" }]
+
+[[package]]
+name = "flywheel-worktree"
+version = "0.1.0"
+source = { editable = "packages/flywheel-worktree" }
+dependencies = [
+    { name = "flywheel-orchestrator" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" }]
 
 [[package]]
 name = "h11"

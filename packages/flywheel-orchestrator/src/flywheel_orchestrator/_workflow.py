@@ -76,6 +76,12 @@ class TaskStatusRow:
     gate the lifecycle is currently parked on; ``None`` in every state
     except ``AWAITING_APPROVAL``. Surfaces use it (together with the
     in-row ``task``) to render the pending gate's instruction.
+
+    ``prerequisites`` is the task's dependency edges (other task ids that
+    must reach DONE first). This is an orchestration-layer concept — not part
+    of the core ``Task`` definition — so the orchestrator reads it from the
+    task source and carries it on the row, where ``select_next_task`` consults
+    it.
     """
 
     task_file: Path
@@ -86,6 +92,22 @@ class TaskStatusRow:
     latest_error: str
     blocked_requires: str | None = None
     awaiting_manual_ordinal: int | None = None
+    prerequisites: tuple[str, ...] = ()
+
+def _read_prerequisites(path: Path) -> tuple[str, ...]:
+    """Read a task file's ``prerequisites`` edges (the orchestration DAG).
+
+    Core ``flywheel`` ignores ``prerequisites`` (it is not part of a single
+    task's definition), so the orchestrator parses it from the task source
+    itself. The file is already known to be valid JSON by the time this is
+    called (``load_active_tasks`` loaded the task through it first).
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    raw = data.get("prerequisites") if isinstance(data, dict) else None
+    return tuple(str(p) for p in raw) if isinstance(raw, list) else ()
 
 def iter_active_phase_dirs(tasks_dir: Path) -> Iterator[Path]:
     """Yield ``active/<phase>`` subdirectories in deterministic order.
@@ -227,6 +249,7 @@ def build_status_rows(
                 latest_error=snapshot.latest_error,
                 blocked_requires=snapshot.blocked_requires,
                 awaiting_manual_ordinal=snapshot.awaiting_manual_ordinal,
+                prerequisites=_read_prerequisites(path),
             )
         )
     return rows
@@ -273,7 +296,7 @@ def select_next_task(
         if not all(
             (dep := by_id.get(prereq_id)) is not None
             and dep.state == TaskState.DONE
-            for prereq_id in row.task.prerequisites
+            for prereq_id in row.prerequisites
         ):
             continue
         return row
@@ -1185,7 +1208,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     row.latest_status.value if row.latest_status else None
                 ),
                 "latest_error": row.latest_error,
-                "prerequisites": list(row.task.prerequisites),
+                "prerequisites": list(row.prerequisites),
             }
             parsed = _parse_blocked_requires(row.blocked_requires)
             if parsed is not None:

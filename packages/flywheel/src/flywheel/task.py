@@ -99,7 +99,6 @@ class Task:
     goal: str
     graders: list[Grader]
     id: str = field(default_factory=_default_id)
-    prerequisites: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     context: Context = field(default_factory=Context)
 
@@ -114,8 +113,3 @@ class Task:
 
         if not isinstance(self.graders, list):
             raise ValidationError("graders must be a list")
-
-        if self.id in self.prerequisites:
-            raise ValidationError(
-                f"prerequisites must not reference the task's own id {self.id!r}"
-            )

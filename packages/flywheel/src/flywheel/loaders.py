@@ -171,10 +171,12 @@ def _task_from_dict(data: Any, source: str) -> Task:
     }
     if "id" in data:
         kwargs["id"] = data["id"]
-    if "prerequisites" in data:
-        kwargs["prerequisites"] = list(data["prerequisites"])
     if "tags" in data:
         kwargs["tags"] = list(data["tags"])
+    # ``prerequisites`` is an orchestration-layer concept (the inter-task DAG),
+    # not part of a single task's definition — flywheel core ignores it here.
+    # Consumers that schedule across tasks parse it from the task source
+    # themselves (see flywheel_orchestrator).
 
     try:
         task = Task(**kwargs)
@@ -261,7 +263,6 @@ def serialize_task(task: Task) -> dict[str, Any]:
         "id": task.id,
         "goal": task.goal,
         "graders": [_grader_to_dict(g) for g in task.graders],
-        "prerequisites": list(task.prerequisites),
         "tags": list(task.tags),
         "context": _context_to_dict(task.context),
     }

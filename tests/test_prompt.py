@@ -37,7 +37,6 @@ def _briefed_task() -> Task:
     return Task(
         id="add-retry-logic",
         goal="HTTP client retries 5xx and timeout failures with exponential backoff.",
-        prerequisites=["setup-http-client"],
         context=Context(
             relevant=[
                 "src/flywheel/http/client.py",

@@ -104,7 +104,8 @@ def test_load_task_file_handles_fully_briefed_task(tmp_path: Path) -> None:
     p = tmp_path / "full.json"
     p.write_text(json.dumps(_fully_briefed()))
     task = load_task_file(p)
-    assert task.prerequisites == ["setup"]
+    # ``prerequisites`` in the file is ignored by core (orchestration-layer
+    # concept); the rest of the briefed fields load.
     assert task.context.relevant == ["src/foo.py"]
     assert task.context.notes == "see ADR"
     assert [g.type for g in task.graders] == [
@@ -421,17 +422,6 @@ def test_task_digest_changes_when_definition_changes() -> None:
     )
 
 
-def test_task_digest_ignores_prerequisites() -> None:
-    # prerequisites is the inter-task DAG — an orchestration-layer concept, not
-    # part of the single-task definition this hash addresses.
-    base = Task(id="x", goal="g", graders=[CommandGrader(run="true")])
-    digest = task_digest(base)
-    assert (
-        task_digest(
-            Task(id="x", goal="g", graders=base.graders, prerequisites=["dep"])
-        )
-        == digest
-    )
 
 
 def test_load_task_file_rejects_non_string_judge_model(tmp_path: Path) -> None:

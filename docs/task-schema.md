@@ -16,11 +16,10 @@ The schema is intentionally minimal: one required field (`goal`), the rest optio
 | --------------- | -------- | --------- | ------------------------------------------ |
 | `graders`       | []Grader | `[]`      | Verification checks; all must pass for `done`. Empty = unverified run (`done` reflects the agent's own claim, nothing external is checked). |
 | `id`            | string   | `uuid4()` | Unique identifier, no whitespace           |
-| `prerequisites` | []string | `[]`      | Task IDs that must complete first          |
 | `tags`          | []string | `[]`      | Free-form labels for filtering and grouping |
 | `context`       | Context  | (empty)   | Briefing material the agent reads upfront  |
 
-`prerequisites` cannot reference the task's own id. Git workflow concerns (commit messages, branch naming) and loading concerns (files, queues, APIs) live outside the schema.
+Flywheel core owns the lifecycle of a *single* task, so the schema describes one task in isolation. Cross-task scheduling — the dependency DAG (`prerequisites`), phases, and queueing — is an **orchestration-layer** concern owned by consumers built on flywheel (e.g. `flywheel-orchestrator`), not part of the core `Task`. A consumer's task source may carry a `prerequisites` key; core ignores it, and the orchestrator parses it to schedule. Git workflow concerns (commit messages, branch naming) and loading concerns (files, queues, APIs) likewise live outside the schema.
 
 ## Context
 

@@ -31,14 +31,12 @@ def test_context_defaults_to_empty() -> None:
     task = Task(goal="g", graders=[CommandGrader(run="x")])
     assert task.context == Context()
     assert task.tags == []
-    assert task.prerequisites == []
 
 
 def test_full_construction_passes_validate() -> None:
     task = Task(
         id="add-retry",
         goal="Retry on 5xx.",
-        prerequisites=["setup-client"],
         tags=["http"],
         context=Context(
             relevant=["src/flywheel/http/client.py"],
@@ -79,17 +77,6 @@ def test_validate_accepts_empty_graders() -> None:
 def test_validate_rejects_non_list_graders() -> None:
     task = Task(goal="g", graders="nope")  # type: ignore[arg-type]
     with pytest.raises(ValidationError, match="graders"):
-        task.validate()
-
-
-def test_validate_rejects_self_referential_prerequisites() -> None:
-    task = Task(
-        id="t1",
-        goal="g",
-        graders=[CommandGrader(run="x")],
-        prerequisites=["t1"],
-    )
-    with pytest.raises(ValidationError, match="prerequisites"):
         task.validate()
 
 

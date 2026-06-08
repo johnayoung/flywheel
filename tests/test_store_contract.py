@@ -1353,22 +1353,6 @@ def test_editing_tags_forks_a_new_version(store: object) -> None:
     assert pinned is not None and pinned.tags == ["a"]
 
 
-def test_prerequisites_are_not_persisted_by_core(store: object) -> None:
-    assert isinstance(store, TaskStore)
-    # prerequisites is an orchestration-layer concept; flywheel core records
-    # only the single-task definition, so it round-trips empty.
-    task = Task(
-        id="t",
-        goal="Do the thing.",
-        graders=[CommandGrader(run="true")],
-        prerequisites=["dep-a", "dep-b"],
-    )
-    store.save_task(task, now=_t(0))
-    loaded = store.load_task("t")
-    assert loaded is not None
-    assert loaded.prerequisites == []
-
-
 # --- Control command channel (00013 store layer) ---------------------------
 
 

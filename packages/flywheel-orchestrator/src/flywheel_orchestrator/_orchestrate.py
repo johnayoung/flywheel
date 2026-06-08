@@ -72,10 +72,12 @@ from flywheel.task import Task
 from flywheel.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
-    TaskStatusRow,
     _stranded_run_ids,
-    build_status_rows,
     run_task_file,
+)
+from flywheel_orchestrator._workflow import (
+    TaskStatusRow,
+    build_status_rows,
     select_next_task,
 )
 

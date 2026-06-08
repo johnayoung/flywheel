@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.workflow import (
+from flywheel_orchestrator._workflow import (
     LOOP_PATH_OPTOUT_FILENAME,
     LoopPathOptOut,
     LoopPathOptOutError,

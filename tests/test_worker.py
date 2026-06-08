@@ -505,7 +505,7 @@ def _live_row(
     """Build a ``flywheel.workflow.LiveRunRow`` without spinning a store."""
     from datetime import datetime, timezone
 
-    from flywheel.workflow import LiveRunRow
+    from flywheel_orchestrator._workflow import LiveRunRow
 
     if last_ts is _LIVE_TS_DEFAULT:
         ts_val = datetime.now(timezone.utc)

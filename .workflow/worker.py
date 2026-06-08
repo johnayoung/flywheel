@@ -56,12 +56,14 @@ from flywheel_orchestrator import (
     orchestrate,
 )
 from flywheel.workflow import (
-    DEFAULT_LOG_DIR,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
+    _format_event_line,
+)
+from flywheel_orchestrator import (
+    DEFAULT_LOG_DIR,
     LOOP_BASE_FILENAME,
     LiveRunRow,
-    _format_event_line,
     archive_completed_phases,
     collect_live_rows,
     iter_active_phase_dirs,

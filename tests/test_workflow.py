@@ -29,22 +29,25 @@ from flywheel.workflow import (
     EVENTS_JSON,
     EVENTS_NONE,
     EVENTS_PLAIN,
+    build_inline_task,
+    main,
+    recover_stranded_lifecycles,
+    run_task_object,
+)
+from flywheel_orchestrator._workflow import (
     LOOP_BASE_FILENAME,
     TaskState,
     archive_completed_phases,
-    build_inline_task,
     build_status_rows,
     collect_live_rows,
     iter_active_phase_dirs,
     iter_active_task_files,
-    main,
     phase_diff_vs_base,
     read_phase_base,
-    recover_stranded_lifecycles,
-    run_task_object,
     select_next_task,
     write_phase_base_if_missing,
 )
+from flywheel_orchestrator._workflow import main as orch_main
 
 
 def _write_task(
@@ -973,7 +976,7 @@ def test_main_next_prints_path_and_exits_zero(
     phase = tmp_path / "active" / "01-phase"
     written = _write_task(phase / "a.json", "a")
     db = tmp_path / "db.sqlite"
-    rc = main(
+    rc = orch_main(
         [
             "next",
             "--tasks-dir",
@@ -991,7 +994,7 @@ def test_main_next_returns_one_when_no_tasks(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     db = tmp_path / "db.sqlite"
-    rc = main(["next", "--tasks-dir", str(tmp_path), "--db", str(db)])
+    rc = orch_main(["next", "--tasks-dir", str(tmp_path), "--db", str(db)])
     assert rc == 1
     assert capsys.readouterr().out == ""
 
@@ -1172,7 +1175,7 @@ def test_main_live_prints_one_line_per_running_task(
         )
     finally:
         store.close()
-    rc = main(["live", "--db", str(db)])
+    rc = orch_main(["live", "--db", str(db)])
     assert rc == 0
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -1185,7 +1188,7 @@ def test_main_live_empty_prints_placeholder(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     db = tmp_path / "db.sqlite"
-    rc = main(["live", "--db", str(db)])
+    rc = orch_main(["live", "--db", str(db)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "(no in-flight runs)"
 
@@ -1303,7 +1306,7 @@ def test_live_renders_zero_totals_when_no_iteration_completed_yet(
 ) -> None:
     """A run that has not completed an iteration still renders breadcrumb
     + action line; totals display as zero / ``--``."""
-    from flywheel.workflow import _format_live_line
+    from flywheel_orchestrator._workflow import _format_live_line
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
@@ -1375,7 +1378,7 @@ def test_live_breadcrumb_renders_attempt_and_iter_from_latest_activity(
 
 
 def test_live_breadcrumb_unknown_when_no_activity(tmp_path: Path) -> None:
-    from flywheel.workflow import _format_live_line
+    from flywheel_orchestrator._workflow import _format_live_line
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
@@ -1395,7 +1398,7 @@ def test_live_breadcrumb_unknown_when_no_activity(tmp_path: Path) -> None:
 def test_live_truncates_overlong_detail(tmp_path: Path) -> None:
     """Very long tool args never wrap unboundedly — the assembled detail is
     capped (00011 edge case)."""
-    from flywheel.workflow import _LIVE_DETAIL_MAX_WIDTH, _format_live_line
+    from flywheel_orchestrator._workflow import _LIVE_DETAIL_MAX_WIDTH, _format_live_line
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
@@ -1513,7 +1516,7 @@ def test_main_live_includes_totals_and_breadcrumb_in_rendered_output(
         )
     finally:
         store.close()
-    rc = main(["live", "--db", str(db)])
+    rc = orch_main(["live", "--db", str(db)])
     assert rc == 0
     out = capsys.readouterr().out
     line = next(ln for ln in out.splitlines() if "task-render" in ln)
@@ -1535,7 +1538,7 @@ def test_main_status_json_emits_machine_readable(
     phase = tmp_path / "active" / "01"
     _write_task(phase / "a.json", "a")
     db = tmp_path / "db.sqlite"
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -1655,7 +1658,7 @@ def test_main_recover_prints_run_ids(
         seeded = _seed_running(store, "task-x")
     finally:
         store.close()
-    rc = main(["recover", "--db", str(db)])
+    rc = orch_main(["recover", "--db", str(db)])
     assert rc == 0
     out = capsys.readouterr().out.strip().splitlines()
     assert out == [seeded.run_id]
@@ -1674,7 +1677,7 @@ def test_main_recover_task_id_finalizes_only_that_task(
         b = _seed_running(store, "task-b")
     finally:
         store.close()
-    rc = main(["recover", "--db", str(db), "--task-id", "task-a"])
+    rc = orch_main(["recover", "--db", str(db), "--task-id", "task-a"])
     assert rc == 0
     out = capsys.readouterr().out.strip().splitlines()
     assert out == [a.run_id]
@@ -1699,7 +1702,7 @@ def test_main_recover_empty_prints_placeholder(
     db = tmp_path / "db.sqlite"
     # Touch the store so it exists with no lifecycles.
     SqliteStore(db).close()
-    rc = main(["recover", "--db", str(db)])
+    rc = orch_main(["recover", "--db", str(db)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == "(no stranded lifecycles)"
 
@@ -1715,7 +1718,7 @@ def test_main_recheck_blocked_empty_store_prints_placeholder(
     'lifecycles exist but none with blocked_requires_json'."""
     db = tmp_path / "db.sqlite"
     SqliteStore(db).close()
-    rc = main(
+    rc = orch_main(
         [
             "recheck-blocked",
             "--tasks-dir",
@@ -1757,7 +1760,7 @@ def test_main_recheck_blocked_all_satisfied_transitions_and_prints_unblocked(
     (tmp_path / "ready.flag").write_text("ok")
     monkeypatch.chdir(tmp_path)
 
-    rc = main(
+    rc = orch_main(
         [
             "recheck-blocked",
             "--tasks-dir",
@@ -1813,7 +1816,7 @@ def test_main_recheck_blocked_partially_satisfied_reports_still_blocked(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "recheck-blocked",
             "--tasks-dir",
@@ -1875,7 +1878,7 @@ def test_main_recheck_blocked_run_id_targets_one_lifecycle(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "recheck-blocked",
             "--tasks-dir",
@@ -1932,7 +1935,7 @@ def test_main_recheck_blocked_dry_run_reports_without_transitioning(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "recheck-blocked",
             "--tasks-dir",
@@ -1990,7 +1993,7 @@ def test_main_status_text_includes_blocked_on_for_blocked_interrupted_row(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -2021,7 +2024,7 @@ def test_main_status_text_omits_blocked_on_for_sigint_interrupted_row(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -2057,7 +2060,7 @@ def test_main_status_json_includes_parsed_blocked_requires_when_present(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -3163,7 +3166,7 @@ def test_main_status_renders_awaiting_on_line_with_instruction(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -3203,7 +3206,7 @@ def test_main_status_json_emits_awaiting_on_payload(
     finally:
         store.close()
 
-    rc = main(
+    rc = orch_main(
         [
             "status",
             "--tasks-dir",
@@ -3268,7 +3271,7 @@ def test_main_live_renders_awaiting_on_followup_line(
         )
     finally:
         store.close()
-    rc = main(["live", "--db", str(db)])
+    rc = orch_main(["live", "--db", str(db)])
     assert rc == 0
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if ln.strip()]

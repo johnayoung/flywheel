@@ -63,7 +63,6 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
             "sdk_messages",
             "run_sequence",
             "schema_version",
-            "task_claims",
             "control_commands",
         }
     finally:

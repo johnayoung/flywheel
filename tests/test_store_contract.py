@@ -34,8 +34,6 @@ from flywheel import (
     AttemptStarted,
     AttemptStore,
     AuditStore,
-    ClaimLostError,
-    ClaimStore,
     ControlCommandStore,
     DomainEventStore,
     EventRecord,
@@ -1242,158 +1240,13 @@ def test_domain_events_share_the_event_log_but_not_the_audit_stream(
     assert telemetry[0].sequence == 2
 
 
-# --- Task claim / lease (P5 multi-worker mutual exclusion) -----------------
+# --- Shared deterministic clock helper -------------------------------------
 
 
 def _t(second: int) -> datetime:
     return datetime(2026, 5, 28, 12, 0, second, tzinfo=timezone.utc)
 
 
-def test_store_satisfies_claim_store_protocol(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-
-
-def test_acquire_claim_on_free_task_succeeds(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    claim = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert claim is not None
-    assert claim.task_id == "task-a"
-    assert claim.worker_id == "worker-1"
-    assert claim.version == 1
-    assert claim.lease_expires_at == _t(30)
-    loaded = store.load_claim("task-a")
-    assert loaded is not None and loaded.worker_id == "worker-1"
-
-
-def test_acquire_claim_held_by_live_other_worker_returns_none(
-    store: object,
-) -> None:
-    assert isinstance(store, ClaimStore)
-    first = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert first is not None
-    # Still well within the lease window: a different worker cannot claim.
-    second = store.acquire_claim(
-        "task-a", "worker-2", now=_t(10), lease_seconds=30
-    )
-    assert second is None
-    # The original claim is untouched.
-    loaded = store.load_claim("task-a")
-    assert loaded is not None and loaded.worker_id == "worker-1"
-
-
-def test_acquire_claim_reacquires_own_live_claim(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    first = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert first is not None
-    again = store.acquire_claim(
-        "task-a", "worker-1", now=_t(5), lease_seconds=30
-    )
-    assert again is not None
-    assert again.worker_id == "worker-1"
-    assert again.version == 2
-    assert again.lease_expires_at == _t(35)
-
-
-def test_acquire_claim_steals_expired_lease(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    first = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert first is not None
-    # now is past the lease end -> a different worker reclaims it.
-    stolen = store.acquire_claim(
-        "task-a", "worker-2", now=_t(31), lease_seconds=30
-    )
-    assert stolen is not None
-    assert stolen.worker_id == "worker-2"
-    assert stolen.version == 2
-
-
-def test_renew_extends_lease_and_bumps_version(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    claim = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert claim is not None
-    renewed = store.renew_claim(claim, now=_t(20), lease_seconds=30)
-    assert renewed.version == 2
-    assert renewed.lease_expires_at == _t(50)
-    # A different worker still cannot claim while the renewed lease is live.
-    assert (
-        store.acquire_claim(
-            "task-a", "worker-2", now=_t(40), lease_seconds=30
-        )
-        is None
-    )
-
-
-def test_renew_after_steal_raises_claim_lost(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    claim = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert claim is not None
-    # worker-2 steals after expiry, bumping the version.
-    stolen = store.acquire_claim(
-        "task-a", "worker-2", now=_t(31), lease_seconds=30
-    )
-    assert stolen is not None
-    # worker-1's stale token no longer matches -> it learns it lost.
-    with pytest.raises(ClaimLostError) as exc_info:
-        store.renew_claim(claim, now=_t(35), lease_seconds=30)
-    assert exc_info.value.task_id == "task-a"
-
-
-def test_release_frees_the_task_for_another_worker(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    claim = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert claim is not None
-    store.release_claim(claim)
-    assert store.load_claim("task-a") is None
-    # Even within the original lease window, the task is now free.
-    reclaimed = store.acquire_claim(
-        "task-a", "worker-2", now=_t(5), lease_seconds=30
-    )
-    assert reclaimed is not None
-    assert reclaimed.worker_id == "worker-2"
-
-
-def test_release_with_stale_token_is_noop(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    claim = store.acquire_claim(
-        "task-a", "worker-1", now=_t(0), lease_seconds=30
-    )
-    assert claim is not None
-    stolen = store.acquire_claim(
-        "task-a", "worker-2", now=_t(31), lease_seconds=30
-    )
-    assert stolen is not None
-    # worker-1 releasing its stale token must not drop worker-2's claim.
-    store.release_claim(claim)
-    loaded = store.load_claim("task-a")
-    assert loaded is not None and loaded.worker_id == "worker-2"
-
-
-def test_claims_are_independent_per_task(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    a = store.acquire_claim("task-a", "worker-1", now=_t(0), lease_seconds=30)
-    b = store.acquire_claim("task-b", "worker-2", now=_t(0), lease_seconds=30)
-    assert a is not None and b is not None
-    assert store.load_claim("task-a").worker_id == "worker-1"  # type: ignore[union-attr]
-    assert store.load_claim("task-b").worker_id == "worker-2"  # type: ignore[union-attr]
-
-
-def test_load_missing_claim_returns_none(store: object) -> None:
-    assert isinstance(store, ClaimStore)
-    assert store.load_claim("nope") is None
 
 
 # --- TaskStore --------------------------------------------------------------

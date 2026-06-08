@@ -62,13 +62,14 @@ from flywheel.harness import (
     resolve_manual_approval,
 )
 from flywheel.lifecycle import Status
-from flywheel.store_protocols import (
-    ClaimLostError,
-    OptimisticConcurrencyError,
-    TaskClaim,
-)
+from flywheel.store_protocols import OptimisticConcurrencyError
 from flywheel.store_sqlite import SqliteStore
 from flywheel.task import Task
+from flywheel_orchestrator._claims import (
+    ClaimLostError,
+    SqliteClaimStore,
+    TaskClaim,
+)
 from flywheel.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
@@ -196,6 +197,7 @@ def _is_awaiting_approval(row: TaskStatusRow) -> bool:
 
 def _recover_claimable_stranded(
     control: SqliteStore,
+    claims: SqliteClaimStore,
     worker_id: str,
     *,
     lease_seconds: float,
@@ -216,7 +218,7 @@ def _recover_claimable_stranded(
         lifecycle = control.load_lifecycle(run_id)
         if lifecycle is None:
             continue
-        claim = control.acquire_claim(
+        claim = claims.acquire_claim(
             lifecycle.task_id,
             worker_id,
             now=now(),
@@ -231,7 +233,7 @@ def _recover_claimable_stranded(
             if finalize_stranded_lifecycle(control, run_id, now=now):
                 recovered.append(run_id)
         finally:
-            control.release_claim(claim)
+            claims.release_claim(claim)
     return tuple(recovered)
 
 
@@ -249,13 +251,13 @@ class _ClaimHeartbeat:
     def __init__(
         self,
         *,
-        store: SqliteStore,
+        claims: SqliteClaimStore,
         claim: TaskClaim,
         lease_seconds: float,
         interval: float,
         now: Callable[[], datetime],
     ) -> None:
-        self._store = store
+        self._claims = claims
         self._claim = claim
         self._lease_seconds = lease_seconds
         self._interval = interval
@@ -275,7 +277,7 @@ class _ClaimHeartbeat:
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             try:
-                renewed = self._store.renew_claim(
+                renewed = self._claims.renew_claim(
                     self._claim,
                     now=self._now(),
                     lease_seconds=self._lease_seconds,
@@ -354,10 +356,13 @@ async def orchestrate(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox_root.mkdir(parents=True, exist_ok=True)
 
+    # Two stores on one file: flywheel's core store (lifecycle, run state) and
+    # the orchestrator's own claim store (task_claims). Each owns its tables.
     control = SqliteStore(db_path)
+    claims = SqliteClaimStore(db_path)
     try:
         recovered = _recover_claimable_stranded(
-            control, wid, lease_seconds=lease_seconds, now=clock
+            control, claims, wid, lease_seconds=lease_seconds, now=clock
         )
         runs: list[RunRecord] = []
         attempted_fresh: set[str] = set()
@@ -385,7 +390,7 @@ async def orchestrate(
                 run_id = row.latest_run_id
                 if run_id is None or run_id in attempted_resume:
                     continue
-                claim = control.acquire_claim(
+                claim = claims.acquire_claim(
                     row.task.id,
                     wid,
                     now=clock(),
@@ -434,6 +439,7 @@ async def orchestrate(
                     attempted_resume.add(run_id)
                     record = await _drive_or_relinquish(
                         control,
+                        claims,
                         claim,
                         file_by_id[row.task.id],
                         db_path=db_path,
@@ -460,7 +466,7 @@ async def orchestrate(
                     break
                 finally:
                     if claim is not None:
-                        control.release_claim(claim)
+                        claims.release_claim(claim)
             if progressed:
                 continue
 
@@ -481,7 +487,7 @@ async def orchestrate(
                 run_id = row.latest_run_id
                 if run_id is None or run_id in attempted_approve:
                     continue
-                claim = control.acquire_claim(
+                claim = claims.acquire_claim(
                     row.task.id,
                     wid,
                     now=clock(),
@@ -513,7 +519,7 @@ async def orchestrate(
                     progressed = True
                     break
                 finally:
-                    control.release_claim(claim)
+                    claims.release_claim(claim)
             if progressed:
                 continue
 
@@ -529,7 +535,7 @@ async def orchestrate(
                 pick = select_next_task(rows, exclude_ids=frozenset(exclude))
                 if pick is None:
                     break
-                claim = control.acquire_claim(
+                claim = claims.acquire_claim(
                     pick.task.id,
                     wid,
                     now=clock(),
@@ -547,7 +553,7 @@ async def orchestrate(
                     # A failing provider skips this task for the session
                     # (already in attempted_fresh) and keeps draining the
                     # rest, rather than unwinding the whole worker.
-                    control.release_claim(claim)
+                    claims.release_claim(claim)
                     if stream is not None:
                         print(
                             f"[orchestrate] {pick.task.id}: prepare failed "
@@ -558,6 +564,7 @@ async def orchestrate(
                     continue
                 record = await _drive_or_relinquish(
                     control,
+                    claims,
                     claim,
                     pick.task_file,
                     db_path=db_path,
@@ -590,10 +597,12 @@ async def orchestrate(
         )
     finally:
         control.close()
+        claims.close()
 
 
 async def _drive_under_lease(
     control: SqliteStore,
+    claims: SqliteClaimStore,
     claim: TaskClaim,
     task_file: Path,
     *,
@@ -628,7 +637,7 @@ async def _drive_under_lease(
     sandbox is left untouched (parked) for the next attempt to reuse.
     """
     heartbeat = _ClaimHeartbeat(
-        store=control,
+        claims=claims,
         claim=claim,
         lease_seconds=lease_seconds,
         interval=heartbeat_interval,
@@ -658,7 +667,7 @@ async def _drive_under_lease(
             )
     finally:
         latest = heartbeat.stop()
-        control.release_claim(latest)
+        claims.release_claim(latest)
     return RunRecord(
         task_id=task_id,
         run_id=outcome.lifecycle.run_id,
@@ -670,6 +679,7 @@ async def _drive_under_lease(
 
 async def _drive_or_relinquish(
     control: SqliteStore,
+    claims: SqliteClaimStore,
     claim: TaskClaim,
     task_file: Path,
     *,
@@ -696,6 +706,7 @@ async def _drive_or_relinquish(
     try:
         return await _drive_under_lease(
             control,
+            claims,
             claim,
             task_file,
             task_id=task_id,

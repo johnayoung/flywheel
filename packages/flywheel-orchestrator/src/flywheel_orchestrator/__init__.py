@@ -8,6 +8,15 @@ the on-disk task queue / phases, and driving each chosen task through
 around. The ``flywheel-orchestrate`` console command is its CLI.
 """
 
+from typing import TYPE_CHECKING
+
+from flywheel_orchestrator._claims import (
+    ClaimLostError,
+    ClaimStore,
+    InMemoryClaimStore,
+    SqliteClaimStore,
+    TaskClaim,
+)
 from flywheel_orchestrator._orchestrate import (
     DEFAULT_LEASE_SECONDS,
     OrchestratorReport,
@@ -18,6 +27,22 @@ from flywheel_orchestrator._orchestrate import (
     Submitter,
     orchestrate,
 )
+
+if TYPE_CHECKING:
+    from flywheel_orchestrator._claims_postgres import (
+        PostgresClaimStore as PostgresClaimStore,
+    )
+
+
+def __getattr__(name: str) -> object:
+    """Lazy re-export so the ``postgres`` extra stays optional."""
+    if name == "PostgresClaimStore":
+        from flywheel_orchestrator._claims_postgres import PostgresClaimStore
+
+        return PostgresClaimStore
+    raise AttributeError(
+        f"module 'flywheel_orchestrator' has no attribute {name!r}"
+    )
 from flywheel_orchestrator._workflow import (
     DEFAULT_LOG_DIR,
     DEFAULT_TASKS_DIR,
@@ -43,8 +68,14 @@ from flywheel_orchestrator._workflow import (
 )
 
 __all__ = [
+    "ClaimLostError",
+    "ClaimStore",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_LOG_DIR",
+    "InMemoryClaimStore",
+    "PostgresClaimStore",
+    "SqliteClaimStore",
+    "TaskClaim",
     "DEFAULT_TASKS_DIR",
     "LOOP_BASE_FILENAME",
     "LOOP_PATH_OPTOUT_FILENAME",

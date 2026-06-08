@@ -24,7 +24,7 @@ Storage layout follows the table boundaries in
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from flywheel.event_serde import event_from_record, event_kind, event_payload
@@ -42,7 +42,6 @@ from flywheel.notifier import RunNotifier
 from flywheel.task import Task
 from flywheel.store_protocols import (
     AuditRecord,
-    ClaimLostError,
     ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
@@ -51,7 +50,6 @@ from flywheel.store_protocols import (
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
     SdkMessageRecord,
-    TaskClaim,
 )
 
 # Page cap matches the sqlite/postgres ``read_audit_since`` cap; consumers
@@ -174,7 +172,6 @@ class InMemoryStore:
         # save_sdk_messages so the two write paths produce one strictly
         # ascending audit ordering per run_id.
         self._run_sequence: dict[str, int] = {}
-        self._claims: dict[str, TaskClaim] = {}
         # Task model mirroring the persistence schema:
         #   _task_identities  -- logical task id -> first_seen_at (the FK
         #                        anchor; a run can only reference a registered
@@ -546,71 +543,6 @@ class InMemoryStore:
         ]
         rows.sort(key=lambda r: r.ordinal)
         return [_clone_grader_result(r) for r in rows]
-
-    # --- ClaimStore --------------------------------------------------------
-
-    def acquire_claim(
-        self,
-        task_id: str,
-        worker_id: str,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim | None:
-        existing = self._claims.get(task_id)
-        free = (
-            existing is None
-            or existing.lease_expires_at <= now
-            or existing.worker_id == worker_id
-        )
-        if not free:
-            return None
-        version = existing.version + 1 if existing is not None else 1
-        claim = TaskClaim(
-            task_id=task_id,
-            worker_id=worker_id,
-            claimed_at=now,
-            lease_expires_at=now + timedelta(seconds=lease_seconds),
-            version=version,
-        )
-        self._claims[task_id] = claim
-        return claim
-
-    def renew_claim(
-        self,
-        claim: TaskClaim,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim:
-        existing = self._claims.get(claim.task_id)
-        if (
-            existing is None
-            or existing.version != claim.version
-            or existing.worker_id != claim.worker_id
-        ):
-            raise ClaimLostError(claim.task_id)
-        renewed = TaskClaim(
-            task_id=claim.task_id,
-            worker_id=claim.worker_id,
-            claimed_at=existing.claimed_at,
-            lease_expires_at=now + timedelta(seconds=lease_seconds),
-            version=existing.version + 1,
-        )
-        self._claims[claim.task_id] = renewed
-        return renewed
-
-    def release_claim(self, claim: TaskClaim) -> None:
-        existing = self._claims.get(claim.task_id)
-        if (
-            existing is not None
-            and existing.version == claim.version
-            and existing.worker_id == claim.worker_id
-        ):
-            del self._claims[claim.task_id]
-
-    def load_claim(self, task_id: str) -> TaskClaim | None:
-        return self._claims.get(task_id)
 
     # --- ControlCommandStore -----------------------------------------------
 

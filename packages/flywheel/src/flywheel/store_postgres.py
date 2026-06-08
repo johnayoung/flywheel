@@ -39,7 +39,7 @@ import logging
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
 from typing import Any, cast
@@ -72,7 +72,6 @@ from flywheel.task import Task
 from flywheel.store_protocols import (
     CURRENT_SCHEMA_VERSION,
     AuditRecord,
-    ClaimLostError,
     ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
@@ -82,7 +81,6 @@ from flywheel.store_protocols import (
     OptimisticConcurrencyError,
     SdkMessageRecord,
     StoreSchemaError,
-    TaskClaim,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -1233,113 +1231,6 @@ class PostgresStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_grader_result(r) for r in rows]
-
-    # --- ClaimStore -------------------------------------------------------
-
-    def acquire_claim(
-        self,
-        task_id: str,
-        worker_id: str,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim | None:
-        lease_expires = now + timedelta(seconds=lease_seconds)
-        # One atomic statement: insert when free, or steal/re-acquire on
-        # conflict only when the existing lease has lapsed or is already
-        # ours. A live claim held by another worker fails the DO UPDATE
-        # WHERE, so RETURNING yields no row and we return None.
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO task_claims (
-                        task_id, worker_id, claimed_at, lease_expires_at,
-                        version
-                    ) VALUES (%s, %s, %s, %s, 1)
-                    ON CONFLICT (task_id) DO UPDATE SET
-                        worker_id = EXCLUDED.worker_id,
-                        claimed_at = EXCLUDED.claimed_at,
-                        lease_expires_at = EXCLUDED.lease_expires_at,
-                        version = task_claims.version + 1
-                    WHERE task_claims.lease_expires_at <= EXCLUDED.claimed_at
-                       OR task_claims.worker_id = EXCLUDED.worker_id
-                    RETURNING version
-                    """,
-                    (task_id, worker_id, now, lease_expires),
-                )
-                row = cur.fetchone()
-        if row is None:
-            return None
-        return TaskClaim(
-            task_id=task_id,
-            worker_id=worker_id,
-            claimed_at=now,
-            lease_expires_at=lease_expires,
-            version=int(row[0]),
-        )
-
-    def renew_claim(
-        self,
-        claim: TaskClaim,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim:
-        lease_expires = now + timedelta(seconds=lease_seconds)
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE task_claims
-                    SET lease_expires_at = %s, version = version + 1
-                    WHERE task_id = %s AND version = %s AND worker_id = %s
-                    RETURNING version
-                    """,
-                    (lease_expires, claim.task_id, claim.version,
-                     claim.worker_id),
-                )
-                row = cur.fetchone()
-        if row is None:
-            raise ClaimLostError(claim.task_id)
-        return TaskClaim(
-            task_id=claim.task_id,
-            worker_id=claim.worker_id,
-            claimed_at=claim.claimed_at,
-            lease_expires_at=lease_expires,
-            version=int(row[0]),
-        )
-
-    def release_claim(self, claim: TaskClaim) -> None:
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM task_claims "
-                    "WHERE task_id = %s AND version = %s AND worker_id = %s",
-                    (claim.task_id, claim.version, claim.worker_id),
-                )
-
-    def load_claim(self, task_id: str) -> TaskClaim | None:
-        with self._pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT task_id, worker_id, claimed_at, lease_expires_at,
-                           version
-                    FROM task_claims WHERE task_id = %s
-                    """,
-                    (task_id,),
-                )
-                row = cur.fetchone()
-        if row is None:
-            return None
-        return TaskClaim(
-            task_id=row["task_id"],
-            worker_id=row["worker_id"],
-            claimed_at=row["claimed_at"],
-            lease_expires_at=row["lease_expires_at"],
-            version=int(row["version"]),
-        )
 
     # --- ControlCommandStore ----------------------------------------------
 

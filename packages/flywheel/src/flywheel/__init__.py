@@ -104,8 +104,6 @@ from flywheel.store_protocols import (
     AttemptStore,
     AuditRecord,
     AuditStore,
-    ClaimLostError,
-    ClaimStore,
     ControlCommandRecord,
     ControlCommandStore,
     DomainEventStore,
@@ -122,7 +120,6 @@ from flywheel.store_protocols import (
     SdkMessageStore,
     StoreConflictError,
     StoreSchemaError,
-    TaskClaim,
     TaskStore,
 )
 from flywheel.task import (
@@ -178,8 +175,6 @@ __all__ = [
     "BreachedField",
     "CLOSING_FENCE",
     "CURRENT_SCHEMA_VERSION",
-    "ClaimLostError",
-    "ClaimStore",
     "CommandGrader",
     "CommandGraderRequirement",
     "Context",
@@ -244,7 +239,6 @@ __all__ = [
     "StrategyResult",
     "Subscription",
     "Task",
-    "TaskClaim",
     "TaskLoadError",
     "TaskStore",
     "ToolInteraction",

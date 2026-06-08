@@ -229,29 +229,10 @@ CREATE TABLE IF NOT EXISTS run_sequence (
   next_seq  INTEGER NOT NULL
 );
 
--- task_claims: multi-worker mutual exclusion. At most one row per task_id;
--- a worker acquires the row (when free, expired, or already its own) before
--- running the task and releases it on completion. lease_expires_at is the
--- liveness signal: a crashed worker's claim is reclaimable once its lease
--- lapses. version drives optimistic concurrency for renew/release so a
--- worker whose claim was stolen (lease expired, another worker took over)
--- learns it lost.
---
--- task_id here is intentionally NOT foreign-keyed to tasks(id) — the one
--- task reference in the schema that stays a bare string. A claim is taken
--- before the task definition is recorded (the orchestrator acquires the lease
--- during selection, then run_task saves the task), and it is deleted on
--- completion: this is transient coordination state, not part of the audit
--- record, so it has no catalog row to anchor to and nothing reads it as
--- history. That is the opposite of lifecycles.task_id, which is durable audit
--- state and therefore does foreign-key tasks(id).
-CREATE TABLE IF NOT EXISTS task_claims (
-  task_id          TEXT PRIMARY KEY,
-  worker_id        TEXT NOT NULL,
-  claimed_at       DATETIME NOT NULL,
-  lease_expires_at DATETIME NOT NULL,
-  version          INTEGER NOT NULL
-);
+-- Multi-worker mutual exclusion (the task_claims lease) is NOT a flywheel-core
+-- concern — a single task's lifecycle has no notion of competing workers. It
+-- lives in the orchestration layer's own store (flywheel_orchestrator), which
+-- can share this database file but owns its own tables.
 
 -- control_commands: operator-issued steering commands routed through the
 -- store. A producer (the CLI) enqueues a row; the in-process watcher in
@@ -289,4 +270,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 8);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 9);

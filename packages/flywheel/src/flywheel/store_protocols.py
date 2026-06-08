@@ -72,26 +72,13 @@ class LifecycleNotFoundError(StoreConflictError):
         self.run_id = run_id
 
 
-class ClaimLostError(StoreConflictError):
-    """Raised when ``renew_claim`` finds the claim is no longer the caller's.
-
-    Either the lease lapsed and another worker stole the task, or the claim
-    was released, so the version/worker no longer match. The caller must
-    stop acting on the task — another worker now owns it.
-    """
-
-    def __init__(self, task_id: str) -> None:
-        super().__init__(f"claim on task {task_id!r} lost")
-        self.task_id = task_id
-
-
 # --- Schema-version mismatch signal ----------------------------------------
 
 
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 8
+CURRENT_SCHEMA_VERSION: int = 9
 
 
 class StoreSchemaError(Exception):
@@ -210,24 +197,6 @@ class GraderResultRecord:
     ts: datetime
     grader_name: str | None = None
     id: int | None = None
-
-
-@dataclass(frozen=True, kw_only=True)
-class TaskClaim:
-    """A worker's lease on a task, mirroring one ``task_claims`` row.
-
-    Immutable snapshot: ``acquire_claim`` / ``renew_claim`` return a fresh
-    instance with the bumped ``version`` and extended ``lease_expires_at``.
-    ``version`` and ``worker_id`` together are the optimistic-concurrency
-    key for renew/release — a stale token (wrong version, or a different
-    worker stole the task) is rejected.
-    """
-
-    task_id: str
-    worker_id: str
-    claimed_at: datetime
-    lease_expires_at: datetime
-    version: int
 
 
 @dataclass(kw_only=True)
@@ -487,53 +456,6 @@ class GraderResultStore(Protocol):
 
 
 @runtime_checkable
-class ClaimStore(Protocol):
-    """Per-task lease contract for multi-worker mutual exclusion.
-
-    At most one live claim exists per ``task_id``. A worker acquires it
-    before running the task and releases it on completion; the lease's
-    expiry lets another worker reclaim a task whose worker crashed.
-
-    * ``acquire_claim`` returns a :class:`TaskClaim` when the task is free,
-      the existing lease has expired (the new claim *steals* it), or the
-      caller already holds it (idempotent re-acquire). It returns ``None``
-      when a *live* lease is held by a different worker. The check-and-write
-      is atomic so two workers racing for the same task cannot both win.
-    * ``renew_claim`` extends the lease, bumping ``version``; it raises
-      :class:`ClaimLostError` when the caller's token no longer matches the
-      stored row (stolen after expiry, or released).
-    * ``release_claim`` drops the claim when the token still matches; a
-      no-op if it was already stolen or released.
-    * ``load_claim`` returns the current claim for a task, or ``None``.
-
-    ``now`` is injected (not read from a clock) so lease expiry is
-    deterministic and testable; ``lease_seconds`` sets the new
-    ``lease_expires_at = now + lease_seconds``.
-    """
-
-    def acquire_claim(
-        self,
-        task_id: str,
-        worker_id: str,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim | None: ...
-
-    def renew_claim(
-        self,
-        claim: TaskClaim,
-        *,
-        now: datetime,
-        lease_seconds: float,
-    ) -> TaskClaim: ...
-
-    def release_claim(self, claim: TaskClaim) -> None: ...
-
-    def load_claim(self, task_id: str) -> TaskClaim | None: ...
-
-
-@runtime_checkable
 class ControlCommandStore(Protocol):
     """Persistence contract for operator-issued control commands.
 
@@ -584,8 +506,6 @@ __all__ = [
     "AuditRecord",
     "AuditStore",
     "CURRENT_SCHEMA_VERSION",
-    "ClaimLostError",
-    "ClaimStore",
     "ControlCommandRecord",
     "ControlCommandStore",
     "DomainEventStore",
@@ -602,6 +522,5 @@ __all__ = [
     "SdkMessageStore",
     "StoreConflictError",
     "StoreSchemaError",
-    "TaskClaim",
     "TaskStore",
 ]

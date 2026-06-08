@@ -26,7 +26,7 @@ from flywheel import (
     Status,
     ValidEnvelope,
 )
-from flywheel_orchestrator import orchestrate
+from flywheel_orchestrator import SqliteClaimStore, orchestrate
 from flywheel.store_sqlite import SqliteStore
 
 
@@ -303,7 +303,7 @@ def test_held_claim_makes_orchestrator_skip_the_task(tmp_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     # A peer worker holds a live lease on the only task.
-    holder = SqliteStore(db_path)
+    holder = SqliteClaimStore(db_path)
     try:
         claim = holder.acquire_claim(
             "owned",
@@ -320,7 +320,7 @@ def test_held_claim_makes_orchestrator_skip_the_task(tmp_path: Path) -> None:
     assert report.runs == ()
 
     # Once the lease is released, a fresh orchestrate run picks it up.
-    releaser = SqliteStore(db_path)
+    releaser = SqliteClaimStore(db_path)
     try:
         releaser.release_claim(claim)
     finally:
@@ -336,7 +336,7 @@ def test_claim_is_released_after_a_run(tmp_path: Path) -> None:
     report = _orchestrate(tmp_path, _always_verify())
     assert [r.task_id for r in report.runs] == ["solo"]
 
-    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    store = SqliteClaimStore(tmp_path / "flywheel.sqlite")
     try:
         assert store.load_claim("solo") is None
     finally:
@@ -414,7 +414,7 @@ def test_claim_lost_mid_run_relinquishes_without_killing_worker(
     _write_task(phase, "b-winner")
 
     async def _stub_drive(
-        control, claim, task_file, *, task_id, stream, **kwargs
+        control, claims, claim, task_file, *, task_id, stream, **kwargs
     ):
         if task_id == "a-loser":
             raise OptimisticConcurrencyError(
@@ -556,13 +556,13 @@ def test_awaiting_approval_with_no_pending_command_stays_parked(
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
     from flywheel_orchestrator._orchestrate import _ClaimHeartbeat
 
-    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    store = SqliteClaimStore(tmp_path / "flywheel.sqlite")
     try:
         start = datetime.now(timezone.utc)
         claim = store.acquire_claim("t", "w", now=start, lease_seconds=10)
         assert claim is not None
         heartbeat = _ClaimHeartbeat(
-            store=store,
+            claims=store,
             claim=claim,
             lease_seconds=10,
             interval=0.02,

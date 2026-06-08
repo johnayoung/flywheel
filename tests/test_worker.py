@@ -1,4 +1,4 @@
-"""Tests for the git-worktree consumer ``.workflow/worker.py``.
+"""Tests for the git-worktree consumer ``flywheel_worktree.worker``.
 
 Two layers:
 
@@ -10,15 +10,14 @@ Two layers:
   commits in the sandbox, asserting the task reaches DONE and its branch
   FF-merges into the base.
 
-``.workflow/worker.py`` is not an importable package module, so it is loaded
-via a ``sys.path`` insert of the ``.workflow`` directory.
+The worker now ships as the ``flywheel-worktree`` package; tests import it
+directly as ``flywheel_worktree.worker``.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -33,12 +32,7 @@ from flywheel import (
 )
 from flywheel.store_sqlite import SqliteStore
 from flywheel_orchestrator import SandboxRequest, SubmitRequest
-
-_WORKFLOW_DIR = Path(__file__).resolve().parents[1] / ".workflow"
-if str(_WORKFLOW_DIR) not in sys.path:
-    sys.path.insert(0, str(_WORKFLOW_DIR))
-
-import worker  # noqa: E402  (path-dependent import)
+from flywheel_worktree import worker
 
 
 # --- git helpers ------------------------------------------------------------

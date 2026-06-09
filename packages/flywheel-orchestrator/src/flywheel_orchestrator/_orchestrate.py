@@ -48,7 +48,9 @@ git.
 
 from __future__ import annotations
 
+import asyncio
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +63,7 @@ from flywheel.harness import (
     recheck_blocked_lifecycle,
     resolve_manual_approval,
 )
+from flywheel.invoker_client import CONTROL_COMMAND_INTERRUPT
 from flywheel.lifecycle import Status
 from flywheel.store_protocols import OptimisticConcurrencyError
 from flywheel.store_sqlite import SqliteStore
@@ -103,9 +106,138 @@ from flywheel_orchestrator._workflow import (
 # discipline across the fleet.
 DEFAULT_LEASE_SECONDS: float = 300.0
 
+# How often the source reconciler (the steering bridge) re-lists the work
+# source while runs are in flight. The bridge's rule: an in-flight run whose
+# item is no longer listed by its source gets an ``interrupt`` control
+# command. 15s keeps tracker API traffic negligible while bounding how long
+# a cancelled item keeps burning tokens.
+DEFAULT_RECONCILE_SECONDS: float = 15.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _live_run_rows(control: SqliteStore) -> list[tuple[str, str]]:
+    """``(run_id, task_id)`` for every lifecycle currently in flight.
+
+    Only ``running``/``validating`` qualify: those are the statuses with a
+    live worker session that an ``interrupt`` command can reach.
+    ``AWAITING_APPROVAL`` is deliberately excluded — a parked gate has no
+    session to interrupt, and its disposition belongs to the approve/reject
+    resolver, not the steering bridge.
+    """
+    cursor = control._connection.execute(  # noqa: SLF001 — intentional
+        """
+        SELECT run_id, task_id
+        FROM lifecycles
+        WHERE status IN ('running', 'validating')
+        ORDER BY run_id
+        """
+    )
+    return [(row["run_id"], row["task_id"]) for row in cursor.fetchall()]
+
+
+def reconcile_live_runs(
+    control: SqliteStore,
+    wanted_task_ids: frozenset[str],
+    *,
+    already_signaled: set[str],
+    now: datetime,
+) -> tuple[str, ...]:
+    """Enqueue ``interrupt`` for live runs whose item the source dropped.
+
+    The steering bridge's core: ``wanted_task_ids`` is the current
+    ``list_work()`` projection; any in-flight run whose task id is absent
+    gets one ``interrupt`` control command (the spec-00013 store-routed
+    path — the run's own watcher applies it, so this works for peer
+    workers' runs too). ``already_signaled`` is the caller-owned dedup set:
+    a run is signaled at most once per session even though it stays in
+    ``running`` until the watcher acts. Returns the run ids newly signaled
+    this call.
+
+    The payload attributes the command in the audit stream; the watcher
+    ignores interrupt payloads, so the attribution is free.
+    """
+    signaled: list[str] = []
+    for run_id, task_id in _live_run_rows(control):
+        if task_id in wanted_task_ids or run_id in already_signaled:
+            continue
+        control.enqueue_command(
+            run_id,
+            CONTROL_COMMAND_INTERRUPT,
+            {
+                "origin": "source-reconciler",
+                "reason": (
+                    f"task {task_id!r} is no longer listed by the work "
+                    f"source"
+                ),
+            },
+            now=now,
+        )
+        already_signaled.add(run_id)
+        signaled.append(run_id)
+    return tuple(signaled)
+
+
+async def _source_reconcile_loop(
+    *,
+    source: WorkSource,
+    control: SqliteStore,
+    interval: float,
+    now: Callable[[], datetime],
+    stream: TextIO | None,
+) -> None:
+    """Tick :func:`reconcile_live_runs` every ``interval`` seconds.
+
+    Runs as a sibling asyncio task while :func:`orchestrate` awaits drives,
+    so a mid-run operator edit (closed issue, pulled label, deleted task
+    file) reaches the live session without waiting for the run to end.
+
+    Failure posture: a listing failure NEVER interrupts anything — a
+    tracker hiccup must not be read as "all work vanished" — and a store
+    error skips the tick. Both are logged to ``stream`` and retried on the
+    next tick; the loop only exits by cancellation.
+    """
+    already_signaled: set[str] = set()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            wanted = frozenset(item.task.id for item in source.list_work())
+        except Exception as exc:  # noqa: BLE001 - adapter code
+            if stream is not None:
+                print(
+                    f"[orchestrate] steering: work-source listing failed "
+                    f"({type(exc).__name__}: {exc}); no runs interrupted, "
+                    f"retrying next tick",
+                    file=stream,
+                    flush=True,
+                )
+            continue
+        try:
+            newly = reconcile_live_runs(
+                control,
+                wanted,
+                already_signaled=already_signaled,
+                now=now(),
+            )
+        except Exception as exc:  # noqa: BLE001 - transient store error
+            if stream is not None:
+                print(
+                    f"[orchestrate] steering: reconcile failed "
+                    f"({type(exc).__name__}: {exc}); retrying next tick",
+                    file=stream,
+                    flush=True,
+                )
+            continue
+        if stream is not None:
+            for run_id in newly:
+                print(
+                    f"[orchestrate] steering: run {run_id}'s item vanished "
+                    f"from the work source; interrupt enqueued",
+                    file=stream,
+                    flush=True,
+                )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -328,6 +460,7 @@ async def orchestrate(
     now: Callable[[], datetime] | None = None,
     prepare_sandbox: SandboxProvider | None = None,
     submit: Submitter | None = None,
+    reconcile_seconds: float | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task from the work source to quiescence.
 
@@ -357,6 +490,13 @@ async def orchestrate(
     (still under the lease). Report delivery is best-effort: a raising
     ``report`` is logged to ``stream`` and contained, never unwinding the
     scheduling loop.
+
+    ``reconcile_seconds`` enables the steering bridge: every N seconds a
+    sibling task re-lists the source and enqueues an ``interrupt`` control
+    command for any in-flight run whose item is no longer listed (see
+    :func:`reconcile_live_runs`). ``None``/``0`` (the default) disables it,
+    preserving prior behavior for library callers; the CLI and the worktree
+    daemon enable it by default.
     """
     if source is None:
         if tasks_dir is None:
@@ -394,10 +534,22 @@ async def orchestrate(
     # the orchestrator's own claim store (task_claims). Each owns its tables.
     control = SqliteStore(db_path)
     claims = SqliteClaimStore(db_path)
+    reconciler: asyncio.Task[None] | None = None
     try:
         recovered = _recover_claimable_stranded(
             control, claims, wid, lease_seconds=lease_seconds, now=clock
         )
+        if reconcile_seconds is not None and reconcile_seconds > 0:
+            reconciler = asyncio.create_task(
+                _source_reconcile_loop(
+                    source=source,
+                    control=control,
+                    interval=reconcile_seconds,
+                    now=clock,
+                    stream=stream,
+                ),
+                name="flywheel-source-reconciler",
+            )
         runs: list[RunRecord] = []
         attempted_fresh: set[str] = set()
         attempted_resume: set[str] = set()
@@ -623,6 +775,10 @@ async def orchestrate(
             worker_id=wid, recovered=recovered, runs=tuple(runs)
         )
     finally:
+        if reconciler is not None:
+            reconciler.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconciler
         control.close()
         claims.close()
 
@@ -807,6 +963,7 @@ async def _drive_or_relinquish(
 
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
+    "DEFAULT_RECONCILE_SECONDS",
     "OrchestratorReport",
     "RunRecord",
     "SandboxProvider",
@@ -814,4 +971,5 @@ __all__ = [
     "SubmitRequest",
     "Submitter",
     "orchestrate",
+    "reconcile_live_runs",
 ]

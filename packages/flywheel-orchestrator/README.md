@@ -79,6 +79,18 @@ After each driven run the orchestrator calls `source.report(WorkReport)` with
 the terminal status and the final attempt's grader receipts — under the task
 lease, after `submit`, best-effort (a raising report never unwinds the loop).
 
+## Steering bridge
+
+The work source is also the steering wheel: while runs are in flight, a
+reconciler re-lists the source every `reconcile_seconds` and enqueues an
+`interrupt` control command for any run whose item is no longer listed —
+close the GitHub issue, pull its label, or delete the task JSON, and the
+live session is interrupted (lifecycle parks as `INTERRUPTED`, sandbox
+preserved; restore the item and the run resumes). A listing failure never
+interrupts anything. Off by default for library callers
+(`reconcile_seconds=None`); the CLI and the worktree daemon default to 15s
+(`--reconcile-seconds`, 0 disables).
+
 ## The submit seam
 
 `orchestrate()` provisions a sandbox and acts on each task's terminal status

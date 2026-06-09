@@ -683,6 +683,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
             max_retries=args.max_retries,
             worker_id=args.worker_id,
             lease_seconds=args.lease_seconds,
+            reconcile_seconds=args.reconcile_seconds or None,
         )
     )
     for run_id in report.recovered:
@@ -1623,6 +1624,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "reclaimable. Expiry uses each host's wall clock, so set this "
             "well above (max cross-host clock skew + max heartbeat gap) or a "
             "fast-clocked worker may steal a live peer's lease."
+        ),
+    )
+    p_orchestrate.add_argument(
+        "--reconcile-seconds",
+        type=float,
+        default=15.0,
+        help=(
+            "Steering bridge: re-list the work source every N seconds and "
+            "enqueue an interrupt for any in-flight run whose item is no "
+            "longer listed (closed issue, pulled label, deleted task file). "
+            "0 disables (default: 15)."
         ),
     )
     p_orchestrate.set_defaults(func=_cmd_orchestrate)

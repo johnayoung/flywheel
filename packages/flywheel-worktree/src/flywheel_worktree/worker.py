@@ -762,6 +762,7 @@ def run_once(
     max_retries: int,
     worker_id: str | None = None,
     lease_seconds: float = 300.0,
+    reconcile_seconds: float | None = None,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     log: Logger | None = None,
@@ -796,6 +797,7 @@ def run_once(
             max_retries=max_retries,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
+            reconcile_seconds=reconcile_seconds,
             prepare_sandbox=submitter.prepare,
             submit=submitter.submit,
             stream=stream,
@@ -862,6 +864,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--worker-id", default=None)
     parser.add_argument("--lease-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--reconcile-seconds",
+        type=float,
+        default=15.0,
+        help=(
+            "Steering bridge: re-list the work source every N seconds and "
+            "interrupt in-flight runs whose item vanished (e.g. its task "
+            "file was deleted). 0 disables (default: 15)."
+        ),
+    )
     parser.add_argument(
         "--log-dir",
         default=None,
@@ -958,6 +970,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     max_retries=args.max_retries,
                     worker_id=args.worker_id,
                     lease_seconds=args.lease_seconds,
+                    reconcile_seconds=args.reconcile_seconds or None,
                     stream=sys.stderr,
                     log=log,
                     log_dir=log_dir,

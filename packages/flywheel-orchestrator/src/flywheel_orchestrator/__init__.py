@@ -19,6 +19,7 @@ from flywheel_orchestrator._claims import (
 )
 from flywheel_orchestrator._orchestrate import (
     DEFAULT_LEASE_SECONDS,
+    DEFAULT_RECONCILE_SECONDS,
     OrchestratorReport,
     RunRecord,
     SandboxProvider,
@@ -26,6 +27,7 @@ from flywheel_orchestrator._orchestrate import (
     SubmitRequest,
     Submitter,
     orchestrate,
+    reconcile_live_runs,
 )
 
 if TYPE_CHECKING:
@@ -90,6 +92,7 @@ __all__ = [
     "ClaimStore",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_LOG_DIR",
+    "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DirectoryWorkSource",
     "GithubWorkSource",
@@ -130,6 +133,7 @@ __all__ = [
     "orchestrate",
     "phase_diff_vs_base",
     "read_phase_base",
+    "reconcile_live_runs",
     "select_next_task",
     "status_rows_for_items",
     "task_state",

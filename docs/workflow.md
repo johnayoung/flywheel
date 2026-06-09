@@ -74,6 +74,7 @@ The orchestrator does not consume `.flywheel/tasks/` directly anymore — it con
 
 - **Inbound** — `list_work()` returns `WorkItem`s, each a validated core `Task` plus `prerequisites` and an opaque `source_ref`. Anything that cannot compile to a Task with at least one grader never reaches the scheduler.
 - **Outbound** — `report(WorkReport)` receives each driven run's terminal status, run id, and final grader receipts after the consumer `submit` step, still under the task lease. Delivery is best-effort; a raising report never unwinds the loop. Ticket writes go through this path, never through the agent.
+- **Steering** — a reconciler re-lists the source every `--reconcile-seconds` (default 15, 0 disables) and enqueues an `interrupt` control command for any in-flight run whose item is no longer listed (closed issue, pulled label, deleted task file). A listing failure never interrupts anything. The run parks as `INTERRUPTED` with its sandbox preserved — restore the item and it resumes.
 
 Adapters shipped today:
 

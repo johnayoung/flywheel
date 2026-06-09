@@ -23,6 +23,45 @@ flywheel-orchestrate live               # one line per in-flight run
 flywheel-orchestrate recover            # finalize stranded lifecycles
 ```
 
+## Work sources
+
+Work comes in through a `WorkSource` — anything that can enumerate items
+compiled to flywheel `Task`s and receive outcome reports back:
+
+```python
+from flywheel_orchestrator import DirectoryWorkSource, GithubWorkSource, orchestrate
+
+await orchestrate(source=GithubWorkSource(repo="owner/name", label="flywheel"),
+                  db_path=db, sandbox_root=root)
+```
+
+- `DirectoryWorkSource` — the `.workflow/tasks/active/<phase>/*.json` layout
+  (what `tasks_dir=` wraps; the historical default).
+- `GithubWorkSource` — labeled open issues via the `gh` CLI. An optional
+  fenced ` ```flywheel ` JSON block in the issue body supplies
+  goal/graders/context/prerequisites; issues without graders use the policy's
+  default graders or are skipped. Outcomes post back as comments (or close
+  the issue).
+
+A repo-root `flywheel.toml` selects the source per project and declares
+default graders; the CLI auto-detects it (`--policy` overrides, an explicit
+`--tasks-dir` always wins):
+
+```toml
+[source]
+kind = "github"
+repo = "owner/name"
+label = "flywheel"
+
+[[defaults.graders]]
+type = "command"
+run = "uv run pytest"
+```
+
+After each driven run the orchestrator calls `source.report(WorkReport)` with
+the terminal status and the final attempt's grader receipts — under the task
+lease, after `submit`, best-effort (a raising report never unwinds the loop).
+
 ## The submit seam
 
 `orchestrate()` provisions a sandbox and acts on each task's terminal status

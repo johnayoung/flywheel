@@ -84,6 +84,8 @@ from flywheel.lifecycle import (
 )
 from flywheel.loaders import (
     TaskLoadError,
+    load_graders,
+    load_task_data,
     load_task_directory,
     load_task_file,
     load_tasks_jsonl,
@@ -261,6 +263,8 @@ __all__ = [
     "first_breach",
     "hello",
     "invoke_iteration",
+    "load_graders",
+    "load_task_data",
     "load_task_directory",
     "load_task_file",
     "load_tasks_jsonl",

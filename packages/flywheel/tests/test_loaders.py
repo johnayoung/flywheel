@@ -444,6 +444,55 @@ def test_load_task_file_rejects_non_string_judge_model(tmp_path: Path) -> None:
     assert "judge_model" in msg
 
 
+# ---------- load_task_data / load_graders (non-file twins) ----------
+
+
+def test_load_task_data_builds_validated_task() -> None:
+    from flywheel import load_task_data
+
+    task = load_task_data(
+        {
+            "id": "from-data",
+            "goal": "Build from a decoded payload.",
+            "graders": [{"type": "command", "run": "true"}],
+        },
+        source="api-payload",
+    )
+    assert task.id == "from-data"
+    assert isinstance(task.graders[0], CommandGrader)
+
+
+def test_load_task_data_errors_cite_the_source_label() -> None:
+    from flywheel import load_task_data
+
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_data({"goal": "", "graders": []}, source="issue#42")
+    assert "issue#42" in str(exc.value)
+
+
+def test_load_graders_applies_grader_validation() -> None:
+    from flywheel import load_graders
+
+    graders = load_graders(
+        [
+            {"type": "command", "run": "uv run pytest"},
+            {"type": "transcript", "max_turns": 9},
+        ],
+        source="policy",
+    )
+    assert len(graders) == 2
+    assert isinstance(graders[0], CommandGrader)
+
+    with pytest.raises(TaskLoadError) as exc:
+        load_graders([{"type": "vibes"}], source="policy")
+    assert "policy" in str(exc.value)
+    assert "unknown type" in str(exc.value)
+
+    with pytest.raises(TaskLoadError) as exc2:
+        load_graders({"type": "command"}, source="policy")
+    assert "must be a list" in str(exc2.value)
+
+
 # ---------- coexistence with direct construction ----------
 
 

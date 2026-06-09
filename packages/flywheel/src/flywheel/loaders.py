@@ -28,6 +28,40 @@ class TaskLoadError(ValueError):
     """
 
 
+def load_task_data(data: Any, source: str = "<data>") -> Task:
+    """Build a validated ``Task`` from an already-decoded JSON-shaped value.
+
+    The non-file twin of :func:`load_task_file` for callers that obtained
+    the task dict from somewhere other than disk (an API payload, an issue
+    body, an inline literal). ``source`` labels error messages so failures
+    stay actionable.
+    """
+    return _task_from_dict(data, source)
+
+
+def load_graders(entries: Any, source: str = "<graders>") -> list[Grader]:
+    """Build validated graders from a decoded ``graders``-shaped list.
+
+    Applies exactly the per-entry validation :func:`load_task_file` applies
+    to a task's ``graders`` field. Useful for callers that assemble graders
+    separately from a full task definition (e.g. a default-grader policy
+    applied to externally-sourced work items).
+    """
+    if not isinstance(entries, list):
+        raise TaskLoadError(
+            f"{source}: 'graders' must be a list, got {type(entries).__name__}"
+        )
+    graders: list[Grader] = []
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise TaskLoadError(
+                f"{source}: graders[{idx}] must be an object, "
+                f"got {type(entry).__name__}"
+            )
+        graders.append(_build_grader(entry, source, idx))
+    return graders
+
+
 def load_task_file(path: str | os.PathLike[str]) -> Task:
     """Build a validated ``Task`` from a single JSON file."""
     file_path = Path(path)

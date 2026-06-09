@@ -87,6 +87,7 @@ from flywheel_orchestrator._sources import (
 )
 from flywheel_orchestrator._workflow import (
     TaskStatusRow,
+    _latest_lifecycle_row,
     select_next_task,
     status_rows_for_items,
 )
@@ -940,6 +941,20 @@ async def _drive_or_relinquish(
     authoritative state on the next pass. Consistent with the module's
     invariant that the worst failure mode is wasted latency, never a wrong
     schedule.
+
+    The same containment applies to an **in-band interrupt of this one
+    run**: when a control-command ``interrupt`` (e.g. the steering bridge
+    reacting to a vanished work item) cancels the live SDK stream, the
+    harness finalizes the lifecycle to ``INTERRUPTED`` and re-raises
+    ``CancelledError`` — correct for whole-worker shutdown, fatal for a
+    multi-task session. The discriminator is two-sided: the orchestrate
+    task itself must NOT be the one being cancelled
+    (``current_task().cancelling() == 0`` — a SIGTERM/SIGINT teardown
+    re-raises so the worker actually stops), AND the store must confirm
+    the harness finalized this task's lifecycle to ``INTERRUPTED`` (an
+    unexplained cancellation re-raises rather than being swallowed). A
+    contained interrupt yields a real ``RunRecord`` so the session report
+    still carries the run.
     """
     try:
         return await _drive_under_lease(
@@ -959,6 +974,29 @@ async def _drive_or_relinquish(
                 flush=True,
             )
         return None
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise  # the worker itself is being torn down
+        latest = _latest_lifecycle_row(control, row.task.id)
+        if latest is None or latest[1] is not Status.INTERRUPTED:
+            raise  # not a finalized in-band interrupt; do not swallow
+        interrupted_run_id = latest[0]
+        if stream is not None:
+            print(
+                f"[orchestrate] {row.task.id}: run {interrupted_run_id} "
+                f"interrupted in-band (control command); continuing with "
+                f"remaining tasks",
+                file=stream,
+                flush=True,
+            )
+        return RunRecord(
+            task_id=row.task.id,
+            run_id=interrupted_run_id,
+            status=Status.INTERRUPTED,
+            mode="resume" if kwargs.get("run_id") is not None else "fresh",
+            worker_id=kwargs["worker_id"],
+        )
 
 
 __all__ = [

@@ -281,6 +281,76 @@ def test_listing_failure_never_interrupts(tmp_path: Path) -> None:
     assert report.runs[0].status is Status.DONE
 
 
+def test_inband_interrupt_is_contained_to_one_task(tmp_path: Path) -> None:
+    """A watcher-applied interrupt must not abandon the session's peers.
+
+    The harness finalizes an interrupted run to INTERRUPTED and re-raises
+    CancelledError (correct for whole-worker shutdown). The orchestrator
+    must contain that for a single-run in-band interrupt: record the
+    interrupted run, keep draining the remaining tasks. Reproduced here
+    exactly as the live watcher produces it -- the scripted invoke raises
+    CancelledError mid-iteration, the real harness finalizes, the real
+    orchestrate loop carries on.
+    """
+    source = _MutableSource([_item("doomed"), _item("survivor")])
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        if "doomed" in request.prompt:
+            raise asyncio.CancelledError()
+        return _verify_result()
+
+    report = asyncio.run(
+        orchestrate(
+            source=source,
+            db_path=tmp_path / "flywheel.sqlite",
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_invoke,
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+        )
+    )
+
+    by_task = {r.task_id: r for r in report.runs}
+    assert by_task["doomed"].status is Status.INTERRUPTED
+    assert by_task["survivor"].status is Status.DONE
+
+
+def test_whole_worker_cancellation_still_propagates(tmp_path: Path) -> None:
+    """SIGTERM-style teardown must NOT be swallowed by the containment."""
+
+    started = asyncio.Event()
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        started.set()
+        await asyncio.sleep(30)
+        return _verify_result()
+
+    async def _main() -> None:
+        run = asyncio.ensure_future(
+            orchestrate(
+                source=_MutableSource([_item("long")]),
+                db_path=tmp_path / "flywheel.sqlite",
+                sandbox_root=tmp_path / "sandboxes",
+                invoke=_invoke,
+                max_retries=0,
+                max_turns=4,
+                stream=io.StringIO(),
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=10)
+        run.cancel()
+        try:
+            await run
+        except asyncio.CancelledError:
+            return
+        raise AssertionError(
+            "orchestrate swallowed its own cancellation"
+        )
+
+    asyncio.run(_main())
+
+
 def test_bridge_disabled_by_default(tmp_path: Path) -> None:
     """Library callers see no reconciler unless they opt in."""
     db = tmp_path / "flywheel.sqlite"

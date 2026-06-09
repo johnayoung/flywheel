@@ -65,6 +65,7 @@ from flywheel_orchestrator._sources import (
 from flywheel_orchestrator._workflow import (
     DEFAULT_LOG_DIR,
     DEFAULT_TASKS_DIR,
+    INIT_ROOT,
     LOOP_BASE_FILENAME,
     LOOP_PATH_OPTOUT_FILENAME,
     LiveRunRow,
@@ -99,6 +100,7 @@ __all__ = [
     "SqliteClaimStore",
     "TaskClaim",
     "DEFAULT_TASKS_DIR",
+    "INIT_ROOT",
     "LOOP_BASE_FILENAME",
     "LOOP_PATH_OPTOUT_FILENAME",
     "LiveRunRow",

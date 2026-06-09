@@ -48,6 +48,7 @@ from flywheel.workflow import (
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
     PolicyError,
+    WorkPolicy,
     build_work_source,
     load_policy,
 )
@@ -596,32 +597,52 @@ def _parse_optout_frontmatter(text: str, *, source: str) -> dict[str, str]:
         )
     return fields
 
-def _resolve_tasks_dir(arg: str | None) -> Path:
-    return Path(arg) if arg else DEFAULT_TASKS_DIR
+def _load_effective_policy(args: argparse.Namespace) -> WorkPolicy | None:
+    """Load the policy a CLI invocation should honor, if any.
 
-def _resolve_work_source(args: argparse.Namespace) -> WorkSource:
+    An explicit ``--policy`` file is loaded (and a missing/invalid file is
+    an error); otherwise ``flywheel.toml`` in the working directory is
+    auto-detected; otherwise there is no policy and every default falls
+    back to the legacy ``.workflow/`` layout.
+    """
+    policy_arg = getattr(args, "policy", None)
+    if policy_arg:
+        return load_policy(Path(policy_arg))
+    candidate = Path(DEFAULT_POLICY_FILENAME)
+    if candidate.is_file():
+        return load_policy(candidate)
+    return None
+
+def _resolve_work_source(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> WorkSource:
     """Resolve the work source for a CLI invocation.
 
     Precedence: an explicit ``--tasks-dir`` always selects the directory
-    source (the historical behavior); otherwise an explicit ``--policy``
-    file is loaded; otherwise ``flywheel.toml`` in the working directory is
-    auto-detected; otherwise the default directory layout applies.
+    source (the historical behavior); otherwise the policy decides;
+    otherwise the default directory layout applies.
     """
     if args.tasks_dir:
         return DirectoryWorkSource(Path(args.tasks_dir))
-    policy_arg = getattr(args, "policy", None)
-    policy_path = Path(policy_arg) if policy_arg else None
-    if policy_path is None:
-        candidate = Path(DEFAULT_POLICY_FILENAME)
-        if candidate.is_file():
-            policy_path = candidate
-    if policy_path is not None:
-        return build_work_source(load_policy(policy_path))
+    if policy is not None:
+        return build_work_source(policy)
     return DirectoryWorkSource(DEFAULT_TASKS_DIR)
 
+def _resolve_db_path(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> Path:
+    """``--db`` flag, else the policy's ``[paths] db``, else the legacy
+    ``.workflow/flywheel.sqlite`` default."""
+    if args.db:
+        return Path(args.db)
+    if policy is not None and policy.db_path is not None:
+        return policy.db_path
+    return _resolve_db(None)
+
 def _cmd_next(args: argparse.Namespace) -> int:
-    source = _resolve_work_source(args)
-    db_path = _resolve_db(args.db)
+    policy = _load_effective_policy(args)
+    source = _resolve_work_source(args, policy)
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
@@ -643,13 +664,15 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     # the multi-task CLI moves to the orchestrator package.
     from flywheel_orchestrator import orchestrate
 
-    source = _resolve_work_source(args)
-    db_path = _resolve_db(args.db)
-    sandbox_root = (
-        Path(args.sandbox_root)
-        if args.sandbox_root
-        else Path(".workflow/worktrees")
-    )
+    policy = _load_effective_policy(args)
+    source = _resolve_work_source(args, policy)
+    db_path = _resolve_db_path(args, policy)
+    if args.sandbox_root:
+        sandbox_root = Path(args.sandbox_root)
+    elif policy is not None and policy.sandbox_root is not None:
+        sandbox_root = policy.sandbox_root
+    else:
+        sandbox_root = Path(".workflow/worktrees")
     report = asyncio.run(
         orchestrate(
             source=source,
@@ -1065,7 +1088,7 @@ def _format_live_line(row: LiveRunRow, now: datetime) -> str:
     return head
 
 def _cmd_live(args: argparse.Namespace) -> int:
-    db_path = _resolve_db(args.db)
+    db_path = _resolve_db_path(args, _load_effective_policy(args))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     interval = int(args.watch) if args.watch else 0
 
@@ -1194,8 +1217,9 @@ def _awaiting_instruction_for_row(row: TaskStatusRow) -> str | None:
     return grader.instruction
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    source = _resolve_work_source(args)
-    db_path = _resolve_db(args.db)
+    policy = _load_effective_policy(args)
+    source = _resolve_work_source(args, policy)
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
@@ -1312,8 +1336,9 @@ def _format_recheck_line(
     return f"{run_id}: still blocked ({summary})"
 
 def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
-    source = _resolve_work_source(args)
-    db_path = _resolve_db(args.db)
+    policy = _load_effective_policy(args)
+    source = _resolve_work_source(args, policy)
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
@@ -1377,7 +1402,7 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
         store.close()
 
 def _cmd_recover(args: argparse.Namespace) -> int:
-    db_path = _resolve_db(args.db)
+    db_path = _resolve_db_path(args, _load_effective_policy(args))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
@@ -1392,8 +1417,21 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 def _cmd_archive(args: argparse.Namespace) -> int:
-    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
-    db_path = _resolve_db(args.db)
+    policy = _load_effective_policy(args)
+    if args.tasks_dir:
+        tasks_dir = Path(args.tasks_dir)
+    elif policy is not None and policy.source_kind == "directory":
+        assert policy.tasks_dir is not None  # load_policy guarantees it
+        tasks_dir = policy.tasks_dir
+    elif policy is not None:
+        raise PolicyError(
+            "archive applies to directory work sources only; the active "
+            "policy selects a tracker source (pass --tasks-dir to archive "
+            "a directory layout explicitly)"
+        )
+    else:
+        tasks_dir = DEFAULT_TASKS_DIR
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
@@ -1404,6 +1442,73 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         print(str(dest))
     return 0
 
+
+INIT_ROOT = Path(".flywheel")
+
+_INIT_GITIGNORE = """\
+# Flywheel runtime state: never committed.
+flywheel.sqlite
+flywheel.sqlite-shm
+flywheel.sqlite-wal
+sandboxes/
+worktrees/
+"""
+
+_INIT_POLICY = """\
+# Flywheel work policy: where work comes from and where runtime state lives.
+# Committed with the repo; CLI flags always override.
+
+[source]
+kind = "directory"
+tasks_dir = ".flywheel/tasks"
+
+[paths]
+db = ".flywheel/flywheel.sqlite"
+sandbox_root = ".flywheel/sandboxes"
+
+# Default graders for work items that declare none (tracker sources only;
+# directory task files always declare their own).
+# [[defaults.graders]]
+# type = "command"
+# run = "uv run pytest"
+"""
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Scaffold ``.flywheel/`` and a ``flywheel.toml`` in the working dir.
+
+    Idempotent: existing files are left untouched and reported, so re-running
+    ``init`` never clobbers a tuned policy or an in-use task queue.
+    """
+    created: list[str] = []
+    existing: list[str] = []
+
+    def ensure_file(path: Path, content: str) -> None:
+        if path.exists():
+            existing.append(str(path))
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        created.append(str(path))
+
+    ensure_file(INIT_ROOT / "tasks" / "active" / ".gitkeep", "")
+    ensure_file(INIT_ROOT / "tasks" / "archive" / ".gitkeep", "")
+    ensure_file(INIT_ROOT / ".gitignore", _INIT_GITIGNORE)
+    ensure_file(Path(DEFAULT_POLICY_FILENAME), _INIT_POLICY)
+
+    for path in created:
+        print(f"created: {path}")
+    for path in existing:
+        print(f"exists:  {path} (left untouched)")
+    print()
+    print("Next steps:")
+    print(
+        f"  1. Drop one JSON file per task into "
+        f"{INIT_ROOT}/tasks/active/<phase>/ (see docs/task-schema.md; "
+        f"'goal' and 'graders' are the only required fields)."
+    )
+    print("  2. Run: flywheel-orchestrate orchestrate")
+    print("  3. Watch: flywheel-orchestrate status / live")
+    return 0
 
 def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -1434,6 +1539,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser(
+        "init",
+        help=(
+            "Scaffold .flywheel/ (tasks dir, gitignored runtime state) and "
+            "a flywheel.toml work policy in the current directory. "
+            "Idempotent; never overwrites existing files."
+        ),
+    )
+    p_init.set_defaults(func=_cmd_init)
 
     p_next = sub.add_parser(
         "next",
@@ -1532,6 +1647,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "a glance whether progress is still being made."
         ),
     )
+    _add_common_policy(p_live)
     _add_common_db(p_live)
     p_live.add_argument(
         "--watch",
@@ -1553,6 +1669,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_tasks_dir(p_archive)
+    _add_common_policy(p_archive)
     _add_common_db(p_archive)
     p_archive.set_defaults(func=_cmd_archive)
 
@@ -1595,6 +1712,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "(prints run_ids transitioned to interrupted)."
         ),
     )
+    _add_common_policy(p_recover)
     _add_common_db(p_recover)
     p_recover.add_argument(
         "--task-id",

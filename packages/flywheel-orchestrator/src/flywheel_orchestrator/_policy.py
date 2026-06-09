@@ -16,6 +16,12 @@ Format (TOML, stdlib ``tomllib``)::
     # label = "flywheel"            # required: only issues with this label
     # done_action = "comment"       # or "close" (default "comment")
 
+    # Where runtime state lives (optional). CLI flags still win; without
+    # these the legacy .workflow/ defaults apply.
+    [paths]
+    db = ".flywheel/flywheel.sqlite"
+    sandbox_root = ".flywheel/sandboxes"
+
     # Default grader policy: applied by tracker-backed sources to items
     # that do not declare their own graders. Directory tasks always carry
     # graders (the task schema requires them), so this section is only
@@ -63,7 +69,9 @@ class WorkPolicy:
     ``tasks_dir`` is populated for ``kind = "directory"``;
     ``github_repo``/``github_label``/``github_done_action`` for
     ``kind = "github"``. ``default_graders`` is empty when the file
-    declares none.
+    declares none. ``db_path``/``sandbox_root`` mirror the optional
+    ``[paths]`` table and are ``None`` when unset (the CLI then falls
+    back to its legacy defaults).
     """
 
     source_kind: str
@@ -72,6 +80,8 @@ class WorkPolicy:
     github_label: str | None = None
     github_done_action: str = "comment"
     default_graders: tuple[Grader, ...] = ()
+    db_path: Path | None = None
+    sandbox_root: Path | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -106,6 +116,12 @@ def load_policy(path: Path) -> WorkPolicy:
     except TaskLoadError as exc:
         raise PolicyError(str(exc)) from exc
 
+    paths = data.get("paths") or {}
+    if not isinstance(paths, dict):
+        raise PolicyError(f"{path}: [paths] must be a table")
+    db_path = _optional_path(paths, "db", policy_file=path)
+    sandbox_root = _optional_path(paths, "sandbox_root", policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -118,6 +134,8 @@ def load_policy(path: Path) -> WorkPolicy:
             source_kind="directory",
             tasks_dir=Path(raw_dir) if raw_dir else DEFAULT_TASKS_DIR,
             default_graders=default_graders,
+            db_path=db_path,
+            sandbox_root=sandbox_root,
         )
 
     repo = source.get("repo")
@@ -142,7 +160,22 @@ def load_policy(path: Path) -> WorkPolicy:
         github_label=label,
         github_done_action=done_action,
         default_graders=default_graders,
+        db_path=db_path,
+        sandbox_root=sandbox_root,
     )
+
+
+def _optional_path(
+    table: dict, key: str, *, policy_file: Path
+) -> Path | None:
+    value = table.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise PolicyError(
+            f"{policy_file}: paths.{key} must be a non-empty string"
+        )
+    return Path(value)
 
 
 def build_work_source(policy: WorkPolicy) -> WorkSource:

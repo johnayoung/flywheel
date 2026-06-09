@@ -94,7 +94,9 @@ type = "command"
 run = "uv run pytest"
 ```
 
-`flywheel-orchestrate next|status|orchestrate|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir` always wins and selects the directory source).
+`flywheel-orchestrate next|status|orchestrate|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.workflow/` defaults.
+
+`flywheel-orchestrate init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This is the intended replacement for hand-rolled `.workflow/` setups in new repos.
 
 ## Code vs. convention
 

@@ -13,9 +13,22 @@ Depends on `flywheel`; `flywheel` never depends on this.
 uv add flywheel-orchestrator
 ```
 
+## Quickstart
+
+```bash
+flywheel-orchestrate init               # scaffold .flywheel/ + flywheel.toml
+# drop one JSON file per task into .flywheel/tasks/active/<phase>/
+flywheel-orchestrate orchestrate        # drive everything eligible to done
+```
+
+`init` is idempotent and never overwrites existing files. The generated
+`flywheel.toml` keeps all runtime state (store, sandboxes) under
+`.flywheel/`, gitignored.
+
 ## CLI
 
 ```bash
+flywheel-orchestrate init               # scaffold .flywheel/ + work policy
 flywheel-orchestrate next               # path to the next eligible task
 flywheel-orchestrate orchestrate        # drain every eligible task to quiescence
 flywheel-orchestrate status             # state of every active task
@@ -49,9 +62,13 @@ default graders; the CLI auto-detects it (`--policy` overrides, an explicit
 
 ```toml
 [source]
-kind = "github"
+kind = "github"            # or "directory"
 repo = "owner/name"
 label = "flywheel"
+
+[paths]                    # optional; CLI flags still win
+db = ".flywheel/flywheel.sqlite"
+sandbox_root = ".flywheel/sandboxes"
 
 [[defaults.graders]]
 type = "command"

@@ -89,6 +89,41 @@ def test_default_graders_parse_with_real_validation(tmp_path: Path) -> None:
     assert policy.default_graders[1].max_turns == 50
 
 
+def test_paths_table_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[paths]",
+                    'db = ".flywheel/flywheel.sqlite"',
+                    'sandbox_root = ".flywheel/sandboxes"',
+                ]
+            ),
+        )
+    )
+    assert policy.db_path == Path(".flywheel/flywheel.sqlite")
+    assert policy.sandbox_root == Path(".flywheel/sandboxes")
+
+
+def test_paths_default_to_none(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.db_path is None
+    assert policy.sandbox_root is None
+
+
+def test_paths_reject_non_string_values(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="paths.db"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[paths]\ndb = 7\n',
+            )
+        )
+
+
 # --- validation errors ------------------------------------------------------
 
 

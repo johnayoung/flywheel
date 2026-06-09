@@ -74,12 +74,18 @@ from flywheel.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     _stranded_run_ids,
-    run_task_file,
+    run_task_object,
+)
+from flywheel_orchestrator._sources import (
+    DirectoryWorkSource,
+    GraderReceipt,
+    WorkReport,
+    WorkSource,
 )
 from flywheel_orchestrator._workflow import (
     TaskStatusRow,
-    build_status_rows,
     select_next_task,
+    status_rows_for_items,
 )
 
 # Default lease window and how often the heartbeat renews it. The window is
@@ -137,12 +143,18 @@ class SandboxRequest:
     fresh run; for a resume/recheck it is the lifecycle being continued.
     ``mode`` distinguishes the two so the provider can rebase a parked
     worktree on resume.
+
+    ``task_file`` is populated for file-backed work sources and is an empty
+    ``Path()`` otherwise; ``source_ref`` always carries the source's opaque
+    item handle. Path-deriving providers must treat an empty path as "no
+    file".
     """
 
     task_id: str
     task_file: Path
     run_id: str | None
     mode: Literal["fresh", "resume"]
+    source_ref: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -152,6 +164,8 @@ class SubmitRequest:
     A git-aware consumer uses this to FF-merge the task branch on ``done`` or
     park the ``sandbox`` worktree on a non-done terminal status. ``sandbox``
     is exactly the path the matching :data:`SandboxProvider` returned.
+    ``task_file``/``source_ref`` follow the same convention as
+    :class:`SandboxRequest`.
     """
 
     task_id: str
@@ -159,6 +173,7 @@ class SubmitRequest:
     run_id: str
     status: Status
     sandbox: Path
+    source_ref: str = ""
 
 
 # A consumer maps a SandboxRequest to the directory the task runs in (default:
@@ -299,7 +314,8 @@ class _ClaimHeartbeat:
 
 async def orchestrate(
     *,
-    tasks_dir: Path,
+    tasks_dir: Path | None = None,
+    source: WorkSource | None = None,
     db_path: Path,
     sandbox_root: Path,
     invoke: InvokeFunc | None = None,
@@ -313,7 +329,13 @@ async def orchestrate(
     prepare_sandbox: SandboxProvider | None = None,
     submit: Submitter | None = None,
 ) -> OrchestratorReport:
-    """Drive every eligible task in ``tasks_dir`` to quiescence.
+    """Drive every eligible task from the work source to quiescence.
+
+    Work comes from ``source`` (any
+    :class:`~flywheel_orchestrator._sources.WorkSource`); passing
+    ``tasks_dir`` instead wraps it in the reference
+    :class:`~flywheel_orchestrator._sources.DirectoryWorkSource` — the
+    historical behavior, unchanged. Exactly one of the two must be given.
 
     Returns once this worker can make no further progress: no blocked
     lifecycle it can claim unblocks, and no fresh task is both eligible and
@@ -329,27 +351,39 @@ async def orchestrate(
     status (e.g. FF-merge or park). Both run while the task's lease is held,
     so two workers never merge the same task concurrently; all consumer
     git/strategy code stays in these callbacks, never in flywheel.
+
+    After ``submit``, the run's outcome is projected back to the work
+    source via :meth:`~flywheel_orchestrator._sources.WorkSource.report`
+    (still under the lease). Report delivery is best-effort: a raising
+    ``report`` is logged to ``stream`` and contained, never unwinding the
+    scheduling loop.
     """
+    if source is None:
+        if tasks_dir is None:
+            raise ValueError("orchestrate requires either tasks_dir or source")
+        source = DirectoryWorkSource(tasks_dir)
+    elif tasks_dir is not None:
+        raise ValueError("orchestrate takes tasks_dir or source, not both")
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
 
     def resolve_sandbox(
-        task_id: str,
-        task_file: Path,
+        row: TaskStatusRow,
         run_id: str | None,
         mode: Literal["fresh", "resume"],
     ) -> Path:
         """The directory a task runs in: consumer-provisioned or the default
         ``sandbox_root/<task-id>``."""
         if prepare_sandbox is None:
-            return sandbox_root / task_id
+            return sandbox_root / row.task.id
         return prepare_sandbox(
             SandboxRequest(
-                task_id=task_id,
-                task_file=task_file,
+                task_id=row.task.id,
+                task_file=row.task_file,
                 run_id=run_id,
                 mode=mode,
+                source_ref=row.source_ref,
             )
         )
 
@@ -370,10 +404,10 @@ async def orchestrate(
         attempted_approve: set[str] = set()
 
         while True:
-            rows = build_status_rows(tasks_dir, control)
+            rows = status_rows_for_items(source.list_work(), control)
             task_by_id: dict[str, Task] = {r.task.id: r.task for r in rows}
-            file_by_id: dict[str, Path] = {
-                r.task.id: r.task_file for r in rows
+            row_by_id: dict[str, TaskStatusRow] = {
+                r.task.id: r for r in rows
             }
             blocked_ids = frozenset(
                 r.task.id for r in rows if _is_blocked_interrupted(r)
@@ -407,12 +441,7 @@ async def orchestrate(
                     # session (it never starves peers) rather than unwinding
                     # the worker; the finally releases the claim.
                     try:
-                        sandbox = resolve_sandbox(
-                            row.task.id,
-                            file_by_id[row.task.id],
-                            run_id,
-                            "resume",
-                        )
+                        sandbox = resolve_sandbox(row, run_id, "resume")
                     except Exception as exc:  # noqa: BLE001 - consumer code
                         attempted_resume.add(run_id)
                         if stream is not None:
@@ -441,11 +470,11 @@ async def orchestrate(
                         control,
                         claims,
                         claim,
-                        file_by_id[row.task.id],
+                        row_by_id[row.task.id],
                         db_path=db_path,
                         sandbox=sandbox,
                         submit=submit,
-                        task_id=row.task.id,
+                        work_source=source,
                         run_id=run_id,
                         worker_id=wid,
                         lease_seconds=lease_seconds,
@@ -546,9 +575,7 @@ async def orchestrate(
                     continue
                 attempted_fresh.add(pick.task.id)
                 try:
-                    sandbox = resolve_sandbox(
-                        pick.task.id, pick.task_file, None, "fresh"
-                    )
+                    sandbox = resolve_sandbox(pick, None, "fresh")
                 except Exception as exc:  # noqa: BLE001 - consumer code
                     # A failing provider skips this task for the session
                     # (already in attempted_fresh) and keeps draining the
@@ -566,11 +593,11 @@ async def orchestrate(
                     control,
                     claims,
                     claim,
-                    pick.task_file,
+                    pick,
                     db_path=db_path,
                     sandbox=sandbox,
                     submit=submit,
-                    task_id=pick.task.id,
+                    work_source=source,
                     run_id=None,
                     worker_id=wid,
                     lease_seconds=lease_seconds,
@@ -600,16 +627,41 @@ async def orchestrate(
         claims.close()
 
 
+def _final_grader_receipts(
+    control: SqliteStore, run_id: str
+) -> tuple[GraderReceipt, ...]:
+    """Project the final attempt's grader receipts for a work report.
+
+    Reads the run's attempts and flattens the last attempt's
+    ``grader_results`` rows into :class:`GraderReceipt` values. A run that
+    never reached grading (crash before validate, parked) yields an empty
+    tuple — the report still carries the lifecycle status.
+    """
+    attempts = control.list_attempts(run_id)
+    if not attempts:
+        return ()
+    final_number = attempts[-1].number
+    return tuple(
+        GraderReceipt(
+            ordinal=record.ordinal,
+            grader_type=str(record.grader_type),
+            name=record.grader_name,
+            passed=record.passed,
+        )
+        for record in control.list_grader_results(run_id, final_number)
+    )
+
+
 async def _drive_under_lease(
     control: SqliteStore,
     claims: SqliteClaimStore,
     claim: TaskClaim,
-    task_file: Path,
+    row: TaskStatusRow,
     *,
     db_path: Path,
     sandbox: Path,
     submit: Submitter | None,
-    task_id: str,
+    work_source: WorkSource,
     run_id: str | None,
     worker_id: str,
     lease_seconds: float,
@@ -622,9 +674,10 @@ async def _drive_under_lease(
     now: Callable[[], datetime],
 ) -> RunRecord:
     """Run (or resume) one task while a heartbeat holds its lease, hand the
-    terminal status to ``submit``, then release the lease.
+    terminal status to ``submit``, report it to the work source, then
+    release the lease.
 
-    ``run_task_file`` opens and closes its own store, so its writes are
+    ``run_task_object`` opens and closes its own store, so its writes are
     committed and visible to the orchestrator's control store on the next
     query (separate SQLite connections under WAL). The control store is
     touched only by the heartbeat thread for the duration of the run, never
@@ -635,7 +688,14 @@ async def _drive_under_lease(
     exclusivity that kept peers off the task. It must not raise; a graceful
     SIGTERM cancels the run before this point, so an interrupted task's
     sandbox is left untouched (parked) for the next attempt to reuse.
+
+    ``work_source.report`` runs after ``submit`` (still under the lease) so
+    the external system hears about the outcome only once the consumer's
+    merge/park has settled. Unlike ``submit`` it MAY raise — the exception
+    is contained here and logged to ``stream``; a lost report never costs
+    the schedule.
     """
+    task_id = row.task.id
     heartbeat = _ClaimHeartbeat(
         claims=claims,
         claim=claim,
@@ -644,8 +704,8 @@ async def _drive_under_lease(
         now=now,
     ).start()
     try:
-        outcome = await run_task_file(
-            task_file,
+        outcome = await run_task_object(
+            row.task,
             db_path=db_path,
             sandbox=sandbox,
             model=model,
@@ -654,17 +714,40 @@ async def _drive_under_lease(
             invoke=invoke,
             stream=stream,
             run_id=run_id,
+            source=row.source_ref or None,
         )
         if submit is not None:
             submit(
                 SubmitRequest(
                     task_id=task_id,
-                    task_file=task_file,
+                    task_file=row.task_file,
                     run_id=outcome.lifecycle.run_id,
                     status=outcome.lifecycle.status,
                     sandbox=sandbox,
+                    source_ref=row.source_ref,
                 )
             )
+        try:
+            work_source.report(
+                WorkReport(
+                    task_id=task_id,
+                    source_ref=row.source_ref,
+                    run_id=outcome.lifecycle.run_id,
+                    status=outcome.lifecycle.status,
+                    error=outcome.lifecycle.error or "",
+                    graders=_final_grader_receipts(
+                        control, outcome.lifecycle.run_id
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - adapter code
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: work-source report failed "
+                    f"({type(exc).__name__}: {exc}); continuing",
+                    file=stream,
+                    flush=True,
+                )
     finally:
         latest = heartbeat.stop()
         claims.release_claim(latest)
@@ -681,9 +764,8 @@ async def _drive_or_relinquish(
     control: SqliteStore,
     claims: SqliteClaimStore,
     claim: TaskClaim,
-    task_file: Path,
+    row: TaskStatusRow,
     *,
-    task_id: str,
     stream: TextIO | None,
     **kwargs: Any,
 ) -> RunRecord | None:
@@ -708,15 +790,14 @@ async def _drive_or_relinquish(
             control,
             claims,
             claim,
-            task_file,
-            task_id=task_id,
+            row,
             stream=stream,
             **kwargs,
         )
     except (OptimisticConcurrencyError, ClaimLostError) as exc:
         if stream is not None:
             print(
-                f"[orchestrate] {task_id}: claim lost mid-run "
+                f"[orchestrate] {row.task.id}: claim lost mid-run "
                 f"({type(exc).__name__}); a peer took over, re-evaluating",
                 file=stream,
                 flush=True,

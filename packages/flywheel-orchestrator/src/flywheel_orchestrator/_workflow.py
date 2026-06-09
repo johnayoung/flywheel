@@ -18,7 +18,6 @@ import time
 from collections.abc import (
     Callable,
     Iterable,
-    Iterator,
     Mapping,
 )
 from dataclasses import dataclass
@@ -45,6 +44,21 @@ from flywheel.workflow import (
     _resolve_db,
     _short,
     recover_stranded_lifecycles,
+)
+from flywheel_orchestrator._policy import (
+    DEFAULT_POLICY_FILENAME,
+    PolicyError,
+    build_work_source,
+    load_policy,
+)
+from flywheel_orchestrator._sources import (
+    DirectoryWorkSource,
+    WorkItem,
+    WorkSource,
+    WorkSourceError,
+    iter_active_phase_dirs,
+    iter_active_task_files,
+    load_active_tasks,
 )
 
 DEFAULT_TASKS_DIR = Path(".workflow/tasks")
@@ -82,6 +96,11 @@ class TaskStatusRow:
     of the core ``Task`` definition — so the orchestrator reads it from the
     task source and carries it on the row, where ``select_next_task`` consults
     it.
+
+    ``source_ref`` is the work source's opaque handle for the item (see
+    :class:`flywheel_orchestrator._sources.WorkItem`). ``task_file`` is the
+    on-disk path for file-backed sources and an empty ``Path()`` otherwise —
+    path-deriving consumers must treat an empty path as "no file".
     """
 
     task_file: Path
@@ -93,57 +112,7 @@ class TaskStatusRow:
     blocked_requires: str | None = None
     awaiting_manual_ordinal: int | None = None
     prerequisites: tuple[str, ...] = ()
-
-def _read_prerequisites(path: Path) -> tuple[str, ...]:
-    """Read a task file's ``prerequisites`` edges (the orchestration DAG).
-
-    Core ``flywheel`` ignores ``prerequisites`` (it is not part of a single
-    task's definition), so the orchestrator parses it from the task source
-    itself. The file is already known to be valid JSON by the time this is
-    called (``load_active_tasks`` loaded the task through it first).
-    """
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ()
-    raw = data.get("prerequisites") if isinstance(data, dict) else None
-    return tuple(str(p) for p in raw) if isinstance(raw, list) else ()
-
-def iter_active_phase_dirs(tasks_dir: Path) -> Iterator[Path]:
-    """Yield ``active/<phase>`` subdirectories in deterministic order.
-
-    Filename prefix (``NN-...``) sorts the phases. Hidden directories and
-    files are skipped.
-    """
-    active = tasks_dir / "active"
-    if not active.is_dir():
-        return
-    for entry in sorted(active.iterdir()):
-        if entry.is_dir() and not entry.name.startswith("."):
-            yield entry
-
-def iter_active_task_files(tasks_dir: Path) -> Iterator[Path]:
-    """Yield every ``active/<phase>/<task>.json`` in deterministic order."""
-    for phase in iter_active_phase_dirs(tasks_dir):
-        for entry in sorted(phase.iterdir()):
-            if (
-                entry.is_file()
-                and entry.suffix == ".json"
-                and not entry.name.startswith("_")
-                and not entry.name.startswith(".")
-            ):
-                yield entry
-
-def load_active_tasks(tasks_dir: Path) -> list[tuple[Path, Task]]:
-    """Load every active task; raise ``TaskLoadError`` on the first bad file.
-
-    The list is in deterministic walk order so ``next`` ties break by
-    filename.
-    """
-    out: list[tuple[Path, Task]] = []
-    for path in iter_active_task_files(tasks_dir):
-        out.append((path, load_task_file(path)))
-    return out
+    source_ref: str = ""
 
 _ACTIVE_STATUSES: frozenset[Status] = frozenset(
     {Status.READY, Status.RUNNING, Status.VALIDATING}
@@ -232,16 +201,22 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
         awaiting_manual_ordinal=awaiting_ordinal,
     )
 
-def build_status_rows(
-    tasks_dir: Path, store: SqliteStore
+def status_rows_for_items(
+    items: Iterable[WorkItem], store: SqliteStore
 ) -> list[TaskStatusRow]:
-    """Walk active tasks and return their classified status, in walk order."""
+    """Classify each work item's task against ``store``, in item order.
+
+    The source-agnostic core of :func:`build_status_rows`: items come from
+    any :class:`~flywheel_orchestrator._sources.WorkSource`; the row carries
+    the item's ``source_ref`` and (for file-backed sources) its
+    ``local_path`` so downstream consumers keep their path-derived behavior.
+    """
     rows: list[TaskStatusRow] = []
-    for path, task in load_active_tasks(tasks_dir):
-        snapshot = task_state(store, task)
+    for item in items:
+        snapshot = task_state(store, item.task)
         rows.append(
             TaskStatusRow(
-                task_file=path,
+                task_file=item.local_path if item.local_path else Path(),
                 task=snapshot.task,
                 state=snapshot.state,
                 latest_run_id=snapshot.latest_run_id,
@@ -249,10 +224,19 @@ def build_status_rows(
                 latest_error=snapshot.latest_error,
                 blocked_requires=snapshot.blocked_requires,
                 awaiting_manual_ordinal=snapshot.awaiting_manual_ordinal,
-                prerequisites=_read_prerequisites(path),
+                prerequisites=item.prerequisites,
+                source_ref=item.source_ref,
             )
         )
     return rows
+
+def build_status_rows(
+    tasks_dir: Path, store: SqliteStore
+) -> list[TaskStatusRow]:
+    """Walk active tasks and return their classified status, in walk order."""
+    return status_rows_for_items(
+        DirectoryWorkSource(tasks_dir).list_work(), store
+    )
 
 def select_next_task(
     rows: Iterable[TaskStatusRow],
@@ -615,19 +599,41 @@ def _parse_optout_frontmatter(text: str, *, source: str) -> dict[str, str]:
 def _resolve_tasks_dir(arg: str | None) -> Path:
     return Path(arg) if arg else DEFAULT_TASKS_DIR
 
+def _resolve_work_source(args: argparse.Namespace) -> WorkSource:
+    """Resolve the work source for a CLI invocation.
+
+    Precedence: an explicit ``--tasks-dir`` always selects the directory
+    source (the historical behavior); otherwise an explicit ``--policy``
+    file is loaded; otherwise ``flywheel.toml`` in the working directory is
+    auto-detected; otherwise the default directory layout applies.
+    """
+    if args.tasks_dir:
+        return DirectoryWorkSource(Path(args.tasks_dir))
+    policy_arg = getattr(args, "policy", None)
+    policy_path = Path(policy_arg) if policy_arg else None
+    if policy_path is None:
+        candidate = Path(DEFAULT_POLICY_FILENAME)
+        if candidate.is_file():
+            policy_path = candidate
+    if policy_path is not None:
+        return build_work_source(load_policy(policy_path))
+    return DirectoryWorkSource(DEFAULT_TASKS_DIR)
+
 def _cmd_next(args: argparse.Namespace) -> int:
-    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    source = _resolve_work_source(args)
     db_path = _resolve_db(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
-        rows = build_status_rows(tasks_dir, store)
+        rows = status_rows_for_items(source.list_work(), store)
         pick = select_next_task(rows)
     finally:
         store.close()
     if pick is None:
         return 1
-    print(pick.task_file)
+    # File-backed picks print the path (scripts consume it); external items
+    # print the source's opaque ref.
+    print(pick.task_file if pick.task_file != Path() else pick.source_ref)
     return 0
 
 def _cmd_orchestrate(args: argparse.Namespace) -> int:
@@ -637,7 +643,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     # the multi-task CLI moves to the orchestrator package.
     from flywheel_orchestrator import orchestrate
 
-    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    source = _resolve_work_source(args)
     db_path = _resolve_db(args.db)
     sandbox_root = (
         Path(args.sandbox_root)
@@ -646,7 +652,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     )
     report = asyncio.run(
         orchestrate(
-            tasks_dir=tasks_dir,
+            source=source,
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=args.model,
@@ -1188,12 +1194,12 @@ def _awaiting_instruction_for_row(row: TaskStatusRow) -> str | None:
     return grader.instruction
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    source = _resolve_work_source(args)
     db_path = _resolve_db(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
-        rows = build_status_rows(tasks_dir, store)
+        rows = status_rows_for_items(source.list_work(), store)
     finally:
         store.close()
     if args.json:
@@ -1202,6 +1208,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             entry: dict[str, Any] = {
                 "task_id": row.task.id,
                 "task_file": str(row.task_file),
+                "source_ref": row.source_ref,
                 "state": row.state.value,
                 "latest_run_id": row.latest_run_id,
                 "latest_status": (
@@ -1232,7 +1239,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return 0
     width = max(len(row.task.id) for row in rows)
     for row in rows:
-        phase = row.task_file.parent.name
+        # File-backed rows render their phase directory; external items
+        # (empty task_file) render under their source ref instead.
+        phase = row.task_file.parent.name or row.source_ref or "external"
         suffix = ""
         if row.latest_error:
             suffix = f"  -- {row.latest_error}"
@@ -1303,18 +1312,18 @@ def _format_recheck_line(
     return f"{run_id}: still blocked ({summary})"
 
 def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
-    tasks_dir = _resolve_tasks_dir(args.tasks_dir)
+    source = _resolve_work_source(args)
     db_path = _resolve_db(args.db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SqliteStore(db_path)
     try:
-        # Build a task_id -> Task map by walking the active tasks dir.
-        # An archived (or not-yet-active) task whose lifecycle is blocked
-        # in the store is skipped with a stderr warning so a single
-        # missing file does not crash the batch.
-        task_by_id: dict[str, Task] = {}
-        for _path, task in load_active_tasks(tasks_dir):
-            task_by_id[task.id] = task
+        # Build a task_id -> Task map from the work source. An archived
+        # (or no-longer-listed) task whose lifecycle is blocked in the
+        # store is skipped with a stderr warning so a single missing item
+        # does not crash the batch.
+        task_by_id: dict[str, Task] = {
+            item.task.id: item.task for item in source.list_work()
+        }
 
         if args.run_id:
             lifecycle = store.load_lifecycle(args.run_id)
@@ -1404,6 +1413,18 @@ def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_common_policy(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help=(
+            f"Work-policy file selecting the work source "
+            f"(default: {DEFAULT_POLICY_FILENAME} if present). "
+            f"An explicit --tasks-dir overrides the policy."
+        ),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flywheel-orchestrate",
@@ -1422,6 +1443,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_tasks_dir(p_next)
+    _add_common_policy(p_next)
     _add_common_db(p_next)
     p_next.set_defaults(func=_cmd_next)
 
@@ -1434,6 +1456,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_tasks_dir(p_orchestrate)
+    _add_common_policy(p_orchestrate)
     _add_common_db(p_orchestrate)
     p_orchestrate.add_argument(
         "--sandbox-root",
@@ -1492,6 +1515,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the state of every active task.",
     )
     _add_common_tasks_dir(p_status)
+    _add_common_policy(p_status)
     _add_common_db(p_status)
     p_status.add_argument(
         "--json",
@@ -1542,6 +1566,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_tasks_dir(p_recheck_blocked)
+    _add_common_policy(p_recheck_blocked)
     _add_common_db(p_recheck_blocked)
     p_recheck_blocked.add_argument(
         "--run-id",
@@ -1589,7 +1614,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         return int(args.func(args))
-    except TaskLoadError as exc:
+    except (TaskLoadError, PolicyError, WorkSourceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except FileNotFoundError as exc:

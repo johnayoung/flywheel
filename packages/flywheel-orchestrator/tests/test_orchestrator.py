@@ -413,9 +413,8 @@ def test_claim_lost_mid_run_relinquishes_without_killing_worker(
     _write_task(phase, "a-loser")
     _write_task(phase, "b-winner")
 
-    async def _stub_drive(
-        control, claims, claim, task_file, *, task_id, stream, **kwargs
-    ):
+    async def _stub_drive(control, claims, claim, row, *, stream, **kwargs):
+        task_id = row.task.id
         if task_id == "a-loser":
             raise OptimisticConcurrencyError(
                 f"run-{task_id}", expected_version=1, actual_version=2

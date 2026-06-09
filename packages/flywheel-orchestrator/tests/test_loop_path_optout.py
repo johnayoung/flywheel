@@ -1,7 +1,7 @@
 """Tests for ``flywheel.workflow.load_loop_path_optout``.
 
 Covers the three documented outcomes from the FR-5 opt-out contract in
-``.workflow/specs/00017-FEATURE-in-loop-verification-gate.md``:
+``.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md``:
 
 * the artifact is absent -> the loader returns ``None``;
 * the artifact is present with valid front-matter -> the loader returns

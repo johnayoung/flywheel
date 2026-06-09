@@ -439,7 +439,7 @@ def test_blocked_requires_json_round_trips_through_postgres(
     a non-None value back to NULL must work."""
     payload = (
         '[{"type": "command_grader", "name": "full-suite"}, '
-        '{"type": "file_exists", "path": ".workflow/lkg/.venv", '
+        '{"type": "file_exists", "path": ".flywheel/lkg/.venv", '
         '"present": true}]'
     )
 

@@ -288,7 +288,7 @@ def test_blocked_requires_json_round_trips_through_create_update_load(
     # 2. A non-empty JSON string round-trips byte-for-byte on create.
     payload = (
         '[{"type": "command_grader", "name": "full-suite"}, '
-        '{"type": "file_exists", "path": ".workflow/lkg/.venv", '
+        '{"type": "file_exists", "path": ".flywheel/lkg/.venv", '
         '"present": true}]'
     )
     lc = Lifecycle(

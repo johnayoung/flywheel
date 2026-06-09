@@ -46,9 +46,12 @@ Thumbs.db
 /logs/
 /tmp/
 
-# Per-task worktrees and merge lock managed by .workflow/worker.py
-.workflow/worktrees/
-.workflow/.merge.lock
+# Flywheel runtime state (also covered by .flywheel/.gitignore)
+.flywheel/worktrees/
+.flywheel/sandboxes/
+.flywheel/logs/
+.flywheel/.merge.lock
+.flywheel/flywheel.sqlite*
 
 # Claude Code local config (commands are tracked; the rest is local)
 .claude/*

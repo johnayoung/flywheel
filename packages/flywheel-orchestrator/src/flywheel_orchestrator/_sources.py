@@ -21,7 +21,7 @@ tracker, a queue. Everything tool-specific stays in the adapter:
   the scheduling loop.
 
 :class:`DirectoryWorkSource` is the reference adapter: the historical
-``.workflow/tasks/active/<phase>/*.json`` layout. Its ``report`` is a no-op
+``.flywheel/tasks/active/<phase>/*.json`` layout. Its ``report`` is a no-op
 because the local store *is* the record (phase archiving stays a separate,
 directory-specific flow — see ``archive_completed_phases``).
 """

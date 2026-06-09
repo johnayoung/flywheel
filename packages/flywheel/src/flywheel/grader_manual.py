@@ -1,7 +1,7 @@
 """Manual grader gate-selection and receipt assembly.
 
 Pure module that supports the human-approval gate described in
-``.workflow/specs/00016-FEATURE-manual-grader-approval-gate.md``. The
+``.flywheel/specs/00016-FEATURE-manual-grader-approval-gate.md``. The
 harness/resolver layer drives IO; this module only:
 
 * Selects the next pending :class:`flywheel.task.ManualGrader` on a

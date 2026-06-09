@@ -91,7 +91,7 @@ from flywheel.task import (
 )
 
 
-DEFAULT_DB_PATH = Path(".workflow/flywheel.sqlite")
+DEFAULT_DB_PATH = Path(".flywheel/flywheel.sqlite")
 DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_RETRIES = 1
 
@@ -601,7 +601,7 @@ def _install_cancel_on_signal(
     ``systemctl stop`` — sends SIGTERM, whose default disposition terminates
     the interpreter *without raising*, so the in-flight :func:`run_task`
     never reaches its finalizer and its lifecycle is stranded in ``running``
-    (see ``.workflow/audits/02-harness-resilience.md``). Cancelling the
+    (see ``.flywheel/audits/02-harness-resilience.md``). Cancelling the
     running task instead funnels operator shutdown into the same
     :class:`asyncio.CancelledError` path the caller already drains via
     :func:`finalize_stranded_lifecycle`, so a graceful terminate leaves a
@@ -875,7 +875,7 @@ async def run_task_file(
 # so the claim is falsifiable -- ``/audit-phase`` re-derives the diff
 # signals and emits a finding when an opt-out covers a diff that did add a
 # watched symbol (FR-5, FR-6b of
-# ``.workflow/specs/00017-FEATURE-in-loop-verification-gate.md``).
+# ``.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md``).
 #
 # Format is intentionally minimal: a leading ``---`` ... ``---`` block of
 # ``key: value`` lines, parsed with stdlib only. Required keys are

@@ -48,7 +48,7 @@ await orchestrate(source=GithubWorkSource(repo="owner/name", label="flywheel"),
                   db_path=db, sandbox_root=root)
 ```
 
-- `DirectoryWorkSource` — the `.workflow/tasks/active/<phase>/*.json` layout
+- `DirectoryWorkSource` — the `.flywheel/tasks/active/<phase>/*.json` layout
   (what `tasks_dir=` wraps; the historical default).
 - `GithubWorkSource` — labeled open issues via the `gh` CLI. An optional
   fenced ` ```flywheel ` JSON block in the issue body supplies

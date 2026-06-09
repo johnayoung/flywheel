@@ -6,7 +6,7 @@ tells the harness to abort the attempt and which transition to route to. The
 hang watchdog and harness wiring live in :mod:`flywheel.harness`; the
 ``hang_timeout_seconds`` knob is carried here as pure data only.
 
-See ``.workflow/specs/00015-FEATURE-loop-safety-net.md`` and ``docs/loop.md``
+See ``.flywheel/specs/00015-FEATURE-loop-safety-net.md`` and ``docs/loop.md``
 for the surrounding design. The module is pure: no ``json``/``pathlib``/``io``/
 ``asyncio``/``time`` imports, no ``open()``. Enforced by
 ``tests/test_loop_guard_module_purity.py``.

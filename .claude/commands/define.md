@@ -156,7 +156,7 @@ If ANY checkbox is unchecked, return to STEP 3.
 
 ### Loop-path trigger (in-loop-verification)
 
-Per `.workflow/specs/00017-FEATURE-in-loop-verification-gate.md`, a phase whose cumulative diff trips any of the **Trigger Set** signals below cannot be archived without a DONE task tagged `in-loop-verification`:
+Per `.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md`, a phase whose cumulative diff trips any of the **Trigger Set** signals below cannot be archived without a DONE task tagged `in-loop-verification`:
 
 | # | Signal |
 | - | ------ |
@@ -170,7 +170,7 @@ If the feature plausibly produces any of these, record it in the spec's **Decisi
 
 ## STEP 6: GENERATE FEATURE SPEC
 
-**Spec files MUST be placed at `.workflow/specs/NNNNN-FEATURE-<name>.md`.**
+**Spec files MUST be placed at `.flywheel/specs/NNNNN-FEATURE-<name>.md`.**
 
 ### Determine Next Sequence Number
 
@@ -178,7 +178,7 @@ Before creating the spec file, determine the next available sequence number:
 
 ```bash
 # Find the highest existing sequence number across active and archived specs
-ls .workflow/specs/[0-9]*-FEATURE-*.md .workflow/specs/archive/[0-9]*-FEATURE-*.md 2>/dev/null | \
+ls .flywheel/specs/[0-9]*-FEATURE-*.md .flywheel/specs/archive/[0-9]*-FEATURE-*.md 2>/dev/null | \
   sed 's/.*\/\([0-9]*\)-.*/\1/' | sort -n | tail -1
 ```
 
@@ -186,7 +186,7 @@ ls .workflow/specs/[0-9]*-FEATURE-*.md .workflow/specs/archive/[0-9]*-FEATURE-*.
 - Otherwise, increment the highest number by 1
 - Always zero-pad to 5 digits (e.g., `00001`, `00002`, `00042`)
 
-Create `.workflow/specs/NNNNN-FEATURE-<name>.md`:
+Create `.flywheel/specs/NNNNN-FEATURE-<name>.md`:
 
 ```markdown
 # Feature: <Name>
@@ -270,7 +270,7 @@ Present the spec to the user for final review:
 ```
 ## Feature Spec Complete
 
-I've created `.workflow/specs/NNNNN-FEATURE-<name>.md` with:
+I've created `.flywheel/specs/NNNNN-FEATURE-<name>.md` with:
 - <X> functional requirements
 - <Y> edge cases documented
 - <Z> key decisions recorded
@@ -285,7 +285,7 @@ I've created `.workflow/specs/NNNNN-FEATURE-<name>.md` with:
 
 ## ANTI-PATTERNS
 
-- **DO NOT** place spec files anywhere except `.workflow/specs/`
+- **DO NOT** place spec files anywhere except `.flywheel/specs/`
 - **DO NOT** assume answers to unclear requirements
 - **DO NOT** ask yes/no questions - always provide concrete options
 - **DO NOT** ask more than 3 related questions at once

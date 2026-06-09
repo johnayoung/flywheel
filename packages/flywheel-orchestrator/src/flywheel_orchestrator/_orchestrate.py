@@ -9,7 +9,7 @@ never calls ``transition_to`` and holds no special harness privilege.
 It replaces the poll loops a shell driver otherwise runs — repeatedly shelling
 ``workflow next`` / ``workflow run`` / ``workflow recheck-blocked`` — with one
 in-process driver that re-evaluates after each run it drives. The git-worktree
-consumer ``.workflow/worker.py`` wraps it, injecting worktree submit through
+consumer (``flywheel-worktree``) wraps it, injecting worktree submit through
 the ``prepare_sandbox`` / ``submit`` seam below.
 
 Scheduling, reusing the exact predicates the pull-based CLI already uses

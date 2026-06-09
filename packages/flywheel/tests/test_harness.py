@@ -1527,7 +1527,7 @@ class TestIterationAwareInterrupt:
     worker stops cleanly. :func:`finalize_stranded_lifecycle` remains the
     SIGKILL/OOM/reboot backstop -- this in-band path closes the graceful
     SIGINT/SIGTERM gap documented in
-    ``.workflow/audits/02-harness-resilience.md``.
+    ``.flywheel/audits/02-harness-resilience.md``.
     """
 
     def _cancelling_invoker(
@@ -1958,7 +1958,7 @@ class TestEntryTimeCrash:
     when a Python exception escapes after the lifecycle row exists.
 
     Backs the audit finding in
-    ``.workflow/audits/08-recoverable-blocked-lifecycles.md``: 76
+    ``.flywheel/audits/08-recoverable-blocked-lifecycles.md``: 76
     crashed run_ids produced zero rows in lifecycles/attempts/events
     because the failure happened before any DB write. With the
     create-first ordering and the top-level handler in run_task, the

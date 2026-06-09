@@ -70,20 +70,20 @@ def _commit(worktree: Path, filename: str, body: str, message: str) -> None:
 
 
 def _submitter(repo: Path) -> "worker.GitWorktreeSubmitter":
-    worktrees = repo / ".workflow" / "worktrees"
+    worktrees = repo / ".flywheel" / "worktrees"
     worktrees.mkdir(parents=True, exist_ok=True)
     return worker.GitWorktreeSubmitter(
         repo_root=repo,
-        tasks_dir=repo / ".workflow" / "tasks",
+        tasks_dir=repo / ".flywheel" / "tasks",
         worktrees_dir=worktrees,
         phase_base="main",
-        lock_path=repo / ".workflow" / ".merge.lock",
+        lock_path=repo / ".flywheel" / ".merge.lock",
         log=lambda _m: None,
     )
 
 
 def _task_file(repo: Path, phase: str, task_id: str, *, grader: str = "true") -> Path:
-    tf = repo / ".workflow" / "tasks" / "active" / phase / f"{task_id}.json"
+    tf = repo / ".flywheel" / "tasks" / "active" / phase / f"{task_id}.json"
     tf.parent.mkdir(parents=True, exist_ok=True)
     tf.write_text(
         json.dumps(
@@ -140,7 +140,7 @@ def test_prepare_creates_worktree_and_branch(tmp_path: Path) -> None:
 
     wt = s.prepare(_sandbox_req(tf, "t1"))
 
-    assert wt == repo / ".workflow" / "worktrees" / "t1"
+    assert wt == repo / ".flywheel" / "worktrees" / "t1"
     assert wt.is_dir()
     assert s._branch_exists("flywheel/01-phase/t1")
     assert s._is_registered_worktree(wt)
@@ -154,7 +154,7 @@ def test_prepare_refuses_to_clobber_unregistered_dir(tmp_path: Path) -> None:
     # Branch exists, and a stray directory of the same name exists, but it is
     # not a registered worktree -> refuse rather than destroy operator state.
     _git(repo, "branch", "flywheel/01-phase/t1", "main")
-    (repo / ".workflow" / "worktrees" / "t1").mkdir(parents=True)
+    (repo / ".flywheel" / "worktrees" / "t1").mkdir(parents=True)
 
     raised = False
     try:
@@ -329,7 +329,7 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
     _init_repo(repo)
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1", grader="true")
-    worktree = repo / ".workflow" / "worktrees" / "t1"
+    worktree = repo / ".flywheel" / "worktrees" / "t1"
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
         # Play the agent: commit work in the prepared worktree, then claim
@@ -343,14 +343,14 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
             failure=None,
         )
 
-    db_path = repo / ".workflow" / "flywheel.sqlite"
+    db_path = repo / ".flywheel" / "flywheel.sqlite"
     base_before = _rev(repo, "main")
 
     report = worker.run_once(
         s,
-        tasks_dir=repo / ".workflow" / "tasks",
+        tasks_dir=repo / ".flywheel" / "tasks",
         db_path=db_path,
-        worktrees_dir=repo / ".workflow" / "worktrees",
+        worktrees_dir=repo / ".flywheel" / "worktrees",
         model=None,
         max_turns=4,
         max_retries=0,
@@ -390,10 +390,10 @@ def test_record_phase_bases_captures_once_and_idempotent(tmp_path: Path) -> None
     """
     repo = tmp_path / "repo"
     _init_repo(repo)
-    tasks_dir = repo / ".workflow" / "tasks"
+    tasks_dir = repo / ".flywheel" / "tasks"
     phase_dir = tasks_dir / "active" / "01-phase"
     phase_dir.mkdir(parents=True)
-    lock_path = repo / ".workflow" / ".merge.lock"
+    lock_path = repo / ".flywheel" / ".merge.lock"
 
     head_at_capture = _rev(repo, "main")
 
@@ -433,7 +433,7 @@ def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
     _init_repo(repo)
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1", grader="true")
-    worktree = repo / ".workflow" / "worktrees" / "t1"
+    worktree = repo / ".flywheel" / "worktrees" / "t1"
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
         _commit(worktree, "work.txt", "agent output", "agent work")
@@ -445,15 +445,15 @@ def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
             failure=None,
         )
 
-    db_path = repo / ".workflow" / "flywheel.sqlite"
+    db_path = repo / ".flywheel" / "flywheel.sqlite"
     log_dir = repo / "logs" / "worker"
     assert not log_dir.exists()  # fresh checkout: dir does not exist yet
 
     report = worker.run_once(
         s,
-        tasks_dir=repo / ".workflow" / "tasks",
+        tasks_dir=repo / ".flywheel" / "tasks",
         db_path=db_path,
-        worktrees_dir=repo / ".workflow" / "worktrees",
+        worktrees_dir=repo / ".flywheel" / "worktrees",
         model=None,
         max_turns=4,
         max_retries=0,

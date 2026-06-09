@@ -1,4 +1,0 @@
-# Flywheel runtime state: SQLite store written by the worker.
-flywheel.sqlite
-flywheel.sqlite-shm
-flywheel.sqlite-wal

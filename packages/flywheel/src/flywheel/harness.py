@@ -658,7 +658,7 @@ class _HangDetected(Exception):
     :func:`_run_attempt` boundary catches this BEFORE
     :exc:`asyncio.CancelledError` so a watchdog-induced cancellation never
     reaches the operator-interrupt path (:func:`_handle_interrupt`).
-    See ``.workflow/specs/00015-FEATURE-loop-safety-net.md`` FR-4.
+    See ``.flywheel/specs/00015-FEATURE-loop-safety-net.md`` FR-4.
     """
 
     def __init__(
@@ -958,7 +958,7 @@ def _handle_hang_detected(
     Mirrors the crash path: closes the open attempt as
     :attr:`Outcome.INTERNAL_ERROR` and transitions the lifecycle to
     :attr:`Status.INTERNAL_ERROR` (the infrastructure class, per FR-3 of
-    ``.workflow/specs/00015-FEATURE-loop-safety-net.md``).
+    ``.flywheel/specs/00015-FEATURE-loop-safety-net.md``).
 
     The ``harness.hang_detected`` audit event was emitted inside
     :func:`_invoke_with_watchdog` before the cancel — this helper does not
@@ -1584,7 +1584,7 @@ async def run_task(
     created by the very first append (the ``LifecycleInitialized`` event),
     so there is no window in which events exist before the row — the
     silent-crash shape documented in
-    ``.workflow/audits/08-recoverable-blocked-lifecycles.md`` is closed by
+    ``.flywheel/audits/08-recoverable-blocked-lifecycles.md`` is closed by
     construction. If that first append itself fails (catastrophic store
     breakage), the exception propagates straight to the caller with no
     partial state to reconcile; the worker-side circuit breaker covers the
@@ -1606,7 +1606,7 @@ async def run_task(
     # sourcing the lifecycle row *is* the projection of this event, so the
     # log and the row come into existence together — there is no window in
     # which events could exist before the row (the silent pre-lifecycle
-    # crash shape that .workflow/audits/08-recoverable-blocked-lifecycles.md
+    # crash shape that .flywheel/audits/08-recoverable-blocked-lifecycles.md
     # documents). Append-then-swallow is the defensive resume shape.
     # Persist the task definition before seeding the lifecycle so every run
     # records the exact task it executed (end-to-end traceability). save_task

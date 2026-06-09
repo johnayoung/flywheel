@@ -3,7 +3,7 @@
 Covers the pure gate-selection contract (``next_pending_manual_gate``)
 and the manual receipt assembly contract (``build_manual_result``) per
 the acceptance criteria in
-``.workflow/specs/00016-FEATURE-manual-grader-approval-gate.md``
+``.flywheel/specs/00016-FEATURE-manual-grader-approval-gate.md``
 (FR-3).
 """
 

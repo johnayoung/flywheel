@@ -9,7 +9,7 @@ Format (TOML, stdlib ``tomllib``)::
 
     [source]
     kind = "directory"              # or "github"
-    tasks_dir = ".workflow/tasks"   # directory kind (optional, default shown)
+    tasks_dir = ".flywheel/tasks"   # directory kind (optional, default shown)
 
     # github kind:
     # repo = "owner/name"           # required
@@ -17,7 +17,7 @@ Format (TOML, stdlib ``tomllib``)::
     # done_action = "comment"       # or "close" (default "comment")
 
     # Where runtime state lives (optional). CLI flags still win; without
-    # these the legacy .workflow/ defaults apply.
+    # these the built-in .flywheel/ defaults apply.
     [paths]
     db = ".flywheel/flywheel.sqlite"
     sandbox_root = ".flywheel/sandboxes"
@@ -71,7 +71,7 @@ class WorkPolicy:
     ``kind = "github"``. ``default_graders`` is empty when the file
     declares none. ``db_path``/``sandbox_root`` mirror the optional
     ``[paths]`` table and are ``None`` when unset (the CLI then falls
-    back to its legacy defaults).
+    back to its built-in defaults).
     """
 
     source_kind: str

@@ -1,0 +1,8 @@
+# Flywheel runtime state: never committed.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+sandboxes/
+worktrees/
+logs/
+.merge.lock

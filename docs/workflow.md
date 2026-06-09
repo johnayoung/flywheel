@@ -1,15 +1,15 @@
 # Workflow
 
-How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in `.claude/commands/` (prompt commands run by an operator in Claude Code) and half in `.workflow/` (artifacts and runtime state). This doc records the current state and rationale as the baseline for promoting pieces of it into first-class flywheel features.
+How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in `.claude/commands/` (prompt commands run by an operator in Claude Code) and half in `.flywheel/` (artifacts and runtime state; formerly `.workflow/`, cut over wholesale with history preserved). This doc records the current state and rationale as the baseline for promoting pieces of it into first-class flywheel features.
 
 ## Pipeline at a glance
 
 | Stage     | Command                    | Input                       | Output                                                           |
 | --------- | -------------------------- | --------------------------- | ---------------------------------------------------------------- |
-| Define    | `/define`                  | vague feature idea          | spec: `.workflow/specs/NNNNN-FEATURE-<name>.md`                  |
-| Decompose | `/task`                    | spec reference or free text | task JSONs: `.workflow/tasks/active/NN-<phase>/<id>.json`        |
+| Define    | `/define`                  | vague feature idea          | spec: `.flywheel/specs/NNNNN-FEATURE-<name>.md`                  |
+| Decompose | `/task`                    | spec reference or free text | task JSONs: `.flywheel/tasks/active/NN-<phase>/<id>.json`        |
 | Execute   | `flywheel-worktree` daemon | active phase dirs           | commits on main, lifecycles in the store, archived phase         |
-| Audit     | `/audit-phase`             | store + logs for a phase    | findings: `.workflow/audits/<phase>.md`                          |
+| Audit     | `/audit-phase`             | store + logs for a phase    | findings: `.flywheel/audits/<phase>.md`                          |
 | Propose   | `/propose-improvements`    | one or more audits          | ranked proposals, each handed to `/define`, `/task`, or "accept" |
 
 The loop closes: proposals become specs become phases become audits. Two further commands review the *work* rather than the loop (`/review-phase`, `/arewedone`); they live at user level (`~/.claude/commands/`), not in this repo.
@@ -25,7 +25,7 @@ The loop closes: proposals become specs become phases become audits. Two further
 
 ```
 .claude/commands/           define.md, task.md, audit-phase.md, propose-improvements.md
-.workflow/
+.flywheel/
   specs/                    NNNNN-FEATURE-<name>.md (sequential, zero-padded)
   tasks/
     active/NN-<phase>/      one JSON per task; the worker consumes these
@@ -52,7 +52,7 @@ The daemon is `flywheel-worktree` (`packages/flywheel-worktree/src/flywheel_work
 4. Write per-run logs to `logs/worker/`.
 5. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below.
 
-Default paths are code, not convention: `DEFAULT_TASKS_DIR = .workflow/tasks` and `DEFAULT_LOG_DIR = logs/worker` (`flywheel_orchestrator/_workflow.py:50`), `DEFAULT_DB_PATH = .workflow/flywheel.sqlite` (`flywheel/workflow.py:94`). All are overridable via CLI flags.
+Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` and `DEFAULT_LOG_DIR = logs/worker` (`flywheel_orchestrator/_workflow.py:50`), `DEFAULT_DB_PATH = .flywheel/flywheel.sqlite` (`flywheel/workflow.py:94`). All are overridable via CLI flags.
 
 ### The in-loop-verification gate
 
@@ -70,14 +70,14 @@ Each rule exists because an audit caught its absence:
 
 ## Work sources (project-agnostic boundary)
 
-The orchestrator does not consume `.workflow/tasks/` directly anymore — it consumes a `WorkSource` (`packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py`):
+The orchestrator does not consume `.flywheel/tasks/` directly anymore — it consumes a `WorkSource` (`packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py`):
 
 - **Inbound** — `list_work()` returns `WorkItem`s, each a validated core `Task` plus `prerequisites` and an opaque `source_ref`. Anything that cannot compile to a Task with at least one grader never reaches the scheduler.
 - **Outbound** — `report(WorkReport)` receives each driven run's terminal status, run id, and final grader receipts after the consumer `submit` step, still under the task lease. Delivery is best-effort; a raising report never unwinds the loop. Ticket writes go through this path, never through the agent.
 
 Adapters shipped today:
 
-- `DirectoryWorkSource` — the historical `.workflow/tasks/active/<phase>/*.json` layout; `report` is a no-op (the store is the local record; phase archiving stays a separate directory flow).
+- `DirectoryWorkSource` — the historical `.flywheel/tasks/active/<phase>/*.json` layout; `report` is a no-op (the store is the local record; phase archiving stays a separate directory flow).
 - `GithubWorkSource` (`_github.py`) — labeled open issues via the `gh` CLI. `gh-<number>` task ids; an optional fenced ` ```flywheel ` JSON block in the body overrides goal/graders/context/tags/prerequisites; issues without graders fall back to the policy's default graders or are skipped. Outcomes post back as comments (or close the issue when `done_action = "close"`).
 
 `flywheel.toml` at the repo root selects the source per project (`_policy.py`):
@@ -94,9 +94,9 @@ type = "command"
 run = "uv run pytest"
 ```
 
-`flywheel-orchestrate next|status|orchestrate|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.workflow/` defaults.
+`flywheel-orchestrate next|status|orchestrate|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults.
 
-`flywheel-orchestrate init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This is the intended replacement for hand-rolled `.workflow/` setups in new repos.
+`flywheel-orchestrate init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
 
 ## Code vs. convention
 
@@ -108,7 +108,7 @@ What would need promotion for another codebase to use this workflow:
 | `WorkSource` seam, directory + GitHub adapters, `flywheel.toml`     | `flywheel-orchestrator` (`_sources`, `_github`, `_policy`) | shipped code    |
 | Archive gate, loop-path signals, `.loop-base`, opt-out parsing      | `flywheel-orchestrator` + `flywheel.loop_path_marker` | shipped code    |
 | Worktree-per-task submit strategy, daemon                           | `flywheel-worktree`                                   | shipped code    |
-| Default `.workflow/` paths                                          | CLI defaults in all three packages                    | shipped code    |
+| Default `.flywheel/` paths                                          | CLI defaults in all three packages                    | shipped code    |
 | `/define`, `/task`, `/audit-phase`, `/propose-improvements` prompts | `.claude/commands/`                                   | repo convention |
 | Spec template and `NNNNN-FEATURE-` numbering                        | prose inside `define.md`                              | repo convention |
 | Audit and proposal doc formats, evidence rules                      | prose inside the command prompts                      | repo convention |

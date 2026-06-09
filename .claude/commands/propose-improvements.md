@@ -11,10 +11,10 @@ This is the **action** half of the audit pipeline. `/audit-phase` produces evide
 $ARGUMENTS
 
 Accepted forms:
-- `17-manual-grader-approval-gate` — phase name; reads `.workflow/audits/<phase>.md`
-- `.workflow/audits/<phase>.md` — explicit audit path
-- `all` — synthesize across every audit in `.workflow/audits/` (use for recurring-pattern proposals)
-- (no arg) — most recently modified audit in `.workflow/audits/`
+- `17-manual-grader-approval-gate` — phase name; reads `.flywheel/audits/<phase>.md`
+- `.flywheel/audits/<phase>.md` — explicit audit path
+- `all` — synthesize across every audit in `.flywheel/audits/` (use for recurring-pattern proposals)
+- (no arg) — most recently modified audit in `.flywheel/audits/`
 
 ## CORE PRINCIPLE
 
@@ -24,21 +24,21 @@ Accepted forms:
 
 ```bash
 ARG="${1:-}"
-mkdir -p .workflow/proposals
+mkdir -p .flywheel/proposals
 
 if [[ "$ARG" == "all" ]]; then
-  AUDITS=$(ls -1 .workflow/audits/*.md 2>/dev/null)
+  AUDITS=$(ls -1 .flywheel/audits/*.md 2>/dev/null)
 elif [[ -f "$ARG" ]]; then
   AUDITS="$ARG"
-elif [[ -n "$ARG" && -f ".workflow/audits/$ARG.md" ]]; then
-  AUDITS=".workflow/audits/$ARG.md"
+elif [[ -n "$ARG" && -f ".flywheel/audits/$ARG.md" ]]; then
+  AUDITS=".flywheel/audits/$ARG.md"
 elif [[ -z "$ARG" ]]; then
-  AUDITS=$(ls -1t .workflow/audits/*.md 2>/dev/null | head -1)
+  AUDITS=$(ls -1t .flywheel/audits/*.md 2>/dev/null | head -1)
 fi
 
 echo "Audits in scope:"; echo "$AUDITS"
 # Always list siblings — recurrence across phases raises a proposal's leverage.
-echo "All audits on record:"; ls -1 .workflow/audits/*.md 2>/dev/null
+echo "All audits on record:"; ls -1 .flywheel/audits/*.md 2>/dev/null
 ```
 
 If no audit file resolves, stop and tell the user to run `/audit-phase <phase>` first. Do not invent findings from the raw store — this command consumes audits, it does not produce them.
@@ -52,7 +52,7 @@ An audit may be a clean run or a bypassed-phase note. If it contains no findings
 ```markdown
 # Improvement proposals: <phase>
 
-**Source audit:** `.workflow/audits/<phase>.md`
+**Source audit:** `.flywheel/audits/<phase>.md`
 **Proposed:** <date>
 
 ## Verdict
@@ -119,12 +119,12 @@ Do not advance anything the operator did not pick. "Advance none" is a valid out
 
 ## STEP 7: WRITE THE PROPOSALS DOC
 
-Output goes to `.workflow/proposals/<phase>.md` (or `.workflow/proposals/cross-phase-<date>.md` for an `all` run). Committed, not gitignored — proposals are the record of what the audits drove.
+Output goes to `.flywheel/proposals/<phase>.md` (or `.flywheel/proposals/cross-phase-<date>.md` for an `all` run). Committed, not gitignored — proposals are the record of what the audits drove.
 
 ```markdown
 # Improvement proposals: <phase>
 
-**Source audit(s):** `.workflow/audits/<phase>.md` (+ siblings consulted for recurrence)
+**Source audit(s):** `.flywheel/audits/<phase>.md` (+ siblings consulted for recurrence)
 **Proposed:** <today's date>
 
 ## Summary
@@ -165,7 +165,7 @@ Output goes to `.workflow/proposals/<phase>.md` (or `.workflow/proposals/cross-p
 ```
 ## Proposals ready
 
-Wrote `.workflow/proposals/<phase>.md`.
+Wrote `.flywheel/proposals/<phase>.md`.
 
 **Headline:** <one sentence — e.g. "2 proposals: 1 observability fix to advance, 1 inherent cost to accept">
 
@@ -187,6 +187,6 @@ Run the handoff command for each advancing proposal when ready.
 4. **Rank by leverage; recurrence beats one-offs.** A finding that shows up across multiple audits outranks a single-phase blip. Cheap fixes to recurring friction rank above expensive fixes to one-offs.
 5. **"Accept — do not fix" is a real proposal.** Inherent costs (rate-limiting, a deliberate single-worker run) and one-offs get named and dismissed with a reason. Do not manufacture fixes for them.
 6. **Do not invent work to fill the doc.** A clean audit yields the STEP 2 short note. Few or zero proposals is a correct result.
-7. **Features go through `/define`, not ad hoc.** New capability proposals hand off to `/define` so they land as a `.workflow/specs/` spec; scoped fixes hand off to `/task`. This command writes neither.
+7. **Features go through `/define`, not ad hoc.** New capability proposals hand off to `/define` so they land as a `.flywheel/specs/` spec; scoped fixes hand off to `/task`. This command writes neither.
 8. **The operator owns prioritization.** Use `AskUserQuestion`; advance only what they pick. Record the analysis regardless of what they advance.
 9. **No emojis.**

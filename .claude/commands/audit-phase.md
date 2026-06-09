@@ -11,7 +11,7 @@ This is **not** `/review-phase` (which checks whether shipped work is correct). 
 $ARGUMENTS
 
 Accepted forms:
-- `02-harness-resilience` — phase dir name (looked up under `.workflow/tasks/active/` then `archive/`)
+- `02-harness-resilience` — phase dir name (looked up under `.flywheel/tasks/active/` then `archive/`)
 - (no arg) — most recently archived phase
 
 ## CORE PRINCIPLE
@@ -24,13 +24,13 @@ Accepted forms:
 # Active first, then archive
 ARG="${1:-}"
 if [[ -z "$ARG" ]]; then
-  PHASE=$(ls -1 .workflow/tasks/archive/ 2>/dev/null | grep -E '^[0-9]+-' | sort | tail -1)
+  PHASE=$(ls -1 .flywheel/tasks/archive/ 2>/dev/null | grep -E '^[0-9]+-' | sort | tail -1)
 else
   PHASE="$ARG"
 fi
 
 # Locate the phase directory (active or archive)
-for root in .workflow/tasks/active .workflow/tasks/archive; do
+for root in .flywheel/tasks/active .flywheel/tasks/archive; do
   [[ -d "$root/$PHASE" ]] && PHASE_DIR="$root/$PHASE" && break
 done
 
@@ -53,7 +53,7 @@ If the count is `0` for every task — no lifecycles, no worker logs, no events 
 ```markdown
 ## Phase audit: <phase>
 
-**Source:** `.workflow/flywheel.sqlite`, `logs/worker/`, `<phase-dir>`
+**Source:** `.flywheel/flywheel.sqlite`, `logs/worker/`, `<phase-dir>`
 **Audited:** <date>
 **Wall-clock window:** <earliest commit> -> <latest commit> (from `git log` over the phase task files)
 
@@ -78,7 +78,7 @@ That is the entire audit. Stop. Do not pad with feature ideas, do not invent "re
 
 ## STEP 3: PULL THE EVIDENCE (only if loop activity exists)
 
-The SQLite store at `.workflow/flywheel.sqlite` is the source of truth. Tables: `lifecycles`, `attempts`, `events`, `grader_results`. Schema: `src/flywheel/_schema/persistence-schema.sql`.
+The SQLite store at `.flywheel/flywheel.sqlite` is the source of truth. Tables: `lifecycles`, `attempts`, `events`, `grader_results`. Schema: `src/flywheel/_schema/persistence-schema.sql`.
 
 For each task `id` in the phase, query (use `sqlite3` directly):
 
@@ -220,12 +220,12 @@ After per-task analysis, scan for:
 
 ## STEP 7: WRITE THE REPORT
 
-Output goes to `.workflow/audits/<phase>.md`. Create the dir if needed (`mkdir -p .workflow/audits`). Audits are committed, not gitignored — they're the historical record of flywheel-on-flywheel learnings.
+Output goes to `.flywheel/audits/<phase>.md`. Create the dir if needed (`mkdir -p .flywheel/audits`). Audits are committed, not gitignored — they're the historical record of flywheel-on-flywheel learnings.
 
 ```markdown
 # Phase audit: <phase>
 
-**Source:** `.workflow/flywheel.sqlite`, `logs/worker/`, `<phase-dir>`
+**Source:** `.flywheel/flywheel.sqlite`, `logs/worker/`, `<phase-dir>`
 **Audited:** <today's date>
 **Wall-clock window:** <earliest started_at> -> <latest ended_at>
 
@@ -288,7 +288,7 @@ After writing the file:
 ```
 ## Audit complete
 
-Wrote `.workflow/audits/<phase>.md`.
+Wrote `.flywheel/audits/<phase>.md`.
 
 **Headline:** <one-sentence verdict — what the loop did, not what it should do>
 

@@ -62,9 +62,9 @@ from flywheel_orchestrator._sources import (
     load_active_tasks,
 )
 
-DEFAULT_TASKS_DIR = Path(".workflow/tasks")
+DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
 
-DEFAULT_LOG_DIR = Path("logs/worker")
+DEFAULT_LOG_DIR = Path(".flywheel/logs/worker")
 
 class TaskState(str, Enum):
     """Task-level status derived from the latest lifecycle, if any."""
@@ -308,7 +308,7 @@ def archive_completed_phases(
     ``in-loop-verification`` OR a valid ``loop-path-exempt.md`` opt-out
     artifact lives alongside the task files. A gated phase stays in
     ``active/`` and the refusal reason is reported via ``log`` (the same
-    ``Callable[[str], None]`` seam :func:`.workflow.worker.archive_phases`
+    ``Callable[[str], None]`` seam :func:`.flywheel.worker.archive_phases`
     uses). An empty marker (no watched signal, no recorded base, or
     ``repo_root`` omitted) archives exactly as before -- the gate is a
     pure addition for the loop-path case.
@@ -603,7 +603,7 @@ def _load_effective_policy(args: argparse.Namespace) -> WorkPolicy | None:
     An explicit ``--policy`` file is loaded (and a missing/invalid file is
     an error); otherwise ``flywheel.toml`` in the working directory is
     auto-detected; otherwise there is no policy and every default falls
-    back to the legacy ``.workflow/`` layout.
+    back to the built-in ``.flywheel/`` layout.
     """
     policy_arg = getattr(args, "policy", None)
     if policy_arg:
@@ -631,8 +631,8 @@ def _resolve_work_source(
 def _resolve_db_path(
     args: argparse.Namespace, policy: WorkPolicy | None
 ) -> Path:
-    """``--db`` flag, else the policy's ``[paths] db``, else the legacy
-    ``.workflow/flywheel.sqlite`` default."""
+    """``--db`` flag, else the policy's ``[paths] db``, else the built-in
+    ``.flywheel/flywheel.sqlite`` default."""
     if args.db:
         return Path(args.db)
     if policy is not None and policy.db_path is not None:
@@ -672,7 +672,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     elif policy is not None and policy.sandbox_root is not None:
         sandbox_root = policy.sandbox_root
     else:
-        sandbox_root = Path(".workflow/worktrees")
+        sandbox_root = Path(".flywheel/worktrees")
     report = asyncio.run(
         orchestrate(
             source=source,
@@ -1452,6 +1452,8 @@ flywheel.sqlite-shm
 flywheel.sqlite-wal
 sandboxes/
 worktrees/
+logs/
+.merge.lock
 """
 
 _INIT_POLICY = """\
@@ -1535,7 +1537,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="flywheel-orchestrate",
         description=(
             "Schedule and drive many flywheel tasks laid out under "
-            ".workflow/tasks/active/<phase>/."
+            ".flywheel/tasks/active/<phase>/."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1578,7 +1580,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Root under which each task runs in <sandbox-root>/<task-id> "
-            "(default: .workflow/worktrees)."
+            "(default: .flywheel/worktrees)."
         ),
     )
     p_orchestrate.add_argument(

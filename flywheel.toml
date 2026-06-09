@@ -1,0 +1,16 @@
+# Flywheel work policy: where work comes from and where runtime state lives.
+# Committed with the repo; CLI flags always override.
+
+[source]
+kind = "directory"
+tasks_dir = ".flywheel/tasks"
+
+[paths]
+db = ".flywheel/flywheel.sqlite"
+sandbox_root = ".flywheel/worktrees"
+
+# Default graders for work items that declare none (tracker sources only;
+# directory task files always declare their own).
+# [[defaults.graders]]
+# type = "command"
+# run = "uv run pytest"

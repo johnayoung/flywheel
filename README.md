@@ -112,7 +112,7 @@ uv run python -m flywheel.workflow run task.json
 ```
 
 The command exits `0` when the lifecycle reaches `done` and non-zero
-otherwise. Lifecycle state is persisted to `.workflow/flywheel.sqlite`.
+otherwise. Lifecycle state is persisted to `.flywheel/flywheel.sqlite`.
 
 ## Documentation
 

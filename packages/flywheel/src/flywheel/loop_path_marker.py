@@ -3,7 +3,7 @@
 Pure string analysis: the input is a unified-diff text, the output is the
 set of watched loop-path signals it contains. No file I/O, no git
 invocation, no JSON. Implements the FR-1 trigger set from
-``.workflow/specs/00017-FEATURE-in-loop-verification-gate.md``.
+``.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md``.
 
 Only **added** content is considered: lines beginning with ``+`` and not
 the ``+++`` file header. A watched symbol that appears only in a context
@@ -31,7 +31,7 @@ class LoopPathSignal(str, Enum):
     """Watched signals from the spec's Trigger Set table.
 
     The numeric suffix mirrors the table row in
-    ``.workflow/specs/00017-FEATURE-in-loop-verification-gate.md``.
+    ``.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md``.
     """
 
     # Signal 1: new Status/Outcome enum member or transition-rule entry

@@ -65,8 +65,8 @@ from flywheel.store_sqlite import SqliteStore
 
 # Default store path used when neither ``--db`` nor ``$FLYWHEEL_DB`` is
 # set. Matches the spec's "./flywheel.db" fallback rather than
-# workflow.py's ".workflow/flywheel.sqlite" -- the audit CLI is a
-# debugging tool that may run outside a ``.workflow/`` layout.
+# workflow.py's ".flywheel/flywheel.sqlite" -- the audit CLI is a
+# debugging tool that may run outside a ``.flywheel/`` layout.
 DEFAULT_DB_PATH: Path = Path("flywheel.db")
 DEFAULT_POLL_INTERVAL: float = 0.25
 

@@ -1,6 +1,6 @@
 """Behavioral coverage for :mod:`flywheel.loop_guard`.
 
-Cross-references the FRs in ``.workflow/specs/00015-FEATURE-loop-safety-net.md``:
+Cross-references the FRs in ``.flywheel/specs/00015-FEATURE-loop-safety-net.md``:
 
 - FR-1 (STUCK) -- three consecutive identical failing calls trip at threshold 3.
 - FR-2 (THRASH) -- identical tuple repeating >= K within trailing W trips.

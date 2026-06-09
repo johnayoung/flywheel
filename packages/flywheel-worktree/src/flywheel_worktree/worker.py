@@ -836,7 +836,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="flywheel-worktree",
         description=(
             "Git-worktree worker: drive flywheel tasks under "
-            ".workflow/tasks/active/, each in its own worktree, FF-merging on "
+            ".flywheel/tasks/active/, each in its own worktree, FF-merging on "
             "done and parking on failure."
         ),
     )
@@ -867,7 +867,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Directory for per-run forensics logs. Defaults to "
-            "<repo_root>/logs/worker/."
+            "<repo_root>/.flywheel/logs/worker/."
         ),
     )
     parser.add_argument(
@@ -902,13 +902,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     tasks_dir = (
         Path(args.tasks_dir)
         if args.tasks_dir
-        else repo_root / ".workflow" / "tasks"
+        else repo_root / ".flywheel" / "tasks"
     )
     db_path = (
-        Path(args.db) if args.db else repo_root / ".workflow" / "flywheel.sqlite"
+        Path(args.db) if args.db else repo_root / ".flywheel" / "flywheel.sqlite"
     )
-    worktrees_dir = repo_root / ".workflow" / "worktrees"
-    lock_path = repo_root / ".workflow" / ".merge.lock"
+    worktrees_dir = repo_root / ".flywheel" / "worktrees"
+    lock_path = repo_root / ".flywheel" / ".merge.lock"
     log_dir = Path(args.log_dir) if args.log_dir else repo_root / DEFAULT_LOG_DIR
 
     log = make_logger("[worker]")

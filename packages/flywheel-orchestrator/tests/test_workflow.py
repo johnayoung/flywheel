@@ -530,7 +530,7 @@ def test_write_phase_base_if_missing_captures_head_and_is_idempotent(
     """
     repo = tmp_path / "repo"
     _git_init_repo(repo)
-    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / "01-phase"
     phase_dir.mkdir(parents=True)
 
     head_before = _git_head(repo)
@@ -558,7 +558,7 @@ def test_phase_diff_vs_base_returns_added_lines(tmp_path: Path) -> None:
     """
     repo = tmp_path / "repo"
     _git_init_repo(repo)
-    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / "01-phase"
     phase_dir.mkdir(parents=True)
 
     assert write_phase_base_if_missing(repo, phase_dir) is True
@@ -586,7 +586,7 @@ def test_phase_diff_vs_base_returns_empty_when_no_base_recorded(
     """No ``.loop-base`` => empty diff (degrades safely, never raises)."""
     repo = tmp_path / "repo"
     _git_init_repo(repo)
-    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / "01-phase"
     phase_dir.mkdir(parents=True)
 
     # Advance HEAD so a buggy implementation that fell back to "HEAD..HEAD"
@@ -658,7 +658,7 @@ def _setup_loop_path_phase(
         capture_output=True,
     )
 
-    phase_dir = repo / ".workflow" / "tasks" / "active" / phase_name
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / phase_name
     phase_dir.mkdir(parents=True)
     assert write_phase_base_if_missing(repo, phase_dir) is True
     subprocess.run(
@@ -916,7 +916,7 @@ def test_archive_gate_inert_when_no_loop_base_recorded(
         capture_output=True,
     )
 
-    phase_dir = repo / ".workflow" / "tasks" / "active" / "01-phase"
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / "01-phase"
     phase_dir.mkdir(parents=True)
     tasks_dir = _tasks_dir_of(phase_dir)
     _write_task(phase_dir / "feature-a.json", "feature-a")
@@ -1985,7 +1985,7 @@ def test_main_status_text_includes_blocked_on_for_blocked_interrupted_row(
                 {"type": "command_grader", "name": "full-suite"},
                 {
                     "type": "file_exists",
-                    "path": ".workflow/lkg/.venv",
+                    "path": ".flywheel/lkg/.venv",
                     "present": True,
                 },
             ],
@@ -2006,7 +2006,7 @@ def test_main_status_text_includes_blocked_on_for_blocked_interrupted_row(
     assert rc == 0
     assert "blocked_on:" in out
     assert "command_grader=full-suite" in out
-    assert "file_exists=.workflow/lkg/.venv" in out
+    assert "file_exists=.flywheel/lkg/.venv" in out
 
 
 def test_main_status_text_omits_blocked_on_for_sigint_interrupted_row(
@@ -2091,7 +2091,7 @@ def test_run_task_file_records_crash_for_invoke_runtime_error(
     exception so the worker subshell sees a non-zero exit.
 
     Backs the audit at
-    ``.workflow/audits/08-recoverable-blocked-lifecycles.md`` finding
+    ``.flywheel/audits/08-recoverable-blocked-lifecycles.md`` finding
     "Crashes before create_lifecycle are invisible to every loop
     subsystem except the worker log": the new harness ordering must
     write the lifecycle row first so this exact failure shape is now
@@ -2244,7 +2244,7 @@ def test_run_task_object_finalizes_lifecycle_on_signal(
     pod``, ``systemctl stop``); its default disposition would terminate the
     interpreter before run_task reaches its finalizer, which is the exact
     stranding the bash worker had to reconcile out-of-band
-    (``.workflow/audits/02-harness-resilience.md``). run_task_object installs
+    (``.flywheel/audits/02-harness-resilience.md``). run_task_object installs
     a loop signal handler that converts both signals into asyncio task
     cancellation, which the harness's :func:`_run_attempt` boundary catches
     and routes through :func:`_handle_interrupt` (emits ``harness.interrupted``

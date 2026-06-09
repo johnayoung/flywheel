@@ -261,12 +261,12 @@ class TestBlockedRequires:
         output = _wrap(
             '{"intent": "blocked", '
             '"requires": [{"type": "file_exists", '
-            '"path": ".workflow/lkg/.venv", "present": true}]}'
+            '"path": ".flywheel/lkg/.venv", "present": true}]}'
         )
         result = parse_envelope(output)
         assert isinstance(result, ValidEnvelope)
         assert result.requires == (
-            FileExistsRequirement(path=".workflow/lkg/.venv", present=True),
+            FileExistsRequirement(path=".flywheel/lkg/.venv", present=True),
         )
 
     def test_file_exists_predicate_defaults_present_to_true(self) -> None:

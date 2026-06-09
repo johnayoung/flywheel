@@ -128,7 +128,7 @@ Any of the following symbol-level signals in the phase diff marks it loop-path-b
 
 ### in-loop-verification task
 
-A `command` grader that drives a fixture through the real `orchestrate`/harness via the injectable invoker seam with a scripted envelope. Must exercise both ends of the new path (e.g. harness park AND reactive-sweep apply) and, for schema-touching features, seed a `v(N-1)` store fixture and assert via `SqliteStore` after running the real forward migration — a fresh current-schema store does NOT satisfy the gate (phase 08's exact blind spot). Never touches `.workflow/flywheel.sqlite`.
+A `command` grader that drives a fixture through the real `orchestrate`/harness via the injectable invoker seam with a scripted envelope. Must exercise both ends of the new path (e.g. harness park AND reactive-sweep apply) and, for schema-touching features, seed a `v(N-1)` store fixture and assert via `SqliteStore` after running the real forward migration — a fresh current-schema store does NOT satisfy the gate (phase 08's exact blind spot). Never touches `.flywheel/flywheel.sqlite`.
 
 ### Opt-out artifact
 

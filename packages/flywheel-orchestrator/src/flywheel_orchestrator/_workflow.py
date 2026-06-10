@@ -1553,6 +1553,11 @@ sandbox_root = ".flywheel/sandboxes"
 # [[defaults.graders]]
 # type = "command"
 # run = "uv run pytest"
+
+# Agent runtime settings. Pin the model id the worker passes to the SDK
+# verbatim (no allowlist enforced). CLI flags still override.
+# [agent]
+# model = "claude-sonnet-4-5"
 """
 
 def _cmd_init(args: argparse.Namespace) -> int:

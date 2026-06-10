@@ -52,6 +52,30 @@ def test_init_policy_is_loadable_and_points_into_flywheel_dir(
     assert policy.tasks_dir == Path(".flywheel/tasks")
     assert policy.db_path == Path(".flywheel/flywheel.sqlite")
     assert policy.sandbox_root == Path(".flywheel/sandboxes")
+    # The scaffolded [agent] block is commented out by default, so model
+    # stays unset; the worker falls back to its CLI / built-in default.
+    assert policy.model is None
+
+
+def test_init_policy_agent_example_documented(repo: Path) -> None:
+    """The scaffold must show operators how to pin a model id.
+
+    Uncommenting the example block (verbatim) must yield a loadable
+    policy whose ``model`` matches the scaffolded example -- a typo in
+    the example would leak silently otherwise.
+    """
+    main(["init"])
+    text = (repo / "flywheel.toml").read_text()
+    assert "# [agent]" in text
+    assert '# model = "claude-sonnet-4-5"' in text
+
+    uncommented = text.replace(
+        '# [agent]\n# model = "claude-sonnet-4-5"',
+        '[agent]\nmodel = "claude-sonnet-4-5"',
+    )
+    (repo / "flywheel.toml").write_text(uncommented)
+    policy = load_policy(repo / "flywheel.toml")
+    assert policy.model == "claude-sonnet-4-5"
 
 
 def test_init_is_idempotent_and_never_clobbers(repo: Path, capsys) -> None:

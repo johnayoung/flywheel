@@ -124,6 +124,163 @@ def test_paths_reject_non_string_values(tmp_path: Path) -> None:
         )
 
 
+# --- [agent] model ----------------------------------------------------------
+
+
+def test_agent_model_defaults_to_none_when_table_absent(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.model is None
+
+
+def test_agent_model_defaults_to_none_when_key_absent(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[agent]\n',
+        )
+    )
+    assert policy.model is None
+
+
+def test_agent_model_parses_string(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[agent]",
+                    'model = "claude-sonnet-4-5"',
+                ]
+            ),
+        )
+    )
+    assert policy.model == "claude-sonnet-4-5"
+
+
+def test_agent_model_passes_opaque_value_verbatim(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[agent]",
+                    'model = "some-future-unreleased-model-id"',
+                ]
+            ),
+        )
+    )
+    assert policy.model == "some-future-unreleased-model-id"
+
+
+def test_agent_model_rejects_non_string(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[agent]",
+                "model = 7",
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    message = str(exc_info.value)
+    assert "agent.model" in message
+    assert str(policy_file) in message
+
+
+def test_agent_model_rejects_empty_string(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[agent]",
+                'model = ""',
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    message = str(exc_info.value)
+    assert "agent.model" in message
+    assert str(policy_file) in message
+
+
+def test_agent_model_rejects_whitespace_only_string(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[agent]",
+                'model = "   "',
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    assert "agent.model" in str(exc_info.value)
+
+
+def test_agent_table_non_table_raises(tmp_path: Path) -> None:
+    # `agent` declared at the top level as a scalar must reach the
+    # parser before any `[source]` table opens, otherwise it lands
+    # inside `[source]` and the agent table key stays absent.
+    policy_file = _write(
+        tmp_path,
+        'agent = "claude"\n[source]\nkind = "directory"\n',
+    )
+    with pytest.raises(PolicyError, match=r"\[agent\] must be a table"):
+        load_policy(policy_file)
+
+
+def test_agent_model_unknown_keys_ignored(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[agent]",
+                    'model = "claude-sonnet-4-5"',
+                    'future_setting = "ok"',
+                ]
+            ),
+        )
+    )
+    assert policy.model == "claude-sonnet-4-5"
+
+
+def test_agent_model_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[agent]",
+                    'model = "claude-opus-4"',
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.model == "claude-opus-4"
+
+
 # --- validation errors ------------------------------------------------------
 
 

@@ -30,6 +30,11 @@ Format (TOML, stdlib ``tomllib``)::
     type = "command"
     run = "uv run pytest"
 
+    # Agent runtime settings (optional). The model id is an opaque string
+    # passed verbatim to the SDK; flywheel does not maintain an allowlist.
+    [agent]
+    model = "claude-sonnet-4-5"
+
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
 default policy is not runnable and never reaches the scheduler.
@@ -71,7 +76,10 @@ class WorkPolicy:
     ``kind = "github"``. ``default_graders`` is empty when the file
     declares none. ``db_path``/``sandbox_root`` mirror the optional
     ``[paths]`` table and are ``None`` when unset (the CLI then falls
-    back to its built-in defaults).
+    back to its built-in defaults). ``model`` mirrors the optional
+    ``[agent] model`` key -- an opaque, repo-pinned model id passed
+    verbatim to the SDK; ``None`` when unset (the worker then falls back
+    to its CLI flag / built-in default).
     """
 
     source_kind: str
@@ -82,6 +90,7 @@ class WorkPolicy:
     default_graders: tuple[Grader, ...] = ()
     db_path: Path | None = None
     sandbox_root: Path | None = None
+    model: str | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -122,6 +131,11 @@ def load_policy(path: Path) -> WorkPolicy:
     db_path = _optional_path(paths, "db", policy_file=path)
     sandbox_root = _optional_path(paths, "sandbox_root", policy_file=path)
 
+    agent = data.get("agent") or {}
+    if not isinstance(agent, dict):
+        raise PolicyError(f"{path}: [agent] must be a table")
+    model = _optional_agent_model(agent, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -136,6 +150,7 @@ def load_policy(path: Path) -> WorkPolicy:
             default_graders=default_graders,
             db_path=db_path,
             sandbox_root=sandbox_root,
+            model=model,
         )
 
     repo = source.get("repo")
@@ -162,6 +177,7 @@ def load_policy(path: Path) -> WorkPolicy:
         default_graders=default_graders,
         db_path=db_path,
         sandbox_root=sandbox_root,
+        model=model,
     )
 
 
@@ -176,6 +192,28 @@ def _optional_path(
             f"{policy_file}: paths.{key} must be a non-empty string"
         )
     return Path(value)
+
+
+def _optional_agent_model(
+    table: dict, *, policy_file: Path
+) -> str | None:
+    """Validate and return the optional ``agent.model`` string.
+
+    Returns ``None`` when the key is absent so an unconfigured policy
+    leaves :attr:`WorkPolicy.model` at its default. A non-string value, or
+    a string that is empty or whitespace-only, raises :class:`PolicyError`
+    so a typo never silently degrades into "no model pinned." No
+    allowlist is enforced -- the value is an opaque identifier passed
+    through verbatim to the SDK.
+    """
+    value = table.get("model")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: agent.model must be a non-empty string"
+        )
+    return value
 
 
 def build_work_source(policy: WorkPolicy) -> WorkSource:

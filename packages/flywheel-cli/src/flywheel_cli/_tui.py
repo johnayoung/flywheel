@@ -1,17 +1,19 @@
-"""``flywheel-tui`` CLI entry point.
+"""Operator-console entry point for the ``fw`` / ``flywheel`` shell.
 
-Bare ``flywheel-tui`` opens the Textual dashboard against the store the
-orchestrator's policy resolves to; ``flywheel-tui --json`` (or any
-invocation whose stdout is not a TTY) prints one machine-readable
-:class:`DashboardSnapshot` and exits 0 with no ANSI sequences — matches
-Claude Code's interactive-default + print-mode pattern.
+Bare ``fw`` opens the Textual dashboard against the store the
+orchestrator's policy resolves to; ``fw --json`` (or any invocation
+whose stdout is not a TTY) prints one machine-readable
+:class:`DashboardSnapshot` and exits 0 with no ANSI sequences -- matches
+Claude Code's interactive-default + print-mode pattern. Lives in
+:mod:`flywheel_cli` (formerly :mod:`flywheel_tui._cli`) so the console
+and the verb router ship under one distribution.
 
-Store path resolution reuses
-:func:`flywheel_orchestrator.resolve_db_path` and
-:func:`flywheel_orchestrator.load_effective_policy` so the precedence is
-identical to ``flywheel-orchestrate live``/``status``; the work source
-(used only for the summary header's task-state counts) mirrors the same
-explicit ``--tasks-dir`` -> policy -> default fallback chain.
+Store path resolution reuses :func:`flywheel_orchestrator.resolve_db_path`
+and :func:`flywheel_orchestrator.load_effective_policy` so the precedence
+is identical to ``fw status`` / ``fw live``; the work source (used by
+both the summary header's task-state counts and the ``/archive`` slash
+command) mirrors the same explicit ``--tasks-dir`` -> policy -> default
+fallback chain.
 """
 
 from __future__ import annotations
@@ -34,18 +36,19 @@ from flywheel_orchestrator import (
     PolicyError,
     WorkPolicy,
     WorkSource,
+    archive_completed_phases,
     build_work_source,
     load_effective_policy,
     resolve_db_path,
 )
 
-from flywheel_tui._dashboard import (
+from flywheel_cli._dashboard import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DashboardApp,
 )
-from flywheel_tui._session import TranscriptEntry, TranscriptTailer
-from flywheel_tui._session_screen import SessionScreen, SessionStatus
-from flywheel_tui._snapshot import (
+from flywheel_cli._session import TranscriptEntry, TranscriptTailer
+from flywheel_cli._session_screen import SessionScreen, SessionStatus
+from flywheel_cli._snapshot import (
     DashboardSnapshot,
     build_snapshot,
     snapshot_to_dict,
@@ -56,31 +59,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Resolve the store, then dispatch to the TUI or the JSON snapshot.
 
     Returns 0 on a clean exit, 2 when the resolved store does not exist
-    (the operator-facing remedy is ``flywheel-orchestrate init``).
-    Snapshot mode auto-engages when stdout is not a TTY so the command
-    is pipe-safe by default.
+    (the operator-facing remedy is ``fw init``). Snapshot mode auto-
+    engages when stdout is not a TTY so the command is pipe-safe by
+    default.
     """
     args = _build_parser().parse_args(argv)
     try:
         policy = load_effective_policy(args.policy)
     except PolicyError as exc:
-        print(f"flywheel-tui: policy error: {exc}", file=sys.stderr)
+        print(f"fw: policy error: {exc}", file=sys.stderr)
         return 2
     db_path = resolve_db_path(args.db, policy=policy)
     if not db_path.exists():
         return _emit_missing_store(db_path)
 
     work_source = _resolve_work_source(args.tasks_dir, policy)
+    archive_tasks_dir = _resolve_archive_tasks_dir(args.tasks_dir, policy)
     json_mode = args.json or not sys.stdout.isatty()
 
     if json_mode:
         return _run_snapshot(db_path, work_source)
-    return _run_dashboard(db_path, work_source)
+    return _run_dashboard(db_path, work_source, archive_tasks_dir)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="flywheel-tui",
+        prog="fw",
         description=(
             "Interactive realtime dashboard of in-flight flywheel runs. "
             "Bare invocation opens the Textual app; --json (or a "
@@ -92,7 +96,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Store path. Defaults to the policy's [paths] db (else "
-            ".flywheel/flywheel.sqlite). Matches flywheel-orchestrate."
+            ".flywheel/flywheel.sqlite). Matches fw status / fw live."
         ),
     )
     parser.add_argument(
@@ -108,7 +112,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             f"Tasks root directory for the summary's task-state counts "
-            f"(default: policy source, else {DEFAULT_TASKS_DIR})."
+            f"and /archive (default: policy source, else {DEFAULT_TASKS_DIR})."
         ),
     )
     parser.add_argument(
@@ -134,7 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _resolve_work_source(
     tasks_dir_arg: str | None, policy: WorkPolicy | None
 ) -> WorkSource:
-    """Mirror ``flywheel-orchestrate``'s work-source precedence.
+    """Mirror ``fw status``'s work-source precedence.
 
     Explicit ``--tasks-dir`` always selects the directory source (so the
     summary counts can be pinned at the CLI), else the policy decides,
@@ -147,15 +151,33 @@ def _resolve_work_source(
     return DirectoryWorkSource(DEFAULT_TASKS_DIR)
 
 
+def _resolve_archive_tasks_dir(
+    tasks_dir_arg: str | None, policy: WorkPolicy | None
+) -> Path | None:
+    """Resolve the directory ``/archive`` should sweep, or ``None``.
+
+    ``/archive`` is meaningful only for directory work sources (the same
+    semantics as ``fw archive``); a tracker source returns ``None`` and
+    the slash command degrades to an inline notice.
+    """
+
+    if tasks_dir_arg:
+        return Path(tasks_dir_arg)
+    if policy is None:
+        return DEFAULT_TASKS_DIR
+    if policy.source_kind == "directory" and policy.tasks_dir is not None:
+        return policy.tasks_dir
+    return None
+
+
 def _emit_missing_store(db_path: Path) -> int:
     print(
-        f"flywheel-tui: no store found at {db_path}",
+        f"fw: no store found at {db_path}",
         file=sys.stderr,
     )
     print(
-        "  run 'flywheel-orchestrate init' to scaffold .flywheel/ "
-        "and the work policy, then start the orchestrator to populate "
-        "the store.",
+        "  run 'fw init' to scaffold .flywheel/ and the work policy, "
+        "then start the orchestrator to populate the store.",
         file=sys.stderr,
     )
     return 2
@@ -216,8 +238,17 @@ def _lookup_awaiting_instruction(
     return grader.instruction
 
 
-def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
-    """Open the Textual dashboard, polling ``db_path`` until the operator quits."""
+def _run_dashboard(
+    db_path: Path,
+    work_source: WorkSource,
+    archive_tasks_dir: Path | None,
+) -> int:
+    """Open the Textual dashboard, polling ``db_path`` until the operator quits.
+
+    ``archive_tasks_dir`` is the directory the ``/archive`` slash command
+    sweeps; ``None`` for tracker-source policies disables the verb (the
+    screen surfaces a "not wired" notice).
+    """
     started_at = datetime.now(timezone.utc)
     store = SqliteStore(db_path)
 
@@ -228,6 +259,31 @@ def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
             now=datetime.now(timezone.utc),
             started_at=started_at,
         )
+
+    def enqueue_for_run(
+        run_id: str, kind: str, payload: Mapping[str, Any]
+    ) -> int:
+        """Producer seam shared by the dashboard slash commands."""
+
+        record = store.enqueue_command(
+            run_id, kind, payload, now=datetime.now(timezone.utc)
+        )
+        assert record.id is not None
+        return record.id
+
+    def archive() -> list[str]:
+        """``/archive`` action: sweep the directory work source.
+
+        Returns the list of moved phase directories (relative paths)
+        the operator sees in the inline notice. Disabled (returns an
+        empty list, the screen treats it as a no-op) for tracker
+        sources where ``fw archive`` itself errors.
+        """
+
+        if archive_tasks_dir is None:
+            return []
+        moved = archive_completed_phases(archive_tasks_dir, store)
+        return [str(path) for path in moved]
 
     def open_session(run_id: str, task_id: str) -> SessionScreen | None:
         """Construct the per-run session screen on Enter.
@@ -284,9 +340,15 @@ def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
             fetch=fetch,
             status=status,
             enqueue=enqueue,
+            archive=archive,
         )
 
-    app = DashboardApp(poll=poll, open_session=open_session)
+    app = DashboardApp(
+        poll=poll,
+        open_session=open_session,
+        enqueue=enqueue_for_run,
+        archive=archive,
+    )
     try:
         rc = app.run()
     finally:

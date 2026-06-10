@@ -1,7 +1,8 @@
-"""Unified ``fw`` command router (interim package).
+"""Unified ``fw`` / ``flywheel`` command + console package.
 
-This package owns no execution logic of its own. Every subcommand is a
-thin dispatch into the existing implementations:
+This package owns the operator console (Textual dashboard + per-run
+session screen + persistent input bar) and the verb router that
+dispatches every other subcommand:
 
 * ``init``, ``status``, ``live``, ``archive``, ``recover``,
   ``recheck-blocked`` -> :func:`flywheel_orchestrator._workflow.main`.
@@ -11,13 +12,45 @@ thin dispatch into the existing implementations:
   git-worktree daemon loop, in-process -- no shell-out).
 * ``audit`` -> :func:`flywheel.audit._cli.main`.
 * bare ``fw`` (TTY) or ``fw --json`` / non-TTY stdout ->
-  :func:`flywheel_tui._cli.main` (Textual console or JSON snapshot).
+  :func:`flywheel_cli._tui.main` (Textual console or JSON snapshot).
 
-The package's distribution name is the interim ``flywheel-cli`` (the
-core package still owns the ``flywheel`` script until the cli-cutover
-task flips both). The console script installed here is ``fw`` ONLY.
+The console code (``_dashboard.py``, ``_session*.py``, ``_snapshot.py``,
+``_slash.py``, ``_tui.py``) was absorbed from the deleted ``flywheel-tui``
+package per spec 00021; the import paths now live under
+:mod:`flywheel_cli` and there is no transitional shim.
 """
 
 from flywheel_cli._cli import main
+from flywheel_cli._session import (
+    EntryKind,
+    TranscriptEntry,
+    TranscriptTailer,
+    classify,
+    is_terminal,
+)
+from flywheel_cli._session_screen import SessionScreen, SessionStatus
+from flywheel_cli._snapshot import (
+    DashboardSnapshot,
+    RowSnapshot,
+    SummaryData,
+    build_snapshot,
+    snapshot_to_dict,
+)
+from flywheel_cli._tui import main as tui_main
 
-__all__ = ["main"]
+__all__ = [
+    "DashboardSnapshot",
+    "EntryKind",
+    "RowSnapshot",
+    "SessionScreen",
+    "SessionStatus",
+    "SummaryData",
+    "TranscriptEntry",
+    "TranscriptTailer",
+    "build_snapshot",
+    "classify",
+    "is_terminal",
+    "main",
+    "snapshot_to_dict",
+    "tui_main",
+]

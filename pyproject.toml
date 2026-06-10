@@ -8,6 +8,9 @@
 #                                   DAG, claims, multi-worker). depends on flywheel.
 #   packages/flywheel-worktree      built on top: git-worktree submit strategy +
 #                                   reference worker. depends on flywheel-orchestrator.
+#   packages/flywheel-cli           top of stack: the `fw` shell -- verb router
+#                                   plus the absorbed TUI (dashboard + session +
+#                                   persistent input bar). depends on the three above.
 #
 # Dependency arrows point one way only; core imports nothing downstream.
 
@@ -17,7 +20,6 @@ testpaths = [
     "packages/flywheel/tests",
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
-    "packages/flywheel-tui/tests",
     "packages/flywheel-cli/tests",
 ]
 
@@ -28,7 +30,6 @@ members = ["packages/*"]
 flywheel = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
-flywheel-tui = { workspace = true }
 flywheel-cli = { workspace = true }
 
 [dependency-groups]
@@ -36,7 +37,6 @@ dev = [
     "flywheel[postgres]",
     "flywheel-orchestrator",
     "flywheel-worktree",
-    "flywheel-tui",
     "flywheel-cli",
     "pytest>=9.0.3",
     "testcontainers>=4.0",

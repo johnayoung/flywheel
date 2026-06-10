@@ -2,12 +2,19 @@
 
 Pressing ``Enter`` on a dashboard row opens this screen. It pulls the
 selected run's merged audit stream through a
-:class:`flywheel_tui._session.TranscriptTailer`, renders each entry
+:class:`flywheel_cli._session.TranscriptTailer`, renders each entry
 chat-style, and tail-follows until either the operator scrolls up
 (follow pauses, a new-activity indicator appears) or the run reaches a
 terminal status (a banner pins the terminal state and the transcript
 stays scrollable). ``Escape`` returns to the dashboard with the row
 selection preserved.
+
+The compose box doubles as the persistent input bar: plain text is a
+``say`` (the shipped behaviour); a leading ``/`` switches the line into
+a slash command from the shared :mod:`flywheel_cli._slash` vocabulary
+(``/help``, ``/status``, ``/approve``, ``/reject [feedback]``,
+``/interrupt``, ``/archive``, ``/quit``). Slash commands target the
+viewed run with the exact store-mediated semantics of their CLI twins.
 
 The screen takes a ``fetch`` callable and a ``status`` callable rather
 than a store handle so Pilot tests can drive deterministic frames
@@ -36,10 +43,24 @@ from flywheel.invoker_client import (
     CONTROL_COMMAND_SAY,
 )
 from flywheel.lifecycle import Status
-from flywheel_tui._session import (
+
+from flywheel_cli._session import (
     EntryKind,
     TranscriptEntry,
     is_terminal,
+)
+from flywheel_cli._slash import (
+    HELP_TEXT,
+    SLASH_APPROVE,
+    SLASH_ARCHIVE,
+    SLASH_HELP,
+    SLASH_INTERRUPT,
+    SLASH_QUIT,
+    SLASH_REJECT,
+    SLASH_STATUS,
+    is_slash,
+    parse_slash,
+    unknown_command_notice,
 )
 
 
@@ -74,6 +95,12 @@ Production callers wire this to a closure over ``ControlCommandStore.enqueue_com
 that fills in the run_id and a fresh timestamp; tests pass a stub that
 records the call and returns a monotonically-increasing fake id.
 """
+
+
+# Side-effect seam for ``/archive``: returns the list of moved phase
+# directories so the screen can summarise the outcome inline. Kept as a
+# callable so tests can stub it without standing up a directory layout.
+ArchiveAction = Callable[[], list[str]]
 
 
 @dataclass
@@ -138,7 +165,7 @@ class SessionStatus:
 class SessionScreen(Screen[None]):
     """Drill-down view of one run's transcript.
 
-    The screen owns three observable bits of state:
+    The screen owns four observable bits of state:
 
     * ``_follow`` -- the tail-follow flag. ``True`` on open and after
       the operator presses ``End``; toggled to ``False`` by ``Page Up``,
@@ -152,6 +179,12 @@ class SessionScreen(Screen[None]):
     * ``_last_status`` -- the most recent :class:`SessionStatus`. Read
       by the banner / gate widgets so a transient store-read failure
       keeps the last good banner on screen rather than blanking it.
+    * ``_notice`` -- the inline operator notice line. Populated when
+      steering is refused (run no longer steerable, store raise),
+      ``/help`` / ``/status`` print a one-shot message, or an unknown
+      slash command is typed. The compose input is preserved on the
+      unknown-command branch so the operator can edit and resubmit
+      (Error Handling row in spec 00021).
 
     Exposed for tests: ``run_id``, ``entries`` (rendered so far),
     ``_follow``, ``_new_activity`` -- the same shape ``DashboardApp``
@@ -250,6 +283,7 @@ class SessionScreen(Screen[None]):
         status: Callable[[], SessionStatus],
         poll_interval_seconds: float = DEFAULT_SESSION_POLL_INTERVAL_SECONDS,
         enqueue: EnqueueCommand | None = None,
+        archive: ArchiveAction | None = None,
     ) -> None:
         super().__init__()
         self._run_id = run_id
@@ -258,6 +292,7 @@ class SessionScreen(Screen[None]):
         self._status = status
         self._poll_interval_seconds = poll_interval_seconds
         self._enqueue = enqueue
+        self._archive = archive
         # Observable state -- kept on the instance so tests can assert
         # transitions without scraping widget render output.
         self._follow: bool = True
@@ -297,6 +332,12 @@ class SessionScreen(Screen[None]):
 
         return self._new_activity
 
+    @property
+    def notice(self) -> str | None:
+        """The current inline notice text, if any (Pilot-test seam)."""
+
+        return self._notice
+
     # ----- Textual lifecycle --------------------------------------------
 
     def compose(self) -> ComposeResult:
@@ -308,17 +349,18 @@ class SessionScreen(Screen[None]):
         yield Static("", id="session_pending", classes="hidden")
         yield Static("", id="session_notice", classes="hidden")
         yield Static("", id="session_steering_help", classes="hidden")
-        # The compose box doubles as the reject-feedback field: pressing
-        # Enter submits a ``say``, Ctrl+R submits the current value as a
-        # reject's optional feedback. The placeholder advertises the
-        # primary action.
+        # The compose box doubles as the persistent input bar: plain
+        # text is a ``say``, a leading ``/`` switches into slash-command
+        # mode, Ctrl+R submits the current value as a reject's optional
+        # feedback. The placeholder advertises the primary actions plus
+        # the slash escape so the operator can discover the vocabulary
+        # without leaving the screen.
         yield Input(
             placeholder=(
-                "message to inject (enter=say, ctrl+x=interrupt, "
+                "say message or /help (enter=say, ctrl+x=interrupt, "
                 "ctrl+y=approve, ctrl+r=reject)"
             ),
             id="session_compose",
-            classes="hidden",
         )
 
     def on_mount(self) -> None:
@@ -483,8 +525,11 @@ class SessionScreen(Screen[None]):
             indicator.update("")
             indicator.add_class("hidden")
 
-        # Steering widgets: pending list, inline notice, compose box,
-        # and the help line that advertises the available verbs.
+        # Steering widgets: pending list, inline notice, and the help
+        # line that advertises the available verbs. The compose box
+        # itself stays mounted (it owns the slash-command vocabulary)
+        # but loses its placeholder and goes read-only-ish on terminal
+        # so the operator cannot type say/interrupt into a dead run.
         self._render_pending_widget()
         self._render_notice_widget()
         self._render_compose_widget()
@@ -531,19 +576,19 @@ class SessionScreen(Screen[None]):
             notice_widget.add_class("hidden")
 
     def _render_compose_widget(self) -> None:
-        """Show / hide the compose box and the steering help footer.
+        """Show / hide the steering help footer; the compose box stays.
 
-        The compose Input is mounted but kept hidden when no enqueue
-        seam was wired (the snapshot-only Pilot tests) or when the
-        viewed run is in a terminal status. The help footer mirrors
-        the visibility so the operator never sees a "press ctrl+y to
-        approve" hint against a DONE run.
+        The compose Input remains mounted for the whole life of the
+        screen so the slash-command vocabulary (``/help``, ``/quit``,
+        ...) is always reachable -- even on a terminal run where
+        ``say`` would be a no-op. The help footer only advertises the
+        verbs that would actually succeed for the current status so the
+        operator never sees "press ctrl+y to approve" against a DONE
+        run.
         """
 
-        compose = self.query_one("#session_compose", Input)
         help_widget = self.query_one("#session_steering_help", Static)
         if self._enqueue is None:
-            compose.add_class("hidden")
             help_widget.add_class("hidden")
             help_widget.update("")
             return
@@ -559,14 +604,9 @@ class SessionScreen(Screen[None]):
             and status.status in _APPROVABLE_STATUSES
         )
         if not can_say_or_interrupt and not can_approve_or_reject:
-            # Terminal / pre-run: hide the compose box entirely so the
-            # operator cannot type into a dead session. The transcript
-            # remains scrollable per FR-7.
-            compose.add_class("hidden")
             help_widget.add_class("hidden")
             help_widget.update("")
             return
-        compose.remove_class("hidden")
         help_lines: list[str] = []
         if can_say_or_interrupt:
             help_lines.append("enter=say  ctrl+x=interrupt")
@@ -639,17 +679,115 @@ class SessionScreen(Screen[None]):
     # ----- Steering -----------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter on the compose box submits a ``say`` command."""
+        """Compose-box submit -- slash command, or fall through to ``say``.
+
+        A leading ``/`` switches into the shared slash vocabulary; the
+        input clears on success and stays populated on the unknown-
+        command branch so the operator can correct the typo without
+        retyping the rest of the line.
+        """
 
         if event.input.id != "session_compose":
             return
-        text = event.value.strip()
+        raw = event.value
+        if is_slash(raw):
+            self._handle_slash(raw, event.input)
+            return
+        text = raw.strip()
         if not text:
             self._set_notice("say message must be non-empty")
             self._render_status_widgets()
             return
         self.submit_say(text)
         event.input.value = ""
+
+    def _handle_slash(self, raw: str, input_widget: Input) -> None:
+        """Dispatch one slash command line from the compose box.
+
+        The slash command set mirrors the dashboard's so the operator
+        moves between the two surfaces with one vocabulary. Errors
+        leave the input populated (Error Handling row in spec 00021)
+        so the operator can edit and resubmit; successes clear it.
+        """
+
+        command = parse_slash(raw)
+        verb = command.verb
+        if not verb:
+            self._set_notice(unknown_command_notice(""))
+            self._render_status_widgets()
+            return
+        if verb == SLASH_HELP:
+            self._set_notice(HELP_TEXT)
+            self._render_status_widgets()
+            input_widget.value = ""
+            return
+        if verb == SLASH_STATUS:
+            self._set_notice(self._status_text())
+            self._render_status_widgets()
+            input_widget.value = ""
+            return
+        if verb == SLASH_APPROVE:
+            self.submit_approve()
+            input_widget.value = ""
+            return
+        if verb == SLASH_REJECT:
+            feedback = command.argument or None
+            self.submit_reject(feedback)
+            input_widget.value = ""
+            return
+        if verb == SLASH_INTERRUPT:
+            self.submit_interrupt()
+            input_widget.value = ""
+            return
+        if verb == SLASH_ARCHIVE:
+            self._handle_archive()
+            input_widget.value = ""
+            return
+        if verb == SLASH_QUIT:
+            input_widget.value = ""
+            self.app.exit()
+            return
+        # Unknown verb: preserve the typed line for editing.
+        self._set_notice(unknown_command_notice(verb))
+        self._render_status_widgets()
+
+    def _status_text(self) -> str:
+        """Render the viewed run's lifecycle status for ``/status``."""
+
+        status = self._last_status
+        if status is None:
+            return f"run {self._run_id}: status unknown"
+        if status.missing:
+            return f"run {self._run_id}: not found in store"
+        if status.status is None:
+            return f"run {self._run_id}: lifecycle in unresolved state"
+        line = f"run {self._run_id}: status={status.status.value}"
+        if status.awaiting_instruction:
+            line += f"; gate={status.awaiting_instruction}"
+        return line
+
+    def _handle_archive(self) -> None:
+        """Run the ``/archive`` action and surface its outcome inline."""
+
+        if self._archive is None:
+            self._set_notice(
+                "/archive is not wired on this screen (no archive seam)"
+            )
+            self._render_status_widgets()
+            return
+        try:
+            moved = self._archive()
+        except Exception as exc:  # noqa: BLE001 - boundary against archive errors
+            self._set_notice(f"/archive failed: {exc}")
+            self._render_status_widgets()
+            return
+        if not moved:
+            self._set_notice("/archive: no phases archived")
+        else:
+            self._set_notice(
+                "/archive: moved " + ", ".join(moved)
+            )
+        self._render_status_widgets()
 
     def action_interrupt(self) -> None:
         """Key binding: enqueue an interrupt command."""
@@ -794,7 +932,7 @@ def _short(value: object, limit: int = 60) -> str:
     """Collapse ``value`` to a single line capped at ``limit`` characters.
 
     Used to summarise the operator's say / reject feedback text in the
-    pending-commands widget. Mirrors :func:`flywheel_tui._session._short`
+    pending-commands widget. Mirrors :func:`flywheel_cli._session._short`
     so the dashboard and session view collapse identically.
     """
 
@@ -822,7 +960,7 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
 
     Public so tests can assert the rendered shape (header tag, body
     text) without mounting a Textual app. Newlines inside the body
-    have already been collapsed by :mod:`flywheel_tui._session`.
+    have already been collapsed by :mod:`flywheel_cli._session`.
     """
 
     header_style = _HEADER_STYLES.get(entry.kind, "")
@@ -836,6 +974,7 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
 
 
 __all__ = [
+    "ArchiveAction",
     "DEFAULT_SESSION_POLL_INTERVAL_SECONDS",
     "EnqueueCommand",
     "SessionScreen",

@@ -1,7 +1,7 @@
 [project]
 name = "flywheel-cli"
 version = "0.1.0"
-description = "Unified `fw` command router: delegates to the existing single-task, orchestrator, worker, TUI, and audit entry points."
+description = "Unified `fw` command router and operator console: dashboard + session screen + persistent input bar; delegates verbs to the existing single-task, orchestrator, worker, and audit entry points."
 requires-python = ">=3.13"
 authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }
@@ -10,7 +10,7 @@ dependencies = [
     "flywheel",
     "flywheel-orchestrator",
     "flywheel-worktree",
-    "flywheel-tui",
+    "textual>=0.85",
 ]
 
 [project.scripts]

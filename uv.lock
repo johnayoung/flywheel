@@ -7,7 +7,6 @@ members = [
     "flywheel",
     "flywheel-cli",
     "flywheel-orchestrator",
-    "flywheel-tui",
     "flywheel-worktree",
 ]
 
@@ -16,7 +15,6 @@ dev = [
     { name = "flywheel", extras = ["postgres"], editable = "packages/flywheel" },
     { name = "flywheel-cli", editable = "packages/flywheel-cli" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
-    { name = "flywheel-tui", editable = "packages/flywheel-tui" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "testcontainers", specifier = ">=4.0" },
@@ -298,16 +296,16 @@ source = { editable = "packages/flywheel-cli" }
 dependencies = [
     { name = "flywheel" },
     { name = "flywheel-orchestrator" },
-    { name = "flywheel-tui" },
     { name = "flywheel-worktree" },
+    { name = "textual" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "flywheel", editable = "packages/flywheel" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
-    { name = "flywheel-tui", editable = "packages/flywheel-tui" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
+    { name = "textual", specifier = ">=0.85" },
 ]
 
 [[package]]
@@ -320,21 +318,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [{ name = "flywheel", editable = "packages/flywheel" }]
-
-[[package]]
-name = "flywheel-tui"
-version = "0.1.0"
-source = { editable = "packages/flywheel-tui" }
-dependencies = [
-    { name = "flywheel-orchestrator" },
-    { name = "textual" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
-    { name = "textual", specifier = ">=0.85" },
-]
 
 [[package]]
 name = "flywheel-worktree"

@@ -1,4 +1,4 @@
-"""Pilot-driven tests for :class:`flywheel_tui._session_screen.SessionScreen`.
+"""Pilot-driven tests for :class:`flywheel_cli._session_screen.SessionScreen`.
 
 The screen receives ``fetch`` / ``status`` callables so these tests
 drive deterministic frames without touching SQLite (the cursor and
@@ -26,10 +26,10 @@ from textual.widgets import DataTable, Input, Static
 from flywheel.lifecycle import Lifecycle, Status
 from flywheel.store_sqlite import SqliteStore
 
-from flywheel_tui._dashboard import DashboardApp
-from flywheel_tui._session import EntryKind, TranscriptEntry, TranscriptTailer
-from flywheel_tui._session_screen import SessionScreen, SessionStatus
-from flywheel_tui._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel_cli._dashboard import DashboardApp
+from flywheel_cli._session import EntryKind, TranscriptEntry, TranscriptTailer
+from flywheel_cli._session_screen import SessionScreen, SessionStatus
+from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 
 def _run(coro: Callable[[], Coroutine[Any, Any, None]]) -> None:
@@ -929,9 +929,16 @@ def test_session_screen_steering_disabled_on_done_run(
             async with app.run_test() as pilot:
                 await app.push_screen(screen)
                 await pilot.pause()
-                # Compose box and help footer are hidden in terminal.
+                # Compose box stays mounted (it owns the persistent
+                # slash-command vocabulary) but the steering help footer
+                # hides because every verb except /help / /quit would be
+                # a no-op on a terminal run.
                 compose = screen.query_one("#session_compose", Input)
-                assert compose.has_class("hidden")
+                assert not compose.has_class("hidden")
+                help_widget = screen.query_one(
+                    "#session_steering_help", Static
+                )
+                assert help_widget.has_class("hidden")
                 # Every verb returns None and writes nothing.
                 assert screen.submit_say("late") is None
                 assert screen.submit_interrupt() is None

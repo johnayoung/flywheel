@@ -1,8 +1,8 @@
 """``fw`` command router.
 
-Bare ``fw`` opens the existing Textual console; ``fw --json`` or a
-non-TTY stdout prints one JSON snapshot and exits (delegated to
-:func:`flywheel_tui._cli.main`, which already implements that fork).
+Bare ``fw`` opens the Textual console; ``fw --json`` or a non-TTY stdout
+prints one JSON snapshot and exits (delegated to
+:func:`flywheel_cli._tui.main`, which already implements that fork).
 Every other verb forwards its remaining argv to the pre-existing
 subcommand implementation so output and exit codes match the
 pre-router originals byte-for-byte.
@@ -29,8 +29,9 @@ from collections.abc import Sequence
 from flywheel.audit._cli import main as _audit_main
 from flywheel.workflow import main as _core_main
 from flywheel_orchestrator._workflow import main as _orchestrator_main
-from flywheel_tui._cli import main as _tui_main
 from flywheel_worktree.worker import main as _worker_main
+
+from flywheel_cli._tui import main as _tui_main
 
 
 _PROG = "fw"

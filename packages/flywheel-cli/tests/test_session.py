@@ -17,7 +17,7 @@ from flywheel.redaction import default_policy
 from flywheel.store_protocols import EventRecord, SdkMessageRecord
 from flywheel.store_sqlite import SqliteStore
 
-from flywheel_tui._session import (
+from flywheel_cli._session import (
     EntryKind,
     TERMINAL_STATUSES,
     TranscriptTailer,

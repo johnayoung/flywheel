@@ -1,4 +1,4 @@
-"""Pilot-driven tests for :class:`flywheel_tui._dashboard.DashboardApp`.
+"""Pilot-driven tests for :class:`flywheel_cli._dashboard.DashboardApp`.
 
 The Textual app receives an injected ``poll`` callable, so these tests
 drive deterministic frames without touching SQLite. Coverage matches
@@ -19,8 +19,8 @@ from typing import Any
 
 from textual.widgets import DataTable, Static
 
-from flywheel_tui._dashboard import DashboardApp
-from flywheel_tui._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel_cli._dashboard import DashboardApp
+from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 
 def _run(coro: Callable[[], Coroutine[Any, Any, None]]) -> None:

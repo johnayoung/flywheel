@@ -37,6 +37,11 @@ from flywheel_cli._snapshot import (
     snapshot_to_dict,
 )
 from flywheel_cli._tui import main as tui_main
+from flywheel_cli._worker_supervisor import (
+    WorkerState,
+    WorkerStatus,
+    WorkerSupervisor,
+)
 
 __all__ = [
     "DashboardSnapshot",
@@ -47,6 +52,9 @@ __all__ = [
     "SummaryData",
     "TranscriptEntry",
     "TranscriptTailer",
+    "WorkerState",
+    "WorkerStatus",
+    "WorkerSupervisor",
     "build_snapshot",
     "classify",
     "is_terminal",

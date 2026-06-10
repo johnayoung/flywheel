@@ -33,6 +33,12 @@ from flywheel.invoker_client import (
 )
 from flywheel.lifecycle import Status
 
+from flywheel_cli._quit_prompt import (
+    QUIT_CANCEL,
+    QUIT_DETACH,
+    QUIT_STOP,
+    QuitPromptScreen,
+)
 from flywheel_cli._session_screen import ArchiveAction, SessionScreen
 from flywheel_cli._slash import (
     HELP_TEXT,
@@ -43,11 +49,13 @@ from flywheel_cli._slash import (
     SLASH_QUIT,
     SLASH_REJECT,
     SLASH_STATUS,
+    SLASH_WORKER,
     is_slash,
     parse_slash,
     unknown_command_notice,
 )
 from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel_cli._worker_supervisor import WorkerState, WorkerStatus
 
 # How long a row that just left the active set stays dimmed on screen.
 DEFAULT_LINGER_SECONDS: int = 30
@@ -86,6 +94,22 @@ _TABLE_COLUMNS: tuple[str, ...] = (
 # ``enqueue_command``-bound closure to both.
 EnqueueForRun = Callable[[str, str, Mapping[str, Any]], int]
 """``(run_id, kind, payload) -> command_id`` -- store enqueue seam."""
+
+
+# Producer seams the dashboard threads through to the worker supervisor
+# so the supervision module stays a hard dependency of the wiring layer
+# only -- the app sees four small callables it can mock in tests
+# without dragging in subprocess machinery. Production callers bind
+# them to ``WorkerSupervisor`` instance methods; tests pass stubs that
+# record the calls and return scripted statuses.
+WorkerStatusFn = Callable[[], WorkerStatus]
+"""``() -> WorkerStatus`` -- read-only status poll for the status bar."""
+WorkerStartFn = Callable[[], WorkerStatus]
+"""``() -> WorkerStatus`` -- ``/worker start`` and post-DEAD respawn."""
+WorkerStopFn = Callable[[], bool]
+"""``() -> bool`` -- ``/worker stop`` and quit-prompt 's' branch."""
+WorkerDetachFn = Callable[[], None]
+"""``() -> None`` -- quit-prompt Enter branch (idempotent forget)."""
 
 
 # Statuses against which the in-process watcher will apply ``interrupt``.
@@ -139,6 +163,12 @@ class DashboardApp(App[int]):
         padding: 0 1;
     }
 
+    #worker_bar {
+        height: auto;
+        padding: 0 1;
+        color: $accent;
+    }
+
     #status_bar {
         height: auto;
         padding: 0 1;
@@ -179,9 +209,12 @@ class DashboardApp(App[int]):
         # ``enter`` is documented for the help footer; the actual
         # dispatch lives in :meth:`on_data_table_row_selected` because
         # the DataTable widget already owns ``enter`` and fires a
-        # ``RowSelected`` message we listen for there. ``priority=True``
-        # so the binding still shows up in the bottom bar.
-        Binding("enter", "open_session", "Open", show=True, priority=True),
+        # ``RowSelected`` message we listen for there. Non-priority
+        # so the supervised-quit prompt's own ``enter`` binding (on
+        # top of the screen stack) is the one that fires when the
+        # modal is active -- a priority Enter on the App would
+        # pre-empt the prompt and silently no-op the detach choice.
+        Binding("enter", "open_session", "Open", show=True),
         Binding("q", "quit", "Quit", show=True),
         Binding("question_mark", "toggle_help", "Help", show=True),
         # Focus shortcut for the persistent input bar. ``priority=True``
@@ -203,6 +236,10 @@ class DashboardApp(App[int]):
         open_session: Callable[[str, str], SessionScreen | None] | None = None,
         enqueue: EnqueueForRun | None = None,
         archive: ArchiveAction | None = None,
+        worker_status: WorkerStatusFn | None = None,
+        worker_start: WorkerStartFn | None = None,
+        worker_stop: WorkerStopFn | None = None,
+        worker_detach: WorkerDetachFn | None = None,
     ) -> None:
         super().__init__()
         self._poll = poll
@@ -217,6 +254,17 @@ class DashboardApp(App[int]):
         self._open_session = open_session
         self._enqueue = enqueue
         self._archive = archive
+        # Worker supervision seams. ``None`` (the default) disables the
+        # worker status bar and degrades ``/worker`` to a "not wired"
+        # notice -- the same shape the dashboard's existing ``enqueue``
+        # / ``archive`` seams take so snapshot-only tests stay light.
+        self._worker_status = worker_status
+        self._worker_start = worker_start
+        self._worker_stop = worker_stop
+        self._worker_detach = worker_detach
+        # Latest worker status snapshot; cached so the status bar can
+        # re-render between polls without re-querying the supervisor.
+        self._last_worker_status: WorkerStatus | None = None
         self._memo: dict[str, _RowMemo] = {}
         self._last_snapshot: DashboardSnapshot | None = None
         self._last_error: str | None = None
@@ -229,6 +277,10 @@ class DashboardApp(App[int]):
         # unknown command, archive summary).
         self._filter: str = ""
         self._notice: str | None = None
+        # ``True`` once a quit-prompt modal is on the screen stack so
+        # rapid double-q does not stack multiple prompts; cleared in the
+        # prompt's dismiss callback.
+        self._quit_prompt_active: bool = False
 
     # ----- Public test seams ---------------------------------------------------
 
@@ -244,10 +296,17 @@ class DashboardApp(App[int]):
 
         return self._notice
 
+    @property
+    def worker_status(self) -> WorkerStatus | None:
+        """The most recent worker status snapshot, or ``None`` if not wired."""
+
+        return self._last_worker_status
+
     # ----- Textual lifecycle -------------------------------------------------
 
     def compose(self) -> ComposeResult:
         yield Static("", id="summary")
+        yield Static("", id="worker_bar", classes="hidden")
         yield DataTable(id="rows")
         yield Static("", id="empty_state", classes="hidden")
         yield Static("", id="status_bar", classes="hidden")
@@ -327,6 +386,30 @@ class DashboardApp(App[int]):
         self.query_one("#summary", Static).update(
             _format_summary(snapshot.summary)
         )
+
+        # Worker bar -- queried each render so a dying child surfaces
+        # within one tick. ``None`` (no supervisor wired) hides the bar
+        # entirely so snapshot-only tests are unaffected.
+        worker_bar = self.query_one("#worker_bar", Static)
+        if self._worker_status is not None:
+            try:
+                status = self._worker_status()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                status = None
+                self._last_error = f"worker status read failed: {exc}"
+            if status is not None:
+                self._last_worker_status = status
+                worker_bar.update(_format_worker_status(status))
+                worker_bar.remove_class("hidden")
+            elif self._last_worker_status is not None:
+                worker_bar.update(_format_worker_status(self._last_worker_status))
+                worker_bar.remove_class("hidden")
+            else:
+                worker_bar.update("")
+                worker_bar.add_class("hidden")
+        else:
+            worker_bar.update("")
+            worker_bar.add_class("hidden")
 
         # Compute the visible ordering after the filter is applied so
         # empty-state / row rendering / cursor-bound calculations all
@@ -412,6 +495,80 @@ class DashboardApp(App[int]):
     def action_cursor_down(self) -> None:
         self.query_one(DataTable).action_cursor_down()
 
+    def action_quit(self) -> None:
+        """Quit through the supervised-child handoff prompt when applicable.
+
+        Override of :meth:`App.action_quit`. When the supervisor owns
+        a live child, push the prompt screen and decide based on the
+        operator's choice; otherwise exit immediately. The prompt is
+        a one-shot modal -- ``_quit_prompt_active`` guards against a
+        rapid double-q stacking two prompts.
+        """
+
+        self.request_quit()
+
+    def request_quit(self) -> None:
+        """Shared entry point for ``q`` binding, ``/quit`` slash, and SIGINT.
+
+        Routes through the supervised-child prompt when the supervisor
+        owns a live child, exits silently otherwise. Public so the TUI
+        wrapper can call it on a signal handler without going through
+        a keypress.
+        """
+
+        if self._quit_prompt_active:
+            return
+        status_fn = self._worker_status
+        if status_fn is None:
+            self.exit()
+            return
+        try:
+            status = status_fn()
+        except Exception:  # noqa: BLE001 - boundary against supervisor errors
+            # If we cannot read the worker status, default to detach
+            # behaviour: never silently kill the child (spec).
+            self.exit()
+            return
+        if status.state != WorkerState.SUPERVISED:
+            self.exit()
+            return
+        self._quit_prompt_active = True
+        self.push_screen(QuitPromptScreen(), self._handle_quit_choice)
+
+    def _handle_quit_choice(self, result: str | None) -> None:
+        """Apply the operator's quit-prompt choice.
+
+        ``Enter`` -> detach (worker keeps running, console exits).
+        ``s``     -> stop the supervised child (SIGTERM + wait), exit.
+        ``Esc``   -> cancel; no exit, supervision state untouched.
+        ``None``  -> Textual delivered a dismissal without a value
+                     (modal popped without a binding firing); treat as
+                     a cancel so we never silently kill the child.
+        """
+
+        self._quit_prompt_active = False
+        if result == QUIT_DETACH:
+            if self._worker_detach is not None:
+                try:
+                    self._worker_detach()
+                except Exception:  # noqa: BLE001 - boundary
+                    pass
+            self.exit()
+            return
+        if result == QUIT_STOP:
+            if self._worker_stop is not None:
+                try:
+                    self._worker_stop()
+                except Exception:  # noqa: BLE001 - boundary
+                    pass
+            self.exit()
+            return
+        # QUIT_CANCEL (or unknown) -- stay on the dashboard.
+        if result not in (QUIT_CANCEL, None):
+            # Defensive: an unrecognised dismiss value is treated as a
+            # cancel so we never silently kill the child.
+            pass
+
     def action_toggle_help(self) -> None:
         widget = self.query_one("#help_footer", Static)
         if widget.has_class("hidden"):
@@ -426,15 +583,41 @@ class DashboardApp(App[int]):
 
         self.query_one("#dashboard_input", Input).focus()
 
+    def on_data_table_row_selected(
+        self, event: DataTable.RowSelected
+    ) -> None:
+        """Open the per-run session screen when DataTable emits RowSelected.
+
+        ``DataTable`` consumes ``enter`` itself and surfaces a
+        ``RowSelected`` message; the dashboard's ``enter`` binding
+        is intentionally non-priority so the supervised-quit prompt's
+        own ``enter`` wins while the prompt is on top of the screen
+        stack -- this handler is the dispatch site for the normal
+        case (no modal active).
+        """
+
+        if self._quit_prompt_active:
+            return
+        del event  # row id is read from ``_visible_run_order`` for stability
+        self.action_open_session()
+
     def action_open_session(self) -> None:
         """Push the session screen for the currently-selected row.
 
         No-op when no session factory was supplied (snapshot-only Pilot
         tests) or when the cursor sits on an empty table. The selected
         row id is looked up in ``_visible_run_order`` so we never trust
-        the table widget's internal index past a refresh.
+        the table widget's internal index past a refresh. Skips when
+        a modal (the quit prompt) is on top so an Enter that should
+        confirm the prompt does not also push a session screen.
         """
 
+        # The Enter binding is ``priority=True`` for bottom-bar display,
+        # but that priority means it fires even while the quit prompt
+        # is the active screen; short-circuit so the prompt's own
+        # Enter binding is the one that wins on top of the stack.
+        if self._quit_prompt_active:
+            return
         if self._open_session is None:
             return
         run_id = self._selected_run_id()
@@ -556,9 +739,15 @@ class DashboardApp(App[int]):
             self._handle_archive()
             input_widget.value = ""
             return
+        if verb == SLASH_WORKER:
+            notice = self.handle_worker_slash(command.argument)
+            if notice:
+                self._set_notice(notice)
+            input_widget.value = ""
+            return
         if verb == SLASH_QUIT:
             input_widget.value = ""
-            self.exit()
+            self.request_quit()
             return
         # Unknown verb: keep the typed line so the operator can fix
         # the typo without re-entering the rest.
@@ -624,6 +813,78 @@ class DashboardApp(App[int]):
         else:
             self._set_notice("/archive: moved " + ", ".join(moved))
 
+    def handle_worker_slash(self, argument: str) -> str:
+        """Dispatch ``/worker start`` and ``/worker stop`` against the supervisor.
+
+        Returns the inline notice the caller should surface
+        (dashboard's ``#dashboard_notice``, session screen's
+        ``#session_notice``). The four observable outcomes per
+        sub-verb -- no supervisor wired, unknown sub-verb, and the
+        success / failure of the underlying
+        :class:`WorkerSupervisor` call -- are all returned through
+        the same string so both screens reach the operator with one
+        vocabulary.
+
+        Public (no leading underscore) because the
+        :class:`SessionScreen` calls it via ``getattr(self.app, ...)``
+        when the operator types ``/worker`` on the per-run view.
+        """
+
+        sub = argument.strip().lower()
+        if sub == "start":
+            if self._worker_start is None:
+                return "/worker start is not wired on this screen"
+            try:
+                status = self._worker_start()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                return f"/worker start failed: {exc}"
+            self._last_worker_status = status
+            if status.state == WorkerState.SUPERVISED:
+                return f"/worker start: supervised (pid={status.pid})"
+            if status.state == WorkerState.DETACHED:
+                return (
+                    "/worker start: a worker already holds a live lease "
+                    "(detached); no spawn"
+                )
+            if status.state == WorkerState.ERROR:
+                return (
+                    f"/worker start failed: {status.message or 'unknown'}"
+                )
+            return f"/worker start: state={status.state.value}"
+        if sub == "stop":
+            if self._worker_stop is None:
+                return "/worker stop is not wired on this screen"
+            # Edge case: only signal a child this console owns. A
+            # detached or external worker shows an inline notice
+            # instead -- the spec calls this out explicitly so the
+            # operator cannot accidentally kill someone else's run.
+            current = (
+                self._worker_status() if self._worker_status is not None else None
+            )
+            if current is None or current.state != WorkerState.SUPERVISED:
+                state_name = current.state.value if current is not None else "unknown"
+                return (
+                    f"/worker stop: no supervised child to stop "
+                    f"(state={state_name})"
+                )
+            try:
+                stopped = self._worker_stop()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                return f"/worker stop failed: {exc}"
+            if self._worker_status is not None:
+                try:
+                    self._last_worker_status = self._worker_status()
+                except Exception:  # noqa: BLE001 - re-read is opportunistic
+                    pass
+            if stopped:
+                return "/worker stop: worker terminated gracefully"
+            return (
+                "/worker stop: worker did not exit within the wait window"
+            )
+        return (
+            f"/worker: unknown sub-verb {sub!r}; try 'start' or 'stop'"
+        )
+
     def _status_text(self) -> str:
         """Render the selected run's status for ``/status``.
 
@@ -674,6 +935,33 @@ def _status_from_value(value: str) -> Status | None:
         return Status(value)
     except ValueError:
         return None
+
+
+def _format_worker_status(status: WorkerStatus) -> str:
+    """Render one ``worker:`` line for the status bar.
+
+    Follows the spec's status-bar vocabulary verbatim
+    (``worker: supervised`` / ``detached`` / ``none`` / ``dead`` /
+    ``error: <reason>``) so a docs grep on the labels lands on this
+    function. The ``none`` line embeds the ``/worker start`` hint
+    explicitly called out in the Error Handling row for
+    ``--no-worker`` with nothing live.
+    """
+
+    state = status.state
+    if state == WorkerState.SUPERVISED:
+        pid = f" pid={status.pid}" if status.pid is not None else ""
+        return f"worker: supervised{pid}"
+    if state == WorkerState.DETACHED:
+        return "worker: detached (this console did not spawn it)"
+    if state == WorkerState.NONE:
+        return "worker: none -- type '/worker start' to spawn one"
+    if state == WorkerState.DEAD:
+        detail = f" ({status.message})" if status.message else ""
+        return f"worker: dead -- type '/worker start' to respawn{detail}"
+    if state == WorkerState.ERROR:
+        return f"worker: error: {status.message or 'unknown'}"
+    return f"worker: {state.value}"
 
 
 def _format_summary(summary: SummaryData) -> str:

@@ -19,15 +19,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-# The seven verbs the input bar honours. ``/worker`` is intentionally
-# absent here -- it lands with the supervision task per the cli-shell-input
-# constraints.
+# The eight verbs the input bar honours. ``/worker start|stop`` is
+# the supervision handle for the engine-on-launch child the console
+# manages -- ``start`` (re)spawns a worker when none is live, ``stop``
+# sends SIGTERM to the supervised child.
 SLASH_HELP = "help"
 SLASH_STATUS = "status"
 SLASH_APPROVE = "approve"
 SLASH_REJECT = "reject"
 SLASH_INTERRUPT = "interrupt"
 SLASH_ARCHIVE = "archive"
+SLASH_WORKER = "worker"
 SLASH_QUIT = "quit"
 
 SLASH_COMMANDS: tuple[str, ...] = (
@@ -37,6 +39,7 @@ SLASH_COMMANDS: tuple[str, ...] = (
     SLASH_REJECT,
     SLASH_INTERRUPT,
     SLASH_ARCHIVE,
+    SLASH_WORKER,
     SLASH_QUIT,
 )
 
@@ -49,6 +52,7 @@ HELP_LINES: tuple[str, ...] = (
     "  /reject [feedback]  reject the parked manual gate (optional feedback)",
     "  /interrupt          interrupt the run",
     "  /archive            archive completed phases",
+    "  /worker start|stop  spawn or gracefully stop the supervised worker",
     "  /quit               exit the console",
 )
 
@@ -119,6 +123,7 @@ __all__ = [
     "SLASH_QUIT",
     "SLASH_REJECT",
     "SLASH_STATUS",
+    "SLASH_WORKER",
     "SlashCommand",
     "is_slash",
     "parse_slash",

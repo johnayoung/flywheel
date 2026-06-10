@@ -53,6 +53,7 @@ from flywheel_cli._snapshot import (
     build_snapshot,
     snapshot_to_dict,
 )
+from flywheel_cli._worker_supervisor import WorkerSupervisor
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -79,7 +80,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if json_mode:
         return _run_snapshot(db_path, work_source)
-    return _run_dashboard(db_path, work_source, archive_tasks_dir)
+    tasks_dir = _resolve_tasks_dir_for_worker(args.tasks_dir, policy)
+    return _run_dashboard(
+        db_path,
+        work_source,
+        archive_tasks_dir,
+        tasks_dir=tasks_dir,
+        no_worker=args.no_worker,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -132,6 +140,15 @@ def _build_parser() -> argparse.ArgumentParser:
             f"{DEFAULT_POLL_INTERVAL_SECONDS})."
         ),
     )
+    parser.add_argument(
+        "--no-worker",
+        action="store_true",
+        help=(
+            "Skip spawning a supervised flywheel-worktree worker on "
+            "console launch. The status bar shows worker: none until "
+            "you type '/worker start' or run a worker manually."
+        ),
+    )
     return parser
 
 
@@ -149,6 +166,28 @@ def _resolve_work_source(
     if policy is not None:
         return build_work_source(policy)
     return DirectoryWorkSource(DEFAULT_TASKS_DIR)
+
+
+def _resolve_tasks_dir_for_worker(
+    tasks_dir_arg: str | None, policy: WorkPolicy | None
+) -> Path | None:
+    """Resolve the ``--tasks-dir`` value the spawned worker should use.
+
+    The supervisor forwards this to the child as ``--tasks-dir`` so
+    the worker reads the same active/ directory the console resolved
+    for the summary header. ``None`` means "use the worker's own
+    default" (``<repo>/.flywheel/tasks``) -- correct for the common
+    case where the operator runs ``fw`` at the repo root and the
+    policy left the source at its default.
+    """
+
+    if tasks_dir_arg:
+        return Path(tasks_dir_arg)
+    if policy is None:
+        return None
+    if policy.source_kind == "directory" and policy.tasks_dir is not None:
+        return policy.tasks_dir
+    return None
 
 
 def _resolve_archive_tasks_dir(
@@ -242,15 +281,28 @@ def _run_dashboard(
     db_path: Path,
     work_source: WorkSource,
     archive_tasks_dir: Path | None,
+    *,
+    tasks_dir: Path | None,
+    no_worker: bool,
 ) -> int:
     """Open the Textual dashboard, polling ``db_path`` until the operator quits.
 
     ``archive_tasks_dir`` is the directory the ``/archive`` slash command
     sweeps; ``None`` for tracker-source policies disables the verb (the
     screen surfaces a "not wired" notice).
+
+    The supervisor is constructed unconditionally so the status bar
+    always shows worker state, but only spawned when ``no_worker`` is
+    false (FR-2 honours ``--no-worker`` by skipping the auto-spawn;
+    the operator can still type ``/worker start`` afterwards). The
+    ``finally`` block detaches before closing the store -- never a
+    silent kill, per the spec.
     """
     started_at = datetime.now(timezone.utc)
     store = SqliteStore(db_path)
+    supervisor = WorkerSupervisor(db_path=db_path, tasks_dir=tasks_dir)
+    if not no_worker:
+        supervisor.start()
 
     def poll() -> DashboardSnapshot:
         return build_snapshot(
@@ -348,10 +400,20 @@ def _run_dashboard(
         open_session=open_session,
         enqueue=enqueue_for_run,
         archive=archive,
+        worker_status=supervisor.status,
+        worker_start=supervisor.start,
+        worker_stop=supervisor.stop,
+        worker_detach=supervisor.detach,
     )
     try:
         rc = app.run()
     finally:
+        # ``close()`` is the detach-by-default path: the supervised
+        # child (if any) keeps running so a SIGINT-on-the-console exit
+        # never silently kills the worker (spec FR-3 / Edge Cases).
+        # The operator's explicit ``stop`` choice has already signaled
+        # the child by the time we get here.
+        supervisor.close()
         store.close()
     return rc if isinstance(rc, int) else 0
 

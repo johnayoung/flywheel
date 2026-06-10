@@ -58,6 +58,7 @@ from flywheel_cli._slash import (
     SLASH_QUIT,
     SLASH_REJECT,
     SLASH_STATUS,
+    SLASH_WORKER,
     is_slash,
     parse_slash,
     unknown_command_notice,
@@ -743,9 +744,21 @@ class SessionScreen(Screen[None]):
             self._handle_archive()
             input_widget.value = ""
             return
+        if verb == SLASH_WORKER:
+            self._handle_worker_slash(command.argument)
+            input_widget.value = ""
+            return
         if verb == SLASH_QUIT:
             input_widget.value = ""
-            self.app.exit()
+            # Route through the dashboard's supervised-child prompt so
+            # quit from the session screen takes the same detach-or-stop
+            # path as quit from the dashboard (spec FR-3: prompt appears
+            # only when this console owns a supervised child).
+            request_quit = getattr(self.app, "request_quit", None)
+            if callable(request_quit):
+                request_quit()
+            else:
+                self.app.exit()
             return
         # Unknown verb: preserve the typed line for editing.
         self._set_notice(unknown_command_notice(verb))
@@ -765,6 +778,27 @@ class SessionScreen(Screen[None]):
         if status.awaiting_instruction:
             line += f"; gate={status.awaiting_instruction}"
         return line
+
+    def _handle_worker_slash(self, argument: str) -> None:
+        """Forward ``/worker start|stop`` to the dashboard app's handler.
+
+        The session screen does not own the worker supervisor (the
+        :class:`DashboardApp` does); routing through the app keeps a
+        single dispatch site so the inline notice and status-bar
+        update flow remain consistent across screens. When the app
+        lacks the seam (snapshot-only tests, ``--no-worker``), the
+        notice mirrors the dashboard's "not wired" message.
+        """
+
+        handler = getattr(self.app, "handle_worker_slash", None)
+        if not callable(handler):
+            self._set_notice("/worker is not wired on this screen")
+            self._render_status_widgets()
+            return
+        notice = handler(argument)
+        if isinstance(notice, str) and notice:
+            self._set_notice(notice)
+            self._render_status_widgets()
 
     def _handle_archive(self) -> None:
         """Run the ``/archive`` action and surface its outcome inline."""

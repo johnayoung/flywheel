@@ -27,7 +27,7 @@ Two surfaces are exported:
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -638,10 +638,15 @@ def _classify_event(
       ``harness.manual_rejected`` become :attr:`EntryKind.GATE` lines
       so a manual-gate decision is visually distinct from generic
       lifecycle telemetry.
-    * Every other ``harness.*`` event becomes a generic
-      :attr:`EntryKind.LIFECYCLE` line; the kind is the header and the
-      payload digest is the body. Custom plugin events without the
-      ``harness.`` prefix render the same way.
+    * Every other ``harness.*`` event becomes an :attr:`EntryKind.LIFECYCLE`
+      line. When the kind has a registered formatter in
+      :data:`_LIFECYCLE_FORMATTERS` the body is a short human phrase
+      built from named payload fields; unknown kinds keep the legacy
+      ``kind + JSON-digest`` rendering so a future plugin event still
+      surfaces in order. A formatter that raises on a missing or
+      oddly-shaped payload field falls back to the same digest pair so
+      a malformed record never crashes the classifier (spec FR-4 Error
+      Handling row).
     """
 
     kind = record.kind
@@ -674,7 +679,7 @@ def _classify_event(
                     control_command_id=command_id,
                 )
             ]
-        body = f"applied {command_kind}"
+        body = f"{command_kind} applied"
         return [
             TranscriptEntry(
                 sequence=sequence,
@@ -718,7 +723,7 @@ def _classify_event(
                 ts=record.ts,
                 kind=EntryKind.LIFECYCLE,
                 header="control",
-                body=f"failed {command_kind}: {error_detail}",
+                body=f"{command_kind} failed: {error_detail}",
                 attempt_number=record.attempt_number,
                 iteration_number=None,
                 control_command_id=command_id,
@@ -752,19 +757,415 @@ def _classify_event(
                 iteration_number=None,
             )
         ]
-    body = _short(_payload_digest(payload))
+    header, body = _lifecycle_header_body(kind, payload)
     return [
         TranscriptEntry(
             sequence=sequence,
             sub_index=0,
             ts=record.ts,
             kind=EntryKind.LIFECYCLE,
-            header=kind,
+            header=header,
             body=body,
             attempt_number=record.attempt_number,
             iteration_number=None,
         )
     ]
+
+
+def _lifecycle_header_body(
+    kind: str, payload: Mapping[str, Any]
+) -> tuple[str, str]:
+    """Resolve the ``(header, body)`` pair for a lifecycle telemetry event.
+
+    Known harness kinds (:data:`_LIFECYCLE_FORMATTERS`) get a friendly
+    header plus a brace-free human phrase built from named payload
+    fields. Anything else -- a future plugin event, an unrecognized
+    ``harness.*`` kind, or a known kind whose formatter raised on a
+    missing / oddly-typed field -- falls back to the legacy pair: the
+    full kind as the header and the sorted-key JSON digest of the
+    payload as the body. The fallback path mirrors the pre-humanization
+    rendering exactly so existing audit readers keep their identity-
+    by-shape assumptions (FR-4 Error Handling).
+    """
+
+    formatter = _LIFECYCLE_FORMATTERS.get(kind)
+    if formatter is not None:
+        try:
+            result = formatter(payload)
+        except Exception:
+            return kind, _short(_payload_digest(payload))
+        return result
+    return kind, _short(_payload_digest(payload))
+
+
+# --- Lifecycle event formatters --------------------------------------------
+#
+# Per spec FR-4 each known harness.* kind renders as a short human phrase
+# rather than a JSON digest. Every formatter is pure, takes the raw event
+# payload (Mapping[str, Any]) and returns the ``(header, body)`` pair the
+# transcript line uses. A formatter MAY raise on a missing or oddly shaped
+# field; the caller (:func:`_lifecycle_header_body`) catches the exception
+# and falls back to the kind-plus-JSON-digest pair so a malformed payload
+# never crashes the classifier. Phrases are brace-free so the line stays
+# scannable when the digest equivalent would have inlined ``{"key":...}``.
+
+_LifecycleFormatter = Callable[[Mapping[str, Any]], tuple[str, str]]
+
+
+def _format_token_count(value: int) -> str:
+    """Render a token count compactly: ``500``, ``1.2k``, ``3.4M``.
+
+    Used by the iteration-completed phrase so a 1.2k-token iteration
+    fits on the same line as the iteration number.
+    """
+
+    if value < 1000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{value / 1000:.1f}k"
+    return f"{value / 1_000_000:.1f}M"
+
+
+def _require_int(payload: Mapping[str, Any], key: str) -> int:
+    """Return ``payload[key]`` as an int or raise.
+
+    ``bool`` is rejected explicitly because ``isinstance(True, int)`` is
+    ``True`` in Python and ``True`` is not a meaningful count.
+    """
+
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key!r} must be int")
+    return value
+
+
+def _optional_str(payload: Mapping[str, Any], key: str) -> str | None:
+    """Return ``payload[key]`` when it is a non-empty string, else ``None``."""
+
+    value = payload.get(key)
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _fmt_iteration_completed(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``iteration 3 · 1.2k tokens · 4 turns`` (FR-4 acceptance phrase)."""
+
+    iteration = _require_int(payload, "iteration")
+    parts: list[str] = [f"iteration {iteration}"]
+    usage = payload.get("usage")
+    if isinstance(usage, Mapping):
+        total = usage.get("total_tokens")
+        if (
+            not isinstance(total, bool)
+            and isinstance(total, int)
+            and total > 0
+        ):
+            parts.append(f"{_format_token_count(total)} tokens")
+    num_turns = payload.get("num_turns")
+    if (
+        not isinstance(num_turns, bool)
+        and isinstance(num_turns, int)
+        and num_turns > 0
+    ):
+        parts.append(f"{num_turns} turn{'s' if num_turns != 1 else ''}")
+    failure = payload.get("failure")
+    if isinstance(failure, Mapping):
+        ferr = failure.get("error_type")
+        fmsg = failure.get("message")
+        ferr_s = ferr if isinstance(ferr, str) else None
+        fmsg_s = fmsg if isinstance(fmsg, str) else None
+        if ferr_s and fmsg_s:
+            parts.append(f"failure: {ferr_s}: {fmsg_s}")
+        elif ferr_s:
+            parts.append(f"failure: {ferr_s}")
+        elif fmsg_s:
+            parts.append(f"failure: {fmsg_s}")
+    return "iteration", " · ".join(parts)
+
+
+def _fmt_attempt_started(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``attempt 2 started``."""
+
+    number = _require_int(payload, "number")
+    return "attempt", f"attempt {number} started"
+
+
+def _fmt_attempt_finalized(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``attempt 2 finalized (succeeded)`` or with trailing error detail."""
+
+    number = _require_int(payload, "number")
+    body = f"attempt {number} finalized"
+    outcome = _optional_str(payload, "outcome")
+    if outcome:
+        body += f" ({outcome})"
+    error = _optional_str(payload, "error")
+    if error:
+        body += f": {error}"
+    return "attempt", body
+
+
+def _fmt_retry_scheduled(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``retry 1/3 scheduled`` -- counts are required to surface the budget."""
+
+    retries_used = _require_int(payload, "retries_used")
+    max_retries = _require_int(payload, "max_retries")
+    return (
+        "retry",
+        f"retry {retries_used}/{max_retries} scheduled",
+    )
+
+
+def _fmt_blocked(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``blocked: <reason>`` -- the reason is the lifecycle's user-facing why."""
+
+    reason = _optional_str(payload, "reason")
+    if reason is None:
+        return "blocked", "blocked"
+    return "blocked", f"blocked: {reason}"
+
+
+def _fmt_unblocked(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``unblocked: interrupted -> ready`` (status edge for the operator)."""
+
+    frm = _optional_str(payload, "from_status")
+    to = _optional_str(payload, "to_status")
+    if frm and to:
+        return "unblocked", f"unblocked: {frm} -> {to}"
+    return "unblocked", "unblocked"
+
+
+def _fmt_interrupted(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``interrupted (worker_interrupted): operator interrupted mid-attempt``."""
+
+    classification = _optional_str(payload, "classification")
+    message = _optional_str(payload, "message")
+    body = "interrupted"
+    if classification:
+        body += f" ({classification})"
+    if message:
+        body += f": {message}"
+    return "interrupted", body
+
+
+def _fmt_stuck(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``stuck on Bash: <reason>`` -- names the offending tool."""
+
+    tool_name = _optional_str(payload, "tool_name")
+    reason = _optional_str(payload, "reason")
+    body = "stuck"
+    if tool_name:
+        body += f" on {tool_name}"
+    if reason:
+        body += f": {reason}"
+    return "stuck", body
+
+
+def _fmt_thrash_detected(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``thrash on Edit: <reason>`` -- twin of stuck for tuple-repetition."""
+
+    tool_name = _optional_str(payload, "tool_name")
+    reason = _optional_str(payload, "reason")
+    body = "thrash detected"
+    if tool_name:
+        body += f" on {tool_name}"
+    if reason:
+        body += f": {reason}"
+    return "thrash", body
+
+
+def _fmt_hang_detected(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``hang detected at iteration 4 · silence 12.3s · threshold 10.0s``."""
+
+    parts: list[str] = ["hang detected"]
+    iteration = payload.get("iteration")
+    if not isinstance(iteration, bool) and isinstance(iteration, int):
+        parts.append(f"at iteration {iteration}")
+    silence = payload.get("silence_seconds")
+    if not isinstance(silence, bool) and isinstance(silence, (int, float)):
+        parts.append(f"silence {float(silence):.1f}s")
+    timeout = payload.get("hang_timeout_seconds")
+    if not isinstance(timeout, bool) and isinstance(timeout, (int, float)):
+        parts.append(f"threshold {float(timeout):.1f}s")
+    return "hang", " · ".join(parts)
+
+
+def _fmt_budget_exceeded(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``budget exceeded: turns>10`` -- the breached descriptor is required."""
+
+    breached = _optional_str(payload, "breached")
+    if breached is None:
+        return "budget", "budget exceeded"
+    return "budget", f"budget exceeded: {breached}"
+
+
+def _fmt_context_threshold_crossed(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``context threshold 75% crossed (sdk)`` -- percentage tier marker."""
+
+    percentage = payload.get("percentage")
+    if not isinstance(percentage, bool) and isinstance(
+        percentage, (int, float)
+    ):
+        pct = f"{float(percentage):.0f}%"
+    else:
+        tier = payload.get("tier")
+        if isinstance(tier, bool) or not isinstance(tier, (int, float)):
+            raise ValueError("missing tier/percentage")
+        pct = f"{float(tier) * 100:.0f}%"
+    body = f"context threshold {pct} crossed"
+    source = _optional_str(payload, "capacity_source")
+    if source:
+        body += f" ({source})"
+    return "context", body
+
+
+def _fmt_context_recovery(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``context recovery (mid_turn) at iteration 7``."""
+
+    parts: list[str] = ["context recovery"]
+    trigger = _optional_str(payload, "trigger")
+    if trigger:
+        parts.append(f"({trigger})")
+    iteration = payload.get("iteration")
+    if not isinstance(iteration, bool) and isinstance(iteration, int):
+        parts.append(f"at iteration {iteration}")
+    return "context", " ".join(parts)
+
+
+def _fmt_rubric_invoked(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``rubric invoked: review-migration``."""
+
+    grader_name = _optional_str(payload, "grader_name")
+    if grader_name is None:
+        return "rubric", "rubric invoked"
+    return "rubric", f"rubric invoked: {grader_name}"
+
+
+def _fmt_rubric_verdict(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``rubric pass: review-migration`` / ``fail`` / ``unknown``."""
+
+    if "passed" not in payload:
+        raise KeyError("passed")
+    unknown = bool(payload.get("unknown"))
+    passed = payload.get("passed")
+    if unknown:
+        verdict = "unknown"
+    elif passed is True:
+        verdict = "pass"
+    elif passed is False:
+        verdict = "fail"
+    else:
+        raise TypeError("passed must be bool")
+    grader_name = _optional_str(payload, "grader_name")
+    if grader_name:
+        return "rubric", f"rubric {verdict}: {grader_name}"
+    return "rubric", f"rubric {verdict}"
+
+
+def _fmt_crash(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """``crash (entry_error): RuntimeError: stack overflow``."""
+
+    body = "crash"
+    classification = _optional_str(payload, "classification")
+    if classification:
+        body += f" ({classification})"
+    detail_bits: list[str] = []
+    exc_type = _optional_str(payload, "exception_type")
+    message = _optional_str(payload, "message")
+    if exc_type:
+        detail_bits.append(exc_type)
+    if message:
+        detail_bits.append(message)
+    if detail_bits:
+        body += ": " + ": ".join(detail_bits)
+    return "crash", body
+
+
+def _fmt_audit_write_failed(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``audit write failed: SqliteError: db locked`` (FR-5 fallback signal)."""
+
+    body = "audit write failed"
+    exc_type = _optional_str(payload, "error_type")
+    message = _optional_str(payload, "message")
+    bits = [b for b in (exc_type, message) if b]
+    if bits:
+        body += ": " + ": ".join(bits)
+    return "audit", body
+
+
+def _fmt_protocol_failure(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``protocol failure: malformed: bad json`` -- envelope-level surface."""
+
+    body = "protocol failure"
+    bits: list[str] = []
+    inner_kind = _optional_str(payload, "kind")
+    if inner_kind:
+        bits.append(inner_kind)
+    reason = _optional_str(payload, "reason")
+    detail = _optional_str(payload, "detail")
+    if reason:
+        bits.append(reason)
+    elif detail:
+        bits.append(detail)
+    if bits:
+        body += ": " + ": ".join(bits)
+    return "protocol", body
+
+
+def _fmt_recheck_attempted(
+    payload: Mapping[str, Any],
+) -> tuple[str, str]:
+    """``recheck attempted: satisfied`` / ``unsatisfied`` (dry-run aware)."""
+
+    all_satisfied = payload.get("all_satisfied")
+    dry_run = payload.get("dry_run")
+    if isinstance(all_satisfied, bool):
+        verdict = "satisfied" if all_satisfied else "unsatisfied"
+    else:
+        verdict = "complete"
+    body = f"recheck attempted: {verdict}"
+    if dry_run is True:
+        body += " (dry-run)"
+    return "recheck", body
+
+
+# Registry of per-kind humanizers. Adding a new kind here is the only
+# hook needed to humanize its rendering; the classifier picks it up
+# automatically via :func:`_lifecycle_header_body`. Kinds absent from
+# the registry stay on the legacy kind-plus-JSON-digest path so an
+# unrecognized future event still surfaces in the transcript without
+# any code change here.
+_LIFECYCLE_FORMATTERS: dict[str, _LifecycleFormatter] = {
+    "harness.iteration_completed": _fmt_iteration_completed,
+    "harness.attempt_started": _fmt_attempt_started,
+    "harness.attempt_finalized": _fmt_attempt_finalized,
+    "harness.retry_scheduled": _fmt_retry_scheduled,
+    "harness.blocked": _fmt_blocked,
+    "harness.unblocked": _fmt_unblocked,
+    "harness.interrupted": _fmt_interrupted,
+    "harness.stuck": _fmt_stuck,
+    "harness.thrash_detected": _fmt_thrash_detected,
+    "harness.hang_detected": _fmt_hang_detected,
+    "harness.budget_exceeded": _fmt_budget_exceeded,
+    "harness.context_threshold_crossed": _fmt_context_threshold_crossed,
+    "harness.context_recovery": _fmt_context_recovery,
+    "harness.rubric_invoked": _fmt_rubric_invoked,
+    "harness.rubric_verdict": _fmt_rubric_verdict,
+    "harness.crash": _fmt_crash,
+    "harness.audit_write_failed": _fmt_audit_write_failed,
+    "harness.protocol_failure": _fmt_protocol_failure,
+    "harness.recheck_attempted": _fmt_recheck_attempted,
+}
 
 
 def _payload_digest(payload: Mapping[str, Any]) -> str:

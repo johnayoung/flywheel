@@ -488,14 +488,49 @@ def test_classify_operator_say_event_attributes_text() -> None:
 
 
 def test_classify_non_say_control_event_renders_generic_control_line() -> None:
+    """A non-``say`` ``control_command_applied`` renders as a human
+    phrase (no JSON digest) and keeps ``control_command_id`` populated so
+    :meth:`SessionScreen._reconcile_pending` can flip the pending marker
+    when the watcher catches up."""
+
     record = _event_record(
         kind="harness.control_command_applied",
         payload={"command_id": 1, "kind": "interrupt", "payload": {}},
     )
     entries = classify(record)
-    assert entries[0].kind is EntryKind.LIFECYCLE
-    assert entries[0].header == "control"
-    assert "interrupt" in entries[0].body
+    entry = entries[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "control"
+    assert "interrupt" in entry.body
+    # Humanized phrase: no JSON braces or comma-separated digest noise.
+    assert "{" not in entry.body
+    assert "}" not in entry.body
+    # The id is the seam the screen uses to reconcile pending commands;
+    # it must survive the humanization.
+    assert entry.control_command_id == 1
+
+
+def test_classify_control_command_failed_surfaces_error_detail() -> None:
+    """``control_command_failed`` keeps populating ``control_command_id``
+    and ``control_command_error`` so the screen's pending-to-failed
+    pilot tests continue to surface ``error_type: message`` inline."""
+
+    record = _event_record(
+        kind="harness.control_command_failed",
+        payload={
+            "command_id": 7,
+            "kind": "say",
+            "error_type": "SDKDisconnected",
+            "message": "session was closed",
+        },
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "control"
+    assert "SDKDisconnected" in entry.body
+    assert "session was closed" in entry.body
+    assert entry.control_command_id == 7
+    assert entry.control_command_error == "SDKDisconnected: session was closed"
 
 
 def test_classify_gate_event_carries_grader_name() -> None:
@@ -510,16 +545,152 @@ def test_classify_gate_event_carries_grader_name() -> None:
     assert "ordinal=2" in entries[0].body
 
 
-def test_classify_lifecycle_event_uses_kind_as_header() -> None:
+def test_classify_iteration_completed_renders_humanized_phrase() -> None:
+    """FR-4 acceptance: a known kind renders a brace-free phrase
+    containing the iteration number and a token count."""
+
     record = _event_record(
         kind="harness.iteration_completed",
-        payload={"iteration": 3, "usage": {"total_tokens": 100}},
+        payload={"iteration": 3, "usage": {"total_tokens": 1200}},
     )
-    entries = classify(record)
-    assert entries[0].kind is EntryKind.LIFECYCLE
-    assert entries[0].header == "harness.iteration_completed"
-    # Payload digest is deterministic + sorted.
-    assert "iteration" in entries[0].body
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "iteration"
+    assert "iteration 3" in entry.body
+    # Token count present in any compact form -- 1200 renders as ``1.2k``.
+    assert "1.2k" in entry.body
+    # The defining contrast with the legacy JSON-digest rendering: no
+    # braces survive the humanization.
+    assert "{" not in entry.body
+    assert "}" not in entry.body
+
+
+def test_classify_iteration_completed_includes_turns_and_failure() -> None:
+    """``num_turns`` and a populated ``failure`` block surface in the
+    phrase when present; otherwise they are omitted."""
+
+    record = _event_record(
+        kind="harness.iteration_completed",
+        payload={
+            "iteration": 5,
+            "usage": {"total_tokens": 500},
+            "num_turns": 4,
+            "failure": {
+                "error_type": "EnvelopeError",
+                "message": "missing envelope",
+            },
+        },
+    )
+    entry = classify(record)[0]
+    assert entry.header == "iteration"
+    assert "iteration 5" in entry.body
+    assert "500 tokens" in entry.body
+    assert "4 turns" in entry.body
+    assert "EnvelopeError" in entry.body
+    assert "missing envelope" in entry.body
+
+
+def test_classify_attempt_started_renders_humanized_phrase() -> None:
+    record = _event_record(
+        kind="harness.attempt_started",
+        payload={"number": 2, "agent_context": {"model": "test"}},
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "attempt"
+    assert entry.body == "attempt 2 started"
+
+
+def test_classify_attempt_finalized_includes_outcome_and_error() -> None:
+    record = _event_record(
+        kind="harness.attempt_finalized",
+        payload={
+            "number": 1,
+            "outcome": "agent_error",
+            "error": "protocol failure: missing envelope",
+        },
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "attempt"
+    assert entry.body == (
+        "attempt 1 finalized (agent_error): "
+        "protocol failure: missing envelope"
+    )
+
+
+def test_classify_retry_scheduled_shows_counter() -> None:
+    record = _event_record(
+        kind="harness.retry_scheduled",
+        payload={"retries_used": 1, "max_retries": 3},
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "retry"
+    assert entry.body == "retry 1/3 scheduled"
+
+
+def test_classify_known_kind_with_missing_field_falls_back_to_digest() -> None:
+    """FR-4 Error Handling: a known kind whose payload is missing a
+    required field falls back to the legacy ``kind + JSON digest`` pair
+    rather than raising or producing a half-formed phrase."""
+
+    record = _event_record(
+        kind="harness.iteration_completed",
+        # ``iteration`` is required; without it the formatter raises and
+        # the classifier falls back to the digest pair.
+        payload={"usage": {"total_tokens": 100}},
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    # Fallback restores the raw kind as the header.
+    assert entry.header == "harness.iteration_completed"
+    # The body is the JSON-digest of the payload (braces present).
+    assert "{" in entry.body
+    assert "}" in entry.body
+    assert "total_tokens" in entry.body
+
+
+def test_classify_unrecognized_kind_still_shows_json_digest() -> None:
+    """FR-4 acceptance: an unrecognized event kind keeps the legacy
+    ``kind + JSON digest`` rendering -- nothing is suppressed, nothing
+    is humanized in a way that would lose payload context."""
+
+    record = _event_record(
+        kind="harness.audit_finalized",
+        payload={"reason": "shutdown", "attempts": 4},
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "harness.audit_finalized"
+    # Digest body retains the JSON braces -- the contrast that proves
+    # humanization did not kick in for an unrecognized kind.
+    assert "{" in entry.body
+    assert "}" in entry.body
+    assert "shutdown" in entry.body
+
+
+def test_classify_known_kind_with_non_json_serializable_payload_uses_short() -> None:
+    """Edge case: a payload value that cannot serialize through the
+    JSON digest falls through to :func:`_short` exactly as the
+    pre-humanization classifier did."""
+
+    class _Unserializable:
+        def __repr__(self) -> str:
+            return "<weird>"
+
+    # Use a kind with no formatter so the digest path is exercised
+    # directly.
+    record = _event_record(
+        kind="harness.audit_finalized",
+        payload={"weird": _Unserializable()},
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.LIFECYCLE
+    assert entry.header == "harness.audit_finalized"
+    # ``_payload_digest`` catches the JSON failure and falls through to
+    # ``_short(dict(payload))``; that surface contains the weird repr.
+    assert "weird" in entry.body
 
 
 def test_classify_result_message_renders_turn_end_marker() -> None:

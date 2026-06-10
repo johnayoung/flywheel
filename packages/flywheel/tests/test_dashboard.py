@@ -231,8 +231,75 @@ def test_dashboard_summary_header_shows_counts_and_totals() -> None:
             assert "queued=3" in text
             assert "done=5" in text
             assert "failed=1" in text
-            assert "tokens=12345" in text
-            assert "$1.2345" in text
+            assert "tokens=12k" in text
+            assert "$1.23" in text
             assert "2m05s" in text
+
+    _run(body)
+
+
+def test_dashboard_cursor_survives_refresh() -> None:
+    """Regression: ``DataTable.clear()`` resets the cursor to row 0 and
+    ``_render`` runs on every poll tick, so without explicit restore the
+    selection snapped back to the first task once a second."""
+
+    async def body() -> None:
+        snapshot = _snapshot(_row("alpha"), _row("beta"), _row("gamma"))
+        app = DashboardApp(
+            poll=lambda: snapshot, poll_interval_seconds=1000.0
+        )
+        async with app.run_test() as pilot:
+            table = app.query_one(DataTable)
+            await pilot.press("down")
+            assert table.cursor_row == 1
+            # A poll tick re-renders; the selection must stay on beta.
+            app.refresh_now()
+            await pilot.pause()
+            assert table.cursor_row == 1
+
+    _run(body)
+
+
+def test_dashboard_cursor_follows_selected_run_when_rows_shift() -> None:
+    """The restore targets the selected run id, so reordering or
+    departing rows above it do not change which run is selected."""
+
+    async def body() -> None:
+        state: dict[str, DashboardSnapshot] = {
+            "snapshot": _snapshot(_row("alpha"), _row("beta"), _row("gamma"))
+        }
+        clock = _Clock(datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc))
+        app = DashboardApp(
+            poll=lambda: state["snapshot"],
+            poll_interval_seconds=1000.0,
+            linger_seconds=0,
+            clock=clock,
+        )
+        async with app.run_test() as pilot:
+            table = app.query_one(DataTable)
+            await pilot.press("down")
+            assert app._visible_run_order[table.cursor_row] == "run-beta"
+            # Alpha finishes and drops out instantly (linger 0).
+            state["snapshot"] = _snapshot(_row("beta"), _row("gamma"))
+            clock.advance(1)
+            app.refresh_now()
+            await pilot.pause()
+            assert app._visible_run_order[table.cursor_row] == "run-beta"
+
+    _run(body)
+
+
+def test_dashboard_ctrl_c_quits() -> None:
+    """ctrl+c routes through the quit path (ctrl+q is unusable inside
+    VS Code's terminal, so the Textual default hint dead-ends)."""
+
+    async def body() -> None:
+        app = DashboardApp(
+            poll=lambda: _snapshot(_row("alpha")),
+            poll_interval_seconds=1000.0,
+        )
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+c")
+        assert app.return_code in (0, None)
 
     _run(body)

@@ -31,9 +31,14 @@ class RowSnapshot:
     """One in-flight run's render-ready fields.
 
     Mirrors :class:`flywheel_orchestrator.LiveRunRow` minus the live
-    ``last_ts`` (collapsed to ``age_seconds`` against the snapshot's
-    ``now``) so the dashboard and ``--json`` surfaces consume the same
-    flat shape.
+    timestamps (collapsed against the snapshot's ``now``) so the
+    dashboard and ``--json`` surfaces consume the same flat shape.
+
+    ``age_seconds`` is how long the run has existed (since its earliest
+    lifecycle transition) -- it grows monotonically while the run is
+    in flight. ``idle_seconds`` is how long since the run's last
+    recorded activity -- it resets on every event and is the staleness
+    signal.
     """
 
     run_id: str
@@ -42,6 +47,7 @@ class RowSnapshot:
     attempt: int | None
     iteration: int | None
     age_seconds: int | None
+    idle_seconds: int | None = None
     tokens: int
     cost_usd: float
     turns: int
@@ -119,14 +125,16 @@ def build_snapshot(
 
 
 def _row_snapshot(row: LiveRunRow, *, now: datetime) -> RowSnapshot:
-    if row.last_ts is None:
+    # Negative spans (clock skew between SQLite and the host) read as 0s
+    # rather than a misleading negative — mirrors ``_format_live_line``.
+    if row.started_at is None:
         age_s: int | None = None
     else:
-        age_s = int((now - row.last_ts).total_seconds())
-        if age_s < 0:
-            # Clock skew between SQLite and the host reads as 0s rather
-            # than a misleading negative — mirrors ``_format_live_line``.
-            age_s = 0
+        age_s = max(0, int((now - row.started_at).total_seconds()))
+    if row.last_ts is None:
+        idle_s: int | None = None
+    else:
+        idle_s = max(0, int((now - row.last_ts).total_seconds()))
     return RowSnapshot(
         run_id=row.run_id,
         task_id=row.task_id,
@@ -134,6 +142,7 @@ def _row_snapshot(row: LiveRunRow, *, now: datetime) -> RowSnapshot:
         attempt=row.attempt,
         iteration=row.iteration,
         age_seconds=age_s,
+        idle_seconds=idle_s,
         tokens=row.tokens_total,
         cost_usd=row.cost_usd_total,
         turns=row.turns_total,
@@ -167,6 +176,7 @@ def snapshot_to_dict(snapshot: DashboardSnapshot) -> dict[str, Any]:
                 "attempt": r.attempt,
                 "iteration": r.iteration,
                 "age_seconds": r.age_seconds,
+                "idle_seconds": r.idle_seconds,
                 "tokens": r.tokens,
                 "cost_usd": r.cost_usd,
                 "turns": r.turns,

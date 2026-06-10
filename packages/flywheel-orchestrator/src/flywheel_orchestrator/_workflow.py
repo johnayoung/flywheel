@@ -770,6 +770,11 @@ class LiveRunRow:
     turns_total: int
     iterations_completed: int
     awaiting_instruction: str | None = None
+    # Earliest lifecycle transition timestamp -- when the run started.
+    # ``last_ts`` answers "how long since the run did anything" (idle /
+    # staleness); ``started_at`` answers "how long has this run been
+    # going" (the age an operator expects to grow monotonically).
+    started_at: datetime | None = None
 
 _SDK_KIND_LABELS: dict[str, str] = {
     "AssistantMessage": "ASSISTANT",
@@ -946,7 +951,8 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     conn = store._connection  # noqa: SLF001
     lifecycles = conn.execute(
         """
-        SELECT run_id, task_id, status, awaiting_manual_ordinal
+        SELECT run_id, task_id, status, awaiting_manual_ordinal,
+               timestamps_json
         FROM lifecycles
         WHERE status IN ('running', 'validating', 'awaiting_approval')
         ORDER BY task_id, run_id
@@ -1016,6 +1022,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 str(evt["kind"]), evt["payload_json"]
             )
         tokens, cost, turns, iters_completed = _sum_run_totals(conn, run_id)
+        started_at = _earliest_lifecycle_ts(lc["timestamps_json"])
         status = Status(lc["status"])
         awaiting_instruction = _resolve_awaiting_instruction(
             store,
@@ -1038,9 +1045,34 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 turns_total=turns,
                 iterations_completed=iters_completed,
                 awaiting_instruction=awaiting_instruction,
+                started_at=started_at,
             )
         )
     return rows
+
+def _earliest_lifecycle_ts(timestamps_json: str | None) -> datetime | None:
+    """Earliest transition timestamp recorded on a lifecycle row.
+
+    ``timestamps_json`` is keyed by status, and retries overwrite the
+    ``ready``/``running`` keys with the latest transition -- so the
+    minimum across all recorded values is the only stable "when did
+    this run start" answer. Unparseable JSON or values degrade to
+    ``None`` (the caller renders the age as unknown).
+    """
+    if not timestamps_json:
+        return None
+    try:
+        payload = json.loads(timestamps_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    parsed = [
+        ts
+        for value in payload.values()
+        if isinstance(value, str) and (ts := _parse_db_ts(value)) is not None
+    ]
+    return min(parsed) if parsed else None
 
 def _resolve_awaiting_instruction(
     store: SqliteStore,
@@ -1097,23 +1129,27 @@ def _format_totals(row: LiveRunRow) -> str:
     )
 
 def _format_live_line(row: LiveRunRow, now: datetime) -> str:
-    if row.last_ts is None:
+    # ``age`` is how long the run has existed (earliest lifecycle
+    # transition); ``idle`` is how long since its last recorded
+    # activity. Staleness is an idle property -- a long-running but
+    # chatty run is healthy, a quiet one is not.
+    if row.started_at is None:
         age_str = "—"
+    else:
+        age_str = f"{_clamped_seconds(row.started_at, now)}s"
+    if row.last_ts is None:
+        idle_str = "—"
         stale = ""
     else:
-        age_s = int((now - row.last_ts).total_seconds())
-        # Negative ages (clock skew between SQLite and host) read as "0s"
-        # rather than a misleading negative.
-        if age_s < 0:
-            age_s = 0
-        age_str = f"{age_s}s"
-        stale = "  STALE" if age_s > _LIVE_STALE_AFTER_SECONDS else ""
+        idle_s = _clamped_seconds(row.last_ts, now)
+        idle_str = f"{idle_s}s"
+        stale = "  STALE" if idle_s > _LIVE_STALE_AFTER_SECONDS else ""
     detail = _short(row.last_detail, _LIVE_DETAIL_MAX_WIDTH)
     head = (
         f"{row.task_id}  {row.status.value}  "
         f"{_format_breadcrumb(row)}  "
         f"{_format_totals(row)}  "
-        f"age={age_str}  {row.last_kind}  {detail}{stale}"
+        f"age={age_str}  idle={idle_str}  {row.last_kind}  {detail}{stale}"
     )
     if row.awaiting_instruction is not None:
         # The owed decision is rendered as an indented follow-up line —
@@ -1122,6 +1158,14 @@ def _format_live_line(row: LiveRunRow, now: datetime) -> str:
         # needs you" surfacing across both views.
         return f"{head}\n    awaiting_on: {row.awaiting_instruction}"
     return head
+
+def _clamped_seconds(then: datetime, now: datetime) -> int:
+    """Whole seconds between two instants, clamped at zero.
+
+    Negative spans (clock skew between SQLite and host) read as 0
+    rather than a misleading negative.
+    """
+    return max(0, int((now - then).total_seconds()))
 
 def _cmd_live(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args, _load_effective_policy(args))

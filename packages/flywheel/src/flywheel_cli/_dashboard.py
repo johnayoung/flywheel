@@ -66,27 +66,38 @@ DEFAULT_POLL_INTERVAL_SECONDS: float = 1.0
 
 _HELP_LINES: tuple[str, ...] = (
     "key bindings",
-    "  up/down  move row selection",
-    "  enter    open session view for the selected run",
-    "  escape   close the session view (back to dashboard)",
-    "  ctrl+i   focus the input bar (filter + slash commands)",
-    "  q        quit",
-    "  ?        toggle this help footer",
+    "  up/down     move row selection",
+    "  enter       open session view for the selected run",
+    "  escape      close the session view (back to dashboard)",
+    "  ctrl+i      focus the input bar (filter + slash commands)",
+    "  q / ctrl+c  quit",
+    "  ?           toggle this help footer",
     "",
     "input bar: plain text filters rows; /help lists slash commands.",
 )
 
 _HELP_TEXT: str = "\n".join(_HELP_LINES)
 
-_TABLE_COLUMNS: tuple[str, ...] = (
-    "task_id",
-    "status",
-    "pos",
-    "age",
-    "tokens",
-    "cost",
-    "last_action",
+# ``(key, label)`` pairs: keys are the stable cell identifiers (the
+# filter haystack and tests address cells by position), labels are what
+# the header row shows.
+_TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("task_id", "task"),
+    ("status", "status"),
+    ("pos", "attempt/iter"),
+    ("age", "age"),
+    ("tokens", "tokens"),
+    ("cost", "cost"),
+    ("last_action", "last action"),
 )
+
+# Status -> cell style for the active rows. Anything unknown renders
+# unstyled; departed rows are dimmed wholesale regardless of status.
+_STATUS_STYLES: Mapping[str, str] = {
+    Status.RUNNING.value: "bold green",
+    Status.VALIDATING.value: "bold yellow",
+    Status.AWAITING_APPROVAL.value: "bold magenta",
+}
 
 
 # Producer seam for the dashboard's slash commands. Matches the shape
@@ -161,12 +172,18 @@ class DashboardApp(App[int]):
     #summary {
         height: auto;
         padding: 0 1;
+        background: $boost;
     }
 
     #worker_bar {
         height: auto;
         padding: 0 1;
-        color: $accent;
+        background: $boost;
+    }
+
+    #rows {
+        height: 1fr;
+        scrollbar-gutter: stable;
     }
 
     #status_bar {
@@ -195,7 +212,11 @@ class DashboardApp(App[int]):
 
     #dashboard_input {
         height: auto;
-        padding: 0 1;
+        border: tall $primary 60%;
+    }
+
+    #dashboard_input:focus {
+        border: tall $accent;
     }
 
     .hidden {
@@ -216,6 +237,13 @@ class DashboardApp(App[int]):
         # pre-empt the prompt and silently no-op the detach choice.
         Binding("enter", "open_session", "Open", show=True),
         Binding("q", "quit", "Quit", show=True),
+        # Terminal muscle memory: ctrl+c routes through the same
+        # supervised-quit prompt as ``q``. Textual's default binds
+        # ctrl+c to a "press ctrl+q to quit" hint, but ctrl+q is
+        # swallowed by VS Code's terminal, leaving no way out.
+        # ``priority=True`` so it also fires while the input bar has
+        # focus.
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
         Binding("question_mark", "toggle_help", "Help", show=True),
         # Focus shortcut for the persistent input bar. ``priority=True``
         # so the chord wins even when focus has bounced to a child
@@ -325,8 +353,8 @@ class DashboardApp(App[int]):
         table = self.query_one(DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        for column in _TABLE_COLUMNS:
-            table.add_column(column, key=column)
+        for key, label in _TABLE_COLUMNS:
+            table.add_column(label, key=key)
         # Pin focus on the table so arrows/Enter/q/? do not get
         # intercepted by the input bar by default.
         table.focus()
@@ -460,17 +488,35 @@ class DashboardApp(App[int]):
         # Rows: clear and re-add in task_id order so layout is stable.
         # Filtered-out runs are simply omitted (their memos persist so a
         # filter clear restores them without re-poll).
+        #
+        # ``DataTable.clear()`` resets the cursor to row 0, and this
+        # method runs on every poll tick -- so the selection must be
+        # captured before the clear and restored after the rebuild, or
+        # the operator's cursor snaps back to the first row once a
+        # second. Restore targets the previously-selected run id (rows
+        # may have shifted), falling back to the old index clamped into
+        # the new bounds when that run left the visible set.
         table = self.query_one(DataTable)
+        selected_run_id = self._selected_run_id()
+        previous_row = table.cursor_row
         table.clear()
         self._visible_run_order = []
         for run_id, memo in filtered_items:
             cells = _row_to_cells(memo.snapshot)
             if memo.active:
-                table.add_row(*cells, key=run_id)
+                table.add_row(*_style_active_cells(cells), key=run_id)
             else:
                 dimmed = tuple(Text(c, style="dim") for c in cells)
                 table.add_row(*dimmed, key=run_id)
             self._visible_run_order.append(run_id)
+        if self._visible_run_order:
+            if selected_run_id in self._visible_run_order:
+                target = self._visible_run_order.index(selected_run_id)
+            else:
+                target = max(
+                    0, min(previous_row, len(self._visible_run_order) - 1)
+                )
+            table.move_cursor(row=target, animate=False)
 
     def _row_matches_filter(self, row: RowSnapshot) -> bool:
         """Whether ``row`` survives the current plain-text row filter.
@@ -937,7 +983,7 @@ def _status_from_value(value: str) -> Status | None:
         return None
 
 
-def _format_worker_status(status: WorkerStatus) -> str:
+def _format_worker_status(status: WorkerStatus) -> Text:
     """Render one ``worker:`` line for the status bar.
 
     Follows the spec's status-bar vocabulary verbatim
@@ -945,41 +991,67 @@ def _format_worker_status(status: WorkerStatus) -> str:
     ``error: <reason>``) so a docs grep on the labels lands on this
     function. The ``none`` line embeds the ``/worker start`` hint
     explicitly called out in the Error Handling row for
-    ``--no-worker`` with nothing live.
+    ``--no-worker`` with nothing live. Returned as a styled
+    :class:`rich.text.Text` -- healthy states render calm, dead/error
+    render loud.
     """
 
     state = status.state
     if state == WorkerState.SUPERVISED:
         pid = f" pid={status.pid}" if status.pid is not None else ""
-        return f"worker: supervised{pid}"
+        return Text(f"worker: supervised{pid}", style="green")
     if state == WorkerState.DETACHED:
-        return "worker: detached (this console did not spawn it)"
+        return Text(
+            "worker: detached (this console did not spawn it)",
+            style="yellow",
+        )
     if state == WorkerState.NONE:
-        return "worker: none -- type '/worker start' to spawn one"
+        return Text(
+            "worker: none -- type '/worker start' to spawn one",
+            style="dim",
+        )
     if state == WorkerState.DEAD:
         detail = f" ({status.message})" if status.message else ""
-        return f"worker: dead -- type '/worker start' to respawn{detail}"
+        return Text(
+            f"worker: dead -- type '/worker start' to respawn{detail}",
+            style="bold red",
+        )
     if state == WorkerState.ERROR:
-        return f"worker: error: {status.message or 'unknown'}"
-    return f"worker: {state.value}"
+        return Text(
+            f"worker: error: {status.message or 'unknown'}",
+            style="bold red",
+        )
+    return Text(f"worker: {state.value}")
 
 
-def _format_summary(summary: SummaryData) -> str:
+def _format_summary(summary: SummaryData) -> Text:
     """Render the summary header — single line so it stays readable on
     narrow terminals; counts roll up to match ``flywheel status``
-    aggregated by state."""
+    aggregated by state. Zero counts render dim so the populated ones
+    carry the eye; ``failed`` goes red the moment it is non-zero."""
     counts = summary.task_counts
     queued = counts.get("fresh", 0)
     done = counts.get("done", 0)
     failed = counts.get("retryable", 0)
     runtime = _format_duration(summary.runtime_seconds)
-    return (
-        f"active={summary.active_workers}  "
-        f"queued={queued}  done={done}  failed={failed}  "
-        f"tokens={summary.tokens_total}  "
-        f"cost=${summary.cost_usd_total:.4f}  "
-        f"runtime={runtime}"
+    text = Text()
+    text.append(
+        f"active={summary.active_workers}",
+        "bold green" if summary.active_workers else "dim",
     )
+    text.append("  ")
+    text.append(f"queued={queued}", "cyan" if queued else "dim")
+    text.append("  ")
+    text.append(f"done={done}", "green" if done else "dim")
+    text.append("  ")
+    text.append(f"failed={failed}", "bold red" if failed else "dim")
+    text.append("  ")
+    text.append(f"tokens={_format_tokens(summary.tokens_total)}")
+    text.append("  ")
+    text.append(f"cost={_format_cost(summary.cost_usd_total)}")
+    text.append("  ")
+    text.append(f"runtime={runtime}")
+    return text
 
 
 def _format_duration(seconds: int) -> str:
@@ -995,21 +1067,72 @@ def _format_duration(seconds: int) -> str:
 
 
 def _row_to_cells(row: RowSnapshot) -> tuple[str, str, str, str, str, str, str]:
-    attempt = f"attempt={row.attempt}" if row.attempt is not None else "attempt=?"
-    iteration = (
-        f"iter={row.iteration}" if row.iteration is not None else "iter=?"
+    attempt = str(row.attempt) if row.attempt is not None else "?"
+    iteration = str(row.iteration) if row.iteration is not None else "?"
+    pos = f"{attempt}/{iteration}"
+    age = (
+        "—"
+        if row.age_seconds is None
+        else _format_duration(row.age_seconds)
     )
-    pos = f"{attempt} {iteration}"
-    age = "—" if row.age_seconds is None else f"{row.age_seconds}s"
-    cost = f"${row.cost_usd:.4f}"
-    detail = row.last_detail
+    detail = _truncate(row.last_detail, _MAX_DETAIL_WIDTH)
     action = f"{row.last_kind} {detail}".strip()
     return (
         row.task_id,
         row.status,
         pos,
         age,
-        str(row.tokens),
-        cost,
+        _format_tokens(row.tokens),
+        _format_cost(row.cost_usd),
         action,
     )
+
+
+def _style_active_cells(
+    cells: tuple[str, str, str, str, str, str, str],
+) -> tuple[str | Text, ...]:
+    """Apply the status colour to an active row's status cell.
+
+    Styling happens here rather than in :func:`_row_to_cells` so the
+    plain-string cells stay the single source for the filter haystack.
+    """
+
+    style = _STATUS_STYLES.get(cells[1])
+    if style is None:
+        return cells
+    return (
+        cells[0],
+        Text(cells[1], style=style),
+        *cells[2:],
+    )
+
+
+# Last-action details are agent text/tool summaries that can run long;
+# cap the cell so one chatty run does not push every other column off
+# a narrow terminal.
+_MAX_DETAIL_WIDTH: int = 60
+
+
+def _truncate(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"
+
+
+def _format_tokens(tokens: int) -> str:
+    """Humanize token counts: ``980`` / ``56k`` / ``36.0M``."""
+
+    if tokens >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 10_000:
+        return f"{tokens / 1_000:.0f}k"
+    return str(tokens)
+
+
+def _format_cost(cost_usd: float) -> str:
+    """Render dollars: cents-precision once past $1, tenths-of-a-cent
+    below it (early-run costs are fractions of a cent)."""
+
+    if cost_usd >= 1:
+        return f"${cost_usd:.2f}"
+    return f"${cost_usd:.4f}"

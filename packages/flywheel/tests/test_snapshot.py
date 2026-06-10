@@ -126,17 +126,20 @@ def test_build_snapshot_task_counts_match_status_states(tmp_path: Path) -> None:
 
 
 def test_build_snapshot_age_clamps_clock_skew_to_zero(tmp_path: Path) -> None:
-    """A last_ts strictly in the future (SQLite/host skew) reads as 0s
-    rather than a negative age — mirrors ``_format_live_line``."""
+    """Timestamps strictly in the future (SQLite/host skew) read as 0s
+    rather than a negative age/idle — mirrors ``_format_live_line``."""
     db = tmp_path / "db.sqlite"
     now = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
     future = now.replace(minute=5)
     store = SqliteStore(db)
     try:
-        running = _seed_running(store, "skewed")
+        lc = Lifecycle(task_id="skewed", run_id="run-skewed-running")
+        lc.transition_to(Status.READY, now=future)
+        lc.transition_to(Status.RUNNING, now=future)
+        store.create_lifecycle(lc)
         store.append_event(
             EventRecord(
-                run_id=running.run_id,
+                run_id=lc.run_id,
                 ts=future,
                 kind="harness.attempt_started",
                 payload={},
@@ -148,6 +151,41 @@ def test_build_snapshot_age_clamps_clock_skew_to_zero(tmp_path: Path) -> None:
         store.close()
     assert len(snap.rows) == 1
     assert snap.rows[0].age_seconds == 0
+    assert snap.rows[0].idle_seconds == 0
+
+
+def test_build_snapshot_age_is_run_age_not_last_event_age(
+    tmp_path: Path,
+) -> None:
+    """``age_seconds`` measures from the run's first lifecycle
+    transition and keeps growing as fresh events land; the per-event
+    reset lives in ``idle_seconds``. Regression: the dashboard age
+    column used to bounce back to 0 on every new event."""
+    db = tmp_path / "db.sqlite"
+    start = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+    event_ts = start.replace(minute=1, second=40)  # 100s in
+    now = start.replace(minute=2)  # 120s in
+    store = SqliteStore(db)
+    try:
+        lc = Lifecycle(task_id="aging", run_id="run-aging")
+        lc.transition_to(Status.READY, now=start)
+        lc.transition_to(Status.RUNNING, now=start)
+        store.create_lifecycle(lc)
+        store.append_event(
+            EventRecord(
+                run_id=lc.run_id,
+                ts=event_ts,
+                kind="harness.iteration_completed",
+                payload={"iteration": 1},
+                attempt_number=1,
+            )
+        )
+        snap = build_snapshot(store, now=now, started_at=now)
+    finally:
+        store.close()
+    assert len(snap.rows) == 1
+    assert snap.rows[0].age_seconds == 120
+    assert snap.rows[0].idle_seconds == 20
 
 
 def test_snapshot_to_dict_emits_full_schema(tmp_path: Path) -> None:
@@ -178,6 +216,7 @@ def test_snapshot_to_dict_emits_full_schema(tmp_path: Path) -> None:
         "attempt",
         "iteration",
         "age_seconds",
+        "idle_seconds",
         "tokens",
         "cost_usd",
         "turns",

@@ -23,7 +23,9 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
+from flywheel.lifecycle import Status
 from flywheel.store_sqlite import SqliteStore
+from flywheel.task import ManualGrader
 from flywheel_orchestrator import (
     DEFAULT_POLICY_FILENAME,
     DEFAULT_TASKS_DIR,
@@ -40,6 +42,8 @@ from flywheel_tui._dashboard import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DashboardApp,
 )
+from flywheel_tui._session import TranscriptEntry, TranscriptTailer
+from flywheel_tui._session_screen import SessionScreen, SessionStatus
 from flywheel_tui._snapshot import (
     DashboardSnapshot,
     build_snapshot,
@@ -177,6 +181,40 @@ def _run_snapshot(db_path: Path, work_source: WorkSource) -> int:
     return 0
 
 
+def _lookup_awaiting_instruction(
+    store: SqliteStore,
+    *,
+    run_id: str,
+    status: Status,
+    awaiting_ordinal: int | None,
+) -> str | None:
+    """Resolve the pending manual gate's instruction for a parked run.
+
+    Local mirror of the awaiting-instruction lookup
+    :func:`flywheel_orchestrator.collect_live_rows` performs for the
+    dashboard row: returns ``None`` unless the lifecycle is parked at
+    :class:`flywheel.lifecycle.Status.AWAITING_APPROVAL` with a valid
+    ordinal that addresses a :class:`flywheel.task.ManualGrader` on
+    the task definition pinned to the run. A stale ordinal or
+    archived task degrades to ``None`` so the session screen still
+    renders -- the banner just won't carry an instruction.
+    """
+
+    if status != Status.AWAITING_APPROVAL:
+        return None
+    if not isinstance(awaiting_ordinal, int):
+        return None
+    task = store.load_task_for_run(run_id)
+    if task is None:
+        return None
+    if awaiting_ordinal < 0 or awaiting_ordinal >= len(task.graders):
+        return None
+    grader = task.graders[awaiting_ordinal]
+    if not isinstance(grader, ManualGrader):
+        return None
+    return grader.instruction
+
+
 def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
     """Open the Textual dashboard, polling ``db_path`` until the operator quits."""
     started_at = datetime.now(timezone.utc)
@@ -190,7 +228,47 @@ def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
             started_at=started_at,
         )
 
-    app = DashboardApp(poll=poll)
+    def open_session(run_id: str, task_id: str) -> SessionScreen | None:
+        """Construct the per-run session screen on Enter.
+
+        A fresh :class:`TranscriptTailer` per push means re-opening a
+        run rewinds the cursor and re-renders the recent window from
+        the top; the alternative (one global tailer per run cached
+        across pushes) would skip records the operator already saw.
+        Status is sampled directly from the shared store handle so the
+        awaiting-gate instruction and terminal-state banner stay live
+        for the duration of the screen.
+        """
+
+        tailer = TranscriptTailer(store, run_id)
+
+        def fetch() -> list[TranscriptEntry]:
+            return tailer.fetch()
+
+        def status() -> SessionStatus:
+            lifecycle = store.load_lifecycle(run_id)
+            if lifecycle is None:
+                return SessionStatus(
+                    status=None, awaiting_instruction=None, missing=True
+                )
+            return SessionStatus(
+                status=lifecycle.status,
+                awaiting_instruction=_lookup_awaiting_instruction(
+                    store,
+                    run_id=run_id,
+                    status=lifecycle.status,
+                    awaiting_ordinal=lifecycle.awaiting_manual_ordinal,
+                ),
+            )
+
+        return SessionScreen(
+            run_id=run_id,
+            task_id=task_id,
+            fetch=fetch,
+            status=status,
+        )
+
+    app = DashboardApp(poll=poll, open_session=open_session)
     try:
         rc = app.run()
     finally:

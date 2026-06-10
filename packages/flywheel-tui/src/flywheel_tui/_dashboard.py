@@ -18,6 +18,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Static
 
+from flywheel_tui._session_screen import SessionScreen
 from flywheel_tui._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 # How long a row that just left the active set stays dimmed on screen.
@@ -30,6 +31,8 @@ DEFAULT_POLL_INTERVAL_SECONDS: float = 1.0
 _HELP_LINES: tuple[str, ...] = (
     "key bindings",
     "  up/down  move row selection",
+    "  enter    open session view for the selected run",
+    "  escape   close the session view (back to dashboard)",
     "  q        quit",
     "  ?        toggle this help footer",
 )
@@ -108,6 +111,12 @@ class DashboardApp(App[int]):
     BINDINGS = [
         Binding("up", "cursor_up", "Up", show=True),
         Binding("down", "cursor_down", "Down", show=True),
+        # ``enter`` is documented for the help footer; the actual
+        # dispatch lives in :meth:`on_data_table_row_selected` because
+        # the DataTable widget already owns ``enter`` and fires a
+        # ``RowSelected`` message we listen for there. ``priority=True``
+        # so the binding still shows up in the bottom bar.
+        Binding("enter", "open_session", "Open", show=True, priority=True),
         Binding("q", "quit", "Quit", show=True),
         Binding("question_mark", "toggle_help", "Help", show=True),
     ]
@@ -119,12 +128,19 @@ class DashboardApp(App[int]):
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         linger_seconds: int = DEFAULT_LINGER_SECONDS,
         clock: Callable[[], datetime] | None = None,
+        open_session: Callable[[str, str], SessionScreen | None] | None = None,
     ) -> None:
         super().__init__()
         self._poll = poll
         self._poll_interval_seconds = poll_interval_seconds
         self._linger_seconds = linger_seconds
         self._clock = clock or _utcnow
+        # Factory the CLI threads through so the dashboard can construct
+        # a session screen for the selected run without owning the store
+        # handle. ``None`` (the default) disables the Enter binding --
+        # useful for the existing snapshot-only Pilot tests so they do
+        # not need to seed a transcript every time.
+        self._open_session = open_session
         self._memo: dict[str, _RowMemo] = {}
         self._last_snapshot: DashboardSnapshot | None = None
         self._last_error: str | None = None
@@ -259,6 +275,32 @@ class DashboardApp(App[int]):
         else:
             widget.add_class("hidden")
             self._help_visible = False
+
+    def action_open_session(self) -> None:
+        """Push the session screen for the currently-selected row.
+
+        No-op when no session factory was supplied (snapshot-only Pilot
+        tests) or when the cursor sits on an empty table. The selected
+        row id is looked up in ``_visible_run_order`` so we never trust
+        the table widget's internal index past a refresh.
+        """
+
+        if self._open_session is None:
+            return
+        table = self.query_one(DataTable)
+        row_index = table.cursor_row
+        if row_index is None or row_index < 0:
+            return
+        if row_index >= len(self._visible_run_order):
+            return
+        run_id = self._visible_run_order[row_index]
+        memo = self._memo.get(run_id)
+        if memo is None:
+            return
+        screen = self._open_session(run_id, memo.snapshot.task_id)
+        if screen is None:
+            return
+        self.push_screen(screen)
 
 
 def _utcnow() -> datetime:

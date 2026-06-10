@@ -17,6 +17,7 @@ testpaths = [
     "packages/flywheel/tests",
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
+    "packages/flywheel-tui/tests",
 ]
 
 [tool.uv.workspace]
@@ -26,12 +27,14 @@ members = ["packages/*"]
 flywheel = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
+flywheel-tui = { workspace = true }
 
 [dependency-groups]
 dev = [
     "flywheel[postgres]",
     "flywheel-orchestrator",
     "flywheel-worktree",
+    "flywheel-tui",
     "pytest>=9.0.3",
     "testcontainers>=4.0",
 ]

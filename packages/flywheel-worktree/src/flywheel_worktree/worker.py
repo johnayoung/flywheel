@@ -54,9 +54,11 @@ from flywheel_core import (
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
     OrchestratorReport,
+    PolicyError,
     RunRecord,
     SandboxRequest,
     SubmitRequest,
+    load_effective_policy,
     orchestrate,
 )
 from flywheel_core.workflow import (
@@ -907,10 +909,42 @@ def _interruptible_sleep(seconds: int, should_stop: Callable[[], bool]) -> None:
         time.sleep(1)
 
 
+def _resolve_model(args: argparse.Namespace) -> str | None:
+    """Resolve the agent model id the worker invokes the SDK with.
+
+    Precedence is exactly:
+
+    * an explicit ``--model`` CLI flag wins;
+    * else ``flywheel.toml`` ``[agent] model`` auto-detected in the
+      current working directory (matches the orchestrator verbs'
+      ``load_effective_policy(None)`` lookup);
+    * else ``None`` so :class:`ClaudeAgentOptions` is constructed
+      without a model and the SDK falls through to the Claude Code
+      default -- the historical behaviour direct ``python -m`` callers
+      relied on before this feature.
+
+    A malformed policy file is surfaced as :class:`PolicyError`; the
+    caller turns it into the standard exit-2 + stderr remedy.
+    """
+
+    if args.model:
+        return args.model
+    policy = load_effective_policy()
+    if policy is None:
+        return None
+    return policy.model
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
     phase_base = _phase_base(repo_root)
+
+    try:
+        model = _resolve_model(args)
+    except PolicyError as exc:
+        print(f"flywheel worker: policy error: {exc}", file=sys.stderr)
+        return 2
 
     tasks_dir = (
         Path(args.tasks_dir)
@@ -966,7 +1000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     tasks_dir=tasks_dir,
                     db_path=db_path,
                     worktrees_dir=worktrees_dir,
-                    model=args.model,
+                    model=model,
                     max_turns=args.max_turns,
                     max_retries=args.max_retries,
                     worker_id=args.worker_id,

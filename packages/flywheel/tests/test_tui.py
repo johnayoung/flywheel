@@ -16,8 +16,10 @@ import pytest
 
 from flywheel_core.lifecycle import Lifecycle, Status
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_orchestrator import WorkPolicy
 
 from flywheel import tui_main
+from flywheel._tui import _resolve_model_for_worker
 
 
 def _seed_running(store: SqliteStore, task_id: str) -> Lifecycle:
@@ -95,3 +97,57 @@ def test_tui_main_json_mode_with_empty_store(
     payload = json.loads(capsys.readouterr().out)
     assert payload["rows"] == []
     assert payload["summary"]["active_workers"] == 0
+
+
+# --- model resolution helper -----------------------------------------------
+
+
+def _directory_policy(
+    tmp_path: Path, *, model: str | None = None
+) -> WorkPolicy:
+    """Minimal directory-kind policy for resolver tests."""
+
+    return WorkPolicy(
+        source_kind="directory",
+        tasks_dir=tmp_path / "tasks",
+        model=model,
+    )
+
+
+def test_resolve_model_prefers_explicit_flag_over_policy(
+    tmp_path: Path,
+) -> None:
+    """CLI ``--model`` wins, even when the policy pins a different id."""
+
+    policy = _directory_policy(tmp_path, model="claude-sonnet-4-5")
+    assert (
+        _resolve_model_for_worker("claude-opus-4-8", policy)
+        == "claude-opus-4-8"
+    )
+
+
+def test_resolve_model_falls_back_to_policy_when_flag_absent(
+    tmp_path: Path,
+) -> None:
+    """No ``--model`` flag: the policy's ``[agent] model`` is used."""
+
+    policy = _directory_policy(tmp_path, model="claude-sonnet-4-5")
+    assert _resolve_model_for_worker(None, policy) == "claude-sonnet-4-5"
+
+
+def test_resolve_model_returns_none_for_no_flag_and_no_policy(
+    tmp_path: Path,
+) -> None:
+    """Bare CLI + no policy + no model: ``None`` so the SDK uses its
+    own default (the current pre-feature behaviour)."""
+
+    assert _resolve_model_for_worker(None, None) is None
+    # And a policy without ``[agent] model`` (``.model is None``)
+    # behaves the same way.
+    assert _resolve_model_for_worker(None, _directory_policy(tmp_path)) is None
+
+
+def test_resolve_model_flag_wins_when_policy_is_unset(tmp_path: Path) -> None:
+    """No policy loaded but ``--model`` given: the flag still wins."""
+
+    assert _resolve_model_for_worker("claude-haiku", None) == "claude-haiku"

@@ -584,3 +584,69 @@ def test_heartbeat_truncates_overlong_detail() -> None:
     line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
     # Belt-and-braces cap: the heartbeat constant + reasonable prefix.
     assert len(line) < worker._HEARTBEAT_DETAIL_MAX_WIDTH + 200
+
+
+# --- headless model resolution ---------------------------------------------
+
+
+import argparse  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def _args(model: str | None = None) -> argparse.Namespace:
+    """Build an ``argparse.Namespace`` shaped like ``_build_parser``'s
+    output, but trimmed to the fields :func:`_resolve_model` reads."""
+
+    return argparse.Namespace(model=model)
+
+
+def test_resolve_model_uses_flag_when_provided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ``--model`` wins even when ``flywheel.toml`` pins a
+    different id -- the documented "CLI flags always override" contract."""
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "flywheel.toml").write_text(
+        '[source]\nkind = "directory"\n[agent]\nmodel = "claude-from-policy"\n'
+    )
+    assert worker._resolve_model(_args(model="claude-from-flag")) == (
+        "claude-from-flag"
+    )
+
+
+def test_resolve_model_honors_policy_when_flag_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headless ``flywheel worker`` path picks up
+    ``[agent] model`` from the cwd's ``flywheel.toml`` automatically."""
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "flywheel.toml").write_text(
+        '[source]\nkind = "directory"\n[agent]\nmodel = "claude-from-policy"\n'
+    )
+    assert worker._resolve_model(_args(model=None)) == "claude-from-policy"
+
+
+def test_resolve_model_returns_none_without_policy_or_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``flywheel.toml`` in cwd and no ``--model``: pre-feature
+    behaviour preserved -- ``None`` so the SDK uses the Claude Code
+    default."""
+
+    monkeypatch.chdir(tmp_path)
+    assert not (tmp_path / "flywheel.toml").exists()
+    assert worker._resolve_model(_args(model=None)) is None
+
+
+def test_resolve_model_returns_none_when_policy_omits_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy file without an ``[agent]`` table leaves the worker on
+    the pre-feature default (``None``)."""
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "flywheel.toml").write_text('[source]\nkind = "directory"\n')
+    assert worker._resolve_model(_args(model=None)) is None

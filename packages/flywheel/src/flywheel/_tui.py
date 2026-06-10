@@ -81,11 +81,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if json_mode:
         return _run_snapshot(db_path, work_source)
     tasks_dir = _resolve_tasks_dir_for_worker(args.tasks_dir, policy)
+    model = _resolve_model_for_worker(args.model, policy)
     return _run_dashboard(
         db_path,
         work_source,
         archive_tasks_dir,
         tasks_dir=tasks_dir,
+        model=model,
         no_worker=args.no_worker,
     )
 
@@ -141,6 +143,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Agent model id forwarded to the spawned worker as "
+            "--model. Overrides the [agent] model setting in "
+            "flywheel.toml; absent both, the SDK uses the Claude Code "
+            "default."
+        ),
+    )
+    parser.add_argument(
         "--no-worker",
         action="store_true",
         help=(
@@ -188,6 +200,29 @@ def _resolve_tasks_dir_for_worker(
     if policy.source_kind == "directory" and policy.tasks_dir is not None:
         return policy.tasks_dir
     return None
+
+
+def _resolve_model_for_worker(
+    model_arg: str | None, policy: WorkPolicy | None
+) -> str | None:
+    """Resolve the agent model id the spawned worker should run with.
+
+    Precedence is exactly:
+
+    * an explicit ``--model`` CLI flag wins;
+    * else ``flywheel.toml`` ``[agent] model`` (when a policy loaded);
+    * else ``None`` so the worker omits ``--model`` and the SDK
+      falls through to the Claude Code default.
+
+    Mirrors :func:`_resolve_tasks_dir_for_worker`'s explicit-flag ->
+    policy -> default chain so both knobs share one mental model.
+    """
+
+    if model_arg:
+        return model_arg
+    if policy is None:
+        return None
+    return policy.model
 
 
 def _resolve_archive_tasks_dir(
@@ -283,6 +318,7 @@ def _run_dashboard(
     archive_tasks_dir: Path | None,
     *,
     tasks_dir: Path | None,
+    model: str | None,
     no_worker: bool,
 ) -> int:
     """Open the Textual dashboard, polling ``db_path`` until the operator quits.
@@ -300,7 +336,9 @@ def _run_dashboard(
     """
     started_at = datetime.now(timezone.utc)
     store = SqliteStore(db_path)
-    supervisor = WorkerSupervisor(db_path=db_path, tasks_dir=tasks_dir)
+    supervisor = WorkerSupervisor(
+        db_path=db_path, tasks_dir=tasks_dir, model=model
+    )
     if not no_worker:
         supervisor.start()
 

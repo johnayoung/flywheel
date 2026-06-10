@@ -139,6 +139,10 @@ def test_default_spawn_argv_targets_flywheel_worktree_module(
     assert "--db" in argv
     assert str(db) in argv
     assert "--tasks-dir" not in argv  # only added when provided
+    # ``--model`` is omitted entirely when the console resolved
+    # ``None`` so the worker's own default (also ``None``) lets the
+    # SDK fall through to the Claude Code default.
+    assert "--model" not in argv
 
 
 def test_default_spawn_argv_forwards_tasks_dir(tmp_path: Path) -> None:
@@ -148,6 +152,26 @@ def test_default_spawn_argv_forwards_tasks_dir(tmp_path: Path) -> None:
     assert "--tasks-dir" in argv
     idx = argv.index("--tasks-dir")
     assert argv[idx + 1] == str(tasks)
+
+
+def test_default_spawn_argv_forwards_model_when_set(tmp_path: Path) -> None:
+    """An effective model id is appended as ``--model <value>``."""
+
+    db = tmp_path / "db.sqlite"
+    argv = build_default_spawn_argv(
+        db, tasks_dir=None, model="claude-sonnet-4-5"
+    )
+    assert "--model" in argv
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "claude-sonnet-4-5"
+
+
+def test_default_spawn_argv_omits_model_when_none(tmp_path: Path) -> None:
+    """Explicit ``model=None`` matches the keyword's default: no flag."""
+
+    db = tmp_path / "db.sqlite"
+    argv = build_default_spawn_argv(db, tasks_dir=None, model=None)
+    assert "--model" not in argv
 
 
 # --- WorkerSupervisor lifecycle --------------------------------------------

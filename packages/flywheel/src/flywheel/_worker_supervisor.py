@@ -147,7 +147,9 @@ def has_live_lease(db_path: Path, *, now: datetime | None = None) -> bool:
         conn.close()
 
 
-def build_default_spawn_argv(db_path: Path, *, tasks_dir: Path | None) -> list[str]:
+def build_default_spawn_argv(
+    db_path: Path, *, tasks_dir: Path | None, model: str | None = None
+) -> list[str]:
     """Compose the ``python -m flywheel_worktree.worker ...`` argv.
 
     Used by the production ``WorkerSupervisor`` to launch the daemon
@@ -155,8 +157,15 @@ def build_default_spawn_argv(db_path: Path, *, tasks_dir: Path | None) -> list[s
     the supervisor's ownership / quit-path behaviour is exercised
     without spawning the real worker. The args are the minimal pair
     the worker needs to land on the same store the console is
-    watching; everything else (heartbeat, lease seconds, model)
-    defaults to the worker's own argparse defaults.
+    watching; everything else (heartbeat, lease seconds) defaults to
+    the worker's own argparse defaults.
+
+    ``model`` is the agent model id the console resolved via the
+    ``--model`` CLI flag / ``flywheel.toml`` ``[agent] model`` policy.
+    When set, it is appended as ``--model <value>`` so the spawned
+    worker pins every task to that model; when ``None``, the flag is
+    omitted entirely and the worker's own ``--model`` default (also
+    ``None``) lets the SDK fall through to the Claude Code default.
     """
 
     argv: list[str] = [
@@ -168,6 +177,8 @@ def build_default_spawn_argv(db_path: Path, *, tasks_dir: Path | None) -> list[s
     ]
     if tasks_dir is not None:
         argv.extend(["--tasks-dir", str(tasks_dir)])
+    if model is not None:
+        argv.extend(["--model", model])
     return argv
 
 
@@ -196,6 +207,12 @@ class WorkerSupervisor:
             spawned worker as ``--tasks-dir`` so it watches the same
             tree the console resolves. Ignored when ``spawn_argv`` is
             provided (tests pin the argv directly).
+        model: Optional agent model id the console resolved
+            (``--model`` CLI flag > ``flywheel.toml`` ``[agent] model``
+            > ``None``). Forwarded to the spawned worker as
+            ``--model <value>`` when set, omitted entirely otherwise so
+            the SDK keeps falling through to the Claude Code default.
+            Ignored when ``spawn_argv`` is provided.
     """
 
     def __init__(
@@ -205,6 +222,7 @@ class WorkerSupervisor:
         log_dir: Path | None = None,
         spawn_argv: Sequence[str] | None = None,
         tasks_dir: Path | None = None,
+        model: str | None = None,
     ) -> None:
         self._db_path = db_path
         self._log_dir = (
@@ -214,7 +232,7 @@ class WorkerSupervisor:
             self._spawn_argv: list[str] = list(spawn_argv)
         else:
             self._spawn_argv = build_default_spawn_argv(
-                db_path, tasks_dir=tasks_dir
+                db_path, tasks_dir=tasks_dir, model=model
             )
         self._child: subprocess.Popen[bytes] | None = None
         self._log_handle: IO[bytes] | None = None

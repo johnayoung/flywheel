@@ -4,21 +4,24 @@ The screen receives ``fetch`` / ``status`` callables so these tests
 drive deterministic frames without touching SQLite (the cursor and
 classification paths are covered by ``test_session``). Coverage maps
 to FR-3 (Escape returns to dashboard with selection preserved), FR-4
-(rendering of each message class, follow-pause-resume), FR-7 (terminal
-banner appears + steering disabled signal), and the Edge Cases table
-(empty transcript renders cleanly; AWAITING_APPROVAL surfaces gate).
+(rendering of each message class, follow-pause-resume), FR-5/FR-6
+(steering verbs enqueue exactly one command, pending-to-applied /
+pending-to-failed transitions, verbs disabled on inactive runs), FR-7
+(terminal banner appears + steering disabled signal), and the Edge
+Cases table (empty transcript renders cleanly; AWAITING_APPROVAL
+surfaces gate).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from textual.containers import VerticalScroll
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, Input, Static
 
 from flywheel.lifecycle import Lifecycle, Status
 from flywheel.store_sqlite import SqliteStore
@@ -395,6 +398,24 @@ def _write_running_lifecycle(store: SqliteStore, task_id: str) -> Lifecycle:
     return lc
 
 
+def _store_enqueue(store: SqliteStore, run_id: str) -> Callable[[str, Mapping[str, Any]], int]:
+    """Bind a SqliteStore's ``enqueue_command`` to a (kind, payload) closure.
+
+    Matches the shape the production CLI wires up so the tests exercise
+    the same producer path: enqueue against the live store, return the
+    assigned ``id``.
+    """
+
+    def enqueue(kind: str, payload: Mapping[str, Any]) -> int:
+        record = store.enqueue_command(
+            run_id, kind, payload, now=datetime.now(timezone.utc)
+        )
+        assert record.id is not None
+        return record.id
+
+    return enqueue
+
+
 def test_dashboard_enter_opens_session_escape_restores_selection(
     tmp_path: Path,
 ) -> None:
@@ -511,6 +532,540 @@ def test_dashboard_enter_opens_session_escape_restores_selection(
                 assert not isinstance(app.screen, SessionScreen)
                 table = app.query_one(DataTable)
                 assert table.cursor_row == 1
+        finally:
+            store.close()
+
+    _run(body)
+
+
+# --- Steering tests --------------------------------------------------------
+
+
+def test_session_screen_say_enqueues_one_command_with_text_payload(
+    tmp_path: Path,
+) -> None:
+    """FR-5: a submitted say message produces exactly one control_commands
+    row with kind=say and payload={text: ...}."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=_ScriptedFetch(),
+                status=_running_status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                command_id = screen.submit_say("please add docstrings")
+                await pilot.pause()
+                assert command_id is not None
+                # Exactly one row was written.
+                claimed = store.claim_commands(
+                    lc.run_id, now=datetime.now(timezone.utc)
+                )
+                assert len(claimed) == 1
+                assert claimed[0].kind == "say"
+                assert claimed[0].payload == {
+                    "text": "please add docstrings"
+                }
+                # Pending command tracked on the screen.
+                assert command_id in screen.pending_commands
+                assert (
+                    screen.pending_commands[command_id].kind == "say"
+                )
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_interrupt_enqueues_with_empty_payload(
+    tmp_path: Path,
+) -> None:
+    """FR-5: ctrl+x enqueues exactly one ``interrupt`` row with no payload."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=_ScriptedFetch(),
+                status=_running_status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                command_id = screen.submit_interrupt()
+                await pilot.pause()
+                assert command_id is not None
+                claimed = store.claim_commands(
+                    lc.run_id, now=datetime.now(timezone.utc)
+                )
+                assert len(claimed) == 1
+                assert claimed[0].kind == "interrupt"
+                assert claimed[0].payload == {}
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_approve_and_reject_only_when_awaiting_approval(
+    tmp_path: Path,
+) -> None:
+    """FR-5/FR-6 + Edge Cases: approve / reject affordances are only honoured
+    when the run is in AWAITING_APPROVAL.
+
+    - Reject with no feedback on an AWAITING_APPROVAL run emits one
+      reject row with an empty payload.
+    - Reject with feedback emits one reject row with {"feedback": ...}.
+    - Approve emits one approve row.
+    """
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            run_id = "run-gated"
+            lc = Lifecycle(task_id="gated", run_id=run_id)
+            lc.transition_to(Status.READY, now=_NOW)
+            lc.transition_to(Status.RUNNING, now=_NOW)
+            lc.transition_to(Status.VALIDATING, now=_NOW)
+            lc.transition_to(Status.AWAITING_APPROVAL, now=_NOW)
+            store.create_lifecycle(lc)
+            screen = SessionScreen(
+                run_id=run_id,
+                task_id="gated",
+                fetch=_ScriptedFetch(),
+                status=lambda: _awaiting_status(
+                    "Confirm the migration."
+                ),
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                approve_id = screen.submit_approve()
+                reject_no_feedback_id = screen.submit_reject(None)
+                reject_with_feedback_id = screen.submit_reject(
+                    "please redo the migration with smaller batches"
+                )
+                await pilot.pause()
+                assert approve_id is not None
+                assert reject_no_feedback_id is not None
+                assert reject_with_feedback_id is not None
+                claimed = store.claim_commands(
+                    run_id, now=datetime.now(timezone.utc)
+                )
+                # Three rows in enqueue order.
+                assert [c.kind for c in claimed] == [
+                    "approve",
+                    "reject",
+                    "reject",
+                ]
+                assert claimed[0].payload == {}
+                # Empty feedback rejects emit no ``feedback`` key.
+                assert claimed[1].payload == {}
+                assert claimed[2].payload == {
+                    "feedback": "please redo the migration with smaller batches"
+                }
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_pending_to_applied_transition(
+    tmp_path: Path,
+) -> None:
+    """FR-6 acceptance: an enqueued command renders pending; once the
+    matching ``harness.control_command_applied`` event lands in the
+    transcript the pending marker resolves and the OPERATOR_SAY line
+    is visible."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            fetch = _ScriptedFetch()
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=fetch,
+                status=_running_status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                command_id = screen.submit_say("ship it")
+                await pilot.pause()
+                assert command_id is not None
+                # Pending list shows the command and the widget is
+                # visible (not hidden).
+                pending_widget = screen.query_one(
+                    "#session_pending", Static
+                )
+                assert not pending_widget.has_class("hidden")
+                # Seed the applied event with a matching command_id.
+                fetch.queue.append(
+                    [
+                        TranscriptEntry(
+                            sequence=20,
+                            sub_index=0,
+                            ts=_NOW,
+                            kind=EntryKind.OPERATOR_SAY,
+                            header="operator(say)",
+                            body="ship it",
+                            attempt_number=1,
+                            iteration_number=None,
+                            control_command_id=command_id,
+                        )
+                    ]
+                )
+                screen.refresh_now()
+                await pilot.pause()
+                # Pending entry resolved out of the dict; the
+                # OPERATOR_SAY entry is now in the transcript.
+                assert command_id not in screen.pending_commands
+                assert any(
+                    e.kind == EntryKind.OPERATOR_SAY
+                    and e.control_command_id == command_id
+                    for e in screen.entries
+                )
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_pending_to_failed_surfaces_error_detail(
+    tmp_path: Path,
+) -> None:
+    """FR-6 acceptance: ``harness.control_command_failed`` flips the
+    pending marker to a failure line carrying the event's error_detail
+    inline."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            fetch = _ScriptedFetch()
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=fetch,
+                status=_running_status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                command_id = screen.submit_say("oops")
+                await pilot.pause()
+                assert command_id is not None
+                # Seed the failure event.
+                fetch.queue.append(
+                    [
+                        TranscriptEntry(
+                            sequence=99,
+                            sub_index=0,
+                            ts=_NOW,
+                            kind=EntryKind.LIFECYCLE,
+                            header="control",
+                            body=(
+                                "failed say: SDKDisconnected: "
+                                "session was closed"
+                            ),
+                            attempt_number=1,
+                            iteration_number=None,
+                            control_command_id=command_id,
+                            control_command_error=(
+                                "SDKDisconnected: session was closed"
+                            ),
+                        )
+                    ]
+                )
+                screen.refresh_now()
+                await pilot.pause()
+                pending = screen.pending_commands.get(command_id)
+                assert pending is not None
+                assert pending.status == "failed"
+                assert pending.error_detail is not None
+                assert "SDKDisconnected" in pending.error_detail
+                pending_widget = screen.query_one(
+                    "#session_pending", Static
+                )
+                rendered = str(pending_widget.render())
+                assert "failed" in rendered
+                assert "SDKDisconnected" in rendered
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_steering_disabled_on_done_run(
+    tmp_path: Path,
+) -> None:
+    """FR-6/FR-7: verbs are unavailable when the viewed run is in a
+    terminal status. submit_* methods emit an inline notice and do
+    NOT touch the store."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            run_id = "run-done"
+            lc = Lifecycle(task_id="done", run_id=run_id)
+            lc.transition_to(Status.READY, now=_NOW)
+            lc.transition_to(Status.RUNNING, now=_NOW)
+            lc.transition_to(Status.VALIDATING, now=_NOW)
+            lc.transition_to(Status.DONE, now=_NOW)
+            store.create_lifecycle(lc)
+            screen = SessionScreen(
+                run_id=run_id,
+                task_id="done",
+                fetch=_ScriptedFetch(),
+                status=lambda: _terminal_status(Status.DONE),
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                # Compose box and help footer are hidden in terminal.
+                compose = screen.query_one("#session_compose", Input)
+                assert compose.has_class("hidden")
+                # Every verb returns None and writes nothing.
+                assert screen.submit_say("late") is None
+                assert screen.submit_interrupt() is None
+                assert screen.submit_approve() is None
+                assert screen.submit_reject("late feedback") is None
+                claimed = store.claim_commands(
+                    run_id, now=datetime.now(timezone.utc)
+                )
+                assert claimed == []
+                # Notice widget is visible with a not-steerable note.
+                notice = screen.query_one("#session_notice", Static)
+                assert not notice.has_class("hidden")
+                assert "not steerable" in str(notice.render())
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_status_left_active_between_render_and_submit(
+    tmp_path: Path,
+) -> None:
+    """Edge case row: a run that left the active set between render and
+    submit gets an inline not-steerable notice and no enqueue. We seed
+    the status callable to first return RUNNING (the render frame), then
+    DONE (the submit frame)."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            status = _ScriptedStatus(_running_status())
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=_ScriptedFetch(),
+                status=status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                # Run terminated before the operator submitted.
+                status.push(_terminal_status(Status.DONE))
+                screen.refresh_now()
+                await pilot.pause()
+                assert screen.submit_say("too late") is None
+                claimed = store.claim_commands(
+                    lc.run_id, now=datetime.now(timezone.utc)
+                )
+                assert claimed == []
+                notice = screen.query_one("#session_notice", Static)
+                assert not notice.has_class("hidden")
+        finally:
+            store.close()
+
+    _run(body)
+
+
+def test_session_screen_applied_event_for_other_producer_ignored(
+    tmp_path: Path,
+) -> None:
+    """An applied event for a command enqueued by another producer (CLI)
+    must not be matched to this instance's pending markers."""
+
+    async def body() -> None:
+        db = tmp_path / "db.sqlite"
+        store = SqliteStore(db)
+        try:
+            lc = _write_running_lifecycle(store, "alpha")
+            fetch = _ScriptedFetch()
+            screen = SessionScreen(
+                run_id=lc.run_id,
+                task_id=lc.task_id,
+                fetch=fetch,
+                status=_running_status,
+                poll_interval_seconds=1000.0,
+                enqueue=_store_enqueue(store, lc.run_id),
+            )
+            app = DashboardApp(
+                poll=lambda: DashboardSnapshot(
+                    summary=SummaryData(
+                        active_workers=0,
+                        task_counts={},
+                        tokens_total=0,
+                        cost_usd_total=0.0,
+                        runtime_seconds=0,
+                    ),
+                    rows=(),
+                ),
+                poll_interval_seconds=1000.0,
+            )
+            async with app.run_test() as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                my_id = screen.submit_say("mine")
+                await pilot.pause()
+                assert my_id is not None
+                # An applied event from a CLI-issued command sneaks in.
+                stranger_id = my_id + 999
+                fetch.queue.append(
+                    [
+                        TranscriptEntry(
+                            sequence=42,
+                            sub_index=0,
+                            ts=_NOW,
+                            kind=EntryKind.OPERATOR_SAY,
+                            header="operator(say)",
+                            body="from the CLI",
+                            attempt_number=1,
+                            iteration_number=None,
+                            control_command_id=stranger_id,
+                        )
+                    ]
+                )
+                screen.refresh_now()
+                await pilot.pause()
+                # Local pending entry is untouched.
+                assert my_id in screen.pending_commands
         finally:
             store.close()
 

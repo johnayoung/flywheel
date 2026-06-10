@@ -18,16 +18,23 @@ poll through these seams.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
+from flywheel.invoker_client import (
+    CONTROL_COMMAND_APPROVE,
+    CONTROL_COMMAND_INTERRUPT,
+    CONTROL_COMMAND_REJECT,
+    CONTROL_COMMAND_SAY,
+)
 from flywheel.lifecycle import Status
 from flywheel_tui._session import (
     EntryKind,
@@ -40,6 +47,51 @@ from flywheel_tui._session import (
 # audit CLI's default --follow cadence so the session view's responsiveness
 # is on par with `python -m flywheel.audit --follow`.
 DEFAULT_SESSION_POLL_INTERVAL_SECONDS: float = 0.25
+
+
+# Lifecycle statuses against which the live in-session watcher can apply
+# ``say`` / ``interrupt``. Mirrors :func:`flywheel.workflow._enqueue_control_command`
+# (``RUNNING`` + ``VALIDATING``): outside this set the SDK session is no
+# longer being driven so an enqueued command would sit pending forever.
+_STEERABLE_STATUSES: frozenset[Status] = frozenset(
+    {Status.RUNNING, Status.VALIDATING}
+)
+
+# Lifecycle status at which a parked manual gate accepts approve/reject.
+# Single-element set kept as a frozenset so the steerability check shares
+# the same "is in set" shape as ``_STEERABLE_STATUSES``.
+_APPROVABLE_STATUSES: frozenset[Status] = frozenset(
+    {Status.AWAITING_APPROVAL}
+)
+
+
+# Per-command kind a session-screen submit produces. Used both to build the
+# ``control_commands`` row and to drive the pending-list rendering.
+EnqueueCommand = Callable[[str, Mapping[str, Any]], int]
+"""Producer seam: takes (kind, payload), returns the store-assigned command id.
+
+Production callers wire this to a closure over ``ControlCommandStore.enqueue_command``
+that fills in the run_id and a fresh timestamp; tests pass a stub that
+records the call and returns a monotonically-increasing fake id.
+"""
+
+
+@dataclass
+class _PendingCommand:
+    """One outstanding operator-issued command awaiting watcher feedback.
+
+    ``status`` is one of ``"pending"`` / ``"failed"`` -- an applied command
+    is removed from the pending list outright because the matching
+    transcript entry (OPERATOR_SAY for ``say``, control / gate(...) lines
+    for the rest) already announces the apply in the transcript. A failed
+    command stays visible so the operator can see the error_detail inline.
+    """
+
+    command_id: int
+    kind: str
+    summary: str
+    status: str = "pending"
+    error_detail: str | None = None
 
 
 _HEADER_STYLES: dict[EntryKind, str] = {
@@ -142,6 +194,29 @@ class SessionScreen(Screen[None]):
         color: $accent;
     }
 
+    #session_pending {
+        height: auto;
+        padding: 0 1;
+        color: $accent;
+    }
+
+    #session_notice {
+        height: auto;
+        padding: 0 1;
+        color: $warning;
+    }
+
+    #session_steering_help {
+        height: auto;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #session_compose {
+        height: auto;
+        padding: 0 1;
+    }
+
     .hidden {
         display: none;
     }
@@ -155,6 +230,15 @@ class SessionScreen(Screen[None]):
         Binding("pagedown", "page_down", "Page down", show=True),
         Binding("up", "scroll_up", "Up", show=True),
         Binding("down", "scroll_down", "Down", show=True),
+        # Steering bindings. ``priority=True`` so they still fire when
+        # focus sits inside the compose ``Input`` widget. Bare letter
+        # keys would clash with typing in the compose box, so each
+        # verb is on a ctrl-chord that the Input does not consume.
+        Binding(
+            "ctrl+x", "interrupt", "Interrupt", show=True, priority=True
+        ),
+        Binding("ctrl+y", "approve", "Approve", show=True, priority=True),
+        Binding("ctrl+r", "reject", "Reject", show=True, priority=True),
     ]
 
     def __init__(
@@ -165,6 +249,7 @@ class SessionScreen(Screen[None]):
         fetch: Callable[[], list[TranscriptEntry]],
         status: Callable[[], SessionStatus],
         poll_interval_seconds: float = DEFAULT_SESSION_POLL_INTERVAL_SECONDS,
+        enqueue: EnqueueCommand | None = None,
     ) -> None:
         super().__init__()
         self._run_id = run_id
@@ -172,6 +257,7 @@ class SessionScreen(Screen[None]):
         self._fetch = fetch
         self._status = status
         self._poll_interval_seconds = poll_interval_seconds
+        self._enqueue = enqueue
         # Observable state -- kept on the instance so tests can assert
         # transitions without scraping widget render output.
         self._follow: bool = True
@@ -179,6 +265,11 @@ class SessionScreen(Screen[None]):
         self._last_status: SessionStatus | None = None
         self._last_error: str | None = None
         self.entries: list[TranscriptEntry] = []
+        # Steering state -- ordered by enqueue id so the pending list
+        # always renders in submit order, matching the watcher's claim
+        # order.
+        self.pending_commands: dict[int, _PendingCommand] = {}
+        self._notice: str | None = None
 
     # ----- Public test seams --------------------------------------------
 
@@ -214,6 +305,21 @@ class SessionScreen(Screen[None]):
         yield Static("", id="session_banner", classes="hidden")
         yield VerticalScroll(id="session_transcript")
         yield Static("", id="session_indicator", classes="hidden")
+        yield Static("", id="session_pending", classes="hidden")
+        yield Static("", id="session_notice", classes="hidden")
+        yield Static("", id="session_steering_help", classes="hidden")
+        # The compose box doubles as the reject-feedback field: pressing
+        # Enter submits a ``say``, Ctrl+R submits the current value as a
+        # reject's optional feedback. The placeholder advertises the
+        # primary action.
+        yield Input(
+            placeholder=(
+                "message to inject (enter=say, ctrl+x=interrupt, "
+                "ctrl+y=approve, ctrl+r=reject)"
+            ),
+            id="session_compose",
+            classes="hidden",
+        )
 
     def on_mount(self) -> None:
         self._render_header()
@@ -267,6 +373,7 @@ class SessionScreen(Screen[None]):
         for entry in new_entries:
             self.entries.append(entry)
             transcript.mount(_render_entry_widget(entry))
+            self._reconcile_pending(entry)
         if self._follow:
             # ``animate=False`` keeps the viewport pinned in tests --
             # ``run_test`` does not advance an animation clock.
@@ -274,6 +381,45 @@ class SessionScreen(Screen[None]):
             self._new_activity = False
         else:
             self._new_activity = True
+
+    def _reconcile_pending(self, entry: TranscriptEntry) -> None:
+        """Flip a pending steering command to applied / failed.
+
+        Match is by ``control_command_id`` on the transcript entry --
+        the classifier exposes that field on
+        ``harness.control_command_applied`` and
+        ``harness.control_command_failed`` events only. A command
+        enqueued by another producer (CLI) lands as an entry too but
+        carries an id this screen never enqueued, so it slides past
+        without disturbing the local pending state.
+
+        Applied commands are dropped from the pending list because the
+        same record produces a transcript entry (OPERATOR_SAY for
+        ``say``, control / gate(...) lines for the rest) that already
+        announces the apply. Failed commands stay visible so the
+        operator sees the error_detail inline.
+        """
+
+        command_id = entry.control_command_id
+        if command_id is None:
+            return
+        pending = self.pending_commands.get(command_id)
+        if pending is None:
+            return
+        if entry.kind == EntryKind.LIFECYCLE and entry.header == "control":
+            if entry.control_command_error is not None:
+                pending.status = "failed"
+                pending.error_detail = entry.control_command_error
+                return
+            # Non-say apply: the transcript already carries
+            # "control  applied {kind}", so drop the pending marker.
+            self.pending_commands.pop(command_id, None)
+            return
+        if entry.kind == EntryKind.OPERATOR_SAY:
+            # Apply for ``say``: the OPERATOR_SAY line itself replaces
+            # the pending marker.
+            self.pending_commands.pop(command_id, None)
+            return
 
     def _render_header(self) -> None:
         """One-line header showing run + task id; updated on mount only."""
@@ -337,6 +483,100 @@ class SessionScreen(Screen[None]):
             indicator.update("")
             indicator.add_class("hidden")
 
+        # Steering widgets: pending list, inline notice, compose box,
+        # and the help line that advertises the available verbs.
+        self._render_pending_widget()
+        self._render_notice_widget()
+        self._render_compose_widget()
+
+    def _render_pending_widget(self) -> None:
+        """Render the pending-commands list above the compose box.
+
+        Each line is one outstanding command: ``[#id] kind: summary``
+        for a pending entry, or ``[#id] kind failed: <error>`` for a
+        failure. The widget is hidden when no commands are pending so
+        the transcript reclaims the screen real estate.
+        """
+
+        pending_widget = self.query_one("#session_pending", Static)
+        if not self.pending_commands:
+            pending_widget.update("")
+            pending_widget.add_class("hidden")
+            return
+        lines: list[str] = []
+        for command_id in sorted(self.pending_commands.keys()):
+            command = self.pending_commands[command_id]
+            if command.status == "failed":
+                error = command.error_detail or "(no detail)"
+                lines.append(
+                    f"[#{command_id}] {command.kind} failed: {error}"
+                )
+            else:
+                lines.append(
+                    f"[#{command_id}] {command.kind} pending"
+                    + (f": {command.summary}" if command.summary else "")
+                )
+        pending_widget.update("\n".join(lines))
+        pending_widget.remove_class("hidden")
+
+    def _render_notice_widget(self) -> None:
+        """Render the inline operator notice (e.g. not-steerable)."""
+
+        notice_widget = self.query_one("#session_notice", Static)
+        if self._notice:
+            notice_widget.update(self._notice)
+            notice_widget.remove_class("hidden")
+        else:
+            notice_widget.update("")
+            notice_widget.add_class("hidden")
+
+    def _render_compose_widget(self) -> None:
+        """Show / hide the compose box and the steering help footer.
+
+        The compose Input is mounted but kept hidden when no enqueue
+        seam was wired (the snapshot-only Pilot tests) or when the
+        viewed run is in a terminal status. The help footer mirrors
+        the visibility so the operator never sees a "press ctrl+y to
+        approve" hint against a DONE run.
+        """
+
+        compose = self.query_one("#session_compose", Input)
+        help_widget = self.query_one("#session_steering_help", Static)
+        if self._enqueue is None:
+            compose.add_class("hidden")
+            help_widget.add_class("hidden")
+            help_widget.update("")
+            return
+        status = self._last_status
+        can_say_or_interrupt = (
+            status is not None
+            and status.status is not None
+            and status.status in _STEERABLE_STATUSES
+        )
+        can_approve_or_reject = (
+            status is not None
+            and status.status is not None
+            and status.status in _APPROVABLE_STATUSES
+        )
+        if not can_say_or_interrupt and not can_approve_or_reject:
+            # Terminal / pre-run: hide the compose box entirely so the
+            # operator cannot type into a dead session. The transcript
+            # remains scrollable per FR-7.
+            compose.add_class("hidden")
+            help_widget.add_class("hidden")
+            help_widget.update("")
+            return
+        compose.remove_class("hidden")
+        help_lines: list[str] = []
+        if can_say_or_interrupt:
+            help_lines.append("enter=say  ctrl+x=interrupt")
+        if can_approve_or_reject:
+            help_lines.append(
+                "ctrl+y=approve  ctrl+r=reject (input value = feedback)"
+            )
+        help_widget.update("  ".join(help_lines))
+        help_widget.remove_class("hidden")
+
     # ----- Bindings -----------------------------------------------------
 
     def action_back(self) -> None:
@@ -396,8 +636,173 @@ class SessionScreen(Screen[None]):
             # there is actual new activity to point at.
             self._render_status_widgets()
 
+    # ----- Steering -----------------------------------------------------
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter on the compose box submits a ``say`` command."""
+
+        if event.input.id != "session_compose":
+            return
+        text = event.value.strip()
+        if not text:
+            self._set_notice("say message must be non-empty")
+            self._render_status_widgets()
+            return
+        self.submit_say(text)
+        event.input.value = ""
+
+    def action_interrupt(self) -> None:
+        """Key binding: enqueue an interrupt command."""
+
+        self.submit_interrupt()
+
+    def action_approve(self) -> None:
+        """Key binding: enqueue an approve command (AWAITING_APPROVAL only)."""
+
+        self.submit_approve()
+
+    def action_reject(self) -> None:
+        """Key binding: enqueue a reject command, lifting the optional
+        feedback from the compose box's current value."""
+
+        feedback: str | None = None
+        try:
+            compose = self.query_one("#session_compose", Input)
+        except Exception:  # noqa: BLE001 - widget not mounted yet
+            compose = None
+        if compose is not None:
+            raw = compose.value.strip()
+            if raw:
+                feedback = raw
+                compose.value = ""
+        self.submit_reject(feedback)
+
+    def submit_say(self, text: str) -> int | None:
+        """Enqueue a ``say`` command; returns the command id or ``None``.
+
+        ``None`` is returned when steering is disabled (no enqueue seam
+        wired) or when the run left the steerable set between render
+        and submit. In the latter case an inline notice surfaces; the
+        store is not touched. Re-checking status at submit time is the
+        Edge Cases row "run left active set between render and submit"
+        requirement.
+        """
+
+        return self._enqueue_steering(
+            kind=CONTROL_COMMAND_SAY,
+            payload={"text": text},
+            summary=_short(text, 60),
+            permitted=_STEERABLE_STATUSES,
+        )
+
+    def submit_interrupt(self) -> int | None:
+        """Enqueue an ``interrupt`` command; returns the command id."""
+
+        return self._enqueue_steering(
+            kind=CONTROL_COMMAND_INTERRUPT,
+            payload={},
+            summary="",
+            permitted=_STEERABLE_STATUSES,
+        )
+
+    def submit_approve(self) -> int | None:
+        """Enqueue an ``approve`` command (AWAITING_APPROVAL only)."""
+
+        return self._enqueue_steering(
+            kind=CONTROL_COMMAND_APPROVE,
+            payload={},
+            summary="",
+            permitted=_APPROVABLE_STATUSES,
+        )
+
+    def submit_reject(self, feedback: str | None) -> int | None:
+        """Enqueue a ``reject`` command; ``feedback`` is optional.
+
+        An empty / whitespace-only feedback collapses to ``None`` so
+        the payload matches the watcher's expected shape (``feedback``
+        present only when truthy) -- mirrors
+        :func:`flywheel.workflow._cmd_reject` which omits the field
+        when no ``--feedback`` flag is supplied.
+        """
+
+        payload: dict[str, Any] = {}
+        if feedback is not None and feedback.strip():
+            payload["feedback"] = feedback
+        summary = _short(feedback, 60) if feedback else ""
+        return self._enqueue_steering(
+            kind=CONTROL_COMMAND_REJECT,
+            payload=payload,
+            summary=summary,
+            permitted=_APPROVABLE_STATUSES,
+        )
+
+    def _enqueue_steering(
+        self,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+        summary: str,
+        permitted: frozenset[Status],
+    ) -> int | None:
+        """Single enqueue path shared by the four steering verbs.
+
+        Centralises the submit-time status re-check so a stale viewed
+        status (one that changed between render and submit) is caught
+        before the store is touched. On success: records the
+        :class:`_PendingCommand`, clears the previous notice, refreshes
+        widgets so the pending list shows immediately. On failure (no
+        seam wired / status not permitted / store raised): records an
+        inline notice, no store touch.
+        """
+
+        if self._enqueue is None:
+            return None
+        status = self._last_status
+        current_status = status.status if status is not None else None
+        if current_status is None or current_status not in permitted:
+            self._set_notice(
+                f"run is not steerable for {kind!r} "
+                f"(status={current_status.value if current_status else 'unknown'})"
+            )
+            self._render_status_widgets()
+            return None
+        try:
+            command_id = self._enqueue(kind, dict(payload))
+        except Exception as exc:  # noqa: BLE001 - boundary against store errors
+            self._set_notice(f"enqueue failed: {exc}")
+            self._render_status_widgets()
+            return None
+        self.pending_commands[command_id] = _PendingCommand(
+            command_id=command_id,
+            kind=kind,
+            summary=summary,
+        )
+        self._notice = None
+        self._render_status_widgets()
+        return command_id
+
+    def _set_notice(self, message: str) -> None:
+        """Record an inline notice; ``_render_notice_widget`` picks it up."""
+
+        self._notice = message
+
 
 # --- Rendering helpers -----------------------------------------------------
+
+
+def _short(value: object, limit: int = 60) -> str:
+    """Collapse ``value`` to a single line capped at ``limit`` characters.
+
+    Used to summarise the operator's say / reject feedback text in the
+    pending-commands widget. Mirrors :func:`flywheel_tui._session._short`
+    so the dashboard and session view collapse identically.
+    """
+
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    if len(text) <= limit:
+        return text
+    keep = max(limit - 1, 1)
+    return text[:keep] + "…"
 
 
 def _render_entry_widget(entry: TranscriptEntry) -> Static:
@@ -432,6 +837,7 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
 
 __all__ = [
     "DEFAULT_SESSION_POLL_INTERVAL_SECONDS",
+    "EnqueueCommand",
     "SessionScreen",
     "SessionStatus",
     "render_entry_text",

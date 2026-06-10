@@ -19,9 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from flywheel.lifecycle import Status
 from flywheel.store_sqlite import SqliteStore
@@ -261,11 +262,28 @@ def _run_dashboard(db_path: Path, work_source: WorkSource) -> int:
                 ),
             )
 
+        def enqueue(kind: str, payload: Mapping[str, Any]) -> int:
+            """Enqueue a control command against ``run_id`` for the live store.
+
+            Closes over ``store`` and ``run_id`` so the screen sees a
+            single-argument-pair signature. The returned id is the
+            store-assigned ``control_commands.id`` -- the same key the
+            in-process watcher uses to attribute its
+            ``harness.control_command_applied`` / ``_failed`` telemetry.
+            """
+
+            record = store.enqueue_command(
+                run_id, kind, payload, now=datetime.now(timezone.utc)
+            )
+            assert record.id is not None
+            return record.id
+
         return SessionScreen(
             run_id=run_id,
             task_id=task_id,
             fetch=fetch,
             status=status,
+            enqueue=enqueue,
         )
 
     app = DashboardApp(poll=poll, open_session=open_session)

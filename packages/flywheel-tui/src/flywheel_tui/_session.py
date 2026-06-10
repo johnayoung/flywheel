@@ -122,6 +122,15 @@ class TranscriptEntry:
     payload. Both are pre-sanitised by :class:`TranscriptTailer`'s
     redactor when used end-to-end so the screen never needs to look
     inside the original payload again.
+
+    ``control_command_id`` carries the store-side id of the control
+    command this entry resolves (set on
+    ``harness.control_command_applied`` and
+    ``harness.control_command_failed`` events only); the session screen
+    uses it to flip a pending steering-command marker to applied /
+    failed when the watcher's telemetry catches up. ``control_command_error``
+    is the human-readable failure detail attached to the failed variant
+    so the screen can surface ``error_type: message`` inline.
     """
 
     sequence: int
@@ -132,6 +141,8 @@ class TranscriptEntry:
     body: str
     attempt_number: int | None
     iteration_number: int | None
+    control_command_id: int | None = None
+    control_command_error: str | None = None
 
 
 # --- Classification helpers ------------------------------------------------
@@ -517,6 +528,10 @@ def _classify_event(
     if kind == "harness.control_command_applied":
         command_kind_raw = payload.get("kind")
         command_kind = str(command_kind_raw) if command_kind_raw is not None else "?"
+        command_id_raw = payload.get("command_id")
+        command_id = (
+            int(command_id_raw) if isinstance(command_id_raw, int) else None
+        )
         if command_kind == "say":
             inner = payload.get("payload")
             text_raw = (
@@ -535,6 +550,7 @@ def _classify_event(
                     body=text,
                     attempt_number=record.attempt_number,
                     iteration_number=None,
+                    control_command_id=command_id,
                 )
             ]
         body = f"applied {command_kind}"
@@ -548,6 +564,44 @@ def _classify_event(
                 body=body,
                 attempt_number=record.attempt_number,
                 iteration_number=None,
+                control_command_id=command_id,
+            )
+        ]
+    if kind == "harness.control_command_failed":
+        command_kind_raw = payload.get("kind")
+        command_kind = str(command_kind_raw) if command_kind_raw is not None else "?"
+        command_id_raw = payload.get("command_id")
+        command_id = (
+            int(command_id_raw) if isinstance(command_id_raw, int) else None
+        )
+        error_type_raw = payload.get("error_type")
+        message_raw = payload.get("message")
+        error_type = (
+            str(error_type_raw) if isinstance(error_type_raw, str) else None
+        )
+        error_message = (
+            str(message_raw) if isinstance(message_raw, str) else None
+        )
+        if error_type and error_message:
+            error_detail = f"{error_type}: {error_message}"
+        elif error_message:
+            error_detail = error_message
+        elif error_type:
+            error_detail = error_type
+        else:
+            error_detail = "(no detail)"
+        return [
+            TranscriptEntry(
+                sequence=sequence,
+                sub_index=0,
+                ts=record.ts,
+                kind=EntryKind.LIFECYCLE,
+                header="control",
+                body=f"failed {command_kind}: {error_detail}",
+                attempt_number=record.attempt_number,
+                iteration_number=None,
+                control_command_id=command_id,
+                control_command_error=error_detail,
             )
         ]
     if kind in _GATE_EVENT_KINDS:

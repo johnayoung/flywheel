@@ -597,21 +597,33 @@ def _parse_optout_frontmatter(text: str, *, source: str) -> dict[str, str]:
         )
     return fields
 
-def _load_effective_policy(args: argparse.Namespace) -> WorkPolicy | None:
-    """Load the policy a CLI invocation should honor, if any.
+def load_effective_policy(
+    policy_path: Path | str | None = None,
+) -> WorkPolicy | None:
+    """Load the policy ``flywheel-orchestrate`` would honor for an invocation.
 
-    An explicit ``--policy`` file is loaded (and a missing/invalid file is
-    an error); otherwise ``flywheel.toml`` in the working directory is
-    auto-detected; otherwise there is no policy and every default falls
-    back to the built-in ``.flywheel/`` layout.
+    Mirrors the orchestrate CLI's precedence so a downstream package can
+    pin to the same resolution without reaching for private helpers:
+
+    * an explicit ``policy_path`` is loaded (and a missing/invalid file is
+      an error -- propagated as :class:`PolicyError`);
+    * otherwise ``flywheel.toml`` in the working directory is auto-detected;
+    * otherwise there is no policy and every default falls back to the
+      built-in ``.flywheel/`` layout.
+
+    Passing ``None`` (the default) selects auto-detection; an empty string
+    is treated as "not specified" to match the argparse default surface.
     """
-    policy_arg = getattr(args, "policy", None)
-    if policy_arg:
-        return load_policy(Path(policy_arg))
+    if policy_path:
+        return load_policy(Path(policy_path))
     candidate = Path(DEFAULT_POLICY_FILENAME)
     if candidate.is_file():
         return load_policy(candidate)
     return None
+
+def _load_effective_policy(args: argparse.Namespace) -> WorkPolicy | None:
+    """argparse-flavored wrapper around :func:`load_effective_policy`."""
+    return load_effective_policy(getattr(args, "policy", None))
 
 def _resolve_work_source(
     args: argparse.Namespace, policy: WorkPolicy | None
@@ -628,16 +640,33 @@ def _resolve_work_source(
         return build_work_source(policy)
     return DirectoryWorkSource(DEFAULT_TASKS_DIR)
 
-def _resolve_db_path(
-    args: argparse.Namespace, policy: WorkPolicy | None
+def resolve_db_path(
+    db: Path | str | None = None,
+    *,
+    policy: WorkPolicy | None = None,
 ) -> Path:
-    """``--db`` flag, else the policy's ``[paths] db``, else the built-in
-    ``.flywheel/flywheel.sqlite`` default."""
-    if args.db:
-        return Path(args.db)
+    """Resolve the SQLite store path with orchestrate's precedence.
+
+    Explicit ``db`` argument (the CLI's ``--db`` flag) wins, else the
+    policy's ``[paths] db`` setting, else the built-in
+    ``.flywheel/flywheel.sqlite`` default. A downstream consumer (e.g. the
+    TUI) can pin to the same resolution without reaching for argparse or
+    private helpers.
+
+    Passing ``None`` (the default) means "not specified at the CLI"; an
+    empty string is treated identically to match the argparse default.
+    """
+    if db:
+        return Path(db)
     if policy is not None and policy.db_path is not None:
         return policy.db_path
     return _resolve_db(None)
+
+def _resolve_db_path(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> Path:
+    """argparse-flavored wrapper around :func:`resolve_db_path`."""
+    return resolve_db_path(args.db, policy=policy)
 
 def _cmd_next(args: argparse.Namespace) -> int:
     policy = _load_effective_policy(args)

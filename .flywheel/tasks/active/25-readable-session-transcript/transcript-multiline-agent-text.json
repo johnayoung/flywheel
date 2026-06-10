@@ -1,0 +1,38 @@
+{
+  "id": "transcript-multiline-agent-text",
+  "goal": "Agent text entries in the session transcript render as full multi-line text with original line breaks preserved and no truncation cap, wrapped to the widget width.",
+  "tags": ["tui", "session-transcript"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00022-FEATURE-readable-session-transcript.md",
+      "packages/flywheel/src/flywheel/_session.py",
+      "packages/flywheel/src/flywheel/_session_screen.py",
+      "packages/flywheel/tests/test_session.py",
+      "packages/flywheel/tests/test_session_screen.py"
+    ],
+    "references": [
+      "Spec FR-1: a multi-paragraph assistant text block renders with paragraphs intact; no ellipsis suffix on prose of any length"
+    ],
+    "constraints": [
+      "Only AGENT_TEXT prose drops the _short() flattening; other entry kinds keep their current collapsed bodies in this task",
+      "TranscriptEntry may grow a multi-line-capable body representation, but sequence/sub_index ordering and the control_command_id/control_command_error fields must keep their exact semantics so pending-command reconciliation keeps working",
+      "Redaction continues to run upstream in TranscriptTailer before classification; do not move or weaken it",
+      "Tests that pin the old single-line behavior must be updated in the same commit: packages/flywheel/tests/test_session.py::test_classify_assistant_text_block_renders_agent_entry and packages/flywheel/tests/test_session_screen.py::test_session_screen_renders_all_message_classes",
+      "Add test coverage for the FR-1 acceptance: multi-paragraph agent text renders with line breaks intact and without truncation",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No markdown interpretation of agent text; render verbatim (LOOP_STATUS envelopes and markdown syntax appear as-is)",
+      "No changes to tool call/result, lifecycle, timestamp, or spacing rendering (later tasks in this phase)",
+      "Do not touch flywheel_core.audit CLI output"
+    ],
+    "edge_cases": [
+      "Empty agent text block: skip the entry or render header-only, never a stray blank block",
+      "Agent text containing carriage returns or trailing whitespace should not produce phantom blank lines"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel/tests/test_session.py packages/flywheel/tests/test_session_screen.py", "name": "session-tests" },
+    { "type": "command", "run": "uv run pytest packages/flywheel", "name": "package-suite" }
+  ]
+}

@@ -31,6 +31,10 @@ from flywheel._session import EntryKind, TranscriptEntry, TranscriptTailer
 from flywheel._session_screen import (
     SessionScreen,
     SessionStatus,
+    _block_group,
+    _is_error_entry,
+    _needs_blank_separator,
+    _resolve_styles,
     render_entry_text,
 )
 from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
@@ -43,6 +47,10 @@ def _run(coro: Callable[[], Coroutine[Any, Any, None]]) -> None:
 
 
 _NOW = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
+# Wall-clock prefix render_entry_text emits for every block-start line at
+# ``_NOW``; pulled into a constant so the layout assertions read as
+# ``f"{_TS}  agent  ack"`` rather than burying the literal in every test.
+_TS = "12:00:00"
 
 
 def _entry(
@@ -77,6 +85,25 @@ def _awaiting_status(instruction: str) -> SessionStatus:
     return SessionStatus(
         status=Status.AWAITING_APPROVAL, awaiting_instruction=instruction
     )
+
+
+def _static_plain(widget: Static) -> str:
+    """Return the plain-text content of a :class:`Static`'s renderable.
+
+    The session screen mounts a :class:`rich.text.Text` into each Static
+    so layout assertions (leading blank, timestamp gutter) can introspect
+    the rendered shape without reaching into Textual internals. Textual's
+    :class:`Static` exposes the original construction-time renderable via
+    the ``content`` property; on a Text that surfaces a ``plain`` attr,
+    everything else falls back to ``str()`` so the helper is safe to call
+    on the banner / notice widgets too.
+    """
+
+    content = widget.content
+    plain = getattr(content, "plain", None)
+    if isinstance(plain, str):
+        return plain
+    return str(content)
 
 
 class _ScriptedFetch:
@@ -116,10 +143,17 @@ class _ScriptedStatus:
 
 
 def test_session_screen_renders_all_message_classes() -> None:
-    """FR-4 acceptance: pilot test asserts rendering of each message
-    class (agent text, tool call, tool result, operator say, lifecycle,
-    gate event). Multi-line AGENT_TEXT prose is rendered verbatim with
-    its line breaks preserved (FR-1)."""
+    """FR-4 + FR-5 + FR-6 acceptance: pilot test asserts rendering of each
+    message class (agent text, tool call, tool result, operator say,
+    lifecycle, gate event) and the inter-block layout. Multi-line
+    AGENT_TEXT prose is rendered verbatim with its line breaks preserved
+    (FR-1); every block-start line carries a dim ``HH:MM:SS`` prefix
+    (FR-5); blank-line separators only appear between consecutive blocks
+    whose group changes -- agent -> tool, tool -> operator, operator ->
+    lifecycle (FR-6) -- with no blank between the tool call and its own
+    result and no blank between two lifecycle-group entries (LIFECYCLE
+    followed by GATE).
+    """
 
     async def body() -> None:
         fetch = _ScriptedFetch()
@@ -202,23 +236,57 @@ def test_session_screen_renders_all_message_classes() -> None:
                 EntryKind.LIFECYCLE,
                 EntryKind.GATE,
             ]
-            # Transcript widget mounted one Static per entry.
+            # Transcript widget mounted exactly one Static per entry.
             transcript = screen.query_one(
                 "#session_transcript", VerticalScroll
             )
-            assert len(transcript.query(Static)) >= 6
+            statics = list(transcript.query(Static))
+            assert len(statics) == 6
             # The AGENT_TEXT body kept its paragraph break verbatim.
             assert screen.entries[0].body == multi_line_prose
             assert "\n\n" in screen.entries[0].body
+            # Leading-blank pattern (FR-6): no blank before the first
+            # entry; blanks before each group change (tool, operator,
+            # lifecycle); no blank between tool call and its result; no
+            # blank between two lifecycle-group entries (LIFECYCLE then
+            # GATE).
+            plains = [_static_plain(s) for s in statics]
+            expected_leading_blank = [
+                False,  # agent (first entry on screen)
+                True,   # agent -> tool group change
+                False,  # tool call -> tool result (special rule)
+                True,   # tool result -> operator group change
+                True,   # operator -> lifecycle group change
+                False,  # lifecycle -> gate within lifecycle group
+            ]
+            for index, (plain, blank) in enumerate(
+                zip(plains, expected_leading_blank)
+            ):
+                if blank:
+                    assert plain.startswith("\n"), (
+                        f"entry #{index} should have a leading blank line"
+                    )
+                else:
+                    assert not plain.startswith("\n"), (
+                        f"entry #{index} should NOT have a leading blank line"
+                    )
+            # FR-5: each rendered block carries exactly one HH:MM:SS
+            # prefix; multi-line AGENT_TEXT does NOT repeat the
+            # timestamp on continuation lines.
+            for index, plain in enumerate(plains):
+                assert plain.count(_TS) == 1, (
+                    f"entry #{index} should carry exactly one timestamp"
+                )
 
     _run(body)
 
 
 def test_render_entry_text_keeps_agent_text_inline_when_single_line() -> None:
-    """A single-line AGENT_TEXT body still renders as ``agent  body``.
+    """A single-line AGENT_TEXT body still renders as ``HH:MM:SS  agent  body``.
 
     Preserves the dense single-line look for short prose so the
-    transcript stays scannable on common short replies.
+    transcript stays scannable on common short replies; the dim
+    ``HH:MM:SS`` block-start prefix sits ahead of the header per FR-5.
     """
 
     entry = TranscriptEntry(
@@ -233,14 +301,15 @@ def test_render_entry_text_keeps_agent_text_inline_when_single_line() -> None:
     )
     rendered = render_entry_text(entry)
     plain = rendered.plain
-    assert plain == "agent  ack"
+    assert plain == f"{_TS}  agent  ack"
     assert "\n" not in plain
 
 
 def test_render_entry_text_tool_result_success_is_indented_one_line() -> None:
-    """FR-3 rendering: a successful TOOL_RESULT renders as a single
-    indented row -- two spaces in front of the header so the line
-    visually nests under the preceding tool call."""
+    """FR-3 + FR-5 rendering: a successful TOOL_RESULT renders as a single
+    indented row -- two spaces in front of the header so the line visually
+    nests under the preceding tool call, and the dim ``HH:MM:SS`` block-start
+    prefix sits ahead of that indent."""
 
     entry = TranscriptEntry(
         sequence=1,
@@ -253,13 +322,14 @@ def test_render_entry_text_tool_result_success_is_indented_one_line() -> None:
         iteration_number=1,
     )
     plain = render_entry_text(entry).plain
-    assert plain == "  tool_result  ok"
+    assert plain == f"{_TS}    tool_result  ok"
 
 
 def test_render_entry_text_tool_result_error_breaks_lines_below_header() -> None:
-    """FR-3 rendering: a multi-line error body puts the header on its
-    own indented row and each detail line on its own row indented four
-    spaces deep."""
+    """FR-3 + FR-5 + FR-7 rendering: a multi-line error body puts the header
+    on its own indented row (after the dim timestamp prefix) and each detail
+    line on its own row indented four spaces deep, with no dim style on the
+    error header or body."""
 
     body = "first error\nsecond error\n... +20 more lines"
     entry = TranscriptEntry(
@@ -275,23 +345,27 @@ def test_render_entry_text_tool_result_error_breaks_lines_below_header() -> None
     rendered = render_entry_text(entry)
     plain = rendered.plain
     expected = (
-        "  tool_result(error)\n"
+        f"{_TS}    tool_result(error)\n"
         "    first error\n"
         "    second error\n"
         "    ... +20 more lines"
     )
     assert plain == expected
-    # Body is styled red (not dim) so a failure pops visually. Inspect
-    # the spans of the rendered Text to confirm no ``dim`` style sneaks
-    # in on the error body lines.
-    body_styles = [
-        str(span.style) for span in rendered.spans if "dim" in str(span.style)
+    # Body is styled red (not dim) so a failure pops visually. The only
+    # dim span in the rendered Text is the leading ``HH:MM:SS`` timestamp
+    # (positions 0-8); confirm no dim style sneaks onto the header or
+    # body content beyond that range.
+    non_timestamp_dim = [
+        span
+        for span in rendered.spans
+        if "dim" in str(span.style).lower() and span.start >= len(_TS)
     ]
-    assert body_styles == []
+    assert non_timestamp_dim == []
 
 
 def test_render_entry_text_tool_result_error_single_line_inline() -> None:
-    """A short single-line error sits on the same row as the header."""
+    """A short single-line error sits on the same row as the header,
+    after the dim ``HH:MM:SS`` block-start prefix (FR-5)."""
 
     entry = TranscriptEntry(
         sequence=1,
@@ -304,12 +378,13 @@ def test_render_entry_text_tool_result_error_single_line_inline() -> None:
         iteration_number=1,
     )
     plain = render_entry_text(entry).plain
-    assert plain == "  tool_result(error)  boom"
+    assert plain == f"{_TS}    tool_result(error)  boom"
 
 
 def test_render_entry_text_breaks_multi_line_agent_text_below_header() -> None:
-    """FR-1 rendering: multi-paragraph AGENT_TEXT puts the header on
-    its own line and the prose underneath with original breaks intact.
+    """FR-1 + FR-5 rendering: multi-paragraph AGENT_TEXT puts the timestamped
+    header on its own line and the prose underneath with original breaks
+    intact; continuation lines carry no timestamp prefix.
     """
 
     prose = "first paragraph\n\nsecond paragraph"
@@ -325,10 +400,337 @@ def test_render_entry_text_breaks_multi_line_agent_text_below_header() -> None:
     )
     rendered = render_entry_text(entry)
     plain = rendered.plain
-    # Header sits on its own line; prose follows verbatim.
-    assert plain == f"agent\n{prose}"
+    # Header (with the leading timestamp gutter) sits on its own line;
+    # prose follows verbatim with no per-line timestamp repetition.
+    assert plain == f"{_TS}  agent\n{prose}"
     # The blank line between paragraphs survives the renderer.
     assert "\n\n" in plain
+    # The timestamp appears exactly once -- only on the first line of the
+    # block (FR-5: "first line of each block ... continuation lines do not").
+    assert plain.count(_TS) == 1
+
+
+def test_render_entry_text_timestamp_prefix_is_dim_only_on_first_line() -> None:
+    """FR-5 acceptance: the dim ``HH:MM:SS`` prefix sits on the first
+    line of each block; continuation lines (multi-line agent prose,
+    multi-line error body) do not repeat the timestamp."""
+
+    prose = "line one\nline two"
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.AGENT_TEXT,
+        header="agent",
+        body=prose,
+        attempt_number=1,
+        iteration_number=1,
+    )
+    rendered = render_entry_text(entry)
+    plain = rendered.plain
+    # The block-start timestamp appears exactly once -- on the header
+    # line. The continuation prose line ("line two") carries no prefix.
+    assert plain.count(_TS) == 1
+    assert plain.startswith(f"{_TS}  agent\n")
+    # The timestamp span itself is styled ``dim`` and sits at the very
+    # start of the rendered Text (offset 0 -> 8).
+    dim_spans = [
+        span for span in rendered.spans if "dim" in str(span.style).lower()
+    ]
+    assert any(span.start == 0 and span.end == len(_TS) for span in dim_spans)
+
+
+def test_render_entry_text_leading_blank_inserts_one_newline_above_block() -> None:
+    """FR-6 plumbing: ``leading_blank=True`` prefixes the rendered Text
+    with exactly one newline so the widget renders a blank row above
+    the new block; the block-start timestamp follows immediately on
+    the line below the blank."""
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.TOOL_CALL,
+        header="tool(Edit)",
+        body="README.md",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    plain = render_entry_text(entry, leading_blank=True).plain
+    assert plain == f"\n{_TS}  tool(Edit)  README.md"
+    # Exactly one separator newline -- no double blank.
+    assert plain.count("\n") == 1
+
+
+def test_session_screen_agent_then_tool_call_has_two_timestamps_one_blank() -> None:
+    """FR-5 + FR-6 acceptance: an agent block followed by a tool call
+    shows exactly two timestamps and one separating blank line, and a
+    tool call followed by its result is not separated."""
+
+    async def body() -> None:
+        fetch = _ScriptedFetch()
+        fetch.queue.append(
+            [
+                _entry(
+                    kind=EntryKind.AGENT_TEXT,
+                    header="agent",
+                    body="planning the edit",
+                    sequence=1,
+                ),
+                _entry(
+                    kind=EntryKind.TOOL_CALL,
+                    header="tool(Edit)",
+                    body="README.md",
+                    sequence=2,
+                ),
+                _entry(
+                    kind=EntryKind.TOOL_RESULT,
+                    header="tool_result",
+                    body="ok",
+                    sequence=3,
+                ),
+            ]
+        )
+        screen = SessionScreen(
+            run_id="run-x",
+            task_id="task-alpha",
+            fetch=fetch,
+            status=_running_status,
+            poll_interval_seconds=1000.0,
+        )
+        app = DashboardApp(
+            poll=lambda: DashboardSnapshot(
+                summary=SummaryData(
+                    active_workers=0,
+                    task_counts={},
+                    tokens_total=0,
+                    cost_usd_total=0.0,
+                    runtime_seconds=0,
+                ),
+                rows=(),
+            ),
+            poll_interval_seconds=1000.0,
+        )
+        async with app.run_test() as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            transcript = screen.query_one(
+                "#session_transcript", VerticalScroll
+            )
+            statics = list(transcript.query(Static))
+            assert len(statics) == 3
+            plains = [_static_plain(s) for s in statics]
+            agent_plain, tool_plain, result_plain = plains
+            # FR-5: each block-start line carries exactly one timestamp.
+            assert agent_plain.count(_TS) == 1
+            assert tool_plain.count(_TS) == 1
+            assert result_plain.count(_TS) == 1
+            # FR-6: agent -> tool_call crosses the group boundary, so the
+            # tool widget renders one leading blank line. Together with
+            # the agent line that is exactly two timestamps and one
+            # separating blank line for the agent+tool pair.
+            assert not agent_plain.startswith("\n")
+            assert tool_plain.startswith("\n")
+            assert tool_plain.count("\n") == 1
+            # FR-6: tool call -> tool result stays glued together (no
+            # leading blank line on the result widget).
+            assert not result_plain.startswith("\n")
+
+    _run(body)
+
+
+def test_session_screen_blank_separator_persists_across_fetches() -> None:
+    """FR-6 edge case: a new block arriving in a later fetch still gets
+    its blank-line separator relative to the last block of the previous
+    fetch -- the grouping rule compares against the last entry in
+    ``screen.entries``, not just the entries in the current page.
+    """
+
+    async def body() -> None:
+        fetch = _ScriptedFetch()
+        # First fetch: only an agent text block.
+        fetch.queue.append(
+            [
+                _entry(
+                    kind=EntryKind.AGENT_TEXT,
+                    header="agent",
+                    body="hello",
+                    sequence=1,
+                )
+            ]
+        )
+        screen = SessionScreen(
+            run_id="run-x",
+            task_id="task-alpha",
+            fetch=fetch,
+            status=_running_status,
+            poll_interval_seconds=1000.0,
+        )
+        app = DashboardApp(
+            poll=lambda: DashboardSnapshot(
+                summary=SummaryData(
+                    active_workers=0,
+                    task_counts={},
+                    tokens_total=0,
+                    cost_usd_total=0.0,
+                    runtime_seconds=0,
+                ),
+                rows=(),
+            ),
+            poll_interval_seconds=1000.0,
+        )
+        async with app.run_test() as pilot:
+            await app.push_screen(screen)
+            await pilot.pause()
+            assert len(screen.entries) == 1
+            # Second fetch: a tool call arrives a tick later. The agent
+            # entry has already been consumed, so the screen must
+            # remember it when classifying the new block's group.
+            fetch.queue.append(
+                [
+                    _entry(
+                        kind=EntryKind.TOOL_CALL,
+                        header="tool(Edit)",
+                        body="README.md",
+                        sequence=2,
+                    )
+                ]
+            )
+            screen.refresh_now()
+            await pilot.pause()
+            transcript = screen.query_one(
+                "#session_transcript", VerticalScroll
+            )
+            statics = list(transcript.query(Static))
+            assert len(statics) == 2
+            agent_plain, tool_plain = (_static_plain(s) for s in statics)
+            # First entry: no leading blank.
+            assert not agent_plain.startswith("\n")
+            # Second entry, arriving in a later fetch, still gets a
+            # leading blank because its group differs from the previous
+            # rendered entry.
+            assert tool_plain.startswith("\n")
+
+    _run(body)
+
+
+def test_resolve_styles_no_error_kind_is_double_dimmed() -> None:
+    """FR-7 acceptance: every error-class entry resolves to a style
+    pair whose header and body are not both ``dim``. Error tool results
+    carry a red style.
+    """
+
+    error_entries = [
+        # Erroring tool result (header ``(error)`` suffix is the signal).
+        TranscriptEntry(
+            sequence=1,
+            sub_index=0,
+            ts=_NOW,
+            kind=EntryKind.TOOL_RESULT,
+            header="tool_result(error)",
+            body="boom",
+            attempt_number=1,
+            iteration_number=1,
+        ),
+        # ``harness.control_command_failed`` lifecycle entry (the
+        # classifier sets ``control_command_error`` to the human
+        # detail).
+        TranscriptEntry(
+            sequence=2,
+            sub_index=0,
+            ts=_NOW,
+            kind=EntryKind.LIFECYCLE,
+            header="control",
+            body="say failed: SDKDisconnected: session was closed",
+            attempt_number=1,
+            iteration_number=None,
+            control_command_id=7,
+            control_command_error="SDKDisconnected: session was closed",
+        ),
+    ]
+    for entry in error_entries:
+        assert _is_error_entry(entry)
+        header_style, body_style = _resolve_styles(entry)
+        both_dim = (
+            "dim" in header_style.lower() and "dim" in body_style.lower()
+        )
+        assert not both_dim, (
+            f"{entry.header!r} resolved to dim+dim "
+            f"(header={header_style!r}, body={body_style!r})"
+        )
+        # FR-7 explicit: error tool results carry a red style.
+        assert "red" in header_style.lower()
+        assert "red" in body_style.lower()
+
+
+def test_resolve_styles_humanized_lifecycle_stays_dim() -> None:
+    """FR-7: humanized (non-error) lifecycle phrases stay dim so the
+    busy telemetry stream recedes visually behind agent prose.
+    """
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.LIFECYCLE,
+        header="iteration",
+        body="iteration 3 · 1.2k tokens",
+        attempt_number=1,
+        iteration_number=None,
+    )
+    assert not _is_error_entry(entry)
+    header_style, body_style = _resolve_styles(entry)
+    assert "dim" in header_style.lower()
+    assert "dim" in body_style.lower()
+
+
+def test_resolve_styles_agent_text_body_is_not_dim() -> None:
+    """FR-7: agent text uses the default (non-dim) body style so the
+    core content of the session reads as the visually dominant line.
+    """
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.AGENT_TEXT,
+        header="agent",
+        body="hello there",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    header_style, body_style = _resolve_styles(entry)
+    # Body is not dim.
+    assert "dim" not in body_style.lower()
+
+
+def test_block_group_consecutive_tool_uses_share_group() -> None:
+    """FR-6 acceptance edge case: consecutive ``tool_use`` blocks count
+    as one tool-activity group, so two tool calls in a row do not get a
+    blank line between them."""
+
+    first = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.TOOL_CALL,
+        header="tool(Read)",
+        body="a.py",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    second = TranscriptEntry(
+        sequence=1,
+        sub_index=1,
+        ts=_NOW,
+        kind=EntryKind.TOOL_CALL,
+        header="tool(Read)",
+        body="b.py",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    assert _block_group(first) == _block_group(second)
+    assert not _needs_blank_separator(first, second)
 
 
 def test_session_screen_scroll_up_pauses_follow_and_indicator_shows() -> None:

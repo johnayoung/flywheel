@@ -410,12 +410,24 @@ class SessionScreen(Screen[None]):
         land (so the operator sees them on End-resume) but the
         viewport is left alone and ``_new_activity`` flips so the
         indicator shows.
+
+        Block grouping (FR-6) compares each new entry against the
+        previous rendered entry only: when the block group changes
+        (agent prose / tool activity / operator / lifecycle) the new
+        widget is prefixed with a leading blank line. The comparison
+        works correctly across incremental ``fetch`` poll boundaries
+        because the previous entry is read from ``self.entries`` --
+        which already contains entries appended in earlier ticks.
         """
 
         transcript = self.query_one("#session_transcript", VerticalScroll)
         for entry in new_entries:
+            prev_entry = self.entries[-1] if self.entries else None
+            leading_blank = _needs_blank_separator(prev_entry, entry)
             self.entries.append(entry)
-            transcript.mount(_render_entry_widget(entry))
+            transcript.mount(
+                _render_entry_widget(entry, leading_blank=leading_blank)
+            )
             self._reconcile_pending(entry)
         if self._follow:
             # ``animate=False`` keeps the viewport pinned in tests --
@@ -962,6 +974,57 @@ class SessionScreen(Screen[None]):
 # --- Rendering helpers -----------------------------------------------------
 
 
+# Block-group identifiers used by :func:`_needs_blank_separator` to decide
+# whether two consecutive rendered entries should be separated by a blank
+# line (FR-6). The four groups mirror the spec's classification: agent
+# prose, tool activity, operator turns, and lifecycle telemetry. SYSTEM /
+# RESULT collapse into ``lifecycle`` because they share its quiet visual
+# weight; USER_TEXT collapses into ``operator`` because a SDK UserMessage
+# arriving at the watcher seam is the operator's own injection (or a
+# scripted user-of-the-loop).
+_BLOCK_GROUP_AGENT: str = "agent"
+_BLOCK_GROUP_TOOL: str = "tool"
+_BLOCK_GROUP_OPERATOR: str = "operator"
+_BLOCK_GROUP_LIFECYCLE: str = "lifecycle"
+
+
+def _block_group(entry: TranscriptEntry) -> str:
+    """Return the FR-6 block-group identifier for ``entry``."""
+
+    if entry.kind is EntryKind.AGENT_TEXT:
+        return _BLOCK_GROUP_AGENT
+    if entry.kind in (EntryKind.TOOL_CALL, EntryKind.TOOL_RESULT):
+        return _BLOCK_GROUP_TOOL
+    if entry.kind in (EntryKind.OPERATOR_SAY, EntryKind.USER_TEXT):
+        return _BLOCK_GROUP_OPERATOR
+    return _BLOCK_GROUP_LIFECYCLE
+
+
+def _needs_blank_separator(
+    prev: TranscriptEntry | None, curr: TranscriptEntry
+) -> bool:
+    """Whether ``curr`` should be preceded by a blank line (FR-6).
+
+    Returns ``False`` for the first rendered entry (no leading blank
+    on the first block of the screen). Returns ``False`` when ``prev``
+    is a tool call and ``curr`` is the matching tool result so the
+    nested ``↳`` line stays glued to its call. Otherwise returns
+    ``True`` only when the previous and current entries belong to
+    different block groups; consecutive entries inside the same group
+    (e.g. two assistant text blocks, two tool_use blocks in one turn,
+    a tool call followed by another tool call) do not insert a blank.
+    """
+
+    if prev is None:
+        return False
+    if (
+        prev.kind is EntryKind.TOOL_CALL
+        and curr.kind is EntryKind.TOOL_RESULT
+    ):
+        return False
+    return _block_group(prev) != _block_group(curr)
+
+
 def _short(value: object, limit: int = 60) -> str:
     """Collapse ``value`` to a single line capped at ``limit`` characters.
 
@@ -977,42 +1040,104 @@ def _short(value: object, limit: int = 60) -> str:
     return text[:keep] + "…"
 
 
-def _render_entry_widget(entry: TranscriptEntry) -> Static:
+def _is_error_entry(entry: TranscriptEntry) -> bool:
+    """Whether ``entry`` is an FR-7 "error class" line.
+
+    Three signals collapse into the same boolean: a TOOL_RESULT whose
+    classifier flagged it ``(error)`` in the header, and a LIFECYCLE
+    entry carrying a non-empty ``control_command_error`` (the
+    classifier sets this on ``harness.control_command_failed``). The
+    boolean steers :func:`_resolve_styles` away from any double-dim
+    pair so a failure never blends into the surrounding telemetry.
+    """
+
+    if entry.kind is EntryKind.TOOL_RESULT and entry.header.endswith(
+        "(error)"
+    ):
+        return True
+    if (
+        entry.kind is EntryKind.LIFECYCLE
+        and entry.control_command_error is not None
+    ):
+        return True
+    return False
+
+
+def _resolve_styles(entry: TranscriptEntry) -> tuple[str, str]:
+    """Return the ``(header_style, body_style)`` pair for ``entry``.
+
+    Error-class entries (FR-7) are routed to ``("bold red", "red")``
+    regardless of the static :data:`_HEADER_STYLES` / :data:`_BODY_STYLES`
+    mapping so a failed control command, a failed lifecycle state, or
+    an erroring tool result is never rendered as a dim+dim ghost.
+    Non-error entries fall through to the static maps so humanized
+    lifecycle phrases stay dim and agent text keeps its non-dim body.
+    """
+
+    if _is_error_entry(entry):
+        return "bold red", "red"
+    return (
+        _HEADER_STYLES.get(entry.kind, ""),
+        _BODY_STYLES.get(entry.kind, ""),
+    )
+
+
+def _render_entry_widget(
+    entry: TranscriptEntry, *, leading_blank: bool = False
+) -> Static:
     """Build the :class:`Static` widget for one transcript entry.
 
     Each row is a single :class:`Text` so colour styling (header bold,
-    body dimmed for tool results) survives ``run_test`` without needing
-    a separate widget tree per entry.
+    body dimmed for tool results, red for errors) survives ``run_test``
+    without needing a separate widget tree per entry. When the caller
+    asks for a ``leading_blank`` the Text starts with a literal newline
+    so the widget renders one blank row above its content -- this is the
+    FR-6 block-group separator and lives on the new widget rather than
+    a separate mount so an incremental fetch never inserts an extra
+    standalone blank row.
     """
 
-    text = render_entry_text(entry)
+    text = render_entry_text(entry, leading_blank=leading_blank)
     return Static(text, expand=True)
 
 
-def render_entry_text(entry: TranscriptEntry) -> Text:
+def render_entry_text(
+    entry: TranscriptEntry, *, leading_blank: bool = False
+) -> Text:
     """Render one entry as a ``rich.text.Text`` block.
 
     Public so tests can assert the rendered shape (header tag, body
-    text) without mounting a Textual app. For most entry kinds the
-    body has been collapsed to one line by :mod:`flywheel._session`,
-    so the layout is ``header  body`` on a single row. AGENT_TEXT
-    bodies are kept verbatim (FR-1), so a multi-line body is rendered
-    with the header on its own line and the prose below it; the
-    enclosing :class:`Static` widget wraps long lines to the widget
-    width. TOOL_RESULT entries are rendered as indented outcome lines
-    underneath their tool call (FR-3): the header sits two spaces in,
+    text) without mounting a Textual app. Every entry starts with a
+    dim ``HH:MM:SS`` prefix taken from ``entry.ts`` (FR-5) followed by
+    two spaces; continuation lines inside a multi-line body do not
+    repeat the timestamp. ``leading_blank=True`` prepends a single
+    newline so the widget renders one blank row above the timestamp
+    line -- :class:`SessionScreen` sets this when the previous
+    rendered entry belongs to a different block group (FR-6).
+
+    For most entry kinds the body has been collapsed to one line by
+    :mod:`flywheel._session`, so the layout is ``HH:MM:SS  header  body``
+    on a single row. AGENT_TEXT bodies are kept verbatim (FR-1), so a
+    multi-line body is rendered with the header on its own (timestamped)
+    line and the prose below it; the enclosing :class:`Static` widget
+    wraps long lines to the widget width. TOOL_RESULT entries are
+    rendered as indented outcome lines underneath their tool call
+    (FR-3): the header sits two spaces in (after the timestamp gutter),
     a single-line body shares the same row, and a multi-line error
     body breaks below with each line indented four spaces. Error
-    results override the dim body style with a non-dim red so an
-    operator can spot a failure at a glance.
+    entries (FR-7) override the static style map with a non-dim red so
+    an operator can spot a failure at a glance even on a busy stream.
     """
 
-    if entry.kind is EntryKind.TOOL_RESULT:
-        return _render_tool_result_text(entry)
-
-    header_style = _HEADER_STYLES.get(entry.kind, "")
-    body_style = _BODY_STYLES.get(entry.kind, "")
     text = Text()
+    if leading_blank:
+        text.append("\n")
+    text.append(entry.ts.strftime("%H:%M:%S"), style="dim")
+    text.append("  ")
+    if entry.kind is EntryKind.TOOL_RESULT:
+        _append_tool_result_body(text, entry)
+        return text
+    header_style, body_style = _resolve_styles(entry)
     text.append(entry.header, style=header_style)
     if entry.body:
         if entry.kind is EntryKind.AGENT_TEXT and "\n" in entry.body:
@@ -1023,34 +1148,28 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
     return text
 
 
-def _render_tool_result_text(entry: TranscriptEntry) -> Text:
-    """Render a TOOL_RESULT entry as an indented outcome line.
+def _append_tool_result_body(text: Text, entry: TranscriptEntry) -> None:
+    """Append the indented TOOL_RESULT body onto ``text`` after the timestamp.
 
-    Layout:
+    Layout (after the leading ``HH:MM:SS  `` prefix supplied by
+    :func:`render_entry_text`):
 
     * ``  tool_result  ok`` -- success on a single row, body dim.
     * ``  tool_result(error)`` followed by indented detail lines below
       it -- multi-line error detail, body red and never dimmed.
 
-    The header is prefixed with two spaces so the result visually nests
-    under the preceding tool call; multi-line bodies indent four spaces
-    so the detail is one level deeper than the header. Error styling is
-    independent of :data:`_HEADER_STYLES` / :data:`_BODY_STYLES` so the
-    dim convention for non-error tool results stays untouched.
+    The header is prefixed with two spaces so the result visually
+    nests under the preceding tool call; multi-line bodies indent four
+    spaces so the detail is one level deeper than the header. The
+    error / success style split is owned by :func:`_resolve_styles` so
+    FR-7's "no double-dim" guarantee applies here too.
     """
 
-    is_error = entry.header.endswith("(error)")
-    if is_error:
-        header_style = "bold red"
-        body_style = "red"
-    else:
-        header_style = _HEADER_STYLES.get(EntryKind.TOOL_RESULT, "")
-        body_style = _BODY_STYLES.get(EntryKind.TOOL_RESULT, "")
-    text = Text()
+    header_style, body_style = _resolve_styles(entry)
     text.append("  ")
     text.append(entry.header, style=header_style)
     if not entry.body:
-        return text
+        return
     if "\n" in entry.body:
         for line in entry.body.split("\n"):
             text.append("\n    ")
@@ -1058,7 +1177,6 @@ def _render_tool_result_text(entry: TranscriptEntry) -> Text:
     else:
         text.append("  ")
         text.append(entry.body, style=body_style)
-    return text
 
 
 __all__ = [

@@ -93,10 +93,112 @@ def test_classify_assistant_text_block_renders_agent_entry() -> None:
     entry = entries[0]
     assert entry.kind is EntryKind.AGENT_TEXT
     assert entry.header == "agent"
+    # AGENT_TEXT prose is preserved verbatim (no _short flattening,
+    # no length cap, no ellipsis suffix). A single-line block round-
+    # trips unchanged.
     assert entry.body == "I'll edit the README now."
+    assert "…" not in entry.body
     assert entry.sequence == 10
     assert entry.attempt_number == 1
     assert entry.iteration_number == 1
+
+
+def test_classify_assistant_multi_paragraph_text_preserves_line_breaks() -> None:
+    """FR-1: a multi-paragraph assistant text block reaches the screen
+    with paragraphs intact and no truncation or ellipsis appended."""
+
+    prose = (
+        "First paragraph explains the plan.\n"
+        "\n"
+        "Second paragraph dives into the details.\n"
+        "Third line continues the second paragraph."
+    )
+    record = _assistant_record(
+        content=[{"type": "text", "text": prose}],
+        sequence=11,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.AGENT_TEXT
+    assert entry.header == "agent"
+    # Original line breaks are preserved verbatim; nothing flattens to
+    # spaces, nothing is dropped.
+    assert entry.body == prose
+    assert "\n\n" in entry.body
+    assert "…" not in entry.body
+
+
+def test_classify_assistant_long_text_is_not_truncated() -> None:
+    """FR-1 acceptance: prose far longer than the legacy _short cap
+    reaches the screen with no ellipsis and the full character count."""
+
+    long_text = "x" * 10_000
+    record = _assistant_record(
+        content=[{"type": "text", "text": long_text}],
+        sequence=12,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.AGENT_TEXT
+    assert entry.body == long_text
+    assert len(entry.body) == 10_000
+    assert "…" not in entry.body
+
+
+def test_classify_assistant_text_strips_carriage_returns_and_trailing_ws() -> None:
+    """Edge case: carriage returns and per-line trailing whitespace
+    must not produce phantom blank lines or trailing pad."""
+
+    raw = "line one  \r\nline two\t\r\n\r\nline four   \r\n"
+    record = _assistant_record(
+        content=[{"type": "text", "text": raw}],
+        sequence=13,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    # CR characters disappear; trailing whitespace on each line is
+    # stripped; the trailing newline at the very end is stripped.
+    assert "\r" not in entry.body
+    assert not entry.body.endswith("\n")
+    assert not entry.body.endswith(" ")
+    assert entry.body == "line one\nline two\n\nline four"
+
+
+def test_classify_assistant_whitespace_only_text_block_is_skipped() -> None:
+    """Edge case: an empty / pure-whitespace text block produces no
+    entry rather than rendering a stray blank line."""
+
+    record = _assistant_record(
+        content=[{"type": "text", "text": "   \r\n\t  \n"}],
+        sequence=14,
+    )
+    entries = classify(record)
+    # The block collapses to nothing; the classifier still emits a
+    # single fallback ``(empty)`` entry rather than zero entries so an
+    # otherwise-empty assistant turn does not disappear silently.
+    assert len(entries) == 1
+    assert entries[0].body == "(empty)"
+
+
+def test_classify_assistant_thinking_block_preserves_multi_line_prose() -> None:
+    """Extended-thinking blocks share the AGENT_TEXT prose path: line
+    breaks survive and no truncation is applied."""
+
+    thinking = "Step 1: read the spec.\nStep 2: write the test.\nStep 3: ship."
+    record = _assistant_record(
+        content=[{"type": "thinking", "thinking": thinking}],
+        sequence=15,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.AGENT_TEXT
+    assert entry.header == "agent(thinking)"
+    assert entry.body == thinking
+    assert "…" not in entry.body
 
 
 def test_classify_assistant_tool_use_collapses_args() -> None:

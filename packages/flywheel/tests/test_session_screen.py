@@ -28,7 +28,11 @@ from flywheel_core.store_sqlite import SqliteStore
 
 from flywheel._dashboard import DashboardApp
 from flywheel._session import EntryKind, TranscriptEntry, TranscriptTailer
-from flywheel._session_screen import SessionScreen, SessionStatus
+from flywheel._session_screen import (
+    SessionScreen,
+    SessionStatus,
+    render_entry_text,
+)
 from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 
@@ -114,16 +118,22 @@ class _ScriptedStatus:
 def test_session_screen_renders_all_message_classes() -> None:
     """FR-4 acceptance: pilot test asserts rendering of each message
     class (agent text, tool call, tool result, operator say, lifecycle,
-    gate event)."""
+    gate event). Multi-line AGENT_TEXT prose is rendered verbatim with
+    its line breaks preserved (FR-1)."""
 
     async def body() -> None:
         fetch = _ScriptedFetch()
+        multi_line_prose = (
+            "planning the edit\n"
+            "\n"
+            "step two: write the test"
+        )
         fetch.queue.append(
             [
                 _entry(
                     kind=EntryKind.AGENT_TEXT,
                     header="agent",
-                    body="planning the edit",
+                    body=multi_line_prose,
                     sequence=1,
                 ),
                 _entry(
@@ -197,8 +207,58 @@ def test_session_screen_renders_all_message_classes() -> None:
                 "#session_transcript", VerticalScroll
             )
             assert len(transcript.query(Static)) >= 6
+            # The AGENT_TEXT body kept its paragraph break verbatim.
+            assert screen.entries[0].body == multi_line_prose
+            assert "\n\n" in screen.entries[0].body
 
     _run(body)
+
+
+def test_render_entry_text_keeps_agent_text_inline_when_single_line() -> None:
+    """A single-line AGENT_TEXT body still renders as ``agent  body``.
+
+    Preserves the dense single-line look for short prose so the
+    transcript stays scannable on common short replies.
+    """
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.AGENT_TEXT,
+        header="agent",
+        body="ack",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    rendered = render_entry_text(entry)
+    plain = rendered.plain
+    assert plain == "agent  ack"
+    assert "\n" not in plain
+
+
+def test_render_entry_text_breaks_multi_line_agent_text_below_header() -> None:
+    """FR-1 rendering: multi-paragraph AGENT_TEXT puts the header on
+    its own line and the prose underneath with original breaks intact.
+    """
+
+    prose = "first paragraph\n\nsecond paragraph"
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.AGENT_TEXT,
+        header="agent",
+        body=prose,
+        attempt_number=1,
+        iteration_number=1,
+    )
+    rendered = render_entry_text(entry)
+    plain = rendered.plain
+    # Header sits on its own line; prose follows verbatim.
+    assert plain == f"agent\n{prose}"
+    # The blank line between paragraphs survives the renderer.
+    assert "\n\n" in plain
 
 
 def test_session_screen_scroll_up_pauses_follow_and_indicator_shows() -> None:

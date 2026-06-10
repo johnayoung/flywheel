@@ -164,6 +164,25 @@ def _short(value: object, limit: int = _COLLAPSED_BODY_LIMIT) -> str:
     return text[:keep] + "…"
 
 
+def _normalize_agent_text(text: str) -> str:
+    """Sanitise an AGENT_TEXT body without flattening or truncating.
+
+    Used by the assistant-text and assistant-thinking branches so prose
+    of any length reaches the session screen with paragraph breaks
+    preserved (FR-1). Carriage returns are dropped so a CRLF stream
+    produces a single line break per paragraph; per-line trailing
+    whitespace is stripped so an editor's stray tabs or spaces after a
+    ``\\n`` do not become a phantom blank line; trailing whitespace at
+    the very end is stripped so the entry never renders a blank tail.
+    Leading whitespace is preserved -- a code block or quoted reply may
+    legitimately be indented.
+    """
+
+    cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = "\n".join(line.rstrip() for line in cleaned.split("\n"))
+    return cleaned.rstrip()
+
+
 def _summarise_tool_input(input_obj: Any) -> str:
     """Collapse a tool_use ``input`` mapping to ``k=v, k=v`` form.
 
@@ -256,9 +275,14 @@ def _classify_assistant_block(
     if btype == "thinking":
         # Extended-thinking blocks are rendered as agent text with a
         # distinguishing header so operators can see the chain of
-        # reasoning without a separate widget class.
+        # reasoning without a separate widget class. Thinking is prose,
+        # so it shares the AGENT_TEXT no-flatten / no-truncate path with
+        # the ``text`` branch below (FR-1).
         text = block.get("thinking") or block.get("text")
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str):
+            return None
+        body = _normalize_agent_text(text)
+        if not body:
             return None
         return TranscriptEntry(
             sequence=sequence,
@@ -266,13 +290,19 @@ def _classify_assistant_block(
             ts=record.ts,
             kind=EntryKind.AGENT_TEXT,
             header="agent(thinking)",
-            body=_short(text),
+            body=body,
             attempt_number=record.attempt_number,
             iteration_number=record.iteration_number,
         )
     text = block.get("text")
     if isinstance(text, str):
-        if not text:
+        # AGENT_TEXT prose is rendered verbatim: original line breaks
+        # survive, the body is not capped, no ellipsis is appended. The
+        # screen wraps long lines to the widget width. Empty / pure-
+        # whitespace blocks still collapse to ``None`` so an idle keep-
+        # alive turn does not leave a blank line in the transcript.
+        body = _normalize_agent_text(text)
+        if not body:
             return None
         return TranscriptEntry(
             sequence=sequence,
@@ -280,7 +310,7 @@ def _classify_assistant_block(
             ts=record.ts,
             kind=EntryKind.AGENT_TEXT,
             header="agent",
-            body=_short(text),
+            body=body,
             attempt_number=record.attempt_number,
             iteration_number=record.iteration_number,
         )

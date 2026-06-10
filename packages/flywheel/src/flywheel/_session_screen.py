@@ -990,11 +990,16 @@ def _render_entry_widget(entry: TranscriptEntry) -> Static:
 
 
 def render_entry_text(entry: TranscriptEntry) -> Text:
-    """Render one entry as a ``rich.text.Text`` line.
+    """Render one entry as a ``rich.text.Text`` block.
 
     Public so tests can assert the rendered shape (header tag, body
-    text) without mounting a Textual app. Newlines inside the body
-    have already been collapsed by :mod:`flywheel._session`.
+    text) without mounting a Textual app. For most entry kinds the
+    body has been collapsed to one line by :mod:`flywheel._session`,
+    so the layout is ``header  body`` on a single row. AGENT_TEXT
+    bodies are kept verbatim (FR-1), so a multi-line body is rendered
+    with the header on its own line and the prose below it; the
+    enclosing :class:`Static` widget wraps long lines to the widget
+    width.
     """
 
     header_style = _HEADER_STYLES.get(entry.kind, "")
@@ -1002,7 +1007,10 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
     text = Text()
     text.append(entry.header, style=header_style)
     if entry.body:
-        text.append("  ")
+        if entry.kind is EntryKind.AGENT_TEXT and "\n" in entry.body:
+            text.append("\n")
+        else:
+            text.append("  ")
         text.append(entry.body, style=body_style)
     return text
 

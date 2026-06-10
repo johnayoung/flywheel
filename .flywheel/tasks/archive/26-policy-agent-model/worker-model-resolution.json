@@ -1,0 +1,46 @@
+{
+  "id": "worker-model-resolution",
+  "goal": "Both worker entrypoints (fw dashboard spawn and flywheel worker headless) run the agent with the model resolved as CLI --model over flywheel.toml [agent] model over the Claude Code default.",
+  "prerequisites": ["policy-agent-model-field"],
+  "tags": ["policy", "worker"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00023-FEATURE-policy-agent-model.md",
+      "packages/flywheel/src/flywheel/_tui.py",
+      "packages/flywheel/src/flywheel/_cli.py",
+      "packages/flywheel/src/flywheel/_worker_supervisor.py",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+      "packages/flywheel/tests/test_worker_supervisor.py",
+      "packages/flywheel/tests/test_tui.py",
+      "packages/flywheel/tests/test_fw_router.py"
+    ],
+    "references": [
+      "_resolve_tasks_dir_for_worker in packages/flywheel/src/flywheel/_tui.py -- the explicit-flag -> policy -> default resolution pattern to mirror for model",
+      "The spawn argv builder in packages/flywheel/src/flywheel/_worker_supervisor.py -- the conditional --tasks-dir append is the model for the conditional --model append",
+      "packages/flywheel-worktree/tests/test_worker.py already passes model='claude-test' through run_once -- threading below the entrypoints exists and needs no change"
+    ],
+    "constraints": [
+      "Precedence is exactly: explicit --model flag, else WorkPolicy.model, else None (SDK falls through to the Claude Code default)",
+      "The fw dashboard path resolves the model from the loaded policy and the supervisor spawn argv includes --model <value> only when an effective model resolved; no --model arg is appended when none is",
+      "flywheel worker (headless, routed via _cli.py to flywheel_worktree.worker.main) honors the policy model when no --model flag is given; an explicit --model flag still wins",
+      "flywheel_worktree.worker's existing --model flag semantics are unchanged for direct python -m invocation without a policy file present",
+      "Tests pinning the exact spawn argv in packages/flywheel/tests/test_worker_supervisor.py must be updated in the same commit if the argv builder signature or output changes",
+      "Add test coverage for: all three precedence tiers, the conditional spawn argv (present and absent), and the headless path honoring the policy model",
+      "No changes to rubric judge_model or summarizer_model resolution",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No changes to the flywheel set-model control command; it continues to override the session model mid-run regardless of source",
+      "No new validation of model id validity; the SDK rejects unknown ids at session start",
+      "No per-task model override"
+    ],
+    "edge_cases": [
+      "Policy file absent entirely: both entrypoints behave exactly as today (model None end to end)",
+      "Attempt records show the effective model in agent_context.model_id when one is resolved, via the existing recording in flywheel_core.workflow"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel/tests/test_worker_supervisor.py packages/flywheel/tests/test_tui.py packages/flywheel/tests/test_fw_router.py", "name": "entrypoint-tests" },
+    { "type": "command", "run": "uv run pytest packages/flywheel packages/flywheel-worktree", "name": "package-suites" }
+  ]
+}

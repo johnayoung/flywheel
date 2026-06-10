@@ -201,7 +201,11 @@ def test_classify_assistant_thinking_block_preserves_multi_line_prose() -> None:
     assert "…" not in entry.body
 
 
-def test_classify_assistant_tool_use_collapses_args() -> None:
+def test_classify_assistant_tool_use_shows_primary_arg_for_mapped_tool() -> None:
+    """FR-2: a mapped tool (Edit) renders its primary argument value
+    verbatim -- ``file_path`` -- and drops the other input keys so the
+    line stays scannable."""
+
     record = _assistant_record(
         content=[
             {
@@ -216,10 +220,122 @@ def test_classify_assistant_tool_use_collapses_args() -> None:
     entry = entries[0]
     assert entry.kind is EntryKind.TOOL_CALL
     assert entry.header == "tool(Edit)"
-    # First two keys make it into the body summary; same convention
-    # the dashboard uses for ``last_detail``.
-    assert "file_path=README.md" in entry.body
-    assert "old=x" in entry.body
+    # Just the file_path value, no ``key=`` prefix and no other keys.
+    assert entry.body == "README.md"
+    assert "=" not in entry.body
+
+
+def test_classify_assistant_tool_use_bash_shows_command() -> None:
+    """FR-2: Bash maps to ``command`` -- the command surfaces verbatim."""
+
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "ls -la /tmp", "description": "list"},
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.header == "tool(Bash)"
+    assert entry.body == "ls -la /tmp"
+
+
+def test_classify_assistant_tool_use_grep_shows_pattern() -> None:
+    """FR-2: Grep maps to ``pattern``."""
+
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "Grep",
+                "input": {"pattern": "TODO", "glob": "*.py"},
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.header == "tool(Grep)"
+    assert entry.body == "TODO"
+
+
+def test_classify_assistant_tool_use_unmapped_keeps_kv_form() -> None:
+    """FR-2: an unmapped tool falls back to the first-two-keys ``k=v``
+    summary so unfamiliar tools still surface enough context."""
+
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "MysteryTool",
+                "input": {"alpha": "one", "beta": "two", "gamma": "three"},
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.header == "tool(MysteryTool)"
+    # First two keys land in the body, third is dropped.
+    assert "alpha=one" in entry.body
+    assert "beta=two" in entry.body
+    assert "gamma" not in entry.body
+
+
+def test_classify_assistant_tool_use_mapped_missing_key_falls_back() -> None:
+    """Edge case: a mapped tool whose primary key is absent falls back
+    to the generic ``k=v`` summary rather than raising."""
+
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "Edit",
+                "input": {"old": "a", "new": "b"},
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.header == "tool(Edit)"
+    # No ``file_path`` -- fall through to k=v of the remaining keys.
+    assert "old=a" in entry.body
+    assert "new=b" in entry.body
+
+
+def test_classify_assistant_tool_use_non_mapping_input_does_not_raise() -> None:
+    """Edge case: a non-mapping input collapses through ``_short`` and
+    never raises."""
+
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "Edit",
+                "input": "not a mapping",
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.TOOL_CALL
+    assert entry.body == "not a mapping"
+
+
+def test_classify_assistant_tool_use_long_command_is_not_truncated() -> None:
+    """FR-2 edge case: a very long single-line command surfaces in full
+    so the widget wraps it at width rather than the classifier
+    truncating with an ellipsis."""
+
+    long_command = "echo " + "x" * 1000
+    record = _assistant_record(
+        content=[
+            {
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": long_command},
+            }
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.body == long_command
+    assert "…" not in entry.body
 
 
 def test_classify_assistant_fans_out_text_and_tool_use() -> None:
@@ -242,7 +358,10 @@ def test_classify_assistant_fans_out_text_and_tool_use() -> None:
     assert all(e.sequence == 7 for e in entries)
 
 
-def test_classify_user_tool_result_collapses_size_and_body() -> None:
+def test_classify_user_tool_result_success_renders_brief_ok_line() -> None:
+    """FR-3: a successful tool result is a single brief line carrying
+    ``ok`` plus a content hint (line count for multi-line output)."""
+
     body = "stdout line 1\nstdout line 2"
     record = _user_record(
         content=[
@@ -258,19 +377,88 @@ def test_classify_user_tool_result_collapses_size_and_body() -> None:
     entry = entries[0]
     assert entry.kind is EntryKind.TOOL_RESULT
     assert entry.header == "tool_result"
-    assert f"{len(body)}B" in entry.body
-    # Newlines collapse so the line stays single-row.
+    # Two non-empty lines -> body summarises as ``ok (2 lines)``.
+    assert entry.body == "ok (2 lines)"
+    # Body is single-row -- no embedded newlines on success.
     assert "\n" not in entry.body
 
 
+def test_classify_user_tool_result_single_line_success_includes_first_line() -> None:
+    """FR-3: a single-line successful body inlines the line as the
+    content hint, ``ok: <line>``."""
+
+    record = _user_record(
+        content=[
+            {"tool_use_id": "t1", "content": "file written", "is_error": False}
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.TOOL_RESULT
+    assert entry.header == "tool_result"
+    assert entry.body == "ok: file written"
+
+
+def test_classify_user_tool_result_empty_success_collapses_to_ok() -> None:
+    """Edge case: empty success content collapses to a bare ``ok``."""
+
+    record = _user_record(
+        content=[
+            {"tool_use_id": "t1", "content": "", "is_error": False}
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.TOOL_RESULT
+    assert entry.header == "tool_result"
+    assert entry.body == "ok"
+
+
 def test_classify_user_tool_result_flags_error() -> None:
+    """is_error swaps the header to the ``(error)`` variant; a short
+    error body fits on one line and survives verbatim."""
+
     record = _user_record(
         content=[
             {"tool_use_id": "t1", "content": "boom", "is_error": True}
         ]
     )
-    entries = classify(record)
-    assert entries[0].header == "tool_result(error)"
+    entry = classify(record)[0]
+    assert entry.header == "tool_result(error)"
+    assert entry.body == "boom"
+
+
+def test_classify_user_tool_result_error_caps_at_ten_lines() -> None:
+    """FR-3 acceptance: a 30-line error body keeps the first ten lines
+    verbatim and appends ``... +20 more lines``."""
+
+    body = "\n".join(f"err line {i}" for i in range(30))
+    record = _user_record(
+        content=[
+            {"tool_use_id": "t1", "content": body, "is_error": True}
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.kind is EntryKind.TOOL_RESULT
+    assert entry.header == "tool_result(error)"
+    lines = entry.body.split("\n")
+    # Ten detail lines + one overflow marker line.
+    assert len(lines) == 11
+    assert lines[:10] == [f"err line {i}" for i in range(10)]
+    assert lines[10] == "... +20 more lines"
+
+
+def test_classify_user_tool_result_error_under_cap_renders_verbatim() -> None:
+    """An error body within the cap retains all lines without an
+    overflow marker."""
+
+    body = "first\nsecond\nthird"
+    record = _user_record(
+        content=[
+            {"tool_use_id": "t1", "content": body, "is_error": True}
+        ]
+    )
+    entry = classify(record)[0]
+    assert entry.body == body
+    assert "more lines" not in entry.body
 
 
 def test_classify_user_text_block() -> None:

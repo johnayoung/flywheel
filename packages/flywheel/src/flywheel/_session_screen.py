@@ -999,8 +999,16 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
     bodies are kept verbatim (FR-1), so a multi-line body is rendered
     with the header on its own line and the prose below it; the
     enclosing :class:`Static` widget wraps long lines to the widget
-    width.
+    width. TOOL_RESULT entries are rendered as indented outcome lines
+    underneath their tool call (FR-3): the header sits two spaces in,
+    a single-line body shares the same row, and a multi-line error
+    body breaks below with each line indented four spaces. Error
+    results override the dim body style with a non-dim red so an
+    operator can spot a failure at a glance.
     """
+
+    if entry.kind is EntryKind.TOOL_RESULT:
+        return _render_tool_result_text(entry)
 
     header_style = _HEADER_STYLES.get(entry.kind, "")
     body_style = _BODY_STYLES.get(entry.kind, "")
@@ -1011,6 +1019,44 @@ def render_entry_text(entry: TranscriptEntry) -> Text:
             text.append("\n")
         else:
             text.append("  ")
+        text.append(entry.body, style=body_style)
+    return text
+
+
+def _render_tool_result_text(entry: TranscriptEntry) -> Text:
+    """Render a TOOL_RESULT entry as an indented outcome line.
+
+    Layout:
+
+    * ``  tool_result  ok`` -- success on a single row, body dim.
+    * ``  tool_result(error)`` followed by indented detail lines below
+      it -- multi-line error detail, body red and never dimmed.
+
+    The header is prefixed with two spaces so the result visually nests
+    under the preceding tool call; multi-line bodies indent four spaces
+    so the detail is one level deeper than the header. Error styling is
+    independent of :data:`_HEADER_STYLES` / :data:`_BODY_STYLES` so the
+    dim convention for non-error tool results stays untouched.
+    """
+
+    is_error = entry.header.endswith("(error)")
+    if is_error:
+        header_style = "bold red"
+        body_style = "red"
+    else:
+        header_style = _HEADER_STYLES.get(EntryKind.TOOL_RESULT, "")
+        body_style = _BODY_STYLES.get(EntryKind.TOOL_RESULT, "")
+    text = Text()
+    text.append("  ")
+    text.append(entry.header, style=header_style)
+    if not entry.body:
+        return text
+    if "\n" in entry.body:
+        for line in entry.body.split("\n"):
+            text.append("\n    ")
+            text.append(line, style=body_style)
+    else:
+        text.append("  ")
         text.append(entry.body, style=body_style)
     return text
 

@@ -72,6 +72,25 @@ _COLLAPSED_BODY_LIMIT: int = 240
 # pair when summarising tool-call args.
 _TOOL_ARG_VALUE_LIMIT: int = 60
 
+# Per-tool primary-argument map for the TOOL_CALL summary line. Tools in
+# this table render their key argument verbatim (file_path for Edit /
+# Read / Write, command for Bash, pattern for Grep / Glob) so the line
+# is scannable at a glance; tools not in this table fall back to the
+# generic ``k=v, k=v`` summary of the first two input keys.
+_TOOL_KEY_ARG: dict[str, str] = {
+    "Edit": "file_path",
+    "Read": "file_path",
+    "Write": "file_path",
+    "Bash": "command",
+    "Grep": "pattern",
+    "Glob": "pattern",
+}
+
+# Maximum number of lines of detail retained on an is_error TOOL_RESULT.
+# Anything beyond is dropped and replaced with a ``... +N more lines``
+# suffix so a pathological stack trace cannot blow up the widget.
+_TOOL_ERROR_LINE_LIMIT: int = 10
+
 # Per-record cap on the number of content blocks fanned out into
 # separate transcript entries. Keeps a pathological assistant turn
 # from producing thousands of rows; the cap is generous enough that
@@ -183,18 +202,42 @@ def _normalize_agent_text(text: str) -> str:
     return cleaned.rstrip()
 
 
-def _summarise_tool_input(input_obj: Any) -> str:
-    """Collapse a tool_use ``input`` mapping to ``k=v, k=v`` form.
+def _flatten_to_line(value: object) -> str:
+    """Collapse ``value`` to a single line without truncating it.
 
-    Cap-and-truncate semantics mirror
-    :func:`flywheel_orchestrator._workflow._summarize_assistant`: at
-    most the first two keys land in the summary and each value is
-    capped at :data:`_TOOL_ARG_VALUE_LIMIT` characters. Non-mapping
-    inputs collapse via :func:`_short` for symmetry.
+    Used for the primary tool-call argument so a long single-line
+    command surfaces in full and the widget wraps it at width rather
+    than the classifier truncating with an ellipsis (FR-2 edge case:
+    very long single-line commands wrap at widget width rather than
+    truncating).
+    """
+
+    return str(value).replace("\n", " ").replace("\r", " ")
+
+
+def _summarise_tool_input(name: str, input_obj: Any) -> str:
+    """Collapse a tool_use ``input`` mapping to a scannable summary.
+
+    For tools listed in :data:`_TOOL_KEY_ARG` the body is the value of
+    the primary argument (``file_path`` for Edit/Read/Write, ``command``
+    for Bash, ``pattern`` for Grep/Glob), flattened to one line so the
+    row stays scannable. Long values are not truncated -- the widget
+    wraps them at width. Unmapped tools, and mapped tools whose primary
+    key is absent or empty, fall back to the generic ``k=v, k=v`` form
+    over the first two keys; each value in that form is capped at
+    :data:`_TOOL_ARG_VALUE_LIMIT` characters via :func:`_short`. Non-
+    mapping inputs collapse via :func:`_short` for symmetry, and never
+    raise -- an odd payload still renders rather than crashing the
+    classifier.
     """
 
     if not isinstance(input_obj, Mapping):
         return _short(input_obj)
+    primary = _TOOL_KEY_ARG.get(name)
+    if primary is not None and primary in input_obj:
+        flattened = _flatten_to_line(input_obj[primary])
+        if flattened:
+            return flattened
     if not input_obj:
         return ""
     parts: list[str] = []
@@ -261,7 +304,7 @@ def _classify_assistant_block(
     btype = block.get("type")
     if btype == "tool_use":
         name = str(block.get("name", "?"))
-        summary = _summarise_tool_input(block.get("input"))
+        summary = _summarise_tool_input(name, block.get("input"))
         return TranscriptEntry(
             sequence=sequence,
             sub_index=sub_index,
@@ -377,6 +420,52 @@ def _classify_user(
     return entries
 
 
+def _format_tool_result_body(text: str, *, is_error: bool) -> str:
+    """Format a tool result body for the indented outcome line (FR-3).
+
+    On success the body is a single brief line: literal ``ok`` plus a
+    content hint -- the first line of output when there is exactly one,
+    otherwise an ``ok (N lines)`` line-count summary. Empty success
+    output collapses to a bare ``ok``. On error the body keeps up to
+    :data:`_TOOL_ERROR_LINE_LIMIT` lines of detail verbatim and appends
+    a ``... +N more lines`` suffix for anything beyond, so a 100KB
+    stack trace cannot blow up the transcript widget. Carriage returns
+    are normalised so a CRLF stream produces one line break per
+    paragraph.
+    """
+
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if is_error:
+        return _format_tool_error_body(normalised)
+    return _format_tool_success_body(normalised)
+
+
+def _format_tool_success_body(text: str) -> str:
+    """Render the brief one-line outcome for a successful tool result."""
+
+    if not text.strip():
+        return "ok"
+    non_empty = [line for line in text.split("\n") if line.strip()]
+    if not non_empty:
+        return "ok"
+    if len(non_empty) == 1:
+        return f"ok: {_short(non_empty[0].strip())}"
+    return f"ok ({len(non_empty)} lines)"
+
+
+def _format_tool_error_body(text: str) -> str:
+    """Render an is_error tool result with a 10-line cap + overflow marker."""
+
+    if not text:
+        return ""
+    lines = text.split("\n")
+    if len(lines) <= _TOOL_ERROR_LINE_LIMIT:
+        return text
+    kept = lines[:_TOOL_ERROR_LINE_LIMIT]
+    remaining = len(lines) - _TOOL_ERROR_LINE_LIMIT
+    return "\n".join(kept) + f"\n... +{remaining} more lines"
+
+
 def _classify_user_block(
     record: SdkMessageRecord,
     sequence: int,
@@ -401,24 +490,26 @@ def _classify_user_block(
         )
     if "tool_use_id" in block:
         body_raw = block.get("content")
-        if isinstance(body_raw, str):
-            body = _short(body_raw)
-            size = len(body_raw)
+        if body_raw is None:
+            raw_text = ""
+        elif isinstance(body_raw, str):
+            raw_text = body_raw
         else:
-            body = _short(body_raw) if body_raw is not None else ""
-            size = len(body)
+            # A non-string content payload (e.g. SDK content-block list)
+            # collapses through :func:`_short` so the classifier never
+            # raises on an odd shape; the formatter then folds it into
+            # the success / error body shape below.
+            raw_text = _short(body_raw)
         is_error = bool(block.get("is_error"))
-        header = "tool_result"
-        if is_error:
-            header = "tool_result(error)"
-        summary = f"{size}B" if not body else f"{size}B: {body}"
+        header = "tool_result(error)" if is_error else "tool_result"
+        body = _format_tool_result_body(raw_text, is_error=is_error)
         return TranscriptEntry(
             sequence=sequence,
             sub_index=sub_index,
             ts=record.ts,
             kind=EntryKind.TOOL_RESULT,
             header=header,
-            body=summary,
+            body=body,
             attempt_number=record.attempt_number,
             iteration_number=record.iteration_number,
         )

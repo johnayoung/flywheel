@@ -139,13 +139,13 @@ def test_session_screen_renders_all_message_classes() -> None:
                 _entry(
                     kind=EntryKind.TOOL_CALL,
                     header="tool(Edit)",
-                    body="file_path=README.md",
+                    body="README.md",
                     sequence=2,
                 ),
                 _entry(
                     kind=EntryKind.TOOL_RESULT,
                     header="tool_result",
-                    body="14B",
+                    body="ok",
                     sequence=3,
                 ),
                 _entry(
@@ -235,6 +235,76 @@ def test_render_entry_text_keeps_agent_text_inline_when_single_line() -> None:
     plain = rendered.plain
     assert plain == "agent  ack"
     assert "\n" not in plain
+
+
+def test_render_entry_text_tool_result_success_is_indented_one_line() -> None:
+    """FR-3 rendering: a successful TOOL_RESULT renders as a single
+    indented row -- two spaces in front of the header so the line
+    visually nests under the preceding tool call."""
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.TOOL_RESULT,
+        header="tool_result",
+        body="ok",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    plain = render_entry_text(entry).plain
+    assert plain == "  tool_result  ok"
+
+
+def test_render_entry_text_tool_result_error_breaks_lines_below_header() -> None:
+    """FR-3 rendering: a multi-line error body puts the header on its
+    own indented row and each detail line on its own row indented four
+    spaces deep."""
+
+    body = "first error\nsecond error\n... +20 more lines"
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.TOOL_RESULT,
+        header="tool_result(error)",
+        body=body,
+        attempt_number=1,
+        iteration_number=1,
+    )
+    rendered = render_entry_text(entry)
+    plain = rendered.plain
+    expected = (
+        "  tool_result(error)\n"
+        "    first error\n"
+        "    second error\n"
+        "    ... +20 more lines"
+    )
+    assert plain == expected
+    # Body is styled red (not dim) so a failure pops visually. Inspect
+    # the spans of the rendered Text to confirm no ``dim`` style sneaks
+    # in on the error body lines.
+    body_styles = [
+        str(span.style) for span in rendered.spans if "dim" in str(span.style)
+    ]
+    assert body_styles == []
+
+
+def test_render_entry_text_tool_result_error_single_line_inline() -> None:
+    """A short single-line error sits on the same row as the header."""
+
+    entry = TranscriptEntry(
+        sequence=1,
+        sub_index=0,
+        ts=_NOW,
+        kind=EntryKind.TOOL_RESULT,
+        header="tool_result(error)",
+        body="boom",
+        attempt_number=1,
+        iteration_number=1,
+    )
+    plain = render_entry_text(entry).plain
+    assert plain == "  tool_result(error)  boom"
 
 
 def test_render_entry_text_breaks_multi_line_agent_text_below_header() -> None:

@@ -1,0 +1,48 @@
+{
+  "id": "tui-dashboard",
+  "goal": "A new flywheel-tui workspace package (CLI entry point flywheel-tui, built on Textual, depending on flywheel-orchestrator) renders a keyboard-navigable realtime dashboard of in-flight runs polled ~1s, and instead prints one machine-readable JSON snapshot and exits 0 when --json is passed or stdout is not a TTY.",
+  "prerequisites": ["tui-live-rows-seam"],
+  "tags": ["tui", "observability"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00020-FEATURE-tui-operator-console.md -- FR-1, FR-2, FR-3 (except Enter drill-in), FR-7 dashboard linger, and the Error Handling table are this task's surface",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/__init__.py -- the public LiveRunRow/collect_live_rows/store-resolution seams from tui-live-rows-seam",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_status (:1220) computes the queued/done/failed counts the summary header must match",
+      "pyproject.toml -- workspace root: register the new member under [tool.uv.sources], the dev dependency group, and [tool.pytest.ini_options] testpaths"
+    ],
+    "references": [
+      "packages/flywheel-worktree/pyproject.toml -- mirror this downstream-package pyproject shape (uv_build backend, workspace dep, [project.scripts] entry)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py:1091 -- _cmd_live's poll-loop rendering is the non-interactive ancestor of this dashboard"
+    ],
+    "constraints": [
+      "Dashboard rows come from the public collect_live_rows seam; store path resolution is identical to flywheel-orchestrate (explicit --db, else policy [paths] db, else default). Do not duplicate the resolution logic.",
+      "One row per active run (RUNNING/VALIDATING/AWAITING_APPROVAL) showing task id, status, attempt/iteration, age, tokens, cost, last action; summary header with active-worker count, queued/done/failed counts, total tokens/cost, runtime.",
+      "Keyboard: up/down moves selection, q quits, ? toggles a help footer listing bindings; cover navigation with a scripted Textual Pilot test asserting the bindings work.",
+      "--json (or non-TTY stdout) emits parseable JSON with the same fields as the rendered rows, exit 0, no ANSI escape sequences.",
+      "No store at the resolved path: exit with a clear message naming the path and the init remedy; never launch the TUI.",
+      "Zero active runs: render header plus an empty-state line and keep polling. Store read raises: status-bar warning, last good frame stays, polling retries; persistent failure never crashes the app.",
+      "A run leaving the active set keeps its row dimmed for ~30s before dropping (FR-7 dashboard half).",
+      "The Textual dependency lives only in packages/flywheel-tui; nothing may depend on flywheel-tui, and flywheel core and the orchestrate live/status commands are untouched.",
+      "Register the package in the root pyproject.toml (uv sources, dev group, pytest testpaths) so uv sync and the root uv run pytest cover it.",
+      "Run mcp__ide__getDiagnostics on every .py file touched and fix all Pylance errors in the same turn.",
+      "Commit with a Conventional Commits feat: message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No session screen, transcript rendering, or steering -- Enter drill-in lands in tui-session-transcript.",
+      "No full all-tasks board (queued/blocked/done browsing) and no historical-run browser.",
+      "No push/notify freshness channel -- polling only, no new store infrastructure.",
+      "No changes to flywheel-orchestrate live/status output."
+    ],
+    "edge_cases": [
+      "Two TUI instances against one store: both are read-only pollers; no conflict.",
+      "Terminal resize degrades gracefully (Textual reflow); no emojis anywhere in the UI.",
+      "Counts in the summary header must match flywheel-orchestrate status against the same store."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-tui/tests", "name": "tui-tests" },
+    { "type": "command", "run": "grep -q 'packages/flywheel-tui/tests' pyproject.toml", "name": "testpaths-registered" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^feat'", "name": "commit-landed" }
+  ]
+}

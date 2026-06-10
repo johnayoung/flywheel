@@ -1,0 +1,43 @@
+{
+  "id": "cli-router",
+  "goal": "A new flywheel-cli workspace package (interim dist flywheel-cli, module flywheel_cli, console script fw only) routes init, worker [--once], status [--json], live [--watch], say, interrupt, approve, reject, archive, recover, recheck-blocked, and audit to their existing implementations, and bare fw (or --json/non-TTY) launches the existing flywheel-tui console or snapshot.",
+  "tags": ["cli", "unified-cli"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00021-FEATURE-unified-cli.md -- FR-4 and FR-7 are this task's surface; the Decisions Log fixes the interim naming",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_init/_cmd_status/_cmd_live/_cmd_archive/_cmd_recover/_cmd_recheck_blocked are the delegation targets",
+      "packages/flywheel/src/flywheel/workflow.py -- the say/interrupt/approve/reject/audit producer verbs to delegate to",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the daemon loop behind fw worker [--once]",
+      "pyproject.toml -- workspace root: register flywheel-cli under [tool.uv.sources], the dev group, and testpaths"
+    ],
+    "references": [
+      "packages/flywheel-tui/pyproject.toml -- mirror this downstream-package pyproject shape",
+      "packages/flywheel-tui/src/flywheel_tui/_cli.py -- the TTY-vs---json dispatch pattern bare fw must reuse (delegate to it; absorption happens in cli-shell-input)"
+    ],
+    "constraints": [
+      "Interim naming is deliberate: dir packages/flywheel-cli, dist flywheel-cli, console script fw ONLY -- core still owns the flywheel script until cli-cutover-rename flips both. Do not touch core's script.",
+      "Delegate, never reimplement: each subcommand calls the existing implementation (import and invoke; flywheel worker runs the flywheel-worktree daemon loop in-process, not via shell-out). Output and exit codes must match the originals.",
+      "Exposing run, next, or bare orchestrate as fw subcommands is forbidden -- they stay python -m plumbing per the spec's lean-surface decision.",
+      "Store-path resolution goes through the public load_effective_policy/resolve_db_path seams from spec 00020; do not duplicate resolution logic.",
+      "Package depends on flywheel-orchestrator, flywheel-worktree, and (interim, removed next task) flywheel-tui.",
+      "Existing flywheel-orchestrate/flywheel-worktree/flywheel-tui scripts keep working unchanged in this task.",
+      "Run mcp__ide__getDiagnostics on every .py file touched and fix all Pylance errors in the same turn.",
+      "Commit with a Conventional Commits feat: message before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No slash commands or input-bar work (cli-shell-input).",
+      "No worker liveness detection or supervision (cli-worker-supervision).",
+      "No renames or script deletions (cli-cutover-rename)."
+    ],
+    "edge_cases": [
+      "fw <verb> --help must work without a store present.",
+      "Subcommands needing a store follow the existing per-command behavior for a missing store in this task; the spec's unified no-store message lands with the cutover."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-cli/tests", "name": "cli-tests" },
+    { "type": "command", "run": "uv run fw --help >/dev/null && uv run fw worker --help >/dev/null && uv run fw status --help >/dev/null && uv run fw approve --help >/dev/null", "name": "help-wiring" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^feat'", "name": "commit-landed" }
+  ]
+}

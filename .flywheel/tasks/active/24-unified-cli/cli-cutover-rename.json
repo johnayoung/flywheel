@@ -1,0 +1,45 @@
+{
+  "id": "cli-cutover-rename",
+  "goal": "Core moves to packages/flywheel-core (dist flywheel-core, import flywheel unchanged) and the product moves from packages/flywheel-cli to packages/flywheel (dist flywheel, console scripts flywheel and fw), deleting the flywheel-orchestrate and flywheel-worktree console scripts and core's flywheel script so the workspace installs exactly two scripts.",
+  "prerequisites": ["cli-worker-supervision"],
+  "tags": ["cli", "refactor", "unified-cli"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00021-FEATURE-unified-cli.md -- FR-1, FR-6, FR-7, and the purity-test edge case are this task's surface",
+      "pyproject.toml -- workspace root: [tool.uv.sources], dev group, and testpaths all reference the old paths (shared-invariant dependents; update in the same commit)",
+      "packages/flywheel/pyproject.toml and packages/flywheel-cli/pyproject.toml -- the dist names, [project.scripts], and uv_build module configuration being flipped",
+      "CLAUDE.md -- the workspace-layout section and command examples name the old packages and binaries; update in the same commit",
+      "README.md -- ditto for any quickstart commands"
+    ],
+    "references": [
+      "git log 4bc3414 -- the .workflow-to-.flywheel wholesale cutover; same no-shims discipline",
+      ".flywheel/specs/00021-FEATURE-unified-cli.md Decisions Log -- dist and import names are independent: dist flywheel-core ships module flywheel via uv_build module-name config"
+    ],
+    "constraints": [
+      "import flywheel resolves to core everywhere, unchanged: no Python import-path edits in core, orchestrator, or worktree beyond what the dir moves force (which should be none); the purity tests pass unmodified.",
+      "Use git mv for both directory moves so history follows.",
+      "flywheel-orchestrator and flywheel-worktree keep their dists and python -m plumbing; only their [project.scripts] entries are deleted. Core keeps python -m flywheel.workflow.",
+      "fw and flywheel are two script entries on one implementation -- byte-identical behavior.",
+      "Subcommands and the console honor a non-default [paths] db in flywheel.toml after the rename (FR-7), and a missing store yields the unified message naming the resolved path and the flywheel init remedy.",
+      "Update every dangling reference to the old dist names, script names, and paths: root pyproject (sources, dev group, testpaths), root conftest if it names paths, CLAUDE.md, README.md, and any docs/ examples. Archived specs/tasks and audit files are historical records -- leave them.",
+      "uv sync must succeed from a clean checkout after the change; uv.lock is regenerated in the same commit.",
+      "Run mcp__ide__getDiagnostics on every .py file touched and fix all Pylance errors in the same turn.",
+      "Commit with a Conventional Commits message (refactor!: -- this is the breaking cutover) before emitting intent=verify."
+    ],
+    "non_goals": [
+      "No behavior changes to any command -- this task is renames, script flips, and reference updates only.",
+      "No deprecation shims or transitional aliases.",
+      "No PyPI publishing decisions (parked in the spec)."
+    ],
+    "edge_cases": [
+      "The running worker that executes this task imports the old layout from its own venv -- that is fine; the rename takes effect for processes started after the merge. Do not attempt to restart or signal the worker from inside the task.",
+      "grep for the dead script names (flywheel-orchestrate, flywheel-worktree as a command, flywheel-tui) must come up empty outside .flywheel/tasks/archive/, .flywheel/specs/, .flywheel/audits/, and git history."
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "tests" },
+    { "type": "command", "run": "test -d packages/flywheel-core && test ! -d packages/flywheel-cli && test -d packages/flywheel/src/flywheel_cli", "name": "layout" },
+    { "type": "command", "run": "uv run flywheel --help >/dev/null && uv run fw --help >/dev/null && ! uv run flywheel-orchestrate --help >/dev/null 2>&1 && ! uv run flywheel-tui --help >/dev/null 2>&1", "name": "scripts-flipped" },
+    { "type": "command", "run": "git log -1 --format=%s | grep -qE '^refactor'", "name": "commit-landed" }
+  ]
+}

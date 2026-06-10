@@ -1,0 +1,41 @@
+{
+  "id": "transcript-structure-styles",
+  "goal": "The session transcript gains a dim HH:MM:SS timestamp on the first line of each block, a blank line between blocks when the speaker group changes, and a re-tuned style map where errors are never double-dimmed and agent text is visually dominant.",
+  "prerequisites": ["transcript-humanize-lifecycle"],
+  "tags": ["tui", "session-transcript"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00022-FEATURE-readable-session-transcript.md",
+      "packages/flywheel/src/flywheel/_session.py",
+      "packages/flywheel/src/flywheel/_session_screen.py",
+      "packages/flywheel/tests/test_session_screen.py"
+    ],
+    "references": [
+      "Spec FR-5: timestamp comes from the record's ts field, first line of each block only, continuation lines bare",
+      "Spec FR-6: blank line when the block group changes (agent prose / tool activity / operator / lifecycle); none between a tool call and its own indented result line, and consecutive tool_use blocks count as one tool-activity group",
+      "Spec FR-7: no error-class kind may map to dim header plus dim body; humanized lifecycle lines stay dim; agent text uses the default non-dim body style"
+    ],
+    "constraints": [
+      "Grouping logic may compare against the previous rendered entry only; no cross-record buffering beyond that, so the ~250ms incremental poll appends stay correct at the boundary between fetches",
+      "The first block on screen gets no leading blank line",
+      "Scroll-follow behavior and the scroll-up pause indicator must keep working; packages/flywheel/tests/test_session_screen.py::test_session_screen_scroll_up_pauses_follow_and_indicator_shows must stay green",
+      "Tests pinning the old packed layout or style map must be updated in the same commit, including packages/flywheel/tests/test_session_screen.py::test_session_screen_renders_all_message_classes",
+      "Add test coverage for the FR-5/FR-6/FR-7 acceptance: an agent block followed by a tool call shows exactly two timestamps and one separating blank line, a tool call and its result are not separated, and the style map contains no double-dimmed error kind",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No iteration boundary markers or rules",
+      "No new keybindings, settings, or expand/collapse UI state",
+      "No changes to the dashboard screen or the flywheel_core.audit CLI"
+    ],
+    "edge_cases": [
+      "Incremental appends across poll boundaries: a new block arriving in a later fetch still gets its blank-line separator and timestamp relative to the last block of the previous fetch",
+      "Blocks rendering at the same wall-clock second still each get their own block-start timestamp"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel/tests/test_session.py packages/flywheel/tests/test_session_screen.py", "name": "session-tests" },
+    { "type": "command", "run": "uv run pytest packages/flywheel", "name": "package-suite" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

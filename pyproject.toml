@@ -18,6 +18,7 @@ testpaths = [
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
     "packages/flywheel-tui/tests",
+    "packages/flywheel-cli/tests",
 ]
 
 [tool.uv.workspace]
@@ -28,6 +29,7 @@ flywheel = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
 flywheel-tui = { workspace = true }
+flywheel-cli = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -35,6 +37,7 @@ dev = [
     "flywheel-orchestrator",
     "flywheel-worktree",
     "flywheel-tui",
+    "flywheel-cli",
     "pytest>=9.0.3",
     "testcontainers>=4.0",
 ]

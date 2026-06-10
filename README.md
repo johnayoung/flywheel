@@ -114,6 +114,18 @@ uv run python -m flywheel.workflow run task.json
 The command exits `0` when the lifecycle reaches `done` and non-zero
 otherwise. Lifecycle state is persisted to `.flywheel/flywheel.sqlite`.
 
+For operator workflows above a single task (initializing a project,
+driving a phase, observing live runs), use the unified product shell:
+
+```bash
+uv run flywheel init                # scaffold .flywheel/ + flywheel.toml
+uv run flywheel worker              # drive the active phase to quiescence
+uv run flywheel status              # snapshot every active task
+uv run flywheel                     # operator console (alias: fw)
+```
+
+`flywheel` and `fw` are byte-identical entries on one implementation.
+
 ## Documentation
 
 - [docs/vision.md](docs/vision.md) -- what flywheel is, and what it is not.

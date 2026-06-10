@@ -1,8 +1,10 @@
-"""Unified ``fw`` / ``flywheel`` command + console package.
+"""Unified ``flywheel`` / ``fw`` command + console package.
 
-This package owns the operator console (Textual dashboard + per-run
-session screen + persistent input bar) and the verb router that
-dispatches every other subcommand:
+This is the product shell: dist name ``flywheel``, import module
+``flywheel_cli``, console scripts ``flywheel`` and ``fw`` (one
+implementation, two byte-identical entries). It owns the operator
+console (Textual dashboard + per-run session screen + persistent input
+bar) and the verb router that dispatches every other subcommand:
 
 * ``init``, ``status``, ``live``, ``archive``, ``recover``,
   ``recheck-blocked`` -> :func:`flywheel_orchestrator._workflow.main`.
@@ -11,13 +13,13 @@ dispatches every other subcommand:
 * ``worker`` -> :func:`flywheel_worktree.worker.main` (the
   git-worktree daemon loop, in-process -- no shell-out).
 * ``audit`` -> :func:`flywheel.audit._cli.main`.
-* bare ``fw`` (TTY) or ``fw --json`` / non-TTY stdout ->
+* bare ``flywheel`` / ``fw`` (TTY) or ``--json`` / non-TTY stdout ->
   :func:`flywheel_cli._tui.main` (Textual console or JSON snapshot).
 
 The console code (``_dashboard.py``, ``_session*.py``, ``_snapshot.py``,
-``_slash.py``, ``_tui.py``) was absorbed from the deleted ``flywheel-tui``
-package per spec 00021; the import paths now live under
-:mod:`flywheel_cli` and there is no transitional shim.
+``_slash.py``, ``_tui.py``) was absorbed from the prior standalone TUI
+package per spec 00021; the import paths now live under :mod:`flywheel_cli`
+and there is no transitional shim.
 """
 
 from flywheel_cli._cli import main

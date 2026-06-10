@@ -5,15 +5,15 @@ requires-python = ">=3.13"
 [manifest]
 members = [
     "flywheel",
-    "flywheel-cli",
+    "flywheel-core",
     "flywheel-orchestrator",
     "flywheel-worktree",
 ]
 
 [manifest.dependency-groups]
 dev = [
-    { name = "flywheel", extras = ["postgres"], editable = "packages/flywheel" },
-    { name = "flywheel-cli", editable = "packages/flywheel-cli" },
+    { name = "flywheel", editable = "packages/flywheel" },
+    { name = "flywheel-core", extras = ["postgres"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
     { name = "pytest", specifier = ">=9.0.3" },
@@ -272,6 +272,25 @@ name = "flywheel"
 version = "0.1.0"
 source = { editable = "packages/flywheel" }
 dependencies = [
+    { name = "flywheel-core" },
+    { name = "flywheel-orchestrator" },
+    { name = "flywheel-worktree" },
+    { name = "textual" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "flywheel-core", editable = "packages/flywheel-core" },
+    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
+    { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
+    { name = "textual", specifier = ">=0.85" },
+]
+
+[[package]]
+name = "flywheel-core"
+version = "0.1.0"
+source = { editable = "packages/flywheel-core" }
+dependencies = [
     { name = "claude-agent-sdk" },
 ]
 
@@ -290,34 +309,15 @@ requires-dist = [
 provides-extras = ["postgres"]
 
 [[package]]
-name = "flywheel-cli"
-version = "0.1.0"
-source = { editable = "packages/flywheel-cli" }
-dependencies = [
-    { name = "flywheel" },
-    { name = "flywheel-orchestrator" },
-    { name = "flywheel-worktree" },
-    { name = "textual" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "flywheel", editable = "packages/flywheel" },
-    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
-    { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
-    { name = "textual", specifier = ">=0.85" },
-]
-
-[[package]]
 name = "flywheel-orchestrator"
 version = "0.1.0"
 source = { editable = "packages/flywheel-orchestrator" }
 dependencies = [
-    { name = "flywheel" },
+    { name = "flywheel-core" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "flywheel", editable = "packages/flywheel" }]
+requires-dist = [{ name = "flywheel-core", editable = "packages/flywheel-core" }]
 
 [[package]]
 name = "flywheel-worktree"

@@ -1,9 +1,11 @@
-"""Tests for ``flywheel-orchestrate init`` and policy-carried paths.
+"""Tests for ``flywheel init`` (delegated to the orchestrator module) and
+policy-carried paths.
 
 init scaffolds a self-contained ``.flywheel/`` layout plus a repo-root
 ``flywheel.toml`` whose ``[paths]`` table keeps every default off the
-legacy ``.workflow/`` tree. The CLI tests run ``main()`` directly with a
-chdir'd tmp cwd -- the same resolution path the console script takes.
+legacy ``.workflow/`` tree. The CLI tests run :func:`main` directly with a
+chdir'd tmp cwd -- the same resolution path the unified product shell takes
+when it routes ``flywheel init``.
 """
 
 from __future__ import annotations

@@ -3,41 +3,47 @@
 # The hard line between flywheel-core and what is built on top is drawn here,
 # in the package tree:
 #
-#   packages/flywheel               core: the lifecycle of a SINGLE task.
-#   packages/flywheel-orchestrator  built on top: drives MANY tasks (selection,
-#                                   DAG, claims, multi-worker). depends on flywheel.
-#   packages/flywheel-worktree      built on top: git-worktree submit strategy +
-#                                   reference worker. depends on flywheel-orchestrator.
-#   packages/flywheel-cli           top of stack: the `fw` shell -- verb router
-#                                   plus the absorbed TUI (dashboard + session +
-#                                   persistent input bar). depends on the three above.
+#   packages/flywheel-core           core: the lifecycle of a SINGLE task.
+#                                    dist ``flywheel-core``, module ``flywheel``.
+#   packages/flywheel-orchestrator   built on top: drives MANY tasks (selection,
+#                                    DAG, claims, multi-worker). depends on
+#                                    flywheel-core.
+#   packages/flywheel-worktree       built on top: git-worktree submit strategy +
+#                                    reference worker. depends on
+#                                    flywheel-orchestrator.
+#   packages/flywheel                top of stack: the `flywheel` / `fw` shell --
+#                                    verb router plus the operator console
+#                                    (dashboard + session + persistent input
+#                                    bar). dist ``flywheel``, module
+#                                    ``flywheel_cli``. depends on the three
+#                                    above.
 #
 # Dependency arrows point one way only; core imports nothing downstream.
 
 [tool.pytest.ini_options]
 # Each package keeps its own tests/; shared fixtures live in the root conftest.
 testpaths = [
-    "packages/flywheel/tests",
+    "packages/flywheel-core/tests",
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
-    "packages/flywheel-cli/tests",
+    "packages/flywheel/tests",
 ]
 
 [tool.uv.workspace]
 members = ["packages/*"]
 
 [tool.uv.sources]
-flywheel = { workspace = true }
+flywheel-core = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
-flywheel-cli = { workspace = true }
+flywheel = { workspace = true }
 
 [dependency-groups]
 dev = [
-    "flywheel[postgres]",
+    "flywheel-core[postgres]",
     "flywheel-orchestrator",
     "flywheel-worktree",
-    "flywheel-cli",
+    "flywheel",
     "pytest>=9.0.3",
     "testcontainers>=4.0",
 ]

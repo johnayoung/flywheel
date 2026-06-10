@@ -144,9 +144,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-worker",
         action="store_true",
         help=(
-            "Skip spawning a supervised flywheel-worktree worker on "
-            "console launch. The status bar shows worker: none until "
-            "you type '/worker start' or run a worker manually."
+            "Skip spawning a supervised worker on console launch. The "
+            "status bar shows worker: none until you type '/worker start' "
+            "or run 'flywheel worker' in another terminal."
         ),
     )
     return parser

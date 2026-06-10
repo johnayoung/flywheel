@@ -1,11 +1,13 @@
 # flywheel-orchestrator
 
-The multi-task layer built on [`flywheel`](../flywheel). Flywheel runs **one**
-task; this drives **many**: it decides which task runs next over a prerequisite
-DAG, coordinates several workers over a shared store (claims + leases), and
-drives each chosen task through `flywheel.run_task`.
+The multi-task layer built on [`flywheel-core`](../flywheel-core). Flywheel runs
+**one** task; this drives **many**: it decides which task runs next over a
+prerequisite DAG, coordinates several workers over a shared store (claims +
+leases), and drives each chosen task through `flywheel.run_task`.
 
-Depends on `flywheel`; `flywheel` never depends on this.
+Depends on `flywheel-core`; `flywheel-core` never depends on this. Library
+only; verbs are exposed through the unified product shell (`flywheel`
+subcommands route here).
 
 ## Install
 
@@ -16,9 +18,9 @@ uv add flywheel-orchestrator
 ## Quickstart
 
 ```bash
-flywheel-orchestrate init               # scaffold .flywheel/ + flywheel.toml
+flywheel init                   # scaffold .flywheel/ + flywheel.toml
 # drop one JSON file per task into .flywheel/tasks/active/<phase>/
-flywheel-orchestrate orchestrate        # drive everything eligible to done
+flywheel worker                 # drive every eligible task to quiescence
 ```
 
 `init` is idempotent and never overwrites existing files. The generated
@@ -27,14 +29,20 @@ flywheel-orchestrate orchestrate        # drive everything eligible to done
 
 ## CLI
 
+The product shell ships verbs that delegate here in-process; module-level
+plumbing remains available as `python -m flywheel_orchestrator._workflow`:
+
 ```bash
-flywheel-orchestrate init               # scaffold .flywheel/ + work policy
-flywheel-orchestrate next               # path to the next eligible task
-flywheel-orchestrate orchestrate        # drain every eligible task to quiescence
-flywheel-orchestrate status             # state of every active task
-flywheel-orchestrate live               # one line per in-flight run
-flywheel-orchestrate recover            # finalize stranded lifecycles
+flywheel init                   # scaffold .flywheel/ + work policy
+flywheel status                 # state of every active task
+flywheel live                   # one line per in-flight run
+flywheel archive                # move fully-DONE phases to archive/
+flywheel recover                # finalize stranded lifecycles
+flywheel recheck-blocked        # re-evaluate blocked lifecycles' requires
 ```
+
+`next` and bare `orchestrate` remain `python -m flywheel_orchestrator._workflow`
+plumbing; the blessed headless drain is `flywheel worker [--once]`.
 
 ## Work sources
 
@@ -107,8 +115,8 @@ await orchestrate(
 )
 ```
 
-`flywheel-worktree` is a worked example of that seam. Bring your own for a
-different VCS/sandbox/merge strategy.
+The `flywheel-worktree` package is a worked example of that seam. Bring your
+own for a different VCS/sandbox/merge strategy.
 
 ## Persistence
 

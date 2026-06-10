@@ -4,8 +4,10 @@ Flywheel core owns the lifecycle of a single task. This package is the layer
 above it: deciding *which* task runs next (selection over a prerequisite DAG),
 coordinating *several workers* over a shared store (claims + leases), managing
 the on-disk task queue / phases, and driving each chosen task through
-``flywheel.run_task``. It depends on ``flywheel`` and never the other way
-around. The ``flywheel-orchestrate`` console command is its CLI.
+``flywheel.run_task``. It depends on ``flywheel-core`` and never the other
+way around. Library only: verbs are surfaced through the unified product
+shell (``flywheel``), and module-level plumbing remains runnable as
+``python -m flywheel_orchestrator._workflow``.
 """
 
 from typing import TYPE_CHECKING

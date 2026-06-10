@@ -1,7 +1,13 @@
 """Multi-task scheduling, phase/queue management, live dashboard, and the
-``flywheel-orchestrate`` CLI — the consumer layer above the single-task loop.
+orchestrator's argparse entry point — the consumer layer above the
+single-task loop.
 
 Extracted verbatim from ``flywheel.workflow`` in the core/consumer split.
+Verbs are now exposed through the unified product shell
+(``flywheel status`` / ``flywheel live`` / ``flywheel init`` / ...),
+which calls :func:`main` here in-process. Module-level plumbing remains
+runnable as ``python -m flywheel_orchestrator._workflow``.
+
 Shared single-task helpers are imported from ``flywheel.workflow`` (the
 dependency arrow points orchestrator -> core, never the reverse).
 """
@@ -600,7 +606,7 @@ def _parse_optout_frontmatter(text: str, *, source: str) -> dict[str, str]:
 def load_effective_policy(
     policy_path: Path | str | None = None,
 ) -> WorkPolicy | None:
-    """Load the policy ``flywheel-orchestrate`` would honor for an invocation.
+    """Load the policy the orchestrator verbs honor for an invocation.
 
     Mirrors the orchestrate CLI's precedence so a downstream package can
     pin to the same resolution without reaching for private helpers:
@@ -1538,8 +1544,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         f"{INIT_ROOT}/tasks/active/<phase>/ (see docs/task-schema.md; "
         f"'goal' and 'graders' are the only required fields)."
     )
-    print("  2. Run: flywheel-orchestrate orchestrate")
-    print("  3. Watch: flywheel-orchestrate status / live")
+    print("  2. Run: flywheel worker")
+    print("  3. Watch: flywheel status / live")
     return 0
 
 def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
@@ -1564,7 +1570,7 @@ def _add_common_policy(parser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="flywheel-orchestrate",
+        prog="flywheel",
         description=(
             "Schedule and drive many flywheel tasks laid out under "
             ".flywheel/tasks/active/<phase>/."

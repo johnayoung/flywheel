@@ -3,7 +3,7 @@
 Drives :class:`WorkerSupervisor` with a trivial child process (a
 Python one-liner that sleeps) so the supervisor's ownership /
 quit-path / DEAD-after-exit behaviour is exercised end-to-end
-without launching the real ``flywheel-worktree`` daemon (the spec
+without launching the real git-worktree worker daemon (the spec
 explicitly approves this substitution for ownership / quit-path
 tests). Liveness detection is covered against a real SQLite store
 that mirrors what ``SqliteClaimStore`` would persist.

@@ -966,8 +966,8 @@ def _format_worker_status(status: WorkerStatus) -> str:
 
 def _format_summary(summary: SummaryData) -> str:
     """Render the summary header — single line so it stays readable on
-    narrow terminals; counts roll up to match
-    ``flywheel-orchestrate status`` aggregated by state."""
+    narrow terminals; counts roll up to match ``flywheel status``
+    aggregated by state."""
     counts = summary.task_counts
     queued = counts.get("fresh", 0)
     done = counts.get("done", 0)

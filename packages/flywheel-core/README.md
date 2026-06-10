@@ -1,31 +1,38 @@
-# flywheel
+# flywheel-core
 
 Production-grade orchestration loop for AI coding agents. Owns the execution
 lifecycle of a **single task**: invoke the agent, validate its iteration
 envelopes, verify with graders, record attempts, retry. It knows nothing about
 who calls it.
 
+The dist is `flywheel-core`; the import module is unchanged at `flywheel` so
+every existing `import flywheel` and `python -m flywheel.workflow` site keeps
+working.
+
 Scheduling across many tasks (a dependency DAG, claims, multi-worker, git
 submit) is **not** here — that's the consumer layer (`flywheel-orchestrator`,
-`flywheel-worktree`).
+`flywheel-worktree`); operator verbs are owned by the top-of-stack `flywheel`
+product package.
 
 ## Install
 
 ```bash
-uv add flywheel            # core
-uv add 'flywheel[postgres]'  # + Postgres store backend
+uv add flywheel-core                # core
+uv add 'flywheel-core[postgres]'    # + Postgres store backend
 ```
 
 ## Run one task
 
 ```bash
-flywheel run "Add exponential backoff to the HTTP client." \
+uv run python -m flywheel.workflow run "Add exponential backoff to the HTTP client." \
     --check "uv run pytest tests/http"
-flywheel run path/to/task.json
+uv run python -m flywheel.workflow run path/to/task.json
 ```
 
-`flywheel run` streams events to stdout and exits 0 only on `done`. Other
-subcommands: `is-done`, `interrupt`, `steer`, `set-model`, `approve`, `reject`.
+`flywheel.workflow run` streams events to stdout and exits 0 only on `done`.
+Other subcommands: `is-done`, `interrupt`, `steer`, `set-model`, `approve`,
+`reject`. The product shell (`flywheel` / `fw`) re-exposes the operator-facing
+verbs (`say`, `interrupt`, `approve`, `reject`) on top of these primitives.
 
 ## Library
 

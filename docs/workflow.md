@@ -8,7 +8,7 @@ How flywheel develops itself. Every feature since the Postgres store has gone th
 | --------- | -------------------------- | --------------------------- | ---------------------------------------------------------------- |
 | Define    | `/define`                  | vague feature idea          | spec: `.flywheel/specs/NNNNN-FEATURE-<name>.md`                  |
 | Decompose | `/task`                    | spec reference or free text | task JSONs: `.flywheel/tasks/active/NN-<phase>/<id>.json`        |
-| Execute   | `flywheel-worktree` daemon | active phase dirs           | commits on main, lifecycles in the store, archived phase         |
+| Execute   | `flywheel worker` daemon   | active phase dirs           | commits on main, lifecycles in the store, archived phase         |
 | Audit     | `/audit-phase`             | store + logs for a phase    | findings: `.flywheel/audits/<phase>.md`                          |
 | Propose   | `/propose-improvements`    | one or more audits          | ranked proposals, each handed to `/define`, `/task`, or "accept" |
 
@@ -44,7 +44,7 @@ Phases are plain directories: the `NN-` prefix controls walk order, there is no 
 
 ## The runtime loop
 
-The daemon is `flywheel-worktree` (`packages/flywheel-worktree/src/flywheel_worktree/worker.py`). Each cycle:
+The daemon is invoked as `flywheel worker` (the product shell delegates in-process to `packages/flywheel-worktree/src/flywheel_worktree/worker.py`). Each cycle:
 
 1. Commit any untracked task JSONs under `tasks/active/`.
 2. Record a `.loop-base` SHA for any phase that lacks one.
@@ -52,7 +52,7 @@ The daemon is `flywheel-worktree` (`packages/flywheel-worktree/src/flywheel_work
 4. Write per-run logs to `logs/worker/`.
 5. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below.
 
-Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` and `DEFAULT_LOG_DIR = logs/worker` (`flywheel_orchestrator/_workflow.py:50`), `DEFAULT_DB_PATH = .flywheel/flywheel.sqlite` (`flywheel/workflow.py:94`). All are overridable via CLI flags.
+Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` and `DEFAULT_LOG_DIR = logs/worker` (`flywheel_orchestrator/_workflow.py`), `DEFAULT_DB_PATH = .flywheel/flywheel.sqlite` (`flywheel/workflow.py`). All are overridable via CLI flags.
 
 ### The in-loop-verification gate
 
@@ -95,9 +95,9 @@ type = "command"
 run = "uv run pytest"
 ```
 
-`flywheel-orchestrate next|status|orchestrate|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults.
+`flywheel status|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults. The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `flywheel worker [--once]` to drive a phase.
 
-`flywheel-orchestrate init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
+`flywheel init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
 
 ## Code vs. convention
 
@@ -108,7 +108,7 @@ What would need promotion for another codebase to use this workflow:
 | Task selection, claims/leases, `orchestrate`                        | `flywheel-orchestrator`                               | shipped code    |
 | `WorkSource` seam, directory + GitHub adapters, `flywheel.toml`     | `flywheel-orchestrator` (`_sources`, `_github`, `_policy`) | shipped code    |
 | Archive gate, loop-path signals, `.loop-base`, opt-out parsing      | `flywheel-orchestrator` + `flywheel.loop_path_marker` | shipped code    |
-| Worktree-per-task submit strategy, daemon                           | `flywheel-worktree`                                   | shipped code    |
+| Worktree-per-task submit strategy, daemon                           | `flywheel-worktree` package (library)                 | shipped code    |
 | Default `.flywheel/` paths                                          | CLI defaults in all three packages                    | shipped code    |
 | `/define`, `/task`, `/audit-phase`, `/propose-improvements` prompts | `.claude/commands/`                                   | repo convention |
 | Spec template and `NNNNN-FEATURE-` numbering                        | prose inside `define.md`                              | repo convention |

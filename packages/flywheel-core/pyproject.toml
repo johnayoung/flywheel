@@ -1,0 +1,29 @@
+[project]
+name = "flywheel-core"
+version = "0.1.0"
+description = "Production-grade orchestration loop for AI coding agents — owns the lifecycle of a single task."
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name = "John Young", email = "john.anto.young@gmail.com" }
+]
+dependencies = [
+    "claude-agent-sdk>=0.2.83",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.2",
+    "psycopg_pool>=3.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"
+
+# Dist name is ``flywheel-core`` but the import module stays ``flywheel`` so
+# every existing ``import flywheel`` site (and the purity tests) keep working
+# unchanged. uv_build derives the module name from the dist by default, so
+# pin it explicitly here.
+[tool.uv.build-backend]
+module-name = "flywheel"

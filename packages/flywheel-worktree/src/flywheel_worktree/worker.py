@@ -2,10 +2,11 @@
 """Git-worktree worker: the reference consumer that drives flywheel tasks.
 
 The ``flywheel-worktree`` package — one worked example of building on top of
-``flywheel-orchestrator``, installed as the ``flywheel-worktree`` console
-command. It is the strategy layer of ``docs/strategy.md``: the code between
-"agent finished" and "result merged". It owns the two concerns flywheel
-deliberately does not:
+``flywheel-orchestrator``. Library only: the daemon is launched through the
+unified product shell as ``flywheel worker``, which calls :func:`main` in
+this module in-process. It is the strategy layer of ``docs/strategy.md``:
+the code between "agent finished" and "result merged". It owns the two
+concerns flywheel deliberately does not:
 
 * **Git submit** — each task runs in its own worktree on branch
   ``flywheel/<phase>/<task-id>``; on ``done`` the branch is FF-merged into the
@@ -26,7 +27,7 @@ A graceful SIGTERM/SIGINT finalizes the in-flight lifecycle to ``interrupted``
 (inside flywheel's ``run_task_object``) and stops the loop; SIGKILL/OOM/reboot
 are caught by orchestrate's startup recovery sweep on the next run.
 
-    flywheel-worktree [--once] [--tasks-dir DIR] [--db PATH] ...
+    flywheel worker [--once] [--tasks-dir DIR] [--db PATH] ...
 """
 
 from __future__ import annotations
@@ -835,7 +836,7 @@ def _phase_base(repo_root: Path) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="flywheel-worktree",
+        prog="flywheel worker",
         description=(
             "Git-worktree worker: drive flywheel tasks under "
             ".flywheel/tasks/active/, each in its own worktree, FF-merging on "

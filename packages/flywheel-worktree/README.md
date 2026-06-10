@@ -5,7 +5,9 @@ the git-worktree submit strategy plus a daemon poll loop. One worked example of
 "here's what you can build on flywheel" — copy it, or swap the strategy for
 your own.
 
-Depends on `flywheel-orchestrator`.
+Depends on `flywheel-orchestrator`. Library only; the daemon is launched
+through the product shell as `flywheel worker` (which delegates in-process
+to :func:`flywheel_worktree.worker.main`).
 
 ## What it does
 
@@ -21,9 +23,9 @@ Depends on `flywheel-orchestrator`.
 ## Install / run
 
 ```bash
-uv add flywheel-worktree
-flywheel-worktree --once        # one drain cycle
-flywheel-worktree               # daemon loop
+uv add flywheel
+flywheel worker --once          # one drain cycle
+flywheel worker                 # daemon loop
 ```
 
 Run several against one store for parallelism — leases keep workers off the same

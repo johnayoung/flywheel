@@ -1,11 +1,12 @@
-"""``fw`` command router.
+"""``flywheel`` / ``fw`` command router.
 
-Bare ``fw`` opens the Textual console; ``fw --json`` or a non-TTY stdout
-prints one JSON snapshot and exits (delegated to
+Bare ``flywheel`` (or ``fw``) opens the Textual console; ``--json`` or a
+non-TTY stdout prints one JSON snapshot and exits (delegated to
 :func:`flywheel_cli._tui.main`, which already implements that fork).
 Every other verb forwards its remaining argv to the pre-existing
 subcommand implementation so output and exit codes match the
-pre-router originals byte-for-byte.
+pre-router originals byte-for-byte. ``flywheel`` and ``fw`` are byte-
+identical entries on this one implementation.
 
 The verb map is fixed by spec 00021's FR-4:
 
@@ -13,7 +14,8 @@ The verb map is fixed by spec 00021's FR-4:
   ``recover``, ``recheck-blocked``
 * core (single-task producer verbs): ``interrupt``, ``approve``,
   ``reject``, ``say`` (surface name) -> ``steer`` (core verb)
-* worker: ``worker [--once]`` -> the ``flywheel-worktree`` daemon loop
+* worker: ``worker [--once]`` -> the git-worktree daemon loop in
+  :mod:`flywheel_worktree.worker`
 * audit: ``audit RUN_ID`` -> ``python -m flywheel.audit``
 
 ``run``, ``next``, and bare ``orchestrate`` are intentionally NOT
@@ -56,9 +58,11 @@ _WORKER_VERB = "worker"
 _AUDIT_VERB = "audit"
 
 _USAGE = """\
-usage: fw [--json] [--help] <verb> [args...]
+usage: flywheel [--json] [--help] <verb> [args...]
+       fw [--json] [--help] <verb> [args...]
 
-Bare 'fw' opens the operator console in a TTY; 'fw --json' (or any
+'flywheel' and 'fw' are byte-identical entries on one implementation.
+Bare invocation opens the operator console in a TTY; '--json' (or any
 invocation whose stdout is not a TTY) prints one JSON snapshot and
 exits 0.
 
@@ -77,12 +81,14 @@ Verbs:
   audit RUN_ID     stream the totally-ordered audit records for a run
 
 Each verb forwards its own --help to the underlying implementation,
-so 'fw <verb> --help' lists that verb's specific flags.
+so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
+that verb's specific flags.
 """
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Route ``fw <verb> ...`` to the pre-existing implementation.
+    """Route ``flywheel <verb> ...`` (or ``fw <verb> ...``) to the
+    pre-existing implementation.
 
     Returns the delegated command's exit code unchanged. Unknown verbs
     exit 2 (argparse convention) with a stderr line pointing at
@@ -114,11 +120,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if verb in _CORE_VERBS:
         return _core_main([verb, *rest])
     if verb == _SAY_VERB:
-        # Surface name rename: 'fw say' is core's 'flywheel steer'.
+        # Surface name rename: the shell's 'say' is core's 'steer' verb.
         return _core_main([_CORE_STEER_VERB, *rest])
     if verb == _WORKER_VERB:
-        # In-process delegation to the flywheel-worktree daemon loop
-        # (spec constraint: no shell-out).
+        # In-process delegation to the git-worktree daemon loop in
+        # :mod:`flywheel_worktree.worker` (spec constraint: no shell-out).
         return _worker_main(rest)
     if verb == _AUDIT_VERB:
         return _audit_main(rest)

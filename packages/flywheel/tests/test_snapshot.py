@@ -99,7 +99,7 @@ def test_build_snapshot_includes_running_rows(tmp_path: Path) -> None:
 
 
 def test_build_snapshot_task_counts_match_status_states(tmp_path: Path) -> None:
-    """Summary counts mirror what flywheel-orchestrate status would emit
+    """Summary counts mirror what ``flywheel status`` would emit
     aggregated by ``TaskState`` for the same store + work source."""
     db = tmp_path / "db.sqlite"
     tasks = tmp_path / "tasks"

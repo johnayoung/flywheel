@@ -1,25 +1,29 @@
 [project]
 name = "flywheel"
 version = "0.1.0"
-description = "Production-grade orchestration loop for AI coding agents — owns the lifecycle of a single task."
-readme = "README.md"
+description = "Unified `flywheel` / `fw` command router and operator console: dashboard + session screen + persistent input bar; delegates verbs to the core single-task, orchestrator, and worker implementations."
 requires-python = ">=3.13"
 authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }
 ]
 dependencies = [
-    "claude-agent-sdk>=0.2.83",
+    "flywheel-core",
+    "flywheel-orchestrator",
+    "flywheel-worktree",
+    "textual>=0.85",
 ]
 
 [project.scripts]
-flywheel = "flywheel.workflow:main"
-
-[project.optional-dependencies]
-postgres = [
-    "psycopg[binary]>=3.2",
-    "psycopg_pool>=3.2",
-]
+flywheel = "flywheel_cli._cli:main"
+fw = "flywheel_cli._cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.14,<0.9.0"]
 build-backend = "uv_build"
+
+# Dist name is ``flywheel`` (the product) but the import module is
+# ``flywheel_cli`` so it never collides with the core ``flywheel`` module
+# shipped by ``flywheel-core``. uv_build would otherwise derive the module
+# name from the dist; pin it explicitly.
+[tool.uv.build-backend]
+module-name = "flywheel_cli"

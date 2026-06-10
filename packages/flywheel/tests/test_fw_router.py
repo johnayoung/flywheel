@@ -94,8 +94,8 @@ def test_fw_bare_emits_snapshot_when_stdout_not_tty(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bare ``fw`` with a non-TTY stdout prints the same JSON snapshot
-    the existing ``flywheel-tui`` already produces (FR-1)."""
+    """Bare ``fw`` with a non-TTY stdout prints the JSON snapshot the
+    operator console produces under ``--json`` (FR-1)."""
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
@@ -125,7 +125,8 @@ def test_fw_json_flag_emits_snapshot(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["rows"][0]["task_id"] == "beta"
-    # No ANSI escapes in JSON mode (mirrors the flywheel-tui contract).
+    # No ANSI escapes in JSON mode (FR-1: snapshot is parseable, no
+    # terminal control bytes leak through).
     assert "\x1b" not in json.dumps(payload)
 
 
@@ -332,7 +333,7 @@ def test_fw_worker_help_exits_zero(
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     # Worker's own description mentions the git-worktree role.
-    assert "flywheel-worktree" in out or "worktree" in out
+    assert "worktree" in out
 
 
 def test_fw_status_help_exits_zero(

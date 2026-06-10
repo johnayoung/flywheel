@@ -10,7 +10,8 @@ Two layers:
   commits in the sandbox, asserting the task reaches DONE and its branch
   FF-merges into the base.
 
-The worker now ships as the ``flywheel-worktree`` package; tests import it
+The worker ships in the ``flywheel-worktree`` package (library only after the
+unified-CLI cutover: launched via ``flywheel worker``); tests import it
 directly as ``flywheel_worktree.worker``.
 """
 

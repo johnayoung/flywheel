@@ -1,31 +1,33 @@
 """Single-task CLI — run and steer one flywheel task against a real agent.
 
-This is the ``flywheel`` console command: it owns no execution logic of its
+This is the core single-task entry point: it owns no execution logic of its
 own — running a task delegates to :func:`flywheel.harness.run_task` with the
 production Claude Code invoker, and steering enqueues control commands. It
 covers exactly one task at a time. Multi-task scheduling (selection over a
-prerequisite DAG, phases, the live dashboard, stranded recovery) is the
-``flywheel-orchestrate`` CLI in the ``flywheel-orchestrator`` package, which
-is built on top of this loop.
+prerequisite DAG, phases, the live dashboard, stranded recovery) lives in
+the ``flywheel-orchestrator`` package, which is built on top of this loop.
+
+Core no longer ships a ``flywheel`` console script (that name belongs to the
+product shell, which forwards operator verbs back here in-process). Invoke
+the core verbs as ``python -m flywheel.workflow`` -- the surface below is
+unchanged.
 
 Subcommands::
 
-    flywheel run GOAL_OR_FILE [--check CMD] [--rubric A] [--db PATH]
-                              [--sandbox DIR] [--model MODEL]
-                              [--max-retries N] [--max-turns N]
-                              [--json | --quiet]
-    flywheel is-done TASK_FILE [--db PATH]
-    flywheel interrupt RUN_ID [--db PATH]
-    flywheel steer RUN_ID MESSAGE [--db PATH]
-    flywheel set-model RUN_ID MODEL [--db PATH]
-    flywheel approve RUN_ID [--db PATH]
-    flywheel reject RUN_ID [--feedback TEXT] [--db PATH]
+    python -m flywheel.workflow run GOAL_OR_FILE [--check CMD] [--rubric A]
+        [--db PATH] [--sandbox DIR] [--model MODEL]
+        [--max-retries N] [--max-turns N] [--json | --quiet]
+    python -m flywheel.workflow is-done TASK_FILE [--db PATH]
+    python -m flywheel.workflow interrupt RUN_ID [--db PATH]
+    python -m flywheel.workflow steer RUN_ID MESSAGE [--db PATH]
+    python -m flywheel.workflow set-model RUN_ID MODEL [--db PATH]
+    python -m flywheel.workflow approve RUN_ID [--db PATH]
+    python -m flywheel.workflow reject RUN_ID [--feedback TEXT] [--db PATH]
 
 ``run`` accepts either an inline goal string or a task-file path; an inline
 goal with no ``--check``/``--rubric`` is an unverified run (DONE reflects the
-agent's own claim). ``flywheel run "<goal>"`` is the zero-config front door.
-Events stream to stdout as they fire (readable by default, NDJSON with
-``--json``).
+agent's own claim). Events stream to stdout as they fire (readable by
+default, NDJSON with ``--json``).
 """
 
 from __future__ import annotations
@@ -1141,10 +1143,11 @@ def _add_common_db(parser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="flywheel",
+        prog="python -m flywheel.workflow",
         description=(
             "Run and steer a single flywheel task. Multi-task scheduling "
-            "lives in the flywheel-orchestrate CLI."
+            "lives in the flywheel-orchestrator package, exposed via the "
+            "flywheel/fw product shell."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)

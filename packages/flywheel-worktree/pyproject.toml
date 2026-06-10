@@ -1,7 +1,7 @@
 [project]
 name = "flywheel-worktree"
 version = "0.1.0"
-description = "Git-worktree submit strategy and reference worker for flywheel-orchestrator."
+description = "Git-worktree submit strategy and reference worker library for flywheel-orchestrator."
 readme = "README.md"
 requires-python = ">=3.13"
 authors = [
@@ -11,8 +11,10 @@ dependencies = [
     "flywheel-orchestrator",
 ]
 
-[project.scripts]
-flywheel-worktree = "flywheel_worktree.worker:main"
+# Console script removed in the unified-CLI cutover: the worker is launched
+# through ``flywheel worker [--once]`` (the product shell delegates to
+# :func:`flywheel_worktree.worker.main` in-process) and remains runnable as
+# ``python -m flywheel_worktree.worker`` plumbing.
 
 [build-system]
 requires = ["uv_build>=0.8.14,<0.9.0"]

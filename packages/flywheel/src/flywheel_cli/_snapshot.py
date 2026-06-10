@@ -5,8 +5,8 @@ The Textual app and the ``--json`` snapshot mode render the exact same
 parallel: one row per active run (RUNNING / VALIDATING /
 AWAITING_APPROVAL) sourced from the public
 :func:`flywheel_orchestrator.collect_live_rows` seam, plus a summary
-header whose task-state counts mirror ``flywheel-orchestrate status``
-against the same store.
+header whose task-state counts mirror ``flywheel status`` against the
+same store.
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ class SummaryData:
 
     ``task_counts`` is keyed by :class:`flywheel_orchestrator.TaskState`'s
     ``value`` (``fresh``/``in_progress``/``retryable``/``interrupted``/
-    ``awaiting_approval``/``done``) and matches what
-    ``flywheel-orchestrate status`` would emit against the same store
-    and work source. Missing keys mean zero.
+    ``awaiting_approval``/``done``) and matches what ``flywheel status``
+    would emit against the same store and work source. Missing keys
+    mean zero.
     """
 
     active_workers: int
@@ -92,10 +92,10 @@ def build_snapshot(
     """Snapshot the store for one dashboard frame.
 
     ``work_source`` is consulted only for the summary header's task-state
-    counts (matching ``flywheel-orchestrate status``); a missing or
-    raising source degrades to an empty counts map so the live-rows
-    half of the dashboard still renders. ``started_at`` and ``now`` are
-    threaded explicitly so callers (the polling loop, tests) own time.
+    counts (matching ``flywheel status``); a missing or raising source
+    degrades to an empty counts map so the live-rows half of the
+    dashboard still renders. ``started_at`` and ``now`` are threaded
+    explicitly so callers (the polling loop, tests) own time.
     """
     live = collect_live_rows(store)
     rows = tuple(_row_snapshot(r, now=now) for r in live)
@@ -147,8 +147,9 @@ def _row_snapshot(row: LiveRunRow, *, now: datetime) -> RowSnapshot:
 def snapshot_to_dict(snapshot: DashboardSnapshot) -> dict[str, Any]:
     """Render a :class:`DashboardSnapshot` as plain JSON-encodable data.
 
-    Field names are stable: scripts piping ``flywheel-tui --json`` rely
-    on the same keys the Textual surface uses internally.
+    Field names are stable: scripts piping ``flywheel --json`` (or
+    ``fw --json``) rely on the same keys the Textual surface uses
+    internally.
     """
     return {
         "summary": {

@@ -1,8 +1,10 @@
 """Subprocess supervisor for the engine-on-launch worker.
 
-Bare ``fw`` opens the operator console; this module is how the console
-keeps a ``flywheel-worktree`` worker running underneath it. The
-supervisor owns three responsibilities (and intentionally no more):
+Bare ``flywheel`` (or ``fw``) opens the operator console; this module
+is how the console keeps a git-worktree worker running underneath it
+(the worker is :mod:`flywheel_worktree.worker`, launched as a
+``flywheel worker`` subprocess). The supervisor owns three
+responsibilities (and intentionally no more):
 
 * **Liveness detection** -- a SQL read against the existing
   ``task_claims`` table. A row whose ``lease_expires_at`` is still in
@@ -170,7 +172,7 @@ def build_default_spawn_argv(db_path: Path, *, tasks_dir: Path | None) -> list[s
 
 
 class WorkerSupervisor:
-    """Spawn, detach from, and stop one ``flywheel-worktree`` child.
+    """Spawn, detach from, and stop one git-worktree worker child.
 
     Construction does not spawn anything; call :meth:`start` to spawn.
     ``status()`` is cheap (a ``Popen.poll`` plus a ``task_claims`` SQL

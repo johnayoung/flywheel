@@ -47,9 +47,9 @@ import subprocess
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from flywheel.lifecycle import Status
-from flywheel.loaders import TaskLoadError, load_graders
-from flywheel.task import Context, Grader, Task, ValidationError
+from flywheel_core.lifecycle import Status
+from flywheel_core.loaders import TaskLoadError, load_graders
+from flywheel_core.task import Context, Grader, Task, ValidationError
 
 from flywheel_orchestrator._sources import (
     WorkItem,

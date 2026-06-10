@@ -1,4 +1,4 @@
-"""SQLite-specific tests for ``flywheel.store_sqlite.SqliteStore``.
+"""SQLite-specific tests for ``flywheel_core.store_sqlite.SqliteStore``.
 
 The shared protocol contract lives in ``test_store_contract.py`` and
 runs against every backend. Tests here pin down properties that only
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
     GraderResultRecord,
@@ -27,7 +27,7 @@ from flywheel import (
     Status,
     StoreSchemaError,
 )
-from flywheel.store_sqlite import _SCHEMA_PATH
+from flywheel_core.store_sqlite import _SCHEMA_PATH
 
 
 # --- Schema bootstrap ------------------------------------------------------

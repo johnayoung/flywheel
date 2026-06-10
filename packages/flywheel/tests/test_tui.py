@@ -1,6 +1,6 @@
-"""Tests for the operator-console entry point inside ``flywheel_cli``.
+"""Tests for the operator-console entry point inside ``flywheel``.
 
-Drives :func:`flywheel_cli.tui_main` directly so the JSON snapshot, the
+Drives :func:`flywheel.tui_main` directly so the JSON snapshot, the
 non-TTY auto-detect, and the missing-store error path are all exercised
 without spawning the Textual app. The interactive TUI path is covered
 by :mod:`test_dashboard` and :mod:`test_session_screen`.
@@ -14,10 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli import tui_main
+from flywheel import tui_main
 
 
 def _seed_running(store: SqliteStore, task_id: str) -> Lifecycle:

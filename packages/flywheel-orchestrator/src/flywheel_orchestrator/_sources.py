@@ -7,7 +7,7 @@ tracker, a queue. Everything tool-specific stays in the adapter:
 
 * **Inbound** — :meth:`WorkSource.list_work` enumerates the items that are
   candidates right now, each already compiled to a validated
-  :class:`~flywheel.task.Task` (plus the orchestration-layer
+  :class:`~flywheel_core.task.Task` (plus the orchestration-layer
   ``prerequisites`` edges). Items that cannot compile to a runnable Task
   (e.g. a tracker issue with no graders and no default grader policy) are
   the adapter's problem to skip or surface — they never reach the
@@ -34,9 +34,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from flywheel.lifecycle import Status
-from flywheel.loaders import load_task_file
-from flywheel.task import Task
+from flywheel_core.lifecycle import Status
+from flywheel_core.loaders import load_task_file
+from flywheel_core.task import Task
 
 
 class WorkSourceError(RuntimeError):
@@ -116,7 +116,7 @@ class WorkSource(Protocol):
         Called once per scheduling pass, so implementations should be
         cheap-ish and deterministic in order (ties in selection break by
         enumeration order). Raises :class:`WorkSourceError` (or
-        ``flywheel.loaders.TaskLoadError``) when the source exists but an
+        ``flywheel_core.loaders.TaskLoadError``) when the source exists but an
         item cannot compile.
         """
         ...

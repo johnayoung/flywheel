@@ -1,4 +1,4 @@
-"""Behavioral tests for ``flywheel.recovery_summarizer``.
+"""Behavioral tests for ``flywheel_core.recovery_summarizer``.
 
 Two layers are exercised:
 
@@ -26,8 +26,8 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel.prompt import RecoveryHandoff
-from flywheel.recovery_summarizer import (
+from flywheel_core.prompt import RecoveryHandoff
+from flywheel_core.recovery_summarizer import (
     CLOSING_FENCE,
     OPENING_FENCE,
     DuplicateHandoff,
@@ -41,7 +41,7 @@ from flywheel.recovery_summarizer import (
     parse_handoff,
     run_recovery_summarizer,
 )
-from flywheel.task import Task
+from flywheel_core.task import Task
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -567,7 +567,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(_assistant_with(_wrap(_well_formed_payload())))
 
         monkeypatch.setattr(
-            "flywheel.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core.recovery_summarizer._sdk_query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(
@@ -603,7 +603,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(_assistant_with(_wrap(_well_formed_payload())))
 
         monkeypatch.setattr(
-            "flywheel.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core.recovery_summarizer._sdk_query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(
@@ -632,7 +632,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(*(_assistant_with(c) for c in chunks))
 
         monkeypatch.setattr(
-            "flywheel.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core.recovery_summarizer._sdk_query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(

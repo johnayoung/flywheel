@@ -47,11 +47,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence, TextIO
 
-from flywheel import (
+from flywheel_core import (
     InvokeFunc,
     Status,
 )
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
     OrchestratorReport,
     RunRecord,
@@ -59,7 +59,7 @@ from flywheel_orchestrator import (
     SubmitRequest,
     orchestrate,
 )
-from flywheel.workflow import (
+from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     _format_event_line,
@@ -504,7 +504,7 @@ def archive_phases(
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
 
     ``repo_root`` enables the loop-path archive gate
-    (:func:`flywheel.workflow.archive_completed_phases` reads the phase's
+    (:func:`flywheel_core.workflow.archive_completed_phases` reads the phase's
     cumulative diff vs ``.loop-base`` to derive the marker); omitting it
     skips the gate entirely, which matches the legacy ``archive_phases``
     contract. Refusal reasons are reported via the same ``log`` callable
@@ -665,7 +665,7 @@ def retention_sweep(
 
 # Hard ceiling on the rendered action so a runaway tool-call payload can
 # never wrap the single-line heartbeat unboundedly. The per-field
-# summarizers in `flywheel.workflow` already truncate individual values;
+# summarizers in `flywheel_core.workflow` already truncate individual values;
 # this is the belt-and-braces final cap.
 _HEARTBEAT_DETAIL_MAX_WIDTH: int = 100
 
@@ -705,7 +705,7 @@ def _format_heartbeat(row: LiveRunRow, now: datetime) -> str:
 
 class Heartbeat:
     """Background thread printing per-in-flight-run progress lines via
-    :func:`flywheel.workflow.collect_live_rows`, so a watcher can tell the
+    :func:`flywheel_core.workflow.collect_live_rows`, so a watcher can tell the
     agent is still moving. Quiet when nothing is in flight."""
 
     def __init__(self, db_path: Path, interval: int, log: Logger) -> None:

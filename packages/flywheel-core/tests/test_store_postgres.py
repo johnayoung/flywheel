@@ -1,4 +1,4 @@
-"""Postgres-specific tests for ``flywheel.store_postgres.PostgresStore``.
+"""Postgres-specific tests for ``flywheel_core.store_postgres.PostgresStore``.
 
 The shared protocol contract lives in ``test_store_contract.py`` and
 runs against every backend (including Postgres when Docker is up).
@@ -26,7 +26,7 @@ from uuid import uuid4
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
     EventRecord,
@@ -49,14 +49,14 @@ from flywheel import (
 def test_import_guard_names_the_postgres_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``flywheel.store_postgres`` must raise ``ImportError`` naming the
+    """``flywheel_core.store_postgres`` must raise ``ImportError`` naming the
     ``postgres`` extra when ``psycopg`` is unavailable."""
     # Force ``import psycopg`` to fail; clear the cached store_postgres
     # module so the import-time guard re-runs.
     monkeypatch.setitem(sys.modules, "psycopg", None)
-    monkeypatch.delitem(sys.modules, "flywheel.store_postgres", raising=False)
+    monkeypatch.delitem(sys.modules, "flywheel_core.store_postgres", raising=False)
     with pytest.raises(ImportError) as exc_info:
-        importlib.import_module("flywheel.store_postgres")
+        importlib.import_module("flywheel_core.store_postgres")
     msg = str(exc_info.value)
     assert "postgres" in msg
     assert "flywheel[postgres]" in msg
@@ -88,7 +88,7 @@ def fresh_schema() -> str:
 @pytest.fixture
 def pg_store(fresh_schema: str) -> Iterator[Any]:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     store = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=4)
     try:
@@ -109,7 +109,7 @@ def test_invalid_schema_name_is_rejected() -> None:
     constructor, but we want a real DSN so the construction sequence is
     exercised end-to-end."""
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     for bad in ("public; drop table x", "1invalid", "bad-name", ""):
         with pytest.raises(ValueError):
@@ -164,7 +164,7 @@ def test_jsonb_columns_use_jsonb_type(
 def test_bootstrap_is_idempotent(fresh_schema: str) -> None:
     """A second construction against the same DB+schema must succeed."""
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     s1 = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
     try:
@@ -315,7 +315,7 @@ def test_foreign_key_rejects_orphan_grader_result(pg_store: Any) -> None:
 
 def test_pool_supports_parallel_reads(fresh_schema: str) -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     store = PostgresStore(dsn, schema=fresh_schema, pool_min=2, pool_max=4)
     try:
@@ -354,7 +354,7 @@ def test_pool_supports_parallel_reads(fresh_schema: str) -> None:
 
 def test_schema_isolation_between_two_stores() -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     schema_a = f"flywheel_iso_a_{uuid4().hex[:8]}"
     schema_b = f"flywheel_iso_b_{uuid4().hex[:8]}"
@@ -410,7 +410,7 @@ def test_optimistic_concurrency_conflict_via_two_pool_connections(
 
 def test_close_releases_pool_resources(fresh_schema: str) -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     store = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
     store.create_lifecycle(Lifecycle(task_id="t", run_id="r1"))
@@ -510,7 +510,7 @@ def test_opening_postgres_with_mismatched_schema_version_raises(
     fresh_schema: str,
 ) -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     store = PostgresStore(dsn, schema=fresh_schema, pool_min=1, pool_max=2)
     store.close()
@@ -559,7 +559,7 @@ def test_listen_notify_bridges_cross_instance_writes(
     fresh_schema: str,
 ) -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     _ts = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
     # Writer does not listen; consumer listens on the same schema/channel.
@@ -594,7 +594,7 @@ def test_listen_notify_bridges_cross_instance_writes(
 
 def test_close_stops_the_listener_thread(fresh_schema: str) -> None:
     dsn = _dsn_or_skip()
-    from flywheel import PostgresStore
+    from flywheel_core import PostgresStore
 
     store = PostgresStore(
         dsn, schema=fresh_schema, pool_min=1, pool_max=2, listen=True

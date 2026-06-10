@@ -1,4 +1,4 @@
-"""Module-purity tests for :mod:`flywheel.prompt`.
+"""Module-purity tests for :mod:`flywheel_core.prompt`.
 
 The prompt builder operates only on its typed inputs (Task, Lifecycle,
 IterationInputs) plus stable envelope constants. It must not import IO,
@@ -8,7 +8,7 @@ file, network, or SDK APIs, and must not call ``open()``.
 import ast
 import inspect
 
-import flywheel.prompt as prompt_module
+import flywheel_core.prompt as prompt_module
 
 
 FORBIDDEN_IMPORTS = {
@@ -45,7 +45,7 @@ def test_prompt_module_has_no_io_sdk_or_network_imports() -> None:
             if node.module:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
-    assert not leaked, f"flywheel.prompt imports forbidden modules: {leaked}"
+    assert not leaked, f"flywheel_core.prompt imports forbidden modules: {leaked}"
 
 
 def test_prompt_module_does_not_call_open_or_file_apis() -> None:
@@ -53,7 +53,7 @@ def test_prompt_module_does_not_call_open_or_file_apis() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.prompt calls forbidden builtin {node.func.id!r}"
+                f"flywheel_core.prompt calls forbidden builtin {node.func.id!r}"
             )
 
 
@@ -64,16 +64,16 @@ def test_prompt_module_imports_only_flywheel_typed_inputs_and_stdlib() -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".")[0]
-                if root != "flywheel":
+                if root != "flywheel_core":
                     third_party.add(root)
         elif isinstance(node, ast.ImportFrom):
             if node.module:
                 root = node.module.split(".")[0]
-                if root != "flywheel":
+                if root != "flywheel_core":
                     third_party.add(root)
 
     allowed_stdlib = {"dataclasses", "typing", "enum", "collections"}
     leaked = third_party - allowed_stdlib
     assert not leaked, (
-        f"flywheel.prompt imports outside the allowed stdlib subset: {leaked}"
+        f"flywheel_core.prompt imports outside the allowed stdlib subset: {leaked}"
     )

@@ -1,6 +1,6 @@
 """Tests for the ``fw`` router.
 
-Drives :func:`flywheel_cli.main` directly so each delegation target is
+Drives :func:`flywheel.main` directly so each delegation target is
 exercised through the seam the console script will take. The router
 must forward output and exit codes from the underlying implementation
 unchanged (FR-4 of spec 00021).
@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli import main
+from flywheel import main
 
 
 # --- helpers ---------------------------------------------------------------
@@ -314,7 +314,7 @@ def test_fw_audit_unknown_run_exits_zero_with_stderr_notice(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``fw audit RUN_ID`` for an unknown run id mirrors the underlying
-    ``python -m flywheel.audit`` behavior: exit 0 with a stderr notice."""
+    ``python -m flywheel_core.audit`` behavior: exit 0 with a stderr notice."""
     db = tmp_path / "db.sqlite"
     SqliteStore(db).close()
     rc = main(["audit", "run-ghost", "--db", str(db)])

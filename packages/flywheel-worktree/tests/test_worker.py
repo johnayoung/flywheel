@@ -23,7 +23,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     Intent,
     InvocationRequest,
     InvocationSignals,
@@ -31,7 +31,7 @@ from flywheel import (
     Status,
     ValidEnvelope,
 )
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import SandboxRequest, SubmitRequest
 from flywheel_worktree import worker
 
@@ -497,7 +497,7 @@ def _live_row(
     turns_total: int = 0,
     iterations_completed: int = 0,
 ) -> object:
-    """Build a ``flywheel.workflow.LiveRunRow`` without spinning a store."""
+    """Build a ``flywheel_core.workflow.LiveRunRow`` without spinning a store."""
     from datetime import datetime, timezone
 
     from flywheel_orchestrator import LiveRunRow

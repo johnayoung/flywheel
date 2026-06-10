@@ -1,4 +1,4 @@
-"""Behavior tests for the pure :mod:`flywheel.redaction` core.
+"""Behavior tests for the pure :mod:`flywheel_core.redaction` core.
 
 Covers the FRs that land in this task:
 
@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from flywheel.redaction import (
+from flywheel_core.redaction import (
     EnvValueRedactor,
     FieldPathRedactor,
     PatternRedactor,
@@ -34,7 +34,7 @@ from flywheel.redaction import (
     compose,
     default_policy,
 )
-from flywheel.store_protocols import (
+from flywheel_core.store_protocols import (
     AuditRecord,
     EventRecord,
     SdkMessageRecord,

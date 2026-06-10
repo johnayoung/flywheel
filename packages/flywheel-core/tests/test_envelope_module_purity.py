@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.envelope as envelope_module
+import flywheel_core.envelope as envelope_module
 
 
 FORBIDDEN_IMPORTS = {
@@ -37,7 +37,7 @@ def test_envelope_module_has_no_io_sdk_or_network_imports() -> None:
             if node.module:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
-    assert not leaked, f"flywheel.envelope imports forbidden modules: {leaked}"
+    assert not leaked, f"flywheel_core.envelope imports forbidden modules: {leaked}"
 
 
 def test_envelope_module_does_not_call_open_or_file_apis() -> None:
@@ -45,5 +45,5 @@ def test_envelope_module_does_not_call_open_or_file_apis() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.envelope calls forbidden builtin {node.func.id!r}"
+                f"flywheel_core.envelope calls forbidden builtin {node.func.id!r}"
             )

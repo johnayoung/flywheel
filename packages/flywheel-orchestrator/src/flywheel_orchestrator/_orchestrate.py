@@ -13,20 +13,20 @@ consumer (the ``flywheel-worktree`` package) wraps it, injecting worktree
 submit through the ``prepare_sandbox`` / ``submit`` seam below.
 
 Scheduling, reusing the exact predicates the pull-based CLI already uses
-(:func:`flywheel.workflow.select_next_task` /
-:func:`~flywheel.workflow.build_status_rows`):
+(:func:`flywheel_core.workflow.select_next_task` /
+:func:`~flywheel_core.workflow.build_status_rows`):
 
 * **Prerequisite promotion** — a fresh/retryable task runs only once every
   task in its ``prerequisites`` has a ``DONE`` lifecycle.
 * **Reactive unblocking** — a blocked-interrupted lifecycle (``INTERRUPTED``
   with a persisted ``blocked_requires`` snapshot) is re-evaluated via
-  :func:`flywheel.harness.recheck_blocked_lifecycle`; when its predicates
+  :func:`flywheel_core.harness.recheck_blocked_lifecycle`; when its predicates
   now hold it is unblocked and **resumed on its own run_id** (continuing its
   history), not re-run from scratch. Blocked tasks are excluded from fresh
   selection so they are never wastefully re-run while still blocked.
 
 **Multi-worker (P5).** Several orchestrators may share one store. Before
-running a task a worker must acquire its :class:`~flywheel.store_protocols.
+running a task a worker must acquire its :class:`~flywheel_core.store_protocols.
 ClaimStore` lease; a task held by a live lease is skipped, so no two workers
 run the same task. A background heartbeat renews the lease while the run is
 in flight, so the lease doubles as a liveness signal: if a worker crashes,
@@ -57,23 +57,23 @@ from pathlib import Path
 from typing import Any, Callable, Literal, TextIO
 from uuid import uuid4
 
-from flywheel.harness import (
+from flywheel_core.harness import (
     InvokeFunc,
     finalize_stranded_lifecycle,
     recheck_blocked_lifecycle,
     resolve_manual_approval,
 )
-from flywheel.invoker_client import CONTROL_COMMAND_INTERRUPT
-from flywheel.lifecycle import Status
-from flywheel.store_protocols import OptimisticConcurrencyError
-from flywheel.store_sqlite import SqliteStore
-from flywheel.task import Task
+from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
+from flywheel_core.lifecycle import Status
+from flywheel_core.store_protocols import OptimisticConcurrencyError
+from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.task import Task
 from flywheel_orchestrator._claims import (
     ClaimLostError,
     SqliteClaimStore,
     TaskClaim,
 )
-from flywheel.workflow import (
+from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     _stranded_run_ids,

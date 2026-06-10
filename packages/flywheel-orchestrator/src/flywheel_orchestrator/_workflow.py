@@ -2,13 +2,13 @@
 orchestrator's argparse entry point — the consumer layer above the
 single-task loop.
 
-Extracted verbatim from ``flywheel.workflow`` in the core/consumer split.
+Extracted verbatim from ``flywheel_core.workflow`` in the core/consumer split.
 Verbs are now exposed through the unified product shell
 (``flywheel status`` / ``flywheel live`` / ``flywheel init`` / ...),
 which calls :func:`main` here in-process. Module-level plumbing remains
 runnable as ``python -m flywheel_orchestrator._workflow``.
 
-Shared single-task helpers are imported from ``flywheel.workflow`` (the
+Shared single-task helpers are imported from ``flywheel_core.workflow`` (the
 dependency arrow points orchestrator -> core, never the reverse).
 """
 
@@ -33,16 +33,16 @@ from pathlib import Path
 from typing import Any
 
 
-from flywheel.harness import (
+from flywheel_core.harness import (
     RecheckOutcome,
     recheck_blocked_lifecycle,
 )
-from flywheel.lifecycle import Status
-from flywheel.loaders import TaskLoadError, load_task_file
-from flywheel.loop_path_marker import LoopPathSignal, detect_loop_path_signals
-from flywheel.store_sqlite import SqliteStore
-from flywheel.task import ManualGrader, Task
-from flywheel.workflow import (
+from flywheel_core.lifecycle import Status
+from flywheel_core.loaders import TaskLoadError, load_task_file
+from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
+from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.task import ManualGrader, Task
+from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     _add_common_db,
@@ -309,7 +309,7 @@ def archive_completed_phases(
 
     When ``repo_root`` is supplied, the phase's cumulative diff vs its
     recorded ``.loop-base`` is inspected for the watched loop-path signals
-    (see :mod:`flywheel.loop_path_marker`). A phase whose diff hits any
+    (see :mod:`flywheel_core.loop_path_marker`). A phase whose diff hits any
     signal is gated: it archives only when it contains a DONE task tagged
     ``in-loop-verification`` OR a valid ``loop-path-exempt.md`` opt-out
     artifact lives alongside the task files. A gated phase stays in
@@ -1254,7 +1254,7 @@ def _format_unsatisfied(
 
     The recheck primitive emits per-predicate dicts with normalized
     ``type``/``identifier`` keys (see
-    :func:`flywheel.harness._evaluate_blocked_predicate`), so we can read
+    :func:`flywheel_core.harness._evaluate_blocked_predicate`), so we can read
     them directly without re-deriving identifiers per predicate shape.
     """
     parts: list[str] = []

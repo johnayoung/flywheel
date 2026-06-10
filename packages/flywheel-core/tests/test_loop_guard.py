@@ -1,4 +1,4 @@
-"""Behavioral coverage for :mod:`flywheel.loop_guard`.
+"""Behavioral coverage for :mod:`flywheel_core.loop_guard`.
 
 Cross-references the FRs in ``.flywheel/specs/00015-FEATURE-loop-safety-net.md``:
 
@@ -11,8 +11,8 @@ Cross-references the FRs in ``.flywheel/specs/00015-FEATURE-loop-safety-net.md``
 
 from typing import Any
 
-from flywheel.invoker import ToolInteraction, ToolResultObservation
-from flywheel.loop_guard import (
+from flywheel_core.invoker import ToolInteraction, ToolResultObservation
+from flywheel_core.loop_guard import (
     LoopGuard,
     LoopGuardConfig,
     LoopGuardVerdictKind,

@@ -1,6 +1,6 @@
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     Context,
     ManualGrader,
@@ -9,7 +9,7 @@ from flywheel import (
     TranscriptGrader,
     ValidationError,
 )
-from flywheel.task import KNOWN_GRADER_TYPES
+from flywheel_core.task import KNOWN_GRADER_TYPES
 
 
 def test_construct_task_directly_and_validate() -> None:

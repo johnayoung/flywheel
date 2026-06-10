@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`flywheel.examples.hello`.
+"""Contract tests for :mod:`flywheel_core.examples.hello`.
 
 The example's production agent is the real Claude Code CLI driven via
 ``claude_agent_sdk.query``. Tests inject a fake :class:`InvokeFunc`
@@ -27,7 +27,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     InvocationRequest,
     InvocationSignals,
     IterationResult,
@@ -35,8 +35,8 @@ from flywheel import (
     Status,
     ValidEnvelope,
 )
-from flywheel.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
-from flywheel.examples.hello import (
+from flywheel_core.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
+from flywheel_core.examples.hello import (
     TARGET_CONTENT,
     TARGET_FILENAME,
     build_task,

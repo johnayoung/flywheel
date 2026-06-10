@@ -1,0 +1,336 @@
+"""Domain events: the event-sourced source of truth for a lifecycle.
+
+A :class:`Lifecycle` is the *fold* of a closed, ordered sequence of domain
+events. This module defines that closed set plus the pure reducer
+(:func:`apply` / :func:`replay`) that derives lifecycle state from it.
+
+Two invariants make this safe to depend on:
+
+- **Closed taxonomy.** Only the event types defined here may change lifecycle
+  state. Pure-observability telemetry (``harness.iteration_completed`` and
+  friends) lives outside this module and is never folded into state.
+- **Purity.** Like :mod:`flywheel_core.lifecycle`, this module performs no
+  json/pathlib/io. Serialization of an event to/from a store row is the
+  concrete store's responsibility; here events are plain dataclasses.
+
+``version`` semantics: it is the *domain-event offset*. Every domain event
+advances ``version`` by exactly one, so for a folded lifecycle
+``version == number of domain events folded``. This doubles as the
+optimistic-concurrency compare-and-swap key when the store conditionally
+appends the next event.
+"""
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from enum import Enum
+from typing import ClassVar
+
+from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
+
+
+class DomainEventKind(str, Enum):
+    """Discriminator for the closed domain-event set.
+
+    The value is the stable wire identifier a store persists alongside the
+    serialized event payload.
+    """
+
+    LIFECYCLE_INITIALIZED = "lifecycle_initialized"
+    TRANSITIONED_TO = "transitioned_to"
+    BLOCKED = "blocked"
+    UNBLOCKED = "unblocked"
+    AWAITING_APPROVAL = "awaiting_approval"
+    RETRY_SCHEDULED = "retry_scheduled"
+    ATTEMPT_STARTED = "attempt_started"
+    ATTEMPT_FINALIZED = "attempt_finalized"
+    SESSION_RECORDED = "session_recorded"
+    GRADER_EVALUATED = "grader_evaluated"
+
+
+@dataclass(frozen=True, kw_only=True)
+class _DomainEventBase:
+    """Fields shared by every domain event.
+
+    ``sequence`` and ``id`` are assigned by the store on append and are
+    ``None`` for in-memory events that have not been persisted yet. They are
+    never read by the reducer; ordering during a fold is the caller's
+    responsibility (the store returns events in ``sequence`` order).
+    """
+
+    run_id: str
+    ts: datetime
+    attempt_number: int | None = None
+    sequence: int | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class LifecycleInitialized(_DomainEventBase):
+    """Seeds the lifecycle. Must be the first event in any stream.
+
+    Replaces the old ``create_lifecycle`` write: appending this event is what
+    brings a lifecycle row into existence, so there is no window in which
+    events exist before the lifecycle does.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.LIFECYCLE_INITIALIZED
+
+    task_id: str
+    worker_id: str = ""
+    artifacts_dir: str = ""
+    task_content_hash: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransitionedTo(_DomainEventBase):
+    """A state-machine move. Carries the status and, for failure states, the
+    error string. The reducer derives the retry-counter increment and the
+    READY-clears-``blocked_requires_json`` rule from the edge."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.TRANSITIONED_TO
+
+    target: Status
+    error: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class Blocked(_DomainEventBase):
+    """Records the machine-readable blocked-requires snapshot. Always paired
+    with a subsequent ``TransitionedTo(INTERRUPTED)``."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.BLOCKED
+
+    requires_json: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class Unblocked(_DomainEventBase):
+    """Audit witness that a blocked lifecycle's requirements were satisfied.
+    The actual snapshot clear happens via the paired ``TransitionedTo(READY)``,
+    so this event's fold is the identity (it still advances ``version``)."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.UNBLOCKED
+
+
+@dataclass(frozen=True, kw_only=True)
+class AwaitingApproval(_DomainEventBase):
+    """Records which manual-grader gate a lifecycle is parking on.
+
+    Always paired with a subsequent ``TransitionedTo(AWAITING_APPROVAL)``
+    (or, on re-park to a later gate, a re-emit while the lifecycle is
+    already in ``AWAITING_APPROVAL``). The reducer folds ``awaiting_ordinal``
+    onto the lifecycle's ``awaiting_manual_ordinal`` field; the centralized
+    clear on ``-> READY`` / ``-> DONE`` / ``-> FAILED_VALIDATION`` later
+    nulls it again.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.AWAITING_APPROVAL
+
+    awaiting_ordinal: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class RetryScheduled(_DomainEventBase):
+    """Audit witness of the harness's decision to retry. The retry-counter
+    bump is applied by the paired ``TransitionedTo(READY)`` from a retry-source
+    status, so this event's fold is the identity (it still advances
+    ``version``)."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.RETRY_SCHEDULED
+
+    retries_used: int
+    max_retries: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttemptStarted(_DomainEventBase):
+    """Opens a new :class:`Attempt` in the lifecycle's attempts projection."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.ATTEMPT_STARTED
+
+    number: int
+    attempt_run_id: str
+    started_at: datetime
+    agent_context: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, kw_only=True)
+class AttemptFinalized(_DomainEventBase):
+    """Closes the matching :class:`Attempt` and records the lifecycle's last
+    agent output."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.ATTEMPT_FINALIZED
+
+    number: int
+    outcome: Outcome
+    ended_at: datetime
+    agent_output: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionRecorded(_DomainEventBase):
+    """Records the agent session id for resumption."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.SESSION_RECORDED
+
+    session_id: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class GraderEvaluated(_DomainEventBase):
+    """A grader receipt. Projects a ``grader_results`` row; its fold onto the
+    :class:`Lifecycle` dataclass is the identity (it still advances
+    ``version``)."""
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.GRADER_EVALUATED
+
+    ordinal: int
+    grader_type: str
+    passed: bool
+    duration_ms: int
+    grader_name: str | None = None
+    grader_spec: Mapping[str, object] = field(default_factory=dict)
+    payload: Mapping[str, object] = field(default_factory=dict)
+
+
+DomainEvent = (
+    LifecycleInitialized
+    | TransitionedTo
+    | Blocked
+    | Unblocked
+    | AwaitingApproval
+    | RetryScheduled
+    | AttemptStarted
+    | AttemptFinalized
+    | SessionRecorded
+    | GraderEvaluated
+)
+
+
+class EventReplayError(ValueError):
+    """Raised when an event stream cannot be folded into a coherent state.
+
+    Surfaced loudly rather than coerced: an empty stream, a stream that does
+    not begin with :class:`LifecycleInitialized`, a duplicate initialization,
+    or a finalize for an attempt that was never started all indicate a corrupt
+    log, not a recoverable condition. An illegal state-machine edge raises
+    :class:`flywheel_core.lifecycle.LifecycleTransitionError` (from
+    ``apply_transition``) for the same reason.
+    """
+
+
+def _clone(state: Lifecycle) -> Lifecycle:
+    """Return an independent copy so :func:`apply` never mutates its input."""
+    return Lifecycle(
+        task_id=state.task_id,
+        run_id=state.run_id,
+        worker_id=state.worker_id,
+        status=state.status,
+        timestamps=dict(state.timestamps),
+        version=state.version,
+        retries=state.retries,
+        error=state.error,
+        agent_output=state.agent_output,
+        attempts=[
+            replace(a, agent_context=dict(a.agent_context))
+            for a in state.attempts
+        ],
+        session_id=state.session_id,
+        artifacts_dir=state.artifacts_dir,
+        blocked_requires_json=state.blocked_requires_json,
+        awaiting_manual_ordinal=state.awaiting_manual_ordinal,
+        task_content_hash=state.task_content_hash,
+    )
+
+
+def _finalize_attempt(state: Lifecycle, event: AttemptFinalized) -> None:
+    for attempt in state.attempts:
+        if attempt.number == event.number:
+            attempt.ended_at = event.ended_at
+            attempt.outcome = event.outcome
+            attempt.agent_output = event.agent_output
+            attempt.error = event.error
+            state.agent_output = event.agent_output
+            return
+    raise EventReplayError(
+        f"AttemptFinalized for unknown attempt number {event.number}"
+    )
+
+
+def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
+    """Fold one domain event onto ``state``, returning a new lifecycle.
+
+    ``state`` is ``None`` only for the leading :class:`LifecycleInitialized`;
+    every other event requires an existing state. The returned lifecycle is a
+    fresh object — the input is never mutated — so a fold is referentially
+    transparent and repeatable.
+    """
+    if isinstance(event, LifecycleInitialized):
+        if state is not None:
+            raise EventReplayError(
+                "LifecycleInitialized must be the first and only seed event"
+            )
+        return Lifecycle(
+            task_id=event.task_id,
+            run_id=event.run_id,
+            worker_id=event.worker_id,
+            artifacts_dir=event.artifacts_dir,
+            task_content_hash=event.task_content_hash,
+            status=Status.PENDING,
+            version=1,
+        )
+
+    if state is None:
+        raise EventReplayError(
+            "event stream must begin with LifecycleInitialized"
+        )
+
+    new = _clone(state)
+    new.version += 1
+
+    if isinstance(event, TransitionedTo):
+        new.apply_transition(event.target, error=event.error, now=event.ts)
+    elif isinstance(event, Blocked):
+        new.blocked_requires_json = event.requires_json
+    elif isinstance(event, AwaitingApproval):
+        new.awaiting_manual_ordinal = event.awaiting_ordinal
+    elif isinstance(event, AttemptStarted):
+        new.attempts.append(
+            Attempt(
+                number=event.number,
+                started_at=event.started_at,
+                run_id=event.attempt_run_id,
+                agent_context=dict(event.agent_context),
+            )
+        )
+    elif isinstance(event, AttemptFinalized):
+        _finalize_attempt(new, event)
+    elif isinstance(event, SessionRecorded):
+        new.session_id = event.session_id
+    elif isinstance(event, (Unblocked, RetryScheduled, GraderEvaluated)):
+        # Identity fold: these carry audit intent or project a separate table.
+        # They still advance version as members of the domain-event sequence.
+        pass
+    else:  # pragma: no cover - exhaustive over the closed union
+        raise EventReplayError(
+            f"unknown domain event: {type(event).__name__}"
+        )
+
+    return new
+
+
+def replay(events: Iterable[DomainEvent]) -> Lifecycle:
+    """Fold an ordered domain-event sequence into a :class:`Lifecycle`.
+
+    The sequence must begin with :class:`LifecycleInitialized`. Raises
+    :class:`EventReplayError` for an empty stream and surfaces any
+    state-machine illegality from the underlying transitions.
+    """
+    state: Lifecycle | None = None
+    for event in events:
+        state = apply(state, event)
+    if state is None:
+        raise EventReplayError("cannot replay an empty event stream")
+    return state

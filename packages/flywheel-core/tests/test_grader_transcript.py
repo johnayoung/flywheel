@@ -1,4 +1,4 @@
-"""Behavioral tests for ``flywheel.grader_transcript``.
+"""Behavioral tests for ``flywheel_core.grader_transcript``.
 
 Two behaviors share one source of truth (``TranscriptGrader``) and the
 tests assert that:
@@ -28,7 +28,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     CommandGrader,
     InMemoryStore,

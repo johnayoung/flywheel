@@ -1,4 +1,4 @@
-"""Tests for the ``flywheel.workflow`` CLI module.
+"""Tests for the ``flywheel_core.workflow`` CLI module.
 
 Covers the pure logic — task discovery, status classification, eligibility,
 archive — against an in-memory SQLite store and temp task dirs. The ``run``
@@ -18,14 +18,14 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import Message
 
-from flywheel.envelope import Intent, ValidEnvelope
-from flywheel.harness import HarnessOutcome, InvocationRequest
-from flywheel.invoker import InvocationSignals, IterationResult
-from flywheel.lifecycle import Attempt, Lifecycle, Outcome, Status
-from flywheel.store_protocols import EventRecord
-from flywheel.store_sqlite import SqliteStore
-from flywheel.task import CommandGrader, RubricGrader, ValidationError
-from flywheel.workflow import (
+from flywheel_core.envelope import Intent, ValidEnvelope
+from flywheel_core.harness import HarnessOutcome, InvocationRequest
+from flywheel_core.invoker import InvocationSignals, IterationResult
+from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
+from flywheel_core.store_protocols import EventRecord
+from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.task import CommandGrader, RubricGrader, ValidationError
+from flywheel_core.workflow import (
     EVENTS_JSON,
     EVENTS_NONE,
     EVENTS_PLAIN,
@@ -2099,9 +2099,9 @@ def test_run_task_file_records_crash_for_invoke_runtime_error(
     """
     import asyncio
 
-    from flywheel.harness import InvocationRequest
-    from flywheel.invoker import IterationResult
-    from flywheel.workflow import run_task_file
+    from flywheel_core.harness import InvocationRequest
+    from flywheel_core.invoker import IterationResult
+    from flywheel_core.workflow import run_task_file
 
     task_file = tmp_path / "task.json"
     _write_task(task_file, "probe")
@@ -2351,7 +2351,7 @@ def test_main_run_inline_goal_dispatches_to_run_task_object(
 ) -> None:
     """``flywheel run "<goal>"`` (non-file target) builds an inline Task
     and routes it through ``run_task_object``, not ``run_task_file``."""
-    import flywheel.workflow as workflow
+    import flywheel_core.workflow as workflow
 
     captured: dict[str, object] = {}
 
@@ -2379,7 +2379,7 @@ def test_main_run_inline_goal_dispatches_to_run_task_object(
     assert rc == 0
     task = captured["task"]
     assert isinstance(task, object)
-    from flywheel.task import Task
+    from flywheel_core.task import Task
 
     assert isinstance(task, Task)
     assert task.goal == "add retries to the http client"
@@ -2393,7 +2393,7 @@ def test_main_run_file_dispatches_to_run_task_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An existing-file target loads as a task file via ``run_task_file``."""
-    import flywheel.workflow as workflow
+    import flywheel_core.workflow as workflow
 
     task_file = _write_task(tmp_path / "task.json", "probe")
     seen: dict[str, object] = {}
@@ -2485,7 +2485,7 @@ def _sdk_messages_sample() -> list[Message]:
 
 
 def test_format_live_message_renders_text_tool_result_and_result() -> None:
-    from flywheel.workflow import _format_live_message
+    from flywheel_core.workflow import _format_live_message
 
     text, tool, user, result = _sdk_messages_sample()
     assert "ASSISTANT  I will create the file." in _format_live_message(text)
@@ -2499,7 +2499,7 @@ def test_format_live_message_renders_text_tool_result_and_result() -> None:
 def test_make_message_observer_plain_writes_readable_lines() -> None:
     import io
 
-    from flywheel.workflow import _make_message_observer
+    from flywheel_core.workflow import _make_message_observer
 
     buf = io.StringIO()
     observer = _make_message_observer(EVENTS_PLAIN, out=buf)
@@ -2514,7 +2514,7 @@ def test_make_message_observer_plain_writes_readable_lines() -> None:
 def test_make_message_observer_json_writes_valid_ndjson() -> None:
     import io
 
-    from flywheel.workflow import _make_message_observer
+    from flywheel_core.workflow import _make_message_observer
 
     buf = io.StringIO()
     observer = _make_message_observer(EVENTS_JSON, out=buf)
@@ -2531,7 +2531,7 @@ def test_make_message_observer_json_writes_valid_ndjson() -> None:
 def test_make_message_observer_none_mode_returns_none() -> None:
     import io
 
-    from flywheel.workflow import _make_message_observer
+    from flywheel_core.workflow import _make_message_observer
 
     assert _make_message_observer(EVENTS_NONE, out=io.StringIO()) is None
 
@@ -2544,7 +2544,7 @@ def test_make_claude_code_invoke_forwards_on_message(
     control store is wired in)."""
     import asyncio
 
-    import flywheel.workflow as workflow
+    import flywheel_core.workflow as workflow
 
     captured: dict[str, object] = {}
 
@@ -2580,8 +2580,8 @@ def test_make_claude_code_invoke_uses_client_path_when_control_store_set(
     watcher runs against the open ClaudeSDKClient session."""
     import asyncio
 
-    import flywheel.workflow as workflow
-    from flywheel.store_memory import InMemoryStore
+    import flywheel_core.workflow as workflow
+    from flywheel_core.store_memory import InMemoryStore
 
     captured: dict[str, object] = {}
 
@@ -3078,7 +3078,7 @@ def _seed_awaiting_with_task(
     Returns ``(lifecycle, content_hash)`` so callers can both reload
     the run and reach back into the tasks table when they need to.
     """
-    from flywheel.task import CommandGrader, ManualGrader, Task
+    from flywheel_core.task import CommandGrader, ManualGrader, Task
 
     now = datetime.now(timezone.utc)
     task = Task(

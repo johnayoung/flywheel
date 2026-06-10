@@ -16,7 +16,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     FileExistsRequirement,
     Intent,
     InvocationRequest,
@@ -27,7 +27,7 @@ from flywheel import (
     ValidEnvelope,
 )
 from flywheel_orchestrator import SqliteClaimStore, orchestrate
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 
 
 # --- fixtures / helpers -----------------------------------------------------
@@ -407,7 +407,7 @@ def test_claim_lost_mid_run_relinquishes_without_killing_worker(
     # losing task is relinquished (recorded as no run) and the loop carries
     # on to the next claimable task.
     import flywheel_orchestrator._orchestrate as orch
-    from flywheel import OptimisticConcurrencyError
+    from flywheel_core import OptimisticConcurrencyError
 
     phase = tmp_path / "tasks" / "active" / "01-phase"
     _write_task(phase, "a-loser")

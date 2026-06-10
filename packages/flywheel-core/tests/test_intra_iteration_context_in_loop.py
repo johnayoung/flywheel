@@ -6,7 +6,7 @@ path -- an iteration that finishes naturally and only then crosses the
 occupancy ratio at its tail. This file covers the new mid-turn path:
 the ratio crosses *while the iteration is still streaming*, the harness
 arms the recovery-interrupt event, the invoker raises
-:class:`flywheel.invoker_client.HarnessRecoveryRequested`, and the
+:class:`flywheel_core.invoker_client.HarnessRecoveryRequested`, and the
 harness produces AND applies the summarize-restart recovery on the real
 loop.
 
@@ -14,17 +14,17 @@ What this file does, and the only thing it does, is drive a fixture
 through the shipped harness pipeline so the mid-turn interrupt-to-recovery
 path is observed end-to-end:
 
-* The real :func:`flywheel.harness.run_task` runs the attempts.
-* A real :class:`flywheel.store_sqlite.SqliteStore` persists every
+* The real :func:`flywheel_core.harness.run_task` runs the attempts.
+* A real :class:`flywheel_core.store_sqlite.SqliteStore` persists every
   event, attempt, and lifecycle row. Assertions read the on-disk store
   rather than relying on the harness's return value.
-* The real :func:`flywheel.recovery_summarizer.run_recovery_summarizer`
+* The real :func:`flywheel_core.recovery_summarizer.run_recovery_summarizer`
   is invoked through ``HarnessConfig.recovery_summarizer_invoke`` -- the
   same seam production uses. Only the summarizer's response text is
   scripted (a well-formed handoff envelope); the runner that parses
   and validates it is the production code.
 * The agent is scripted through the production ``InvokeFunc`` seam --
-  the same shape :func:`flywheel.invoker_client.invoke_iteration_with_client`
+  the same shape :func:`flywheel_core.invoker_client.invoke_iteration_with_client`
   satisfies. The scripted invoker mirrors the production watcher
   contract by forwarding each streamed :class:`AssistantMessage` to
   ``request.on_message`` and, once the harness arms
@@ -59,7 +59,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     HarnessConfig,
     Intent,
     InvocationRequest,
@@ -72,15 +72,15 @@ from flywheel import (
     ValidEnvelope,
     run_task,
 )
-from flywheel.invoker_client import HarnessRecoveryRequested
-from flywheel.prompt import RecoveryHandoff
-from flywheel.recovery_summarizer import (
+from flywheel_core.invoker_client import HarnessRecoveryRequested
+from flywheel_core.prompt import RecoveryHandoff
+from flywheel_core.recovery_summarizer import (
     CLOSING_FENCE as RECOVERY_CLOSING_FENCE,
 )
-from flywheel.recovery_summarizer import (
+from flywheel_core.recovery_summarizer import (
     OPENING_FENCE as RECOVERY_OPENING_FENCE,
 )
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 
 
 # --- Scripted SDK message helpers -----------------------------------------
@@ -282,7 +282,7 @@ def test_real_loop_drives_full_midturn_summarize_restart(
     async def summarizer_invoke(prompt: str, summarizer_worktree: object) -> str:
         """Scripted summarizer returning a well-formed handoff envelope.
 
-        The production :func:`flywheel.recovery_summarizer.run_recovery_summarizer`
+        The production :func:`flywheel_core.recovery_summarizer.run_recovery_summarizer`
         runner parses this string via ``parse_handoff`` and threads the
         resulting :class:`RecoveryHandoff` into the next attempt's
         :class:`IterationInputs`. The handoff fields chosen here let

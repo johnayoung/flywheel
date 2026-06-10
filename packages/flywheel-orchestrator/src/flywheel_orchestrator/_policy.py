@@ -41,8 +41,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from flywheel.loaders import TaskLoadError, load_graders
-from flywheel.task import Grader
+from flywheel_core.loaders import TaskLoadError, load_graders
+from flywheel_core.task import Grader
 
 from flywheel_orchestrator._github import GithubWorkSource
 from flywheel_orchestrator._sources import DirectoryWorkSource, WorkSource

@@ -1,4 +1,4 @@
-"""Tests for ``flywheel.workflow.load_loop_path_optout``.
+"""Tests for ``flywheel_core.workflow.load_loop_path_optout``.
 
 Covers the three documented outcomes from the FR-5 opt-out contract in
 ``.flywheel/specs/00017-FEATURE-in-loop-verification-gate.md``:

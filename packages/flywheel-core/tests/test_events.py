@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from flywheel.events import (
+from flywheel_core.events import (
     AttemptFinalized,
     AttemptStarted,
     Blocked,
@@ -17,7 +17,7 @@ from flywheel.events import (
     apply,
     replay,
 )
-from flywheel.lifecycle import Lifecycle, LifecycleTransitionError, Outcome, Status
+from flywheel_core.lifecycle import Lifecycle, LifecycleTransitionError, Outcome, Status
 
 
 _BASE = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)

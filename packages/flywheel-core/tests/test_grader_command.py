@@ -1,4 +1,4 @@
-"""Behavioral tests for ``flywheel.grader_command.run_command_graders``.
+"""Behavioral tests for ``flywheel_core.grader_command.run_command_graders``.
 
 Each test asserts a property of the documented contract: ordering by
 ``Task.graders`` index, abort-after-failure, distinguishable failure
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     Context,
     GraderResultRecord,
@@ -33,7 +33,7 @@ def _attempt_run_id(store: InMemoryStore, run_id: str = "r1") -> None:
     ``test_store_contract`` keeps these tests honest about the audit path.
     """
 
-    from flywheel import Attempt, Lifecycle
+    from flywheel_core import Attempt, Lifecycle
 
     if store.load_lifecycle(run_id) is None:
         store.create_lifecycle(Lifecycle(task_id="t", run_id=run_id))
@@ -410,7 +410,7 @@ def test_records_are_appended_not_updated_on_rerun() -> None:
 
     _run(task, store)
     # Second attempt — different attempt_number, fresh ordinal=0.
-    from flywheel import Attempt
+    from flywheel_core import Attempt
 
     store.save_attempt(
         "r1",

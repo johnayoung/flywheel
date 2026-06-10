@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.loop_guard as loop_guard_module
+import flywheel_core.loop_guard as loop_guard_module
 
 
 FORBIDDEN_IMPORTS = {"json", "pathlib", "io", "asyncio", "time"}
@@ -27,7 +27,7 @@ def test_loop_guard_module_has_no_file_stream_or_timing_imports() -> None:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
     assert not leaked, (
-        f"flywheel.loop_guard imports forbidden modules: {leaked}"
+        f"flywheel_core.loop_guard imports forbidden modules: {leaked}"
     )
 
 
@@ -36,6 +36,6 @@ def test_loop_guard_module_does_not_call_open_or_file_apis() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.loop_guard calls forbidden builtin "
+                f"flywheel_core.loop_guard calls forbidden builtin "
                 f"{node.func.id!r}"
             )

@@ -1,6 +1,6 @@
 """Postgres :class:`ClaimStore`. Behind the ``postgres`` extra.
 
-Mirrors ``flywheel.store_postgres`` operationally — a pooled, schema-isolated
+Mirrors ``flywheel_core.store_postgres`` operationally — a pooled, schema-isolated
 connection — but owns only ``task_claims`` and its own
 ``orchestrator_schema_version`` sentinel, so it can share a database (under the
 same or a different schema) with flywheel's Postgres store without either

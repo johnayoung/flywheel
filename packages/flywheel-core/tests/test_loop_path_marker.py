@@ -1,4 +1,4 @@
-"""Unit tests for ``flywheel.loop_path_marker``.
+"""Unit tests for ``flywheel_core.loop_path_marker``.
 
 Each signal in the FR-1 Trigger Set is covered with a synthetic unified
 diff. The two FR-1 acceptance cases are pinned explicitly:
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from textwrap import dedent
 
-from flywheel.loop_path_marker import (
+from flywheel_core.loop_path_marker import (
     LoopPathSignal,
     detect_loop_path_signals,
 )

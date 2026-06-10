@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from flywheel import (
+from flywheel_core import (
     EventHandler,
     EventRecord,
     InMemoryStore,
@@ -21,7 +21,7 @@ from flywheel import (
     TransitionedTo,
     subscribe,
 )
-from flywheel.store_protocols import AuditRecord
+from flywheel_core.store_protocols import AuditRecord
 
 _BASE = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
 

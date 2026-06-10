@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     NoOpStrategy,
     Strategy,

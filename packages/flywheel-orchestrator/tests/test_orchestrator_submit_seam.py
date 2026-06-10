@@ -17,7 +17,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     FileExistsRequirement,
     Intent,
     InvocationRequest,

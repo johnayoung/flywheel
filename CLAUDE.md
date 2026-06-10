@@ -6,12 +6,12 @@ Flywheel is a Python orchestration loop for AI coding agents — it owns the exe
 
 ## Workspace layout (the hard line)
 
-A uv workspace of four packages under `packages/`. The dependency arrow points one way only — core imports nothing downstream:
+A uv workspace of four packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
 
-- **`flywheel-core`** (dist) / **`flywheel`** (import) — the lifecycle of a **single task**. Knows nothing about who calls it. No console script; invoke via `python -m flywheel.workflow`. This is the only package most contributors touch.
+- **`flywheel-core`** (import `flywheel_core`) — the lifecycle of a **single task**. Knows nothing about who calls it. No console script; invoke via `python -m flywheel_core.workflow`. This is the only package most contributors touch.
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, claims/leases, multi-worker, phases). Owns its own store (`task_claims`). Library only; no console script.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
-- **`flywheel`** (dist) / **`flywheel_cli`** (import) — top of stack: the unified product shell. Console scripts `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
+- **`flywheel`** (import `flywheel`) — top of stack: the unified product shell. Console scripts `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
 
@@ -21,7 +21,7 @@ Authoritative specs in `docs/` override any inferred behavior:
 - `docs/task-schema.md` — `Task`/`Grader`/`Context` shape and validation rules
 - `docs/task-lifecycle.md` — `Lifecycle`/`Attempt`/`Status`/`Outcome` and transition rules
 - `docs/loop.md` — iteration envelope (`<!-- LOOP_STATUS -->`) and harness behavior
-- `packages/flywheel-core/src/flywheel/_schema/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`); Postgres mirror lives alongside it
+- `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`); Postgres mirror lives alongside it
 - `docs/strategy.md` — submission strategy (deferred)
 - `docs/roadmap.md` — ordered build plan; each item depends only on prior items
 
@@ -39,7 +39,7 @@ Python 3.13 required. `uv` is the package manager and task runner — do not inv
 
 ## Non-negotiable invariants
 
-- **IMPORTANT: `flywheel.task` and `flywheel.lifecycle` are pure.** No `json`/`pathlib`/`io` imports, no `open()`. Enforced by `packages/flywheel-core/tests/test_task_module_purity.py` and `test_lifecycle_module_purity.py`. Do not weaken these tests to make a feature fit — move file/JSON code into `flywheel.loaders` instead.
+- **IMPORTANT: `flywheel_core.task` and `flywheel_core.lifecycle` are pure.** No `json`/`pathlib`/`io` imports, no `open()`. Enforced by `packages/flywheel-core/tests/test_task_module_purity.py` and `test_lifecycle_module_purity.py`. Do not weaken these tests to make a feature fit — move file/JSON code into `flywheel_core.loaders` instead.
 - **IMPORTANT: `Task` is input-source agnostic.** Direct dataclass construction is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source. See memory `feedback_task_schema_input_agnostic.md`.
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.

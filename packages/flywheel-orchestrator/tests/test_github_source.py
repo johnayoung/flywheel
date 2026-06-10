@@ -13,8 +13,8 @@ import json
 
 import pytest
 
-from flywheel import Status
-from flywheel.task import CommandGrader
+from flywheel_core import Status
+from flywheel_core.task import CommandGrader
 from flywheel_orchestrator import (
     GithubWorkSource,
     GraderReceipt,

@@ -1,4 +1,4 @@
-"""Contract tests for :func:`flywheel.harness.recheck_blocked_lifecycle`.
+"""Contract tests for :func:`flywheel_core.harness.recheck_blocked_lifecycle`.
 
 The recheck primitive re-evaluates a blocked lifecycle's persisted
 ``requires`` predicates against the worker CWD/env and, when every
@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     CommandGraderRequirement,
     EnvVarSetRequirement,

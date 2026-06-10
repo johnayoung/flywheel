@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.store_memory as store_memory_module
+import flywheel_core.store_memory as store_memory_module
 
 
 # The in-memory store is the test substrate — durable persistence belongs
@@ -38,7 +38,7 @@ def test_in_memory_store_module_has_no_persistence_or_file_imports() -> None:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
     assert not leaked, (
-        f"flywheel.store_memory imports forbidden modules: {leaked}"
+        f"flywheel_core.store_memory imports forbidden modules: {leaked}"
     )
 
 
@@ -47,6 +47,6 @@ def test_in_memory_store_module_does_not_call_open() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.store_memory calls forbidden builtin "
+                f"flywheel_core.store_memory calls forbidden builtin "
                 f"{node.func.id!r}"
             )

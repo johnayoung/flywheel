@@ -1,4 +1,4 @@
-"""Behavioral tests for ``flywheel.grader_manual``.
+"""Behavioral tests for ``flywheel_core.grader_manual``.
 
 Covers the pure gate-selection contract (``next_pending_manual_gate``)
 and the manual receipt assembly contract (``build_manual_result``) per
@@ -11,14 +11,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     ManualGrader,
     RubricGrader,
     Task,
     TranscriptGrader,
 )
-from flywheel.grader_manual import (
+from flywheel_core.grader_manual import (
     ManualGate,
     build_manual_result,
     next_pending_manual_gate,

@@ -20,10 +20,3 @@ postgres = [
 [build-system]
 requires = ["uv_build>=0.8.14,<0.9.0"]
 build-backend = "uv_build"
-
-# Dist name is ``flywheel-core`` but the import module stays ``flywheel`` so
-# every existing ``import flywheel`` site (and the purity tests) keep working
-# unchanged. uv_build derives the module name from the dist by default, so
-# pin it explicitly here.
-[tool.uv.build-backend]
-module-name = "flywheel"

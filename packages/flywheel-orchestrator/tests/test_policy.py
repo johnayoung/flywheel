@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel.task import CommandGrader, TranscriptGrader
+from flywheel_core.task import CommandGrader, TranscriptGrader
 from flywheel_orchestrator import (
     DEFAULT_TASKS_DIR,
     DirectoryWorkSource,

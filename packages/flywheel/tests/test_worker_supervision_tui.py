@@ -25,13 +25,13 @@ from typing import Any
 import pytest
 from textual.widgets import Input, Static
 
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli._dashboard import DashboardApp
-from flywheel_cli._quit_prompt import QuitPromptScreen
-from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
-from flywheel_cli._tui import _build_parser
-from flywheel_cli._worker_supervisor import (
+from flywheel._dashboard import DashboardApp
+from flywheel._quit_prompt import QuitPromptScreen
+from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel._tui import _build_parser
+from flywheel._worker_supervisor import (
     WorkerState,
     WorkerStatus,
     WorkerSupervisor,

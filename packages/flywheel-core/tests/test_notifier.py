@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from flywheel import (
+from flywheel_core import (
     EventRecord,
     InMemoryStore,
     LifecycleInitialized,
@@ -23,7 +23,7 @@ from flywheel import (
     Status,
     TransitionedTo,
 )
-from flywheel.audit import _resolve_notifier, stream
+from flywheel_core.audit import _resolve_notifier, stream
 
 _BASE = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
 

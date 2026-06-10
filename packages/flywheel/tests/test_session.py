@@ -12,12 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.redaction import default_policy
-from flywheel.store_protocols import EventRecord, SdkMessageRecord
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.redaction import default_policy
+from flywheel_core.store_protocols import EventRecord, SdkMessageRecord
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli._session import (
+from flywheel._session import (
     EntryKind,
     TERMINAL_STATUSES,
     TranscriptTailer,

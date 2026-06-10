@@ -1,4 +1,4 @@
-"""Behavioral tests for ``flywheel.grader_rubric``.
+"""Behavioral tests for ``flywheel_core.grader_rubric``.
 
 Two layers are exercised:
 
@@ -27,7 +27,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     CommandGrader,
     InMemoryStore,
@@ -37,7 +37,7 @@ from flywheel import (
     Task,
     TranscriptGrader,
 )
-from flywheel.grader_rubric import (
+from flywheel_core.grader_rubric import (
     CLOSING_FENCE,
     OPENING_FENCE,
     DuplicateVerdict,
@@ -648,7 +648,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel.grader_rubric._sdk_query", fake_query
+            "flywheel_core.grader_rubric._sdk_query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -689,7 +689,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel.grader_rubric._sdk_query", fake_query
+            "flywheel_core.grader_rubric._sdk_query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -718,7 +718,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel.grader_rubric._sdk_query", fake_query
+            "flywheel_core.grader_rubric._sdk_query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -745,7 +745,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel.grader_rubric._sdk_query", fake_query
+            "flywheel_core.grader_rubric._sdk_query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -778,7 +778,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel.grader_rubric._sdk_query", fake_query
+            "flywheel_core.grader_rubric._sdk_query", fake_query
         )
 
         invoker = _make_default_judge_invoke(

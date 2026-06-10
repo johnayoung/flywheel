@@ -1,4 +1,4 @@
-"""Tests for the ``flywheel.audit`` streaming reader and logger emitter.
+"""Tests for the ``flywheel_core.audit`` streaming reader and logger emitter.
 
 The spec lists five acceptance criteria for this module; this file
 covers each one against the in-memory store substrate so the library
@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     AuditLoggerHandle,
     EventRecord,
     InMemoryStore,
@@ -32,7 +32,7 @@ from flywheel import (
     attach_logger,
     stream,
 )
-from flywheel.audit._cli import (
+from flywheel_core.audit._cli import (
     PREVIEW_MAX_CHARS,
     TRUNCATION_HINT,
     main as cli_main,
@@ -406,9 +406,9 @@ def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
     the public ``stream`` reader operators actually consume.
     """
 
-    from flywheel.grader_manual import ManualGate
-    from flywheel.harness import _enter_manual_gate
-    from flywheel.lifecycle import Attempt, Outcome
+    from flywheel_core.grader_manual import ManualGate
+    from flywheel_core.harness import _enter_manual_gate
+    from flywheel_core.lifecycle import Attempt, Outcome
 
     store = _make_store_with_lifecycle("run-await")
     # Drive RUNNING -> VALIDATING so the in-memory version matches the
@@ -469,12 +469,12 @@ def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
     assert awaiting[0].attempt_number == 1
 
 
-# --- python -m flywheel.audit CLI -------------------------------------------
+# --- python -m flywheel_core.audit CLI -------------------------------------------
 #
 # These tests carry the keyword "cli" so ``pytest -k cli`` selects only
 # the CLI surface. They write fixtures into a SqliteStore (the canonical
 # durable backend) and exercise the CLI via either ``cli_main`` for
-# speed or a real ``python -m flywheel.audit`` subprocess for the
+# speed or a real ``python -m flywheel_core.audit`` subprocess for the
 # end-to-end integration acceptance criterion.
 
 
@@ -551,7 +551,7 @@ def _run_cli(
 
     Returns ``(exit_code, stdout, stderr)``. Faster than spawning a
     subprocess; used by every test that doesn't specifically assert the
-    ``python -m flywheel.audit`` boot path.
+    ``python -m flywheel_core.audit`` boot path.
     """
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -562,7 +562,7 @@ def _run_cli(
 def test_cli_default_mode_prints_records_in_chronological_order_via_subprocess(
     tmp_path: Path,
 ) -> None:
-    """End-to-end: ``python -m flywheel.audit`` against a SqliteStore.
+    """End-to-end: ``python -m flywheel_core.audit`` against a SqliteStore.
 
     This is the spec's named integration test -- it opens a tmp sqlite
     db, writes a fixture run, and invokes the module via subprocess so
@@ -575,7 +575,7 @@ def test_cli_default_mode_prints_records_in_chronological_order_via_subprocess(
         [
             sys.executable,
             "-m",
-            "flywheel.audit",
+            "flywheel_core.audit",
             run_id,
             "--db",
             str(db),
@@ -714,13 +714,13 @@ def test_cli_help_runs_cleanly() -> None:
     """``--help`` is part of the verification harness; ensure it exits 0
     and emits something on stdout."""
     completed = subprocess.run(
-        [sys.executable, "-m", "flywheel.audit", "--help"],
+        [sys.executable, "-m", "flywheel_core.audit", "--help"],
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 0
-    assert "python -m flywheel.audit" in completed.stdout
+    assert "python -m flywheel_core.audit" in completed.stdout
     # Spec-required flags are documented.
     assert "--json" in completed.stdout
     assert "--follow" in completed.stdout

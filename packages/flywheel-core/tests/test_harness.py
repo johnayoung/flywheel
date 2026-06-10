@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`flywheel.harness`.
+"""Contract tests for :mod:`flywheel_core.harness`.
 
 Each test injects a stub ``invoke`` callable returning canned
 :class:`IterationResult` instances rather than spawning a real agent.
@@ -27,7 +27,7 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     CommandGrader,
     HarnessConfig,
@@ -47,25 +47,25 @@ from flywheel import (
     replay,
     run_task,
 )
-from flywheel.grader_rubric import (
+from flywheel_core.grader_rubric import (
     CLOSING_FENCE as RUBRIC_CLOSING_FENCE,
 )
-from flywheel.grader_rubric import (
+from flywheel_core.grader_rubric import (
     OPENING_FENCE as RUBRIC_OPENING_FENCE,
 )
-from flywheel.grader_rubric import (
+from flywheel_core.grader_rubric import (
     RubricJudgeError,
 )
-from flywheel.harness import (
+from flywheel_core.harness import (
     _build_observation,
     _build_usage_breakdown,
     _handle_interrupt,
     finalize_stranded_lifecycle,
 )
-from flywheel.invoker import ToolInteraction, ToolResultObservation
-from flywheel.loop_guard import LoopGuardConfig
-from flywheel.loaders import task_digest
-from flywheel.envelope import (
+from flywheel_core.invoker import ToolInteraction, ToolResultObservation
+from flywheel_core.loop_guard import LoopGuardConfig
+from flywheel_core.loaders import task_digest
+from flywheel_core.envelope import (
     CLOSING_FENCE,
     CommandGraderRequirement,
     DuplicateEnvelope,
@@ -900,7 +900,7 @@ class TestSoleOwnerOfTransitions:
         """
         import ast
 
-        src_root = Path(__file__).resolve().parents[1] / "src" / "flywheel"
+        src_root = Path(__file__).resolve().parents[1] / "src" / "flywheel_core"
         violations: list[tuple[str, int]] = []
         for py in src_root.glob("*.py"):
             if py.name in ("lifecycle.py", "harness.py"):
@@ -926,7 +926,7 @@ class TestSoleOwnerOfTransitions:
         """
         import ast
 
-        src_root = Path(__file__).resolve().parents[1] / "src" / "flywheel"
+        src_root = Path(__file__).resolve().parents[1] / "src" / "flywheel_core"
         violations: list[tuple[str, int]] = []
         for py in src_root.glob("*.py"):
             if py.name == "lifecycle.py":
@@ -2487,7 +2487,7 @@ class TestDeferredSubsystems:
         that these remain TODO. Confirms the list is present and matches
         the spec.
         """
-        from flywheel import harness as harness_module
+        from flywheel_core import harness as harness_module
 
         expected = {
             "thrash net-diff detection (sub-problem b)",
@@ -3384,8 +3384,8 @@ class TestResolveManualApproval:
     def test_approve_single_gate_reaches_done_with_passed_receipt(
         self,
     ) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_APPROVE
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_APPROVE
 
         store, task, lifecycle = self._park_single_gate()
         # Snapshot the attempt outcome the gate-entry path finalized so
@@ -3458,8 +3458,8 @@ class TestResolveManualApproval:
     def test_approve_multi_gate_reparks_then_final_approve_reaches_done(
         self,
     ) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_APPROVE
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_APPROVE
 
         store, task, lifecycle = self._park_two_gates()
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3534,7 +3534,7 @@ class TestResolveManualApproval:
         assert attempts[0].outcome == Outcome.SUCCEEDED
 
     def test_resolver_noop_when_no_pending_command_keeps_park(self) -> None:
-        from flywheel import resolve_manual_approval
+        from flywheel_core import resolve_manual_approval
 
         store, task, lifecycle = self._park_single_gate(
             run_id="run-resolver-idle"
@@ -3567,7 +3567,7 @@ class TestResolveManualApproval:
         assert approved == []
 
     def test_resolver_noop_when_lifecycle_not_awaiting(self) -> None:
-        from flywheel import resolve_manual_approval
+        from flywheel_core import resolve_manual_approval
 
         # Drive an automated-pass-no-manual lifecycle straight to DONE
         # so the resolver sees a non-AWAITING_APPROVAL status.
@@ -3601,8 +3601,8 @@ class TestResolveManualApproval:
     # --- FR-6: reject ----------------------------------------------------
 
     def test_reject_with_retries_remaining_transitions_to_ready(self) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store, task, lifecycle = self._park_single_gate(
             run_id="run-reject-retry"
@@ -3682,8 +3682,8 @@ class TestResolveManualApproval:
         assert applied_events[0].payload["kind"] == "reject"
 
     def test_reject_with_retries_exhausted_reaches_failed(self) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store, task, lifecycle = self._park_single_gate(
             run_id="run-reject-fail"
@@ -3737,8 +3737,8 @@ class TestResolveManualApproval:
         assert manual_rows[0].payload["summary"] == "not good enough"
 
     def test_reject_on_first_gate_skips_subsequent_gates(self) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store, task, lifecycle = self._park_two_gates(
             run_id="run-reject-short-circuit"
@@ -3784,8 +3784,8 @@ class TestResolveManualApproval:
         )
 
     def test_reject_with_absent_feedback_records_placeholder(self) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store, task, lifecycle = self._park_single_gate(
             run_id="run-reject-no-feedback"
@@ -3826,8 +3826,8 @@ class TestResolveManualApproval:
         assert rejected[0].payload["feedback"] == "(no feedback provided)"
 
     def test_reject_with_empty_feedback_records_placeholder(self) -> None:
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store, task, lifecycle = self._park_single_gate(
             run_id="run-reject-empty-feedback"
@@ -3877,8 +3877,8 @@ class TestResolveManualApproval:
            ``_collect_prior_manual_findings`` and the renderer emits the
            operator-labeled bullet.
         """
-        from flywheel import resolve_manual_approval
-        from flywheel.invoker_client import CONTROL_COMMAND_REJECT
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store = InMemoryStore()
         task = Task(
@@ -4504,8 +4504,8 @@ class TestLoopGuardAuditStream:
     """FR-7: harness.stuck / harness.thrash_detected round-trip via audit."""
 
     def test_stuck_event_round_trips_through_audit_stream(self) -> None:
-        from flywheel.audit import stream as audit_stream
-        from flywheel.store_protocols import EventRecord
+        from flywheel_core.audit import stream as audit_stream
+        from flywheel_core.store_protocols import EventRecord
 
         store = InMemoryStore()
         task = Task(
@@ -4556,8 +4556,8 @@ class TestLoopGuardAuditStream:
         assert len(stuck[0].payload["input_digest"]) == 64
 
     def test_thrash_event_round_trips_through_audit_stream(self) -> None:
-        from flywheel.audit import stream as audit_stream
-        from flywheel.store_protocols import EventRecord
+        from flywheel_core.audit import stream as audit_stream
+        from flywheel_core.store_protocols import EventRecord
 
         store = InMemoryStore()
         task = Task(
@@ -4643,7 +4643,7 @@ def _ratelimit_event(uuid_: str) -> RateLimitEvent:
 class TestHangWatchdog:
     """FR-3: hang watchdog -> internal_error; FR-4: disambiguated from the
     operator-interrupt path; FR-7: harness.hang_detected round-trips
-    through ``flywheel.audit.stream``.
+    through ``flywheel_core.audit.stream``.
 
     Drives the timing comparison via a controllable monotonic clock and
     the existing ``on_message`` seam rather than real wall-clock sleeps,
@@ -4944,10 +4944,10 @@ class TestHangWatchdog:
 
     def test_hang_detected_round_trips_through_audit_stream(self) -> None:
         # FR-7 acceptance: harness.hang_detected persists through the
-        # store and reads back via flywheel.audit.stream under the per-run
+        # store and reads back via flywheel_core.audit.stream under the per-run
         # monotonic sequence.
-        from flywheel.audit import stream as audit_stream
-        from flywheel.store_protocols import EventRecord
+        from flywheel_core.audit import stream as audit_stream
+        from flywheel_core.store_protocols import EventRecord
 
         store = InMemoryStore()
         task = Task(goal="g", graders=[])
@@ -5017,8 +5017,8 @@ class TestHangWatchdog:
 # --- Context-recovery policy (spec 00018) ---------------------------------
 
 
-from flywheel.prompt import RecoveryHandoff
-from flywheel.recovery_summarizer import (
+from flywheel_core.prompt import RecoveryHandoff
+from flywheel_core.recovery_summarizer import (
     CLOSING_FENCE as RECOVERY_CLOSING_FENCE,
     OPENING_FENCE as RECOVERY_OPENING_FENCE,
 )
@@ -5908,7 +5908,7 @@ class TestMidTurnContextObserve:
 # --- Mid-turn context-recovery act (spec 00019) --------------------------
 
 
-from flywheel.invoker_client import HarnessRecoveryRequested
+from flywheel_core.invoker_client import HarnessRecoveryRequested
 
 
 def _scripted_invoker_midturn_act(

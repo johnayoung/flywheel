@@ -1,10 +1,11 @@
 # uv workspace root (virtual — not a package itself).
 #
 # The hard line between flywheel-core and what is built on top is drawn here,
-# in the package tree:
+# in the package tree. Every dist name matches its import name (dashes to
+# underscores) — ``packages/<dist>/src/<import>``:
 #
 #   packages/flywheel-core           core: the lifecycle of a SINGLE task.
-#                                    dist ``flywheel-core``, module ``flywheel``.
+#                                    module ``flywheel_core``.
 #   packages/flywheel-orchestrator   built on top: drives MANY tasks (selection,
 #                                    DAG, claims, multi-worker). depends on
 #                                    flywheel-core.
@@ -14,9 +15,8 @@
 #   packages/flywheel                top of stack: the `flywheel` / `fw` shell --
 #                                    verb router plus the operator console
 #                                    (dashboard + session + persistent input
-#                                    bar). dist ``flywheel``, module
-#                                    ``flywheel_cli``. depends on the three
-#                                    above.
+#                                    bar). module ``flywheel``. depends on the
+#                                    three above.
 #
 # Dependency arrows point one way only; core imports nothing downstream.
 

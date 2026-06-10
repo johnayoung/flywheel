@@ -1,4 +1,4 @@
-"""Tests for the pure :mod:`flywheel_cli._snapshot` collector.
+"""Tests for the pure :mod:`flywheel._snapshot` collector.
 
 These exercise the snapshot shape against a real SqliteStore so the
 ``--json`` and Textual surfaces share the same data path the
@@ -10,12 +10,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.store_protocols import EventRecord
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_protocols import EventRecord
+from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import DirectoryWorkSource
 
-from flywheel_cli._snapshot import build_snapshot, snapshot_to_dict
+from flywheel._snapshot import build_snapshot, snapshot_to_dict
 
 
 def _seed_running(store: SqliteStore, task_id: str) -> Lifecycle:

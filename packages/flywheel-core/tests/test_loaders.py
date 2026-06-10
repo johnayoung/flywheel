@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CommandGrader,
     Context,
     ManualGrader,
@@ -16,7 +16,7 @@ from flywheel import (
     load_task_file,
     load_tasks_jsonl,
 )
-from flywheel.loaders import deserialize_task, serialize_task, task_digest
+from flywheel_core.loaders import deserialize_task, serialize_task, task_digest
 
 
 def _well_formed() -> dict:
@@ -448,7 +448,7 @@ def test_load_task_file_rejects_non_string_judge_model(tmp_path: Path) -> None:
 
 
 def test_load_task_data_builds_validated_task() -> None:
-    from flywheel import load_task_data
+    from flywheel_core import load_task_data
 
     task = load_task_data(
         {
@@ -463,7 +463,7 @@ def test_load_task_data_builds_validated_task() -> None:
 
 
 def test_load_task_data_errors_cite_the_source_label() -> None:
-    from flywheel import load_task_data
+    from flywheel_core import load_task_data
 
     with pytest.raises(TaskLoadError) as exc:
         load_task_data({"goal": "", "graders": []}, source="issue#42")
@@ -471,7 +471,7 @@ def test_load_task_data_errors_cite_the_source_label() -> None:
 
 
 def test_load_graders_applies_grader_validation() -> None:
-    from flywheel import load_graders
+    from flywheel_core import load_graders
 
     graders = load_graders(
         [
@@ -498,7 +498,7 @@ def test_load_graders_applies_grader_validation() -> None:
 
 def test_direct_task_construction_remains_unchanged() -> None:
     # No loader involvement; identical to roadmap-01-task-dataclass behavior.
-    from flywheel import Context
+    from flywheel_core import Context
 
     task = Task(
         goal="Direct.",

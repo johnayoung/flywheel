@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.store_protocols as store_protocols_module
+import flywheel_core.store_protocols as store_protocols_module
 
 
 FORBIDDEN_IMPORTS = {
@@ -37,7 +37,7 @@ def test_store_protocols_module_has_no_io_or_persistence_imports() -> None:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
     assert not leaked, (
-        f"flywheel.store_protocols imports forbidden modules: {leaked}"
+        f"flywheel_core.store_protocols imports forbidden modules: {leaked}"
     )
 
 
@@ -46,6 +46,6 @@ def test_store_protocols_module_does_not_call_open_or_file_apis() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.store_protocols calls forbidden builtin "
+                f"flywheel_core.store_protocols calls forbidden builtin "
                 f"{node.func.id!r}"
             )

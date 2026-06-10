@@ -1,6 +1,6 @@
 import pytest
 
-from flywheel.envelope import (
+from flywheel_core.envelope import (
     CLOSING_FENCE,
     OPENING_FENCE,
     CommandGraderRequirement,

@@ -1,4 +1,4 @@
-"""Behavioural tests for :mod:`flywheel.prompt`.
+"""Behavioural tests for :mod:`flywheel_core.prompt`.
 
 Covers determinism, content surface (goal / context / graders /
 lifecycle), envelope-contract fidelity, and lifecycle-state reflection
@@ -7,7 +7,7 @@ between a first-attempt prompt and a retry prompt.
 
 from datetime import datetime, timezone
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     CommandGrader,
     Context,
@@ -21,8 +21,8 @@ from flywheel import (
     TranscriptGrader,
     build_iteration_prompt,
 )
-from flywheel.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
-from flywheel.prompt import ManualFinding, RubricFindings
+from flywheel_core.envelope import CLOSING_FENCE, Intent, OPENING_FENCE
+from flywheel_core.prompt import ManualFinding, RubricFindings
 
 
 def _minimal_task() -> Task:

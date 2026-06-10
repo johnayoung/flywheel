@@ -1,4 +1,4 @@
-"""Memory-backend-specific tests for ``flywheel.store_memory.InMemoryStore``.
+"""Memory-backend-specific tests for ``flywheel_core.store_memory.InMemoryStore``.
 
 The shared protocol contract — round-trips, ordering, optimistic
 concurrency, append-only enforcement — runs against every backend from
@@ -9,7 +9,7 @@ persistence) and would not make sense to parametrize over backends.
 
 from __future__ import annotations
 
-from flywheel import InMemoryStore, Lifecycle, Status
+from flywheel_core import InMemoryStore, Lifecycle, Status
 
 
 def test_two_in_memory_stores_have_independent_state() -> None:

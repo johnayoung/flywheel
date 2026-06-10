@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.strategy as strategy_module
+import flywheel_core.strategy as strategy_module
 
 
 FORBIDDEN_IMPORTS = {
@@ -35,12 +35,12 @@ def test_strategy_module_has_no_subprocess_git_or_network_imports() -> None:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
     assert not leaked, (
-        f"flywheel.strategy imports forbidden modules: {leaked}"
+        f"flywheel_core.strategy imports forbidden modules: {leaked}"
     )
 
 
 def test_strategy_module_namespace_exposes_no_forbidden_apis() -> None:
     for name in FORBIDDEN_IMPORTS:
         assert not hasattr(strategy_module, name), (
-            f"flywheel.strategy unexpectedly exposes {name!r}"
+            f"flywheel_core.strategy unexpectedly exposes {name!r}"
         )

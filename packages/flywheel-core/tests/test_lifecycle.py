@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     Lifecycle,
     LifecycleTransitionError,

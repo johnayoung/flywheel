@@ -7,11 +7,11 @@ those live in ``tests/test_harness.py::TestContextRecovery`` and
 thing it does, is drive a fixture through the real production loop so
 the shipped summarize-restart path is observed end-to-end:
 
-* The real ``flywheel.harness.run_task`` runs the attempts.
-* A real ``flywheel.store_sqlite.SqliteStore`` persists every event,
+* The real ``flywheel_core.harness.run_task`` runs the attempts.
+* A real ``flywheel_core.store_sqlite.SqliteStore`` persists every event,
   attempt, and lifecycle row. We assert against what is on disk, not
   what the harness happened to return.
-* The real ``flywheel.recovery_summarizer.run_recovery_summarizer`` is
+* The real ``flywheel_core.recovery_summarizer.run_recovery_summarizer`` is
   invoked through ``HarnessConfig.recovery_summarizer_invoke`` -- the
   same seam production uses. Only the summarizer's response text is
   scripted (a well-formed handoff envelope); the runner that parses
@@ -45,7 +45,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     HarnessConfig,
     Intent,
     InvocationRequest,
@@ -58,14 +58,14 @@ from flywheel import (
     ValidEnvelope,
     run_task,
 )
-from flywheel.prompt import RecoveryHandoff
-from flywheel.recovery_summarizer import (
+from flywheel_core.prompt import RecoveryHandoff
+from flywheel_core.recovery_summarizer import (
     CLOSING_FENCE as RECOVERY_CLOSING_FENCE,
 )
-from flywheel.recovery_summarizer import (
+from flywheel_core.recovery_summarizer import (
     OPENING_FENCE as RECOVERY_OPENING_FENCE,
 )
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.store_sqlite import SqliteStore
 
 
 # --- Scripted SDK message helpers -----------------------------------------

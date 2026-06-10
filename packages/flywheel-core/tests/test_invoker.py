@@ -26,7 +26,7 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from flywheel.envelope import (
+from flywheel_core.envelope import (
     CLOSING_FENCE,
     OPENING_FENCE,
     Intent,
@@ -34,7 +34,7 @@ from flywheel.envelope import (
     TruncatedEnvelope,
     ValidEnvelope,
 )
-from flywheel.invoker import (
+from flywheel_core.invoker import (
     InvocationSignals,
     IterationResult,
     ToolInteraction,
@@ -391,7 +391,7 @@ class TestInvokerScope:
         import ast
         import inspect
 
-        import flywheel.invoker as invoker_module
+        import flywheel_core.invoker as invoker_module
 
         source_path = inspect.getsourcefile(invoker_module)
         assert source_path is not None
@@ -409,12 +409,12 @@ class TestInvokerScope:
         # task definitions. Those concerns are deferred to later roadmap
         # items.
         forbidden = {
-            "flywheel.lifecycle",
-            "flywheel.loaders",
-            "flywheel.store_memory",
-            "flywheel.store_sqlite",
-            "flywheel.store_protocols",
-            "flywheel.task",
+            "flywheel_core.lifecycle",
+            "flywheel_core.loaders",
+            "flywheel_core.store_memory",
+            "flywheel_core.store_sqlite",
+            "flywheel_core.store_protocols",
+            "flywheel_core.task",
         }
         leaked = imported & forbidden
         assert not leaked, f"invoker leaked imports: {leaked}"
@@ -423,7 +423,7 @@ class TestInvokerScope:
         import ast
         import inspect
 
-        import flywheel.invoker as invoker_module
+        import flywheel_core.invoker as invoker_module
 
         source_path = inspect.getsourcefile(invoker_module)
         assert source_path is not None
@@ -433,11 +433,11 @@ class TestInvokerScope:
         tree = ast.parse(source)
         delegates = False
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "flywheel.envelope":
+            if isinstance(node, ast.ImportFrom) and node.module == "flywheel_core.envelope":
                 for alias in node.names:
                     if alias.name == "parse_envelope":
                         delegates = True
-        assert delegates, "invoker must import parse_envelope from flywheel.envelope"
+        assert delegates, "invoker must import parse_envelope from flywheel_core.envelope"
 
 
 # --- SDK message capture --------------------------------------------------

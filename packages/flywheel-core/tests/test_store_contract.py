@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     Attempt,
     AttemptFinalized,
     AttemptStarted,
@@ -78,7 +78,7 @@ def store(
     else:
         if postgres_dsn is None:
             pytest.skip("Postgres backend skipped: no database reachable")
-        from flywheel import PostgresStore
+        from flywheel_core import PostgresStore
 
         instance = PostgresStore(
             postgres_dsn,

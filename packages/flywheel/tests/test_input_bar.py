@@ -22,12 +22,12 @@ from typing import Any
 
 from textual.widgets import DataTable, Input, Static
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli._dashboard import DashboardApp
-from flywheel_cli._session_screen import SessionScreen, SessionStatus
-from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel._dashboard import DashboardApp
+from flywheel._session_screen import SessionScreen, SessionStatus
+from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 
 def _run(coro: Callable[[], Coroutine[Any, Any, None]]) -> None:

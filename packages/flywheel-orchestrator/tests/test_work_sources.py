@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
-from flywheel import (
+from flywheel_core import (
     Intent,
     InvocationRequest,
     InvocationSignals,
@@ -25,8 +25,8 @@ from flywheel import (
     Status,
     ValidEnvelope,
 )
-from flywheel.store_sqlite import SqliteStore
-from flywheel.task import CommandGrader, Task
+from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.task import CommandGrader, Task
 from flywheel_orchestrator import (
     DirectoryWorkSource,
     WorkItem,

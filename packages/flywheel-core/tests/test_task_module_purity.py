@@ -1,7 +1,7 @@
 import ast
 import inspect
 
-import flywheel.task as task_module
+import flywheel_core.task as task_module
 
 
 FORBIDDEN_IMPORTS = {"json", "pathlib", "io"}
@@ -26,7 +26,7 @@ def test_task_module_has_no_file_or_stream_imports() -> None:
             if node.module:
                 seen.add(node.module.split(".")[0])
     leaked = seen & FORBIDDEN_IMPORTS
-    assert not leaked, f"flywheel.task imports forbidden modules: {leaked}"
+    assert not leaked, f"flywheel_core.task imports forbidden modules: {leaked}"
 
 
 def test_task_module_does_not_call_open_or_file_apis() -> None:
@@ -34,12 +34,12 @@ def test_task_module_does_not_call_open_or_file_apis() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             assert node.func.id not in FORBIDDEN_BUILTINS, (
-                f"flywheel.task calls forbidden builtin {node.func.id!r}"
+                f"flywheel_core.task calls forbidden builtin {node.func.id!r}"
             )
 
 
 def test_task_dataclass_constructor_takes_no_path_or_payload_args() -> None:
-    from flywheel.task import Task
+    from flywheel_core.task import Task
 
     field_names = {f.name for f in Task.__dataclass_fields__.values()}
     for forbidden in {"path", "file", "filename", "filepath", "payload", "raw", "json", "source"}:

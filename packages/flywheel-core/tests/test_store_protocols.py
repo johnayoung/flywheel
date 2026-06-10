@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from flywheel import (
+from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
     AttemptStore,

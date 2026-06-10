@@ -1,4 +1,4 @@
-"""Contract tests for :mod:`flywheel.invoker_client`.
+"""Contract tests for :mod:`flywheel_core.invoker_client`.
 
 The client-based invoker is the production path for the workflow CLI:
 it opens a :class:`claude_agent_sdk.ClaudeSDKClient`, runs a watcher
@@ -27,8 +27,8 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel.envelope import CLOSING_FENCE, OPENING_FENCE, Intent, ValidEnvelope
-from flywheel.invoker_client import (
+from flywheel_core.envelope import CLOSING_FENCE, OPENING_FENCE, Intent, ValidEnvelope
+from flywheel_core.invoker_client import (
     CONTROL_COMMAND_APPROVE,
     CONTROL_COMMAND_INTERRUPT,
     CONTROL_COMMAND_REJECT,
@@ -41,7 +41,7 @@ from flywheel.invoker_client import (
     HarnessRecoveryRequested,
     invoke_iteration_with_client,
 )
-from flywheel.store_memory import InMemoryStore
+from flywheel_core.store_memory import InMemoryStore
 
 
 def _wrap_envelope(payload: str) -> str:

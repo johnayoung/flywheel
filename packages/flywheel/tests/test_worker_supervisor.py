@@ -1,4 +1,4 @@
-"""Tests for :mod:`flywheel_cli._worker_supervisor`.
+"""Tests for :mod:`flywheel._worker_supervisor`.
 
 Drives :class:`WorkerSupervisor` with a trivial child process (a
 Python one-liner that sleeps) so the supervisor's ownership /
@@ -23,7 +23,7 @@ import pytest
 
 from flywheel_orchestrator import SqliteClaimStore
 
-from flywheel_cli._worker_supervisor import (
+from flywheel._worker_supervisor import (
     DEFAULT_STOP_TIMEOUT_SECONDS,
     WorkerState,
     WorkerStatus,
@@ -83,7 +83,7 @@ def test_has_live_lease_returns_false_for_db_without_claims_table(
     (only ``SqliteStore`` was bootstrapped) reports no live worker."""
 
     db = tmp_path / "core-only.sqlite"
-    from flywheel.store_sqlite import SqliteStore
+    from flywheel_core.store_sqlite import SqliteStore
 
     SqliteStore(db).close()
     assert has_live_lease(db) is False

@@ -14,16 +14,9 @@ dependencies = [
 ]
 
 [project.scripts]
-flywheel = "flywheel_cli._cli:main"
-fw = "flywheel_cli._cli:main"
+flywheel = "flywheel._cli:main"
+fw = "flywheel._cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.14,<0.9.0"]
 build-backend = "uv_build"
-
-# Dist name is ``flywheel`` (the product) but the import module is
-# ``flywheel_cli`` so it never collides with the core ``flywheel`` module
-# shipped by ``flywheel-core``. uv_build would otherwise derive the module
-# name from the dist; pin it explicitly.
-[tool.uv.build-backend]
-module-name = "flywheel_cli"

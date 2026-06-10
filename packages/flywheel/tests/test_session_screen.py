@@ -1,4 +1,4 @@
-"""Pilot-driven tests for :class:`flywheel_cli._session_screen.SessionScreen`.
+"""Pilot-driven tests for :class:`flywheel._session_screen.SessionScreen`.
 
 The screen receives ``fetch`` / ``status`` callables so these tests
 drive deterministic frames without touching SQLite (the cursor and
@@ -23,13 +23,13 @@ from typing import Any
 from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Input, Static
 
-from flywheel.lifecycle import Lifecycle, Status
-from flywheel.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_sqlite import SqliteStore
 
-from flywheel_cli._dashboard import DashboardApp
-from flywheel_cli._session import EntryKind, TranscriptEntry, TranscriptTailer
-from flywheel_cli._session_screen import SessionScreen, SessionStatus
-from flywheel_cli._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel._dashboard import DashboardApp
+from flywheel._session import EntryKind, TranscriptEntry, TranscriptTailer
+from flywheel._session_screen import SessionScreen, SessionStatus
+from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 
 
 def _run(coro: Callable[[], Coroutine[Any, Any, None]]) -> None:

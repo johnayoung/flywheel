@@ -501,6 +501,7 @@ def _make_claude_code_invoke(
             on_message=composed,
             context_observer=request.context_observer,
             recovery_interrupt_event=request.recovery_interrupt_event,
+            on_applied=request.on_command_applied,
         )
 
     return _invoke

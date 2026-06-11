@@ -1334,3 +1334,218 @@ class TestHarnessRecoveryInterrupt:
             assert client.interrupt_calls == 0
 
         asyncio.run(_run())
+
+
+class TestSteeringLedgerSeam:
+    """``on_applied`` fires once per successfully dispatched command.
+
+    The seam is how the harness ledgers steering (spec 00025 FR-10):
+    failed dispatches and not-applicable verbs never reach it, a raising
+    callback never breaks the drain, and an ``interrupt`` reaches it
+    before the cancellation propagates so the ledger fact lands even
+    when the tick stops the run.
+    """
+
+    def test_on_applied_receives_each_dispatched_command(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_SAY,
+            {"text": "steer"},
+            now=datetime.now(timezone.utc),
+        )
+        applied: list[Any] = []
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    on_applied=applied.append,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert len(applied) == 1
+        assert applied[0].kind == CONTROL_COMMAND_SAY
+        assert dict(applied[0].payload) == {"text": "steer"}
+        assert applied[0].id is not None
+
+    def test_on_applied_skipped_when_dispatch_fails(self) -> None:
+        """Edge case (spec 00025 FR-10): a claimed command whose SDK
+        application fails leaves no ledger record -- the row stays
+        claimed in the store as the visible trace."""
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+            set_model_should_raise=RuntimeError("transport down"),
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_SET_MODEL,
+            {"model": "claude-opus-4-8"},
+            now=datetime.now(timezone.utc),
+        )
+        applied: list[Any] = []
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    on_applied=applied.append,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert applied == []
+        kinds = [kind for kind, _ in audit_log]
+        assert EVENT_CONTROL_FAILED in kinds
+        # The claimed row is retained: a fresh claim sweep returns
+        # nothing (claim-once), so the row's continued existence is the
+        # visible trace of the failed application.
+        assert store.claim_commands("run-1", now=datetime.now(timezone.utc)) == []
+
+    def test_on_applied_skipped_for_not_applicable_verbs(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        applied: list[Any] = []
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    on_applied=applied.append,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert applied == []
+
+    def test_raising_on_applied_does_not_break_the_drain(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_SAY,
+            {"text": "steer"},
+            now=datetime.now(timezone.utc),
+        )
+        audit_log, emit = _make_audit()
+
+        def _explode(_command: Any) -> None:
+            raise RuntimeError("ledger offline")
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    on_applied=_explode,
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == ["steer"]
+        kinds = [kind for kind, _ in audit_log]
+        assert EVENT_CONTROL_APPLIED in kinds
+
+    def test_interrupt_reaches_on_applied_before_cancellation(self) -> None:
+        gate = asyncio.Event()  # never set: only the interrupt exits.
+        client = _FakeClient(
+            messages=[_assistant_text("never-emitted"), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        store.enqueue_command(
+            "run-1",
+            CONTROL_COMMAND_INTERRUPT,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+        applied: list[Any] = []
+
+        async def _run() -> None:
+            with pytest.raises(asyncio.CancelledError):
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    on_applied=applied.append,
+                )
+
+        asyncio.run(_run())
+        assert [c.kind for c in applied] == [CONTROL_COMMAND_INTERRUPT]

@@ -32,6 +32,7 @@ from flywheel_core import (
     AttemptFinalized,
     AttemptStarted,
     AttemptStore,
+    CommandApplied,
     ControlCommandStore,
     DomainEventStore,
     GraderEvaluated,
@@ -1333,3 +1334,70 @@ def test_control_command_payload_isolated_from_caller_mutations(
     claimed = store.claim_commands("r1", now=_t(1))
     assert len(claimed) == 1
     assert dict(claimed[0].payload) == {"text": "original"}
+
+
+def test_delete_command_removes_the_applied_row(store: object) -> None:
+    """Queue hygiene (spec 00025 FR-10): after the steering domain event
+    commits, the consumer deletes the applied row; a later claim sweep
+    never sees it again."""
+    assert isinstance(store, ControlCommandStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+
+    store.enqueue_command("r1", "say", {"text": "one"}, now=_t(0))
+    store.enqueue_command("r1", "interrupt", {}, now=_t(1))
+    claimed = store.claim_commands("r1", now=_t(2))
+    assert len(claimed) == 2
+
+    applied = claimed[0]
+    assert applied.id is not None
+    store.delete_command(applied.id)
+
+    # The deleted row is gone; the other claimed row is untouched (it
+    # stays claimed, so it never re-enters the pending queue either).
+    assert store.claim_commands("r1", now=_t(3)) == []
+    survivor = claimed[1]
+    assert survivor.id is not None
+    store.delete_command(survivor.id)
+
+
+def test_delete_command_unknown_id_is_noop(store: object) -> None:
+    assert isinstance(store, ControlCommandStore)
+    store.delete_command(987654)
+
+
+def test_command_applied_round_trips_through_the_ledger(
+    store: object,
+) -> None:
+    """The steering ledger fact (spec 00025 FR-10) persists and replays:
+    kind, operator payload, queue-row provenance, and applied-at all
+    survive list_domain_events, and the fold is the identity."""
+    assert isinstance(store, DomainEventStore)
+    _seed(store)
+    store.append_domain_event(
+        CommandApplied(
+            run_id="r1",
+            ts=_dts(1),
+            attempt_number=1,
+            command_kind="say",
+            command_payload={"text": "focus on graders"},
+            command_id=42,
+        ),
+        expected_version=1,
+    )
+
+    events = store.list_domain_events("r1")
+    assert [type(e).__name__ for e in events] == [
+        "LifecycleInitialized",
+        "CommandApplied",
+    ]
+    steering = events[1]
+    assert isinstance(steering, CommandApplied)
+    assert steering.command_kind == "say"
+    assert dict(steering.command_payload) == {"text": "focus on graders"}
+    assert steering.command_id == 42
+    assert steering.ts == _dts(1)
+
+    folded = replay(events)
+    assert folded.status is Status.PENDING
+    assert folded.version == 2

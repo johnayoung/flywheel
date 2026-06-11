@@ -24,6 +24,7 @@ from flywheel_core.events import (
     AttemptStarted,
     AwaitingApproval,
     Blocked,
+    CommandApplied,
     DomainEvent,
     DomainEventKind,
     GraderEvaluated,
@@ -93,6 +94,12 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
             "grader_name": event.grader_name,
             "grader_spec": dict(event.grader_spec),
             "payload": dict(event.payload),
+        }
+    if isinstance(event, CommandApplied):
+        return {
+            "command_kind": event.command_kind,
+            "command_payload": dict(event.command_payload),
+            "command_id": event.command_id,
         }
     raise TypeError(f"cannot serialize unknown domain event {type(event)!r}")
 
@@ -176,6 +183,13 @@ def event_from_record(
             grader_name=payload.get("grader_name"),
             grader_spec=dict(payload.get("grader_spec", {})),
             payload=dict(payload.get("payload", {})),
+            **common,
+        )
+    if event_kind_enum is DomainEventKind.COMMAND_APPLIED:
+        return CommandApplied(
+            command_kind=payload["command_kind"],
+            command_payload=dict(payload.get("command_payload", {})),
+            command_id=payload.get("command_id"),
             **common,
         )
     raise ValueError(f"unknown domain event kind {kind!r}")

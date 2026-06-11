@@ -6716,3 +6716,197 @@ class TestMidTurnContextRecoveryAct:
         # Exactly one boundary recovery, no mid-turn one.
         assert len(recoveries) == 1
         assert recoveries[0].payload["trigger"] == "boundary"
+
+
+# --- Steering ledger (spec 00025 FR-10) -------------------------------------
+
+
+class TestSteeringLedger:
+    """Applying a control command appends a ``CommandApplied`` domain
+    event to the ledger and deletes the applied queue row; an append
+    failure retains the row as the visible trace."""
+
+    def _steering_invoker(
+        self, store: InMemoryStore, run_id: str
+    ) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
+        """Invoker standing in for the live watcher: claims the run's
+        pending commands and feeds each through the harness's
+        ``on_command_applied`` seam before returning the iteration."""
+
+        async def _invoker(request: InvocationRequest) -> IterationResult:
+            claimed = store.claim_commands(
+                run_id, now=datetime.now(timezone.utc)
+            )
+            assert request.on_command_applied is not None
+            for cmd in claimed:
+                request.on_command_applied(cmd)
+            result = _iteration(
+                envelope=ValidEnvelope(intent=Intent.VERIFY),
+                messages=(_assistant(), _result_msg()),
+            )
+            if request.on_message is not None:
+                for msg in result.messages:
+                    request.on_message(msg)
+            return result
+
+        return _invoker
+
+    def test_applied_command_lands_in_ledger_and_clears_queue(self) -> None:
+        from flywheel_core.events import CommandApplied
+
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[_ok_command()])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-steer")
+        store.enqueue_command(
+            "run-steer",
+            "say",
+            {"text": "focus on graders"},
+            now=datetime.now(timezone.utc),
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                invoke=self._steering_invoker(store, "run-steer"),
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        steering = [
+            e
+            for e in store.list_domain_events("run-steer")
+            if isinstance(e, CommandApplied)
+        ]
+        assert len(steering) == 1
+        assert steering[0].command_kind == "say"
+        assert dict(steering[0].command_payload) == {
+            "text": "focus on graders"
+        }
+        assert steering[0].command_id is not None
+        # The applied queue row was deleted after the event committed.
+        assert store._control_commands == []
+        # The ledger fact reached the run stream via the existing
+        # domain-mirror path (no second mirror).
+        mirror_kinds = [r.kind for r in sink.records]
+        assert mirror_kinds.count("domain.command_applied") == 1
+        # Replay over the augmented log still folds to the stored state.
+        folded = replay(store.list_domain_events("run-steer"))
+        assert folded.status == outcome.lifecycle.status
+        assert folded.version == outcome.lifecycle.version
+
+    def test_append_failure_retains_queue_row(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from flywheel_core.events import CommandApplied
+
+        class _LedgerDownStore(InMemoryStore):
+            def append_domain_event(
+                self, event: Any, *, expected_version: int
+            ) -> Lifecycle:
+                if isinstance(event, CommandApplied):
+                    raise RuntimeError("ledger offline")
+                return super().append_domain_event(
+                    event, expected_version=expected_version
+                )
+
+        store = _LedgerDownStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[_ok_command()])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-steer-fail")
+        store.enqueue_command(
+            "run-steer-fail",
+            "say",
+            {"text": "steer"},
+            now=datetime.now(timezone.utc),
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                invoke=self._steering_invoker(store, "run-steer-fail"),
+            )
+        )
+
+        # The run is unaffected; no steering fact was recorded; the
+        # claimed row is retained as the visible trace and the failure
+        # surfaced on stderr.
+        assert outcome.lifecycle.status == Status.DONE
+        assert not any(
+            isinstance(e, CommandApplied)
+            for e in store.list_domain_events("run-steer-fail")
+        )
+        assert len(store._control_commands) == 1
+        assert store._control_commands[0].claimed_at is not None
+        assert "steering ledger append failed" in capsys.readouterr().err
+
+    def test_resolver_approve_ledgers_steering_and_deletes_row(self) -> None:
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.events import CommandApplied
+        from flywheel_core.invoker_client import CONTROL_COMMAND_APPROVE
+
+        helper = TestResolveManualApproval()
+        helper._wt = self._wt
+        store, sink, task, lifecycle = helper._park_single_gate(
+            run_id="run-steer-approve"
+        )
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_APPROVE,
+            {},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(lifecycle, store, task, sink=sink)
+
+        assert result.applied
+        steering = [
+            e
+            for e in store.list_domain_events(lifecycle.run_id)
+            if isinstance(e, CommandApplied)
+        ]
+        assert len(steering) == 1
+        assert steering[0].command_kind == CONTROL_COMMAND_APPROVE
+        assert store._control_commands == []
+
+    def test_resolver_reject_ledgers_steering_and_deletes_row(self) -> None:
+        from flywheel_core import resolve_manual_approval
+        from flywheel_core.events import CommandApplied
+        from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
+
+        helper = TestResolveManualApproval()
+        helper._wt = self._wt
+        store, sink, task, lifecycle = helper._park_single_gate(
+            run_id="run-steer-reject"
+        )
+        store.enqueue_command(
+            lifecycle.run_id,
+            CONTROL_COMMAND_REJECT,
+            {"feedback": "tighten the rollout plan"},
+            now=datetime.now(timezone.utc),
+        )
+
+        result = resolve_manual_approval(lifecycle, store, task, sink=sink)
+
+        assert result.applied
+        steering = [
+            e
+            for e in store.list_domain_events(lifecycle.run_id)
+            if isinstance(e, CommandApplied)
+        ]
+        assert len(steering) == 1
+        assert steering[0].command_kind == CONTROL_COMMAND_REJECT
+        assert dict(steering[0].command_payload) == {
+            "feedback": "tighten the rollout plan"
+        }
+        assert store._control_commands == []
+
+    @pytest.fixture(autouse=True)
+    def _worktree(self, tmp_path: Path) -> None:
+        self._wt = str(tmp_path)

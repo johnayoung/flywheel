@@ -774,6 +774,15 @@ class SqliteStore:
         records.sort(key=lambda r: r.id if r.id is not None else 0)
         return records
 
+    def delete_command(self, command_id: int) -> None:
+        # Queue hygiene (spec 00025 FR-10): the consumer deletes an
+        # applied row only after the steering domain event committed.
+        # Unknown ids are a no-op by contract.
+        self._connection.execute(
+            "DELETE FROM control_commands WHERE id = ?",
+            (command_id,),
+        )
+
 
 # --- Row -> dataclass converters --------------------------------------------
 

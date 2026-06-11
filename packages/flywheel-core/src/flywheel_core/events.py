@@ -46,6 +46,7 @@ class DomainEventKind(str, Enum):
     ATTEMPT_FINALIZED = "attempt_finalized"
     SESSION_RECORDED = "session_recorded"
     GRADER_EVALUATED = "grader_evaluated"
+    COMMAND_APPLIED = "command_applied"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -195,6 +196,25 @@ class GraderEvaluated(_DomainEventBase):
     payload: Mapping[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, kw_only=True)
+class CommandApplied(_DomainEventBase):
+    """Records an operator control command applied against the run.
+
+    A ledger fact (spec 00025 FR-10): the operator intervention survives
+    even after the applied ``control_commands`` queue row is deleted.
+    ``ts`` is the applied-at moment; ``command_kind`` / ``command_payload``
+    snapshot the verb and the operator-supplied fields; ``command_id``
+    keeps the queue-row provenance. Its fold onto the :class:`Lifecycle`
+    dataclass is the identity (it still advances ``version``).
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.COMMAND_APPLIED
+
+    command_kind: str
+    command_payload: Mapping[str, object] = field(default_factory=dict)
+    command_id: int | None = None
+
+
 DomainEvent = (
     LifecycleInitialized
     | TransitionedTo
@@ -206,6 +226,7 @@ DomainEvent = (
     | AttemptFinalized
     | SessionRecorded
     | GraderEvaluated
+    | CommandApplied
 )
 
 
@@ -309,7 +330,9 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
         _finalize_attempt(new, event)
     elif isinstance(event, SessionRecorded):
         new.session_id = event.session_id
-    elif isinstance(event, (Unblocked, RetryScheduled, GraderEvaluated)):
+    elif isinstance(
+        event, (Unblocked, RetryScheduled, GraderEvaluated, CommandApplied)
+    ):
         # Identity fold: these carry audit intent or project a separate table.
         # They still advance version as members of the domain-event sequence.
         pass

@@ -237,6 +237,7 @@ async def _drain_pending(
     audit_emit: AuditEmit | None,
     now: Callable[[], datetime],
     interrupt_flag: list[bool],
+    on_applied: Callable[[ControlCommandRecord], None] | None = None,
 ) -> None:
     """Claim every pending row for ``run_id`` and apply it in order.
 
@@ -246,11 +247,21 @@ async def _drain_pending(
     double-apply a command. Each apply is independent: a failure on one
     row records a failed-application event and the loop continues with
     the next row, matching the spec's "best-effort, never abort"
-    contract.
+    contract. A failed dispatch also never reaches ``on_applied``: the
+    row stays claimed in the store as the visible trace (spec 00025
+    FR-10 edge case), and no ledger fact is recorded for an application
+    that did not happen.
+
+    ``on_applied`` is the steering-ledger seam (spec 00025 FR-10): it is
+    invoked once per successfully dispatched command, after the audit
+    event lands, so the harness can append the ``CommandApplied`` domain
+    event and delete the applied queue row. Calls are guarded like
+    ``audit_emit`` — a raising callback never breaks the drain.
 
     ``interrupt_flag`` is the sole channel back to the watcher loop: a
     successful ``interrupt`` dispatch flips the flag so the iteration
-    task is cancelled on the same tick (after the audit event lands).
+    task is cancelled on the same tick (after the audit event and the
+    steering ledger record land).
     """
     try:
         pending = control_store.claim_commands(run_id, now=now())
@@ -293,6 +304,14 @@ async def _drain_pending(
                     "payload": dict(command.payload),
                 },
             )
+        if dispatched and on_applied is not None:
+            # Steering ledger (spec 00025 FR-10): record the applied
+            # command before a possible interrupt cancellation below, so
+            # the ledger fact lands even when this tick stops the run.
+            try:
+                on_applied(command)
+            except Exception:  # noqa: BLE001 - never break the drain.
+                pass
         if command.kind == CONTROL_COMMAND_INTERRUPT:
             interrupt_flag[0] = True
 
@@ -349,6 +368,7 @@ async def invoke_iteration_with_client(
     ] = ClaudeSDKClient,
     context_observer: ContextUsageObserver | None = None,
     recovery_interrupt_event: asyncio.Event | None = None,
+    on_applied: Callable[[ControlCommandRecord], None] | None = None,
 ) -> IterationResult:
     """Drive one iteration through :class:`ClaudeSDKClient` with a watcher.
 
@@ -394,6 +414,13 @@ async def invoke_iteration_with_client(
       dispatch is best-effort: an exception from ``client.interrupt``
       is swallowed and the recovery signal is still raised so the
       harness still routes the attempt into recovery.
+
+    ``on_applied`` is the steering-ledger seam (spec 00025 FR-10): the
+    watcher invokes it once per successfully dispatched command so the
+    harness can append the ``CommandApplied`` domain event and delete
+    the applied queue row. Guarded like ``audit_emit`` — a raising
+    callback never breaks the drain. Failed dispatches and
+    not-applicable verbs (``approve`` / ``reject``) never reach it.
     """
     interrupt_flag: list[bool] = [False]
     recovery_requested: list[bool] = [False]
@@ -446,6 +473,7 @@ async def invoke_iteration_with_client(
                     audit_emit=audit_emit,
                     now=now,
                     interrupt_flag=interrupt_flag,
+                    on_applied=on_applied,
                 )
                 if interrupt_flag[0]:
                     # Cancel the iteration task so the harness's

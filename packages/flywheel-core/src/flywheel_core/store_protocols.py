@@ -473,6 +473,12 @@ class ControlCommandStore(Protocol):
       call) returns nothing for the same rows — the claim never
       double-applies. An empty pending queue returns an empty list with
       no error.
+    * ``delete_command(command_id)`` removes one row by its store-side
+      ``id`` — queue hygiene, not retention (spec 00025 FR-10): the
+      consumer deletes an applied row only after the steering domain
+      event recording the application has committed to the ledger, so
+      the operator fact outlives the queue row. Deleting an unknown id
+      is a no-op.
     """
 
     def enqueue_command(
@@ -490,6 +496,8 @@ class ControlCommandStore(Protocol):
         *,
         now: datetime,
     ) -> list[ControlCommandRecord]: ...
+
+    def delete_command(self, command_id: int) -> None: ...
 
 
 __all__ = [

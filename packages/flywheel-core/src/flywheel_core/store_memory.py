@@ -488,5 +488,11 @@ class InMemoryStore:
         claimed.sort(key=lambda c: c.id if c.id is not None else 0)
         return [_clone_control_command(c) for c in claimed]
 
+    def delete_command(self, command_id: int) -> None:
+        # Queue hygiene (spec 00025 FR-10); unknown ids are a no-op.
+        self._control_commands = [
+            c for c in self._control_commands if c.id != command_id
+        ]
+
 
 __all__ = ["InMemoryStore"]

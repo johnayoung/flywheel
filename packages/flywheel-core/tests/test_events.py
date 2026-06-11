@@ -6,6 +6,7 @@ from flywheel_core.events import (
     AttemptFinalized,
     AttemptStarted,
     Blocked,
+    CommandApplied,
     DomainEventKind,
     EventReplayError,
     GraderEvaluated,
@@ -222,6 +223,13 @@ def test_identity_fold_events_only_advance_version() -> None:
             passed=True,
             duration_ms=1,
         ),
+        CommandApplied(
+            run_id="run-1",
+            ts=_ts(2),
+            command_kind="say",
+            command_payload={"text": "focus on graders"},
+            command_id=7,
+        ),
     ):
         after = apply(before, identity_event)
         assert after.version == before.version + 1
@@ -295,3 +303,4 @@ def test_domain_event_kind_discriminator_is_stable() -> None:
     assert LifecycleInitialized.KIND is DomainEventKind.LIFECYCLE_INITIALIZED
     assert TransitionedTo.KIND is DomainEventKind.TRANSITIONED_TO
     assert GraderEvaluated.KIND is DomainEventKind.GRADER_EVALUATED
+    assert CommandApplied.KIND is DomainEventKind.COMMAND_APPLIED

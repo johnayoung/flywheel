@@ -1113,6 +1113,17 @@ class PostgresStore:
         records.sort(key=lambda r: r.id if r.id is not None else 0)
         return records
 
+    def delete_command(self, command_id: int) -> None:
+        # Queue hygiene (spec 00025 FR-10): the consumer deletes an
+        # applied row only after the steering domain event committed.
+        # Unknown ids are a no-op by contract.
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM control_commands WHERE id = %s",
+                    (command_id,),
+                )
+
 
 # --- Attempt upsert (shared by save_attempt and the projection) -------------
 

@@ -115,6 +115,7 @@ from flywheel_core.events import (
     AttemptStarted,
     AwaitingApproval,
     Blocked,
+    CommandApplied,
     DomainEvent,
     LifecycleInitialized,
     TransitionedTo,
@@ -234,6 +235,8 @@ class HarnessStore(Protocol):
         now: datetime,
     ) -> list[ControlCommandRecord]: ...
 
+    def delete_command(self, command_id: int) -> None: ...
+
 
 @dataclass(frozen=True, kw_only=True)
 class InvocationRequest:
@@ -282,6 +285,16 @@ class InvocationRequest:
     test invokers) leave the event un-polled; mid-turn act on those
     paths degrades to observe-only (FR-4 plain-path degradation), and
     the spec 00018 boundary recovery still covers the iteration's tail.
+
+    ``on_command_applied`` is the harness's steering-ledger seam (spec
+    00025 FR-10). When supplied, an invoker that applies an operator
+    control command against the live session calls it once per
+    successfully dispatched command, after the dispatch returns. The
+    harness's callback appends the :class:`CommandApplied` domain event
+    to the ledger and deletes the applied queue row once the event
+    commits; it swallows its own exceptions (an append failure retains
+    the row and surfaces on stderr), so invokers do not need to wrap it.
+    Invokers without a control plane leave it un-called.
     """
 
     prompt: str
@@ -291,6 +304,7 @@ class InvocationRequest:
     on_message: Callable[[Message], None] | None = None
     context_observer: Callable[[ContextUsageResponse], None] | None = None
     recovery_interrupt_event: asyncio.Event | None = None
+    on_command_applied: Callable[[ControlCommandRecord], None] | None = None
 
 
 InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]
@@ -857,6 +871,9 @@ class _MirroringStore:
         self, run_id: str, *, now: datetime
     ) -> list[ControlCommandRecord]:
         return self._wrapped.claim_commands(run_id, now=now)
+
+    def delete_command(self, command_id: int) -> None:
+        self._wrapped.delete_command(command_id)
 
 
 # Statuses from which the operator-interrupt finalizer can land cleanly on
@@ -2795,6 +2812,26 @@ async def _drive_iterations(
     recovery_trigger: _RecoveryTrigger | None = None
     attempt_number = attempt.number
 
+    def _record_steering(command: ControlCommandRecord) -> None:
+        """Ledger an applied control command, then delete its queue row.
+
+        Spec 00025 FR-10: invoked by the live invoker's watcher after a
+        command was successfully dispatched against the SDK session. The
+        watcher coroutine interleaves with this loop on one event loop
+        (the harness is parked awaiting the iteration task while it
+        runs), and ``_append`` reconciles ``lifecycle`` in place, so the
+        version key stays consistent for the harness's next append. The
+        failure semantics live in :func:`_ledger_steering` — never
+        raises back into the watcher.
+        """
+        _ledger_steering(
+            lifecycle,
+            store,
+            command,
+            attempt_number=attempt_number,
+            clock=clock,
+        )
+
     prior_rubric_findings = _collect_prior_rubric_findings(
         store, lifecycle.run_id, attempt_number
     )
@@ -3020,6 +3057,7 @@ async def _drive_iterations(
             on_message=_on_message,
             context_observer=_context_observer,
             recovery_interrupt_event=recovery_interrupt_event,
+            on_command_applied=_record_steering,
         )
         # Hang watchdog gate (FR-3 / FR-5): when the threshold is unset or
         # non-positive the watchdog never starts and the call path is
@@ -4018,6 +4056,54 @@ def _emit_control_applied(
     )
 
 
+def _ledger_steering(
+    lifecycle: Lifecycle,
+    store: HarnessStore,
+    command: ControlCommandRecord,
+    *,
+    attempt_number: int | None,
+    clock: Callable[[], datetime],
+) -> None:
+    """Append the :class:`CommandApplied` ledger fact, then delete the row.
+
+    The resolver-side twin of ``_drive_iterations``'s ``_record_steering``
+    (spec 00025 FR-10): the application already happened, so an append
+    failure retains the claimed queue row as the visible trace and
+    surfaces on stderr rather than raising back into the caller.
+    """
+    try:
+        _append(
+            lifecycle,
+            CommandApplied(
+                run_id=lifecycle.run_id,
+                ts=clock(),
+                attempt_number=attempt_number,
+                command_kind=command.kind,
+                command_payload=dict(command.payload),
+                command_id=command.id,
+            ),
+            store=store,
+        )
+    except Exception as exc:  # noqa: BLE001 - application already landed.
+        print(
+            "flywheel: steering ledger append failed for command "
+            f"{command.id!r} ({command.kind}): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if command.id is None:
+        return
+    try:
+        store.delete_command(command.id)
+    except Exception as exc:  # noqa: BLE001 - hygiene is best-effort.
+        print(
+            "flywheel: applied control command row "
+            f"{command.id!r} could not be deleted: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def resolve_manual_approval(
     lifecycle: Lifecycle,
     store: HarnessStore,
@@ -4192,6 +4278,13 @@ def resolve_manual_approval(
         _emit_control_applied(
             telemetry, target, attempt_number=attempt_number
         )
+        _ledger_steering(
+            lifecycle,
+            store,
+            target,
+            attempt_number=attempt_number,
+            clock=clock,
+        )
         return ResolveApprovalOutcome(
             applied=True, reason=reason, command_id=target.id
         )
@@ -4230,6 +4323,13 @@ def resolve_manual_approval(
     )
     _emit_control_applied(
         telemetry, target, attempt_number=attempt_number
+    )
+    _ledger_steering(
+        lifecycle,
+        store,
+        target,
+        attempt_number=attempt_number,
+        clock=clock,
     )
 
     # Reuse the same retry arm run_task drives so a reject reaches the

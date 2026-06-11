@@ -113,6 +113,9 @@ class _ControlCommandStub:
     ) -> list[ControlCommandRecord]:
         return []
 
+    def delete_command(self, command_id: int) -> None:
+        return None
+
 
 def test_lifecycle_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_LifecycleStub(), LifecycleStore)

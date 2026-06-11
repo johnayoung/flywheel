@@ -36,6 +36,7 @@ import argparse
 import asyncio
 import json
 import signal
+import subprocess
 import sys
 from collections.abc import (
     Callable,
@@ -507,6 +508,31 @@ def _make_claude_code_invoke(
     return _invoke
 
 
+def _resolve_base_commit_sha(sandbox: Path) -> str | None:
+    """Resolve the workspace's base commit SHA (spec 00025 FR-11).
+
+    Called at run start against the freshly prepared workspace, so
+    ``HEAD`` here is the commit the worktree was created from (the
+    consumer's ``prepare_sandbox`` hands the harness a clean checkout
+    immediately before this runs). A sandbox that is not a git checkout
+    — direct flywheel-core invocations without a worktree — yields
+    ``None`` and the pin is omitted cleanly rather than fabricated.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(sandbox), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if len(sha) == 40 else None
+
+
 def _make_event_emitter(
     events: str, *, out: TextIO
 ) -> Callable[[TelemetryRecord], None] | None:
@@ -714,6 +740,22 @@ async def run_task_object(
             if current_task is not None
             else []
         )
+        # World-state pin (spec 00025 FR-11): every attempt's
+        # agent_context records the effective model id the SDK is
+        # invoked with (post --model / policy / default resolution;
+        # "claude-code-default" is the documented stand-in when the SDK
+        # falls through to the Claude Code default) and, when the
+        # sandbox is a git checkout, the resolved base commit SHA the
+        # workspace was created from. agent_context rides the
+        # AttemptStarted payload, so both values survive replay.
+        agent_context = {
+            "model_id": model or "claude-code-default",
+            "agent_sdk": "claude_agent_sdk",
+            "sandbox": str(sandbox),
+        }
+        base_sha = _resolve_base_commit_sha(sandbox)
+        if base_sha is not None:
+            agent_context["base_commit_sha"] = base_sha
         try:
             outcome = await run_task(
                 task,
@@ -721,11 +763,7 @@ async def run_task_object(
                 backend,
                 config=HarnessConfig(
                     max_retries=max_retries,
-                    agent_context={
-                        "model_id": model or "claude-code-default",
-                        "agent_sdk": "claude_agent_sdk",
-                        "sandbox": str(sandbox),
-                    },
+                    agent_context=agent_context,
                     worktree=sandbox,
                 ),
                 invoke=invoker,

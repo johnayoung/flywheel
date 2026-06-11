@@ -3182,3 +3182,102 @@ def test_collect_live_rows_omits_awaiting_instruction_when_task_missing(
     row = rows[0]
     assert row.status == Status.AWAITING_APPROVAL
     assert row.awaiting_instruction is None
+
+
+# --- World-state pinning (spec 00025 FR-11) ----------------------------------
+
+
+def _git_sandbox(tmp_path: Path) -> tuple[Path, str]:
+    """Create a one-commit git checkout standing in for a prepared
+    worktree, returning the sandbox path and its HEAD SHA."""
+    sandbox = tmp_path / "wt"
+    sandbox.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"], cwd=sandbox, check=True
+    )
+    (sandbox / "README").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README"], cwd=sandbox, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=flywheel-test",
+            "-c",
+            "user.email=test@flywheel.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+        cwd=sandbox,
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=sandbox,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return sandbox, head
+
+
+def test_run_task_object_pins_world_state_for_git_sandbox(
+    tmp_path: Path,
+) -> None:
+    """Every attempt records the resolved base commit SHA and the
+    effective model id in agent_context, and both survive replay."""
+    import asyncio
+
+    from flywheel_core.events import replay
+
+    sandbox, head = _git_sandbox(tmp_path)
+    task = build_inline_task("do the thing")
+    db_path = tmp_path / "db.sqlite"
+    outcome = asyncio.run(
+        run_task_object(
+            task,
+            db_path=db_path,
+            sandbox=sandbox,
+            model="claude-opus-4-8",
+            invoke=_verify_invoke,
+        )
+    )
+    assert outcome.lifecycle.status == Status.DONE
+    ctx = outcome.attempts[0].agent_context
+    assert ctx["model_id"] == "claude-opus-4-8"
+    assert ctx["base_commit_sha"] == head
+    assert len(ctx["base_commit_sha"]) == 40
+
+    # Both values survive domain-event replay: the pin rides the
+    # AttemptStarted payload, not a projection-only column.
+    store = SqliteStore(db_path)
+    try:
+        folded = replay(store.list_domain_events(outcome.lifecycle.run_id))
+    finally:
+        store.close()
+    replayed_ctx = folded.attempts[0].agent_context
+    assert replayed_ctx["base_commit_sha"] == head
+    assert replayed_ctx["model_id"] == "claude-opus-4-8"
+
+
+def test_run_task_object_omits_base_sha_without_worktree(
+    tmp_path: Path,
+) -> None:
+    """Direct invocations without a git workspace record the model id
+    and omit the SHA cleanly rather than fabricating one."""
+    import asyncio
+
+    task = build_inline_task("do the thing")
+    outcome = asyncio.run(
+        run_task_object(
+            task,
+            db_path=tmp_path / "db.sqlite",
+            sandbox=tmp_path / "plain-sandbox",
+            invoke=_verify_invoke,
+        )
+    )
+    assert outcome.lifecycle.status == Status.DONE
+    ctx = outcome.attempts[0].agent_context
+    assert ctx["model_id"] == "claude-code-default"
+    assert "base_commit_sha" not in ctx

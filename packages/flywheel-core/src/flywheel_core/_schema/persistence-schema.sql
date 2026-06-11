@@ -118,9 +118,15 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
--- agent_context_json captures the agent identity for this attempt so the run
--- is interpretable across model, SDK, and prompt changes. Suggested keys:
--- model_id, model_version, agent_sdk_version, prompt_template_hash.
+-- agent_context_json captures the agent identity and world state for this
+-- attempt so the run is interpretable across model, SDK, and prompt
+-- changes. Suggested keys: model_id, model_version, agent_sdk_version,
+-- prompt_template_hash. This is also the canonical home of the world-state
+-- pin (spec 00025 FR-11): model_id is the effective model resolved from
+-- --model / policy / default before the SDK is invoked, and
+-- base_commit_sha is the 40-char commit the workspace was created from
+-- (omitted when the run has no git worktree). The mapping rides the
+-- AttemptStarted payload, so both values survive domain-event replay.
 -- Per-grader failures are not denormalized here — query grader_results with
 -- (run_id, attempt_number) and passed = 0 instead.
 --

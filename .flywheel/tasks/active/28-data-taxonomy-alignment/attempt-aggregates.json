@@ -1,0 +1,38 @@
+{
+  "id": "attempt-aggregates",
+  "goal": "Attempt records carry rolled-up token, iteration, turn, and last-activity aggregates updated at iteration boundaries, and the dashboard snapshot is computed from relational rows with no telemetry-event scan.",
+  "prerequisites": ["telemetry-sink"],
+  "tags": ["data-taxonomy", "oltp"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00025-FEATURE-data-taxonomy-alignment.md",
+      "packages/flywheel-core/src/flywheel_core/harness.py",
+      "packages/flywheel-core/src/flywheel_core/lifecycle.py",
+      "packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py",
+      "packages/flywheel-core/src/flywheel_core/store_memory.py",
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py",
+      "packages/flywheel-core/src/flywheel_core/workflow.py",
+      "packages/flywheel/src/flywheel/_snapshot.py"
+    ],
+    "constraints": [
+      "Spec FR-6 is authoritative: cumulative input/output/cache tokens, iterations completed, turns, last-activity timestamp on the attempt row, updated through the existing optimistic-concurrency write path at iteration boundaries",
+      "Snapshot values (tokens, cost, idle, age, iteration position) must match today's telemetry-derived values for a driven run, within timer tolerance",
+      "Update BOTH schema files (sqlite and the postgres mirror), bump CURRENT_SCHEMA_VERSION, and refuse pre-feature databases via the existing StoreSchemaError path -- no forward migration",
+      "Attempt is a pure dataclass in lifecycle.py: add fields without introducing I/O imports; the purity tests must pass unweakened",
+      "Enumerate and update every test that pins the old schema version constant or the Attempt shape in the same commit (search for CURRENT_SCHEMA_VERSION and Attempt( across all packages' tests)",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "Do not stop writing telemetry events to the store yet -- the write-path move is the next task",
+      "Do not touch sdk_messages or run_sequence"
+    ],
+    "edge_cases": [
+      "A run with zero completed iterations must produce zeroed aggregates, not NULL-driven crashes in the snapshot",
+      "Replay of domain events must not be affected by the new columns"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

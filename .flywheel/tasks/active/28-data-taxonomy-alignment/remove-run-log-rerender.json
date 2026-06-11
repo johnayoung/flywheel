@@ -1,0 +1,33 @@
+{
+  "id": "remove-run-log-rerender",
+  "goal": "The worker no longer renders per-run .log files from the store and no longer sweeps log files; the run JSONL is the only telemetry artifact and its lifecycle is operator-owned.",
+  "prerequisites": ["telemetry-write-path"],
+  "tags": ["data-taxonomy", "worker"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00025-FEATURE-data-taxonomy-alignment.md",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+      "packages/flywheel-worktree/tests"
+    ],
+    "constraints": [
+      "Spec FR-9 is authoritative: delete write_run_log, write_run_logs, _per_run_log_path, the per-run .log format, and the log half of retention_sweep; the parked-worktree hygiene half of the sweep is unchanged",
+      "Retarget or remove the worker's --log-dir flag and DEFAULT_LOG_DIR so the only log-root concept left is the telemetry sink's logs root",
+      "Update the .flywheel init scaffold and its .gitignore template to reflect the logs/runs layout and drop references to the old worker log files",
+      "Phase 18-restore-worker-run-logs added tests pinning the .log rendering -- enumerate and delete/replace them in the same commit rather than leaving a red suite",
+      "Flywheel must not delete or rotate run JSONL files anywhere -- retention is explicitly not flywheel's responsibility",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "Do not touch the supervisor log path in packages/flywheel/src/flywheel/_worker_supervisor.py",
+      "No store or schema changes"
+    ],
+    "edge_cases": [
+      "orchestrate_until_idle currently calls write_run_logs after runs settle -- remove the call site, not just the function"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "! grep -rn 'write_run_log' packages/", "name": "no-rerender-callers" }
+  ]
+}

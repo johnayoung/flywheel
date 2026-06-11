@@ -1,0 +1,36 @@
+{
+  "id": "schema-reduction",
+  "goal": "The store schema and protocols shrink to ledger and OLTP only: sdk_messages, run_sequence, and the events category split are gone, along with the sdk-message and merged-audit store verbs.",
+  "prerequisites": ["readers-tail-file", "remove-run-log-rerender"],
+  "tags": ["data-taxonomy", "schema"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00025-FEATURE-data-taxonomy-alignment.md",
+      "packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py",
+      "packages/flywheel-core/src/flywheel_core/store_memory.py",
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py",
+      "packages/flywheel-core/src/flywheel_core/workflow.py"
+    ],
+    "constraints": [
+      "Spec FR-5 is authoritative: drop sdk_messages and run_sequence from both schema files, make events domain-only (remove the category column and partial index, or rename the table -- record the choice in the schema header), bump CURRENT_SCHEMA_VERSION, refuse older databases via StoreSchemaError",
+      "Remove append_sdk_message, save_sdk_messages, list_sdk_messages, and read_audit_since from the protocols, all three store implementations, and the _EventStreamingStore wrapper; sweep all remaining callers and tests with grep before committing",
+      "Domain-event ordering must remain strictly monotonic per run without the cross-table counter; replay (list_domain_events fold) must behave identically",
+      "Rewrite the schema header comments: the audit-stream description, the run_sequence paragraph, and the sensitivity note now extend to the .flywheel/logs directory",
+      "Store contract tests pin the removed verbs and the shared-sequence interleaving (spec 00010 FR-3) -- update them in the same commit",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No control_commands or task_claims changes -- steering-ledger owns those",
+      "No forward migration of any kind"
+    ],
+    "edge_cases": [
+      "control_commands ordering relies on its own autoincrement id, not run_sequence -- it must be untouched by the counter removal"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" },
+    { "type": "command", "run": "! grep -rn 'sdk_messages\\|run_sequence\\|read_audit_since' packages/*/src/", "name": "no-dead-references" }
+  ]
+}

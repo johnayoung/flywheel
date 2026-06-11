@@ -1,0 +1,35 @@
+{
+  "id": "steering-ledger",
+  "goal": "Applying a control command appends a steering domain event to the ledger and deletes the applied queue row, and released or expired task claims leave no rows behind.",
+  "prerequisites": ["schema-reduction"],
+  "tags": ["data-taxonomy", "ledger"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00025-FEATURE-data-taxonomy-alignment.md",
+      "packages/flywheel-core/src/flywheel_core/events.py",
+      "packages/flywheel-core/src/flywheel_core/harness.py",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+    ],
+    "constraints": [
+      "Spec FR-10 is authoritative: the domain event records kind, payload, and applied-at; it is appended AFTER the live SDK action succeeds; the queue row is deleted only after the event commits, and on event-append failure the row is retained so the failure is visible",
+      "The new DomainEventKind must be handled by the replay fold (a recorded, state-neutral entry) without weakening lifecycle purity tests",
+      "Claim rows are deleted on release and on steal of an expired lease; completed tasks leave zero task_claims rows",
+      "The steering event reaches the run JSONL automatically via the existing domain-mirror path -- do not add a second mirror",
+      "Update every test that asserts claimed control_commands rows persist after apply, in the same commit",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No new control-command verbs and no changes to claim-once semantics",
+      "No TUI changes"
+    ],
+    "edge_cases": [
+      "A command claimed but whose SDK application fails: no domain event, row already claimed -- decide and test the visible outcome rather than leaving it undefined",
+      "Watcher restart between claim and event append must not double-apply or double-record"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

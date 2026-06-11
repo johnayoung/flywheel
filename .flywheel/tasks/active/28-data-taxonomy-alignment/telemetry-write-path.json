@@ -1,0 +1,37 @@
+{
+  "id": "telemetry-write-path",
+  "goal": "The harness streams SDK messages and telemetry events to the run's TelemetrySink (with domain events mirrored as lines) instead of the store, and a sink append failure never aborts or finalizes the attempt.",
+  "prerequisites": ["attempt-aggregates"],
+  "tags": ["data-taxonomy", "telemetry"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00025-FEATURE-data-taxonomy-alignment.md",
+      "packages/flywheel-core/src/flywheel_core/harness.py",
+      "packages/flywheel-core/src/flywheel_core/invoker.py",
+      "packages/flywheel-core/src/flywheel_core/workflow.py",
+      "packages/flywheel-core/tests/test_harness.py"
+    ],
+    "references": [
+      ".flywheel/specs/00010-FEATURE-message-granular-audit-stream.md -- the per-message cadence and on_message composition this task retargets from store to sink"
+    ],
+    "constraints": [
+      "Spec FR-3, FR-4, and FR-7 are authoritative",
+      "Per-message cadence is preserved: each SDK message is appended to the sink as it arrives, before the iteration completes",
+      "Domain events are appended to the store FIRST (the row is authoritative) and then mirrored to the sink; telemetry-category append_event store calls and sdk-message store writes are removed from the harness",
+      "Sink failure semantics: record the first failure once (stderr) and continue the run silently thereafter; domain-event and lifecycle write failures keep today's INTERNAL_ERROR finalization exactly",
+      "The existing strict audit-failure tests in packages/flywheel-core/tests/test_harness.py pin the old store-write path and the old fatal-telemetry behavior -- update them to the new split semantics in the same commit, and sweep every other test asserting harness-to-store telemetry or sdk-message writes",
+      "Commit with a Conventional Commits message before emitting intent=verify"
+    ],
+    "non_goals": [
+      "Do not remove store protocol verbs or schema tables -- that is the schema-reduction task",
+      "Do not retarget the TUI or audit readers -- they may be temporarily blind to live telemetry within this phase"
+    ],
+    "edge_cases": [
+      "A run that produces zero SDK messages must still work; the file may contain only domain mirrors",
+      "A sink that raises on the very first append must not prevent lifecycle seeding or attempt finalization"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

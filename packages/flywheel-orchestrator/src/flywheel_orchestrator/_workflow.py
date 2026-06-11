@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import (
     Callable,
     Iterable,
@@ -1610,36 +1611,53 @@ class _InitAnswers:
     github_done_action: str = "comment"
 
 
+def _render_source_block(
+    answers: _InitAnswers, *, tasks_dir: str = ".flywheel/tasks"
+) -> str:
+    """Render the ``[source]`` section the prompts own.
+
+    For the directory kind, ``tasks_dir`` is the one key the prompts do
+    not answer; the reconfigure path threads the existing value through
+    so a hand-tuned location survives. ``json.dumps`` escaping is valid
+    for TOML basic strings, so an arbitrary preserved path cannot break
+    the rendered file.
+    """
+    if answers.source_kind == "directory":
+        return (
+            f'[source]\n'
+            f'kind = "directory"\n'
+            f'tasks_dir = {json.dumps(tasks_dir)}\n'
+        )
+    return (
+        f'[source]\n'
+        f'kind = "github"\n'
+        f'repo = "{answers.github_repo}"\n'
+        f'label = "{answers.github_label}"\n'
+        f'done_action = "{answers.github_done_action}"\n'
+    )
+
+
+def _render_store_block(answers: _InitAnswers) -> str:
+    """Render the ``[store]`` section the prompts own."""
+    store_block = f'[store]\nbackend = "{answers.store_backend}"\n'
+    if answers.store_schema is not None:
+        store_block += f'schema = "{answers.store_schema}"\n'
+    return store_block
+
+
 def _render_init_policy(answers: _InitAnswers) -> str:
     """Render ``flywheel.toml`` from the answers.
 
     No credential is ever an input here: the postgres DSN lives only in
     the environment (spec FR-4), so it cannot appear in the rendered file.
     """
-    if answers.source_kind == "directory":
-        source_block = (
-            '[source]\n'
-            'kind = "directory"\n'
-            'tasks_dir = ".flywheel/tasks"\n'
-        )
-    else:
-        source_block = (
-            f'[source]\n'
-            f'kind = "github"\n'
-            f'repo = "{answers.github_repo}"\n'
-            f'label = "{answers.github_label}"\n'
-            f'done_action = "{answers.github_done_action}"\n'
-        )
-    store_block = f'[store]\nbackend = "{answers.store_backend}"\n'
-    if answers.store_schema is not None:
-        store_block += f'schema = "{answers.store_schema}"\n'
     return "".join(
         (
             _INIT_POLICY_HEADER,
             "\n",
-            source_block,
+            _render_source_block(answers),
             "\n",
-            store_block,
+            _render_store_block(answers),
             "\n",
             _INIT_POLICY_TAIL,
         )
@@ -1676,6 +1694,20 @@ def _prompt_choice(
         print(
             f"  invalid value {raw!r}; choose one of: {', '.join(choices)}"
         )
+
+
+def _prompt_yes_no(label: str, *, default: bool) -> bool:
+    """One yes/no prompt round-trip; enter accepts ``default``."""
+    rendered = "[y]/n" if default else "y/[n]"
+    while True:
+        raw = _prompt_line(f"{label} ({rendered}): ").lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print(f"  invalid value {raw!r}; answer y or n")
 
 
 def _validate_pg_schema(value: str) -> str | None:
@@ -1944,6 +1976,163 @@ def _print_init_next_steps(store_backend: str | None) -> None:
         )
 
 
+# Matches a top-level TOML table (``[name]``) or array-of-tables
+# (``[[name]]``) header line, tolerating a trailing comment. The captured
+# name is the full dotted path, so ``[source.extra]`` and
+# ``[[defaults.graders]]`` do NOT collide with the bare ``source`` /
+# ``store`` sections the reconfigure rewrite owns.
+_TOML_HEADER_RE = re.compile(
+    r"^\s*\[\[?\s*(?P<name>[^\]]*?)\s*\]\]?\s*(?:#.*)?$"
+)
+
+
+def _split_toml_sections(text: str) -> list[tuple[str | None, str]]:
+    """Split raw TOML text into ``(header name, chunk)`` pairs.
+
+    The first chunk (name ``None``) is the root-table preamble (header
+    comment, any bare keys). Every other chunk starts at its section
+    header line and runs up to the next header, comments and blank lines
+    included. Concatenating the chunk texts reproduces ``text``
+    byte-for-byte -- the rewrite below leans on that to leave sections
+    it does not own untouched.
+    """
+    chunks: list[tuple[str | None, list[str]]] = [(None, [])]
+    for line in text.splitlines(keepends=True):
+        match = _TOML_HEADER_RE.match(line)
+        if match is not None:
+            chunks.append((match.group("name"), [line]))
+        else:
+            chunks[-1][1].append(line)
+    return [(name, "".join(lines)) for name, lines in chunks]
+
+
+def _trailing_blank_lines(chunk: str) -> str:
+    """Return the run of whitespace-only lines closing ``chunk``.
+
+    Preserved across a section replacement so the rewritten file keeps
+    the original blank-line spacing between sections.
+    """
+    lines = chunk.splitlines(keepends=True)
+    tail: list[str] = []
+    for line in reversed(lines):
+        if line.strip():
+            break
+        tail.append(line)
+    return "".join(reversed(tail))
+
+
+def _rewrite_policy_text(
+    original: str, data: Mapping[str, Any], answers: _InitAnswers
+) -> str:
+    """Rewrite only the ``[source]`` and ``[store]`` sections of a policy.
+
+    Every other section (``[paths]``, ``[agent]``,
+    ``[[defaults.graders]]``, anything unknown) passes through verbatim,
+    comments and formatting included (spec FR-9). A section the prompts
+    own but the file lacks -- e.g. ``[store]`` in a pre-``[store]``-era
+    config -- is appended at the end. The directory source's
+    ``tasks_dir`` is the one unanswered key inside an owned section, so
+    the existing value is carried over instead of reset.
+    """
+    tasks_dir = ".flywheel/tasks"
+    source_table = data.get("source")
+    if isinstance(source_table, Mapping) and isinstance(
+        source_table.get("tasks_dir"), str
+    ):
+        tasks_dir = source_table["tasks_dir"]
+    pending: dict[str, str] = {
+        "source": _render_source_block(answers, tasks_dir=tasks_dir),
+        "store": _render_store_block(answers),
+    }
+    out: list[str] = []
+    for name, chunk in _split_toml_sections(original):
+        block = pending.pop(name, None) if name is not None else None
+        if block is None:
+            out.append(chunk)
+        else:
+            out.append(block + _trailing_blank_lines(chunk))
+    text = "".join(out)
+    for name in ("source", "store"):
+        block = pending.get(name)
+        if block is None:
+            continue
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += "\n" + block
+    return text
+
+
+def _describe_current_policy(data: Mapping[str, Any]) -> str:
+    """One-line summary of the settings the reconfigure prompts own."""
+    store = data.get("store")
+    backend = "sqlite"
+    if isinstance(store, Mapping) and isinstance(store.get("backend"), str):
+        backend = store["backend"]
+    source = data.get("source")
+    kind = "(unset)"
+    if isinstance(source, Mapping) and isinstance(source.get("kind"), str):
+        kind = source["kind"]
+    summary = f"store backend = {backend}, work source = {kind}"
+    if isinstance(source, Mapping) and isinstance(source.get("repo"), str):
+        summary += f" ({source['repo']})"
+    return summary
+
+
+def _reconfigure_policy(
+    args: argparse.Namespace, policy_path: Path
+) -> int:
+    """Offer to reconfigure an existing ``flywheel.toml`` (spec FR-9).
+
+    Reachable only on the interactive path -- non-TTY / ``--defaults``
+    runs keep the historical never-touch guarantee. Declining (the
+    default answer) leaves the file byte-identical. Accepting rewrites
+    only the keys the prompts answered; see :func:`_rewrite_policy_text`.
+    A malformed file is reported and left alone rather than overwritten.
+    """
+    original = policy_path.read_text(encoding="utf-8")
+    try:
+        data = tomllib.loads(original)
+    except tomllib.TOMLDecodeError as exc:
+        print(
+            f"error: {policy_path} is not valid TOML ({exc}); "
+            f"left untouched",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"{policy_path}: {_describe_current_policy(data)}")
+    try:
+        if not _prompt_yes_no("reconfigure?", default=False):
+            print(f"exists:  {policy_path} (left untouched)")
+            print()
+            _print_init_next_steps(None)
+            return 0
+        answers = _collect_init_answers(args, interactive=True)
+    except _InitUsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        print(
+            "init: interrupted; flywheel.toml was left untouched",
+            file=sys.stderr,
+        )
+        return 130
+    except EOFError:
+        print(
+            "init: stdin closed before the prompts finished; "
+            "flywheel.toml was left untouched",
+            file=sys.stderr,
+        )
+        return 1
+    policy_path.write_text(
+        _rewrite_policy_text(original, data, answers), encoding="utf-8"
+    )
+    print(f"updated: {policy_path}")
+    print()
+    _print_init_next_steps(answers.store_backend)
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Scaffold ``.flywheel/`` and a ``flywheel.toml`` in the working dir.
 
@@ -1954,6 +2143,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
     non-TTY stdin behaves exactly like ``--defaults``. Answers are
     collected fully before the policy file is written, so aborting
     mid-prompts (Ctrl-C / EOF) never leaves a partial ``flywheel.toml``.
+
+    With an existing ``flywheel.toml``, an interactive run offers to
+    reconfigure it (see :func:`_reconfigure_policy`); a non-interactive
+    run never touches it.
     """
     created: list[str] = []
     existing: list[str] = []
@@ -1976,15 +2169,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"exists:  {path} (left untouched)")
 
     policy_path = Path(DEFAULT_POLICY_FILENAME)
-    if policy_path.exists():
-        # Reconfiguring an existing policy is a separate flow; this one
-        # preserves the historical never-touch guarantee.
-        print(f"exists:  {policy_path} (left untouched)")
-        print()
-        _print_init_next_steps(None)
-        return 0
-
     interactive = sys.stdin.isatty() and not args.defaults
+    if policy_path.exists():
+        if not interactive:
+            # Non-interactive re-runs preserve the historical never-touch
+            # guarantee (spec FR-3 / FR-9).
+            print(f"exists:  {policy_path} (left untouched)")
+            print()
+            _print_init_next_steps(None)
+            return 0
+        return _reconfigure_policy(args, policy_path)
+
     try:
         answers = _collect_init_answers(args, interactive=interactive)
     except _InitUsageError as exc:
@@ -2048,7 +2243,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "a flywheel.toml work policy in the current directory. "
             "Prompts for store backend and work source on a TTY; flags "
             "pre-answer prompts; a non-TTY stdin takes every default. "
-            "Idempotent; never overwrites existing files."
+            "With an existing flywheel.toml, an interactive run offers "
+            "to reconfigure it (rewriting only the answered keys); a "
+            "non-interactive run never touches it."
         ),
     )
     p_init.add_argument(

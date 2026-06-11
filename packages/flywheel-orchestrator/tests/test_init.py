@@ -411,6 +411,168 @@ def test_init_interactive_flag_suppresses_its_prompt(
     assert load_policy(repo / "flywheel.toml").store_backend == "postgres"
 
 
+# --- reconfiguring an existing flywheel.toml (spec FR-9) ----------------------
+
+
+_HAND_TUNED_POLICY = """\
+# Hand-tuned policy: every key here must survive a reconfigure.
+[source]
+kind = "directory"
+tasks_dir = "custom/tasks"
+
+[paths]
+db = "custom/state.sqlite"
+sandbox_root = "custom/sandboxes"
+
+[[defaults.graders]]
+type = "command"
+run = "uv run pytest -q"
+
+[agent]
+model = "claude-opus-4-7"
+"""
+
+
+def test_init_reconfigure_decline_leaves_file_byte_identical(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """Interactive init shows the current settings; declining (the
+    default, plain enter) leaves the file byte-identical."""
+    (repo / "flywheel.toml").write_text(_HAND_TUNED_POLICY)
+    before = (repo / "flywheel.toml").read_bytes()
+    _interactive(monkeypatch, "")  # enter -> default no
+
+    assert main(["init"]) == 0
+
+    assert (repo / "flywheel.toml").read_bytes() == before
+    out = capsys.readouterr().out
+    assert "store backend = sqlite, work source = directory" in out
+    assert "reconfigure? (y/[n]): " in out
+    assert "exists:  flywheel.toml (left untouched)" in out
+    # The scaffold dirs are still ensured.
+    assert (repo / ".flywheel" / "tasks" / "active" / ".gitkeep").is_file()
+
+
+def test_init_reconfigure_round_trip_preserves_hand_tuned_keys(
+    repo: Path, monkeypatch, capsys, no_pg_env
+) -> None:
+    """FR-9 acceptance: only the answered keys change; [agent],
+    [[defaults.graders]], [paths], and the unanswered [source] tasks_dir
+    all survive the round trip."""
+    (repo / "flywheel.toml").write_text(_HAND_TUNED_POLICY)
+    _interactive(
+        monkeypatch,
+        "y",  # reconfigure
+        "postgres",  # store backend
+        "flywheel_ci",  # postgres schema
+        "",  # work source -> directory (default)
+    )
+
+    assert main(["init"]) == 0
+    assert "updated: flywheel.toml" in capsys.readouterr().out
+
+    text = (repo / "flywheel.toml").read_text()
+    # Sections the prompts do not own survive verbatim, comments included.
+    assert "# Hand-tuned policy" in text
+    assert 'model = "claude-opus-4-7"' in text
+    assert 'run = "uv run pytest -q"' in text
+    assert 'db = "custom/state.sqlite"' in text
+    assert 'sandbox_root = "custom/sandboxes"' in text
+    # The unanswered [source] key survives too.
+    assert 'tasks_dir = "custom/tasks"' in text
+
+    policy = load_policy(repo / "flywheel.toml")
+    assert policy.store_backend == "postgres"
+    assert policy.store_schema == "flywheel_ci"
+    assert policy.source_kind == "directory"
+    assert policy.tasks_dir == Path("custom/tasks")
+    assert policy.model == "claude-opus-4-7"
+    assert len(policy.default_graders) == 1
+
+
+def test_init_reconfigure_pre_store_config_gains_store_section(
+    repo: Path, monkeypatch
+) -> None:
+    """A flywheel.toml predating [store] gains the section on reconfigure
+    without disturbing any other key."""
+    (repo / "flywheel.toml").write_text(
+        '[source]\n'
+        'kind = "directory"\n'
+        'tasks_dir = ".flywheel/tasks"\n'
+        '\n'
+        '[agent]\n'
+        'model = "claude-opus-4-7"\n'
+    )
+    _interactive(monkeypatch, "y", "", "")  # reconfigure, sqlite, directory
+
+    assert main(["init"]) == 0
+
+    text = (repo / "flywheel.toml").read_text()
+    assert "[store]" in text
+    assert 'model = "claude-opus-4-7"' in text
+    policy = load_policy(repo / "flywheel.toml")
+    assert policy.store_backend == "sqlite"
+    assert policy.model == "claude-opus-4-7"
+
+
+def test_init_reconfigure_github_to_directory_drops_github_keys(
+    repo: Path, monkeypatch
+) -> None:
+    """Switching source kind github -> directory drops repo/label/
+    done_action (invalid for directory) from [source]."""
+    (repo / "flywheel.toml").write_text(
+        '[source]\n'
+        'kind = "github"\n'
+        'repo = "octo/widgets"\n'
+        'label = "flywheel"\n'
+        'done_action = "comment"\n'
+        '\n'
+        '[store]\n'
+        'backend = "sqlite"\n'
+    )
+    _interactive(monkeypatch, "y", "", "directory")
+
+    assert main(["init"]) == 0
+
+    text = (repo / "flywheel.toml").read_text()
+    assert "repo =" not in text
+    assert "label =" not in text
+    assert "done_action =" not in text
+    policy = load_policy(repo / "flywheel.toml")
+    assert policy.source_kind == "directory"
+    assert policy.tasks_dir == Path(".flywheel/tasks")
+
+
+def test_init_reconfigure_malformed_toml_reports_and_leaves_alone(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    (repo / "flywheel.toml").write_text("[source\nkind =\n")
+    before = (repo / "flywheel.toml").read_bytes()
+    _interactive(monkeypatch, "y")
+
+    assert main(["init"]) == 2
+
+    assert (repo / "flywheel.toml").read_bytes() == before
+    assert "not valid TOML" in capsys.readouterr().err
+
+
+def test_init_defaults_flag_never_touches_existing_policy(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """--defaults (and equally a non-TTY stdin) keeps the historical
+    never-touch behavior: no reconfigure prompt, file untouched."""
+    (repo / "flywheel.toml").write_text(_HAND_TUNED_POLICY)
+    before = (repo / "flywheel.toml").read_bytes()
+    _interactive(monkeypatch, "y", "y", "y")  # would answer prompts if asked
+
+    assert main(["init", "--defaults"]) == 0
+
+    assert (repo / "flywheel.toml").read_bytes() == before
+    out = capsys.readouterr().out
+    assert "exists:  flywheel.toml (left untouched)" in out
+    assert "reconfigure?" not in out
+
+
 # --- aborting mid-prompts never leaves a partial policy file -----------------
 
 

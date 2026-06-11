@@ -83,6 +83,21 @@ def _default_run_id() -> str:
 
 @dataclass
 class Attempt:
+    """One execution attempt of a run.
+
+    The aggregate fields (``input_tokens`` through ``last_activity_at``)
+    are rolled-up counters the harness updates at iteration boundaries
+    through the store's versioned ``save_attempt`` write. Token fields
+    mirror the SDK usage breakdown keys exactly and accumulate
+    per-iteration deltas; ``turns`` and ``total_cost_usd`` accumulate the
+    SDK's session-cumulative per-iteration readings (summed, accepting
+    the known overcount when a session spans iterations — same policy as
+    the telemetry stream). ``iterations_completed`` counts completed
+    iterations; ``last_activity_at`` is the timestamp of the most recent
+    boundary rollup. A zero-iteration attempt carries all-zero counters
+    and a ``None`` last-activity timestamp.
+    """
+
     number: int
     started_at: datetime
     run_id: str
@@ -91,6 +106,24 @@ class Attempt:
     agent_output: str = ""
     error: str = ""
     agent_context: dict[str, str] = field(default_factory=dict)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    iterations_completed: int = 0
+    turns: int = 0
+    total_cost_usd: float = 0.0
+    last_activity_at: datetime | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of the four token-usage fields (the dashboard's tokens)."""
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
 
 
 @dataclass

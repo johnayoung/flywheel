@@ -564,7 +564,40 @@ class SqliteStore:
 
     # --- AttemptStore -----------------------------------------------------
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        if expected_version is None:
+            # Unconditional upsert: either a direct caller's write or the
+            # domain-event projection, which already runs inside the
+            # version-checked append transaction.
+            self._upsert_attempt(run_id, attempt)
+            return
+        # Versioned write (the harness's iteration-boundary aggregate
+        # rollup): verify the lifecycle's optimistic-concurrency key in
+        # the same transaction as the upsert so a stale worker cannot
+        # clobber counters after the run moved on.
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT version FROM lifecycles WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise LifecycleNotFoundError(run_id)
+            actual = int(row["version"])
+            if actual != expected_version:
+                raise OptimisticConcurrencyError(
+                    run_id,
+                    expected_version=expected_version,
+                    actual_version=actual,
+                )
+            self._upsert_attempt(run_id, attempt)
+
+    def _upsert_attempt(self, run_id: str, attempt: Attempt) -> None:
         # INSERT OR REPLACE upserts on the (run_id, number) PK so the
         # harness can record both the start and the finalization of an
         # attempt without separate verbs.
@@ -572,8 +605,11 @@ class SqliteStore:
             """
             INSERT OR REPLACE INTO attempts (
                 run_id, number, attempt_run_id, started_at, ended_at,
-                outcome, agent_output, error, agent_context_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome, agent_output, error, agent_context_json,
+                input_tokens, output_tokens, cache_creation_input_tokens,
+                cache_read_input_tokens, iterations_completed, turns,
+                total_cost_usd, last_activity_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -585,6 +621,18 @@ class SqliteStore:
                 attempt.agent_output,
                 attempt.error,
                 json.dumps(dict(attempt.agent_context)),
+                attempt.input_tokens,
+                attempt.output_tokens,
+                attempt.cache_creation_input_tokens,
+                attempt.cache_read_input_tokens,
+                attempt.iterations_completed,
+                attempt.turns,
+                attempt.total_cost_usd,
+                (
+                    _iso(attempt.last_activity_at)
+                    if attempt.last_activity_at
+                    else None
+                ),
             ),
         )
 
@@ -592,7 +640,10 @@ class SqliteStore:
         row = self._connection.execute(
             """
             SELECT number, attempt_run_id, started_at, ended_at, outcome,
-                   agent_output, error, agent_context_json
+                   agent_output, error, agent_context_json, input_tokens,
+                   output_tokens, cache_creation_input_tokens,
+                   cache_read_input_tokens, iterations_completed, turns,
+                   total_cost_usd, last_activity_at
             FROM attempts
             WHERE run_id = ? AND number = ?
             """,
@@ -606,7 +657,10 @@ class SqliteStore:
         rows = self._connection.execute(
             """
             SELECT number, attempt_run_id, started_at, ended_at, outcome,
-                   agent_output, error, agent_context_json
+                   agent_output, error, agent_context_json, input_tokens,
+                   output_tokens, cache_creation_input_tokens,
+                   cache_read_input_tokens, iterations_completed, turns,
+                   total_cost_usd, last_activity_at
             FROM attempts
             WHERE run_id = ?
             ORDER BY number
@@ -902,6 +956,16 @@ def _row_to_attempt(row: sqlite3.Row) -> Attempt:
         agent_output=row["agent_output"] or "",
         error=row["error"] or "",
         agent_context=json.loads(row["agent_context_json"] or "{}"),
+        input_tokens=int(row["input_tokens"] or 0),
+        output_tokens=int(row["output_tokens"] or 0),
+        cache_creation_input_tokens=int(
+            row["cache_creation_input_tokens"] or 0
+        ),
+        cache_read_input_tokens=int(row["cache_read_input_tokens"] or 0),
+        iterations_completed=int(row["iterations_completed"] or 0),
+        turns=int(row["turns"] or 0),
+        total_cost_usd=float(row["total_cost_usd"] or 0.0),
+        last_activity_at=_parse_iso(row["last_activity_at"]),
     )
 
 

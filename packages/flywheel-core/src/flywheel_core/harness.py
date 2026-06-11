@@ -205,7 +205,13 @@ class HarnessStore(Protocol):
 
     def list_domain_events(self, run_id: str) -> list[DomainEvent]: ...
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None: ...
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None: ...
 
     def list_attempts(self, run_id: str) -> list[Attempt]: ...
 
@@ -1922,7 +1928,7 @@ async def _run_attempt_body(
         invoker=invoker,
         clock=clock,
         mclock=mclock,
-        attempt_number=attempt_number,
+        attempt=attempt,
         transcript_graders=transcript_graders,
         loop_guard=loop_guard,
         recovery_state=recovery_state,
@@ -2784,7 +2790,7 @@ async def _drive_iterations(
     invoker: InvokeFunc,
     clock: Callable[[], datetime],
     mclock: Callable[[], float],
-    attempt_number: int,
+    attempt: Attempt,
     transcript_graders: tuple[TranscriptGrader, ...],
     loop_guard: LoopGuard,
     recovery_state: _RecoveryState,
@@ -2819,6 +2825,7 @@ async def _drive_iterations(
     wall_seconds = 0.0
     loop_guard_verdict: LoopGuardVerdict | None = None
     recovery_trigger: _RecoveryTrigger | None = None
+    attempt_number = attempt.number
 
     prior_rubric_findings = _collect_prior_rubric_findings(
         store, lifecycle.run_id, attempt_number
@@ -3161,6 +3168,37 @@ async def _drive_iterations(
             now=clock,
         )
 
+        # Iteration-boundary aggregate rollup (spec 00025 FR-6): fold this
+        # iteration's deltas into the attempt row's cumulative counters and
+        # persist through the versioned save_attempt path. Token fields are
+        # per-iteration deltas; turns / total_cost_usd are SDK
+        # session-cumulative readings summed at the boundary (same
+        # overcount policy as the telemetry stream). The lifecycle version
+        # is stable across the iteration loop (only telemetry was written
+        # since the AttemptStarted append), so a mismatch means another
+        # writer moved the run on and this worker must not clobber it. A
+        # failed rollup is a relational-write failure and propagates to
+        # the crash path, the same severity as the domain-event writes.
+        attempt.input_tokens += usage_breakdown.get("input_tokens", 0)
+        attempt.output_tokens += usage_breakdown.get("output_tokens", 0)
+        attempt.cache_creation_input_tokens += usage_breakdown.get(
+            "cache_creation_input_tokens", 0
+        )
+        attempt.cache_read_input_tokens += usage_breakdown.get(
+            "cache_read_input_tokens", 0
+        )
+        attempt.iterations_completed = iteration_number
+        num_turns = iteration_result.signals.num_turns
+        if num_turns is not None:
+            attempt.turns += num_turns
+        cost = iteration_result.signals.total_cost_usd
+        if cost is not None:
+            attempt.total_cost_usd += cost
+        attempt.last_activity_at = clock()
+        store.save_attempt(
+            lifecycle.run_id, attempt, expected_version=lifecycle.version
+        )
+
         if iteration_result.failure is not None:
             break
 
@@ -3284,7 +3322,11 @@ async def _validate(
                 run_id=lifecycle.run_id,
                 attempt_number=attempt.number,
                 transcript=agent_output,
-                worktree=config.worktree,
+                worktree=(
+                    str(config.worktree)
+                    if config.worktree is not None
+                    else None
+                ),
                 command_passed=command_passed,
                 transcript_passed=transcript_passed,
                 judge_invoke=config.rubric_judge_invoke,

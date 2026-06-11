@@ -798,7 +798,11 @@ class PostgresStore:
             cur.execute(
                 """
                 SELECT number, attempt_run_id, started_at, ended_at,
-                       outcome, agent_output, error, agent_context_json
+                       outcome, agent_output, error, agent_context_json,
+                       input_tokens, output_tokens,
+                       cache_creation_input_tokens, cache_read_input_tokens,
+                       iterations_completed, turns, total_cost_usd,
+                       last_activity_at
                 FROM attempts
                 WHERE run_id = %s
                 ORDER BY number
@@ -817,31 +821,8 @@ class PostgresStore:
             )
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO attempts (
-                        run_id, number, attempt_run_id, started_at, ended_at,
-                        outcome, agent_output, error, agent_context_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (run_id, number) DO UPDATE SET
-                        attempt_run_id = EXCLUDED.attempt_run_id,
-                        started_at = EXCLUDED.started_at,
-                        ended_at = EXCLUDED.ended_at,
-                        outcome = EXCLUDED.outcome,
-                        agent_output = EXCLUDED.agent_output,
-                        error = EXCLUDED.error,
-                        agent_context_json = EXCLUDED.agent_context_json
-                    """,
-                    (
-                        folded.run_id,
-                        attempt.number,
-                        attempt.run_id or None,
-                        attempt.started_at,
-                        attempt.ended_at,
-                        attempt.outcome.value if attempt.outcome else None,
-                        attempt.agent_output or None,
-                        attempt.error or None,
-                        Jsonb(dict(attempt.agent_context)),
-                    ),
+                    _ATTEMPT_UPSERT_SQL,
+                    _attempt_upsert_params(folded.run_id, attempt),
                 )
         elif isinstance(event, GraderEvaluated):
             assert event.attempt_number is not None
@@ -922,37 +903,45 @@ class PostgresStore:
 
     # --- AttemptStore -----------------------------------------------------
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
         # Upsert on (run_id, number) primary key so callers can both
         # record the start and later finalize an attempt with one verb.
+        # When ``expected_version`` is supplied (the harness's iteration-
+        # boundary aggregate rollup) the lifecycle's optimistic-concurrency
+        # key is verified under FOR UPDATE in the same transaction as the
+        # upsert so a stale worker cannot clobber counters after the run
+        # moved on.
         with self._pool.connection() as conn:
+            if expected_version is not None:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        """
+                        SELECT version FROM lifecycles
+                        WHERE run_id = %s
+                        FOR UPDATE
+                        """,
+                        (run_id,),
+                    )
+                    row = cur.fetchone()
+                if row is None:
+                    raise LifecycleNotFoundError(run_id)
+                actual = int(row["version"])
+                if actual != expected_version:
+                    raise OptimisticConcurrencyError(
+                        run_id,
+                        expected_version=expected_version,
+                        actual_version=actual,
+                    )
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    INSERT INTO attempts (
-                        run_id, number, attempt_run_id, started_at, ended_at,
-                        outcome, agent_output, error, agent_context_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (run_id, number) DO UPDATE SET
-                        attempt_run_id = EXCLUDED.attempt_run_id,
-                        started_at = EXCLUDED.started_at,
-                        ended_at = EXCLUDED.ended_at,
-                        outcome = EXCLUDED.outcome,
-                        agent_output = EXCLUDED.agent_output,
-                        error = EXCLUDED.error,
-                        agent_context_json = EXCLUDED.agent_context_json
-                    """,
-                    (
-                        run_id,
-                        attempt.number,
-                        attempt.run_id or None,
-                        attempt.started_at,
-                        attempt.ended_at,
-                        attempt.outcome.value if attempt.outcome else None,
-                        attempt.agent_output or None,
-                        attempt.error or None,
-                        Jsonb(dict(attempt.agent_context)),
-                    ),
+                    _ATTEMPT_UPSERT_SQL,
+                    _attempt_upsert_params(run_id, attempt),
                 )
 
     def load_attempt(self, run_id: str, number: int) -> Attempt | None:
@@ -961,7 +950,11 @@ class PostgresStore:
                 cur.execute(
                     """
                     SELECT number, attempt_run_id, started_at, ended_at,
-                           outcome, agent_output, error, agent_context_json
+                           outcome, agent_output, error, agent_context_json,
+                           input_tokens, output_tokens,
+                           cache_creation_input_tokens,
+                           cache_read_input_tokens, iterations_completed,
+                           turns, total_cost_usd, last_activity_at
                     FROM attempts
                     WHERE run_id = %s AND number = %s
                     """,
@@ -978,7 +971,11 @@ class PostgresStore:
                 cur.execute(
                     """
                     SELECT number, attempt_run_id, started_at, ended_at,
-                           outcome, agent_output, error, agent_context_json
+                           outcome, agent_output, error, agent_context_json,
+                           input_tokens, output_tokens,
+                           cache_creation_input_tokens,
+                           cache_read_input_tokens, iterations_completed,
+                           turns, total_cost_usd, last_activity_at
                     FROM attempts
                     WHERE run_id = %s
                     ORDER BY number
@@ -1304,6 +1301,60 @@ class PostgresStore:
         return records
 
 
+# --- Attempt upsert (shared by save_attempt and the projection) -------------
+
+
+_ATTEMPT_UPSERT_SQL = """
+    INSERT INTO attempts (
+        run_id, number, attempt_run_id, started_at, ended_at,
+        outcome, agent_output, error, agent_context_json,
+        input_tokens, output_tokens, cache_creation_input_tokens,
+        cache_read_input_tokens, iterations_completed, turns,
+        total_cost_usd, last_activity_at
+    ) VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    )
+    ON CONFLICT (run_id, number) DO UPDATE SET
+        attempt_run_id = EXCLUDED.attempt_run_id,
+        started_at = EXCLUDED.started_at,
+        ended_at = EXCLUDED.ended_at,
+        outcome = EXCLUDED.outcome,
+        agent_output = EXCLUDED.agent_output,
+        error = EXCLUDED.error,
+        agent_context_json = EXCLUDED.agent_context_json,
+        input_tokens = EXCLUDED.input_tokens,
+        output_tokens = EXCLUDED.output_tokens,
+        cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
+        cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
+        iterations_completed = EXCLUDED.iterations_completed,
+        turns = EXCLUDED.turns,
+        total_cost_usd = EXCLUDED.total_cost_usd,
+        last_activity_at = EXCLUDED.last_activity_at
+"""
+
+
+def _attempt_upsert_params(run_id: str, attempt: Attempt) -> tuple[Any, ...]:
+    return (
+        run_id,
+        attempt.number,
+        attempt.run_id or None,
+        attempt.started_at,
+        attempt.ended_at,
+        attempt.outcome.value if attempt.outcome else None,
+        attempt.agent_output or None,
+        attempt.error or None,
+        Jsonb(dict(attempt.agent_context)),
+        attempt.input_tokens,
+        attempt.output_tokens,
+        attempt.cache_creation_input_tokens,
+        attempt.cache_read_input_tokens,
+        attempt.iterations_completed,
+        attempt.turns,
+        attempt.total_cost_usd,
+        attempt.last_activity_at,
+    )
+
+
 # --- Row -> dataclass converters --------------------------------------------
 
 
@@ -1320,6 +1371,16 @@ def _row_to_attempt(row: dict[str, Any]) -> Attempt:
         agent_output=row["agent_output"] or "",
         error=row["error"] or "",
         agent_context=ctx,
+        input_tokens=int(row["input_tokens"] or 0),
+        output_tokens=int(row["output_tokens"] or 0),
+        cache_creation_input_tokens=int(
+            row["cache_creation_input_tokens"] or 0
+        ),
+        cache_read_input_tokens=int(row["cache_read_input_tokens"] or 0),
+        iterations_completed=int(row["iterations_completed"] or 0),
+        turns=int(row["turns"] or 0),
+        total_cost_usd=float(row["total_cost_usd"] or 0.0),
+        last_activity_at=row["last_activity_at"],
     )
 
 

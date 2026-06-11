@@ -151,6 +151,25 @@ def _wrap(payload: str) -> str:
     return f"{OPENING_FENCE}\n{payload}\n{CLOSING_FENCE}"
 
 
+def _strip_attempt_aggregates(*lifecycles: Lifecycle) -> None:
+    """Zero the boundary-rolled aggregate counters on every attempt.
+
+    The aggregates (tokens, iterations, turns, cost, last activity) are
+    OLTP rollups written outside the domain-event ledger, so replay
+    cannot reproduce them; oracle tests comparing ``loaded == folded``
+    normalize them away first."""
+    for lc in lifecycles:
+        for a in lc.attempts:
+            a.input_tokens = 0
+            a.output_tokens = 0
+            a.cache_creation_input_tokens = 0
+            a.cache_read_input_tokens = 0
+            a.iterations_completed = 0
+            a.turns = 0
+            a.total_cost_usd = 0.0
+            a.last_activity_at = None
+
+
 def _run(coro: Coroutine[Any, Any, HarnessOutcome]) -> HarnessOutcome:
     return asyncio.run(coro)
 
@@ -1400,6 +1419,113 @@ class TestIterationCompletedTelemetry:
         }
 
 
+# --- Attempt aggregate rollup (FR-6) ---------------------------------------
+
+
+class TestAttemptAggregateRollup:
+    """The harness rolls token/iteration/turn/cost/last-activity
+    aggregates onto the attempt row at each iteration boundary, through
+    the store's versioned ``save_attempt`` write."""
+
+    def _passing_task(self) -> Task:
+        return Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+
+    def test_attempt_row_carries_cumulative_aggregates_after_run(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-agg-roll")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.CONTINUE),
+                    messages=(
+                        _assistant(
+                            usage={
+                                "input_tokens": 10,
+                                "output_tokens": 5,
+                                "cache_creation_input_tokens": 2,
+                            }
+                        ),
+                        _result_msg(num_turns=3),
+                    ),
+                    signals=_make_signals(num_turns=3, total_cost_usd=0.10),
+                ),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(
+                        _assistant(
+                            usage={
+                                "input_tokens": 7,
+                                "output_tokens": 3,
+                                "cache_read_input_tokens": 50,
+                            }
+                        ),
+                        _result_msg(num_turns=2),
+                    ),
+                    signals=_make_signals(num_turns=2, total_cost_usd=0.05),
+                ),
+            ]
+        )
+        config = HarnessConfig(max_iterations_per_attempt=2)
+
+        outcome = _run(
+            run_task(task, lifecycle, store, config=config, invoke=invoke)
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        attempt = store.load_attempt(lifecycle.run_id, 1)
+        assert attempt is not None
+        assert attempt.input_tokens == 17
+        assert attempt.output_tokens == 8
+        assert attempt.cache_creation_input_tokens == 2
+        assert attempt.cache_read_input_tokens == 50
+        assert attempt.total_tokens == 77
+        assert attempt.iterations_completed == 2
+        assert attempt.turns == 5
+        assert attempt.total_cost_usd == pytest.approx(0.15)
+        assert attempt.last_activity_at is not None
+        # Finalization preserved the rollups alongside the outcome.
+        assert attempt.outcome == Outcome.SUCCEEDED
+        # The folded lifecycle's attempts carry the same aggregates.
+        assert outcome.attempts[0].total_tokens == 77
+
+    def test_none_turns_and_cost_roll_up_as_zero(self) -> None:
+        store = InMemoryStore()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-agg-none")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                    signals=_make_signals(
+                        num_turns=None,
+                        total_cost_usd=None,
+                    ),
+                )
+            ]
+        )
+
+        _run(run_task(task, lifecycle, store, invoke=invoke))
+
+        attempt = store.load_attempt(lifecycle.run_id, 1)
+        assert attempt is not None
+        assert attempt.total_tokens == 0
+        assert attempt.iterations_completed == 1
+        assert attempt.turns == 0
+        assert attempt.total_cost_usd == 0.0
+        assert attempt.last_activity_at is not None
+
+
 # --- Operator interruption ------------------------------------------------
 
 
@@ -2316,7 +2442,13 @@ class TestInterleavedAuditSequence:
         """End-to-end determinism oracle: folding the domain-event log the
         harness produced reconstructs the persisted lifecycle exactly. This
         is the event-sourcing guarantee at the harness level — state is the
-        fold of the log, with no separate authoritative row."""
+        fold of the log, with no separate authoritative row.
+
+        The attempt aggregate counters (tokens, iterations, turns, cost,
+        last activity) are the one deliberate exception: they are OLTP
+        rollups written at iteration boundaries outside the ledger, so the
+        oracle compares lifecycles with aggregates normalized to their
+        defaults."""
         store = InMemoryStore()
         task = Task(
             goal="g",
@@ -2341,9 +2473,10 @@ class TestInterleavedAuditSequence:
 
         loaded = store.load_lifecycle("run-oracle")
         folded = replay(store.list_domain_events("run-oracle"))
+        assert loaded is not None
+        _strip_attempt_aggregates(loaded, folded)
         assert loaded == folded
         # version is the domain-event offset.
-        assert loaded is not None
         assert loaded.version == len(store.list_domain_events("run-oracle"))
 
 
@@ -3090,6 +3223,7 @@ class TestManualGateEntry:
         assert loaded.awaiting_manual_ordinal == 2
         folded = replay(store.list_domain_events(lifecycle.run_id))
         assert folded.awaiting_manual_ordinal == 2
+        _strip_attempt_aggregates(loaded, folded)
         assert loaded == folded
 
     def test_all_pass_with_no_manual_gate_still_reaches_done(self) -> None:

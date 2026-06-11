@@ -78,7 +78,7 @@ class LifecycleNotFoundError(StoreConflictError):
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 9
+CURRENT_SCHEMA_VERSION: int = 10
 
 
 class StoreSchemaError(Exception):
@@ -381,12 +381,29 @@ class AttemptStore(Protocol):
     ``outcome`` unset) and the finalization (``ended_at`` and ``outcome``
     set) of a single attempt without separate verbs.
 
+    ``expected_version`` opts the write into the lifecycle's optimistic-
+    concurrency check: when supplied, the store verifies — atomically with
+    the upsert — that the stored ``Lifecycle.version`` for ``run_id``
+    still equals it, raising ``OptimisticConcurrencyError`` on mismatch
+    and ``LifecycleNotFoundError`` when no lifecycle row exists. The
+    harness uses this for the iteration-boundary aggregate rollup so a
+    stale worker cannot clobber counters after the run moved on. When
+    ``None`` (the default) the write is unconditional, matching the
+    projection path that already runs inside a version-checked
+    ``append_domain_event`` transaction.
+
     ``list_attempts`` returns attempts in ascending ``number`` order
     regardless of insertion order; ``load_attempt`` returns ``None`` for
     missing rows.
     """
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None: ...
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None: ...
 
     def load_attempt(self, run_id: str, number: int) -> Attempt | None: ...
 

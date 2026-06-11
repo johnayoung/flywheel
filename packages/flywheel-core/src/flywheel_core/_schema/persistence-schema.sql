@@ -115,16 +115,35 @@ CREATE TABLE IF NOT EXISTS lifecycles (
 -- model_id, model_version, agent_sdk_version, prompt_template_hash.
 -- Per-grader failures are not denormalized here — query grader_results with
 -- (run_id, attempt_number) and passed = 0 instead.
+--
+-- The aggregate columns (input_tokens .. last_activity_at) are rolled-up
+-- counters the harness writes at iteration boundaries through the
+-- versioned save_attempt path (schema_version 10). Token columns mirror
+-- the SDK usage breakdown keys and accumulate per-iteration deltas;
+-- turns / total_cost_usd accumulate the SDK's session-cumulative
+-- readings (summed at the boundary, same overcount policy as the
+-- telemetry stream); iterations_completed counts completed iterations;
+-- last_activity_at is the timestamp of the most recent rollup (NULL
+-- before the first completed iteration). The dashboard snapshot reads
+-- these relational columns instead of scanning telemetry events.
 CREATE TABLE IF NOT EXISTS attempts (
-  run_id              TEXT NOT NULL,
-  number              INTEGER NOT NULL,
-  attempt_run_id      TEXT,
-  started_at          DATETIME NOT NULL,
-  ended_at            DATETIME,
-  outcome             TEXT,
-  agent_output        TEXT,
-  error               TEXT,
-  agent_context_json  TEXT,
+  run_id                       TEXT NOT NULL,
+  number                       INTEGER NOT NULL,
+  attempt_run_id               TEXT,
+  started_at                   DATETIME NOT NULL,
+  ended_at                     DATETIME,
+  outcome                      TEXT,
+  agent_output                 TEXT,
+  error                        TEXT,
+  agent_context_json           TEXT,
+  input_tokens                 INTEGER NOT NULL DEFAULT 0,
+  output_tokens                INTEGER NOT NULL DEFAULT 0,
+  cache_creation_input_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_read_input_tokens      INTEGER NOT NULL DEFAULT 0,
+  iterations_completed         INTEGER NOT NULL DEFAULT 0,
+  turns                        INTEGER NOT NULL DEFAULT 0,
+  total_cost_usd               REAL NOT NULL DEFAULT 0,
+  last_activity_at             DATETIME,
   PRIMARY KEY (run_id, number),
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
@@ -270,4 +289,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 9);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 10);

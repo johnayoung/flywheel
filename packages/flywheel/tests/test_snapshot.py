@@ -10,8 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flywheel_core.lifecycle import Lifecycle, Status
-from flywheel_core.store_protocols import EventRecord
+from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import DirectoryWorkSource
 
@@ -68,19 +67,18 @@ def test_build_snapshot_includes_running_rows(tmp_path: Path) -> None:
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "alpha")
-        store.append_event(
-            EventRecord(
+        store.save_attempt(
+            running.run_id,
+            Attempt(
+                number=1,
+                started_at=now,
                 run_id=running.run_id,
-                ts=now,
-                kind="harness.iteration_completed",
-                payload={
-                    "iteration": 1,
-                    "usage": {"total_tokens": 100},
-                    "total_cost_usd": 0.25,
-                    "num_turns": 3,
-                },
-                attempt_number=1,
-            )
+                input_tokens=100,
+                iterations_completed=1,
+                turns=3,
+                total_cost_usd=0.25,
+                last_activity_at=now,
+            ),
         )
         snap = build_snapshot(store, now=now, started_at=now)
     finally:
@@ -137,14 +135,9 @@ def test_build_snapshot_age_clamps_clock_skew_to_zero(tmp_path: Path) -> None:
         lc.transition_to(Status.READY, now=future)
         lc.transition_to(Status.RUNNING, now=future)
         store.create_lifecycle(lc)
-        store.append_event(
-            EventRecord(
-                run_id=lc.run_id,
-                ts=future,
-                kind="harness.attempt_started",
-                payload={},
-                attempt_number=1,
-            )
+        store.save_attempt(
+            lc.run_id,
+            Attempt(number=1, started_at=future, run_id=lc.run_id),
         )
         snap = build_snapshot(store, now=now, started_at=now)
     finally:
@@ -158,12 +151,12 @@ def test_build_snapshot_age_is_run_age_not_last_event_age(
     tmp_path: Path,
 ) -> None:
     """``age_seconds`` measures from the run's first lifecycle
-    transition and keeps growing as fresh events land; the per-event
-    reset lives in ``idle_seconds``. Regression: the dashboard age
-    column used to bounce back to 0 on every new event."""
+    transition and keeps growing as fresh activity lands; the per-
+    activity reset lives in ``idle_seconds``. Regression: the dashboard
+    age column used to bounce back to 0 on every new event."""
     db = tmp_path / "db.sqlite"
     start = datetime(2026, 6, 10, 12, 0, tzinfo=timezone.utc)
-    event_ts = start.replace(minute=1, second=40)  # 100s in
+    activity_ts = start.replace(minute=1, second=40)  # 100s in
     now = start.replace(minute=2)  # 120s in
     store = SqliteStore(db)
     try:
@@ -171,14 +164,15 @@ def test_build_snapshot_age_is_run_age_not_last_event_age(
         lc.transition_to(Status.READY, now=start)
         lc.transition_to(Status.RUNNING, now=start)
         store.create_lifecycle(lc)
-        store.append_event(
-            EventRecord(
+        store.save_attempt(
+            lc.run_id,
+            Attempt(
+                number=1,
+                started_at=start,
                 run_id=lc.run_id,
-                ts=event_ts,
-                kind="harness.iteration_completed",
-                payload={"iteration": 1},
-                attempt_number=1,
-            )
+                iterations_completed=1,
+                last_activity_at=activity_ts,
+            ),
         )
         snap = build_snapshot(store, now=now, started_at=now)
     finally:

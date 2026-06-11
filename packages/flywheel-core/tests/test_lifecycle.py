@@ -84,8 +84,48 @@ def test_attempt_fields_match_spec_table() -> None:
         "error",
         "agent_context",
         "run_id",
+        # Boundary-rolled aggregates (FR-6): updated by the harness at
+        # iteration boundaries through the versioned save_attempt write.
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "iterations_completed",
+        "turns",
+        "total_cost_usd",
+        "last_activity_at",
     }
     assert {f.name for f in fields(Attempt)} == expected
+
+
+def test_attempt_aggregates_default_to_zero_with_no_activity() -> None:
+    a = Attempt(
+        number=1,
+        started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        run_id="r1",
+    )
+    assert a.input_tokens == 0
+    assert a.output_tokens == 0
+    assert a.cache_creation_input_tokens == 0
+    assert a.cache_read_input_tokens == 0
+    assert a.total_tokens == 0
+    assert a.iterations_completed == 0
+    assert a.turns == 0
+    assert a.total_cost_usd == 0.0
+    assert a.last_activity_at is None
+
+
+def test_attempt_total_tokens_sums_the_four_usage_fields() -> None:
+    a = Attempt(
+        number=1,
+        started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        run_id="r1",
+        input_tokens=1000,
+        output_tokens=200,
+        cache_creation_input_tokens=30,
+        cache_read_input_tokens=4,
+    )
+    assert a.total_tokens == 1234
 
 
 def test_attempt_constructs_directly_with_agent_context() -> None:

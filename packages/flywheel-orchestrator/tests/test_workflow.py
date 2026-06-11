@@ -1032,70 +1032,87 @@ def test_live_skips_runs_that_are_not_in_flight(tmp_path: Path) -> None:
         store.close()
 
 
-def test_live_reports_latest_sdk_message_when_newer(tmp_path: Path) -> None:
+def _save_live_attempt(
+    store: SqliteStore,
+    lc: Lifecycle,
+    *,
+    number: int = 1,
+    started_at: datetime | None = None,
+    iterations_completed: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    turns: int = 0,
+    total_cost_usd: float = 0.0,
+    last_activity_at: datetime | None = None,
+    ended_at: datetime | None = None,
+    outcome: Outcome | None = None,
+) -> Attempt:
+    """Seed one attempts row with rolled-up aggregates, the way the
+    harness's iteration-boundary rollup would have left it."""
+    attempt = Attempt(
+        number=number,
+        started_at=started_at or datetime.now(timezone.utc),
+        run_id=lc.run_id,
+        ended_at=ended_at,
+        outcome=outcome,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
+        iterations_completed=iterations_completed,
+        turns=turns,
+        total_cost_usd=total_cost_usd,
+        last_activity_at=last_activity_at,
+    )
+    store.save_attempt(lc.run_id, attempt)
+    return attempt
+
+
+def test_live_reports_latest_attempt_position(tmp_path: Path) -> None:
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-a")
-        ts0 = datetime.now(timezone.utc)
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=ts0,
-                kind="harness.attempt_started",
-                payload={},
-                attempt_number=1,
-            )
-        )
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=1,
-            iteration_number=2,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Edit",
-                            "input": {"file_path": "README.md"},
-                        }
-                    ],
-                }
-            ],
+        now = datetime.now(timezone.utc)
+        _save_live_attempt(
+            store,
+            running,
+            iterations_completed=2,
+            input_tokens=10,
+            last_activity_at=now,
         )
         rows = collect_live_rows(store)
         assert len(rows) == 1
         row = rows[0]
         assert row.task_id == "task-a"
         assert row.status == Status.RUNNING
+        assert row.attempt == 1
         assert row.iteration == 2
-        assert row.last_kind == "ASSISTANT"
-        assert "Edit" in row.last_detail
-        assert "README.md" in row.last_detail
+        assert row.last_kind == "ITERATION"
+        assert row.last_detail == "iteration 2 completed"
+        assert row.last_ts == now
     finally:
         store.close()
 
 
-def test_live_falls_back_to_event_when_no_sdk_messages(tmp_path: Path) -> None:
+def test_live_attempt_started_but_no_iteration_yet(tmp_path: Path) -> None:
+    """An attempt row with zero completed iterations renders as the
+    attempt-started position: no iteration, last_ts = started_at."""
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-b")
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_completed",
-                payload={},
-                attempt_number=1,
-            )
-        )
+        started = datetime.now(timezone.utc)
+        _save_live_attempt(store, running, started_at=started)
         rows = collect_live_rows(store)
         assert len(rows) == 1
-        assert rows[0].last_kind == "EVENT"
-        assert rows[0].last_detail == "harness.iteration_completed"
+        assert rows[0].attempt == 1
         assert rows[0].iteration is None
+        assert rows[0].last_kind == "ATTEMPT"
+        assert rows[0].last_detail == "attempt 1 started"
+        assert rows[0].last_ts == started
     finally:
         store.close()
 
@@ -1113,28 +1130,49 @@ def test_live_marks_runs_with_no_activity(tmp_path: Path) -> None:
         store.close()
 
 
-def test_live_summarizes_user_tool_result(tmp_path: Path) -> None:
+def test_live_ignores_telemetry_and_sdk_streams(tmp_path: Path) -> None:
+    """The relational snapshot never scans telemetry events or SDK
+    messages (spec 00025 FR-6): rows written there do not move totals,
+    breadcrumb, or activity."""
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-d")
-        body = "x" * 1234
+        store.append_event(
+            EventRecord(
+                run_id=running.run_id,
+                ts=datetime.now(timezone.utc),
+                kind="harness.iteration_completed",
+                payload={
+                    "iteration": 9,
+                    "usage": {"total_tokens": 999},
+                    "total_cost_usd": 9.99,
+                    "num_turns": 9,
+                },
+                attempt_number=1,
+            )
+        )
         store.save_sdk_messages(
             run_id=running.run_id,
             attempt_number=1,
-            iteration_number=1,
+            iteration_number=9,
             messages=[
                 {
-                    "message_type": "UserMessage",
-                    "content": [
-                        {"tool_use_id": "toolu_x", "content": body}
-                    ],
+                    "message_type": "AssistantMessage",
+                    "content": [{"type": "text", "text": "noise"}],
                 }
             ],
         )
         rows = collect_live_rows(store)
-        assert rows[0].last_kind == "USER"
-        assert rows[0].last_detail == f"tool_result({len(body)}B)"
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.tokens_total == 0
+        assert row.cost_usd_total == 0.0
+        assert row.iterations_completed == 0
+        assert row.attempt is None
+        assert row.iteration is None
+        assert row.last_kind == "(none)"
+        assert row.last_ts is None
     finally:
         store.close()
 
@@ -1147,32 +1185,13 @@ def test_main_live_prints_one_line_per_running_task(
     try:
         running_a = _seed_running(store, "task-a")
         running_b = _seed_running(store, "task-b")
-        store.save_sdk_messages(
-            run_id=running_a.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Read",
-                            "input": {"file_path": "x.py"},
-                        }
-                    ],
-                }
-            ],
+        _save_live_attempt(
+            store,
+            running_a,
+            iterations_completed=1,
+            last_activity_at=datetime.now(timezone.utc),
         )
-        store.append_event(
-            EventRecord(
-                run_id=running_b.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.attempt_started",
-                payload={},
-                attempt_number=1,
-            )
-        )
+        _save_live_attempt(store, running_b)
     finally:
         store.close()
     rc = orch_main(["live", "--db", str(db)])
@@ -1180,8 +1199,14 @@ def test_main_live_prints_one_line_per_running_task(
     out = capsys.readouterr().out
     lines = [ln for ln in out.splitlines() if ln.strip()]
     assert len(lines) == 2
-    assert any("task-a" in ln and "ASSISTANT" in ln and "Read" in ln for ln in lines)
-    assert any("task-b" in ln and "EVENT" in ln for ln in lines)
+    assert any(
+        "task-a" in ln and "ITERATION" in ln and "iteration 1 completed" in ln
+        for ln in lines
+    )
+    assert any(
+        "task-b" in ln and "ATTEMPT" in ln and "attempt 1 started" in ln
+        for ln in lines
+    )
 
 
 def test_main_live_empty_prints_placeholder(
@@ -1196,57 +1221,40 @@ def test_main_live_empty_prints_placeholder(
 # ---------- Live enrichment: breadcrumb + running totals ----------
 
 
-def _iteration_completed_payload(
-    *,
-    iteration: int,
-    total_tokens: int,
-    total_cost_usd: float | None,
-    num_turns: int | None,
-) -> dict[str, object]:
-    """Build a ``harness.iteration_completed`` payload matching the
-    post-00009 shape (usage breakdown + cost + turns)."""
-    return {
-        "iteration": iteration,
-        "envelope": {"kind": "valid", "intent": "continue"},
-        "failure": None,
-        "stop_reason": "end_turn",
-        "rate_limited": False,
-        "usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "total_tokens": total_tokens,
-        },
-        "total_cost_usd": total_cost_usd,
-        "num_turns": num_turns,
-    }
-
-
-def test_live_sums_running_totals_across_iteration_events(
+def test_live_sums_running_totals_across_attempts(
     tmp_path: Path,
 ) -> None:
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-totals")
-        for i, (tt, cost, turns) in enumerate(
-            [(100, 0.01, 2), (250, 0.05, 3), (50, 0.005, 1)], start=1
-        ):
-            store.append_event(
-                EventRecord(
-                    run_id=running.run_id,
-                    ts=datetime.now(timezone.utc),
-                    kind="harness.iteration_completed",
-                    payload=_iteration_completed_payload(
-                        iteration=i,
-                        total_tokens=tt,
-                        total_cost_usd=cost,
-                        num_turns=turns,
-                    ),
-                    attempt_number=1,
-                )
-            )
+        now = datetime.now(timezone.utc)
+        _save_live_attempt(
+            store,
+            running,
+            number=1,
+            iterations_completed=2,
+            input_tokens=100,
+            output_tokens=150,
+            cache_creation_input_tokens=50,
+            cache_read_input_tokens=50,
+            turns=5,
+            total_cost_usd=0.06,
+            last_activity_at=now,
+            ended_at=now,
+            outcome=Outcome.VALIDATION_FAILED,
+        )
+        _save_live_attempt(
+            store,
+            running,
+            number=2,
+            iterations_completed=1,
+            input_tokens=25,
+            output_tokens=25,
+            turns=1,
+            total_cost_usd=0.005,
+            last_activity_at=now,
+        )
         rows = collect_live_rows(store)
     finally:
         store.close()
@@ -1259,70 +1267,20 @@ def test_live_sums_running_totals_across_iteration_events(
     assert abs(row.cost_usd_total - 0.065) < 1e-9
 
 
-def test_live_treats_missing_totals_fields_as_zero(tmp_path: Path) -> None:
-    """Older / partial iteration events render the rest of the row instead
-    of crashing — missing field = zero."""
-    db = tmp_path / "db.sqlite"
-    store = SqliteStore(db)
-    try:
-        running = _seed_running(store, "task-partial")
-        # Event 1: only usage.total_tokens; cost / turns null.
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_completed",
-                payload=_iteration_completed_payload(
-                    iteration=1,
-                    total_tokens=200,
-                    total_cost_usd=None,
-                    num_turns=None,
-                ),
-                attempt_number=1,
-            )
-        )
-        # Event 2: a legacy / partial payload missing every total.
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_completed",
-                payload={"iteration": 2, "envelope": {"kind": "valid"}},
-                attempt_number=1,
-            )
-        )
-        rows = collect_live_rows(store)
-    finally:
-        store.close()
-    row = rows[0]
-    assert row.iterations_completed == 2
-    assert row.tokens_total == 200
-    assert row.cost_usd_total == 0.0
-    assert row.turns_total == 0
-
-
 def test_live_renders_zero_totals_when_no_iteration_completed_yet(
     tmp_path: Path,
 ) -> None:
     """A run that has not completed an iteration still renders breadcrumb
-    + action line; totals display as zero / ``--``."""
+    + action line; totals display as zero / ``--``. A zero-iteration
+    attempt row produces zeroed aggregates, never a NULL-driven crash
+    (spec 00025 edge case)."""
     from flywheel_orchestrator._workflow import _format_live_line
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-empty")
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "starting"}],
-                }
-            ],
-        )
+        _save_live_attempt(store, running)
         rows = collect_live_rows(store)
     finally:
         store.close()
@@ -1337,38 +1295,35 @@ def test_live_renders_zero_totals_when_no_iteration_completed_yet(
     assert "turns=0" in line
     # Breadcrumb and action line both present.
     assert "attempt=1" in line
-    assert "iter=1" in line
-    assert "ASSISTANT" in line
+    assert "iter=?" in line
+    assert "ATTEMPT" in line
 
 
-def test_live_breadcrumb_renders_attempt_and_iter_from_latest_activity(
+def test_live_breadcrumb_renders_attempt_and_iter_from_latest_attempt(
     tmp_path: Path,
 ) -> None:
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-bc")
-        # Earlier event; the sdk_message below has a higher sequence and
-        # therefore drives the breadcrumb.
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.attempt_started",
-                payload={},
-                attempt_number=1,
-            )
+        now = datetime.now(timezone.utc)
+        # Earlier finalized attempt; the in-flight attempt 2 below is the
+        # latest row and therefore drives the breadcrumb.
+        _save_live_attempt(
+            store,
+            running,
+            number=1,
+            iterations_completed=3,
+            last_activity_at=now,
+            ended_at=now,
+            outcome=Outcome.VALIDATION_FAILED,
         )
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=2,
-            iteration_number=4,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "go"}],
-                }
-            ],
+        _save_live_attempt(
+            store,
+            running,
+            number=2,
+            iterations_completed=4,
+            last_activity_at=now,
         )
         rows = collect_live_rows(store)
     finally:
@@ -1393,68 +1348,6 @@ def test_live_breadcrumb_unknown_when_no_activity(tmp_path: Path) -> None:
     line = _format_live_line(row, datetime.now(timezone.utc))
     assert "attempt=?" in line
     assert "iter=?" in line
-
-
-def test_live_truncates_overlong_detail(tmp_path: Path) -> None:
-    """Very long tool args never wrap unboundedly — the assembled detail is
-    capped (00011 edge case)."""
-    from flywheel_orchestrator._workflow import _LIVE_DETAIL_MAX_WIDTH, _format_live_line
-
-    db = tmp_path / "db.sqlite"
-    store = SqliteStore(db)
-    try:
-        running = _seed_running(store, "task-long")
-        long_value = "y" * 5000
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Write",
-                            "input": {"content": long_value},
-                        }
-                    ],
-                }
-            ],
-        )
-        rows = collect_live_rows(store)
-    finally:
-        store.close()
-    line = _format_live_line(rows[0], datetime.now(timezone.utc))
-    # The line is bounded — the detail portion ends at the cap; no 5000-char
-    # blowup. We compare against the cap with a generous overhead allowance
-    # for the prefix fields (task_id, status, breadcrumb, totals, age, kind).
-    assert len(line) < _LIVE_DETAIL_MAX_WIDTH + 200
-
-
-def test_live_unknown_message_type_falls_back_to_label(tmp_path: Path) -> None:
-    """An sdk_message of a type the summarizer does not special-case still
-    renders — using the upper-cased type as the label — and does not crash."""
-    db = tmp_path / "db.sqlite"
-    store = SqliteStore(db)
-    try:
-        running = _seed_running(store, "task-unknown")
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "WeirdNewMessage",
-                    "content": [{"foo": "bar"}],
-                }
-            ],
-        )
-        rows = collect_live_rows(store)
-    finally:
-        store.close()
-    row = rows[0]
-    assert row.last_kind == "WEIRDNEWMESSAGE"
 
 
 def test_live_orders_runs_by_task_id(tmp_path: Path) -> None:
@@ -1483,36 +1376,18 @@ def test_main_live_includes_totals_and_breadcrumb_in_rendered_output(
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-render")
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=3,
-            iteration_number=5,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Read",
-                            "input": {"file_path": "x.py"},
-                        }
-                    ],
-                }
-            ],
-        )
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_completed",
-                payload=_iteration_completed_payload(
-                    iteration=5,
-                    total_tokens=1234,
-                    total_cost_usd=0.0567,
-                    num_turns=4,
-                ),
-                attempt_number=3,
-            )
+        _save_live_attempt(
+            store,
+            running,
+            number=3,
+            iterations_completed=5,
+            input_tokens=1000,
+            output_tokens=200,
+            cache_creation_input_tokens=20,
+            cache_read_input_tokens=14,
+            turns=4,
+            total_cost_usd=0.0567,
+            last_activity_at=datetime.now(timezone.utc),
         )
     finally:
         store.close()
@@ -1521,15 +1396,13 @@ def test_main_live_includes_totals_and_breadcrumb_in_rendered_output(
     out = capsys.readouterr().out
     line = next(ln for ln in out.splitlines() if "task-render" in ln)
     assert "attempt=3" in line
-    # The iteration_completed event was written after the sdk_message, so
-    # it carries the freshest sequence — iter is folded out of its payload.
     assert "iter=5" in line
     assert "tokens=1234" in line
     assert "cost=$0.0567" in line
     assert "turns=4" in line
-    # Latest activity is the iteration-end event itself.
-    assert "EVENT" in line
-    assert "harness.iteration_completed" in line
+    # Latest activity is the rolled-up iteration boundary.
+    assert "ITERATION" in line
+    assert "iteration 5 completed" in line
 
 
 def test_main_status_json_emits_machine_readable(

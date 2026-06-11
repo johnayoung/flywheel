@@ -39,6 +39,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from flywheel_core import (
     Attempt,
     CommandGrader,
+    ControlCommandRecord,
     DomainEvent,
     EventRecord,
     GraderResultRecord,
@@ -198,8 +199,16 @@ class _EventStreamingStore:
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
         return self._wrapped.list_domain_events(run_id)
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
-        self._wrapped.save_attempt(run_id, attempt)
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        self._wrapped.save_attempt(
+            run_id, attempt, expected_version=expected_version
+        )
 
     def list_attempts(self, run_id: str) -> list[Attempt]:
         return self._wrapped.list_attempts(run_id)
@@ -245,6 +254,11 @@ class _EventStreamingStore:
         self, run_id: str, attempt_number: int
     ) -> list[GraderResultRecord]:
         return self._wrapped.list_grader_results(run_id, attempt_number)
+
+    def claim_commands(
+        self, run_id: str, *, now: datetime
+    ) -> list[ControlCommandRecord]:
+        return self._wrapped.claim_commands(run_id, now=now)
 
 
 def _print_section(title: str) -> None:

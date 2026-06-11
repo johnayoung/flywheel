@@ -60,7 +60,13 @@ class _LifecycleStub:
 
 
 class _AttemptStub:
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
         return None
 
     def load_attempt(self, run_id: str, number: int) -> Attempt | None:

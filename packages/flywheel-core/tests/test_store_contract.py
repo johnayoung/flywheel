@@ -568,6 +568,120 @@ def test_attempt_stored_row_isolated_from_caller_mutations(
     assert loaded.agent_context == {"model_id": "x"}
 
 
+def test_attempt_aggregates_round_trip(store: object) -> None:
+    """The rolled-up aggregate columns survive save/load/list on every
+    backend (FR-6: the dashboard reads these relationally)."""
+    assert isinstance(store, AttemptStore)
+    _ensure_lifecycle(store, "r1")
+    activity = datetime(2024, 1, 1, 0, 2, 30, tzinfo=timezone.utc)
+    store.save_attempt(
+        "r1",
+        Attempt(
+            number=1,
+            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            run_id="r1",
+            input_tokens=1000,
+            output_tokens=200,
+            cache_creation_input_tokens=30,
+            cache_read_input_tokens=4,
+            iterations_completed=3,
+            turns=9,
+            total_cost_usd=0.125,
+            last_activity_at=activity,
+        ),
+    )
+    for loaded in (store.load_attempt("r1", 1), store.list_attempts("r1")[0]):
+        assert loaded is not None
+        assert loaded.input_tokens == 1000
+        assert loaded.output_tokens == 200
+        assert loaded.cache_creation_input_tokens == 30
+        assert loaded.cache_read_input_tokens == 4
+        assert loaded.total_tokens == 1234
+        assert loaded.iterations_completed == 3
+        assert loaded.turns == 9
+        assert loaded.total_cost_usd == 0.125
+        assert loaded.last_activity_at == activity
+
+
+def test_attempt_aggregates_default_to_zero(store: object) -> None:
+    """An attempt saved without aggregates (zero completed iterations)
+    reads back as zeroed counters and a None last-activity timestamp."""
+    assert isinstance(store, AttemptStore)
+    _ensure_lifecycle(store, "r1")
+    store.save_attempt(
+        "r1",
+        Attempt(
+            number=1,
+            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            run_id="r1",
+        ),
+    )
+    loaded = store.load_attempt("r1", 1)
+    assert loaded is not None
+    assert loaded.total_tokens == 0
+    assert loaded.iterations_completed == 0
+    assert loaded.turns == 0
+    assert loaded.total_cost_usd == 0.0
+    assert loaded.last_activity_at is None
+
+
+def test_save_attempt_with_matching_expected_version_succeeds(
+    store: object,
+) -> None:
+    assert isinstance(store, AttemptStore)
+    assert isinstance(store, LifecycleStore)
+    _ensure_lifecycle(store, "r1")
+    lc = store.load_lifecycle("r1")
+    assert lc is not None
+    store.save_attempt(
+        "r1",
+        Attempt(
+            number=1,
+            started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            run_id="r1",
+            input_tokens=42,
+        ),
+        expected_version=lc.version,
+    )
+    loaded = store.load_attempt("r1", 1)
+    assert loaded is not None
+    assert loaded.input_tokens == 42
+
+
+def test_save_attempt_with_stale_expected_version_raises(
+    store: object,
+) -> None:
+    assert isinstance(store, AttemptStore)
+    _ensure_lifecycle(store, "r1")
+    with pytest.raises(OptimisticConcurrencyError):
+        store.save_attempt(
+            "r1",
+            Attempt(
+                number=1,
+                started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                run_id="r1",
+            ),
+            expected_version=999,
+        )
+    assert store.load_attempt("r1", 1) is None
+
+
+def test_save_attempt_expected_version_against_missing_run_raises(
+    store: object,
+) -> None:
+    assert isinstance(store, AttemptStore)
+    with pytest.raises(LifecycleNotFoundError):
+        store.save_attempt(
+            "r-missing",
+            Attempt(
+                number=1,
+                started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                run_id="r-missing",
+            ),
+            expected_version=1,
+        )
+
+
 # --- Event round-trip ------------------------------------------------------
 
 
@@ -1144,6 +1258,74 @@ def test_replay_of_domain_events_equals_loaded_projection(
     loaded = store.load_lifecycle("r1")
     folded = replay(store.list_domain_events("r1"))
     assert loaded == folded
+
+
+def test_attempt_finalized_preserves_boundary_rolled_aggregates(
+    store: object,
+) -> None:
+    """Aggregates rolled up between AttemptStarted and AttemptFinalized
+    survive finalization: the fold loads the attempt rows (with their
+    counters) before applying the in-place finalize mutation, so the
+    boundary rollups are not clobbered by the domain-event projection."""
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, AttemptStore)
+    assert isinstance(store, LifecycleStore)
+    _seed(store)
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(1), target=Status.READY),
+        expected_version=1,
+    )
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(2), target=Status.RUNNING),
+        expected_version=2,
+    )
+    store.append_domain_event(
+        AttemptStarted(
+            run_id="r1",
+            ts=_dts(3),
+            attempt_number=1,
+            number=1,
+            attempt_run_id="r1",
+            started_at=_dts(3),
+        ),
+        expected_version=3,
+    )
+    rolled = store.load_attempt("r1", 1)
+    assert rolled is not None
+    rolled.input_tokens = 120
+    rolled.output_tokens = 30
+    rolled.cache_creation_input_tokens = 7
+    rolled.cache_read_input_tokens = 3
+    rolled.iterations_completed = 2
+    rolled.turns = 5
+    rolled.total_cost_usd = 0.5
+    rolled.last_activity_at = _dts(4)
+    store.save_attempt("r1", rolled, expected_version=4)
+    store.append_domain_event(
+        AttemptFinalized(
+            run_id="r1",
+            ts=_dts(5),
+            attempt_number=1,
+            number=1,
+            outcome=Outcome.SUCCEEDED,
+            ended_at=_dts(5),
+            agent_output="done",
+        ),
+        expected_version=4,
+    )
+    loaded = store.load_attempt("r1", 1)
+    assert loaded is not None
+    assert loaded.outcome is Outcome.SUCCEEDED
+    assert loaded.ended_at == _dts(5)
+    assert loaded.total_tokens == 160
+    assert loaded.iterations_completed == 2
+    assert loaded.turns == 5
+    assert loaded.total_cost_usd == 0.5
+    assert loaded.last_activity_at == _dts(4)
+    lc = store.load_lifecycle("r1")
+    assert lc is not None
+    assert lc.attempts[0].input_tokens == 120
+    assert lc.attempts[0].outcome is Outcome.SUCCEEDED
 
 
 def test_domain_events_share_the_event_log_but_not_the_audit_stream(

@@ -90,6 +90,14 @@ def _clone_attempt(a: Attempt) -> Attempt:
         agent_output=a.agent_output,
         error=a.error,
         agent_context=dict(a.agent_context),
+        input_tokens=a.input_tokens,
+        output_tokens=a.output_tokens,
+        cache_creation_input_tokens=a.cache_creation_input_tokens,
+        cache_read_input_tokens=a.cache_read_input_tokens,
+        iterations_completed=a.iterations_completed,
+        turns=a.turns,
+        total_cost_usd=a.total_cost_usd,
+        last_activity_at=a.last_activity_at,
     )
 
 
@@ -389,7 +397,27 @@ class InMemoryStore:
 
     # --- AttemptStore ------------------------------------------------------
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        if expected_version is not None:
+            # Versioned write (the harness's iteration-boundary aggregate
+            # rollup): verify the lifecycle's optimistic-concurrency key
+            # before the upsert so a stale worker cannot clobber counters
+            # after the run moved on.
+            stored = self._lifecycles.get(run_id)
+            if stored is None:
+                raise LifecycleNotFoundError(run_id)
+            if stored.version != expected_version:
+                raise OptimisticConcurrencyError(
+                    run_id,
+                    expected_version=expected_version,
+                    actual_version=stored.version,
+                )
         self._attempts[(run_id, attempt.number)] = _clone_attempt(attempt)
 
     def load_attempt(self, run_id: str, number: int) -> Attempt | None:

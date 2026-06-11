@@ -370,8 +370,16 @@ class _EventStreamingStore:
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
         return self._wrapped.list_domain_events(run_id)
 
-    def save_attempt(self, run_id: str, attempt: Attempt) -> None:
-        self._wrapped.save_attempt(run_id, attempt)
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        self._wrapped.save_attempt(
+            run_id, attempt, expected_version=expected_version
+        )
 
     def list_attempts(self, run_id: str) -> list[Attempt]:
         return self._wrapped.list_attempts(run_id)

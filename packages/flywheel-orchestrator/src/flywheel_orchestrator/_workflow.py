@@ -753,13 +753,18 @@ class LiveRunRow:
     """Per-in-flight-run snapshot used by ``live`` reporting.
 
     ``attempt`` / ``iteration`` form the lifecycle-position breadcrumb
-    (``attempt=N iter=K``). ``last_kind`` + ``last_detail`` are the
-    current agent action. ``tokens_total``/``cost_usd_total``/
-    ``turns_total`` are running totals summed from this run's
-    ``harness.iteration_completed`` events (per the 00011 spec —
-    summed at query time, no harness counter). ``iterations_completed``
-    is the count of those events; zero means "no totals yet" and the
-    totals fields are all zero by definition.
+    (``attempt=N iter=K``). ``last_kind`` + ``last_detail`` describe the
+    run's latest recorded position. All fields are computed from
+    relational rows only (``lifecycles`` + ``attempts`` aggregate
+    columns, per spec 00025 FR-6 — no telemetry-event scan):
+    ``tokens_total``/``cost_usd_total``/``turns_total`` sum the
+    per-attempt rolled-up counters the harness writes at iteration
+    boundaries, and ``iterations_completed`` sums the per-attempt
+    iteration counts. Zero iterations completed means "no totals yet"
+    and the totals fields are all zero by definition. ``last_ts`` is the
+    latest attempt's ``last_activity_at`` rollup timestamp (falling back
+    to its ``started_at`` before the first completed iteration), so
+    idle/staleness updates at iteration-boundary cadence.
 
     ``awaiting_instruction`` carries the pending manual gate's
     instruction text when the run is parked on ``AWAITING_APPROVAL``;
@@ -786,79 +791,6 @@ class LiveRunRow:
     # going" (the age an operator expects to grow monotonically).
     started_at: datetime | None = None
 
-_SDK_KIND_LABELS: dict[str, str] = {
-    "AssistantMessage": "ASSISTANT",
-    "UserMessage": "USER",
-    "SystemMessage": "SYSTEM",
-    "ResultMessage": "RESULT",
-}
-
-def _summarize_assistant(payload: Mapping[str, Any]) -> str:
-    content = payload.get("content") or []
-    if not content:
-        return "(empty)"
-    first = content[0]
-    if not isinstance(first, Mapping):
-        return _short(first)
-    ctype = first.get("type")
-    if ctype == "tool_use":
-        name = first.get("name", "?")
-        input_obj = first.get("input") or {}
-        if isinstance(input_obj, Mapping) and input_obj:
-            kv = ", ".join(
-                f"{k}={_short(v, 30)}"
-                for k, v in list(input_obj.items())[:2]
-            )
-            return f"{name}({kv})"
-        return f"{name}()"
-    text = first.get("text") if isinstance(first, Mapping) else None
-    if isinstance(text, str):
-        return _short(text)
-    return _short(first)
-
-def _summarize_user(payload: Mapping[str, Any]) -> str:
-    content = payload.get("content") or []
-    if not content:
-        return "(empty)"
-    first = content[0]
-    if isinstance(first, Mapping):
-        if "tool_use_id" in first:
-            body = first.get("content")
-            size = len(body) if isinstance(body, str) else 0
-            return f"tool_result({size}B)"
-        text = first.get("text")
-        if isinstance(text, str):
-            return _short(text)
-    return _short(first)
-
-def _summarize_result(payload: Mapping[str, Any]) -> str:
-    return (
-        f"subtype={payload.get('subtype', '?')} "
-        f"turns={payload.get('num_turns', '?')} "
-        f"dur={payload.get('duration_ms', '?')}ms"
-    )
-
-def _summarize_system(payload: Mapping[str, Any]) -> str:
-    subtype = payload.get("subtype")
-    return str(subtype) if subtype is not None else "(system)"
-
-def _summarize_sdk_message(message_type: str, payload_json: str) -> str:
-    try:
-        payload = json.loads(payload_json)
-    except json.JSONDecodeError:
-        return "(unparseable payload)"
-    if not isinstance(payload, Mapping):
-        return _short(payload)
-    if message_type == "AssistantMessage":
-        return _summarize_assistant(payload)
-    if message_type == "UserMessage":
-        return _summarize_user(payload)
-    if message_type == "ResultMessage":
-        return _summarize_result(payload)
-    if message_type == "SystemMessage":
-        return _summarize_system(payload)
-    return message_type
-
 def _parse_db_ts(value: str | None) -> datetime | None:
     if value is None:
         return None
@@ -867,91 +799,19 @@ def _parse_db_ts(value: str | None) -> datetime | None:
     except ValueError:
         return None
 
-_EVENT_KINDS_WITH_ITERATION: frozenset[str] = frozenset(
-    {"harness.iteration_completed"}
-)
-
-def _iteration_from_event_payload(
-    kind: str, payload_json: str | None
-) -> int | None:
-    """Best-effort extract of the iteration number from an event payload.
-
-    Only ``harness.iteration_completed`` (the only iteration-bearing
-    telemetry event today) is parsed. Any decode / shape failure
-    silently returns ``None`` — the breadcrumb falls back to ``iter=?``
-    rather than crashing the view.
-    """
-    if kind not in _EVENT_KINDS_WITH_ITERATION:
-        return None
-    if not payload_json:
-        return None
-    try:
-        payload = json.loads(payload_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    value = payload.get("iteration")
-    return value if isinstance(value, int) else None
-
-def _sum_run_totals(
-    conn: Any, run_id: str
-) -> tuple[int, float, int, int]:
-    """Aggregate this run's iteration-completed telemetry.
-
-    Returns ``(tokens, cost_usd, turns, iterations_completed)``. Missing
-    fields on an older payload are treated as zero / null and skipped —
-    the remaining fields still aggregate. ``cost_usd``/``turns`` are
-    SDK-reported as session-cumulative per iteration; the 00011 spec
-    explicitly summed them at query time, accepting the known
-    overcount when the SDK reuses a session across iterations.
-    """
-    rows = conn.execute(
-        """
-        SELECT payload_json
-        FROM events
-        WHERE run_id = ? AND kind = 'harness.iteration_completed'
-        """,
-        (run_id,),
-    ).fetchall()
-    tokens = 0
-    cost = 0.0
-    turns = 0
-    count = 0
-    for row in rows:
-        count += 1
-        try:
-            payload = json.loads(row["payload_json"])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, Mapping):
-            continue
-        usage = payload.get("usage")
-        if isinstance(usage, Mapping):
-            tt = usage.get("total_tokens")
-            if isinstance(tt, int):
-                tokens += tt
-        cost_val = payload.get("total_cost_usd")
-        if isinstance(cost_val, (int, float)):
-            cost += float(cost_val)
-        turns_val = payload.get("num_turns")
-        if isinstance(turns_val, int):
-            turns += turns_val
-    return tokens, cost, turns, count
-
 def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
-    """Snapshot every in-flight run with its latest activity.
+    """Snapshot every in-flight run from relational rows only.
 
     Reads ``lifecycles`` for status in ``{running, validating,
-    awaiting_approval}`` and joins each row to the freshest
-    ``sdk_messages``/``events`` entry by per-run sequence. The two tables
-    share a monotonic counter (see ``run_sequence``), so picking the
-    higher sequence is correct even when the timestamps are within
-    microseconds of each other. The same join also pins the latest
-    ``attempt_number`` so the breadcrumb stays accurate across retries.
-    Totals are summed from the run's ``harness.iteration_completed``
-    events at query time (no harness counter). Output is sorted by
-    ``task_id`` for stable multi-run rendering per the 00011 spec.
+    awaiting_approval}`` and joins each row to its ``attempts`` rows,
+    whose rolled-up aggregate columns the harness maintains at iteration
+    boundaries (spec 00025 FR-6). No telemetry events or SDK messages
+    are scanned: totals sum the per-attempt counters, the breadcrumb's
+    ``attempt``/``iteration`` come from the latest attempt row, and
+    ``last_ts`` is that row's ``last_activity_at`` rollup timestamp
+    (falling back to ``started_at`` before the first completed
+    iteration). Output is sorted by ``task_id`` for stable multi-run
+    rendering per the 00011 spec.
 
     ``awaiting_approval`` rows have no live worker but are still owed
     operator attention; including them lets ``flywheel live`` surface
@@ -971,67 +831,52 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     rows: list[LiveRunRow] = []
     for lc in lifecycles:
         run_id = lc["run_id"]
-        sdk = conn.execute(
+        attempts = conn.execute(
             """
-            SELECT iteration_number, attempt_number, sequence, message_type,
-                   payload_json, ts
-            FROM sdk_messages
+            SELECT number, started_at, input_tokens, output_tokens,
+                   cache_creation_input_tokens, cache_read_input_tokens,
+                   iterations_completed, turns, total_cost_usd,
+                   last_activity_at
+            FROM attempts
             WHERE run_id = ?
-            ORDER BY sequence DESC
-            LIMIT 1
+            ORDER BY number
             """,
             (run_id,),
-        ).fetchone()
-        evt = conn.execute(
-            """
-            SELECT attempt_number, sequence, kind, payload_json, ts
-            FROM events
-            WHERE run_id = ?
-            ORDER BY sequence DESC
-            LIMIT 1
-            """,
-            (run_id,),
-        ).fetchone()
-        sdk_seq = sdk["sequence"] if sdk is not None else -1
-        evt_seq = evt["sequence"] if evt is not None else -1
+        ).fetchall()
+        tokens = 0
+        cost = 0.0
+        turns = 0
+        iters_completed = 0
+        for a in attempts:
+            tokens += (
+                int(a["input_tokens"] or 0)
+                + int(a["output_tokens"] or 0)
+                + int(a["cache_creation_input_tokens"] or 0)
+                + int(a["cache_read_input_tokens"] or 0)
+            )
+            cost += float(a["total_cost_usd"] or 0.0)
+            turns += int(a["turns"] or 0)
+            iters_completed += int(a["iterations_completed"] or 0)
         iteration: int | None = None
         attempt: int | None = None
         last_kind = "(none)"
         last_detail = "(no activity yet)"
         last_ts: datetime | None = None
-        if sdk_seq >= 0 and sdk_seq >= evt_seq and sdk is not None:
-            iteration = sdk["iteration_number"]
-            attempt_raw = sdk["attempt_number"]
-            attempt = (
-                int(attempt_raw) if isinstance(attempt_raw, int) else None
-            )
-            # sqlite3.Row indexing is typed Any; pin to str so last_kind stays
-            # str (dict.get over an Any key/default otherwise widens to
-            # str | None).
-            message_type = str(sdk["message_type"])
-            last_kind = _SDK_KIND_LABELS.get(
-                message_type, message_type.upper()
-            )
-            last_detail = _summarize_sdk_message(
-                message_type, sdk["payload_json"]
-            )
-            last_ts = _parse_db_ts(sdk["ts"])
-        elif evt is not None and evt_seq >= 0:
-            attempt_raw = evt["attempt_number"]
-            attempt = (
-                int(attempt_raw) if isinstance(attempt_raw, int) else None
-            )
-            last_kind = "EVENT"
-            last_detail = str(evt["kind"])
-            last_ts = _parse_db_ts(evt["ts"])
-            # Iteration-bearing harness events carry the iteration in the
-            # payload — fold it into the breadcrumb so the position stays
-            # accurate when the freshest activity is the iteration-end
-            # event, not an sdk_message.
-            iteration = _iteration_from_event_payload(
-                str(evt["kind"]), evt["payload_json"]
-            )
-        tokens, cost, turns, iters_completed = _sum_run_totals(conn, run_id)
+        if attempts:
+            latest = attempts[-1]
+            attempt = int(latest["number"])
+            latest_iters = int(latest["iterations_completed"] or 0)
+            if latest_iters > 0:
+                iteration = latest_iters
+                last_kind = "ITERATION"
+                last_detail = f"iteration {latest_iters} completed"
+                last_ts = _parse_db_ts(
+                    latest["last_activity_at"]
+                ) or _parse_db_ts(latest["started_at"])
+            else:
+                last_kind = "ATTEMPT"
+                last_detail = f"attempt {attempt} started"
+                last_ts = _parse_db_ts(latest["started_at"])
         started_at = _earliest_lifecycle_ts(lc["timestamps_json"])
         status = Status(lc["status"])
         awaiting_instruction = _resolve_awaiting_instruction(
@@ -1127,7 +972,7 @@ def _format_breadcrumb(row: LiveRunRow) -> str:
 
 def _format_totals(row: LiveRunRow) -> str:
     """Compact ``tokens=… cost=$… turns=…`` rollup of the run's
-    ``harness.iteration_completed`` events. Renders zero/`--` when the
+    per-attempt aggregate counters. Renders zero/`--` when the
     run has not completed an iteration yet (so the breadcrumb and
     action line still render — 00011 edge case)."""
     if row.iterations_completed == 0:

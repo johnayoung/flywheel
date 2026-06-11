@@ -176,6 +176,34 @@ AuditRecord = Union[EventRecord, SdkMessageRecord]
 
 
 @dataclass(kw_only=True)
+class TelemetryRecord:
+    """One line in a run's observability stream.
+
+    The unit of :class:`TelemetrySink` appends. Unlike the store record
+    types above it mirrors no table: telemetry lives outside the
+    database, in per-run destinations owned by a concrete sink (see
+    ``docs/data-taxonomy.md``). There is no store-assigned ``id`` or
+    ``sequence`` — emission order at the sink is the canonical
+    observability ordering for the run.
+
+    ``kind`` discriminates the record (an SDK message type, a harness
+    telemetry event kind, or a mirrored domain-event kind).
+    ``attempt_number``/``iteration_number`` locate the record within the
+    run; either may be ``None`` for records emitted outside an attempt
+    or iteration. ``payload`` is an opaque JSON-compatible mapping
+    persisted verbatim, the same way :attr:`EventRecord.payload` is
+    handled.
+    """
+
+    run_id: str
+    ts: datetime
+    kind: str
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    attempt_number: int | None = None
+    iteration_number: int | None = None
+
+
+@dataclass(kw_only=True)
 class GraderResultRecord:
     """A single grader execution receipt; append-only by contract.
 
@@ -435,6 +463,29 @@ class AuditStore(Protocol):
 
 
 @runtime_checkable
+class TelemetrySink(Protocol):
+    """Pluggable destination for a run's telemetry stream.
+
+    Telemetry (SDK messages, harness telemetry events, mirrored domain
+    events) flows to a sink, not to the relational store: loss is
+    acceptable, ordering is defined by emission order at the sink, and
+    durability semantics belong entirely to the implementation. The MVP
+    implementation is :class:`flywheel_core.telemetry_file.FileTelemetrySink`
+    (one append-only JSONL file per run); nothing in core imports a
+    concrete sink.
+
+    ``append_telemetry`` is the single verb: it accepts one
+    :class:`TelemetryRecord` and persists it to the destination keyed by
+    ``record.run_id``. Implementations must keep concurrent runs
+    disjoint (records for different ``run_id`` values never interleave
+    into one destination) and must not reorder or rewrite previously
+    appended records.
+    """
+
+    def append_telemetry(self, record: TelemetryRecord) -> None: ...
+
+
+@runtime_checkable
 class GraderResultStore(Protocol):
     """Persistence contract for ``grader_results``. Append-only by contract.
 
@@ -523,4 +574,6 @@ __all__ = [
     "StoreConflictError",
     "StoreSchemaError",
     "TaskStore",
+    "TelemetryRecord",
+    "TelemetrySink",
 ]

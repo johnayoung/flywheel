@@ -123,6 +123,12 @@ from flywheel_core.store_protocols import (
     StoreConflictError,
     StoreSchemaError,
     TaskStore,
+    TelemetryRecord,
+    TelemetrySink,
+)
+from flywheel_core.telemetry_file import (
+    DEFAULT_LOGS_ROOT,
+    FileTelemetrySink,
 )
 from flywheel_core.task import (
     KNOWN_GRADER_TYPES,
@@ -182,6 +188,7 @@ __all__ = [
     "Context",
     "ControlCommandRecord",
     "ControlCommandStore",
+    "DEFAULT_LOGS_ROOT",
     "DEFAULT_TAIL_BYTES",
     "DomainEvent",
     "DomainEventKind",
@@ -194,6 +201,7 @@ __all__ = [
     "EventReplayError",
     "EventStore",
     "FileExistsRequirement",
+    "FileTelemetrySink",
     "Grader",
     "GraderResultRecord",
     "GraderResultStore",
@@ -243,6 +251,8 @@ __all__ = [
     "Task",
     "TaskLoadError",
     "TaskStore",
+    "TelemetryRecord",
+    "TelemetrySink",
     "ToolInteraction",
     "ToolResultObservation",
     "TranscriptCounter",

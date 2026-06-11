@@ -38,6 +38,8 @@ from flywheel_core import (
     SdkMessageStore,
     StoreConflictError,
     StoreSchemaError,
+    TelemetryRecord,
+    TelemetrySink,
 )
 
 
@@ -114,6 +116,11 @@ class _AuditStub:
         return []
 
 
+class _TelemetrySinkStub:
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        return None
+
+
 class _ControlCommandStub:
     def enqueue_command(
         self,
@@ -165,6 +172,14 @@ def test_audit_store_protocol_is_satisfiable_by_stub() -> None:
 
 def test_control_command_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_ControlCommandStub(), ControlCommandStore)
+
+
+def test_telemetry_sink_protocol_is_satisfiable_by_stub() -> None:
+    assert isinstance(_TelemetrySinkStub(), TelemetrySink)
+
+
+def test_event_stub_does_not_satisfy_telemetry_sink_protocol() -> None:
+    assert not isinstance(_EventStub(), TelemetrySink)
 
 
 # --- Append-only contract on grader_results --------------------------------
@@ -317,6 +332,30 @@ def test_event_record_payload_defaults_to_empty_mapping() -> None:
     assert e.attempt_number is None
     assert e.id is None
     assert e.sequence is None
+
+
+def test_telemetry_record_is_dataclass_with_minimum_fields() -> None:
+    assert is_dataclass(TelemetryRecord)
+    names = {f.name for f in fields(TelemetryRecord)}
+    assert names == {
+        "run_id",
+        "ts",
+        "kind",
+        "payload",
+        "attempt_number",
+        "iteration_number",
+    }
+
+
+def test_telemetry_record_defaults_coordinates_and_payload() -> None:
+    rec = TelemetryRecord(
+        run_id="r1",
+        ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        kind="message_turn",
+    )
+    assert dict(rec.payload) == {}
+    assert rec.attempt_number is None
+    assert rec.iteration_number is None
 
 
 def test_grader_result_record_constructs_with_required_fields() -> None:

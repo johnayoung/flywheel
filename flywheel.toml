@@ -9,6 +9,9 @@ tasks_dir = ".flywheel/tasks"
 db = ".flywheel/flywheel.sqlite"
 sandbox_root = ".flywheel/worktrees"
 
+[agent]
+model = "claude-fable-5"
+
 # Default graders for work items that declare none (tracker sources only;
 # directory task files always declare their own).
 # [[defaults.graders]]

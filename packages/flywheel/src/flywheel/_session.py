@@ -254,24 +254,50 @@ def _classify_assistant(
     Each ``text`` block becomes an :attr:`EntryKind.AGENT_TEXT` entry;
     each ``tool_use`` block becomes an :attr:`EntryKind.TOOL_CALL`
     entry whose body is the collapsed ``name(arg=val, ...)`` form. A
-    block with neither ``text`` nor a known ``type`` is rendered as
-    agent text using its stringified shape so unknown content never
-    drops silently.
+    block matching no known shape is rendered as agent text using its
+    stringified form so unknown content never drops silently.
+
+    A message whose content is nothing but empty thinking blocks (the
+    keep-alive shape ``{'thinking': '', 'signature': ...}``) produces
+    zero entries -- not the ``(empty)`` fallback -- so signature-only
+    turns leave no trace in the transcript.
     """
 
     content = record.payload.get("content") or []
     if not isinstance(content, Sequence):
         return _fallback_assistant_entry(record, sequence)
+    blocks = list(content)[:_MAX_BLOCKS_PER_MESSAGE]
     entries: list[TranscriptEntry] = []
     sub_index = 0
-    for block in list(content)[:_MAX_BLOCKS_PER_MESSAGE]:
+    for block in blocks:
         entry = _classify_assistant_block(record, sequence, sub_index, block)
         if entry is not None:
             entries.append(entry)
             sub_index += 1
     if not entries:
+        if blocks and all(_is_suppressed_thinking_block(b) for b in blocks):
+            return []
         return _fallback_assistant_entry(record, sequence)
     return entries
+
+
+def _is_suppressed_thinking_block(block: Any) -> bool:
+    """True for a thinking block whose prose collapses to nothing.
+
+    Matches both the explicit ``type == "thinking"`` shape and the
+    typeless dataclass-field shape ``_serialize_sdk_message`` persists
+    (``{'thinking', 'signature'}``). Used to decide whether an entry-
+    less assistant message was a deliberate suppression (render
+    nothing) or an odd payload (render the ``(empty)`` fallback).
+    """
+
+    if not isinstance(block, Mapping):
+        return False
+    btype = block.get("type")
+    if not (btype == "thinking" or (btype is None and "thinking" in block)):
+        return False
+    text = block.get("thinking") or block.get("text")
+    return not isinstance(text, str) or not _normalize_agent_text(text)
 
 
 def _classify_assistant_block(
@@ -282,9 +308,17 @@ def _classify_assistant_block(
 ) -> TranscriptEntry | None:
     """Translate one content block into a single :class:`TranscriptEntry`.
 
-    Returns ``None`` when the block is empty (e.g. a ``text`` field
-    that is the empty string) so an idle keep-alive turn does not
-    leave a blank line in the transcript.
+    Blocks are recognised by an explicit ``type`` key when present, and
+    otherwise by field shape: ``flywheel_core.invoker._serialize_sdk_message``
+    persists SDK content blocks as bare dataclass fields, so a stored
+    ``ToolUseBlock`` is ``{'id', 'name', 'input'}`` and a stored
+    ``ThinkingBlock`` is ``{'thinking', 'signature'}`` with no ``type``
+    discriminator (mirrors the ``tool_use_id`` shape sniff in
+    :func:`_classify_user_block`). Signature values are never rendered.
+
+    Returns ``None`` when the block is empty (e.g. a ``text`` or
+    ``thinking`` field that is the empty string) so an idle keep-alive
+    turn does not leave a blank line in the transcript.
     """
 
     if not isinstance(block, Mapping):
@@ -302,7 +336,9 @@ def _classify_assistant_block(
             iteration_number=record.iteration_number,
         )
     btype = block.get("type")
-    if btype == "tool_use":
+    if btype == "tool_use" or (
+        btype is None and "name" in block and "input" in block
+    ):
         name = str(block.get("name", "?"))
         summary = _summarise_tool_input(name, block.get("input"))
         return TranscriptEntry(
@@ -315,7 +351,7 @@ def _classify_assistant_block(
             attempt_number=record.attempt_number,
             iteration_number=record.iteration_number,
         )
-    if btype == "thinking":
+    if btype == "thinking" or (btype is None and "thinking" in block):
         # Extended-thinking blocks are rendered as agent text with a
         # distinguishing header so operators can see the chain of
         # reasoning without a separate widget class. Thinking is prose,

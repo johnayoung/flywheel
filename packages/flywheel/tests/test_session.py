@@ -338,6 +338,158 @@ def test_classify_assistant_tool_use_long_command_is_not_truncated() -> None:
     assert "…" not in entry.body
 
 
+# --- Typeless content blocks (the shape _serialize_sdk_message persists) ---
+#
+# ``flywheel_core.invoker._serialize_sdk_message`` serializes SDK content
+# blocks as bare dataclass fields: a stored ThinkingBlock is
+# ``{'thinking', 'signature'}`` and a stored ToolUseBlock is
+# ``{'id', 'name', 'input'}`` -- there is no ``type`` discriminator key.
+# These tests build payloads through the real serializer so the
+# producer/consumer shape contract can never silently regress to the raw
+# stringified-dict rendering again.
+
+
+def _serialized_assistant_record(
+    content_blocks: list[Any], *, sequence: int = 1
+) -> SdkMessageRecord:
+    """Build a record whose payload is the real serializer's output."""
+
+    from claude_agent_sdk import AssistantMessage
+
+    from flywheel_core.invoker import _serialize_sdk_message
+
+    payload = _serialize_sdk_message(
+        AssistantMessage(content=content_blocks, model="claude-fable-5")
+    )
+    return SdkMessageRecord(
+        run_id="run-x",
+        attempt_number=1,
+        iteration_number=1,
+        message_type="AssistantMessage",
+        payload=payload,
+        ts=_NOW,
+        sequence=sequence,
+    )
+
+
+def test_classify_serialized_tool_use_block_renders_tool_call() -> None:
+    """A ToolUseBlock persisted by _serialize_sdk_message (no ``type``
+    key) renders as a collapsed TOOL_CALL line, not a raw dict dump."""
+
+    from claude_agent_sdk import ToolUseBlock
+
+    record = _serialized_assistant_record(
+        [
+            ToolUseBlock(
+                id="toolu_01JUhk6nvaoBTtFzq9yFLdtP",
+                name="Bash",
+                input={"command": "uv run pytest 2>&1 | tail -5"},
+            )
+        ],
+        sequence=40,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.TOOL_CALL
+    assert entry.header == "tool(Bash)"
+    assert entry.body == "uv run pytest 2>&1 | tail -5"
+    assert "toolu_" not in entry.body
+
+
+def test_classify_serialized_thinking_block_renders_prose_without_signature() -> None:
+    """A ThinkingBlock persisted by _serialize_sdk_message renders its
+    prose under the agent(thinking) header; the signature blob never
+    reaches the transcript."""
+
+    from claude_agent_sdk import ThinkingBlock
+
+    prose = "Plan: fix the classifier first.\nThen extend the tests."
+    record = _serialized_assistant_record(
+        [ThinkingBlock(thinking=prose, signature="CAISxwMKYggOGAIqQ")],
+        sequence=41,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.AGENT_TEXT
+    assert entry.header == "agent(thinking)"
+    assert entry.body == prose
+    assert "CAISxwMKYggOGAIqQ" not in entry.body
+
+
+def test_classify_serialized_empty_thinking_block_produces_no_entries() -> None:
+    """The keep-alive shape ``{'thinking': '', 'signature': ...}``
+    produces zero entries -- no raw dict, no ``(empty)`` fallback."""
+
+    from claude_agent_sdk import ThinkingBlock
+
+    record = _serialized_assistant_record(
+        [
+            ThinkingBlock(thinking="", signature="CAISxwMKYggOGAIqQ"),
+            ThinkingBlock(thinking="", signature="CAISkgMKYwgOGAIqQ"),
+        ],
+        sequence=42,
+    )
+    assert classify(record) == []
+
+
+def test_classify_serialized_text_block_renders_agent_text() -> None:
+    """A TextBlock persisted by _serialize_sdk_message renders as plain
+    agent prose."""
+
+    from claude_agent_sdk import TextBlock
+
+    record = _serialized_assistant_record(
+        [TextBlock(text="All graders passed; committing now.")],
+        sequence=43,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind is EntryKind.AGENT_TEXT
+    assert entry.header == "agent"
+    assert entry.body == "All graders passed; committing now."
+
+
+def test_classify_serialized_mixed_blocks_suppress_only_empty_thinking() -> None:
+    """A realistic serialized turn (empty thinking + tool_use) keeps
+    the tool call and drops the signature-only block."""
+
+    from claude_agent_sdk import ThinkingBlock, ToolUseBlock
+
+    record = _serialized_assistant_record(
+        [
+            ThinkingBlock(thinking="", signature="CAISxwMKYggOGAIqQ"),
+            ToolUseBlock(
+                id="toolu_01Gb21G696Ymyvb87qMcKmVn",
+                name="Bash",
+                input={"command": "uv run pytest", "timeout": 600000},
+            ),
+        ],
+        sequence=44,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    assert entries[0].kind is EntryKind.TOOL_CALL
+    assert entries[0].header == "tool(Bash)"
+    assert entries[0].body == "uv run pytest"
+
+
+def test_classify_typeless_unknown_block_keeps_stringified_fallback() -> None:
+    """A block matching no known shape still renders its stringified
+    form so unknown content never drops silently."""
+
+    record = _assistant_record(
+        content=[{"mystery": "value"}],
+        sequence=45,
+    )
+    entries = classify(record)
+    assert len(entries) == 1
+    assert entries[0].kind is EntryKind.AGENT_TEXT
+    assert "mystery" in entries[0].body
+
+
 def test_classify_assistant_fans_out_text_and_tool_use() -> None:
     """Multiple content blocks produce multiple entries that share the
     parent record's sequence and disambiguate via ``sub_index``."""

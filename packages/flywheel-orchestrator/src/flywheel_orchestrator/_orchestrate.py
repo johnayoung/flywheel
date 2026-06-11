@@ -79,12 +79,14 @@ from flywheel_core.workflow import (
     _stranded_run_ids,
     run_task_object,
 )
+from flywheel_orchestrator._policy import WorkPolicy
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
     GraderReceipt,
     WorkReport,
     WorkSource,
 )
+from flywheel_orchestrator._store_factory import open_sqlite_bound_store
 from flywheel_orchestrator._workflow import (
     TaskStatusRow,
     _latest_lifecycle_row,
@@ -449,6 +451,7 @@ async def orchestrate(
     *,
     tasks_dir: Path | None = None,
     source: WorkSource | None = None,
+    policy: WorkPolicy | None = None,
     db_path: Path,
     sandbox_root: Path,
     invoke: InvokeFunc | None = None,
@@ -498,6 +501,12 @@ async def orchestrate(
     :func:`reconcile_live_runs`). ``None``/``0`` (the default) disables it,
     preserving prior behavior for library callers; the CLI and the worktree
     daemon enable it by default.
+
+    ``policy`` selects the store backend: construction routes through the
+    store factory (:func:`~flywheel_orchestrator._store_factory.build_store`),
+    so a postgres policy fails fast with the factory's DSN / extra errors.
+    ``None`` (the default for library callers) keeps the historical
+    sqlite-on-``db_path`` behavior byte-for-byte.
     """
     if source is None:
         if tasks_dir is None:
@@ -533,7 +542,9 @@ async def orchestrate(
 
     # Two stores on one file: flywheel's core store (lifecycle, run state) and
     # the orchestrator's own claim store (task_claims). Each owns its tables.
-    control = SqliteStore(db_path)
+    # The core store is built through the factory so the policy's backend
+    # selection (and its fail-fast postgres preconditions) apply here too.
+    control = open_sqlite_bound_store(policy, db_path=db_path)
     claims = SqliteClaimStore(db_path)
     reconciler: asyncio.Task[None] | None = None
     try:

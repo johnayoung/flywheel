@@ -67,6 +67,7 @@ from flywheel_orchestrator._sources import (
     iter_active_task_files,
     load_active_tasks,
 )
+from flywheel_orchestrator._store_factory import open_sqlite_bound_store
 
 DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
 
@@ -679,7 +680,7 @@ def _cmd_next(args: argparse.Namespace) -> int:
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         rows = status_rows_for_items(source.list_work(), store)
         pick = select_next_task(rows)
@@ -711,6 +712,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     report = asyncio.run(
         orchestrate(
             source=source,
+            policy=policy,
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=args.model,
@@ -1168,12 +1170,13 @@ def _clamped_seconds(then: datetime, now: datetime) -> int:
     return max(0, int((now - then).total_seconds()))
 
 def _cmd_live(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args, _load_effective_policy(args))
+    policy = _load_effective_policy(args)
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     interval = int(args.watch) if args.watch else 0
 
     def snapshot() -> None:
-        store = SqliteStore(db_path)
+        store = open_sqlite_bound_store(policy, db_path=db_path)
         try:
             rows = collect_live_rows(store)
         finally:
@@ -1301,7 +1304,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         rows = status_rows_for_items(source.list_work(), store)
     finally:
@@ -1420,7 +1423,7 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         # Build a task_id -> Task map from the work source. An archived
         # (or no-longer-listed) task whose lifecycle is blocked in the
@@ -1482,9 +1485,10 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
         store.close()
 
 def _cmd_recover(args: argparse.Namespace) -> int:
-    db_path = _resolve_db_path(args, _load_effective_policy(args))
+    policy = _load_effective_policy(args)
+    db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         finalized = recover_stranded_lifecycles(store, task_id=args.task_id)
     finally:
@@ -1513,7 +1517,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         tasks_dir = DEFAULT_TASKS_DIR
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         moved = archive_completed_phases(tasks_dir, store)
     finally:

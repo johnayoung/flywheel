@@ -58,7 +58,9 @@ from flywheel_orchestrator import (
     RunRecord,
     SandboxRequest,
     SubmitRequest,
+    WorkPolicy,
     load_effective_policy,
+    open_sqlite_bound_store,
     orchestrate,
 )
 from flywheel_core.workflow import (
@@ -502,6 +504,7 @@ def archive_phases(
     log: Logger,
     *,
     repo_root: Path | None = None,
+    policy: WorkPolicy | None = None,
 ) -> None:
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
 
@@ -512,8 +515,11 @@ def archive_phases(
     contract. Refusal reasons are reported via the same ``log`` callable
     that announces archived phases so a single log stream tells the
     operator everything the sweep did.
+
+    ``policy`` selects the store backend through the orchestrator's store
+    factory; ``None`` keeps the historical sqlite-on-``db_path`` behavior.
     """
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         moved = archive_completed_phases(
             tasks_dir, store, repo_root=repo_root, log=log
@@ -596,20 +602,26 @@ def write_run_log(
 
 
 def write_run_logs(
-    log_dir: Path, report: OrchestratorReport, db_path: Path, log: Logger
+    log_dir: Path,
+    report: OrchestratorReport,
+    db_path: Path,
+    log: Logger,
+    *,
+    policy: WorkPolicy | None = None,
 ) -> list[Path]:
     """Persist a per-run log for every run the orchestrator drove this cycle.
 
-    Opens its own short-lived :class:`SqliteStore` (the orchestrate call has
-    already closed its handle by the time this runs). Returns the list of
-    written paths, in the same order as ``report.runs``. Any per-run write
-    error is logged and skipped — losing a forensics file must never abort
-    the daemon loop.
+    Opens its own short-lived store through the orchestrator's store factory
+    (the orchestrate call has already closed its handle by the time this
+    runs); ``policy=None`` keeps the historical sqlite-on-``db_path``
+    behavior. Returns the list of written paths, in the same order as
+    ``report.runs``. Any per-run write error is logged and skipped — losing
+    a forensics file must never abort the daemon loop.
     """
     written: list[Path] = []
     if not report.runs:
         return written
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         for record in report.runs:
             try:
@@ -710,8 +722,16 @@ class Heartbeat:
     :func:`flywheel_core.workflow.collect_live_rows`, so a watcher can tell the
     agent is still moving. Quiet when nothing is in flight."""
 
-    def __init__(self, db_path: Path, interval: int, log: Logger) -> None:
+    def __init__(
+        self,
+        db_path: Path,
+        interval: int,
+        log: Logger,
+        *,
+        policy: WorkPolicy | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._policy = policy
         self._interval = interval
         self._log = log
         self._stop = threading.Event()
@@ -727,7 +747,11 @@ class Heartbeat:
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             try:
-                store = SqliteStore(self._db_path)
+                # Rebuilt every tick through the factory — safe to call
+                # repeatedly with the same policy (it only constructs).
+                store = open_sqlite_bound_store(
+                    self._policy, db_path=self._db_path
+                )
                 try:
                     rows = collect_live_rows(store)
                 finally:
@@ -770,6 +794,7 @@ def run_once(
     stream: TextIO | None = None,
     log: Logger | None = None,
     log_dir: Path | None = None,
+    policy: WorkPolicy | None = None,
 ) -> OrchestratorReport:
     """One cycle: commit new task files, drain every eligible task to
     quiescence through the git-submit seam, write a per-run forensics log for
@@ -780,6 +805,11 @@ def run_once(
     files always land at ``logs/worker/`` under the active repo regardless of
     the caller's cwd. Pass an explicit path to override (e.g. tests, the
     ``--log-dir`` CLI flag).
+
+    ``policy`` selects the store backend for every store this cycle
+    constructs (orchestrate's, the per-run log writer's, the archive
+    sweep's) through the orchestrator's store factory; ``None`` keeps the
+    historical sqlite-on-``db_path`` behavior.
     """
     log = log or submitter.log
     resolved_log_dir = (
@@ -792,6 +822,7 @@ def run_once(
     report = asyncio.run(
         orchestrate(
             tasks_dir=tasks_dir,
+            policy=policy,
             db_path=db_path,
             sandbox_root=worktrees_dir,
             invoke=invoke,
@@ -806,8 +837,14 @@ def run_once(
             stream=stream,
         )
     )
-    write_run_logs(resolved_log_dir, report, db_path, log)
-    archive_phases(tasks_dir, db_path, log, repo_root=submitter.repo_root)
+    write_run_logs(resolved_log_dir, report, db_path, log, policy=policy)
+    archive_phases(
+        tasks_dir,
+        db_path,
+        log,
+        repo_root=submitter.repo_root,
+        policy=policy,
+    )
     return report
 
 
@@ -909,27 +946,25 @@ def _interruptible_sleep(seconds: int, should_stop: Callable[[], bool]) -> None:
         time.sleep(1)
 
 
-def _resolve_model(args: argparse.Namespace) -> str | None:
+def _resolve_model(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> str | None:
     """Resolve the agent model id the worker invokes the SDK with.
 
     Precedence is exactly:
 
     * an explicit ``--model`` CLI flag wins;
-    * else ``flywheel.toml`` ``[agent] model`` auto-detected in the
-      current working directory (matches the orchestrator verbs'
-      ``load_effective_policy(None)`` lookup);
+    * else ``flywheel.toml`` ``[agent] model`` (``policy`` is the
+      cwd-auto-detected ``load_effective_policy()`` result, loaded once
+      by :func:`main` and shared with the store factory);
     * else ``None`` so :class:`ClaudeAgentOptions` is constructed
       without a model and the SDK falls through to the Claude Code
       default -- the historical behaviour direct ``python -m`` callers
       relied on before this feature.
-
-    A malformed policy file is surfaced as :class:`PolicyError`; the
-    caller turns it into the standard exit-2 + stderr remedy.
     """
 
     if args.model:
         return args.model
-    policy = load_effective_policy()
     if policy is None:
         return None
     return policy.model
@@ -941,10 +976,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     phase_base = _phase_base(repo_root)
 
     try:
-        model = _resolve_model(args)
+        # Loaded once: the same policy resolves the agent model and selects
+        # the store backend for every store this process constructs.
+        policy = load_effective_policy()
     except PolicyError as exc:
         print(f"flywheel worker: policy error: {exc}", file=sys.stderr)
         return 2
+    model = _resolve_model(args, policy)
 
     tasks_dir = (
         Path(args.tasks_dir)
@@ -978,7 +1016,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     retention_sweep(
         repo_root, worktrees_dir, args.worktree_retention_days, time.time(), log
     )
-    heartbeat = Heartbeat(db_path, args.heartbeat, make_logger("[heartbeat]"))
+    heartbeat = Heartbeat(
+        db_path, args.heartbeat, make_logger("[heartbeat]"), policy=policy
+    )
     heartbeat.start()
 
     shutdown = {"requested": False}
@@ -1009,6 +1049,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     stream=sys.stderr,
                     log=log,
                     log_dir=log_dir,
+                    policy=policy,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log(

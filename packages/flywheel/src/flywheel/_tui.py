@@ -32,14 +32,19 @@ from flywheel_core.task import ManualGrader
 from flywheel_orchestrator import (
     DEFAULT_POLICY_FILENAME,
     DEFAULT_TASKS_DIR,
+    PG_DSN_ENV,
+    PG_DSN_FALLBACK_ENV,
     DirectoryWorkSource,
     PolicyError,
+    StoreConfigError,
     WorkPolicy,
     WorkSource,
     archive_completed_phases,
     build_work_source,
     load_effective_policy,
+    open_sqlite_bound_store,
     resolve_db_path,
+    resolve_postgres_dsn,
 )
 
 from flywheel._dashboard import (
@@ -59,10 +64,13 @@ from flywheel._worker_supervisor import WorkerSupervisor
 def main(argv: Sequence[str] | None = None) -> int:
     """Resolve the store, then dispatch to the TUI or the JSON snapshot.
 
-    Returns 0 on a clean exit, 2 when the resolved store does not exist
-    (the operator-facing remedy is ``fw init``). Snapshot mode auto-
-    engages when stdout is not a TTY so the command is pipe-safe by
-    default.
+    Returns 0 on a clean exit, 2 when the resolved store is missing.
+    The missing-store check is backend-aware (spec 00024 FR-11): for
+    sqlite (or no policy) it is file existence at ``db_path`` with the
+    ``fw init`` remedy; for postgres it is DSN env var presence
+    (``FLYWHEEL_PG_DSN`` / ``DATABASE_URL``), since no store file ever
+    exists for that backend. Snapshot mode auto-engages when stdout is
+    not a TTY so the command is pipe-safe by default.
     """
     args = _build_parser().parse_args(argv)
     try:
@@ -71,25 +79,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"fw: policy error: {exc}", file=sys.stderr)
         return 2
     db_path = resolve_db_path(args.db, policy=policy)
-    if not db_path.exists():
+    if policy is not None and policy.store_backend == "postgres":
+        if resolve_postgres_dsn() is None:
+            return _emit_missing_dsn()
+    elif not db_path.exists():
         return _emit_missing_store(db_path)
 
     work_source = _resolve_work_source(args.tasks_dir, policy)
     archive_tasks_dir = _resolve_archive_tasks_dir(args.tasks_dir, policy)
     json_mode = args.json or not sys.stdout.isatty()
 
-    if json_mode:
-        return _run_snapshot(db_path, work_source)
-    tasks_dir = _resolve_tasks_dir_for_worker(args.tasks_dir, policy)
-    model = _resolve_model_for_worker(args.model, policy)
-    return _run_dashboard(
-        db_path,
-        work_source,
-        archive_tasks_dir,
-        tasks_dir=tasks_dir,
-        model=model,
-        no_worker=args.no_worker,
-    )
+    try:
+        if json_mode:
+            return _run_snapshot(db_path, work_source, policy=policy)
+        tasks_dir = _resolve_tasks_dir_for_worker(args.tasks_dir, policy)
+        model = _resolve_model_for_worker(args.model, policy)
+        return _run_dashboard(
+            db_path,
+            work_source,
+            archive_tasks_dir,
+            tasks_dir=tasks_dir,
+            model=model,
+            no_worker=args.no_worker,
+            policy=policy,
+        )
+    except StoreConfigError as exc:
+        # The factory's fail-fast postgres errors (and the sqlite-bound
+        # refusal) carry their own remedy; exit 2 like every other
+        # configuration error.
+        print(f"fw: {exc}", file=sys.stderr)
+        return 2
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -257,14 +276,36 @@ def _emit_missing_store(db_path: Path) -> int:
     return 2
 
 
-def _run_snapshot(db_path: Path, work_source: WorkSource) -> int:
+def _emit_missing_dsn() -> int:
+    """Postgres analogue of :func:`_emit_missing_store` (spec FR-11).
+
+    A postgres backend has no store file to check; the equivalent of "no
+    store found" is "no DSN env var set", and the remedy names both
+    variables of the resolution contract.
+    """
+    print(
+        f"fw: store backend is postgres but neither {PG_DSN_ENV} nor "
+        f"{PG_DSN_FALLBACK_ENV} is set",
+        file=sys.stderr,
+    )
+    print(
+        "  export one with a postgres connection string, then rerun fw.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _run_snapshot(
+    db_path: Path, work_source: WorkSource, *, policy: WorkPolicy | None
+) -> int:
     """Build one snapshot, print it as JSON, exit 0.
 
-    Reads the store once, closes it, prints the payload. No ANSI escape
-    sequences ever touch stdout in this mode.
+    Reads the store once (constructed through the orchestrator's store
+    factory), closes it, prints the payload. No ANSI escape sequences
+    ever touch stdout in this mode.
     """
     now = datetime.now(timezone.utc)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         snapshot = build_snapshot(
             store,
@@ -320,6 +361,7 @@ def _run_dashboard(
     tasks_dir: Path | None,
     model: str | None,
     no_worker: bool,
+    policy: WorkPolicy | None,
 ) -> int:
     """Open the Textual dashboard, polling ``db_path`` until the operator quits.
 
@@ -335,7 +377,7 @@ def _run_dashboard(
     silent kill, per the spec.
     """
     started_at = datetime.now(timezone.utc)
-    store = SqliteStore(db_path)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
     supervisor = WorkerSupervisor(
         db_path=db_path, tasks_dir=tasks_dir, model=model
     )

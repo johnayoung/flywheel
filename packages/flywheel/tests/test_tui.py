@@ -85,6 +85,52 @@ def test_tui_main_missing_store_exits_with_init_remedy(
     assert "fw init" in captured.err
 
 
+def test_tui_main_postgres_backend_without_dsn_exits_2_naming_env_vars(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend-aware missing-store check (spec 00024 FR-11): with
+    ``[store] backend = "postgres"`` and neither DSN env var set, fw
+    exits 2 with a message naming both variables -- never the sqlite
+    missing-file message."""
+    policy_file = tmp_path / "flywheel.toml"
+    policy_file.write_text(
+        '[source]\nkind = "directory"\n[store]\nbackend = "postgres"\n'
+    )
+    monkeypatch.delenv("FLYWHEEL_PG_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    rc = tui_main(["--policy", str(policy_file), "--json"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "FLYWHEEL_PG_DSN" in err
+    assert "DATABASE_URL" in err
+    assert "no store found" not in err
+    assert "fw init" not in err
+
+
+def test_tui_main_sqlite_backend_keeps_missing_file_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit sqlite backend keeps today's file-existence check and
+    message verbatim; DSN env vars are irrelevant to it."""
+    policy_file = tmp_path / "flywheel.toml"
+    db = tmp_path / "absent.sqlite"
+    policy_file.write_text(
+        '[source]\nkind = "directory"\n'
+        '[store]\nbackend = "sqlite"\n'
+        f'[paths]\ndb = "{db}"\n'
+    )
+    monkeypatch.setenv("FLYWHEEL_PG_DSN", "postgres://irrelevant/db")
+    rc = tui_main(["--policy", str(policy_file), "--json"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert f"fw: no store found at {db}" in err
+    assert "fw init" in err
+
+
 def test_tui_main_json_mode_with_empty_store(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -32,7 +32,13 @@ from flywheel_core import (
     ValidEnvelope,
 )
 from flywheel_core.store_sqlite import SqliteStore
-from flywheel_orchestrator import SandboxRequest, SubmitRequest
+from flywheel_orchestrator import (
+    SandboxRequest,
+    StoreConfigError,
+    SubmitRequest,
+    WorkPolicy,
+    load_effective_policy,
+)
 from flywheel_worktree import worker
 
 
@@ -611,22 +617,26 @@ def test_resolve_model_uses_flag_when_provided(
     (tmp_path / "flywheel.toml").write_text(
         '[source]\nkind = "directory"\n[agent]\nmodel = "claude-from-policy"\n'
     )
-    assert worker._resolve_model(_args(model="claude-from-flag")) == (
-        "claude-from-flag"
-    )
+    assert worker._resolve_model(
+        _args(model="claude-from-flag"), load_effective_policy()
+    ) == ("claude-from-flag")
 
 
 def test_resolve_model_honors_policy_when_flag_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The headless ``flywheel worker`` path picks up
-    ``[agent] model`` from the cwd's ``flywheel.toml`` automatically."""
+    ``[agent] model`` from the cwd's ``flywheel.toml`` automatically
+    (``main`` loads the policy once and hands it to the resolver)."""
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "flywheel.toml").write_text(
         '[source]\nkind = "directory"\n[agent]\nmodel = "claude-from-policy"\n'
     )
-    assert worker._resolve_model(_args(model=None)) == "claude-from-policy"
+    assert (
+        worker._resolve_model(_args(model=None), load_effective_policy())
+        == "claude-from-policy"
+    )
 
 
 def test_resolve_model_returns_none_without_policy_or_flag(
@@ -638,7 +648,7 @@ def test_resolve_model_returns_none_without_policy_or_flag(
 
     monkeypatch.chdir(tmp_path)
     assert not (tmp_path / "flywheel.toml").exists()
-    assert worker._resolve_model(_args(model=None)) is None
+    assert worker._resolve_model(_args(model=None), load_effective_policy()) is None
 
 
 def test_resolve_model_returns_none_when_policy_omits_agent(
@@ -649,4 +659,61 @@ def test_resolve_model_returns_none_when_policy_omits_agent(
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "flywheel.toml").write_text('[source]\nkind = "directory"\n')
-    assert worker._resolve_model(_args(model=None)) is None
+    assert worker._resolve_model(_args(model=None), load_effective_policy()) is None
+
+
+# --- store-factory routing ---------------------------------------------------
+
+
+def test_run_once_postgres_policy_without_dsn_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A postgres-backend policy with no DSN env var must surface the
+    factory's fail-fast error from ``run_once`` -- proof the worker's store
+    construction routes through the factory rather than hardcoding sqlite."""
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    _task_file(repo, "01-phase", "t1", grader="true")
+    monkeypatch.delenv("FLYWHEEL_PG_DSN", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    policy = WorkPolicy(
+        source_kind="directory",
+        tasks_dir=repo / ".flywheel" / "tasks",
+        store_backend="postgres",
+    )
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        raise AssertionError("invoke must not run: store construction fails")
+
+    with pytest.raises(StoreConfigError) as excinfo:
+        worker.run_once(
+            s,
+            tasks_dir=repo / ".flywheel" / "tasks",
+            db_path=repo / ".flywheel" / "flywheel.sqlite",
+            worktrees_dir=repo / ".flywheel" / "worktrees",
+            model=None,
+            max_turns=1,
+            max_retries=0,
+            invoke=_invoke,
+            policy=policy,
+        )
+    message = str(excinfo.value)
+    assert "FLYWHEEL_PG_DSN" in message
+    assert "DATABASE_URL" in message
+
+
+def test_archive_phases_and_run_logs_accept_repeated_factory_calls(
+    tmp_path: Path,
+) -> None:
+    """The run loop reconstructs the store each cycle; the factory-backed
+    helpers must be safe to call repeatedly with the same policy."""
+
+    db_path = tmp_path / "flywheel.sqlite"
+    tasks_dir = tmp_path / "tasks"
+    (tasks_dir / "active").mkdir(parents=True)
+    policy = WorkPolicy(source_kind="directory", tasks_dir=tasks_dir)
+    SqliteStore(db_path).close()  # seed the schema once
+    for _ in range(3):
+        worker.archive_phases(tasks_dir, db_path, lambda _m: None, policy=policy)

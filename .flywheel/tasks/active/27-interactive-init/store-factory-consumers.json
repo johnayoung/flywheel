@@ -1,0 +1,37 @@
+{
+  "id": "store-factory-consumers",
+  "goal": "The worker (flywheel-worktree) and fw TUI construct stores through the store factory, and the TUI's missing-store check becomes backend-aware (file existence for sqlite, DSN env var presence for postgres).",
+  "prerequisites": ["store-factory"],
+  "tags": ["init", "store"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+      "packages/flywheel/src/flywheel/_tui.py",
+      "packages/flywheel/tests/test_tui.py",
+      "packages/flywheel-worktree/tests/test_worker.py",
+      ".flywheel/specs/00024-FEATURE-interactive-init.md"
+    ],
+    "references": [
+      "packages/flywheel/src/flywheel/_tui.py:247-257 -- the sqlite-only missing-store error path to make backend-aware (spec FR-11)"
+    ],
+    "constraints": [
+      "Direct SqliteStore( sites to route through the factory: worker.py lines 516, 612, 730 and _tui.py lines 267, 338",
+      "fw with backend=postgres and neither FLYWHEEL_PG_DSN nor DATABASE_URL set exits 2 with a message naming both env vars instead of the sqlite missing-file message; sqlite backend keeps today's message verbatim",
+      "Sqlite behavior must be unchanged for existing configs (absent [store] section)",
+      "test_tui.py and test_worker.py pin the current store-construction and missing-store behavior; update any assertions broken by the factory routing in the same commit",
+      "Commit with a Conventional Commits message (feat:) before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No init/scaffold changes",
+      "No new TUI screens or prompts"
+    ],
+    "edge_cases": [
+      "Worker run loop reconstructs the store (worker.py:730); the factory must be safe to call repeatedly with the same policy"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests packages/flywheel/tests", "name": "consumer-tests" },
+    { "type": "command", "run": "! grep -n 'SqliteStore(' packages/flywheel-worktree/src/flywheel_worktree/worker.py packages/flywheel/src/flywheel/_tui.py", "name": "no-direct-construction" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

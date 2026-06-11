@@ -1,0 +1,34 @@
+{
+  "id": "policy-store-section",
+  "goal": "load_policy parses an optional [store] section (backend = \"sqlite\"|\"postgres\", optional schema string) into WorkPolicy fields store_backend and store_schema, defaulting to sqlite when the section is absent.",
+  "tags": ["init", "store", "policy"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+      "packages/flywheel-orchestrator/tests/test_policy.py",
+      ".flywheel/specs/00024-FEATURE-interactive-init.md"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py:197-216 -- _optional_agent_model shows the validation style for optional sections; mirror it"
+    ],
+    "constraints": [
+      "Absent [store] section must parse to store_backend=\"sqlite\", store_schema=None so every existing flywheel.toml keeps loading unchanged (spec FR-7)",
+      "Unknown backend values raise PolicyError consistent with existing validation messages",
+      "schema, when present, must be a non-empty string; reject other types with PolicyError",
+      "Do not change the init template or _cmd_init in this task; that lands in init-interactive-flow",
+      "Commit with a Conventional Commits message (feat:) before emitting intent=verify"
+    ],
+    "non_goals": [
+      "No store factory or env var resolution here",
+      "No changes to _workflow.py or any CLI verb"
+    ],
+    "edge_cases": [
+      "[store] present but empty table -> sqlite defaults, no error",
+      "backend = \"postgres\" with no schema key -> store_schema stays None"
+    ]
+  },
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py", "name": "policy-tests" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite" }
+  ]
+}

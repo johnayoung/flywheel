@@ -397,18 +397,19 @@ def test_stream_is_lazy_iterator() -> None:
 def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
     tmp_path: Path,
 ) -> None:
-    """The ``harness.awaiting_approval`` event surfaces through the audit
-    stream with every field the operator-surfacing path consumes —
-    ``instructions``, ``awaiting_ordinal``, ``grader_name``, ``run_id``,
-    ``attempt_number``, and ``artifacts_dir``. This is the audit-level
-    oracle for spec 00016 FR-10; the harness-level test asserts the
-    same shape against the persisted event, this one asserts it through
-    the public ``stream`` reader operators actually consume.
+    """The ``harness.awaiting_approval`` event reaches the run's
+    telemetry stream with every field the operator-surfacing path
+    consumes — ``instructions``, ``awaiting_ordinal``, ``grader_name``,
+    ``run_id``, ``attempt_number``, and ``artifacts_dir``. This is the
+    spec 00016 FR-10 oracle, retargeted by spec 00025: telemetry events
+    stream to the sink rather than the store, so the shape is asserted
+    on the sink record (the file-reader round-trip lands with FR-8).
     """
 
     from flywheel_core.grader_manual import ManualGate
-    from flywheel_core.harness import _enter_manual_gate
+    from flywheel_core.harness import _enter_manual_gate, _RunTelemetry
     from flywheel_core.lifecycle import Attempt, Outcome
+    from flywheel_core.store_protocols import TelemetryRecord
 
     store = _make_store_with_lifecycle("run-await")
     # Drive RUNNING -> VALIDATING so the in-memory version matches the
@@ -439,8 +440,16 @@ def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
         grader_name="confirm-migration",
     )
     artifacts_dir = tmp_path / "artifacts" / "run-await" / "attempt-1"
+
+    captured: list[TelemetryRecord] = []
+
+    class _Sink:
+        def append_telemetry(self, record: TelemetryRecord) -> None:
+            captured.append(record)
+
     _enter_manual_gate(
         store=store,
+        telemetry=_RunTelemetry(_Sink(), run_id=lc.run_id, clock=lambda: now),
         lifecycle=lc,
         attempt=attempt,
         gate=gate,
@@ -448,11 +457,8 @@ def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
         clock=lambda: now,
     )
 
-    records = list(stream("run-await", store=store))
     awaiting = [
-        r
-        for r in records
-        if isinstance(r, EventRecord) and r.kind == "harness.awaiting_approval"
+        r for r in captured if r.kind == "harness.awaiting_approval"
     ]
     assert len(awaiting) == 1
     payload = awaiting[0].payload

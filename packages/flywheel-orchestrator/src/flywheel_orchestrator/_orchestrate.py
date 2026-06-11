@@ -65,8 +65,12 @@ from flywheel_core.harness import (
 )
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
 from flywheel_core.lifecycle import Status
-from flywheel_core.store_protocols import OptimisticConcurrencyError
+from flywheel_core.store_protocols import (
+    OptimisticConcurrencyError,
+    TelemetrySink,
+)
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import Task
 from flywheel_orchestrator._claims import (
     ClaimLostError,
@@ -352,6 +356,7 @@ def _recover_claimable_stranded(
     *,
     lease_seconds: float,
     now: Callable[[], datetime],
+    sink: TelemetrySink | None = None,
 ) -> tuple[str, ...]:
     """Finalize stranded lifecycles whose task has no live owner.
 
@@ -380,7 +385,9 @@ def _recover_claimable_stranded(
         try:
             # finalize_stranded_lifecycle takes a clock callable, unlike the
             # claim methods which take a concrete ``now`` value.
-            if finalize_stranded_lifecycle(control, run_id, now=now):
+            if finalize_stranded_lifecycle(
+                control, run_id, now=now, sink=sink
+            ):
                 recovered.append(run_id)
         finally:
             claims.release_claim(claim)
@@ -546,10 +553,20 @@ async def orchestrate(
     # selection (and its fail-fast postgres preconditions) apply here too.
     control = open_sqlite_bound_store(policy, db_path=db_path)
     claims = SqliteClaimStore(db_path)
+    # Control-plane telemetry (recovery sweeps, rechecks, approval
+    # resolution) streams to the same per-run JSONL files the harness
+    # writes (run_task_object derives the identical logs root from
+    # db_path), so out-of-band interventions land in the run's timeline.
+    sink = FileTelemetrySink(db_path.parent / "logs")
     reconciler: asyncio.Task[None] | None = None
     try:
         recovered = _recover_claimable_stranded(
-            control, claims, wid, lease_seconds=lease_seconds, now=clock
+            control,
+            claims,
+            wid,
+            lease_seconds=lease_seconds,
+            now=clock,
+            sink=sink,
         )
         if reconcile_seconds is not None and reconcile_seconds > 0:
             reconciler = asyncio.create_task(
@@ -623,6 +640,7 @@ async def orchestrate(
                             run_id,
                             task_by_id[row.task.id],
                             cwd=sandbox,
+                            sink=sink,
                         )
                     except OptimisticConcurrencyError:
                         # Another worker transitioned it first; let go.
@@ -700,6 +718,7 @@ async def orchestrate(
                             task_by_id[row.task.id],
                             max_retries=max_retries,
                             now=clock,
+                            sink=sink,
                         )
                     except OptimisticConcurrencyError:
                         # Another worker resolved it first; let go.
@@ -793,6 +812,7 @@ async def orchestrate(
                 await reconciler
         control.close()
         claims.close()
+        sink.close()
 
 
 def _final_grader_receipts(

@@ -57,6 +57,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -108,6 +109,7 @@ from flywheel_core.grader_transcript import (
     run_transcript_graders,
     total_tokens_from_usage,
 )
+from flywheel_core.event_serde import event_kind, event_payload
 from flywheel_core.events import (
     AttemptFinalized,
     AttemptStarted,
@@ -138,10 +140,10 @@ from flywheel_core.prompt import (
 )
 from flywheel_core.store_protocols import (
     ControlCommandRecord,
-    EventRecord,
     GraderResultRecord,
     LifecycleAlreadyExistsError,
-    SdkMessageRecord,
+    TelemetryRecord,
+    TelemetrySink,
 )
 from flywheel_core.grader_manual import (
     ManualGate,
@@ -214,20 +216,6 @@ class HarnessStore(Protocol):
     ) -> None: ...
 
     def list_attempts(self, run_id: str) -> list[Attempt]: ...
-
-    def append_event(self, event: EventRecord) -> EventRecord: ...
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord: ...
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[Any]: ...
 
     def append_grader_result(
         self, result: GraderResultRecord
@@ -625,35 +613,6 @@ class _RecoveryState:
     pending_handoff: RecoveryHandoff | None = None
 
 
-class _AuditWriteError(Exception):
-    """Sentinel exception raised when an audit-stream write fails.
-
-    Carries the structured detail used to populate the final
-    ``harness.audit_write_failed`` event and the
-    :class:`Attempt`/`:class:`Lifecycle` finalization. The harness catches
-    this exception at the :func:`_run_attempt` boundary; everywhere else
-    it propagates so the caller (e.g. the outer ``run_task`` retry-arm
-    or :func:`finalize_stranded_lifecycle`) can surface the failure.
-    """
-
-    def __init__(
-        self,
-        *,
-        failing_method: str,
-        inner: BaseException,
-        attempt_number: int | None,
-        iteration_number: int | None = None,
-    ) -> None:
-        super().__init__(
-            f"audit write failed via {failing_method}: "
-            f"{type(inner).__name__}: {inner}"
-        )
-        self.failing_method = failing_method
-        self.inner = inner
-        self.attempt_number = attempt_number
-        self.iteration_number = iteration_number
-
-
 class _HangDetected(Exception):
     """Sentinel raised when the hang watchdog cancels an invocation.
 
@@ -686,156 +645,218 @@ class _HangDetected(Exception):
         self.silence_seconds = silence_seconds
 
 
-def _emit(
-    store: HarnessStore,
-    *,
-    run_id: str,
-    kind: str,
-    payload: Mapping[str, Any],
-    attempt_number: int | None = None,
-    now: Callable[[], datetime] | None = None,
-    best_effort: bool = False,
-) -> None:
-    """Persist one :class:`EventRecord`.
+# Marker kind appended (best-effort) to the sink itself when its first
+# append fails, per spec 00025 FR-7 ("stderr + a marker line attempt in
+# the sink when possible"). A sink that recovered mid-run will carry the
+# marker; a permanently broken one simply drops it.
+_TELEMETRY_FAILED_KIND: str = "harness.telemetry_sink_failed"
 
-    On any store-side exception, wraps the underlying error in
-    :class:`_AuditWriteError` and re-raises so the harness can route
-    the failure through the strict-audit policy (FR-5). When
-    ``best_effort=True`` the exception is swallowed instead — used for
-    the final ``harness.audit_write_failed`` emit so the failure path
-    cannot itself loop.
+# Prefix discriminating mirrored domain-event lines from harness
+# telemetry kinds and SDK message types inside a run's telemetry stream.
+# The store row remains authoritative for state; the mirror line exists
+# so the run file renders a self-contained timeline (spec 00025 FR-4).
+_DOMAIN_MIRROR_KIND_PREFIX: str = "domain."
+
+
+class _RunTelemetry:
+    """Best-effort telemetry emitter for one run (spec 00025 FR-3/FR-4/FR-7).
+
+    Wraps a :class:`flywheel_core.store_protocols.TelemetrySink` with the
+    harness's failure policy: telemetry loss is acceptable, so an append
+    failure never raises. The first failure is recorded once on stderr
+    (plus a best-effort marker line in the sink itself); subsequent
+    failures for the run are silent. A ``None`` sink drops every record —
+    callers that want durable telemetry hand in a concrete sink (the
+    workflow CLI wires :class:`flywheel_core.telemetry_file.FileTelemetrySink`).
     """
-    clock = now or _utcnow
-    try:
-        store.append_event(
-            EventRecord(
-                run_id=run_id,
-                ts=clock(),
+
+    def __init__(
+        self,
+        sink: TelemetrySink | None,
+        *,
+        run_id: str,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._sink = sink
+        self._run_id = run_id
+        self._clock = clock
+        self._failure_reported = False
+
+    def emit(
+        self,
+        *,
+        kind: str,
+        payload: Mapping[str, Any],
+        attempt_number: int | None = None,
+        iteration_number: int | None = None,
+    ) -> None:
+        """Append one harness telemetry record. Never raises."""
+        self._append(
+            TelemetryRecord(
+                run_id=self._run_id,
+                ts=self._clock(),
                 kind=kind,
                 payload=dict(payload),
                 attempt_number=attempt_number,
+                iteration_number=iteration_number,
             )
         )
-    except Exception as exc:
-        if best_effort:
+
+    def sdk_message(
+        self,
+        message: Message,
+        *,
+        attempt_number: int,
+        iteration_number: int,
+    ) -> None:
+        """Append one SDK message the instant it is observed. Never raises.
+
+        ``kind`` is the SDK class name (``AssistantMessage``, ...); the
+        payload is the verbatim :func:`_serialize_sdk_message` dict, the
+        same shape the store used to persist, so downstream renderers
+        keep working off one serialization.
+        """
+        payload = _serialize_sdk_message(message)
+        kind = str(payload.get("message_type", payload.get("type", "")))
+        self._append(
+            TelemetryRecord(
+                run_id=self._run_id,
+                ts=self._clock(),
+                kind=kind,
+                payload=payload,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+            )
+        )
+
+    def mirror_domain(self, event: DomainEvent) -> None:
+        """Mirror one ledger event as a ``domain.<kind>`` line. Never raises.
+
+        Called after the authoritative store append succeeds, so the file
+        timeline interleaves state changes with messages and telemetry in
+        emission order. The line is disposable; the row is the truth.
+        """
+        self._append(
+            TelemetryRecord(
+                run_id=self._run_id,
+                ts=event.ts,
+                kind=f"{_DOMAIN_MIRROR_KIND_PREFIX}{event_kind(event)}",
+                payload=event_payload(event),
+                attempt_number=event.attempt_number,
+            )
+        )
+
+    def _append(self, record: TelemetryRecord) -> None:
+        if self._sink is None:
             return
-        raise _AuditWriteError(
-            failing_method="append_event",
-            inner=exc,
-            attempt_number=attempt_number,
-        ) from exc
-
-
-def _persist_sdk_message(
-    store: HarnessStore,
-    *,
-    run_id: str,
-    attempt_number: int,
-    iteration_number: int,
-    message: Message,
-    now: Callable[[], datetime] | None = None,
-) -> None:
-    """Persist one SDK :class:`Message` the instant it is observed.
-
-    Serializes ``message`` via :func:`_serialize_sdk_message`, builds a
-    :class:`SdkMessageRecord`, and hands it to
-    ``store.append_sdk_message`` — which allocates one tick from the
-    per-run audit sequence counter, inserts the row, and notifies any
-    listeners. On store failure raises :class:`_AuditWriteError` carrying
-    the failing method and the attempt / iteration context so the
-    harness can route the failure through the strict-audit policy
-    (FR-5). The per-iteration batch write that
-    :func:`save_sdk_messages` used to do is gone — sdk_messages rows
-    are themselves the live progress signal.
-    """
-    clock = now or _utcnow
-    payload = _serialize_sdk_message(message)
-    message_type = str(payload.get("message_type", payload.get("type", "")))
-    record = SdkMessageRecord(
-        run_id=run_id,
-        attempt_number=attempt_number,
-        iteration_number=iteration_number,
-        message_type=message_type,
-        payload=payload,
-        ts=clock(),
-    )
-    try:
-        store.append_sdk_message(record)
-    except Exception as exc:
-        raise _AuditWriteError(
-            failing_method="append_sdk_message",
-            inner=exc,
-            attempt_number=attempt_number,
-            iteration_number=iteration_number,
-        ) from exc
-
-
-def _handle_audit_failure(
-    exc: _AuditWriteError,
-    *,
-    store: HarnessStore,
-    lifecycle: Lifecycle,
-    attempt: Attempt | None,
-    clock: Callable[[], datetime],
-) -> None:
-    """Best-effort finalization after a strict-audit write failure.
-
-    Emits ``harness.audit_write_failed`` (best-effort — swallows nested
-    failures so the audit path cannot itself loop), finalizes the open
-    attempt as :attr:`Outcome.INTERNAL_ERROR`, and transitions the
-    lifecycle to :attr:`Status.INTERNAL_ERROR`. The outer retry policy
-    then decides whether the run continues or terminates.
-    """
-    error = (
-        f"audit write failed: {type(exc.inner).__name__}: {exc.inner}"
-    )
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
-        kind="harness.audit_write_failed",
-        payload={
-            "failing_method": exc.failing_method,
-            "error_type": type(exc.inner).__name__,
-            "message": str(exc.inner),
-            "attempt_number": exc.attempt_number,
-            "iteration_number": exc.iteration_number,
-        },
-        attempt_number=exc.attempt_number,
-        now=clock,
-        best_effort=True,
-    )
-    if attempt is not None and attempt.ended_at is None:
-        ended_at = clock()
-        attempt.ended_at = ended_at
-        attempt.outcome = Outcome.INTERNAL_ERROR
-        attempt.error = error
         try:
-            _append(
-                lifecycle,
-                AttemptFinalized(
-                    run_id=lifecycle.run_id,
-                    ts=ended_at,
-                    attempt_number=attempt.number,
-                    number=attempt.number,
-                    outcome=Outcome.INTERNAL_ERROR,
-                    ended_at=ended_at,
-                    agent_output=attempt.agent_output,
-                    error=error,
-                ),
-                store=store,
+            self._sink.append_telemetry(record)
+        except Exception as exc:
+            self._note_failure(exc)
+
+    def _note_failure(self, exc: Exception) -> None:
+        """FR-7: record the first sink failure once, then go silent."""
+        if self._failure_reported:
+            return
+        self._failure_reported = True
+        print(
+            f"flywheel: telemetry sink append failed for run "
+            f"{self._run_id}: {type(exc).__name__}: {exc} — continuing; "
+            f"further telemetry for this run may be lost",
+            file=sys.stderr,
+            flush=True,
+        )
+        if self._sink is None:
+            return
+        try:
+            self._sink.append_telemetry(
+                TelemetryRecord(
+                    run_id=self._run_id,
+                    ts=self._clock(),
+                    kind=_TELEMETRY_FAILED_KIND,
+                    payload={
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
             )
         except Exception:
             pass
-    try:
-        _transition(
-            lifecycle,
-            Status.INTERNAL_ERROR,
-            store=store,
-            error=error,
-            now=clock,
+
+
+class _MirroringStore:
+    """Wrap a :class:`HarnessStore` so every ledger append also lands as a
+    ``domain.*`` mirror line in the run's telemetry stream (FR-4).
+
+    ``append_domain_event`` is the harness's single authoritative
+    state-write seam (see :func:`_append`); mirroring here keeps the
+    store row first — the mirror fires only after the append returned —
+    and covers every transition without threading the telemetry session
+    through each call site. All other store verbs delegate verbatim.
+    """
+
+    def __init__(
+        self, wrapped: HarnessStore, telemetry: _RunTelemetry
+    ) -> None:
+        self._wrapped = wrapped
+        self._telemetry = telemetry
+
+    def append_domain_event(
+        self, event: DomainEvent, *, expected_version: int
+    ) -> Lifecycle:
+        folded = self._wrapped.append_domain_event(
+            event, expected_version=expected_version
         )
-    except Exception:
-        pass
+        self._telemetry.mirror_domain(event)
+        return folded
+
+    def create_lifecycle(self, lifecycle: Lifecycle) -> None:
+        self._wrapped.create_lifecycle(lifecycle)
+
+    def update_lifecycle(
+        self, lifecycle: Lifecycle, *, expected_version: int
+    ) -> None:
+        self._wrapped.update_lifecycle(
+            lifecycle, expected_version=expected_version
+        )
+
+    def load_lifecycle(self, run_id: str) -> Lifecycle | None:
+        return self._wrapped.load_lifecycle(run_id)
+
+    def save_task(self, task: Task, *, now: datetime) -> str:
+        return self._wrapped.save_task(task, now=now)
+
+    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
+        return self._wrapped.list_domain_events(run_id)
+
+    def save_attempt(
+        self,
+        run_id: str,
+        attempt: Attempt,
+        *,
+        expected_version: int | None = None,
+    ) -> None:
+        self._wrapped.save_attempt(
+            run_id, attempt, expected_version=expected_version
+        )
+
+    def list_attempts(self, run_id: str) -> list[Attempt]:
+        return self._wrapped.list_attempts(run_id)
+
+    def append_grader_result(
+        self, result: GraderResultRecord
+    ) -> GraderResultRecord:
+        return self._wrapped.append_grader_result(result)
+
+    def list_grader_results(
+        self, run_id: str, attempt_number: int
+    ) -> list[GraderResultRecord]:
+        return self._wrapped.list_grader_results(run_id, attempt_number)
+
+    def claim_commands(
+        self, run_id: str, *, now: datetime
+    ) -> list[ControlCommandRecord]:
+        return self._wrapped.claim_commands(run_id, now=now)
 
 
 # Statuses from which the operator-interrupt finalizer can land cleanly on
@@ -852,18 +873,18 @@ _INTERRUPTIBLE_STATUSES: frozenset[Status] = frozenset(
 def _handle_interrupt(
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt | None,
     clock: Callable[[], datetime],
 ) -> None:
     """In-band finalization for an operator-driven SIGINT/SIGTERM.
 
-    Mirrors :func:`_handle_audit_failure`: closes the open attempt as
-    :attr:`Outcome.INTERNAL_ERROR`, emits a ``harness.interrupted``
-    telemetry event, and transitions the lifecycle to
-    :attr:`Status.INTERRUPTED`. INTERRUPTED is not a retry-source state, so
-    the retry budget is preserved and the next worker start can resume the
-    run through ``ready``.
+    Closes the open attempt as :attr:`Outcome.INTERNAL_ERROR`, emits a
+    ``harness.interrupted`` telemetry event, and transitions the
+    lifecycle to :attr:`Status.INTERRUPTED`. INTERRUPTED is not a
+    retry-source state, so the retry budget is preserved and the next
+    worker start can resume the run through ``ready``.
 
     Idempotent: when the lifecycle is not in :data:`_INTERRUPTIBLE_STATUSES`
     (already finalized, between attempts, or terminal) the function is a
@@ -871,34 +892,23 @@ def _handle_interrupt(
     scheduled at the next await point, but the synchronous finalization has
     already completed by then, so re-entering this helper just exits early.
 
-    Best-effort emit / append: a store-side failure inside the audit emit or
-    the AttemptFinalized append is swallowed (the audit path itself must not
-    loop, mirroring :func:`_handle_audit_failure`). The status transition
-    remains the source of truth.
+    Best-effort append: a store-side failure inside the AttemptFinalized
+    append is swallowed (the interrupt finalizer must not raise back into
+    the shutdown path). The status transition remains the source of truth.
     """
     if lifecycle.status not in _INTERRUPTIBLE_STATUSES:
         return
     reason = "operator interrupted mid-attempt"
     from_status = lifecycle.status.value
-    try:
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
-            kind="harness.interrupted",
-            payload={
-                "classification": "worker_interrupted",
-                "from_status": from_status,
-                "message": reason,
-            },
-            attempt_number=attempt.number if attempt is not None else None,
-            now=clock,
-            best_effort=True,
-        )
-    except _AuditWriteError:
-        # best_effort=True swallows store errors already; this except is a
-        # belt-and-braces guard so the interrupt finalizer can never itself
-        # raise back into the caller.
-        pass
+    telemetry.emit(
+        kind="harness.interrupted",
+        payload={
+            "classification": "worker_interrupted",
+            "from_status": from_status,
+            "message": reason,
+        },
+        attempt_number=attempt.number if attempt is not None else None,
+    )
     if attempt is not None and attempt.ended_at is None:
         ended_at = clock()
         attempt.ended_at = ended_at
@@ -924,22 +934,15 @@ def _handle_interrupt(
         # Mirror finalize_stranded_lifecycle's telemetry shape so the
         # in-band path and the out-of-band recovery sweep produce the
         # same audit-stream signature for an operator-interrupted attempt.
-        try:
-            _emit(
-                store,
-                run_id=lifecycle.run_id,
-                kind="harness.attempt_finalized",
-                payload={
-                    "number": attempt.number,
-                    "outcome": Outcome.INTERNAL_ERROR.value,
-                    "error": reason,
-                },
-                attempt_number=attempt.number,
-                now=clock,
-                best_effort=True,
-            )
-        except _AuditWriteError:
-            pass
+        telemetry.emit(
+            kind="harness.attempt_finalized",
+            payload={
+                "number": attempt.number,
+                "outcome": Outcome.INTERNAL_ERROR.value,
+                "error": reason,
+            },
+            attempt_number=attempt.number,
+        )
     try:
         _transition(
             lifecycle,
@@ -955,6 +958,7 @@ def _handle_hang_detected(
     exc: _HangDetected,
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt,
     clock: Callable[[], datetime],
@@ -976,6 +980,7 @@ def _handle_hang_detected(
     if attempt.ended_at is None:
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.INTERNAL_ERROR,
@@ -1439,6 +1444,7 @@ _ENTRY_CRASH_PATH_TO_FAILED: dict[Status, tuple[Status, ...]] = {
 
 def _record_entry_crash(
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     exception: BaseException,
     *,
@@ -1451,9 +1457,10 @@ def _record_entry_crash(
     has been persisted. Three secondary-failure shapes are explicitly
     handled:
 
-    * An audit-write failure inside :func:`_emit` is swallowed via
-      ``best_effort=True`` so the recorder cannot itself loop and mask
-      the original exception (the caller re-raises after this returns).
+    * The crash telemetry emit is best-effort by construction
+      (:class:`_RunTelemetry` never raises) so the recorder cannot
+      itself loop and mask the original exception (the caller re-raises
+      after this returns).
     * A transition failure (e.g.
       :class:`~flywheel_core.store_protocols.OptimisticConcurrencyError`
       from a concurrent harness racing on the same ``run_id``)
@@ -1473,17 +1480,13 @@ def _record_entry_crash(
     error = (
         f"harness entry crash: {type(exception).__name__}: {exception}"
     )
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.crash",
         payload={
             "classification": "entry_error",
             "exception_type": type(exception).__name__,
             "message": str(exception),
         },
-        now=clock,
-        best_effort=True,
     )
 
     path = _ENTRY_CRASH_PATH_TO_FAILED.get(lifecycle.status, ())
@@ -1507,6 +1510,7 @@ async def run_task(
     *,
     config: HarnessConfig | None = None,
     invoke: InvokeFunc | None = None,
+    sink: TelemetrySink | None = None,
     now: Callable[[], datetime] | None = None,
     monotonic: Callable[[], float] | None = None,
 ) -> HarnessOutcome:
@@ -1544,6 +1548,15 @@ async def run_task(
     ``invoke`` defaults to :func:`invoke_iteration` (via
     :func:`_default_invoke`); tests inject a stub callable returning
     pre-built :class:`IterationResult` instances.
+
+    ``sink`` is the run's telemetry destination (spec 00025): every SDK
+    message, every ``harness.*`` telemetry event, and a ``domain.*``
+    mirror of every ledger append stream to it in emission order. Sink
+    appends are best-effort — a failure is recorded once on stderr and
+    the run continues (FR-7) — while ledger and lifecycle writes keep
+    their strict failure semantics. ``None`` (the default) drops
+    telemetry; production callers wire a
+    :class:`flywheel_core.telemetry_file.FileTelemetrySink`.
 
     **Entry ordering and resume reconciliation.** The first store
     interaction appends a
@@ -1607,6 +1620,15 @@ async def run_task(
     # handoff so the next ``_run_attempt`` renders ``# Recovery handoff``
     # on its first iteration prompt.
     recovery_state = _RecoveryState()
+
+    # Telemetry session for the run (spec 00025): SDK messages and
+    # harness telemetry stream to the sink; the store keeps only ledger
+    # and OLTP writes. The _MirroringStore wrap makes every ledger
+    # append also land as a domain.* line in the same stream, store row
+    # first, so the run file is a self-contained timeline. A None sink
+    # drops telemetry — production callers wire a FileTelemetrySink.
+    telemetry = _RunTelemetry(sink, run_id=lifecycle.run_id, clock=clock)
+    store = _MirroringStore(store, telemetry)
 
     # Seed the lifecycle by appending the first domain event. Under event
     # sourcing the lifecycle row *is* the projection of this event, so the
@@ -1678,6 +1700,7 @@ async def run_task(
                     task=task,
                     lifecycle=lifecycle,
                     store=store,
+                    telemetry=telemetry,
                     config=config,
                     invoker=invoker,
                     clock=clock,
@@ -1691,51 +1714,13 @@ async def run_task(
                 Status.INTERNAL_ERROR,
             ):
                 if lifecycle.is_retry_eligible(config.max_retries):
-                    try:
-                        _emit(
-                            store,
-                            run_id=lifecycle.run_id,
-                            kind="harness.retry_scheduled",
-                            payload={
-                                "retries_used": lifecycle.retries,
-                                "max_retries": config.max_retries,
-                            },
-                            now=clock,
-                        )
-                    except _AuditWriteError as exc:
-                        # No active attempt to finalize between retries;
-                        # emit the audit-failure event best-effort and
-                        # terminate the run as FAILED with the audit
-                        # error.
-                        audit_error = (
-                            f"audit write failed: "
-                            f"{type(exc.inner).__name__}: {exc.inner}"
-                        )
-                        _emit(
-                            store,
-                            run_id=lifecycle.run_id,
-                            kind="harness.audit_write_failed",
-                            payload={
-                                "failing_method": exc.failing_method,
-                                "error_type": type(exc.inner).__name__,
-                                "message": str(exc.inner),
-                                "attempt_number": exc.attempt_number,
-                                "iteration_number": exc.iteration_number,
-                            },
-                            now=clock,
-                            best_effort=True,
-                        )
-                        try:
-                            _transition(
-                                lifecycle,
-                                Status.FAILED,
-                                store=store,
-                                error=audit_error,
-                                now=clock,
-                            )
-                        except Exception:
-                            pass
-                        break
+                    telemetry.emit(
+                        kind="harness.retry_scheduled",
+                        payload={
+                            "retries_used": lifecycle.retries,
+                            "max_retries": config.max_retries,
+                        },
+                    )
                     _transition(
                         lifecycle, Status.READY, store=store, now=clock
                     )
@@ -1771,7 +1756,7 @@ async def run_task(
         # to FAILED before re-raising so the worker subshell still exits
         # non-zero with the original traceback.
         _record_entry_crash(
-            store, lifecycle, exc, clock=clock
+            store, telemetry, lifecycle, exc, clock=clock
         )
         raise
 
@@ -1784,6 +1769,7 @@ async def _run_attempt(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     config: HarnessConfig,
     invoker: InvokeFunc,
     clock: Callable[[], datetime],
@@ -1815,16 +1801,13 @@ async def _run_attempt(
         store=store,
     )
     try:
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.attempt_started",
             payload={
                 "number": attempt_number,
                 "agent_context": dict(config.agent_context),
             },
             attempt_number=attempt_number,
-            now=clock,
         )
 
         attempt_dir = _ensure_attempt_dir(config, lifecycle, attempt_number)
@@ -1836,6 +1819,7 @@ async def _run_attempt(
             task=task,
             lifecycle=lifecycle,
             store=store,
+            telemetry=telemetry,
             config=config,
             invoker=invoker,
             clock=clock,
@@ -1844,14 +1828,6 @@ async def _run_attempt(
             attempt_dir=attempt_dir,
             transcript_graders=transcript_graders,
             recovery_state=recovery_state,
-        )
-    except _AuditWriteError as exc:
-        _handle_audit_failure(
-            exc,
-            store=store,
-            lifecycle=lifecycle,
-            attempt=attempt,
-            clock=clock,
         )
     except _HangDetected as exc:
         # Hang watchdog tripped: route to the FR-3 internal_error path
@@ -1864,6 +1840,7 @@ async def _run_attempt(
         _handle_hang_detected(
             exc,
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             clock=clock,
@@ -1880,6 +1857,7 @@ async def _run_attempt(
         # the SIGKILL/OOM/reboot backstop.
         _handle_interrupt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             clock=clock,
@@ -1892,6 +1870,7 @@ async def _run_attempt_body(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     config: HarnessConfig,
     invoker: InvokeFunc,
     clock: Callable[[], datetime],
@@ -1901,14 +1880,13 @@ async def _run_attempt_body(
     transcript_graders: tuple[TranscriptGrader, ...],
     recovery_state: _RecoveryState,
 ) -> None:
-    """Inner body of :func:`_run_attempt`, split out so the audit-write
-    sentinel exception can be caught at one boundary.
+    """Inner body of :func:`_run_attempt`, split out so the hang /
+    interrupt sentinel exceptions can be caught at one boundary.
 
-    Every store-write inside this function (either ``append_event`` via
-    :func:`_emit` or ``append_sdk_message`` via the per-message observer
-    built in :func:`_drive_iterations`) raises :class:`_AuditWriteError`
-    on failure; the caller routes that through
-    :func:`_handle_audit_failure`.
+    Telemetry writes inside this function (``telemetry.emit`` and the
+    per-message observer built in :func:`_drive_iterations`) are
+    best-effort and never raise (spec 00025 FR-7); only ledger and OLTP
+    store writes can fail, and those propagate to the caller unchanged.
     """
     attempt_number = attempt.number
     # Fresh LoopGuard per attempt: each attempt is a new agent context,
@@ -1924,6 +1902,7 @@ async def _run_attempt_body(
         task=task,
         lifecycle=lifecycle,
         store=store,
+        telemetry=telemetry,
         config=config,
         invoker=invoker,
         clock=clock,
@@ -1949,6 +1928,7 @@ async def _run_attempt_body(
             task=task,
             lifecycle=lifecycle,
             store=store,
+            telemetry=telemetry,
             config=config,
             attempt=attempt,
             attempt_number=attempt_number,
@@ -1965,6 +1945,7 @@ async def _run_attempt_body(
         _transition(lifecycle, Status.VALIDATING, store=store, now=clock)
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.AGENT_ERROR,
@@ -1987,9 +1968,7 @@ async def _run_attempt_body(
     if iteration_result.failure is not None:
         failure = iteration_result.failure
         crash_error = f"crashed: {failure.error_type}: {failure.message}"
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.crash",
             payload={
                 "error_type": failure.error_type,
@@ -1999,10 +1978,10 @@ async def _run_attempt_body(
                 "classification": "deferred",
             },
             attempt_number=attempt_number,
-            now=clock,
         )
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.INTERNAL_ERROR,
@@ -2031,6 +2010,7 @@ async def _run_attempt_body(
         if loop_guard_verdict.kind is LoopGuardVerdictKind.STUCK:
             _handle_loop_guard_stuck(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 attempt_number=attempt_number,
@@ -2042,6 +2022,7 @@ async def _run_attempt_body(
         if loop_guard_verdict.kind is LoopGuardVerdictKind.THRASH:
             _handle_loop_guard_thrash(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 attempt_number=attempt_number,
@@ -2065,6 +2046,7 @@ async def _run_attempt_body(
             task=task,
             lifecycle=lifecycle,
             store=store,
+            telemetry=telemetry,
             config=config,
             attempt=attempt,
             attempt_number=attempt_number,
@@ -2084,6 +2066,7 @@ async def _run_attempt_body(
             reason = envelope.reason or "agent reported abort intent"
             _finalize_attempt(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 outcome=Outcome.AGENT_ERROR,
@@ -2117,9 +2100,7 @@ async def _run_attempt_body(
                 _transition(
                     lifecycle, Status.VALIDATING, store=store, now=clock
                 )
-                _emit(
-                    store,
-                    run_id=lifecycle.run_id,
+                telemetry.emit(
                     kind="harness.protocol_failure",
                     payload={
                         "kind": "invalid_blocked_requires",
@@ -2127,10 +2108,10 @@ async def _run_attempt_body(
                         "intent": envelope.intent.value,
                     },
                     attempt_number=attempt_number,
-                    now=clock,
                 )
                 _finalize_attempt(
                     store=store,
+                    telemetry=telemetry,
                     lifecycle=lifecycle,
                     attempt=attempt,
                     outcome=Outcome.AGENT_ERROR,
@@ -2151,6 +2132,7 @@ async def _run_attempt_body(
             requires_payload = _serialize_requires(envelope.requires)
             _finalize_attempt(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 outcome=Outcome.CANCELLED,
@@ -2173,16 +2155,13 @@ async def _run_attempt_body(
                 ),
                 store=store,
             )
-            _emit(
-                store,
-                run_id=lifecycle.run_id,
+            telemetry.emit(
                 kind="harness.blocked",
                 payload={
                     "reason": reason,
                     "requires": requires_payload,
                 },
                 attempt_number=attempt_number,
-                now=clock,
             )
             _transition(
                 lifecycle,
@@ -2205,9 +2184,7 @@ async def _run_attempt_body(
     breach = _first_breach_across_graders(transcript_graders, observation)
 
     if breach is not None:
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.budget_exceeded",
             payload={
                 "breached": breach,
@@ -2218,7 +2195,6 @@ async def _run_attempt_body(
                 },
             },
             attempt_number=attempt_number,
-            now=clock,
         )
         run_transcript_graders(
             task,
@@ -2232,6 +2208,7 @@ async def _run_attempt_body(
         error = f"budget exceeded: {breach}"
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.VALIDATION_FAILED,
@@ -2253,6 +2230,7 @@ async def _run_attempt_body(
             task=task,
             lifecycle=lifecycle,
             store=store,
+            telemetry=telemetry,
             config=config,
             attempt=attempt,
             attempt_dir=attempt_dir,
@@ -2270,6 +2248,7 @@ async def _run_attempt_body(
         )
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.AGENT_ERROR,
@@ -2288,16 +2267,14 @@ async def _run_attempt_body(
 
     # Protocol failure: malformed / missing / duplicate / truncated.
     protocol_error = _envelope_protocol_error(envelope)
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.protocol_failure",
         payload=_envelope_payload(envelope),
         attempt_number=attempt_number,
-        now=clock,
     )
     _finalize_attempt(
         store=store,
+        telemetry=telemetry,
         lifecycle=lifecycle,
         attempt=attempt,
         outcome=Outcome.AGENT_ERROR,
@@ -2339,6 +2316,7 @@ def _loop_guard_requires_payload(
 def _handle_loop_guard_stuck(
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt,
     attempt_number: int,
@@ -2361,6 +2339,7 @@ def _handle_loop_guard_stuck(
     requires_payload = _loop_guard_requires_payload(verdict)
     _finalize_attempt(
         store=store,
+        telemetry=telemetry,
         lifecycle=lifecycle,
         attempt=attempt,
         outcome=Outcome.CANCELLED,
@@ -2378,9 +2357,7 @@ def _handle_loop_guard_stuck(
         ),
         store=store,
     )
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.stuck",
         payload={
             "reason": reason,
@@ -2389,7 +2366,6 @@ def _handle_loop_guard_stuck(
             "requires": requires_payload,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
     _transition(
         lifecycle,
@@ -2402,6 +2378,7 @@ def _handle_loop_guard_stuck(
 def _handle_loop_guard_thrash(
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt,
     attempt_number: int,
@@ -2420,9 +2397,7 @@ def _handle_loop_guard_thrash(
     FAILED.
     """
     reason = verdict.reason
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.thrash_detected",
         payload={
             "reason": reason,
@@ -2430,11 +2405,11 @@ def _handle_loop_guard_thrash(
             "input_digest": verdict.input_digest,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
     _transition(lifecycle, Status.VALIDATING, store=store, now=clock)
     _finalize_attempt(
         store=store,
+        telemetry=telemetry,
         lifecycle=lifecycle,
         attempt=attempt,
         outcome=Outcome.AGENT_ERROR,
@@ -2492,6 +2467,7 @@ async def _handle_context_recovery(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     config: HarnessConfig,
     attempt: Attempt,
     attempt_number: int,
@@ -2547,9 +2523,7 @@ async def _handle_context_recovery(
         # share this routing so a failed summarizer never restarts
         # with an empty handoff regardless of which path triggered.
         error = f"recovery summarizer failed: {exc.reason}"
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.crash",
             payload={
                 "classification": "recovery_summarizer_error",
@@ -2558,10 +2532,10 @@ async def _handle_context_recovery(
                 "trigger": recovery_trigger.trigger,
             },
             attempt_number=attempt_number,
-            now=clock,
         )
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.INTERNAL_ERROR,
@@ -2598,9 +2572,7 @@ async def _handle_context_recovery(
     # event is the cleanest "prior attempt closed" marker, but the
     # spec frames context_recovery as the recovery signal itself, so
     # emit it first and the finalize / transitions follow.
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.context_recovery",
         payload={
             "iteration": recovery_trigger.iteration_number,
@@ -2616,10 +2588,10 @@ async def _handle_context_recovery(
             "trigger": recovery_trigger.trigger,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
     _finalize_attempt(
         store=store,
+        telemetry=telemetry,
         lifecycle=lifecycle,
         attempt=attempt,
         outcome=Outcome.RECOVERED,
@@ -2656,11 +2628,9 @@ async def _invoke_with_watchdog(
     request: InvocationRequest,
     hang_timeout: float,
     mclock: Callable[[], float],
-    store: HarnessStore,
-    run_id: str,
+    telemetry: _RunTelemetry,
     attempt_number: int,
     iteration_number: int,
-    clock: Callable[[], datetime],
 ) -> IterationResult:
     """Race ``invoker(request)`` against a hang watchdog.
 
@@ -2748,9 +2718,7 @@ async def _invoke_with_watchdog(
         except asyncio.CancelledError:
             if hang_tripped:
                 silence = mclock() - last_activity
-                _emit(
-                    store,
-                    run_id=run_id,
+                telemetry.emit(
                     kind="harness.hang_detected",
                     payload={
                         "iteration": iteration_number,
@@ -2758,7 +2726,6 @@ async def _invoke_with_watchdog(
                         "silence_seconds": silence,
                     },
                     attempt_number=attempt_number,
-                    now=clock,
                 )
                 raise _HangDetected(
                     attempt_number=attempt_number,
@@ -2786,6 +2753,7 @@ async def _drive_iterations(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     config: HarnessConfig,
     invoker: InvokeFunc,
     clock: Callable[[], datetime],
@@ -2856,14 +2824,7 @@ async def _drive_iterations(
             ),
         )
 
-        # Per-iteration sentinel: a failing per-message store write
-        # captures into this slot rather than propagating out through the
-        # invoker's on_message wrapper (which swallows exceptions so a
-        # faulty live renderer cannot break the agent run). The harness
-        # re-raises after the invoker returns so the strict-audit policy
-        # (FR-5) still routes failures through INTERNAL_ERROR.
         captured_iteration = iteration_number
-        first_audit_error: _AuditWriteError | None = None
 
         # Mid-turn occupancy state (spec 00019 FR-1 / FR-3 / FR-4). All
         # slots are per-iteration: ``emitted_tiers`` enforces "at most
@@ -2922,9 +2883,9 @@ async def _drive_iterations(
             either no reading is available or its ``totalTokens`` is
             absent / non-integer.
 
-            Audit-write failures route through ``first_audit_error``
-            the same way ``_persist_sdk_message`` failures do, so the
-            strict-audit policy (FR-5) catches a faulty event sink.
+            Telemetry emits are best-effort (spec 00025 FR-7): a faulty
+            sink is recorded once on stderr by :class:`_RunTelemetry`
+            and never interrupts the iteration.
 
             Mid-turn act (FR-4 / FR-5 / spec edge case "Crossing 90%
             observe and the act ratio on the same message"): after
@@ -2940,7 +2901,6 @@ async def _drive_iterations(
             flag guards against re-arming on a re-cross / oscillation
             and prevents double-firing for the same crossing.
             """
-            nonlocal first_audit_error
             reading = latest_sdk_reading[0]
             capacity: int | None = None
             source: str | None = None
@@ -2979,25 +2939,19 @@ async def _drive_iterations(
                 if ratio < tier:
                     continue
                 emitted_tiers.append(tier)
-                try:
-                    _emit(
-                        store,
-                        run_id=lifecycle.run_id,
-                        kind="harness.context_threshold_crossed",
-                        payload={
-                            "iteration": captured_iteration,
-                            "tier": tier,
-                            "occupancy_tokens": occupancy,
-                            "capacity_tokens": capacity,
-                            "percentage": ratio * 100.0,
-                            "capacity_source": source,
-                        },
-                        attempt_number=attempt_number,
-                        now=clock,
-                    )
-                except _AuditWriteError as exc:
-                    if first_audit_error is None:
-                        first_audit_error = exc
+                telemetry.emit(
+                    kind="harness.context_threshold_crossed",
+                    payload={
+                        "iteration": captured_iteration,
+                        "tier": tier,
+                        "occupancy_tokens": occupancy,
+                        "capacity_tokens": capacity,
+                        "percentage": ratio * 100.0,
+                        "capacity_source": source,
+                    },
+                    attempt_number=attempt_number,
+                    iteration_number=captured_iteration,
+                )
             # Mid-turn act gate (FR-4 / FR-5). Budget check uses the
             # same ``recoveries_used`` / ``max_context_recoveries``
             # counter the boundary recovery consumes, so the mid-turn
@@ -3016,19 +2970,11 @@ async def _drive_iterations(
                 recovery_interrupt_event.set()
 
         def _on_message(msg: Message) -> None:
-            nonlocal first_audit_error
-            try:
-                _persist_sdk_message(
-                    store,
-                    run_id=lifecycle.run_id,
-                    attempt_number=attempt_number,
-                    iteration_number=captured_iteration,
-                    message=msg,
-                    now=clock,
-                )
-            except _AuditWriteError as exc:
-                if first_audit_error is None:
-                    first_audit_error = exc
+            telemetry.sdk_message(
+                msg,
+                attempt_number=attempt_number,
+                iteration_number=captured_iteration,
+            )
             # Accumulate the work-so-far transcript from streamed
             # AssistantMessage text blocks (FR-4). The iteration's
             # full ``IterationResult.transcript`` covers the boundary
@@ -3093,11 +3039,9 @@ async def _drive_iterations(
                     request=request,
                     hang_timeout=hang_timeout,
                     mclock=mclock,
-                    store=store,
-                    run_id=lifecycle.run_id,
+                    telemetry=telemetry,
                     attempt_number=attempt_number,
                     iteration_number=iteration_number,
-                    clock=clock,
                 )
         except HarnessRecoveryRequested:
             # Spec 00019 FR-4 / FR-7: the live-client invoker raised
@@ -3109,12 +3053,6 @@ async def _drive_iterations(
             # this through :func:`_handle_context_recovery` which
             # finalizes the attempt RECOVERED and emits
             # ``harness.context_recovery`` with ``trigger="mid_turn"``.
-            # Surface any per-message audit-write failure first so the
-            # strict-audit policy (FR-5) still routes through
-            # INTERNAL_ERROR (the same way the normal-completion arm
-            # below does).
-            if first_audit_error is not None:
-                raise first_audit_error
             recovery_trigger = _RecoveryTrigger(
                 occupancy_tokens=midturn_occupancy[0],
                 transcript_tail="".join(partial_transcript_chunks),
@@ -3129,9 +3067,6 @@ async def _drive_iterations(
             break
         wall_seconds = mclock() - started_monotonic
 
-        if first_audit_error is not None:
-            raise first_audit_error
-
         # Context-pressure telemetry: token fields are per-iteration deltas
         # — consumers cumulate by summing the audit stream; the harness
         # holds no running counter. ``total_cost_usd`` and ``num_turns`` are
@@ -3140,9 +3075,7 @@ async def _drive_iterations(
         usage_breakdown = _build_usage_breakdown(iteration_result.messages)
         usage_payload: dict[str, Any] = dict(usage_breakdown)
         usage_payload["total_tokens"] = total_tokens_from_usage(usage_breakdown)
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.iteration_completed",
             payload={
                 "iteration": iteration_number,
@@ -3165,7 +3098,6 @@ async def _drive_iterations(
                 "num_turns": iteration_result.signals.num_turns,
             },
             attempt_number=attempt_number,
-            now=clock,
         )
 
         # Iteration-boundary aggregate rollup (spec 00025 FR-6): fold this
@@ -3266,6 +3198,7 @@ async def _validate(
     task: Task,
     lifecycle: Lifecycle,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     config: HarnessConfig,
     attempt: Attempt,
     attempt_dir: Path | None,
@@ -3338,9 +3271,7 @@ async def _validate(
             error = (
                 f"rubric judge failed: {exc.grader_name}: {exc.reason}"
             )
-            _emit(
-                store,
-                run_id=lifecycle.run_id,
+            telemetry.emit(
                 kind="harness.crash",
                 payload={
                     "classification": "rubric_judge_error",
@@ -3349,10 +3280,10 @@ async def _validate(
                     "message": error,
                 },
                 attempt_number=attempt.number,
-                now=clock,
             )
             _finalize_attempt(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 outcome=Outcome.INTERNAL_ERROR,
@@ -3371,11 +3302,9 @@ async def _validate(
 
         for record in rubric_results:
             _emit_rubric_events(
-                store,
-                run_id=lifecycle.run_id,
+                telemetry,
                 attempt_number=attempt.number,
                 record=record,
-                clock=clock,
             )
         rubric_passed = all(r.passed for r in rubric_results)
 
@@ -3392,6 +3321,7 @@ async def _validate(
         if first_gate is not None:
             _finalize_attempt(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 outcome=Outcome.SUCCEEDED,
@@ -3401,6 +3331,7 @@ async def _validate(
             )
             _enter_manual_gate(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 gate=first_gate,
@@ -3410,6 +3341,7 @@ async def _validate(
             return
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.SUCCEEDED,
@@ -3429,9 +3361,7 @@ async def _validate(
                 f"operator interrupted command grader {grader_label!r} "
                 f"(signal {signal_no})"
             )
-            _emit(
-                store,
-                run_id=lifecycle.run_id,
+            telemetry.emit(
                 kind="harness.crash",
                 payload={
                     "classification": "grader_signaled",
@@ -3441,10 +3371,10 @@ async def _validate(
                     "message": error,
                 },
                 attempt_number=attempt.number,
-                now=clock,
             )
             _finalize_attempt(
                 store=store,
+                telemetry=telemetry,
                 lifecycle=lifecycle,
                 attempt=attempt,
                 outcome=Outcome.INTERNAL_ERROR,
@@ -3462,6 +3392,7 @@ async def _validate(
         error = _grader_failure_error(command_results)
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.VALIDATION_FAILED,
@@ -3482,6 +3413,7 @@ async def _validate(
         error = _grader_failure_error(transcript_results)
         _finalize_attempt(
             store=store,
+            telemetry=telemetry,
             lifecycle=lifecycle,
             attempt=attempt,
             outcome=Outcome.VALIDATION_FAILED,
@@ -3509,6 +3441,7 @@ async def _validate(
     error = f"rubric grader {grader_label!r} failed"
     _finalize_attempt(
         store=store,
+        telemetry=telemetry,
         lifecycle=lifecycle,
         attempt=attempt,
         outcome=Outcome.VALIDATION_FAILED,
@@ -3537,6 +3470,7 @@ async def _validate(
 def _enter_manual_gate(
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt,
     gate: ManualGate,
@@ -3570,9 +3504,7 @@ def _enter_manual_gate(
         now=clock,
     )
     artifacts_dir = str(attempt_dir) if attempt_dir is not None else ""
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.awaiting_approval",
         payload={
             "instructions": gate.instruction,
@@ -3583,17 +3515,14 @@ def _enter_manual_gate(
             "artifacts_dir": artifacts_dir,
         },
         attempt_number=attempt.number,
-        now=clock,
     )
 
 
 def _emit_rubric_events(
-    store: HarnessStore,
+    telemetry: _RunTelemetry,
     *,
-    run_id: str,
     attempt_number: int,
     record: GraderResultRecord,
-    clock: Callable[[], datetime],
 ) -> None:
     """Emit harness.rubric_invoked / harness.rubric_verdict (and, when
     applicable, harness.rubric_unknown) for one persisted rubric record.
@@ -3606,9 +3535,7 @@ def _emit_rubric_events(
     summary = payload.get("summary")
     unknown = bool(payload.get("unknown", False))
     judge_model = payload.get("judge_model")
-    _emit(
-        store,
-        run_id=run_id,
+    telemetry.emit(
         kind="harness.rubric_invoked",
         payload={
             "grader_name": record.grader_name,
@@ -3616,11 +3543,8 @@ def _emit_rubric_events(
             "attempt_number": record.attempt_number,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
-    _emit(
-        store,
-        run_id=run_id,
+    telemetry.emit(
         kind="harness.rubric_verdict",
         payload={
             "grader_name": record.grader_name,
@@ -3629,25 +3553,22 @@ def _emit_rubric_events(
             "unknown": unknown,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
     if unknown:
-        _emit(
-            store,
-            run_id=run_id,
+        telemetry.emit(
             kind="harness.rubric_unknown",
             payload={
                 "grader_name": record.grader_name,
                 "summary": summary,
             },
             attempt_number=attempt_number,
-            now=clock,
         )
 
 
 def _finalize_attempt(
     *,
     store: HarnessStore,
+    telemetry: _RunTelemetry,
     lifecycle: Lifecycle,
     attempt: Attempt,
     outcome: Outcome,
@@ -3682,9 +3603,7 @@ def _finalize_attempt(
         ),
         store=store,
     )
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.attempt_finalized",
         payload={
             "number": attempt.number,
@@ -3692,7 +3611,6 @@ def _finalize_attempt(
             "error": error,
         },
         attempt_number=attempt.number,
-        now=clock,
     )
 
 
@@ -3702,6 +3620,7 @@ def finalize_stranded_lifecycle(
     *,
     reason: str = "worker interrupted before finalization",
     classification: str = "worker_interrupted",
+    sink: TelemetrySink | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> bool:
     """Drain a lifecycle stranded in ``RUNNING`` or ``VALIDATING`` to
@@ -3724,6 +3643,8 @@ def finalize_stranded_lifecycle(
     restart untouched.
     """
     clock = now or _utcnow
+    telemetry = _RunTelemetry(sink, run_id=run_id, clock=clock)
+    store = _MirroringStore(store, telemetry)
     lifecycle = store.load_lifecycle(run_id)
     if lifecycle is None:
         return False
@@ -3760,9 +3681,7 @@ def finalize_stranded_lifecycle(
             ),
             store=store,
         )
-        _emit(
-            store,
-            run_id=run_id,
+        telemetry.emit(
             kind="harness.attempt_finalized",
             payload={
                 "number": attempt.number,
@@ -3770,12 +3689,9 @@ def finalize_stranded_lifecycle(
                 "error": reason,
             },
             attempt_number=attempt.number,
-            now=clock,
         )
 
-    _emit(
-        store,
-        run_id=run_id,
+    telemetry.emit(
         kind="harness.crash",
         payload={
             "classification": classification,
@@ -3783,7 +3699,6 @@ def finalize_stranded_lifecycle(
             "from_status": lifecycle.status.value,
         },
         attempt_number=last_attempt_number,
-        now=clock,
     )
     _transition(lifecycle, Status.INTERRUPTED, store=store, now=clock)
     return True
@@ -3896,6 +3811,7 @@ def recheck_blocked_lifecycle(
     *,
     dry_run: bool = False,
     cwd: str | os.PathLike[str] | None = None,
+    sink: TelemetrySink | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> RecheckOutcome:
     """Re-evaluate a blocked lifecycle's persisted ``requires`` predicates
@@ -3931,6 +3847,8 @@ def recheck_blocked_lifecycle(
     caller — this function does not swallow it.
     """
     clock = now or _utcnow
+    telemetry = _RunTelemetry(sink, run_id=run_id, clock=clock)
+    store = _MirroringStore(store, telemetry)
     lifecycle = store.load_lifecycle(run_id)
     if lifecycle is None:
         return RecheckOutcome(
@@ -3955,16 +3873,13 @@ def recheck_blocked_lifecycle(
                 "detail": parsed,
             },
         )
-        _emit(
-            store,
-            run_id=run_id,
+        telemetry.emit(
             kind="harness.recheck_attempted",
             payload={
                 "per_predicate": [dict(p) for p in per_predicate],
                 "all_satisfied": False,
                 "dry_run": dry_run,
             },
-            now=clock,
         )
         return RecheckOutcome(
             applied=False,
@@ -3985,16 +3900,13 @@ def recheck_blocked_lifecycle(
         )
     all_satisfied = all(bool(p["satisfied"]) for p in evaluated)
 
-    _emit(
-        store,
-        run_id=run_id,
+    telemetry.emit(
         kind="harness.recheck_attempted",
         payload={
             "per_predicate": [dict(p) for p in evaluated],
             "all_satisfied": all_satisfied,
             "dry_run": dry_run,
         },
-        now=clock,
     )
 
     per_predicate_out: tuple[dict[str, object], ...] = tuple(evaluated)
@@ -4014,15 +3926,12 @@ def recheck_blocked_lifecycle(
         )
 
     _transition(lifecycle, Status.READY, store=store, now=clock)
-    _emit(
-        store,
-        run_id=run_id,
+    telemetry.emit(
         kind="harness.unblocked",
         payload={
             "from_status": Status.INTERRUPTED.value,
             "to_status": Status.READY.value,
         },
-        now=clock,
     )
     return RecheckOutcome(
         applied=True,
@@ -4087,11 +3996,10 @@ def _reject_feedback_text(payload: Mapping[str, Any]) -> str:
 
 
 def _emit_control_applied(
-    store: HarnessStore,
+    telemetry: _RunTelemetry,
     command: ControlCommandRecord,
     *,
     attempt_number: int | None,
-    clock: Callable[[], datetime],
 ) -> None:
     """Record the resolver's claim via the existing
     ``harness.control_command_applied`` event so the audit stream
@@ -4099,9 +4007,7 @@ def _emit_control_applied(
     live in-session watcher uses (``EVENT_CONTROL_APPLIED`` in
     :mod:`flywheel_core.invoker_client`).
     """
-    _emit(
-        store,
-        run_id=command.run_id,
+    telemetry.emit(
         kind="harness.control_command_applied",
         payload={
             "command_id": command.id,
@@ -4109,7 +4015,6 @@ def _emit_control_applied(
             "payload": dict(command.payload),
         },
         attempt_number=attempt_number,
-        now=clock,
     )
 
 
@@ -4119,6 +4024,7 @@ def resolve_manual_approval(
     task: Task,
     *,
     max_retries: int = 0,
+    sink: TelemetrySink | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> ResolveApprovalOutcome:
     """Apply the oldest pending approve/reject command to a parked gate.
@@ -4183,6 +4089,8 @@ def resolve_manual_approval(
     caller -- this function does not swallow it.
     """
     clock = now or _utcnow
+    telemetry = _RunTelemetry(sink, run_id=lifecycle.run_id, clock=clock)
+    store = _MirroringStore(store, telemetry)
 
     if lifecycle.status != Status.AWAITING_APPROVAL:
         return ResolveApprovalOutcome(applied=False, reason="not_awaiting")
@@ -4256,9 +4164,7 @@ def resolve_manual_approval(
                 store=store,
             )
             artifacts_dir = lifecycle.artifacts_dir or ""
-            _emit(
-                store,
-                run_id=lifecycle.run_id,
+            telemetry.emit(
                 kind="harness.awaiting_approval",
                 payload={
                     "instructions": next_gate.instruction,
@@ -4269,26 +4175,22 @@ def resolve_manual_approval(
                     "artifacts_dir": artifacts_dir,
                 },
                 attempt_number=attempt_number,
-                now=clock,
             )
             reason = "approved_next_gate"
         else:
             _transition(lifecycle, Status.DONE, store=store, now=clock)
             reason = "approved_done"
 
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.manual_approved",
             payload={
                 "grader_name": gate.grader_name,
                 "awaiting_ordinal": ordinal,
             },
             attempt_number=attempt_number,
-            now=clock,
         )
         _emit_control_applied(
-            store, target, attempt_number=attempt_number, clock=clock
+            telemetry, target, attempt_number=attempt_number
         )
         return ResolveApprovalOutcome(
             applied=True, reason=reason, command_id=target.id
@@ -4317,9 +4219,7 @@ def resolve_manual_approval(
         error=error,
         now=clock,
     )
-    _emit(
-        store,
-        run_id=lifecycle.run_id,
+    telemetry.emit(
         kind="harness.manual_rejected",
         payload={
             "grader_name": gate.grader_name,
@@ -4327,10 +4227,9 @@ def resolve_manual_approval(
             "feedback": feedback_text,
         },
         attempt_number=attempt_number,
-        now=clock,
     )
     _emit_control_applied(
-        store, target, attempt_number=attempt_number, clock=clock
+        telemetry, target, attempt_number=attempt_number
     )
 
     # Reuse the same retry arm run_task drives so a reject reaches the
@@ -4339,16 +4238,13 @@ def resolve_manual_approval(
     # parked-lifecycle resolution. The retry-counter increment lives on
     # the FAILED_VALIDATION -> READY edge in Lifecycle.apply_transition.
     if lifecycle.is_retry_eligible(max_retries):
-        _emit(
-            store,
-            run_id=lifecycle.run_id,
+        telemetry.emit(
             kind="harness.retry_scheduled",
             payload={
                 "retries_used": lifecycle.retries,
                 "max_retries": max_retries,
             },
             attempt_number=attempt_number,
-            now=clock,
         )
         _transition(lifecycle, Status.READY, store=store, now=clock)
         return ResolveApprovalOutcome(

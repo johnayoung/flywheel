@@ -22,6 +22,8 @@ from typing import Any
 
 import pytest
 
+from flywheel_core.store_protocols import TelemetryRecord
+
 from flywheel_core import (
     CommandGrader,
     CommandGraderRequirement,
@@ -70,9 +72,23 @@ def _blocked_lifecycle(
     return lifecycle
 
 
-def _events_of(store: Any, run_id: str, *kinds: str) -> list[dict[str, Any]]:
+class _ListSink:
+    """In-memory TelemetrySink capturing recheck telemetry in order."""
+
+    def __init__(self) -> None:
+        self.records: list[TelemetryRecord] = []
+
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        self.records.append(record)
+
+
+def _events_of(sink: _ListSink, run_id: str, *kinds: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for record in store.list_events(run_id):
+    for record in sink.records:
+        if record.run_id != run_id:
+            continue
+        if not record.kind.startswith("harness."):
+            continue
         if not kinds or record.kind in kinds:
             out.append(
                 {"kind": record.kind, "payload": dict(record.payload)}
@@ -127,7 +143,10 @@ def test_all_satisfied_transitions_clears_column_and_emits_both_events(
         ],
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is True
     assert outcome.reason == "unblocked"
@@ -139,7 +158,7 @@ def test_all_satisfied_transitions_clears_column_and_emits_both_events(
     assert reloaded.blocked_requires_json is None
 
     events = _events_of(
-        store, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
+        sink, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
     )
     kinds = [e["kind"] for e in events]
     assert kinds == ["harness.recheck_attempted", "harness.unblocked"]
@@ -193,8 +212,9 @@ def test_cwd_argument_resolves_predicates_against_sandbox(
         ],
     )
 
+    sink = _ListSink()
     outcome = recheck_blocked_lifecycle(
-        store, lifecycle.run_id, task, cwd=sandbox
+        store, lifecycle.run_id, task, cwd=sandbox, sink=sink
     )
 
     assert outcome.applied is True
@@ -226,7 +246,10 @@ def test_any_unsatisfied_emits_only_recheck_attempted_and_preserves_column(
         store, run_id="run-partial", requires_payload=payload
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.reason == "unsatisfied"
@@ -239,7 +262,7 @@ def test_any_unsatisfied_emits_only_recheck_attempted_and_preserves_column(
     assert reloaded.blocked_requires_json == json.dumps(payload)
 
     events = _events_of(
-        store, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
+        sink, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
     )
     kinds = [e["kind"] for e in events]
     assert kinds == ["harness.recheck_attempted"]
@@ -269,12 +292,15 @@ def test_non_interrupted_lifecycle_is_silent_noop(
     )
     store.create_lifecycle(lifecycle)
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome == RecheckOutcome(
         applied=False, reason="not_blocked", per_predicate=()
     )
-    assert _events_of(store, lifecycle.run_id) == []
+    assert _events_of(sink, lifecycle.run_id) == []
     reloaded = store.load_lifecycle(lifecycle.run_id)
     assert reloaded is not None
     assert reloaded.status == Status.READY
@@ -297,12 +323,15 @@ def test_interrupted_without_blocked_requires_json_is_silent_noop(
         store, run_id="run-sigint", requires_payload=None
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome == RecheckOutcome(
         applied=False, reason="not_blocked", per_predicate=()
     )
-    assert _events_of(store, lifecycle.run_id) == []
+    assert _events_of(sink, lifecycle.run_id) == []
     reloaded = store.load_lifecycle(lifecycle.run_id)
     assert reloaded is not None
     assert reloaded.status == Status.INTERRUPTED
@@ -328,7 +357,10 @@ def test_command_grader_predicate_runs_named_grader_and_surfaces_exit_code(
         requires_payload=[{"type": "command_grader", "name": "full-suite"}],
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.reason == "unsatisfied"
@@ -364,7 +396,10 @@ def test_command_grader_predicate_for_unknown_name_is_unsatisfied(
         ],
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.reason == "unsatisfied"
@@ -377,7 +412,7 @@ def test_command_grader_predicate_for_unknown_name_is_unsatisfied(
     assert reloaded.status == Status.INTERRUPTED
     assert reloaded.blocked_requires_json is not None
     events = _events_of(
-        store, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
+        sink, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
     )
     assert [e["kind"] for e in events] == ["harness.recheck_attempted"]
 
@@ -404,8 +439,9 @@ def test_dry_run_emits_recheck_attempted_only_even_when_all_satisfied(
         store, run_id="run-dry", requires_payload=payload
     )
 
+    sink = _ListSink()
     outcome = recheck_blocked_lifecycle(
-        store, lifecycle.run_id, task, dry_run=True
+        store, lifecycle.run_id, task, dry_run=True, sink=sink
     )
 
     assert outcome.applied is False
@@ -418,7 +454,7 @@ def test_dry_run_emits_recheck_attempted_only_even_when_all_satisfied(
     assert reloaded.blocked_requires_json == json.dumps(payload)
 
     events = _events_of(
-        store, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
+        sink, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
     )
     assert [e["kind"] for e in events] == ["harness.recheck_attempted"]
     assert events[0]["payload"]["dry_run"] is True
@@ -448,7 +484,8 @@ def test_command_grader_recheck_does_not_write_grader_results_row(
         ],
     )
 
-    recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    recheck_blocked_lifecycle(store, lifecycle.run_id, task, sink=sink)
 
     assert _grader_rows(store, lifecycle.run_id) == 0
 
@@ -473,7 +510,10 @@ def test_env_var_set_empty_string_is_unsatisfied(
         requires_payload=[{"type": "env_var_set", "name": "RECHECK_TEST_VAR"}],
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.per_predicate[0]["satisfied"] is False
@@ -505,7 +545,10 @@ def test_file_exists_present_false_is_unsatisfied_when_path_present(
         ],
     )
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.per_predicate[0]["satisfied"] is False
@@ -535,7 +578,10 @@ def test_corrupted_blocked_requires_json_surfaces_parse_error(
     lifecycle.blocked_requires_json = "{not json"
     store.create_lifecycle(lifecycle)
 
-    outcome = recheck_blocked_lifecycle(store, lifecycle.run_id, task)
+    sink = _ListSink()
+    outcome = recheck_blocked_lifecycle(
+        store, lifecycle.run_id, task, sink=sink
+    )
 
     assert outcome.applied is False
     assert outcome.reason.startswith("parse_error:")
@@ -546,7 +592,7 @@ def test_corrupted_blocked_requires_json_surfaces_parse_error(
     assert reloaded.status == Status.INTERRUPTED
 
     events = _events_of(
-        store, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
+        sink, lifecycle.run_id, "harness.recheck_attempted", "harness.unblocked"
     )
     assert [e["kind"] for e in events] == ["harness.recheck_attempted"]
 

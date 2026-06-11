@@ -24,6 +24,7 @@ from flywheel_core.invoker import InvocationSignals, IterationResult
 from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
 from flywheel_core.store_protocols import EventRecord
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import CommandGrader, RubricGrader, ValidationError
 from flywheel_core.workflow import (
     EVENTS_JSON,
@@ -1446,6 +1447,29 @@ def _seed_validating(store: SqliteStore, task_id: str) -> Lifecycle:
     return lc
 
 
+def _run_file_kinds(db: Path, run_id: str) -> list[str]:
+    """Telemetry kinds from the per-run JSONL next to ``db`` (spec 00025)."""
+    run_file = db.parent / "logs" / "runs" / f"{run_id}.jsonl"
+    if not run_file.exists():
+        return []
+    return [
+        json.loads(line)["kind"]
+        for line in run_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _run_file_records(db: Path, run_id: str) -> list[dict]:
+    run_file = db.parent / "logs" / "runs" / f"{run_id}.jsonl"
+    if not run_file.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in run_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def test_recover_finalizes_running_lifecycle(tmp_path: Path) -> None:
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
@@ -1472,7 +1496,8 @@ def test_recover_finalizes_validating_and_closes_open_attempt(
     store = SqliteStore(db)
     try:
         validating = _seed_validating(store, "task-v")
-        finalized = recover_stranded_lifecycles(store)
+        with FileTelemetrySink(db.parent / "logs") as sink:
+            finalized = recover_stranded_lifecycles(store, sink=sink)
         assert finalized == [validating.run_id]
         reloaded = store.load_lifecycle(validating.run_id)
         assert reloaded is not None
@@ -1481,11 +1506,11 @@ def test_recover_finalizes_validating_and_closes_open_attempt(
         assert len(attempts) == 1
         assert attempts[0].ended_at is not None
         assert attempts[0].outcome == Outcome.INTERNAL_ERROR
-        events = store.list_events(validating.run_id)
-        kinds = [e.kind for e in events]
+        records = _run_file_records(db, validating.run_id)
+        kinds = [r["kind"] for r in records]
         assert "harness.crash" in kinds
-        crash = next(e for e in events if e.kind == "harness.crash")
-        assert crash.payload["classification"] == "worker_interrupted"
+        crash = next(r for r in records if r["kind"] == "harness.crash")
+        assert crash["payload"]["classification"] == "worker_interrupted"
     finally:
         store.close()
 
@@ -1561,9 +1586,7 @@ def test_main_recover_task_id_finalizes_only_that_task(
         assert reloaded_a is not None and reloaded_a.status == Status.INTERRUPTED
         # The interrupted transition was event-sourced: replaying the domain
         # log reconstructs the same status, so log and projection agree.
-        assert "harness.crash" in [
-            e.kind for e in store.list_events(a.run_id)
-        ]
+        assert "harness.crash" in _run_file_kinds(db, a.run_id)
         assert reloaded_b is not None and reloaded_b.status == Status.RUNNING
     finally:
         store.close()
@@ -1827,9 +1850,9 @@ def test_main_recheck_blocked_dry_run_reports_without_transitioning(
     store = SqliteStore(db)
     try:
         reloaded = store.load_lifecycle(seeded.run_id)
-        events = [e.kind for e in store.list_events(seeded.run_id)]
     finally:
         store.close()
+    events = _run_file_kinds(db, seeded.run_id)
     assert reloaded is not None
     assert reloaded.status == Status.INTERRUPTED
     assert reloaded.blocked_requires_json is not None
@@ -2009,16 +2032,14 @@ def test_run_task_file_records_crash_for_invoke_runtime_error(
         # Terminal status: the entry-crash recorder walks the lifecycle
         # to FAILED so subsequent observers see the run is over.
         assert row["status"] == Status.FAILED.value
-        # The harness.crash event is the audit-visible record of the
-        # failure mode.
-        crash_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM events "
-            "WHERE run_id = ? AND kind = 'harness.crash'",
-            (run_id,),
-        ).fetchone()["n"]
-        assert crash_count >= 1
     finally:
         store.close()
+    # The harness.crash record is the audit-visible record of the
+    # failure mode; it lives in the per-run telemetry file (spec 00025).
+    crash_count = sum(
+        1 for k in _run_file_kinds(db, run_id) if k == "harness.crash"
+    )
+    assert crash_count >= 1
 
 
 # ---------- run subcommand: inline goal + event streaming ----------
@@ -2161,19 +2182,20 @@ def test_run_task_object_finalizes_lifecycle_on_signal(
         ).fetchall()
         assert len(rows) == 1
         assert rows[0]["status"] == Status.INTERRUPTED.value
-        events = store.list_events(rows[0]["run_id"])
-        kinds = [e.kind for e in events]
-        # The in-band path (00012) emits harness.interrupted at the
-        # _run_attempt boundary; finalize_stranded_lifecycle's
-        # harness.crash signature is reserved for the SIGKILL/OOM/reboot
-        # backstop.
-        assert "harness.interrupted" in kinds
-        interrupted = next(
-            e for e in events if e.kind == "harness.interrupted"
-        )
-        assert interrupted.payload["classification"] == "worker_interrupted"
+        run_id = rows[0]["run_id"]
     finally:
         store.close()
+    records = _run_file_records(db, run_id)
+    kinds = [r["kind"] for r in records]
+    # The in-band path (00012) emits harness.interrupted at the
+    # _run_attempt boundary; finalize_stranded_lifecycle's
+    # harness.crash signature is reserved for the SIGKILL/OOM/reboot
+    # backstop.
+    assert "harness.interrupted" in kinds
+    interrupted = next(
+        r for r in records if r["kind"] == "harness.interrupted"
+    )
+    assert interrupted["payload"]["classification"] == "worker_interrupted"
 
 
 def test_run_task_object_json_events_are_ndjson(
@@ -2475,7 +2497,7 @@ def test_make_claude_code_invoke_uses_client_path_when_control_store_set(
         on_message=None,
         control_store=store,
         run_id="run-1",
-        audit_store=None,
+        telemetry_sink=None,
     )
     request = InvocationRequest(
         prompt="go",

@@ -44,6 +44,7 @@ from flywheel_core.lifecycle import Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import ManualGrader, Task
 from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
@@ -1277,6 +1278,7 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = open_sqlite_bound_store(policy, db_path=db_path)
+    sink = FileTelemetrySink(db_path.parent / "logs")
     try:
         # Build a task_id -> Task map from the work source. An archived
         # (or no-longer-listed) task whose lifecycle is blocked in the
@@ -1307,7 +1309,7 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
                 )
                 return 0
             outcome = recheck_blocked_lifecycle(
-                store, args.run_id, task, dry_run=args.dry_run
+                store, args.run_id, task, dry_run=args.dry_run, sink=sink
             )
             print(
                 _format_recheck_line(
@@ -1330,12 +1332,13 @@ def _cmd_recheck_blocked(args: argparse.Namespace) -> int:
                 )
                 continue
             outcome = recheck_blocked_lifecycle(
-                store, run_id, task, dry_run=args.dry_run
+                store, run_id, task, dry_run=args.dry_run, sink=sink
             )
             print(_format_recheck_line(run_id, outcome, dry_run=args.dry_run))
         return 0
     finally:
         store.close()
+        sink.close()
 
 def _cmd_recover(args: argparse.Namespace) -> int:
     policy = _load_effective_policy(args)
@@ -1343,7 +1346,10 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
-        finalized = recover_stranded_lifecycles(store, task_id=args.task_id)
+        with FileTelemetrySink(db_path.parent / "logs") as sink:
+            finalized = recover_stranded_lifecycles(
+                store, task_id=args.task_id, sink=sink
+            )
     finally:
         store.close()
     if not finalized:

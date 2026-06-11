@@ -37,20 +37,13 @@ from collections.abc import Mapping, Sequence
 from claude_agent_sdk import ClaudeAgentOptions
 
 from flywheel_core import (
-    Attempt,
     CommandGrader,
-    ControlCommandRecord,
-    DomainEvent,
-    EventRecord,
-    GraderResultRecord,
     HarnessConfig,
     HarnessOutcome,
-    HarnessStore,
     InvocationRequest,
     InvokeFunc,
     IterationResult,
     Lifecycle,
-    SdkMessageRecord,
     SqliteStore,
     Status,
     Task,
@@ -58,6 +51,8 @@ from flywheel_core import (
     run_task,
 )
 from flywheel_core.invoker import invoke_iteration
+from flywheel_core.store_protocols import TelemetryRecord
+from flywheel_core.telemetry_file import FileTelemetrySink
 
 
 TARGET_FILENAME = "hello.txt"
@@ -149,116 +144,33 @@ def make_claude_code_invoke(
     return _invoke
 
 
-class _EventStreamingStore:
-    """Forward every store call to ``wrapped`` and emit each persisted
-    event to stdout as one JSON line.
+class _PrintingSink:
+    """Append every telemetry record to the wrapped file sink and emit it
+    to stdout as one JSON line.
 
-    Surfacing harness events live keeps the run observable while the
-    agent is talking. The final ``dump_store_state`` snapshot then shows
-    the same data as it lives in SQLite after the run finishes.
+    Surfacing the run's telemetry stream live keeps the run observable
+    while the agent is talking. The final ``dump_store_state`` snapshot
+    then shows the relational rows in SQLite plus the same stream as it
+    lives in the per-run JSONL file after the run finishes (spec 00025:
+    telemetry is a file concern, not a store concern).
     """
 
-    def __init__(self, wrapped: HarnessStore) -> None:
+    def __init__(self, wrapped: FileTelemetrySink) -> None:
         self._wrapped = wrapped
 
-    @property
-    def notifier(self) -> Any:
-        """Expose the wrapped store's notifier so an audit follower sharing
-        this wrapper still gets in-process push wakeups."""
-        return getattr(self._wrapped, "notifier", None)
-
-    def create_lifecycle(self, lifecycle: Lifecycle) -> None:
-        self._wrapped.create_lifecycle(lifecycle)
-
-    def update_lifecycle(
-        self,
-        lifecycle: Lifecycle,
-        *,
-        expected_version: int,
-    ) -> None:
-        self._wrapped.update_lifecycle(
-            lifecycle, expected_version=expected_version
-        )
-
-    def load_lifecycle(self, run_id: str) -> Lifecycle | None:
-        return self._wrapped.load_lifecycle(run_id)
-
-    def save_task(self, task: Task, *, now: datetime) -> str:
-        return self._wrapped.save_task(task, now=now)
-
-    def append_domain_event(
-        self,
-        event: DomainEvent,
-        *,
-        expected_version: int,
-    ) -> Lifecycle:
-        return self._wrapped.append_domain_event(
-            event, expected_version=expected_version
-        )
-
-    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
-        return self._wrapped.list_domain_events(run_id)
-
-    def save_attempt(
-        self,
-        run_id: str,
-        attempt: Attempt,
-        *,
-        expected_version: int | None = None,
-    ) -> None:
-        self._wrapped.save_attempt(
-            run_id, attempt, expected_version=expected_version
-        )
-
-    def list_attempts(self, run_id: str) -> list[Attempt]:
-        return self._wrapped.list_attempts(run_id)
-
-    def append_event(self, event: EventRecord) -> EventRecord:
-        persisted = self._wrapped.append_event(event)
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        self._wrapped.append_telemetry(record)
         line = json.dumps(
             {
-                "id": persisted.id,
-                "run_id": persisted.run_id,
-                "ts": persisted.ts.isoformat(),
-                "kind": persisted.kind,
-                "attempt_number": persisted.attempt_number,
-                "payload": dict(persisted.payload),
+                "run_id": record.run_id,
+                "ts": record.ts.isoformat(),
+                "kind": record.kind,
+                "attempt_number": record.attempt_number,
+                "payload": dict(record.payload),
             },
             sort_keys=True,
         )
         print(f"event {line}", flush=True)
-        return persisted
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        return self._wrapped.append_sdk_message(message)
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[SdkMessageRecord]:
-        return self._wrapped.save_sdk_messages(
-            run_id, attempt_number, iteration_number, messages
-        )
-
-    def append_grader_result(
-        self, result: GraderResultRecord
-    ) -> GraderResultRecord:
-        return self._wrapped.append_grader_result(result)
-
-    def list_grader_results(
-        self, run_id: str, attempt_number: int
-    ) -> list[GraderResultRecord]:
-        return self._wrapped.list_grader_results(run_id, attempt_number)
-
-    def claim_commands(
-        self, run_id: str, *, now: datetime
-    ) -> list[ControlCommandRecord]:
-        return self._wrapped.claim_commands(run_id, now=now)
 
 
 def _print_section(title: str) -> None:
@@ -277,14 +189,20 @@ def _truncate(text: str, limit: int = 240) -> str:
 
 
 def dump_store_state(
-    store: SqliteStore, run_id: str, *, out: TextIO | None = None
+    store: SqliteStore,
+    run_id: str,
+    *,
+    out: TextIO | None = None,
+    logs_root: Path | None = None,
 ) -> None:
-    """Print every SQLite row associated with ``run_id`` to ``out``.
+    """Print every row associated with ``run_id`` to ``out``.
 
-    Covers the four tables the harness writes during a run:
-    ``lifecycles``, ``attempts``, ``events``, ``grader_results``. Each
-    section prints the columns most useful for understanding what
-    happened, in row-order matching the store's contract.
+    Covers the relational tables the harness writes during a run
+    (``lifecycles``, ``attempts``, ``grader_results``) plus the run's
+    telemetry stream, which lives in ``<logs_root>/runs/<run_id>.jsonl``
+    rather than the database (spec 00025). Each section prints the
+    fields most useful for understanding what happened, in row / line
+    order.
     """
     stream = out if out is not None else sys.stdout
 
@@ -338,20 +256,27 @@ def dump_store_state(
             )
             emit(f"          payload: {payload_snippet}")
 
-    events = store.list_events(run_id)
+    lines: list[dict[str, Any]] = []
+    if logs_root is not None:
+        run_file = Path(logs_root) / "runs" / f"{run_id}.jsonl"
+        if run_file.exists():
+            for raw in run_file.read_text(encoding="utf-8").splitlines():
+                if raw.strip():
+                    lines.append(json.loads(raw))
     emit()
-    emit(f"=== events ({len(events)}) ===")
-    for event in events:
+    emit(f"=== events ({len(lines)}) ===")
+    for index, line in enumerate(lines):
         attempt_n = (
-            event.attempt_number if event.attempt_number is not None else "-"
+            line["attempt_number"]
+            if line.get("attempt_number") is not None
+            else "-"
         )
         payload_snippet = _truncate(
-            _compact_json(dict(event.payload)), limit=200
+            _compact_json(line.get("payload", {})), limit=200
         )
-        event_id = event.id if event.id is not None else 0
         emit(
-            f"  [{event_id:>4}] {event.ts.isoformat()}  "
-            f"attempt={attempt_n}  {event.kind}"
+            f"  [{index:>4}] {line.get('ts', '?')}  "
+            f"attempt={attempt_n}  {line.get('kind', '?')}"
         )
         emit(f"        {payload_snippet}")
 
@@ -381,13 +306,16 @@ async def run_hello_example(
         sandbox_path, model=model, max_turns=max_turns
     )
 
-    backend = SqliteStore(Path(os.fspath(db_path)))
+    resolved_db = Path(os.fspath(db_path))
+    logs_root = resolved_db.parent / "logs"
+    backend = SqliteStore(resolved_db)
+    file_sink = FileTelemetrySink(logs_root)
     try:
-        store = _EventStreamingStore(backend)
+        sink = _PrintingSink(file_sink)
         outcome = await run_task(
             task,
             lifecycle,
-            store,
+            backend,
             config=HarnessConfig(
                 agent_context={
                     "model_id": model or "claude-code-default",
@@ -397,11 +325,15 @@ async def run_hello_example(
                 },
             ),
             invoke=invoker,
+            sink=sink,
         )
         _print_section(f"run finished status={outcome.lifecycle.status.value}")
-        dump_store_state(backend, outcome.lifecycle.run_id)
+        dump_store_state(
+            backend, outcome.lifecycle.run_id, logs_root=logs_root
+        )
     finally:
         backend.close()
+        file_sink.close()
     return outcome
 
 

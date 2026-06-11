@@ -60,9 +60,11 @@ from flywheel_core.harness import (
     _build_observation,
     _build_usage_breakdown,
     _handle_interrupt,
+    _RunTelemetry,
     finalize_stranded_lifecycle,
 )
 from flywheel_core.invoker import ToolInteraction, ToolResultObservation
+from flywheel_core.store_protocols import TelemetryRecord
 from flywheel_core.loop_guard import LoopGuardConfig
 from flywheel_core.loaders import task_digest
 from flywheel_core.envelope import (
@@ -174,6 +176,47 @@ def _run(coro: Coroutine[Any, Any, HarnessOutcome]) -> HarnessOutcome:
     return asyncio.run(coro)
 
 
+class _ListSink:
+    """In-memory TelemetrySink capturing records in emission order.
+
+    Telemetry no longer lands in the store (spec 00025): the harness
+    streams SDK messages, harness.* telemetry, and domain.* ledger
+    mirrors to the run's sink. The view helpers slice the captured
+    stream the way the old store verbs did so assertions stay readable.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[TelemetryRecord] = []
+
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        self.records.append(record)
+
+    def events(self, run_id: str) -> list[TelemetryRecord]:
+        """Harness telemetry records (the old list_events view)."""
+        return [
+            r
+            for r in self.records
+            if r.run_id == run_id and r.kind.startswith("harness.")
+        ]
+
+    def messages(self, run_id: str) -> list[TelemetryRecord]:
+        """SDK message records (the old list_sdk_messages view)."""
+        return [
+            r
+            for r in self.records
+            if r.run_id == run_id
+            and not r.kind.startswith(("harness.", "domain."))
+        ]
+
+    def domain_mirrors(self, run_id: str) -> list[TelemetryRecord]:
+        """domain.* ledger mirror lines, in emission order."""
+        return [
+            r
+            for r in self.records
+            if r.run_id == run_id and r.kind.startswith("domain.")
+        ]
+
+
 def _scripted_invoker(
     results: list[IterationResult],
 ) -> Callable[[InvocationRequest], Awaitable[IterationResult]]:
@@ -212,6 +255,7 @@ def _scripted_invoker(
 class TestSuccessfulRun:
     def test_verify_then_all_graders_pass_reaches_done(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -237,7 +281,7 @@ class TestSuccessfulRun:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.DONE
         assert len(outcome.attempts) == 1
@@ -252,6 +296,7 @@ class TestSuccessfulRun:
 
     def test_agent_context_persisted_on_attempt(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -278,7 +323,7 @@ class TestSuccessfulRun:
         config = HarnessConfig(agent_context=ctx)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         attempt = outcome.attempts[0]
@@ -297,6 +342,7 @@ class TestSuccessfulRun:
         sandbox.mkdir()
         (sandbox / "sentinel.flag").write_text("ok", encoding="utf-8")
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -320,7 +366,7 @@ class TestSuccessfulRun:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # The sentinel only exists inside the sandbox, so reaching DONE
@@ -329,6 +375,7 @@ class TestSuccessfulRun:
 
     def test_per_attempt_artifact_directory_created(self, tmp_path: Path) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -349,7 +396,7 @@ class TestSuccessfulRun:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
         attempt_dir = tmp_path / "attempt-001"
         assert attempt_dir.is_dir()
@@ -366,6 +413,7 @@ class TestRetryPolicy:
         self, tmp_path: Path
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         marker = tmp_path / "attempt_counter"
         # Grader: exit 0 only on the second invocation.
         grader_run = (
@@ -392,7 +440,7 @@ class TestRetryPolicy:
         config = HarnessConfig(max_retries=1)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -403,6 +451,7 @@ class TestRetryPolicy:
 
     def test_validation_failure_terminates_when_retries_exhausted(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -423,7 +472,7 @@ class TestRetryPolicy:
         config = HarnessConfig(max_retries=0)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -442,6 +491,7 @@ class TestRetryPolicy:
         budget rather than a constructor-injected count.)
         """
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -462,7 +512,7 @@ class TestRetryPolicy:
         config = HarnessConfig(max_retries=0)  # retries (0) >= max (0) — exhausted.
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert outcome.lifecycle.status == Status.FAILED
 
@@ -486,6 +536,7 @@ class TestProtocolFailures:
         expected_substr: str,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -506,7 +557,7 @@ class TestProtocolFailures:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.FAILED
         # Without retries, failed_validation terminates in failed; check
@@ -521,6 +572,7 @@ class TestProtocolFailures:
     def test_protocol_failure_does_not_silently_coerce_to_continue(self) -> None:
         """Missing envelopes must not be retried-as-continue silently."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -541,7 +593,7 @@ class TestProtocolFailures:
         config = HarnessConfig(max_iterations_per_attempt=5)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -556,6 +608,7 @@ class TestBlockedAndAbort:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -585,7 +638,7 @@ class TestBlockedAndAbort:
         config = HarnessConfig(max_retries=5)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.INTERRUPTED
@@ -606,7 +659,7 @@ class TestBlockedAndAbort:
         )
         # harness.blocked event carries the structured list alongside reason.
         blocked_events = [
-            e for e in store.list_events(lifecycle.run_id)
+            e for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.blocked"
         ]
         assert len(blocked_events) == 1
@@ -618,6 +671,7 @@ class TestBlockedAndAbort:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -645,7 +699,7 @@ class TestBlockedAndAbort:
         config = HarnessConfig(max_retries=0)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Routed through protocol-failure path: FAILED_VALIDATION terminal
@@ -656,12 +710,13 @@ class TestBlockedAndAbort:
         assert attempt.outcome == Outcome.AGENT_ERROR
         assert "invalid blocked requires" in attempt.error
         assert outcome.lifecycle.blocked_requires_json is None
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.blocked" not in kinds
         assert "harness.protocol_failure" in kinds
 
     def test_abort_transitions_to_failed(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -685,7 +740,7 @@ class TestBlockedAndAbort:
         config = HarnessConfig(max_retries=5)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -702,6 +757,7 @@ class TestBlockedAndAbort:
 class TestCrash:
     def test_invoker_failure_transitions_to_failed(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -726,14 +782,14 @@ class TestCrash:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.FAILED
         attempt = outcome.attempts[0]
         assert attempt.outcome == Outcome.INTERNAL_ERROR
         assert "ProcessError" in attempt.error
         # Crash recorded distinctly via an event.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crash_events = [e for e in events if e.kind == "harness.crash"]
         assert len(crash_events) == 1
         assert crash_events[0].payload["classification"] == "deferred"
@@ -745,6 +801,7 @@ class TestCrash:
 class TestBudgetBreach:
     def test_max_turns_breach_routes_to_failed_validation(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -774,7 +831,7 @@ class TestBudgetBreach:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.FAILED
         attempt = outcome.attempts[0]
@@ -791,6 +848,7 @@ class TestBudgetBreach:
 
     def test_budget_event_emitted_with_observed_totals(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -814,11 +872,11 @@ class TestBudgetBreach:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.budget_exceeded"
         ]
         assert len(events) == 1
@@ -832,6 +890,7 @@ class TestBudgetBreach:
 class TestContinueLoop:
     def test_continue_loops_within_cap_then_verifies(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -860,7 +919,7 @@ class TestContinueLoop:
         config = HarnessConfig(max_iterations_per_attempt=3)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -870,6 +929,7 @@ class TestContinueLoop:
 
     def test_continue_past_cap_fails_validation_without_grading(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -894,7 +954,7 @@ class TestContinueLoop:
         config = HarnessConfig(max_iterations_per_attempt=2)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -970,6 +1030,7 @@ class TestSoleOwnerOfTransitions:
 class TestEntryNormalization:
     def test_pending_lifecycle_is_brought_to_ready(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -990,7 +1051,7 @@ class TestEntryNormalization:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.DONE
         # The PENDING → READY → RUNNING → VALIDATING → DONE chain ran.
@@ -1001,6 +1062,7 @@ class TestEntryNormalization:
 
     def test_resume_from_interrupted_runs_a_new_attempt(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -1024,7 +1086,7 @@ class TestEntryNormalization:
                 )
             ]
         )
-        _run(run_task(task, lifecycle, store, invoke=invoke_first))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke_first))
         assert lifecycle.status == Status.INTERRUPTED
         # Per the centralized clearer, the resume drain (INTERRUPTED ->
         # READY) drops the structured snapshot back to NULL.
@@ -1038,7 +1100,7 @@ class TestEntryNormalization:
                 )
             ]
         )
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke_second))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke_second))
 
         assert outcome.lifecycle.status == Status.DONE
         assert outcome.lifecycle.blocked_requires_json is None
@@ -1053,6 +1115,7 @@ class TestRateLimitSurface:
         """rate_limited per docs/loop.md is transient — the harness
         records the signal but does not classify it as a failure."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -1082,12 +1145,12 @@ class TestRateLimitSurface:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.DONE
         completed_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.iteration_completed"
         ]
         assert completed_events[0].payload["rate_limited"] is True
@@ -1107,22 +1170,22 @@ class TestIterationCompletedTelemetry:
     """
 
     def _completed_payload(
-        self, store: InMemoryStore, run_id: str
+        self, sink: _ListSink, run_id: str
     ) -> Mapping[str, Any]:
         events = [
             e
-            for e in store.list_events(run_id)
+            for e in sink.events(run_id)
             if e.kind == "harness.iteration_completed"
         ]
         assert len(events) == 1, events
         return events[0].payload
 
     def _completed_payloads(
-        self, store: InMemoryStore, run_id: str
+        self, sink: _ListSink, run_id: str
     ) -> list[Mapping[str, Any]]:
         return [
             e.payload
-            for e in store.list_events(run_id)
+            for e in sink.events(run_id)
             if e.kind == "harness.iteration_completed"
         ]
 
@@ -1139,6 +1202,7 @@ class TestIterationCompletedTelemetry:
     # FR-1: per-iteration token breakdown is present with all five fields.
     def test_usage_breakdown_attached_to_payload(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr1")
         usage = {
@@ -1156,9 +1220,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         assert payload["usage"] == {
             "input_tokens": 12,
             "output_tokens": 7,
@@ -1170,6 +1234,7 @@ class TestIterationCompletedTelemetry:
     # FR-2: cost + turns surfaced verbatim from InvocationSignals.
     def test_cost_and_turns_surfaced_from_signals(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr2")
         invoke = _scripted_invoker(
@@ -1185,9 +1250,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         assert payload["num_turns"] == 4
         assert payload["total_cost_usd"] == 0.42
 
@@ -1195,6 +1260,7 @@ class TestIterationCompletedTelemetry:
     # are absent — surface as null, not zero.
     def test_cost_and_turns_null_when_signals_lack_them(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr2-null")
         invoke = _scripted_invoker(
@@ -1210,9 +1276,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         assert payload["num_turns"] is None
         assert payload["total_cost_usd"] is None
 
@@ -1220,6 +1286,7 @@ class TestIterationCompletedTelemetry:
     # (the same _build_observation pipes feed both code paths).
     def test_total_tokens_matches_observation(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr3")
         messages: tuple[Message, ...] = (
@@ -1236,9 +1303,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         observation = _build_observation(messages, wall_seconds=0.0)
         assert payload["usage"]["total_tokens"] == observation.total_tokens
         # Sanity: total_tokens equals the field-wise sum.
@@ -1259,6 +1326,7 @@ class TestIterationCompletedTelemetry:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fr4")
         invoke = _scripted_invoker(
@@ -1284,9 +1352,9 @@ class TestIterationCompletedTelemetry:
         )
         config = HarnessConfig(max_iterations_per_attempt=2)
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        payloads = self._completed_payloads(store, lifecycle.run_id)
+        payloads = self._completed_payloads(sink, lifecycle.run_id)
         assert len(payloads) == 2
         # First iteration carries only its own 15 tokens.
         assert payloads[0]["usage"]["input_tokens"] == 10
@@ -1307,6 +1375,7 @@ class TestIterationCompletedTelemetry:
     # cost / turns reflect whatever the signals say (here: None).
     def test_iteration_without_usage_data_yields_zero_breakdown(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-empty")
         invoke = _scripted_invoker(
@@ -1322,9 +1391,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         assert payload["usage"] == {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -1339,6 +1408,7 @@ class TestIterationCompletedTelemetry:
     # emits the event with whatever pre-failure usage was observed.
     def test_failed_iteration_still_carries_breakdown(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-usage-fail")
         invoke = _scripted_invoker(
@@ -1365,9 +1435,9 @@ class TestIterationCompletedTelemetry:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        payload = self._completed_payload(store, lifecycle.run_id)
+        payload = self._completed_payload(sink, lifecycle.run_id)
         assert payload["failure"] is not None
         assert payload["failure"]["error_type"] == "ProcessError"
         # Breakdown survives the failed iteration.
@@ -1441,6 +1511,7 @@ class TestAttemptAggregateRollup:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-agg-roll")
         invoke = _scripted_invoker(
@@ -1478,7 +1549,7 @@ class TestAttemptAggregateRollup:
         config = HarnessConfig(max_iterations_per_attempt=2)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -1500,6 +1571,7 @@ class TestAttemptAggregateRollup:
 
     def test_none_turns_and_cost_roll_up_as_zero(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._passing_task()
         lifecycle = Lifecycle(task_id="t1", run_id="run-agg-none")
         invoke = _scripted_invoker(
@@ -1515,7 +1587,7 @@ class TestAttemptAggregateRollup:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         attempt = store.load_attempt(lifecycle.run_id, 1)
         assert attempt is not None
@@ -1552,6 +1624,7 @@ class TestOperatorInterruption:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._signal_killed_grader_invocation(2)
         lifecycle = Lifecycle(task_id="t1", run_id="run-sigint-grader")
         invoke = _scripted_invoker(
@@ -1565,7 +1638,7 @@ class TestOperatorInterruption:
         config = HarnessConfig(max_retries=1)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # INTERRUPTED is not a retry-source: the harness must break out
@@ -1580,7 +1653,7 @@ class TestOperatorInterruption:
         # A single harness.crash event with classification grader_signaled
         # must record the kill — that is the audit-visible distinguisher
         # from a real grader failure.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crash = [e for e in events if e.kind == "harness.crash"]
         assert len(crash) == 1
         assert crash[0].payload["classification"] == "grader_signaled"
@@ -1590,6 +1663,7 @@ class TestOperatorInterruption:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._signal_killed_grader_invocation(15)
         lifecycle = Lifecycle(task_id="t1", run_id="run-sigterm-grader")
         invoke = _scripted_invoker(
@@ -1601,13 +1675,13 @@ class TestOperatorInterruption:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         assert outcome.lifecycle.status == Status.INTERRUPTED
         attempt = outcome.attempts[0]
         assert attempt.outcome == Outcome.INTERNAL_ERROR
         crash = [
-            e for e in store.list_events(lifecycle.run_id)
+            e for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.crash"
         ]
         assert len(crash) == 1
@@ -1620,6 +1694,7 @@ class TestOperatorInterruption:
         operator interruption — must consume retry budget like any other
         validation failure."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = self._signal_killed_grader_invocation(11)
         lifecycle = Lifecycle(task_id="t1", run_id="run-sigsegv-grader")
         invoke = _scripted_invoker(
@@ -1633,7 +1708,7 @@ class TestOperatorInterruption:
         config = HarnessConfig(max_retries=0)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -1678,6 +1753,7 @@ class TestIterationAwareInterrupt:
         # FR-1: mid-stream cancellation leaves the lifecycle in INTERRUPTED
         # rather than stranded `running`.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -1691,7 +1767,7 @@ class TestIterationAwareInterrupt:
         invoke = self._cancelling_invoker(pre_messages=(_assistant(),))
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         reloaded = store.load_lifecycle(lifecycle.run_id)
         assert reloaded is not None
@@ -1701,12 +1777,13 @@ class TestIterationAwareInterrupt:
 
     def test_cancelled_attempt_finalizes_as_internal_error(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-attempt")
         invoke = self._cancelling_invoker()
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         attempts = store.list_attempts(lifecycle.run_id)
         assert len(attempts) == 1
@@ -1719,6 +1796,7 @@ class TestIterationAwareInterrupt:
         # FR-2: messages persisted before the interrupt (live via 00010)
         # remain in the store after finalization.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-msgs")
         pre = (
@@ -1728,9 +1806,9 @@ class TestIterationAwareInterrupt:
         invoke = self._cancelling_invoker(pre_messages=pre)
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        rows = store.list_sdk_messages(lifecycle.run_id)
+        rows = sink.messages(lifecycle.run_id)
         # Both assistant messages observed before cancellation must still be
         # in the audit trail; on_message persists immediately.
         assert len(rows) == 2
@@ -1740,14 +1818,15 @@ class TestIterationAwareInterrupt:
     def test_harness_interrupted_event_emitted(self) -> None:
         # FR-4: an observability event records the exogenous stop.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-event")
         invoke = self._cancelling_invoker()
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         interrupted = [e for e in events if e.kind == "harness.interrupted"]
         assert len(interrupted) == 1
         payload = interrupted[0].payload
@@ -1766,18 +1845,19 @@ class TestIterationAwareInterrupt:
         # FR-3: an INTERRUPTED lifecycle can return to READY and run
         # again without losing prior execution history.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-resume")
         invoke_cancel = self._cancelling_invoker(pre_messages=(_assistant(),))
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke_cancel))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke_cancel))
 
         # Sanity: first attempt interrupted, lifecycle parked at INTERRUPTED.
         first = store.load_lifecycle(lifecycle.run_id)
         assert first is not None
         assert first.status == Status.INTERRUPTED
-        first_messages = store.list_sdk_messages(lifecycle.run_id)
+        first_messages = sink.messages(lifecycle.run_id)
         assert len(first_messages) == 1
 
         # Resume on the same run_id with a fresh, non-cancelling invoker;
@@ -1797,7 +1877,7 @@ class TestIterationAwareInterrupt:
             task_id="t1", run_id=lifecycle.run_id
         )
         outcome = _run(
-            run_task(task, resume_lifecycle, store, invoke=invoke_ok)
+            run_task(task, resume_lifecycle, store, sink=sink, invoke=invoke_ok)
         )
         assert outcome.lifecycle.status == Status.DONE
         attempts = store.list_attempts(lifecycle.run_id)
@@ -1808,7 +1888,7 @@ class TestIterationAwareInterrupt:
         assert attempts[0].outcome == Outcome.INTERNAL_ERROR
         assert attempts[1].outcome == Outcome.SUCCEEDED
         # SDK messages from both attempts remain.
-        all_messages = store.list_sdk_messages(lifecycle.run_id)
+        all_messages = sink.messages(lifecycle.run_id)
         assert len(all_messages) >= 2
 
     def test_no_stranded_running_after_interrupt(self) -> None:
@@ -1816,12 +1896,13 @@ class TestIterationAwareInterrupt:
         # leaves no lifecycle in `running` -- finalize_stranded_lifecycle is
         # a no-op because there is nothing left to finalize.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-clean")
         invoke = self._cancelling_invoker()
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         reloaded = store.load_lifecycle(lifecycle.run_id)
         assert reloaded is not None
@@ -1839,15 +1920,16 @@ class TestIterationAwareInterrupt:
         # the interruption path, so calling it twice on the same lifecycle
         # is the unit-level test of the idempotency contract.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-interrupt-idemp")
         invoke = self._cancelling_invoker()
 
         with pytest.raises(asyncio.CancelledError):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         # Capture state after first finalization.
-        first_events = store.list_events(lifecycle.run_id)
+        first_events = sink.events(lifecycle.run_id)
         first_attempts = store.list_attempts(lifecycle.run_id)
         first_version = store.load_lifecycle(lifecycle.run_id).version  # type: ignore[union-attr]
         first_interrupted_count = sum(
@@ -1861,12 +1943,17 @@ class TestIterationAwareInterrupt:
         assert reloaded is not None
         _handle_interrupt(
             store=store,
+            telemetry=_RunTelemetry(
+                sink,
+                run_id=lifecycle.run_id,
+                clock=lambda: datetime.now(timezone.utc),
+            ),
             lifecycle=reloaded,
             attempt=None,
             clock=lambda: datetime.now(timezone.utc),
         )
 
-        second_events = store.list_events(lifecycle.run_id)
+        second_events = sink.events(lifecycle.run_id)
         second_attempts = store.list_attempts(lifecycle.run_id)
         second_version = store.load_lifecycle(lifecycle.run_id).version  # type: ignore[union-attr]
         second_interrupted_count = sum(
@@ -1887,6 +1974,7 @@ class TestIterationAwareInterrupt:
         # validating -- command graders are synchronous, so cancellation
         # cannot land between _transition(VALIDATING) and the judge call.
         store = InMemoryStore()
+        sink = _ListSink()
 
         async def _cancelling_judge(
             prompt: str, grader: RubricGrader, worktree: Any
@@ -1918,6 +2006,7 @@ class TestIterationAwareInterrupt:
                     task,
                     lifecycle,
                     store,
+                    sink=sink,
                     config=HarnessConfig(
                         worktree=str(tmp_path),
                         rubric_judge_invoke=_cancelling_judge,
@@ -1933,7 +2022,7 @@ class TestIterationAwareInterrupt:
         assert attempt.outcome == Outcome.INTERNAL_ERROR
         interrupted_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.interrupted"
         ]
         assert len(interrupted_events) == 1
@@ -1972,8 +2061,9 @@ class TestFinalizeStranded:
 
     def test_finalize_running_transitions_to_interrupted(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         lc = self._seed_running(store, "run-strand-r")
-        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        ok = finalize_stranded_lifecycle(store, lc.run_id, sink=sink)
         assert ok is True
         reloaded = store.load_lifecycle(lc.run_id)
         assert reloaded is not None
@@ -1982,7 +2072,7 @@ class TestFinalizeStranded:
         assert attempts[0].ended_at is not None
         assert attempts[0].outcome == Outcome.INTERNAL_ERROR
         crash = [
-            e for e in store.list_events(lc.run_id)
+            e for e in sink.events(lc.run_id)
             if e.kind == "harness.crash"
         ]
         assert len(crash) == 1
@@ -1991,8 +2081,9 @@ class TestFinalizeStranded:
 
     def test_finalize_validating_transitions_to_interrupted(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         lc = self._seed_validating(store, "run-strand-v")
-        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        ok = finalize_stranded_lifecycle(store, lc.run_id, sink=sink)
         assert ok is True
         reloaded = store.load_lifecycle(lc.run_id)
         assert reloaded is not None
@@ -2000,6 +2091,7 @@ class TestFinalizeStranded:
 
     def test_finalize_done_lifecycle_is_noop(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         now = datetime.now(timezone.utc)
         lc = Lifecycle(task_id="t", run_id="run-strand-done")
         lc.transition_to(Status.READY, now=now)
@@ -2007,7 +2099,7 @@ class TestFinalizeStranded:
         lc.transition_to(Status.VALIDATING, now=now)
         lc.transition_to(Status.DONE, now=now)
         store.create_lifecycle(lc)
-        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        ok = finalize_stranded_lifecycle(store, lc.run_id, sink=sink)
         assert ok is False
         reloaded = store.load_lifecycle(lc.run_id)
         assert reloaded is not None
@@ -2015,6 +2107,7 @@ class TestFinalizeStranded:
 
     def test_finalize_missing_lifecycle_is_noop(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         ok = finalize_stranded_lifecycle(store, "run-does-not-exist")
         assert ok is False
 
@@ -2026,6 +2119,7 @@ class TestFinalizeStranded:
         already-finalized attempt untouched so a manual gate survives
         worker restart (FR-9)."""
         store = InMemoryStore()
+        sink = _ListSink()
         now = datetime.now(timezone.utc)
         lc = Lifecycle(task_id="t", run_id="run-strand-awaiting")
         lc.transition_to(Status.READY, now=now)
@@ -2052,7 +2146,7 @@ class TestFinalizeStranded:
             ),
         )
 
-        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        ok = finalize_stranded_lifecycle(store, lc.run_id, sink=sink)
         assert ok is False
 
         reloaded = store.load_lifecycle(lc.run_id)
@@ -2070,7 +2164,7 @@ class TestFinalizeStranded:
         # No crash event was emitted — the no-op returns before any
         # _emit / _transition / _finalize_attempt call.
         crash = [
-            e for e in store.list_events(lc.run_id)
+            e for e in sink.events(lc.run_id)
             if e.kind == "harness.crash"
         ]
         assert crash == []
@@ -2104,6 +2198,7 @@ class TestEntryTimeCrash:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2116,7 +2211,7 @@ class TestEntryTimeCrash:
         invoke = self._raising_invoke(RuntimeError("transport blew up"))
 
         with pytest.raises(RuntimeError, match="transport blew up"):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         # Lifecycle row exists despite the crash -- the create-first
         # ordering is the whole point.
@@ -2131,7 +2226,7 @@ class TestEntryTimeCrash:
         # classification.
         crash_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.crash"
         ]
         assert len(crash_events) == 1
@@ -2146,6 +2241,7 @@ class TestEntryTimeCrash:
         """attempt_started fired, then invoke raises -- exactly one
         harness.crash event must land, never two."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2158,9 +2254,9 @@ class TestEntryTimeCrash:
         invoke = self._raising_invoke(ValueError("boom"))
 
         with pytest.raises(ValueError, match="boom"):
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         kinds = [e.kind for e in events]
         # attempt_started must have fired before the crash (proves the
         # crash happened mid-attempt, not before any harness work).
@@ -2176,6 +2272,7 @@ class TestEntryTimeCrash:
         persisted must reconcile to the persisted state, run normally,
         and produce no harness.crash event."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2199,7 +2296,7 @@ class TestEntryTimeCrash:
                 )
             ]
         )
-        _run(run_task(task, lifecycle, store, invoke=invoke_first))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke_first))
         assert lifecycle.status == Status.INTERRUPTED
         persisted = store.load_lifecycle(lifecycle.run_id)
         assert persisted is not None
@@ -2220,7 +2317,7 @@ class TestEntryTimeCrash:
             ]
         )
         outcome = _run(
-            run_task(task, stale, store, invoke=invoke_second)
+            run_task(task, stale, store, sink=sink, invoke=invoke_second)
         )
 
         # Reconciliation: the stale Lifecycle's status/version were
@@ -2230,7 +2327,7 @@ class TestEntryTimeCrash:
         # No harness.crash event from the resume path.
         crash_events = [
             e
-            for e in store.list_events(stale.run_id)
+            for e in sink.events(stale.run_id)
             if e.kind == "harness.crash"
         ]
         assert crash_events == []
@@ -2239,6 +2336,7 @@ class TestEntryTimeCrash:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2253,13 +2351,13 @@ class TestEntryTimeCrash:
 
         # The caller observes the original exception, not a wrapper.
         with pytest.raises(RuntimeError) as excinfo:
-            _run(run_task(task, lifecycle, store, invoke=invoke))
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
         assert excinfo.value is sentinel
 
         # And the crash event landed before the propagation.
         crash_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.crash"
         ]
         assert len(crash_events) == 1
@@ -2268,42 +2366,53 @@ class TestEntryTimeCrash:
 # --- Audit-stream: SDK message persistence + strict-audit failure --------
 
 
-class _RaisingStore(InMemoryStore):
-    """In-memory store with selectively-raising audit write paths.
+class _RaisingSink:
+    """TelemetrySink that raises on every append (or only the first N).
 
-    Used by the strict-audit tests to assert the harness routes both
-    ``append_event`` failures and ``append_sdk_message`` failures through
-    the same ``harness.audit_write_failed`` / ``INTERNAL_ERROR``
-    finalization path. Callers configure which method raises by setting
-    the ``raise_on_append_event_kind`` / ``raise_on_append_sdk_message``
-    attributes; failures are emitted by the harness via the
-    best-effort secondary emit, which on this store SUCCEEDS by
-    design (so we can assert exactly one audit_write_failed event was
-    recorded).
+    Used by the telemetry-failure-semantics tests (spec 00025 FR-7): a
+    sink failure must never abort or finalize the attempt. With
+    ``fail_first`` set, only the first ``fail_first`` appends raise and
+    the sink recovers afterwards, capturing later records — that mode
+    exercises the best-effort marker line the harness drops into the
+    sink after the first failure.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, fail_first: int | None = None) -> None:
+        self.attempts = 0
+        self.fail_first = fail_first
+        self.records: list[TelemetryRecord] = []
+
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        self.attempts += 1
+        if self.fail_first is None or self.attempts <= self.fail_first:
+            raise RuntimeError("simulated sink append failure")
+        self.records.append(record)
+
+
+class _DomainRaisingStore(InMemoryStore):
+    """In-memory store whose ledger append raises on a chosen event kind.
+
+    Used to pin the strict half of the FR-7 split: a domain-event write
+    failure is a ledger failure and must keep aborting the run, unlike
+    telemetry loss.
+    """
+
+    def __init__(self, *, raise_on_kind: str) -> None:
         super().__init__()
-        self.raise_on_append_sdk_message: bool = False
-        self.raise_on_append_event_kind: str | None = None
+        self.raise_on_kind = raise_on_kind
 
-    def append_sdk_message(self, message):  # type: ignore[override]
-        if self.raise_on_append_sdk_message:
-            raise RuntimeError("simulated sdk persistence failure")
-        return super().append_sdk_message(message)
-
-    def append_event(self, event):  # type: ignore[override]
-        if (
-            self.raise_on_append_event_kind is not None
-            and event.kind == self.raise_on_append_event_kind
-        ):
-            raise RuntimeError("simulated event persistence failure")
-        return super().append_event(event)
+    def append_domain_event(self, event, *, expected_version):  # type: ignore[override]
+        if event.KIND.value == self.raise_on_kind:
+            raise RuntimeError("simulated ledger append failure")
+        return super().append_domain_event(
+            event, expected_version=expected_version
+        )
 
 
 class TestSdkMessagePersistence:
     def test_each_iteration_persists_its_message_batch(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2336,14 +2445,14 @@ class TestSdkMessagePersistence:
         config = HarnessConfig(max_iterations_per_attempt=2)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert outcome.lifecycle.status == Status.DONE
 
-        listed = store.list_sdk_messages(lifecycle.run_id)
+        listed = sink.messages(lifecycle.run_id)
         # All 4 messages across the two iterations, in input order.
         assert len(listed) == len(iter1_msgs) + len(iter2_msgs)
-        types = [m.message_type for m in listed]
+        types = [m.kind for m in listed]
         assert types == [
             "AssistantMessage",
             "AssistantMessage",
@@ -2358,6 +2467,7 @@ class TestSdkMessagePersistence:
 
     def test_zero_message_iteration_persists_empty_batch(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2376,22 +2486,28 @@ class TestSdkMessagePersistence:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
         # No SDK messages recorded but iteration_completed still fired.
-        assert store.list_sdk_messages(lifecycle.run_id) == []
+        assert sink.messages(lifecycle.run_id) == []
         completed = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.iteration_completed"
         ]
         assert len(completed) == 1
 
 
-class TestInterleavedAuditSequence:
-    def test_events_and_sdk_messages_share_one_monotonic_run_sequence(
+class TestTelemetryStreamOrdering:
+    def test_run_stream_interleaves_messages_telemetry_and_domain_mirrors(
         self,
     ) -> None:
+        """Spec 00025: sink emission order is the canonical observability
+        ordering — SDK messages land before their iteration's
+        ``harness.iteration_completed``, every ledger append is mirrored
+        as a ``domain.*`` line, and the store row count matches the
+        mirror count (row first, line second)."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2415,26 +2531,30 @@ class TestInterleavedAuditSequence:
             ]
         )
 
-        _run(run_task(task, lifecycle, store, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
-        sdk = store.list_sdk_messages(lifecycle.run_id)
-        all_seqs = [e.sequence for e in events] + [m.sequence for m in sdk]
-        assert all(s is not None for s in all_seqs)
-        # Strictly ascending and unique across both record types: the
-        # telemetry events and SDK messages share one per-run counter.
-        deduped = sorted(set(all_seqs))
-        assert deduped == sorted(all_seqs)
-        assert len(deduped) == len(all_seqs)
-        # The counter is also shared with state-bearing domain events
-        # (transitions, attempt start/finalize), which the audit stream
-        # does not surface — so the telemetry/SDK sequences are strictly
-        # ascending but not contiguous from 1.
-        domain = store.list_domain_events(lifecycle.run_id)
-        domain_seqs = [e.sequence for e in domain]
-        assert domain_seqs  # the run produced domain events
-        # No sequence value is shared between the two partitions.
-        assert set(domain_seqs).isdisjoint(set(all_seqs))
+        kinds = [r.kind for r in sink.records]
+        # Per-message cadence: every streamed SDK message precedes the
+        # iteration_completed record of its iteration.
+        completed_idx = kinds.index("harness.iteration_completed")
+        message_indices = [
+            i
+            for i, r in enumerate(sink.records)
+            if r.kind in ("AssistantMessage", "ResultMessage")
+        ]
+        assert len(message_indices) == len(messages)
+        assert all(i < completed_idx for i in message_indices)
+        # Every ledger append is mirrored as a domain.* line, store row
+        # first: counts agree and the mirrored kinds match the rows.
+        domain_rows = store.list_domain_events(lifecycle.run_id)
+        mirrors = sink.domain_mirrors(lifecycle.run_id)
+        assert [m.kind for m in mirrors] == [
+            f"domain.{e.KIND.value}" for e in domain_rows
+        ]
+        # The store holds no telemetry: the legacy events table sees no
+        # writes from the harness anymore.
+        assert store.list_events(lifecycle.run_id) == []
+        assert store.list_sdk_messages(lifecycle.run_id) == []
 
     def test_harness_domain_log_replays_to_the_stored_lifecycle(
         self,
@@ -2450,6 +2570,7 @@ class TestInterleavedAuditSequence:
         oracle compares lifecycles with aggregates normalized to their
         defaults."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2468,7 +2589,7 @@ class TestInterleavedAuditSequence:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
         assert outcome.lifecycle.status is Status.DONE
 
         loaded = store.load_lifecycle("run-oracle")
@@ -2480,13 +2601,11 @@ class TestInterleavedAuditSequence:
         assert loaded.version == len(store.list_domain_events("run-oracle"))
 
 
-class TestStrictAuditFailure:
-    def test_append_sdk_message_failure_finalizes_attempt_as_internal_error(
-        self,
-    ) -> None:
-        store = _RaisingStore()
-        store.raise_on_append_sdk_message = True
-        task = Task(
+class TestTelemetryFailureSemantics:
+    """Spec 00025 FR-7: telemetry loss is non-fatal; ledger loss stays fatal."""
+
+    def _task(self) -> Task:
+        return Task(
             goal="g",
             graders=[
                 CommandGrader(
@@ -2494,95 +2613,102 @@ class TestStrictAuditFailure:
                 )
             ],
         )
-        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-sdk-fail")
-        invoke = _scripted_invoker(
-            [
-                _iteration(
-                    envelope=ValidEnvelope(intent=Intent.VERIFY),
-                    messages=(_assistant(),),
-                )
-            ]
-        )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
-
-        # Retries default to 0, so lifecycle ends in FAILED with the
-        # audit error propagated through the retry policy.
-        assert outcome.lifecycle.status == Status.FAILED
-        assert "audit write failed" in outcome.lifecycle.error
-        # Attempt was finalized as INTERNAL_ERROR per spec.
-        attempt = outcome.attempts[0]
-        assert attempt.outcome == Outcome.INTERNAL_ERROR
-        assert "audit write failed" in attempt.error
-        # Exactly one harness.audit_write_failed event was emitted, with
-        # the failing_method correctly identifying the broken write path.
-        audit_failures = [
-            e
-            for e in store.list_events(lifecycle.run_id)
-            if e.kind == "harness.audit_write_failed"
-        ]
-        assert len(audit_failures) == 1
-        payload = audit_failures[0].payload
-        assert payload["failing_method"] == "append_sdk_message"
-        assert payload["error_type"] == "RuntimeError"
-        assert "simulated sdk persistence failure" in payload["message"]
-        # iteration_number is known at the failure site.
-        assert payload["attempt_number"] == 1
-        assert payload["iteration_number"] == 1
-        # Command grader did NOT run — validation never started.
-        assert store.list_grader_results(lifecycle.run_id, 1) == []
-
-    def test_append_event_failure_finalizes_attempt_as_internal_error(
-        self,
+    def test_sink_failure_never_aborts_the_run(
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        store = _RaisingStore()
-        # Fail on the iteration_completed emit so we are clearly past
-        # save_sdk_messages and inside the same iteration's events.
-        store.raise_on_append_event_kind = "harness.iteration_completed"
-        task = Task(
-            goal="g",
-            graders=[
-                CommandGrader(
-                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
-                )
-            ],
-        )
-        lifecycle = Lifecycle(task_id="t1", run_id="run-audit-evt-fail")
-        invoke = _scripted_invoker(
-            [
-                _iteration(
-                    envelope=ValidEnvelope(intent=Intent.VERIFY),
-                    messages=(_assistant(),),
-                )
-            ]
-        )
-
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
-
-        assert outcome.lifecycle.status == Status.FAILED
-        attempt = outcome.attempts[0]
-        assert attempt.outcome == Outcome.INTERNAL_ERROR
-        assert "audit write failed" in attempt.error
-        audit_failures = [
-            e
-            for e in store.list_events(lifecycle.run_id)
-            if e.kind == "harness.audit_write_failed"
-        ]
-        assert len(audit_failures) == 1
-        payload = audit_failures[0].payload
-        assert payload["failing_method"] == "append_event"
-        assert payload["error_type"] == "RuntimeError"
-        # The save_sdk_messages call succeeded before the append_event
-        # failure, so the iteration's SDK messages should already be in
-        # the audit trail.
-        assert len(store.list_sdk_messages(lifecycle.run_id)) == 1
-
-
-class TestFinalizeStrandedReceivesSequenceNumbers:
-    def test_finalize_stranded_emits_events_with_assigned_sequences(
-        self,
-    ) -> None:
+        """A sink that raises on every append yields a completed DONE run
+        with correct lifecycle state; the first failure is recorded once
+        on stderr and subsequent failures are silent."""
         store = InMemoryStore()
+        sink = _RaisingSink()
+        task = self._task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sink-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
+
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.attempts[0].outcome == Outcome.SUCCEEDED
+        # The sink was attempted repeatedly (messages, telemetry,
+        # mirrors) but the failure was reported exactly once.
+        assert sink.attempts > 1
+        err = capsys.readouterr().err
+        assert err.count("telemetry sink append failed") == 1
+        assert "run-sink-fail" in err
+        # Grader receipts (ledger) are unaffected.
+        assert len(store.list_grader_results(lifecycle.run_id, 1)) == 1
+
+    def test_first_failure_drops_marker_line_when_sink_recovers(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """After the first failed append the harness attempts a marker
+        line in the sink itself; a sink that recovers carries it."""
+        store = InMemoryStore()
+        sink = _RaisingSink(fail_first=1)
+        task = self._task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-sink-marker")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
+
+        assert outcome.lifecycle.status == Status.DONE
+        marker = [
+            r
+            for r in sink.records
+            if r.kind == "harness.telemetry_sink_failed"
+        ]
+        assert len(marker) == 1
+        assert marker[0].payload["error_type"] == "RuntimeError"
+        assert capsys.readouterr().err.count(
+            "telemetry sink append failed"
+        ) == 1
+
+    def test_domain_append_failure_stays_fatal(self) -> None:
+        """The strict half of the split: a ledger write failure aborts
+        the run — the simulated store error propagates to the caller
+        rather than being swallowed like telemetry loss."""
+        store = _DomainRaisingStore(raise_on_kind="attempt_finalized")
+        sink = _ListSink()
+        task = self._task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-ledger-fail")
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(),),
+                )
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="simulated ledger append"):
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
+
+
+class TestFinalizeStrandedTelemetryOrdering:
+    def test_finalize_stranded_streams_events_in_emission_order(
+        self,
+    ) -> None:
+        """Sink emission order is the canonical observability ordering:
+        the stranded finalize streams attempt_finalized before crash,
+        and the ledger appends it makes are mirrored as domain.* lines
+        in the same stream."""
+        store = InMemoryStore()
+        sink = _ListSink()
         now = datetime.now(timezone.utc)
         lc = Lifecycle(task_id="t", run_id="run-strand-seq")
         lc.transition_to(Status.READY, now=now)
@@ -2593,18 +2719,16 @@ class TestFinalizeStrandedReceivesSequenceNumbers:
             Attempt(number=1, started_at=now, run_id=lc.run_id),
         )
 
-        ok = finalize_stranded_lifecycle(store, lc.run_id)
+        ok = finalize_stranded_lifecycle(store, lc.run_id, sink=sink)
         assert ok is True
 
-        # Every event the stranded-finalize emitted carries a
-        # per-run monotonic sequence assigned by the store.
-        events = store.list_events(lc.run_id)
-        assert len(events) >= 1
-        seqs = [e.sequence for e in events]
-        assert all(s is not None for s in seqs)
-        assert seqs == sorted(seqs)
-        # No collisions.
-        assert len(set(seqs)) == len(seqs)
+        kinds = [e.kind for e in sink.events(lc.run_id)]
+        assert kinds == ["harness.attempt_finalized", "harness.crash"]
+        mirror_kinds = [m.kind for m in sink.domain_mirrors(lc.run_id)]
+        assert mirror_kinds == [
+            "domain.attempt_finalized",
+            "domain.transitioned_to",
+        ]
 
 
 # --- TODO subsystems remain deferred --------------------------------------
@@ -2678,6 +2802,7 @@ class TestRubricIntegration:
 
     def test_all_pass_rubric_reaches_done(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2703,7 +2828,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -2716,6 +2841,7 @@ class TestRubricIntegration:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2751,7 +2877,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -2764,6 +2890,7 @@ class TestRubricIntegration:
 
     def test_rubric_fail_with_retry_on_fail_false_interrupts(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2792,7 +2919,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.INTERRUPTED
@@ -2802,6 +2929,7 @@ class TestRubricIntegration:
 
     def test_rubric_fail_with_retries_exhausted_reaches_failed(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2837,7 +2965,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -2847,6 +2975,7 @@ class TestRubricIntegration:
 
     def test_command_fail_short_circuits_before_rubric(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2875,14 +3004,14 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
         assert judge.calls == []
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.rubric_invoked"
         ]
         assert events == []
@@ -2891,6 +3020,7 @@ class TestRubricIntegration:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2919,9 +3049,9 @@ class TestRubricIntegration:
             rubric_judge_invoke=judge,
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         invoked = [e for e in events if e.kind == "harness.rubric_invoked"]
         assert len(invoked) == 1
         assert invoked[0].payload["grader_name"] == "semantics"
@@ -2938,6 +3068,7 @@ class TestRubricIntegration:
 
     def test_judge_crash_routes_to_internal_error(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -2965,7 +3096,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # With max_retries=0, INTERNAL_ERROR exhausts immediately -> FAILED.
@@ -2976,7 +3107,7 @@ class TestRubricIntegration:
         assert "rcrash" in attempt.error
         crash_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.crash"
         ]
         assert len(crash_events) == 1
@@ -2989,6 +3120,7 @@ class TestRubricIntegration:
 
     def test_judge_crash_repeated_retries_exhaust_to_failed(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3026,7 +3158,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.FAILED
@@ -3037,6 +3169,7 @@ class TestRubricIntegration:
 
     def test_unknown_verdict_reaches_done_and_emits_warning(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3067,13 +3200,13 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
         unknown_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.rubric_unknown"
         ]
         assert len(unknown_events) == 1
@@ -3084,6 +3217,7 @@ class TestRubricIntegration:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3122,7 +3256,7 @@ class TestRubricIntegration:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -3148,6 +3282,7 @@ class TestManualGateEntry:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3177,7 +3312,7 @@ class TestManualGateEntry:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Lifecycle parks at AWAITING_APPROVAL pinned to the manual gate.
@@ -3196,7 +3331,7 @@ class TestManualGateEntry:
         # instruction plus the documented context pointers.
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert len(events) == 1
@@ -3228,6 +3363,7 @@ class TestManualGateEntry:
 
     def test_all_pass_with_no_manual_gate_still_reaches_done(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3253,7 +3389,7 @@ class TestManualGateEntry:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Byte-identical to today's all-pass-no-manual path: DONE with no
@@ -3264,7 +3400,7 @@ class TestManualGateEntry:
 
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert events == []
@@ -3274,6 +3410,7 @@ class TestManualGateEntry:
 
     def test_rubric_failure_never_enters_manual_gate(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3305,7 +3442,7 @@ class TestManualGateEntry:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Rubric failure with retry_on_fail=False routes to INTERRUPTED
@@ -3314,13 +3451,14 @@ class TestManualGateEntry:
         assert outcome.lifecycle.awaiting_manual_ordinal is None
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert events == []
 
     def test_command_failure_never_enters_manual_gate(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3346,7 +3484,7 @@ class TestManualGateEntry:
         config = HarnessConfig(worktree=self._wt)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Command grader failure exhausts retries and reaches FAILED
@@ -3355,13 +3493,14 @@ class TestManualGateEntry:
         assert outcome.lifecycle.awaiting_manual_ordinal is None
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert events == []
 
     def test_transcript_failure_never_enters_manual_gate(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3388,7 +3527,7 @@ class TestManualGateEntry:
         config = HarnessConfig(worktree=self._wt, max_retries=0)
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Transcript breach drives FAILED_VALIDATION -> FAILED with no
@@ -3397,7 +3536,7 @@ class TestManualGateEntry:
         assert outcome.lifecycle.awaiting_manual_ordinal is None
         events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert events == []
@@ -3420,7 +3559,7 @@ class TestResolveManualApproval:
         run_id: str = "run-resolver",
         gate_name: str = "confirm-migration",
         gate_instruction: str = "Confirm the migration is safe.",
-    ) -> tuple[InMemoryStore, Task, Lifecycle]:
+    ) -> tuple[InMemoryStore, _ListSink, Task, Lifecycle]:
         """Drive a one-iteration task with command + rubric + one manual
         gate to its parked ``AWAITING_APPROVAL`` state.
 
@@ -3430,6 +3569,7 @@ class TestResolveManualApproval:
         ``harness.awaiting_approval`` event has been emitted.
         """
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3459,10 +3599,10 @@ class TestResolveManualApproval:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert outcome.lifecycle.status == Status.AWAITING_APPROVAL
-        return store, task, outcome.lifecycle
+        return store, sink, task, outcome.lifecycle
 
     def _park_two_gates(
         self,
@@ -3470,10 +3610,11 @@ class TestResolveManualApproval:
         run_id: str = "run-resolver-multi",
         first_name: str = "review-migration",
         second_name: str = "review-rollout",
-    ) -> tuple[InMemoryStore, Task, Lifecycle]:
+    ) -> tuple[InMemoryStore, _ListSink, Task, Lifecycle]:
         """Drive a one-iteration task with two manual gates to its
         first-gate ``AWAITING_APPROVAL`` park."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -3507,11 +3648,11 @@ class TestResolveManualApproval:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert outcome.lifecycle.status == Status.AWAITING_APPROVAL
         assert outcome.lifecycle.awaiting_manual_ordinal == 2
-        return store, task, outcome.lifecycle
+        return store, sink, task, outcome.lifecycle
 
     # --- FR-5: approve ---------------------------------------------------
 
@@ -3521,7 +3662,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_APPROVE
 
-        store, task, lifecycle = self._park_single_gate()
+        store, sink, task, lifecycle = self._park_single_gate()
         # Snapshot the attempt outcome the gate-entry path finalized so
         # the resolver's no-second-finalize claim can be asserted.
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3534,7 +3675,7 @@ class TestResolveManualApproval:
             now=datetime.now(timezone.utc),
         )
 
-        result = resolve_manual_approval(lifecycle, store, task)
+        result = resolve_manual_approval(lifecycle, store, task, sink=sink)
 
         # The resolver applied the approve and promoted to DONE.
         assert result.applied is True
@@ -3567,7 +3708,7 @@ class TestResolveManualApproval:
         assert reloaded[0].outcome == Outcome.SUCCEEDED
         assert reloaded[0].ended_at == attempt.ended_at
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         finalized_events = [
             e for e in events if e.kind == "harness.attempt_finalized"
         ]
@@ -3595,7 +3736,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_APPROVE
 
-        store, task, lifecycle = self._park_two_gates()
+        store, sink, task, lifecycle = self._park_two_gates()
         attempt = store.list_attempts(lifecycle.run_id)[-1]
 
         # First approve: applies to gate A (ordinal 2), re-parks on B
@@ -3606,7 +3747,7 @@ class TestResolveManualApproval:
             {},
             now=datetime.now(timezone.utc),
         )
-        first = resolve_manual_approval(lifecycle, store, task)
+        first = resolve_manual_approval(lifecycle, store, task, sink=sink)
         assert first.applied is True
         assert first.reason == "approved_next_gate"
         assert lifecycle.status == Status.AWAITING_APPROVAL
@@ -3627,7 +3768,7 @@ class TestResolveManualApproval:
         # operators learn the next decision is owed.
         awaiting_events = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.awaiting_approval"
         ]
         assert len(awaiting_events) == 2  # initial + re-park
@@ -3641,7 +3782,7 @@ class TestResolveManualApproval:
             {},
             now=datetime.now(timezone.utc),
         )
-        second = resolve_manual_approval(lifecycle, store, task)
+        second = resolve_manual_approval(lifecycle, store, task, sink=sink)
         assert second.applied is True
         assert second.reason == "approved_done"
         assert lifecycle.status == Status.DONE
@@ -3670,12 +3811,12 @@ class TestResolveManualApproval:
     def test_resolver_noop_when_no_pending_command_keeps_park(self) -> None:
         from flywheel_core import resolve_manual_approval
 
-        store, task, lifecycle = self._park_single_gate(
+        store, sink, task, lifecycle = self._park_single_gate(
             run_id="run-resolver-idle"
         )
         before = lifecycle.version
 
-        result = resolve_manual_approval(lifecycle, store, task)
+        result = resolve_manual_approval(lifecycle, store, task, sink=sink)
 
         assert result.applied is False
         assert result.reason == "no_pending_command"
@@ -3695,7 +3836,7 @@ class TestResolveManualApproval:
         assert manual_rows == []
         approved = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.manual_approved"
         ]
         assert approved == []
@@ -3706,6 +3847,7 @@ class TestResolveManualApproval:
         # Drive an automated-pass-no-manual lifecycle straight to DONE
         # so the resolver sees a non-AWAITING_APPROVAL status.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[_ok_command(), RubricGrader(assertions=["a"], name="r")],
@@ -3724,7 +3866,7 @@ class TestResolveManualApproval:
         )
         config = HarnessConfig(worktree=self._wt, rubric_judge_invoke=judge)
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert outcome.lifecycle.status == Status.DONE
 
@@ -3738,7 +3880,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
-        store, task, lifecycle = self._park_single_gate(
+        store, sink, task, lifecycle = self._park_single_gate(
             run_id="run-reject-retry"
         )
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3756,7 +3898,7 @@ class TestResolveManualApproval:
         )
 
         result = resolve_manual_approval(
-            lifecycle, store, task, max_retries=1
+            lifecycle, store, task, max_retries=1, sink=sink
         )
 
         # The reject lands FAILED_VALIDATION -> READY (the retry arm
@@ -3797,7 +3939,7 @@ class TestResolveManualApproval:
         # harness.manual_rejected carries the documented payload shape;
         # harness.retry_scheduled witnesses the budget consumption;
         # harness.control_command_applied attributes the operator action.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         rejected = [e for e in events if e.kind == "harness.manual_rejected"]
         assert len(rejected) == 1
         assert rejected[0].payload == {
@@ -3819,7 +3961,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
-        store, task, lifecycle = self._park_single_gate(
+        store, sink, task, lifecycle = self._park_single_gate(
             run_id="run-reject-fail"
         )
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3833,7 +3975,7 @@ class TestResolveManualApproval:
 
         # max_retries=0 -> retries exhausted on the first reject.
         result = resolve_manual_approval(
-            lifecycle, store, task, max_retries=0
+            lifecycle, store, task, max_retries=0, sink=sink
         )
 
         assert result.applied is True
@@ -3848,7 +3990,7 @@ class TestResolveManualApproval:
         )
 
         # No retry_scheduled audit event when retries are exhausted.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         retry_events = [
             e for e in events if e.kind == "harness.retry_scheduled"
         ]
@@ -3874,7 +4016,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
-        store, task, lifecycle = self._park_two_gates(
+        store, sink, task, lifecycle = self._park_two_gates(
             run_id="run-reject-short-circuit"
         )
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3890,7 +4032,7 @@ class TestResolveManualApproval:
         # Retries exhausted so the resolver terminates on the first
         # reject; the second gate (ordinal 3) is never evaluated.
         result = resolve_manual_approval(
-            lifecycle, store, task, max_retries=0
+            lifecycle, store, task, max_retries=0, sink=sink
         )
 
         assert result.applied is True
@@ -3921,7 +4063,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
-        store, task, lifecycle = self._park_single_gate(
+        store, sink, task, lifecycle = self._park_single_gate(
             run_id="run-reject-no-feedback"
         )
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3936,7 +4078,7 @@ class TestResolveManualApproval:
         )
 
         result = resolve_manual_approval(
-            lifecycle, store, task, max_retries=0
+            lifecycle, store, task, max_retries=0, sink=sink
         )
         assert result.applied is True
         assert result.reason == "rejected_failed"
@@ -3953,7 +4095,7 @@ class TestResolveManualApproval:
         assert manual_rows[0].payload["summary"] == "(no feedback provided)"
         rejected = [
             e
-            for e in store.list_events(lifecycle.run_id)
+            for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.manual_rejected"
         ]
         assert len(rejected) == 1
@@ -3963,7 +4105,7 @@ class TestResolveManualApproval:
         from flywheel_core import resolve_manual_approval
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
-        store, task, lifecycle = self._park_single_gate(
+        store, sink, task, lifecycle = self._park_single_gate(
             run_id="run-reject-empty-feedback"
         )
         attempt = store.list_attempts(lifecycle.run_id)[-1]
@@ -3978,7 +4120,7 @@ class TestResolveManualApproval:
         )
 
         result = resolve_manual_approval(
-            lifecycle, store, task, max_retries=0
+            lifecycle, store, task, max_retries=0, sink=sink
         )
         assert result.applied is True
 
@@ -4015,6 +4157,8 @@ class TestResolveManualApproval:
         from flywheel_core.invoker_client import CONTROL_COMMAND_REJECT
 
         store = InMemoryStore()
+
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4055,7 +4199,7 @@ class TestResolveManualApproval:
 
         # --- attempt #1: drive to AWAITING_APPROVAL --------------------
         first_outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
         assert first_outcome.lifecycle.status == Status.AWAITING_APPROVAL
         assert first_outcome.attempts[-1].outcome == Outcome.SUCCEEDED
@@ -4085,7 +4229,7 @@ class TestResolveManualApproval:
 
         # --- attempt #2: re-enter run_task, capture the prompt ---------
         second_outcome = _run(
-            run_task(task, live, store, config=config, invoke=invoke)
+            run_task(task, live, store, sink=sink, config=config, invoke=invoke)
         )
 
         # The second attempt ran and (with the manual gate still
@@ -4172,6 +4316,7 @@ class TestHarnessConfigDefaults:
 class TestTaskPersistence:
     def test_run_persists_task_and_pins_content_hash(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(id="persist-me", goal="g", graders=[])
         lifecycle = Lifecycle(task_id="persist-me", run_id="run-persist")
         invoke = _scripted_invoker(
@@ -4187,7 +4332,7 @@ class TestTaskPersistence:
             ]
         )
 
-        outcome = _run(run_task(task, lifecycle, store, invoke=invoke))
+        outcome = _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
 
         # Graderless run reaches DONE on the agent's own claim.
         assert outcome.lifecycle.status == Status.DONE
@@ -4241,6 +4386,7 @@ class TestLoopGuardStuck:
 
     def test_three_consecutive_failing_calls_route_to_interrupted(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4274,7 +4420,7 @@ class TestLoopGuardStuck:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Lifecycle paused in INTERRUPTED with the retry budget unspent
@@ -4290,7 +4436,7 @@ class TestLoopGuardStuck:
         assert store.list_grader_results(lifecycle.run_id, 1) == []
         # Exactly one harness.stuck event naming the tool and the digest.
         stuck_events = [
-            e for e in store.list_events(lifecycle.run_id)
+            e for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.stuck"
         ]
         assert len(stuck_events) == 1
@@ -4315,6 +4461,7 @@ class TestLoopGuardStuck:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4348,7 +4495,7 @@ class TestLoopGuardStuck:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.INTERRUPTED
@@ -4365,6 +4512,7 @@ class TestLoopGuardStuck:
 
     def test_stuck_trips_on_final_iteration_and_preempts_cap(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4406,13 +4554,13 @@ class TestLoopGuardStuck:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Cap-reached would route to FAILED_VALIDATION; STUCK preempts it.
         assert outcome.lifecycle.status == Status.INTERRUPTED
         assert outcome.attempts[0].outcome == Outcome.CANCELLED
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.stuck" in kinds
         # No protocol-failure / continue-past-cap routing.
         assert "harness.protocol_failure" not in kinds
@@ -4423,6 +4571,7 @@ class TestLoopGuardThrash:
 
     def test_thrash_routes_to_ready_when_retries_remain(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4463,7 +4612,7 @@ class TestLoopGuardThrash:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Second attempt's VERIFY result + passing command grader -> DONE.
@@ -4473,12 +4622,12 @@ class TestLoopGuardThrash:
         # First attempt was the thrash trip.
         first = outcome.attempts[0]
         assert first.outcome == Outcome.AGENT_ERROR
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.thrash_detected" in kinds
         assert "harness.retry_scheduled" in kinds
         # Exactly one thrash event with the tool name + digest in payload.
         thrash_events = [
-            e for e in store.list_events(lifecycle.run_id)
+            e for e in sink.events(lifecycle.run_id)
             if e.kind == "harness.thrash_detected"
         ]
         assert len(thrash_events) == 1
@@ -4488,6 +4637,7 @@ class TestLoopGuardThrash:
 
     def test_thrash_routes_to_failed_when_no_retries_remain(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4519,14 +4669,14 @@ class TestLoopGuardThrash:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # No retries budget -> terminal FAILED via the standard retry arm.
         assert outcome.lifecycle.status == Status.FAILED
         attempt = outcome.attempts[0]
         assert attempt.outcome == Outcome.AGENT_ERROR
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.thrash_detected" in kinds
         assert "harness.retry_scheduled" not in kinds
 
@@ -4538,6 +4688,7 @@ class TestLoopGuardPrecedence:
         self,
     ) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4571,12 +4722,12 @@ class TestLoopGuardPrecedence:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.INTERRUPTED
         assert outcome.attempts[0].outcome == Outcome.CANCELLED
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.stuck" in kinds
         # THRASH never emits when STUCK wins on the same observation.
         assert "harness.thrash_detected" not in kinds
@@ -4587,6 +4738,7 @@ class TestLoopGuardDisabled:
 
     def test_thrashing_stream_runs_to_cap_when_detectors_disabled(self) -> None:
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4621,7 +4773,7 @@ class TestLoopGuardDisabled:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # No safety-net detection means the iteration's CONTINUE intent
@@ -4629,7 +4781,7 @@ class TestLoopGuardDisabled:
         assert outcome.lifecycle.status == Status.FAILED
         attempt = outcome.attempts[0]
         assert attempt.outcome == Outcome.AGENT_ERROR
-        kinds = [e.kind for e in store.list_events(lifecycle.run_id)]
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
         assert "harness.stuck" not in kinds
         assert "harness.thrash_detected" not in kinds
 
@@ -4637,11 +4789,10 @@ class TestLoopGuardDisabled:
 class TestLoopGuardAuditStream:
     """FR-7: harness.stuck / harness.thrash_detected round-trip via audit."""
 
-    def test_stuck_event_round_trips_through_audit_stream(self) -> None:
-        from flywheel_core.audit import stream as audit_stream
-        from flywheel_core.store_protocols import EventRecord
-
+    def test_stuck_event_lands_in_telemetry_stream(self) -> None:
         store = InMemoryStore()
+
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4674,26 +4825,23 @@ class TestLoopGuardAuditStream:
             ),
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        # Reading via audit.stream returns the same event records ordered
-        # by the per-run monotonic sequence.
-        records = list(audit_stream("run-audit-stuck", store=store))
+        # The sink stream carries the stuck record in emission order
+        # (file write order is the canonical observability ordering).
         stuck = [
-            r for r in records
-            if isinstance(r, EventRecord) and r.kind == "harness.stuck"
+            r
+            for r in sink.events("run-audit-stuck")
+            if r.kind == "harness.stuck"
         ]
         assert len(stuck) == 1
-        seqs = [r.sequence for r in records if r.sequence is not None]
-        assert seqs == sorted(seqs)
         assert stuck[0].payload["tool_name"] == "Bash"
         assert len(stuck[0].payload["input_digest"]) == 64
 
-    def test_thrash_event_round_trips_through_audit_stream(self) -> None:
-        from flywheel_core.audit import stream as audit_stream
-        from flywheel_core.store_protocols import EventRecord
-
+    def test_thrash_event_lands_in_telemetry_stream(self) -> None:
         store = InMemoryStore()
+
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4724,16 +4872,14 @@ class TestLoopGuardAuditStream:
             ),
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        records = list(audit_stream("run-audit-thrash", store=store))
         thrash = [
-            r for r in records
-            if isinstance(r, EventRecord) and r.kind == "harness.thrash_detected"
+            r
+            for r in sink.events("run-audit-thrash")
+            if r.kind == "harness.thrash_detected"
         ]
         assert len(thrash) == 1
-        seqs = [r.sequence for r in records if r.sequence is not None]
-        assert seqs == sorted(seqs)
         assert thrash[0].payload["tool_name"] == "Bash"
         assert len(thrash[0].payload["input_digest"]) == 64
 
@@ -4807,6 +4953,7 @@ class TestHangWatchdog:
         # is emitted -- the watchdog cancel does NOT reach
         # _handle_interrupt.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-hang-stall")
         mclock, state = self._fake_mclock()
@@ -4848,6 +4995,7 @@ class TestHangWatchdog:
                     task,
                     lifecycle,
                     store,
+                    sink=sink,
                     config=config,
                     invoke=stalling_invoker,
                     monotonic=mclock,
@@ -4870,7 +5018,7 @@ class TestHangWatchdog:
         assert attempt.outcome == Outcome.INTERNAL_ERROR
         assert "hang watchdog" in attempt.error
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         hang_events = [
             e for e in events if e.kind == "harness.hang_detected"
         ]
@@ -4893,6 +5041,7 @@ class TestHangWatchdog:
         # whose mclock delta stays under hang_timeout each tick reaches
         # normal completion; the watchdog never trips.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -4947,6 +5096,7 @@ class TestHangWatchdog:
                 task,
                 lifecycle,
                 store,
+                sink=sink,
                 config=config,
                 invoke=heartbeating_invoker,
                 monotonic=mclock,
@@ -4954,7 +5104,7 @@ class TestHangWatchdog:
         )
 
         assert outcome.lifecycle.status == Status.DONE
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.hang_detected" for e in events)
         assert all(e.kind != "harness.interrupted" for e in events)
 
@@ -4963,6 +5113,7 @@ class TestHangWatchdog:
         # counts as liveness. A steady rate-limit stream must not trip
         # the watchdog even though no agent text is produced.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(
             goal="g",
             graders=[
@@ -5009,6 +5160,7 @@ class TestHangWatchdog:
                 task,
                 lifecycle,
                 store,
+                sink=sink,
                 config=config,
                 invoke=rate_limit_invoker,
                 monotonic=mclock,
@@ -5016,7 +5168,7 @@ class TestHangWatchdog:
         )
 
         assert outcome.lifecycle.status == Status.DONE
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         # Rate-limit-driven liveness must be visible: the
         # iteration_completed payload's rate_limited flag is True (the
         # observable that "rate-limit counted as a message" holds).
@@ -5036,6 +5188,7 @@ class TestHangWatchdog:
         # INTERRUPTED behavior with a harness.interrupted event -- and no
         # harness.hang_detected event because the watchdog never started.
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-cancel-watchdog-off"
@@ -5056,6 +5209,7 @@ class TestHangWatchdog:
                     task,
                     lifecycle,
                     store,
+                    sink=sink,
                     config=config,
                     invoke=cancelling_invoker,
                 )
@@ -5068,7 +5222,7 @@ class TestHangWatchdog:
         assert reloaded.status == Status.INTERRUPTED
         assert reloaded.retries == 0
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         interrupted = [
             e for e in events if e.kind == "harness.interrupted"
         ]
@@ -5076,14 +5230,12 @@ class TestHangWatchdog:
         # Watchdog never started, so no hang event surfaces.
         assert all(e.kind != "harness.hang_detected" for e in events)
 
-    def test_hang_detected_round_trips_through_audit_stream(self) -> None:
-        # FR-7 acceptance: harness.hang_detected persists through the
-        # store and reads back via flywheel_core.audit.stream under the per-run
-        # monotonic sequence.
-        from flywheel_core.audit import stream as audit_stream
-        from flywheel_core.store_protocols import EventRecord
-
+    def test_hang_detected_lands_in_telemetry_stream(self) -> None:
+        # FR-7 acceptance, retargeted by spec 00025: harness.hang_detected
+        # streams to the run's telemetry sink in emission order.
         store = InMemoryStore()
+
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-audit-hang")
         mclock, state = self._fake_mclock()
@@ -5119,6 +5271,7 @@ class TestHangWatchdog:
                     task,
                     lifecycle,
                     store,
+                    sink=sink,
                     config=config,
                     invoke=stalling_invoker,
                     monotonic=mclock,
@@ -5133,17 +5286,12 @@ class TestHangWatchdog:
 
         asyncio.run(main())
 
-        records = list(audit_stream("run-audit-hang", store=store))
         hang = [
             r
-            for r in records
-            if isinstance(r, EventRecord) and r.kind == "harness.hang_detected"
+            for r in sink.events("run-audit-hang")
+            if r.kind == "harness.hang_detected"
         ]
         assert len(hang) == 1
-        # Audit-stream invariant: records are ordered by the per-run
-        # monotonic sequence.
-        seqs = [r.sequence for r in records if r.sequence is not None]
-        assert seqs == sorted(seqs)
         assert hang[0].payload["iteration"] == 1
         assert hang[0].payload["hang_timeout_seconds"] == hang_timeout
 
@@ -5205,6 +5353,7 @@ class TestContextRecovery:
         finalizes RECOVERED and schedules a fresh attempt whose prompt
         carries the # Recovery handoff section."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-recover-happy")
         handoff = RecoveryHandoff(
@@ -5243,7 +5392,7 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
@@ -5255,7 +5404,7 @@ class TestContextRecovery:
         # Recovery does NOT consume max_retries.
         assert outcome.lifecycle.retries == 0
         # Exactly one harness.context_recovery event with the expected payload.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         recoveries = [
             e for e in events if e.kind == "harness.context_recovery"
         ]
@@ -5280,18 +5429,15 @@ class TestContextRecovery:
         )
         # FR-5 ordering: the context_recovery event precedes the
         # recovery attempt's attempt_started.
-        recovery_seq = recoveries[0].sequence
-        started_seqs = [
-            e.sequence
-            for e in events
+        recovery_idx = events.index(recoveries[0])
+        started_indices = [
+            i
+            for i, e in enumerate(events)
             if e.kind == "harness.attempt_started"
             and e.payload.get("number") == 2
         ]
-        assert started_seqs
-        assert recovery_seq is not None
-        first_started_seq = started_seqs[0]
-        assert first_started_seq is not None
-        assert recovery_seq < first_started_seq
+        assert started_indices
+        assert recovery_idx < started_indices[0]
         # FR-3: the recovery attempt's prompt carries the # Recovery
         # handoff section assembled from the summarizer's structured
         # output.
@@ -5308,6 +5454,7 @@ class TestContextRecovery:
     def test_below_ratio_does_not_recover(self, tmp_path: Path) -> None:
         """FR-1 acceptance: a below-ratio iteration does not recover."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-recover-below")
         invoke = _scripted_invoker(
@@ -5343,13 +5490,13 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
         assert len(outcome.attempts) == 1
         assert outcome.attempts[0].outcome == Outcome.SUCCEEDED
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         # Summarizer was never invoked.
         assert summarizer.calls == []  # type: ignore[attr-defined]
@@ -5357,6 +5504,7 @@ class TestContextRecovery:
     def test_disabled_when_capacity_none(self) -> None:
         """FR-2: capacity None disables recovery; massive usage does not fire."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-recover-disabled")
         invoke = _scripted_invoker(
@@ -5384,17 +5532,18 @@ class TestContextRecovery:
         assert config.context_window_tokens is None
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         assert outcome.lifecycle.status == Status.DONE
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
 
     def test_recovery_budget_caps_at_max(self, tmp_path: Path) -> None:
         """FR-4: with max_context_recoveries=1, a run whose every
         iteration is over-ratio recovers exactly once."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-recover-budget")
         handoff = RecoveryHandoff(
@@ -5441,7 +5590,7 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # The run terminates: attempt 1 RECOVERED, attempt 2 ran past
@@ -5452,7 +5601,7 @@ class TestContextRecovery:
         assert outcome.attempts[0].outcome == Outcome.RECOVERED
         assert outcome.attempts[1].outcome == Outcome.AGENT_ERROR
         # Exactly one recovery event.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         recoveries = [
             e for e in events if e.kind == "harness.context_recovery"
         ]
@@ -5472,6 +5621,7 @@ class TestContextRecovery:
         """FR-6: a LoopGuard STUCK verdict + over-ratio iteration halts
         with no recovery event."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-recover-precedence-stuck"
@@ -5517,13 +5667,13 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Loop-guard STUCK preempts recovery: lifecycle ends INTERRUPTED
         # and the recovery event never emits.
         assert outcome.lifecycle.status == Status.INTERRUPTED
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         assert summarizer.calls == []  # type: ignore[attr-defined]
 
@@ -5533,6 +5683,7 @@ class TestContextRecovery:
         """FR-6: a VERIFY iteration + over-ratio occupancy validates
         normally and does not recover."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-recover-precedence-verify"
@@ -5570,12 +5721,12 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Completion claim wins: graderless task reaches DONE.
         assert outcome.lifecycle.status == Status.DONE
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         assert summarizer.calls == []  # type: ignore[attr-defined]
 
@@ -5586,6 +5737,7 @@ class TestContextRecovery:
         iteration and routes through INTERNAL_ERROR. No recovery event
         is emitted; no empty handoff is silently restarted."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-recover-summ-fail")
         invoke = _scripted_invoker(
@@ -5612,7 +5764,7 @@ class TestContextRecovery:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # No recovery event; attempt finalized INTERNAL_ERROR; lifecycle
@@ -5620,7 +5772,7 @@ class TestContextRecovery:
         assert outcome.lifecycle.status == Status.FAILED
         assert len(outcome.attempts) == 1
         assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         crashes = [
             e
@@ -5678,6 +5830,7 @@ class TestMidTurnContextObserve:
         events in tier order, each carrying iteration / tier / occupancy
         / capacity / percentage / capacity_source."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-tiers")
         # Capacity 100, occupancy climbs 40 -> 60 -> 80 -> 95. The
@@ -5705,9 +5858,9 @@ class TestMidTurnContextObserve:
         )
         config = HarnessConfig(context_window_tokens=100)
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -5716,12 +5869,8 @@ class TestMidTurnContextObserve:
         iter_done = next(
             e for e in events if e.kind == "harness.iteration_completed"
         )
-        assert all(
-            (c.sequence is not None)
-            and (iter_done.sequence is not None)
-            and (c.sequence < iter_done.sequence)
-            for c in crossings
-        )
+        iter_done_idx = events.index(iter_done)
+        assert all(events.index(c) < iter_done_idx for c in crossings)
         # Payload shape: every required field present on every event.
         for c in crossings:
             assert c.payload["iteration"] == 1
@@ -5742,6 +5891,7 @@ class TestMidTurnContextObserve:
         """FR-2 off-by-default: with no capacity from either source, an
         oversize usage stream emits zero threshold events."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-disabled")
         invoke = _scripted_invoker(
@@ -5770,9 +5920,9 @@ class TestMidTurnContextObserve:
         config = HarnessConfig()
         assert config.context_window_tokens is None
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(
             e.kind != "harness.context_threshold_crossed" for e in events
         )
@@ -5785,6 +5935,7 @@ class TestMidTurnContextObserve:
         """FR-3: an oscillating estimate that re-crosses an already-emitted
         tier within the same iteration does not produce a duplicate event."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-recross")
         # Capacity 100. Estimate climbs to 60 (crosses 0.5), drops to 40
@@ -5812,9 +5963,9 @@ class TestMidTurnContextObserve:
         )
         config = HarnessConfig(context_window_tokens=100)
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -5826,6 +5977,7 @@ class TestMidTurnContextObserve:
         """FR-3: a single message that crosses 50 / 75 / 90 simultaneously
         emits all three events in tier order on that message."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-jump")
         invoke = _scripted_invoker(
@@ -5847,9 +5999,9 @@ class TestMidTurnContextObserve:
         )
         config = HarnessConfig(context_window_tokens=100)
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -5865,6 +6017,7 @@ class TestMidTurnContextObserve:
         """FR-3: the per-tier emitted set resets at each new iteration so
         a fresh iteration can re-emit tiers a prior iteration consumed."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-reset")
         # Two iterations under one attempt (max_iterations_per_attempt=2).
@@ -5905,9 +6058,9 @@ class TestMidTurnContextObserve:
             max_context_recoveries=0,
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -5929,6 +6082,7 @@ class TestMidTurnContextObserve:
         and the operator capacity, and the event records capacity_source
         ``sdk``."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-sdk-wins")
         # The streamed message reports tiny usage (would not cross 0.5
@@ -5971,9 +6125,9 @@ class TestMidTurnContextObserve:
         )
         config = HarnessConfig(context_window_tokens=1000)
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -5991,6 +6145,7 @@ class TestMidTurnContextObserve:
         """FR-1 hybrid capacity: with no operator knob set, a single SDK
         reading is sufficient to enable threshold observation."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-observe-sdk-only")
         reading: dict[str, Any] = {
@@ -6027,9 +6182,9 @@ class TestMidTurnContextObserve:
         # capacity.
         config = HarnessConfig()
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         crossings = [
             e for e in events if e.kind == "harness.context_threshold_crossed"
         ]
@@ -6107,6 +6262,7 @@ class TestMidTurnContextRecoveryAct:
         BEFORE the recovery attempt's ``AttemptStarted``, and the recovery
         attempt's prompt carries the ``# Recovery handoff`` section."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-happy")
         handoff = RecoveryHandoff(
@@ -6149,7 +6305,7 @@ class TestMidTurnContextRecoveryAct:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Attempt #1 finalized RECOVERED (mid-turn), attempt #2 is the
@@ -6161,7 +6317,7 @@ class TestMidTurnContextRecoveryAct:
         # Recovery does NOT consume max_retries (shared budget is its own).
         assert outcome.lifecycle.retries == 0
         # Exactly one harness.context_recovery event, mid_turn trigger.
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         recoveries = [
             e for e in events if e.kind == "harness.context_recovery"
         ]
@@ -6180,18 +6336,15 @@ class TestMidTurnContextRecoveryAct:
         # FR-6 ordering: the harness.context_recovery event precedes
         # the recovery attempt's AttemptStarted in the per-run audit
         # sequence.
-        recovery_seq = recoveries[0].sequence
-        started_seqs = [
-            e.sequence
-            for e in events
+        recovery_idx = events.index(recoveries[0])
+        started_indices = [
+            i
+            for i, e in enumerate(events)
             if e.kind == "harness.attempt_started"
             and e.payload.get("number") == 2
         ]
-        assert started_seqs
-        assert recovery_seq is not None
-        first_started_seq = started_seqs[0]
-        assert first_started_seq is not None
-        assert recovery_seq < first_started_seq
+        assert started_indices
+        assert recovery_idx < started_indices[0]
         # FR-7 no double-fire: no boundary recovery event on the
         # same attempt (the mid-turn act preempts it).
         assert len(recoveries) == 1
@@ -6217,6 +6370,7 @@ class TestMidTurnContextRecoveryAct:
         per-run audit sequence (the observe event is emitted in the
         same _check_context_thresholds call that arms the act)."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-ordering")
         handoff = RecoveryHandoff(
@@ -6251,9 +6405,9 @@ class TestMidTurnContextRecoveryAct:
             worktree=tmp_path,
         )
 
-        _run(run_task(task, lifecycle, store, config=config, invoke=invoke))
+        _run(run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke))
 
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         observe_90 = next(
             e
             for e in events
@@ -6263,9 +6417,7 @@ class TestMidTurnContextRecoveryAct:
         recovery = next(
             e for e in events if e.kind == "harness.context_recovery"
         )
-        assert observe_90.sequence is not None
-        assert recovery.sequence is not None
-        assert observe_90.sequence < recovery.sequence
+        assert events.index(observe_90) < events.index(recovery)
 
     def test_budget_exhausted_skips_midturn_act(
         self, tmp_path: Path
@@ -6276,6 +6428,7 @@ class TestMidTurnContextRecoveryAct:
         ``iteration_after_resume`` result on its first call because
         the recovery event is never set."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(task_id="t1", run_id="run-midturn-exhausted")
         # max_context_recoveries=0 means the budget check
@@ -6311,7 +6464,7 @@ class TestMidTurnContextRecoveryAct:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # No recovery, no summarizer invocation, attempt reaches DONE
@@ -6319,7 +6472,7 @@ class TestMidTurnContextRecoveryAct:
         assert outcome.lifecycle.status == Status.DONE
         assert len(outcome.attempts) == 1
         assert outcome.attempts[0].outcome == Outcome.SUCCEEDED
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         # Observe events still fire -- act is gated, observe is not.
         crossings = [
@@ -6340,6 +6493,7 @@ class TestMidTurnContextRecoveryAct:
         boundary, even if the second attempt would itself be
         over-ratio."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-midturn-shared-budget"
@@ -6405,7 +6559,7 @@ class TestMidTurnContextRecoveryAct:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=_invoker)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=_invoker)
         )
 
         # Mid-turn recovery used the budget; boundary recovery is
@@ -6415,7 +6569,7 @@ class TestMidTurnContextRecoveryAct:
         assert len(outcome.attempts) == 2
         assert outcome.attempts[0].outcome == Outcome.RECOVERED
         assert outcome.attempts[1].outcome == Outcome.AGENT_ERROR
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         recoveries = [
             e for e in events if e.kind == "harness.context_recovery"
         ]
@@ -6433,6 +6587,7 @@ class TestMidTurnContextRecoveryAct:
         INTERNAL_ERROR. Same routing as a failed boundary recovery --
         we never restart with an empty handoff."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-midturn-summ-fail"
@@ -6464,14 +6619,14 @@ class TestMidTurnContextRecoveryAct:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # No recovery event; attempt finalized INTERNAL_ERROR.
         assert outcome.lifecycle.status == Status.FAILED
         assert len(outcome.attempts) == 1
         assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         assert all(e.kind != "harness.context_recovery" for e in events)
         crashes = [
             e
@@ -6495,6 +6650,7 @@ class TestMidTurnContextRecoveryAct:
         events still emit, the iteration completes naturally, and the
         boundary recovery check covers the over-ratio tail."""
         store = InMemoryStore()
+        sink = _ListSink()
         task = Task(goal="g", graders=[])
         lifecycle = Lifecycle(
             task_id="t1", run_id="run-midturn-plain-degrade"
@@ -6544,7 +6700,7 @@ class TestMidTurnContextRecoveryAct:
         )
 
         outcome = _run(
-            run_task(task, lifecycle, store, config=config, invoke=invoke)
+            run_task(task, lifecycle, store, sink=sink, config=config, invoke=invoke)
         )
 
         # Boundary recovery covered the over-ratio tail -- the run
@@ -6553,7 +6709,7 @@ class TestMidTurnContextRecoveryAct:
         assert len(outcome.attempts) == 2
         assert outcome.attempts[0].outcome == Outcome.RECOVERED
         assert outcome.attempts[1].outcome == Outcome.SUCCEEDED
-        events = store.list_events(lifecycle.run_id)
+        events = sink.events(lifecycle.run_id)
         recoveries = [
             e for e in events if e.kind == "harness.context_recovery"
         ]

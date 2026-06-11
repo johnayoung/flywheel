@@ -176,13 +176,24 @@ class TestRunHelloExample:
             assert "command" in grader_types
             assert all(r.passed for r in grader_rows)
 
-            events = store.list_events(outcome.lifecycle.run_id)
-            event_kinds = {e.kind for e in events}
-            assert "harness.attempt_started" in event_kinds
-            assert "harness.iteration_completed" in event_kinds
-            assert "harness.attempt_finalized" in event_kinds
+            # Telemetry lives in the per-run JSONL file, not the store
+            # (spec 00025): the events table sees no harness writes.
+            assert store.list_events(outcome.lifecycle.run_id) == []
         finally:
             store.close()
+
+        run_file = (
+            db.parent / "logs" / "runs" / f"{outcome.lifecycle.run_id}.jsonl"
+        )
+        assert run_file.exists()
+        kinds = {
+            json.loads(line)["kind"]
+            for line in run_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        assert "harness.attempt_started" in kinds
+        assert "harness.iteration_completed" in kinds
+        assert "harness.attempt_finalized" in kinds
 
 
 class TestDumpStoreState:
@@ -201,7 +212,10 @@ class TestDumpStoreState:
         buffer = io.StringIO()
         try:
             dump_store_state(
-                store, outcome.lifecycle.run_id, out=buffer
+                store,
+                outcome.lifecycle.run_id,
+                out=buffer,
+                logs_root=db.parent / "logs",
             )
         finally:
             store.close()
@@ -307,7 +321,7 @@ class TestStreamedEvents:
         for line in event_lines:
             parsed = json.loads(line)
             assert isinstance(parsed, dict)
-            for key in ("id", "run_id", "ts", "kind", "payload"):
+            for key in ("run_id", "ts", "kind", "payload"):
                 assert key in parsed, f"event missing {key!r}: {parsed!r}"
 
         kinds = {json.loads(line)["kind"] for line in event_lines}

@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
@@ -66,6 +67,7 @@ from flywheel_core.recovery_summarizer import (
     OPENING_FENCE as RECOVERY_OPENING_FENCE,
 )
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 
 
 # --- Scripted SDK message helpers -----------------------------------------
@@ -265,6 +267,7 @@ def test_real_loop_drives_full_summarize_restart(tmp_path: Path) -> None:
     )
 
     store = SqliteStore(db_path)
+    sink = FileTelemetrySink(db_path.parent / "logs")
     try:
         outcome = asyncio.run(
             run_task(
@@ -273,6 +276,7 @@ def test_real_loop_drives_full_summarize_restart(tmp_path: Path) -> None:
                 store,
                 config=config,
                 invoke=invoke,
+                sink=sink,
             )
         )
 
@@ -300,7 +304,25 @@ def test_real_loop_drives_full_summarize_restart(tmp_path: Path) -> None:
         assert persisted_lifecycle.retries == 0
 
         # --- Persisted audit events --------------------------------
-        events = store.list_events(lifecycle.run_id)
+        sink.close()
+        run_file = (
+            db_path.parent / "logs" / "runs" / f"{lifecycle.run_id}.jsonl"
+        )
+        assert run_file.exists()
+        events = [
+            SimpleNamespace(
+                kind=line["kind"],
+                payload=line.get("payload", {}),
+                attempt_number=line.get("attempt_number"),
+            )
+            for line in (
+                json.loads(raw)
+                for raw in run_file.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                if raw.strip()
+            )
+        ]
 
         # FR-5: exactly one harness.context_recovery event carrying
         # occupancy/capacity/budget/summary-digest details.
@@ -344,11 +366,9 @@ def test_real_loop_drives_full_summarize_restart(tmp_path: Path) -> None:
             and e.payload.get("number") == 2
         ]
         assert len(attempt2_started) == 1
-        recovery_seq = recoveries[0].sequence
-        started_seq = attempt2_started[0].sequence
-        assert recovery_seq is not None
-        assert started_seq is not None
-        assert recovery_seq < started_seq
+        assert events.index(recoveries[0]) < events.index(
+            attempt2_started[0]
+        )
 
         # --- Applied recovery: the second prompt carries the handoff ---
         # The harness threaded the structured summary into the

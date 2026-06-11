@@ -58,11 +58,9 @@ from claude_agent_sdk import (
     UserMessage,
 )
 
-from flywheel_core.events import DomainEvent
 from flywheel_core.harness import (
     HarnessConfig,
     HarnessOutcome,
-    HarnessStore,
     InvocationRequest,
     InvokeFunc,
     finalize_stranded_lifecycle,
@@ -74,16 +72,15 @@ from flywheel_core.invoker import (
     invoke_iteration,
 )
 from flywheel_core.invoker_client import invoke_iteration_with_client
-from flywheel_core.lifecycle import Attempt, Lifecycle, Status
+from flywheel_core.lifecycle import Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.store_protocols import (
-    ControlCommandRecord,
     ControlCommandStore,
-    EventRecord,
-    GraderResultRecord,
-    SdkMessageRecord,
+    TelemetryRecord,
+    TelemetrySink,
 )
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import (
     CommandGrader,
     Grader,
@@ -140,7 +137,10 @@ def _stranded_run_ids(store: SqliteStore, task_id: str | None = None) -> list[st
 
 
 def recover_stranded_lifecycles(
-    store: SqliteStore, *, task_id: str | None = None
+    store: SqliteStore,
+    *,
+    task_id: str | None = None,
+    sink: TelemetrySink | None = None,
 ) -> list[str]:
     """Finalize every stranded lifecycle, optionally filtered by ``task_id``.
 
@@ -150,7 +150,7 @@ def recover_stranded_lifecycles(
     """
     finalized: list[str] = []
     for run_id in _stranded_run_ids(store, task_id):
-        if finalize_stranded_lifecycle(store, run_id):
+        if finalize_stranded_lifecycle(store, run_id, sink=sink):
             finalized.append(run_id)
     return finalized
 
@@ -178,30 +178,29 @@ def _event_payload_summary(payload: Mapping[str, Any], *, limit: int = 100) -> s
     return joined
 
 
-def _format_event_line(event: EventRecord) -> str:
-    """One readable line per persisted event for the default ``run`` stream."""
+def _format_event_line(record: TelemetryRecord) -> str:
+    """One readable line per telemetry record for the default ``run`` stream."""
     attempt = (
-        f" attempt={event.attempt_number}"
-        if event.attempt_number is not None
+        f" attempt={record.attempt_number}"
+        if record.attempt_number is not None
         else ""
     )
-    ts = event.ts.strftime("%H:%M:%S")
-    summary = _event_payload_summary(dict(event.payload))
+    ts = record.ts.strftime("%H:%M:%S")
+    summary = _event_payload_summary(dict(record.payload))
     tail = f"  {summary}" if summary else ""
-    return f"[{ts}] {event.kind}{attempt}{tail}"
+    return f"[{ts}] {record.kind}{attempt}{tail}"
 
 
-def _event_json_line(event: EventRecord) -> str:
-    """One NDJSON line per persisted event for ``--json`` consumers."""
+def _event_json_line(record: TelemetryRecord) -> str:
+    """One NDJSON line per telemetry record for ``--json`` consumers."""
     return json.dumps(
         {
-            "id": event.id,
-            "run_id": event.run_id,
-            "ts": event.ts.isoformat(),
-            "kind": event.kind,
-            "attempt_number": event.attempt_number,
-            "category": event.category,
-            "payload": dict(event.payload),
+            "run_id": record.run_id,
+            "ts": record.ts.isoformat(),
+            "kind": record.kind,
+            "attempt_number": record.attempt_number,
+            "iteration_number": record.iteration_number,
+            "payload": dict(record.payload),
         },
         sort_keys=True,
     )
@@ -321,104 +320,33 @@ def _make_message_observer(
     return emit_plain
 
 
-class _EventStreamingStore:
-    """Wrap a :class:`HarnessStore` and emit each persisted telemetry event.
+class _StreamingTelemetrySink:
+    """Wrap a :class:`TelemetrySink` and print harness telemetry live.
 
-    Every store call is forwarded verbatim to ``wrapped``; ``append_event``
-    additionally hands the persisted record to ``emit`` so the run is
-    observable live on stdout while the agent works. No authoritative state
-    is owned here — the wrapped backend stays the single source of truth.
-    Mirrors the seam in ``flywheel_core.examples.hello`` but with a pluggable
-    formatter so ``run`` can offer both readable and JSON output.
+    Every record is appended to ``wrapped`` first (the durable per-run
+    JSONL file), then ``harness.*`` records are additionally handed to
+    ``emit`` so the run is observable live on stdout while the agent
+    works. SDK message records are skipped here — the live message
+    observer (:func:`_make_message_observer`) already renders the
+    agent's turns with the typed objects in hand — and ``domain.*``
+    mirror lines are skipped to keep the stream's shape unchanged from
+    the store-backed era (lifecycle changes still surface via their
+    ``harness.*`` companions).
     """
 
     def __init__(
-        self, wrapped: HarnessStore, *, emit: Callable[[EventRecord], None]
+        self,
+        wrapped: TelemetrySink,
+        *,
+        emit: Callable[[TelemetryRecord], None],
     ) -> None:
         self._wrapped = wrapped
         self._emit = emit
 
-    @property
-    def notifier(self) -> Any:
-        """Expose the wrapped store's notifier so an in-process audit
-        follower sharing this wrapper still gets push wakeups."""
-        return getattr(self._wrapped, "notifier", None)
-
-    def create_lifecycle(self, lifecycle: Lifecycle) -> None:
-        self._wrapped.create_lifecycle(lifecycle)
-
-    def update_lifecycle(
-        self, lifecycle: Lifecycle, *, expected_version: int
-    ) -> None:
-        self._wrapped.update_lifecycle(
-            lifecycle, expected_version=expected_version
-        )
-
-    def load_lifecycle(self, run_id: str) -> Lifecycle | None:
-        return self._wrapped.load_lifecycle(run_id)
-
-    def save_task(self, task: Task, *, now: datetime) -> str:
-        return self._wrapped.save_task(task, now=now)
-
-    def append_domain_event(
-        self, event: DomainEvent, *, expected_version: int
-    ) -> Lifecycle:
-        return self._wrapped.append_domain_event(
-            event, expected_version=expected_version
-        )
-
-    def list_domain_events(self, run_id: str) -> list[DomainEvent]:
-        return self._wrapped.list_domain_events(run_id)
-
-    def save_attempt(
-        self,
-        run_id: str,
-        attempt: Attempt,
-        *,
-        expected_version: int | None = None,
-    ) -> None:
-        self._wrapped.save_attempt(
-            run_id, attempt, expected_version=expected_version
-        )
-
-    def list_attempts(self, run_id: str) -> list[Attempt]:
-        return self._wrapped.list_attempts(run_id)
-
-    def append_event(self, event: EventRecord) -> EventRecord:
-        persisted = self._wrapped.append_event(event)
-        self._emit(persisted)
-        return persisted
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        return self._wrapped.append_sdk_message(message)
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[SdkMessageRecord]:
-        return self._wrapped.save_sdk_messages(
-            run_id, attempt_number, iteration_number, messages
-        )
-
-    def append_grader_result(
-        self, result: GraderResultRecord
-    ) -> GraderResultRecord:
-        return self._wrapped.append_grader_result(result)
-
-    def list_grader_results(
-        self, run_id: str, attempt_number: int
-    ) -> list[GraderResultRecord]:
-        return self._wrapped.list_grader_results(run_id, attempt_number)
-
-    def claim_commands(
-        self, run_id: str, *, now: datetime
-    ) -> list[ControlCommandRecord]:
-        return self._wrapped.claim_commands(run_id, now=now)
+    def append_telemetry(self, record: TelemetryRecord) -> None:
+        self._wrapped.append_telemetry(record)
+        if record.kind.startswith("harness."):
+            self._emit(record)
 
 
 def build_inline_task(
@@ -488,7 +416,7 @@ def _make_claude_code_invoke(
     on_message: Callable[[Message], None] | None = None,
     control_store: ControlCommandStore | None = None,
     run_id: str | None = None,
-    audit_store: HarnessStore | None = None,
+    telemetry_sink: TelemetrySink | None = None,
 ) -> InvokeFunc:
     """Production invoker: real Claude Code spawned in ``sandbox``.
 
@@ -497,12 +425,12 @@ def _make_claude_code_invoke(
     agent's message stream, can claim operator-issued control commands
     from ``control_store`` (interrupt / set_model / say) and apply them
     live against the open session. Each applied command lands as a
-    ``harness.control_command_applied`` event on ``audit_store``; a
-    failed dispatch emits ``harness.control_command_failed`` and the
+    ``harness.control_command_applied`` record on ``telemetry_sink``; a
+    failed dispatch records ``harness.control_command_failed`` and the
     iteration continues, mirroring the per-message persistence contract.
 
-    ``control_store``, ``run_id``, and ``audit_store`` are required for
-    the bidirectional path — when ``control_store`` is ``None`` the
+    ``control_store``, ``run_id``, and ``telemetry_sink`` are required
+    for the bidirectional path — when ``control_store`` is ``None`` the
     invoker falls back to the one-shot :func:`invoke_iteration` (used by
     legacy callers that have no run identity yet, e.g. the on_message
     forwarding test).
@@ -536,24 +464,25 @@ def _make_claude_code_invoke(
         return _invoke_legacy
 
     pinned_run_id = run_id
-    pinned_audit_store = audit_store
+    pinned_sink = telemetry_sink
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
         composed = _compose_message_observers(on_message, request.on_message)
         emit: Callable[[str, Mapping[str, Any]], None] | None = None
-        if pinned_audit_store is not None:
+        if pinned_sink is not None:
             # Bind a non-Optional reference so the inner closure does not
             # need to re-prove the None-check on every call.
-            audit_sink: HarnessStore = pinned_audit_store
+            control_sink: TelemetrySink = pinned_sink
             attempt_number = request.attempt_number
 
             def _audit_emit(kind: str, payload: Mapping[str, Any]) -> None:
-                # Route control-plane events through the same store the
-                # harness writes to so the wrapped streaming wrapper
-                # (if any) sees them and a live operator sees them on
-                # stdout exactly like harness.* events.
-                audit_sink.append_event(
-                    EventRecord(
+                # Route control-plane events through the same sink the
+                # harness streams to so the run file carries them and a
+                # live operator sees them on stdout exactly like
+                # harness.* records (the watcher wraps this in
+                # _emit_safe, so a raising sink never breaks the run).
+                control_sink.append_telemetry(
+                    TelemetryRecord(
                         run_id=pinned_run_id,
                         ts=datetime.now(timezone.utc),
                         kind=kind,
@@ -579,25 +508,25 @@ def _make_claude_code_invoke(
 
 def _make_event_emitter(
     events: str, *, out: TextIO
-) -> Callable[[EventRecord], None] | None:
-    """Build the per-event stdout printer for ``run_task_object``.
+) -> Callable[[TelemetryRecord], None] | None:
+    """Build the per-record stdout printer for ``run_task_object``.
 
     Returns ``None`` for :data:`EVENTS_NONE` (no wrapping); a readable
     line-formatter for :data:`EVENTS_PLAIN`; an NDJSON formatter for
-    :data:`EVENTS_JSON`. Events go to ``out`` (stdout) so they stay
+    :data:`EVENTS_JSON`. Records go to ``out`` (stdout) so they stay
     separable from the ``[workflow]`` diagnostics on stderr.
     """
     if events == EVENTS_NONE:
         return None
     if events == EVENTS_JSON:
 
-        def emit_json(event: EventRecord) -> None:
-            print(_event_json_line(event), file=out, flush=True)
+        def emit_json(record: TelemetryRecord) -> None:
+            print(_event_json_line(record), file=out, flush=True)
 
         return emit_json
 
-    def emit_plain(event: EventRecord) -> None:
-        print(_format_event_line(event), file=out, flush=True)
+    def emit_plain(record: TelemetryRecord) -> None:
+        print(_format_event_line(record), file=out, flush=True)
 
     return emit_plain
 
@@ -659,6 +588,7 @@ async def run_task_object(
     run_id: str | None = None,
     events: str = EVENTS_NONE,
     source: str | None = None,
+    sink: TelemetrySink | None = None,
 ) -> HarnessOutcome:
     """Persist a lifecycle for ``task`` and drive it via ``run_task``.
 
@@ -684,6 +614,12 @@ async def run_task_object(
     lifecycle; passing an existing ``run_id`` makes ``run_task`` resume that
     lifecycle (its seed append hits ``LifecycleAlreadyExistsError`` and the
     harness reconciles from the persisted row).
+
+    ``sink`` overrides the run's telemetry destination (tests inject a
+    fake); ``None`` builds a :class:`FileTelemetrySink` rooted next to
+    the database (``<db dir>/logs`` — the spec 00025 default of
+    ``.flywheel/logs`` for the default db path), writing one JSONL file
+    per run under ``logs/runs/``.
     """
     out = stream if stream is not None else sys.stderr
     lifecycle = (
@@ -696,20 +632,24 @@ async def run_task_object(
     sandbox.mkdir(parents=True, exist_ok=True)
 
     backend = SqliteStore(db_path)
+    owned_sink: FileTelemetrySink | None = None
+    if sink is None:
+        owned_sink = FileTelemetrySink(db_path.parent / "logs")
+        sink = owned_sink
     emitter = _make_event_emitter(events, out=sys.stdout)
-    store: HarnessStore = (
-        backend
+    run_sink: TelemetrySink = (
+        sink
         if emitter is None
-        else _EventStreamingStore(backend, emit=emitter)
+        else _StreamingTelemetrySink(sink, emit=emitter)
     )
 
     # The default invoker surfaces the agent's turns live via on_message
     # and runs the control-command watcher against the open ClaudeSDKClient
     # session; an injected invoke (tests, alternative agents) owns its own
     # transport and the watcher is its responsibility. ``backend`` is the
-    # ControlCommandStore the watcher claims from; ``store`` is the wrapped
-    # audit sink so control-plane events flow through the same live-stream
-    # path as harness.* events.
+    # ControlCommandStore the watcher claims from; ``run_sink`` is the
+    # telemetry destination so control-plane records flow through the same
+    # live-stream path as harness.* records.
     if invoke is not None:
         invoker = invoke
     else:
@@ -720,7 +660,7 @@ async def run_task_object(
             on_message=_make_message_observer(events, out=sys.stdout),
             control_store=backend,
             run_id=lifecycle.run_id,
-            audit_store=store,
+            telemetry_sink=run_sink,
         )
     try:
         # Recover any prior lifecycle for this task that was killed
@@ -728,7 +668,7 @@ async def run_task_object(
         # honest (no lifecycles stuck in `running` forever) and frees
         # the retry budget — INTERRUPTED is not a retry-source state.
         for stranded_run_id in recover_stranded_lifecycles(
-            backend, task_id=task.id
+            backend, task_id=task.id, sink=run_sink
         ):
             print(
                 f"[workflow] recovered: stranded run {stranded_run_id} "
@@ -777,7 +717,7 @@ async def run_task_object(
             outcome = await run_task(
                 task,
                 lifecycle,
-                store,
+                backend,
                 config=HarnessConfig(
                     max_retries=max_retries,
                     agent_context={
@@ -788,6 +728,7 @@ async def run_task_object(
                     worktree=sandbox,
                 ),
                 invoke=invoker,
+                sink=run_sink,
             )
         except (asyncio.CancelledError, KeyboardInterrupt):
             # Operator killed the worker mid-attempt (SIGTERM/SIGINT routed
@@ -795,7 +736,9 @@ async def run_task_object(
             # Finalize the open attempt as INTERNAL_ERROR and transition the
             # lifecycle to INTERRUPTED so the next worker start sees a clean
             # slate rather than a lifecycle wedged in `running`.
-            finalize_stranded_lifecycle(backend, lifecycle.run_id)
+            finalize_stranded_lifecycle(
+                backend, lifecycle.run_id, sink=run_sink
+            )
             print(
                 f"[workflow] status  : interrupted (worker received signal)",
                 file=out,
@@ -817,6 +760,8 @@ async def run_task_object(
             )
     finally:
         backend.close()
+        if owned_sink is not None:
+            owned_sink.close()
     return outcome
 
 

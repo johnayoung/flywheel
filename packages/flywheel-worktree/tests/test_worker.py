@@ -431,11 +431,13 @@ def test_record_phase_bases_captures_once_and_idempotent(tmp_path: Path) -> None
     assert base_file.read_text().strip() == head_at_capture
 
 
-def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
-    """A full ``run_once`` cycle must drop a per-run forensics file keyed to
-    the executed run_id under ``log_dir``. Restoration of the behavior the
-    legacy bash worker lost when ``.workflow/task-worker.sh`` was collapsed
-    into the in-process Python worker."""
+def test_run_once_produces_run_jsonl_and_no_log_files(
+    tmp_path: Path,
+) -> None:
+    """Spec 00025 FR-9: the per-run ``.log`` re-render is gone. A full
+    ``run_once`` cycle leaves the run's telemetry JSONL (written by the
+    harness's sink under ``<db dir>/logs/runs/``) as the only telemetry
+    artifact, and no ``.log`` file is produced anywhere in the repo."""
     repo = tmp_path / "repo"
     _init_repo(repo)
     s = _submitter(repo)
@@ -453,8 +455,6 @@ def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
         )
 
     db_path = repo / ".flywheel" / "flywheel.sqlite"
-    log_dir = repo / "logs" / "worker"
-    assert not log_dir.exists()  # fresh checkout: dir does not exist yet
 
     report = worker.run_once(
         s,
@@ -465,23 +465,19 @@ def test_run_once_writes_per_run_log(tmp_path: Path) -> None:
         max_turns=4,
         max_retries=0,
         invoke=_invoke,
-        log_dir=log_dir,
     )
 
     assert len(report.runs) == 1
     run_id = report.runs[0].run_id
 
-    # The directory was created on demand and a log file keyed to the
-    # executed run_id exists, is non-empty, and contains the run header.
-    assert log_dir.is_dir()
-    short_hash = worker._run_id_hash(run_id)
-    matches = sorted(log_dir.glob(f"t1_{short_hash}_*.log"))
-    assert len(matches) == 1, f"expected one log file, got {matches}"
-    log_file = matches[0]
-    body = log_file.read_text()
-    assert body
-    assert f"run_id={run_id}" in body
-    assert "task_id=t1" in body
+    # The run telemetry JSONL exists and carries the run's stream.
+    run_file = db_path.parent / "logs" / "runs" / f"{run_id}.jsonl"
+    assert run_file.is_file()
+    assert run_file.read_text(encoding="utf-8").strip()
+
+    # FR-9 acceptance: no .log files are produced by a run.
+    assert sorted((repo / ".flywheel").rglob("*.log")) == []
+    assert not (repo / "logs").exists()
 
 
 # --- heartbeat rendering ----------------------------------------------------
@@ -704,7 +700,7 @@ def test_run_once_postgres_policy_without_dsn_fails_fast(
     assert "DATABASE_URL" in message
 
 
-def test_archive_phases_and_run_logs_accept_repeated_factory_calls(
+def test_archive_phases_accepts_repeated_factory_calls(
     tmp_path: Path,
 ) -> None:
     """The run loop reconstructs the store each cycle; the factory-backed

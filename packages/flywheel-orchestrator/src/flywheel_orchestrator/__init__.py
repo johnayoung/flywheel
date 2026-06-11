@@ -75,7 +75,6 @@ from flywheel_orchestrator._store_factory import (
     resolve_postgres_dsn,
 )
 from flywheel_orchestrator._workflow import (
-    DEFAULT_LOG_DIR,
     DEFAULT_TASKS_DIR,
     INIT_ROOT,
     LOOP_BASE_FILENAME,
@@ -103,7 +102,6 @@ __all__ = [
     "ClaimLostError",
     "ClaimStore",
     "DEFAULT_LEASE_SECONDS",
-    "DEFAULT_LOG_DIR",
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DirectoryWorkSource",

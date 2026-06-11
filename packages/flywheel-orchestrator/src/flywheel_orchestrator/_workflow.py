@@ -80,7 +80,6 @@ from flywheel_orchestrator._store_factory import (
 
 DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
 
-DEFAULT_LOG_DIR = Path(".flywheel/logs/worker")
 
 class TaskState(str, Enum):
     """Task-level status derived from the latest lifecycle, if any."""
@@ -1395,6 +1394,8 @@ flywheel.sqlite-shm
 flywheel.sqlite-wal
 sandboxes/
 worktrees/
+# Run telemetry JSONL (logs/runs/<run_id>.jsonl) and supervisor logs:
+# verbatim, sensitive-by-default payloads. Never committed.
 logs/
 .merge.lock
 """

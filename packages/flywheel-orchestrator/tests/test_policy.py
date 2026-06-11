@@ -281,6 +281,198 @@ def test_agent_model_carries_on_github_policy(tmp_path: Path) -> None:
     assert policy.model == "claude-opus-4"
 
 
+# --- [store] backend/schema -------------------------------------------------
+
+
+def test_store_defaults_when_section_absent(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.store_backend == "sqlite"
+    assert policy.store_schema is None
+
+
+def test_store_defaults_when_table_empty(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[store]\n',
+        )
+    )
+    assert policy.store_backend == "sqlite"
+    assert policy.store_schema is None
+
+
+def test_store_backend_sqlite_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[store]",
+                    'backend = "sqlite"',
+                ]
+            ),
+        )
+    )
+    assert policy.store_backend == "sqlite"
+    assert policy.store_schema is None
+
+
+def test_store_backend_postgres_without_schema(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[store]",
+                    'backend = "postgres"',
+                ]
+            ),
+        )
+    )
+    assert policy.store_backend == "postgres"
+    assert policy.store_schema is None
+
+
+def test_store_schema_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[store]",
+                    'backend = "postgres"',
+                    'schema = "flywheel_ci"',
+                ]
+            ),
+        )
+    )
+    assert policy.store_backend == "postgres"
+    assert policy.store_schema == "flywheel_ci"
+
+
+def test_store_unknown_backend_raises(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[store]",
+                'backend = "mysql"',
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    message = str(exc_info.value)
+    assert "store.backend" in message
+    assert str(policy_file) in message
+
+
+def test_store_non_string_backend_raises(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="store.backend"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[store]\nbackend = 7\n',
+            )
+        )
+
+
+def test_store_schema_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="store.schema"):
+        load_policy(
+            _write(
+                tmp_path,
+                "\n".join(
+                    [
+                        "[source]",
+                        'kind = "directory"',
+                        "[store]",
+                        'backend = "postgres"',
+                        "schema = 7",
+                    ]
+                ),
+            )
+        )
+
+
+def test_store_schema_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="store.schema"):
+        load_policy(
+            _write(
+                tmp_path,
+                "\n".join(
+                    [
+                        "[source]",
+                        'kind = "directory"',
+                        "[store]",
+                        'backend = "postgres"',
+                        'schema = ""',
+                    ]
+                ),
+            )
+        )
+
+
+def test_store_schema_rejects_whitespace_only_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="store.schema"):
+        load_policy(
+            _write(
+                tmp_path,
+                "\n".join(
+                    [
+                        "[source]",
+                        'kind = "directory"',
+                        "[store]",
+                        'backend = "postgres"',
+                        'schema = "   "',
+                    ]
+                ),
+            )
+        )
+
+
+def test_store_table_non_table_raises(tmp_path: Path) -> None:
+    # `store` declared at the top level as a scalar must reach the
+    # parser before any `[source]` table opens, otherwise it lands
+    # inside `[source]` and the store table key stays absent.
+    policy_file = _write(
+        tmp_path,
+        'store = "sqlite"\n[source]\nkind = "directory"\n',
+    )
+    with pytest.raises(PolicyError, match=r"\[store\] must be a table"):
+        load_policy(policy_file)
+
+
+def test_store_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[store]",
+                    'backend = "postgres"',
+                    'schema = "flywheel_ci"',
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.store_backend == "postgres"
+    assert policy.store_schema == "flywheel_ci"
+
+
 # --- validation errors ------------------------------------------------------
 
 

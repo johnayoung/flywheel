@@ -35,6 +35,12 @@ Format (TOML, stdlib ``tomllib``)::
     [agent]
     model = "claude-sonnet-4-5"
 
+    # Store backend (optional). Absent section means sqlite, so every
+    # pre-existing flywheel.toml keeps loading unchanged.
+    [store]
+    backend = "sqlite"              # or "postgres"
+    # schema = "flywheel_ci"        # postgres only; optional
+
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
 default policy is not runnable and never reaches the scheduler.
@@ -58,6 +64,8 @@ _SOURCE_KINDS: tuple[str, ...] = ("directory", "github")
 
 _DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
 
+_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
+
 
 class PolicyError(ValueError):
     """Raised when a policy file is missing, unparseable, or invalid.
@@ -79,7 +87,10 @@ class WorkPolicy:
     back to its built-in defaults). ``model`` mirrors the optional
     ``[agent] model`` key -- an opaque, repo-pinned model id passed
     verbatim to the SDK; ``None`` when unset (the worker then falls back
-    to its CLI flag / built-in default).
+    to its CLI flag / built-in default). ``store_backend``/``store_schema``
+    mirror the optional ``[store]`` table; an absent section means sqlite
+    with no schema, so every pre-existing policy file keeps loading
+    unchanged.
     """
 
     source_kind: str
@@ -91,6 +102,8 @@ class WorkPolicy:
     db_path: Path | None = None
     sandbox_root: Path | None = None
     model: str | None = None
+    store_backend: str = "sqlite"
+    store_schema: str | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -136,6 +149,11 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [agent] must be a table")
     model = _optional_agent_model(agent, policy_file=path)
 
+    store = data.get("store") or {}
+    if not isinstance(store, dict):
+        raise PolicyError(f"{path}: [store] must be a table")
+    store_backend, store_schema = _optional_store(store, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -151,6 +169,8 @@ def load_policy(path: Path) -> WorkPolicy:
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=model,
+            store_backend=store_backend,
+            store_schema=store_schema,
         )
 
     repo = source.get("repo")
@@ -178,6 +198,8 @@ def load_policy(path: Path) -> WorkPolicy:
         db_path=db_path,
         sandbox_root=sandbox_root,
         model=model,
+        store_backend=store_backend,
+        store_schema=store_schema,
     )
 
 
@@ -214,6 +236,33 @@ def _optional_agent_model(
             f"{policy_file}: agent.model must be a non-empty string"
         )
     return value
+
+
+def _optional_store(
+    table: dict, *, policy_file: Path
+) -> tuple[str, str | None]:
+    """Validate and return the optional ``[store]`` table contents.
+
+    Returns ``("sqlite", None)`` when the section (or the ``backend``
+    key) is absent so every pre-existing policy file keeps loading
+    unchanged. An unknown backend, or a ``schema`` that is not a
+    non-empty string, raises :class:`PolicyError` so a typo never
+    silently degrades into the sqlite default.
+    """
+    backend = table.get("backend", "sqlite")
+    if backend not in _STORE_BACKENDS:
+        raise PolicyError(
+            f"{policy_file}: store.backend must be one of "
+            f"{_STORE_BACKENDS}, got {backend!r}"
+        )
+    schema = table.get("schema")
+    if schema is None:
+        return backend, None
+    if not isinstance(schema, str) or not schema.strip():
+        raise PolicyError(
+            f"{policy_file}: store.schema must be a non-empty string"
+        )
+    return backend, schema
 
 
 def build_work_source(policy: WorkPolicy) -> WorkSource:

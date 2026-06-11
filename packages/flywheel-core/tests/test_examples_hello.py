@@ -177,8 +177,10 @@ class TestRunHelloExample:
             assert all(r.passed for r in grader_rows)
 
             # Telemetry lives in the per-run JSONL file, not the store
-            # (spec 00025): the events table sees no harness writes.
-            assert store.list_events(outcome.lifecycle.run_id) == []
+            # (spec 00025): the store no longer exposes a telemetry read
+            # at all, and every events row is a domain event.
+            assert not hasattr(store, "list_events")
+            assert store.list_domain_events(outcome.lifecycle.run_id)
         finally:
             store.close()
 

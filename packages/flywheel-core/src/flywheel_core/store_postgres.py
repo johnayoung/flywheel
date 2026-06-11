@@ -71,23 +71,16 @@ from flywheel_core.notifier import RunNotifier
 from flywheel_core.task import Task
 from flywheel_core.store_protocols import (
     CURRENT_SCHEMA_VERSION,
-    AuditRecord,
     ControlCommandRecord,
-    EventRecord,
     GraderResultRecord,
     GraderType,
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
-    SdkMessageRecord,
     StoreSchemaError,
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# Page size for ``read_audit_since``; matches the SQLite and in-memory
-# stores so the audit-stream contract behaves identically across backends.
-_AUDIT_PAGE_SIZE: int = 500
 
 # Postgres channel-name limit (NAMEDATALEN - 1). pg_notify rejects a
 # longer channel, and LISTEN silently truncates it, so we refuse a schema
@@ -277,22 +270,21 @@ class PostgresStore:
                 expected_version=CURRENT_SCHEMA_VERSION,
             )
 
-    def _next_run_sequence(
-        self, cur: Any, run_id: str
-    ) -> int:
-        """Allocate the next per-run audit sequence number atomically.
+    def _next_domain_sequence(self, cur: Any, run_id: str) -> int:
+        """Allocate the next per-run domain-event sequence number.
 
-        Issued through ``cur`` so the increment and the row it gates
-        share one transaction; the ``ON CONFLICT … RETURNING`` clause
-        returns the freshly-stored value in the same statement.
+        ``MAX(sequence) + 1`` over the run's existing event rows, issued
+        through ``cur`` so the read and the insert it gates share one
+        transaction. Concurrent appenders for the same run are serialized
+        by the ``SELECT ... FOR UPDATE`` lock ``append_domain_event``
+        takes on the lifecycle row, so per-run ordering stays strictly
+        monotonic without the retired shared cross-table counter; the
+        ``UNIQUE (run_id, sequence)`` constraint backstops any writer
+        that bypasses the lock.
         """
         cur.execute(
-            """
-            INSERT INTO run_sequence (run_id, next_seq) VALUES (%s, 1)
-            ON CONFLICT (run_id) DO UPDATE
-                SET next_seq = run_sequence.next_seq + 1
-            RETURNING next_seq
-            """,
+            "SELECT COALESCE(MAX(sequence), 0) + 1 "
+            "FROM events WHERE run_id = %s",
             (run_id,),
         )
         row = cur.fetchone()
@@ -853,13 +845,12 @@ class PostgresStore:
         self, conn: Connection[Any], event: DomainEvent
     ) -> int:
         with conn.cursor() as cur:
-            sequence = self._next_run_sequence(cur, event.run_id)
+            sequence = self._next_domain_sequence(cur, event.run_id)
             cur.execute(
                 """
                 INSERT INTO events (
-                    run_id, attempt_number, ts, kind, payload_json, sequence,
-                    category
-                ) VALUES (%s, %s, %s, %s, %s, %s, 'domain')
+                    run_id, attempt_number, ts, kind, payload_json, sequence
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     event.run_id,
@@ -881,7 +872,7 @@ class PostgresStore:
                     SELECT id, run_id, attempt_number, ts, kind,
                            payload_json, sequence
                     FROM events
-                    WHERE run_id = %s AND category = 'domain'
+                    WHERE run_id = %s
                     ORDER BY sequence
                     """,
                     (run_id,),
@@ -984,184 +975,6 @@ class PostgresStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_attempt(r) for r in rows]
-
-    # --- EventStore -------------------------------------------------------
-
-    def append_event(self, event: EventRecord) -> EventRecord:
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                sequence = self._next_run_sequence(cur, event.run_id)
-                cur.execute(
-                    """
-                    INSERT INTO events (
-                        run_id, attempt_number, ts, kind, payload_json,
-                        sequence
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        event.run_id,
-                        event.attempt_number,
-                        event.ts,
-                        event.kind,
-                        Jsonb(dict(event.payload)),
-                        sequence,
-                    ),
-                )
-                row = cur.fetchone()
-                self._notify_pg(cur, event.run_id, sequence)
-        assert row is not None
-        self.notifier.notify(event.run_id, sequence)
-        return EventRecord(
-            run_id=event.run_id,
-            ts=event.ts,
-            kind=event.kind,
-            payload=dict(event.payload),
-            attempt_number=event.attempt_number,
-            id=int(row[0]),
-            sequence=sequence,
-        )
-
-    def list_events(self, run_id: str) -> list[EventRecord]:
-        with self._pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT id, run_id, attempt_number, ts, kind,
-                           payload_json, sequence, category
-                    FROM events
-                    WHERE run_id = %s AND category = 'telemetry'
-                    ORDER BY ts, id
-                    """,
-                    (run_id,),
-                )
-                rows = cur.fetchall()
-        return [_row_to_event(r) for r in rows]
-
-    # --- SdkMessageStore --------------------------------------------------
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        payload = dict(message.payload)
-        message_type = message.message_type or str(
-            payload.get("message_type", payload.get("type", ""))
-        )
-        ts = message.ts
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                sequence = self._next_run_sequence(cur, message.run_id)
-                cur.execute(
-                    """
-                    INSERT INTO sdk_messages (
-                        run_id, attempt_number, iteration_number,
-                        sequence, message_type, payload_json, ts
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        message.run_id,
-                        message.attempt_number,
-                        message.iteration_number,
-                        sequence,
-                        message_type,
-                        Jsonb(payload),
-                        ts,
-                    ),
-                )
-                row = cur.fetchone()
-                self._notify_pg(cur, message.run_id, sequence)
-        assert row is not None
-        self.notifier.notify(message.run_id, sequence)
-        return SdkMessageRecord(
-            run_id=message.run_id,
-            attempt_number=message.attempt_number,
-            iteration_number=message.iteration_number,
-            message_type=message_type,
-            payload=payload,
-            ts=ts,
-            sequence=sequence,
-            id=int(row[0]),
-        )
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[SdkMessageRecord]:
-        persisted: list[SdkMessageRecord] = []
-        for msg in messages:
-            payload = dict(msg)
-            message_type = str(
-                payload.get("message_type", payload.get("type", ""))
-            )
-            record = SdkMessageRecord(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                iteration_number=iteration_number,
-                message_type=message_type,
-                payload=payload,
-                ts=datetime.now(timezone.utc),
-            )
-            persisted.append(self.append_sdk_message(record))
-        return persisted
-
-    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
-        with self._pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT id, run_id, attempt_number, iteration_number,
-                           sequence, message_type, payload_json, ts
-                    FROM sdk_messages
-                    WHERE run_id = %s
-                    ORDER BY sequence
-                    """,
-                    (run_id,),
-                )
-                rows = cur.fetchall()
-        return [_row_to_sdk_message(r) for r in rows]
-
-    # --- AuditStore -------------------------------------------------------
-
-    def read_audit_since(
-        self, run_id: str, cursor: int
-    ) -> list[AuditRecord]:
-        with self._pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    """
-                    SELECT id, run_id, attempt_number, ts, kind,
-                           payload_json, sequence, category
-                    FROM events
-                    WHERE run_id = %s AND sequence > %s
-                      AND category = 'telemetry'
-                    ORDER BY sequence
-                    LIMIT %s
-                    """,
-                    (run_id, cursor, _AUDIT_PAGE_SIZE),
-                )
-                event_rows = cur.fetchall()
-                cur.execute(
-                    """
-                    SELECT id, run_id, attempt_number, iteration_number,
-                           sequence, message_type, payload_json, ts
-                    FROM sdk_messages
-                    WHERE run_id = %s AND sequence > %s
-                    ORDER BY sequence
-                    LIMIT %s
-                    """,
-                    (run_id, cursor, _AUDIT_PAGE_SIZE),
-                )
-                sdk_rows = cur.fetchall()
-        merged: list[AuditRecord] = [_row_to_event(r) for r in event_rows]
-        merged.extend(_row_to_sdk_message(r) for r in sdk_rows)
-        merged.sort(
-            key=lambda r: r.sequence if r.sequence is not None else 0
-        )
-        return merged[:_AUDIT_PAGE_SIZE]
 
     # --- GraderResultStore ------------------------------------------------
 
@@ -1381,33 +1194,6 @@ def _row_to_attempt(row: dict[str, Any]) -> Attempt:
         turns=int(row["turns"] or 0),
         total_cost_usd=float(row["total_cost_usd"] or 0.0),
         last_activity_at=row["last_activity_at"],
-    )
-
-
-def _row_to_event(row: dict[str, Any]) -> EventRecord:
-    sequence_raw = row.get("sequence")
-    return EventRecord(
-        run_id=row["run_id"],
-        ts=row["ts"],
-        kind=row["kind"],
-        payload=dict(row["payload_json"]),
-        attempt_number=row["attempt_number"],
-        id=int(row["id"]),
-        sequence=int(sequence_raw) if sequence_raw is not None else None,
-        category=row.get("category", "telemetry"),
-    )
-
-
-def _row_to_sdk_message(row: dict[str, Any]) -> SdkMessageRecord:
-    return SdkMessageRecord(
-        run_id=row["run_id"],
-        attempt_number=int(row["attempt_number"]),
-        iteration_number=int(row["iteration_number"]),
-        message_type=row["message_type"],
-        payload=dict(row["payload_json"]),
-        ts=row["ts"],
-        sequence=int(row["sequence"]),
-        id=int(row["id"]),
     )
 
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
@@ -56,21 +56,14 @@ from flywheel_core.notifier import RunNotifier
 from flywheel_core.task import Task
 from flywheel_core.store_protocols import (
     CURRENT_SCHEMA_VERSION,
-    AuditRecord,
     ControlCommandRecord,
-    EventRecord,
     GraderResultRecord,
     GraderType,
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
-    SdkMessageRecord,
     StoreSchemaError,
 )
-
-# Page size for ``read_audit_since``: a cursor-based reader can keep
-# polling, but a single call's result set is bounded.
-_AUDIT_PAGE_SIZE: int = 500
 
 # Bundled as package data so the DDL travels with the install — no
 # reliance on a repo-relative ``docs/`` path that breaks under wheel
@@ -196,22 +189,19 @@ class SqliteStore:
                 expected_version=CURRENT_SCHEMA_VERSION,
             )
 
-    def _next_run_sequence(self, run_id: str) -> int:
-        """Allocate the next per-run audit sequence number.
+    def _next_domain_sequence(self, run_id: str) -> int:
+        """Allocate the next per-run domain-event sequence number.
 
-        Atomic with respect to other writers on the same connection because
-        SQLite in autocommit mode serializes statements; the
-        ``ON CONFLICT … RETURNING`` clause yields the newly-stored value
-        in the same statement so events and SDK messages cannot race past
-        each other on the same run_id.
+        ``MAX(sequence) + 1`` over the run's existing event rows. Always
+        called inside the append transaction (``BEGIN IMMEDIATE``
+        serializes writers), so per-run ordering stays strictly monotonic
+        without the retired shared cross-table counter; the
+        ``UNIQUE (run_id, sequence)`` constraint backstops any writer
+        that bypasses the transaction.
         """
         row = self._connection.execute(
-            """
-            INSERT INTO run_sequence (run_id, next_seq) VALUES (?, 1)
-            ON CONFLICT(run_id) DO UPDATE
-                SET next_seq = next_seq + 1
-            RETURNING next_seq
-            """,
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq "
+            "FROM events WHERE run_id = ?",
             (run_id,),
         ).fetchone()
         assert row is not None
@@ -500,13 +490,12 @@ class SqliteStore:
         return folded
 
     def _insert_domain_event_row(self, event: DomainEvent) -> int:
-        sequence = self._next_run_sequence(event.run_id)
+        sequence = self._next_domain_sequence(event.run_id)
         self._connection.execute(
             """
             INSERT INTO events (
-                run_id, attempt_number, ts, kind, payload_json, sequence,
-                category
-            ) VALUES (?, ?, ?, ?, ?, ?, 'domain')
+                run_id, attempt_number, ts, kind, payload_json, sequence
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 event.run_id,
@@ -555,7 +544,7 @@ class SqliteStore:
             SELECT id, run_id, attempt_number, ts, kind, payload_json,
                    sequence
             FROM events
-            WHERE run_id = ? AND category = 'domain'
+            WHERE run_id = ?
             ORDER BY sequence
             """,
             (run_id,),
@@ -668,160 +657,6 @@ class SqliteStore:
             (run_id,),
         ).fetchall()
         return [_row_to_attempt(r) for r in rows]
-
-    # --- EventStore -------------------------------------------------------
-
-    def append_event(self, event: EventRecord) -> EventRecord:
-        sequence = self._next_run_sequence(event.run_id)
-        cursor = self._connection.execute(
-            """
-            INSERT INTO events (
-                run_id, attempt_number, ts, kind, payload_json, sequence
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.run_id,
-                event.attempt_number,
-                _iso(event.ts),
-                event.kind,
-                json.dumps(dict(event.payload)),
-                sequence,
-            ),
-        )
-        self.notifier.notify(event.run_id, sequence)
-        return EventRecord(
-            run_id=event.run_id,
-            ts=event.ts,
-            kind=event.kind,
-            payload=dict(event.payload),
-            attempt_number=event.attempt_number,
-            id=cursor.lastrowid,
-            sequence=sequence,
-        )
-
-    def list_events(self, run_id: str) -> list[EventRecord]:
-        rows = self._connection.execute(
-            """
-            SELECT id, run_id, attempt_number, ts, kind, payload_json,
-                   sequence, category
-            FROM events
-            WHERE run_id = ? AND category = 'telemetry'
-            ORDER BY ts, id
-            """,
-            (run_id,),
-        ).fetchall()
-        return [_row_to_event(r) for r in rows]
-
-    # --- SdkMessageStore --------------------------------------------------
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        payload = dict(message.payload)
-        message_type = message.message_type or str(
-            payload.get("message_type", payload.get("type", ""))
-        )
-        ts = message.ts
-        sequence = self._next_run_sequence(message.run_id)
-        cursor = self._connection.execute(
-            """
-            INSERT INTO sdk_messages (
-                run_id, attempt_number, iteration_number, sequence,
-                message_type, payload_json, ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                message.run_id,
-                message.attempt_number,
-                message.iteration_number,
-                sequence,
-                message_type,
-                json.dumps(payload),
-                _iso(ts),
-            ),
-        )
-        self.notifier.notify(message.run_id, sequence)
-        return SdkMessageRecord(
-            run_id=message.run_id,
-            attempt_number=message.attempt_number,
-            iteration_number=message.iteration_number,
-            message_type=message_type,
-            payload=payload,
-            ts=ts,
-            sequence=sequence,
-            id=cursor.lastrowid,
-        )
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[SdkMessageRecord]:
-        persisted: list[SdkMessageRecord] = []
-        for msg in messages:
-            payload = dict(msg)
-            message_type = str(
-                payload.get("message_type", payload.get("type", ""))
-            )
-            record = SdkMessageRecord(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                iteration_number=iteration_number,
-                message_type=message_type,
-                payload=payload,
-                ts=datetime.now(timezone.utc),
-            )
-            persisted.append(self.append_sdk_message(record))
-        return persisted
-
-    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
-        rows = self._connection.execute(
-            """
-            SELECT id, run_id, attempt_number, iteration_number, sequence,
-                   message_type, payload_json, ts
-            FROM sdk_messages
-            WHERE run_id = ?
-            ORDER BY sequence
-            """,
-            (run_id,),
-        ).fetchall()
-        return [_row_to_sdk_message(r) for r in rows]
-
-    # --- AuditStore -------------------------------------------------------
-
-    def read_audit_since(
-        self, run_id: str, cursor: int
-    ) -> list[AuditRecord]:
-        event_rows = self._connection.execute(
-            """
-            SELECT id, run_id, attempt_number, ts, kind, payload_json,
-                   sequence, category
-            FROM events
-            WHERE run_id = ? AND sequence > ? AND category = 'telemetry'
-            ORDER BY sequence
-            LIMIT ?
-            """,
-            (run_id, cursor, _AUDIT_PAGE_SIZE),
-        ).fetchall()
-        sdk_rows = self._connection.execute(
-            """
-            SELECT id, run_id, attempt_number, iteration_number, sequence,
-                   message_type, payload_json, ts
-            FROM sdk_messages
-            WHERE run_id = ? AND sequence > ?
-            ORDER BY sequence
-            LIMIT ?
-            """,
-            (run_id, cursor, _AUDIT_PAGE_SIZE),
-        ).fetchall()
-        merged: list[AuditRecord] = [_row_to_event(r) for r in event_rows]
-        merged.extend(_row_to_sdk_message(r) for r in sdk_rows)
-        merged.sort(
-            key=lambda r: r.sequence if r.sequence is not None else 0
-        )
-        return merged[:_AUDIT_PAGE_SIZE]
 
     # --- GraderResultStore ------------------------------------------------
 
@@ -969,22 +804,6 @@ def _row_to_attempt(row: sqlite3.Row) -> Attempt:
     )
 
 
-def _row_to_event(row: sqlite3.Row) -> EventRecord:
-    ts = _parse_iso(row["ts"])
-    assert ts is not None
-    sequence_raw = row["sequence"]
-    return EventRecord(
-        run_id=row["run_id"],
-        ts=ts,
-        kind=row["kind"],
-        payload=json.loads(row["payload_json"]),
-        attempt_number=row["attempt_number"],
-        id=int(row["id"]),
-        sequence=int(sequence_raw) if sequence_raw is not None else None,
-        category=row["category"],
-    )
-
-
 def _row_to_domain_event(row: sqlite3.Row) -> DomainEvent:
     ts = _parse_iso(row["ts"])
     assert ts is not None
@@ -996,21 +815,6 @@ def _row_to_domain_event(row: sqlite3.Row) -> DomainEvent:
         ts=ts,
         attempt_number=row["attempt_number"],
         sequence=int(sequence_raw) if sequence_raw is not None else None,
-        id=int(row["id"]),
-    )
-
-
-def _row_to_sdk_message(row: sqlite3.Row) -> SdkMessageRecord:
-    ts = _parse_iso(row["ts"])
-    assert ts is not None
-    return SdkMessageRecord(
-        run_id=row["run_id"],
-        attempt_number=int(row["attempt_number"]),
-        iteration_number=int(row["iteration_number"]),
-        message_type=row["message_type"],
-        payload=json.loads(row["payload_json"]),
-        ts=ts,
-        sequence=int(row["sequence"]),
         id=int(row["id"]),
     )
 

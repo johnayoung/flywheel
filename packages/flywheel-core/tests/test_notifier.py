@@ -19,7 +19,6 @@ import time
 from datetime import datetime, timezone
 
 from flywheel_core import (
-    EventRecord,
     InMemoryStore,
     LifecycleInitialized,
     RunNotifier,
@@ -110,17 +109,12 @@ def test_store_writes_advance_the_notifier_watermark() -> None:
     wm = store.notifier.wait("r1", after=0, timeout=0.01)
     assert wm >= 1
 
-    store.append_event(
-        EventRecord(run_id="r1", ts=_ts(1), kind="harness.x")
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_ts(1), target=Status.READY),
+        expected_version=1,
     )
     wm_after_event = store.notifier.wait("r1", after=wm, timeout=0.01)
     assert wm_after_event > wm
-
-    store.save_sdk_messages("r1", 1, 1, [{"type": "assistant"}])
-    wm_after_sdk = store.notifier.wait(
-        "r1", after=wm_after_event, timeout=0.01
-    )
-    assert wm_after_sdk > wm_after_event
 
 
 def test_default_store_exposes_a_notifier() -> None:

@@ -350,11 +350,10 @@ def _serialize_sdk_message(msg: Message) -> dict[str, Any]:
     :class:`ToolUseBlock`, :class:`ToolResultBlock`, etc.) are
     serialized recursively as plain dicts via :func:`_to_jsonable`.
 
-    Used by :mod:`flywheel_core.harness` to feed
-    ``store.save_sdk_messages`` per iteration. Lives here because
-    every SDK :class:`Message` subtype is already imported in this
-    module. The harness re-exports nothing — it imports this helper
-    directly.
+    Used by :mod:`flywheel_core.harness` to feed each streamed message
+    to the run's telemetry sink. Lives here because every SDK
+    :class:`Message` subtype is already imported in this module. The
+    harness re-exports nothing — it imports this helper directly.
     """
     body = _to_jsonable(msg)
     if not isinstance(body, dict):

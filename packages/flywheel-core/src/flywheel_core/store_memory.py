@@ -13,17 +13,15 @@ Storage layout follows the table boundaries in
   attempts attached; ``attempts`` are populated on read by joining the
   attempts table.
 * ``_attempts`` is keyed by ``(run_id, number)``.
-* ``_events``, ``_sdk_messages``, and ``_grader_results`` are append-only
-  ordered lists with monotonic ids; the contract surface exposes no
+* ``_events`` and ``_grader_results`` are append-only ordered lists with
+  monotonic ids; ``_events`` holds domain rows only (telemetry flows to a
+  ``TelemetrySink``, never the store) and the contract surface exposes no
   update/delete entry point for grader_results.
-* ``_run_sequence`` is the per-``run_id`` monotonic counter shared by
-  ``append_event`` and ``save_sdk_messages`` so events and SDK messages
-  form a single totally-ordered audit stream.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -41,7 +39,6 @@ from flywheel_core.loaders import deserialize_task, serialize_task, task_digest
 from flywheel_core.notifier import RunNotifier
 from flywheel_core.task import Task
 from flywheel_core.store_protocols import (
-    AuditRecord,
     ControlCommandRecord,
     EventRecord,
     GraderResultRecord,
@@ -49,13 +46,7 @@ from flywheel_core.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
-    SdkMessageRecord,
 )
-
-# Page cap matches the sqlite/postgres ``read_audit_since`` cap; consumers
-# drive cursor-based polling and a single page bounds the result set
-# regardless of run length.
-_AUDIT_PAGE_SIZE: int = 500
 
 
 def _clone_lifecycle_row(lc: Lifecycle) -> Lifecycle:
@@ -98,32 +89,6 @@ def _clone_attempt(a: Attempt) -> Attempt:
         turns=a.turns,
         total_cost_usd=a.total_cost_usd,
         last_activity_at=a.last_activity_at,
-    )
-
-
-def _clone_event(e: EventRecord) -> EventRecord:
-    return EventRecord(
-        run_id=e.run_id,
-        ts=e.ts,
-        kind=e.kind,
-        payload=dict(e.payload),
-        attempt_number=e.attempt_number,
-        id=e.id,
-        sequence=e.sequence,
-        category=e.category,
-    )
-
-
-def _clone_sdk_message(m: SdkMessageRecord) -> SdkMessageRecord:
-    return SdkMessageRecord(
-        run_id=m.run_id,
-        attempt_number=m.attempt_number,
-        iteration_number=m.iteration_number,
-        message_type=m.message_type,
-        payload=dict(m.payload),
-        ts=m.ts,
-        sequence=m.sequence,
-        id=m.id,
     )
 
 
@@ -170,16 +135,11 @@ class InMemoryStore:
         self.notifier: RunNotifier = notifier or RunNotifier()
         self._lifecycles: dict[str, Lifecycle] = {}
         self._attempts: dict[tuple[str, int], Attempt] = {}
+        # Domain rows only; telemetry never reaches the store.
         self._events: list[EventRecord] = []
         self._event_seq: int = 0
         self._grader_results: list[GraderResultRecord] = []
         self._grader_result_seq: int = 0
-        self._sdk_messages: list[SdkMessageRecord] = []
-        self._sdk_message_seq: int = 0
-        # Per-run monotonic sequence shared by append_event and
-        # save_sdk_messages so the two write paths produce one strictly
-        # ascending audit ordering per run_id.
-        self._run_sequence: dict[str, int] = {}
         # Task model mirroring the persistence schema:
         #   _task_identities  -- logical task id -> first_seen_at (the FK
         #                        anchor; a run can only reference a registered
@@ -200,10 +160,21 @@ class InMemoryStore:
         self._control_commands: list[ControlCommandRecord] = []
         self._control_command_seq: int = 0
 
-    def _next_run_sequence(self, run_id: str) -> int:
-        nxt = self._run_sequence.get(run_id, 0) + 1
-        self._run_sequence[run_id] = nxt
-        return nxt
+    def _next_domain_sequence(self, run_id: str) -> int:
+        # MAX + 1 over the run's existing event rows, mirroring the
+        # durable stores: strictly monotonic per run without a shared
+        # cross-table counter.
+        return (
+            max(
+                (
+                    e.sequence
+                    for e in self._events
+                    if e.run_id == run_id and e.sequence is not None
+                ),
+                default=0,
+            )
+            + 1
+        )
 
     # --- LifecycleStore ----------------------------------------------------
 
@@ -335,7 +306,7 @@ class InMemoryStore:
 
     def _append_domain_event_row(self, event: DomainEvent) -> int:
         self._event_seq += 1
-        sequence = self._next_run_sequence(event.run_id)
+        sequence = self._next_domain_sequence(event.run_id)
         self._events.append(
             EventRecord(
                 run_id=event.run_id,
@@ -345,7 +316,6 @@ class InMemoryStore:
                 attempt_number=event.attempt_number,
                 id=self._event_seq,
                 sequence=sequence,
-                category="domain",
             )
         )
         return sequence
@@ -376,11 +346,7 @@ class InMemoryStore:
             )
 
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
-        rows = [
-            e
-            for e in self._events
-            if e.run_id == run_id and e.category == "domain"
-        ]
+        rows = [e for e in self._events if e.run_id == run_id]
         rows.sort(key=lambda e: e.sequence if e.sequence is not None else 0)
         return [
             event_from_record(
@@ -432,110 +398,6 @@ class InMemoryStore:
         ]
         rows.sort(key=lambda a: a.number)
         return [_clone_attempt(a) for a in rows]
-
-    # --- EventStore --------------------------------------------------------
-
-    def append_event(self, event: EventRecord) -> EventRecord:
-        self._event_seq += 1
-        sequence = self._next_run_sequence(event.run_id)
-        record = EventRecord(
-            run_id=event.run_id,
-            ts=event.ts,
-            kind=event.kind,
-            payload=dict(event.payload),
-            attempt_number=event.attempt_number,
-            id=self._event_seq,
-            sequence=sequence,
-        )
-        self._events.append(record)
-        self.notifier.notify(event.run_id, sequence)
-        return _clone_event(record)
-
-    def list_events(self, run_id: str) -> list[EventRecord]:
-        rows = [
-            e
-            for e in self._events
-            if e.run_id == run_id and e.category == "telemetry"
-        ]
-        rows.sort(key=lambda e: (e.ts, e.id if e.id is not None else 0))
-        return [_clone_event(e) for e in rows]
-
-    # --- SdkMessageStore ---------------------------------------------------
-
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        self._sdk_message_seq += 1
-        sequence = self._next_run_sequence(message.run_id)
-        payload = dict(message.payload)
-        message_type = message.message_type or str(
-            payload.get("message_type", payload.get("type", ""))
-        )
-        record = SdkMessageRecord(
-            run_id=message.run_id,
-            attempt_number=message.attempt_number,
-            iteration_number=message.iteration_number,
-            message_type=message_type,
-            payload=payload,
-            ts=message.ts,
-            sequence=sequence,
-            id=self._sdk_message_seq,
-        )
-        self._sdk_messages.append(record)
-        self.notifier.notify(message.run_id, sequence)
-        return _clone_sdk_message(record)
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: Sequence[Mapping[str, Any]],
-    ) -> list[SdkMessageRecord]:
-        persisted: list[SdkMessageRecord] = []
-        for msg in messages:
-            payload = dict(msg)
-            message_type = str(
-                payload.get("message_type", payload.get("type", ""))
-            )
-            record = SdkMessageRecord(
-                run_id=run_id,
-                attempt_number=attempt_number,
-                iteration_number=iteration_number,
-                message_type=message_type,
-                payload=payload,
-                ts=datetime.now(timezone.utc),
-            )
-            persisted.append(self.append_sdk_message(record))
-        return persisted
-
-    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
-        rows = [m for m in self._sdk_messages if m.run_id == run_id]
-        rows.sort(key=lambda m: m.sequence if m.sequence is not None else 0)
-        return [_clone_sdk_message(m) for m in rows]
-
-    # --- AuditStore --------------------------------------------------------
-
-    def read_audit_since(
-        self, run_id: str, cursor: int
-    ) -> list[AuditRecord]:
-        merged: list[AuditRecord] = []
-        for e in self._events:
-            if e.run_id != run_id or e.sequence is None:
-                continue
-            if e.category != "telemetry":
-                continue
-            if e.sequence > cursor:
-                merged.append(_clone_event(e))
-        for m in self._sdk_messages:
-            if m.run_id != run_id or m.sequence is None:
-                continue
-            if m.sequence > cursor:
-                merged.append(_clone_sdk_message(m))
-        merged.sort(
-            key=lambda r: r.sequence if r.sequence is not None else 0
-        )
-        return merged[:_AUDIT_PAGE_SIZE]
 
     # --- GraderResultStore -------------------------------------------------
 

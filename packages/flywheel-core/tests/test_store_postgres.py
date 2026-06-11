@@ -29,7 +29,6 @@ import pytest
 from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
-    EventRecord,
     GraderResultRecord,
     Lifecycle,
     LifecycleInitialized,
@@ -577,12 +576,6 @@ def test_listen_notify_bridges_cross_instance_writes(
             LifecycleInitialized(run_id=run_id, ts=_ts, task_id="t"),
             expected_version=0,
         )
-        # The seed alone should already wake the consumer's notifier via the
-        # cross-instance bridge; a telemetry event exercises append_event too.
-        writer.append_event(
-            EventRecord(run_id=run_id, ts=_ts, kind="harness.x")
-        )
-
         # The consumer never wrote anything, yet its notifier watermark is
         # advanced by the bridge translating the writer's committed NOTIFYs.
         watermark = consumer.notifier.wait(run_id, after=0, timeout=5.0)

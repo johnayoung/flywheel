@@ -32,11 +32,8 @@ from flywheel_core import (
     AttemptFinalized,
     AttemptStarted,
     AttemptStore,
-    AuditStore,
     ControlCommandStore,
     DomainEventStore,
-    EventRecord,
-    EventStore,
     GraderEvaluated,
     GraderResultRecord,
     GraderResultStore,
@@ -49,8 +46,6 @@ from flywheel_core import (
     OptimisticConcurrencyError,
     Outcome,
     CommandGrader,
-    SdkMessageRecord,
-    SdkMessageStore,
     SqliteStore,
     Status,
     Task,
@@ -137,12 +132,29 @@ def _ensure_attempt(
 def test_store_satisfies_every_protocol(store: object) -> None:
     assert isinstance(store, LifecycleStore)
     assert isinstance(store, AttemptStore)
-    assert isinstance(store, EventStore)
+    assert isinstance(store, DomainEventStore)
     assert isinstance(store, GraderResultStore)
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, AuditStore)
     assert isinstance(store, TaskStore)
     assert isinstance(store, ControlCommandStore)
+
+
+def test_store_exposes_no_telemetry_verbs(store: object) -> None:
+    """Telemetry flows to a TelemetrySink, never the relational store
+    (spec 00025 FR-5). The sdk-message verbs, the events-side telemetry
+    write path, and the merged audit-stream read were removed with the
+    schema reduction; a store growing one of these back is reintroducing
+    telemetry at ledger grade."""
+    for forbidden in (
+        "append_event",
+        "list_events",
+        "append_sdk_message",
+        "save_sdk_messages",
+        "list_sdk_messages",
+        "read_audit_since",
+    ):
+        assert not hasattr(store, forbidden), (
+            f"telemetry must not reach the store; exposes {forbidden!r}"
+        )
 
 
 def test_store_exposes_no_grader_result_mutators(store: object) -> None:
@@ -682,67 +694,6 @@ def test_save_attempt_expected_version_against_missing_run_raises(
         )
 
 
-# --- Event round-trip ------------------------------------------------------
-
-
-def test_append_event_assigns_monotonic_id_and_returns_record(
-    store: object,
-) -> None:
-    assert isinstance(store, EventStore)
-    _ensure_lifecycle(store, "r1")
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    r1 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    r2 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
-    assert r1.id is not None
-    assert r2.id is not None
-    assert r2.id > r1.id
-
-
-def test_list_events_returns_chronological_order_regardless_of_insertion(
-    store: object,
-) -> None:
-    assert isinstance(store, EventStore)
-    _ensure_lifecycle(store, "r1")
-    later = datetime(2024, 1, 1, 0, 0, 10, tzinfo=timezone.utc)
-    earlier = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    middle = datetime(2024, 1, 1, 0, 0, 5, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=later, kind="c"))
-    store.append_event(EventRecord(run_id="r1", ts=earlier, kind="a"))
-    store.append_event(EventRecord(run_id="r1", ts=middle, kind="b"))
-    listed = store.list_events("r1")
-    assert [e.kind for e in listed] == ["a", "b", "c"]
-
-
-def test_list_events_scoped_by_run_id(store: object) -> None:
-    assert isinstance(store, EventStore)
-    _ensure_lifecycle(store, "r1")
-    _ensure_lifecycle(store, "r2")
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="x"))
-    store.append_event(EventRecord(run_id="r2", ts=ts, kind="y"))
-    assert [e.kind for e in store.list_events("r1")] == ["x"]
-    assert [e.kind for e in store.list_events("r2")] == ["y"]
-
-
-def test_event_payload_isolated_from_caller_mutations(
-    store: object,
-) -> None:
-    assert isinstance(store, EventStore)
-    _ensure_lifecycle(store, "r1")
-    payload: dict[str, int] = {"turns": 1}
-    store.append_event(
-        EventRecord(
-            run_id="r1",
-            ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
-            kind="progress",
-            payload=payload,
-        )
-    )
-    payload["turns"] = 999
-    listed = store.list_events("r1")
-    assert dict(listed[0].payload) == {"turns": 1}
-
-
 # --- Grader-result round-trip ----------------------------------------------
 
 
@@ -827,269 +778,43 @@ def test_grader_spec_and_payload_isolated_from_caller_mutations(
     assert dict(listed[0].payload) == {"exit_code": 0}
 
 
-# --- SDK message persistence -----------------------------------------------
+# --- Per-run monotonic domain-event sequence --------------------------------
 
 
-def test_save_sdk_messages_persists_payloads_byte_for_byte(
+def test_domain_event_sequences_are_dense_and_monotonic_per_run(
     store: object,
 ) -> None:
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    payloads: list[dict[str, object]] = [
-        {
-            "type": "assistant",
-            "content": [{"type": "text", "text": "hi"}],
-            "usage": {"input_tokens": 12, "output_tokens": 34},
-        },
-        {
-            "type": "tool_use",
-            "id": "call-1",
-            "name": "Bash",
-            "input": {"command": "echo hello"},
-        },
-        {
-            "type": "result",
-            "is_error": False,
-            "stop_reason": "end_turn",
-        },
-    ]
-    saved = store.save_sdk_messages(
-        run_id="r1",
-        attempt_number=1,
-        iteration_number=1,
-        messages=payloads,
+    """Without the retired shared cross-table counter, domain events
+    number 1..N per run: dense, strictly ascending, assigned at append
+    time (spec 00025 FR-5)."""
+    assert isinstance(store, DomainEventStore)
+    _seed(store)
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(1), target=Status.READY),
+        expected_version=1,
     )
-    assert len(saved) == len(payloads)
-    # Sequences are per-run monotonic and start from the next run-counter
-    # value; we check strict ascending across the batch only.
-    seqs = [s.sequence for s in saved]
-    assert all(s is not None for s in seqs)
-    assert seqs == sorted(seqs)
-    assert len(set(seqs)) == len(seqs)
-    for got, original in zip(saved, payloads):
-        assert dict(got.payload) == original
-        assert got.message_type == original["type"]
-        assert got.attempt_number == 1
-        assert got.iteration_number == 1
-        assert got.id is not None
-
-
-def test_list_sdk_messages_returns_in_sequence_order(store: object) -> None:
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    store.save_sdk_messages(
-        "r1", 1, 1, [{"type": "assistant", "n": 1}]
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(2), target=Status.RUNNING),
+        expected_version=2,
     )
-    store.save_sdk_messages(
-        "r1", 1, 2, [{"type": "assistant", "n": 2}, {"type": "result", "n": 3}]
-    )
-    store.save_sdk_messages(
-        "r1", 2, 1, [{"type": "assistant", "n": 4}]
-    )
-
-    listed = store.list_sdk_messages("r1")
-    assert [m.payload["n"] for m in listed] == [1, 2, 3, 4]
-    seqs = [m.sequence for m in listed]
-    assert all(s is not None for s in seqs)
-    assert seqs == sorted(seqs)
+    events = store.list_domain_events("r1")
+    assert [e.sequence for e in events] == [1, 2, 3]
 
 
-def test_sdk_messages_scoped_by_run_id(store: object) -> None:
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-    _ensure_lifecycle(store, "r2")
-    store.save_sdk_messages("r1", 1, 1, [{"type": "assistant", "tag": "a"}])
-    store.save_sdk_messages("r2", 1, 1, [{"type": "assistant", "tag": "b"}])
-    assert [m.payload["tag"] for m in store.list_sdk_messages("r1")] == ["a"]
-    assert [m.payload["tag"] for m in store.list_sdk_messages("r2")] == ["b"]
-
-
-def test_sdk_message_payload_isolated_from_caller_mutations(
+def test_domain_event_sequences_are_independent_per_run_id(
     store: object,
 ) -> None:
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    payload: dict[str, object] = {"type": "assistant", "k": "v"}
-    saved = store.save_sdk_messages("r1", 1, 1, [payload])
-    payload["k"] = "MUTATED"
-    payload["new"] = "field"
-    # The persisted record snapshots the caller's payload at save time.
-    listed = store.list_sdk_messages("r1")
-    assert dict(listed[0].payload) == {"type": "assistant", "k": "v"}
-    # The returned record from save is similarly insulated.
-    assert dict(saved[0].payload) == {"type": "assistant", "k": "v"}
-    # And mutating the returned record's payload does not corrupt the
-    # store's row.
-    cast_payload = dict(saved[0].payload)
-    cast_payload["k"] = "ALSO_MUTATED"
-    again = store.list_sdk_messages("r1")
-    assert dict(again[0].payload) == {"type": "assistant", "k": "v"}
-
-
-def test_save_sdk_messages_with_empty_batch_is_noop(store: object) -> None:
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-    saved = store.save_sdk_messages("r1", 1, 1, [])
-    assert saved == []
-    assert store.list_sdk_messages("r1") == []
-
-
-# --- Per-run monotonic sequence shared across events + SDK messages --------
-
-
-def test_interleaved_events_and_sdk_messages_have_ascending_per_run_sequence(
-    store: object,
-) -> None:
-    """Events and SDK messages share one per-run monotonic counter so a
-    single audit ordering exists across both write paths."""
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    e1 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    m1 = store.save_sdk_messages("r1", 1, 1, [{"type": "assistant", "n": 1}])
-    e2 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="progress"))
-    m2 = store.save_sdk_messages(
-        "r1", 1, 2, [{"type": "tool_use", "n": 2}, {"type": "result", "n": 3}]
+    """The per-run sequence is scoped to ``run_id``: two runs each start
+    at 1 and advance independently."""
+    assert isinstance(store, DomainEventStore)
+    _seed(store, "r1")
+    _seed(store, "r2")
+    store.append_domain_event(
+        TransitionedTo(run_id="r1", ts=_dts(1), target=Status.READY),
+        expected_version=1,
     )
-    e3 = store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
-
-    seqs: list[int] = []
-    for rec in (e1, *m1, e2, *m2, e3):
-        assert rec.sequence is not None
-        seqs.append(rec.sequence)
-    # Strict ascending across both record types within one run.
-    assert seqs == sorted(seqs)
-    assert len(set(seqs)) == len(seqs)
-
-
-def test_run_sequences_are_independent_per_run_id(store: object) -> None:
-    """The shared per-run counter is scoped to ``run_id``: two runs may
-    independently start at 1 without colliding."""
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-    _ensure_lifecycle(store, "r2")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    a = store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    b = store.append_event(EventRecord(run_id="r2", ts=ts, kind="started"))
-    assert a.sequence == 1
-    assert b.sequence == 1
-    a2 = store.save_sdk_messages("r1", 1, 1, [{"type": "assistant"}])
-    b2 = store.save_sdk_messages("r2", 1, 1, [{"type": "assistant"}])
-    assert a2[0].sequence == 2
-    assert b2[0].sequence == 2
-
-
-# --- Audit-stream merged read ----------------------------------------------
-
-
-def test_read_audit_since_cursor_zero_returns_every_record(
-    store: object,
-) -> None:
-    assert isinstance(store, AuditStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    store.save_sdk_messages(
-        "r1", 1, 1, [{"type": "assistant"}, {"type": "tool_use"}]
-    )
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
-
-    records = store.read_audit_since("r1", 0)
-    assert len(records) == 4
-    seqs = [r.sequence for r in records]
-    assert all(s is not None for s in seqs)
-    assert seqs == sorted(seqs)
-
-
-def test_read_audit_since_cursor_n_skips_first_n_records(
-    store: object,
-) -> None:
-    assert isinstance(store, AuditStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    store.save_sdk_messages(
-        "r1", 1, 1, [{"type": "assistant"}, {"type": "tool_use"}]
-    )
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="completed"))
-
-    all_records = store.read_audit_since("r1", 0)
-    assert len(all_records) == 4
-
-    after_two = store.read_audit_since("r1", 2)
-    assert len(after_two) == 2
-    assert [r.sequence for r in after_two] == [
-        r.sequence for r in all_records[2:]
-    ]
-
-    after_all = store.read_audit_since(
-        "r1", all_records[-1].sequence or 0
-    )
-    assert after_all == []
-
-
-def test_read_audit_since_returns_typed_union_arms(store: object) -> None:
-    assert isinstance(store, AuditStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="started"))
-    store.save_sdk_messages("r1", 1, 1, [{"type": "assistant"}])
-
-    records = store.read_audit_since("r1", 0)
-    assert isinstance(records[0], EventRecord)
-    assert isinstance(records[1], SdkMessageRecord)
-
-
-def test_read_audit_since_for_unknown_run_returns_empty(store: object) -> None:
-    assert isinstance(store, AuditStore)
-    assert store.read_audit_since("does-not-exist", 0) == []
-
-
-def test_read_audit_since_scoped_by_run_id(store: object) -> None:
-    assert isinstance(store, AuditStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, SdkMessageStore)
-    assert isinstance(store, LifecycleStore)
-    _ensure_lifecycle(store, "r1")
-    _ensure_lifecycle(store, "r2")
-
-    ts = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    store.append_event(EventRecord(run_id="r1", ts=ts, kind="x"))
-    store.save_sdk_messages("r2", 1, 1, [{"type": "assistant", "tag": "r2"}])
-
-    r1 = store.read_audit_since("r1", 0)
-    r2 = store.read_audit_since("r2", 0)
-    assert len(r1) == 1
-    assert len(r2) == 1
-    assert isinstance(r1[0], EventRecord)
-    assert isinstance(r2[0], SdkMessageRecord)
-    assert dict(r2[0].payload) == {"type": "assistant", "tag": "r2"}
+    assert [e.sequence for e in store.list_domain_events("r1")] == [1, 2]
+    assert [e.sequence for e in store.list_domain_events("r2")] == [1]
 
 
 # --- Event-sourced domain-event write path ---------------------------------
@@ -1328,48 +1053,31 @@ def test_attempt_finalized_preserves_boundary_rolled_aggregates(
     assert lc.attempts[0].outcome is Outcome.SUCCEEDED
 
 
-def test_domain_events_share_the_event_log_but_not_the_audit_stream(
+def test_replay_of_listed_domain_events_matches_projection(
     store: object,
 ) -> None:
-    """Domain and telemetry events share the events table and the per-run
-    sequence counter, but the audit stream (and list_events) surface only
-    telemetry rows. Domain events are read back via list_domain_events.
-
-    Keeping the audit stream telemetry-only is deliberate for this phase:
-    state-bearing domain events advance the per-run sequence (so ordering
-    stays coherent) without changing the existing observability surface.
-    """
+    """The events table is the domain ledger and nothing else (spec
+    00025 FR-5): list_domain_events returns the typed stream in dense
+    sequence order, and folding it reproduces exactly the lifecycle the
+    projection row reports."""
     assert isinstance(store, DomainEventStore)
-    assert isinstance(store, EventStore)
-    assert isinstance(store, AuditStore)
+    assert isinstance(store, LifecycleStore)
     _seed(store)
-    store.append_event(
-        EventRecord(run_id="r1", ts=_dts(1), kind="harness.attempt_started")
-    )
     store.append_domain_event(
         TransitionedTo(run_id="r1", ts=_dts(2), target=Status.READY),
         expected_version=1,
     )
 
-    # The audit stream shows only the telemetry event, not the seed or the
-    # transition (both domain).
-    records = store.read_audit_since("r1", 0)
-    kinds = [r.kind for r in records if isinstance(r, EventRecord)]
-    assert kinds == ["harness.attempt_started"]
-    assert all(
-        r.category == "telemetry"
-        for r in records
-        if isinstance(r, EventRecord)
-    )
-
-    # Domain events are read back through the dedicated, typed accessor.
-    domain_kinds = [type(e).__name__ for e in store.list_domain_events("r1")]
+    events = store.list_domain_events("r1")
+    domain_kinds = [type(e).__name__ for e in events]
     assert domain_kinds == ["LifecycleInitialized", "TransitionedTo"]
+    assert [e.sequence for e in events] == [1, 2]
 
-    # But they did advance the shared per-run sequence: the telemetry event
-    # landed at sequence 2 (after the seed at 1), and the transition at 3.
-    telemetry = [r for r in records if isinstance(r, EventRecord)]
-    assert telemetry[0].sequence == 2
+    folded = replay(events)
+    loaded = store.load_lifecycle("r1")
+    assert loaded is not None
+    assert folded.status is loaded.status is Status.READY
+    assert folded.version == loaded.version == 2
 
 
 # --- Shared deterministic clock helper -------------------------------------

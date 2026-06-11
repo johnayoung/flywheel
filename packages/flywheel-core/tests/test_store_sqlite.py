@@ -60,8 +60,6 @@ def test_bootstrap_creates_every_schema_table(tmp_path: Path) -> None:
             "attempts",
             "events",
             "grader_results",
-            "sdk_messages",
-            "run_sequence",
             "schema_version",
             "control_commands",
         }

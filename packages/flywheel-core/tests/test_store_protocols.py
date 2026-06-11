@@ -21,12 +21,9 @@ from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
     AttemptStore,
-    AuditRecord,
-    AuditStore,
     ControlCommandRecord,
     ControlCommandStore,
     EventRecord,
-    EventStore,
     GraderResultRecord,
     GraderResultStore,
     Lifecycle,
@@ -35,7 +32,6 @@ from flywheel_core import (
     LifecycleStore,
     OptimisticConcurrencyError,
     SdkMessageRecord,
-    SdkMessageStore,
     StoreConflictError,
     StoreSchemaError,
     TelemetryRecord,
@@ -76,14 +72,6 @@ class _AttemptStub:
         return []
 
 
-class _EventStub:
-    def append_event(self, event: EventRecord) -> EventRecord:
-        return event
-
-    def list_events(self, run_id: str) -> list[EventRecord]:
-        return []
-
-
 class _GraderResultStub:
     def append_grader_result(
         self, result: GraderResultRecord
@@ -93,32 +81,6 @@ class _GraderResultStub:
     def list_grader_results(
         self, run_id: str, attempt_number: int
     ) -> list[GraderResultRecord]:
-        return []
-
-
-class _SdkMessageStub:
-    def append_sdk_message(
-        self, message: SdkMessageRecord
-    ) -> SdkMessageRecord:
-        return message
-
-    def save_sdk_messages(
-        self,
-        run_id: str,
-        attempt_number: int,
-        iteration_number: int,
-        messages: object,
-    ) -> list[SdkMessageRecord]:
-        return []
-
-    def list_sdk_messages(self, run_id: str) -> list[SdkMessageRecord]:
-        return []
-
-
-class _AuditStub:
-    def read_audit_since(
-        self, run_id: str, cursor: int
-    ) -> list[AuditRecord]:
         return []
 
 
@@ -160,20 +122,8 @@ def test_attempt_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_AttemptStub(), AttemptStore)
 
 
-def test_event_store_protocol_is_satisfiable_by_stub() -> None:
-    assert isinstance(_EventStub(), EventStore)
-
-
 def test_grader_result_store_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_GraderResultStub(), GraderResultStore)
-
-
-def test_sdk_message_store_protocol_is_satisfiable_by_stub() -> None:
-    assert isinstance(_SdkMessageStub(), SdkMessageStore)
-
-
-def test_audit_store_protocol_is_satisfiable_by_stub() -> None:
-    assert isinstance(_AuditStub(), AuditStore)
 
 
 def test_control_command_store_protocol_is_satisfiable_by_stub() -> None:
@@ -184,8 +134,8 @@ def test_telemetry_sink_protocol_is_satisfiable_by_stub() -> None:
     assert isinstance(_TelemetrySinkStub(), TelemetrySink)
 
 
-def test_event_stub_does_not_satisfy_telemetry_sink_protocol() -> None:
-    assert not isinstance(_EventStub(), TelemetrySink)
+def test_attempt_stub_does_not_satisfy_telemetry_sink_protocol() -> None:
+    assert not isinstance(_AttemptStub(), TelemetrySink)
 
 
 # --- Append-only contract on grader_results --------------------------------
@@ -254,7 +204,6 @@ def test_event_record_is_dataclass_with_schema_fields() -> None:
         "kind",
         "payload",
         "sequence",
-        "category",
     }
 
 

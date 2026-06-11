@@ -1227,8 +1227,8 @@ def _payload_digest(payload: Mapping[str, Any]) -> str:
 def classify(record: AuditRecord) -> list[TranscriptEntry]:
     """Convert one :class:`AuditRecord` into ordered transcript entries.
 
-    The record's ``sequence`` is required (the store contract assigns
-    it on every record returned from ``read_audit_since``); a defensive
+    The record's ``sequence`` is required (the file reader assigns a
+    line-count sequence on every record it reconstructs); a defensive
     ``0`` is substituted only when a synthetic record is fed in
     directly. Returns a list because an ``AssistantMessage`` with both
     text and a tool_use produces two entries that must keep their

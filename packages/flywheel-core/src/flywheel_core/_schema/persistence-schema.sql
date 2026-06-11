@@ -3,21 +3,29 @@
 -- Tables mirror the conceptual model: tasks is the content-addressed
 -- catalog of task definitions a run can reference, lifecycles is the row
 -- that mutates (with a Version column for optimistic concurrency), attempts
--- is the per-execution history, events is the timeline of harness-emitted
--- events, grader_results is the per-grader receipt log produced during
--- validation, sdk_messages is the verbatim agent message stream captured per
--- iteration, and run_sequence is the per-run monotonic counter that orders
--- events and sdk_messages into a single audit stream.
+-- is the per-execution history, events is the domain-event ledger the
+-- lifecycle state is folded from, and grader_results is the per-grader
+-- receipt log produced during validation.
+--
+-- events holds domain rows only (since schema_version 11). Telemetry —
+-- harness telemetry events and the verbatim SDK message stream — is not
+-- stored here: it flows to a per-run JSONL file under .flywheel/logs via
+-- the TelemetrySink seam. The former category column, the SDK-message
+-- table, and the shared per-run counter table that interleaved telemetry
+-- with domain rows into one merged audit stream were all removed; the
+-- table name was kept rather than renamed to domain_events. sequence is
+-- allocated per run as MAX(sequence) + 1 inside the append transaction,
+-- so domain-event ordering stays strictly monotonic per run without a
+-- cross-table counter.
 --
 -- grader_results is append-only by contract: rows are written once when a
 -- grader finishes and must not be updated or deleted. Treat the table as an
--- audit log — corrections go in new rows or compensating events. sdk_messages
--- and events share a per-run monotonic sequence number assigned at insert
--- time via run_sequence; readers merge the two on that column for the
--- canonical audit ordering.
+-- audit log — corrections go in new rows or compensating events.
 --
 -- Store contents are sensitive-by-default; payloads are persisted verbatim
--- and unredacted. Operators must treat the database file as confidential.
+-- and unredacted. The same contract extends to the per-run telemetry files
+-- under .flywheel/logs. Operators must treat the database file and the
+-- logs directory as confidential.
 --
 -- schema_version pins the on-disk schema version against the constant
 -- CURRENT_SCHEMA_VERSION declared in flywheel.store_protocols. Stores read
@@ -148,12 +156,13 @@ CREATE TABLE IF NOT EXISTS attempts (
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
 );
 
--- category discriminates a state-bearing 'domain' event (an event-sourced
--- member of the lifecycle log, folded into state) from a pure-observability
--- 'telemetry' event. Both share this table and the per-run sequence ordering
--- so the audit stream is one totally-ordered log; only domain rows are folded.
--- kind holds the DomainEventKind value for domain rows and the harness.*
--- string for telemetry rows.
+-- events: the domain-event ledger. Every row is a state-bearing,
+-- event-sourced member of the lifecycle log; kind holds the
+-- DomainEventKind value. sequence is per-run and strictly monotonic
+-- (MAX + 1 allocated inside the append transaction); list_domain_events
+-- replays rows in ascending sequence order. The UNIQUE (run_id, sequence)
+-- constraint both enforces the ordering invariant and provides the index
+-- that read path uses.
 CREATE TABLE IF NOT EXISTS events (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id          TEXT NOT NULL,
@@ -162,7 +171,6 @@ CREATE TABLE IF NOT EXISTS events (
   kind            TEXT NOT NULL,
   payload_json    TEXT NOT NULL,
   sequence        INTEGER NOT NULL,
-  category        TEXT NOT NULL DEFAULT 'telemetry',
   FOREIGN KEY (run_id) REFERENCES lifecycles(run_id),
   UNIQUE (run_id, sequence)
 );
@@ -197,56 +205,11 @@ CREATE TABLE IF NOT EXISTS grader_results (
   FOREIGN KEY (run_id, attempt_number) REFERENCES attempts(run_id, number)
 );
 
--- events read paths. idx_events_run serves telemetry reads ordered by
--- wall-clock; idx_events_run_sequence serves cursor-paginated audit-stream
--- reads over the shared per-run sequence. idx_events_domain is a partial
--- index over the domain minority so list_domain_events (the event-sourced
--- state fold run on every lifecycle load) scans only the rows it folds
--- instead of walking interleaved telemetry. The partial index is additive:
--- CREATE INDEX IF NOT EXISTS materializes it on reopen of an existing
--- database, so it needs no schema_version bump (same path as task_claims).
+-- events reads are served by the index the UNIQUE (run_id, sequence)
+-- constraint materializes; no separate events index is needed.
 -- grader_results reads are always scoped to one attempt's graders in ordinal
 -- order.
-CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, ts);
-CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence);
-CREATE INDEX IF NOT EXISTS idx_events_domain
-  ON events(run_id, sequence) WHERE category = 'domain';
 CREATE INDEX IF NOT EXISTS idx_grader_results_run_attempt ON grader_results(run_id, attempt_number, ordinal);
-
--- sdk_messages: verbatim agent SDK message stream per iteration. Keyed by
--- an autoincrement id; the per-run audit ordering is carried by the
--- (run_id, sequence) tuple that's also the table's uniqueness invariant.
--- payload_json is opaque JSON; the schema does not parse it. The
--- (run_id, attempt_number, iteration_number) index supports filtering an
--- iteration's worth of messages, and the (run_id, sequence) index covers
--- audit-stream reads keyed by the shared per-run cursor.
-CREATE TABLE IF NOT EXISTS sdk_messages (
-  id                INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id            TEXT    NOT NULL,
-  attempt_number    INTEGER NOT NULL,
-  iteration_number  INTEGER NOT NULL,
-  sequence          INTEGER NOT NULL,
-  message_type      TEXT    NOT NULL,
-  payload_json      TEXT    NOT NULL,
-  ts                DATETIME NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id),
-  UNIQUE (run_id, sequence)
-);
-CREATE INDEX IF NOT EXISTS idx_sdk_messages_run_sequence
-  ON sdk_messages(run_id, sequence);
-CREATE INDEX IF NOT EXISTS idx_sdk_messages_run_attempt_iter
-  ON sdk_messages(run_id, attempt_number, iteration_number);
-
--- run_sequence: per-run monotonic counter shared by events and sdk_messages.
--- Stores increment next_seq atomically via
--- `INSERT INTO run_sequence (run_id, next_seq) VALUES (?, 1)
---   ON CONFLICT(run_id) DO UPDATE SET next_seq = next_seq + 1 RETURNING next_seq`
--- so a single ordering exists across both write paths regardless of which
--- table the inserter targets.
-CREATE TABLE IF NOT EXISTS run_sequence (
-  run_id    TEXT PRIMARY KEY,
-  next_seq  INTEGER NOT NULL
-);
 
 -- Multi-worker mutual exclusion (the task_claims lease) is NOT a flywheel-core
 -- concern — a single task's lifecycle has no notion of competing workers. It
@@ -289,4 +252,4 @@ CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 10);
+INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 11);

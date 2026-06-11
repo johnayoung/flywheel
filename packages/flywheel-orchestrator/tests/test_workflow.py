@@ -22,7 +22,6 @@ from flywheel_core.envelope import Intent, ValidEnvelope
 from flywheel_core.harness import HarnessOutcome, InvocationRequest
 from flywheel_core.invoker import InvocationSignals, IterationResult
 from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
-from flywheel_core.store_protocols import EventRecord
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import CommandGrader, RubricGrader, ValidationError
@@ -1131,42 +1130,20 @@ def test_live_marks_runs_with_no_activity(tmp_path: Path) -> None:
         store.close()
 
 
-def test_live_ignores_telemetry_and_sdk_streams(tmp_path: Path) -> None:
-    """The relational snapshot never scans telemetry events or SDK
-    messages (spec 00025 FR-6): rows written there do not move totals,
-    breadcrumb, or activity."""
+def test_live_reads_relational_rows_only(tmp_path: Path) -> None:
+    """The relational snapshot is computed from lifecycles/attempts rows
+    alone (spec 00025 FR-6). The store exposes no telemetry write or read
+    at all, so a snapshot cannot scan telemetry even by accident."""
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
     try:
         running = _seed_running(store, "task-d")
-        store.append_event(
-            EventRecord(
-                run_id=running.run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_completed",
-                payload={
-                    "iteration": 9,
-                    "usage": {"total_tokens": 999},
-                    "total_cost_usd": 9.99,
-                    "num_turns": 9,
-                },
-                attempt_number=1,
-            )
-        )
-        store.save_sdk_messages(
-            run_id=running.run_id,
-            attempt_number=1,
-            iteration_number=9,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "noise"}],
-                }
-            ],
-        )
+        for forbidden in ("append_event", "save_sdk_messages"):
+            assert not hasattr(store, forbidden)
         rows = collect_live_rows(store)
         assert len(rows) == 1
         row = rows[0]
+        assert row.run_id == running.run_id
         assert row.tokens_total == 0
         assert row.cost_usd_total == 0.0
         assert row.iterations_completed == 0

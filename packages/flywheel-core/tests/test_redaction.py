@@ -53,7 +53,6 @@ def _event(payload: Mapping[str, Any]) -> EventRecord:
         attempt_number=1,
         id=42,
         sequence=7,
-        category="telemetry",
     )
 
 
@@ -105,7 +104,6 @@ def test_redact_preserves_event_record_type_and_metadata() -> None:
     assert out.attempt_number == record.attempt_number
     assert out.id == record.id
     assert out.sequence == record.sequence
-    assert out.category == record.category
 
 
 def test_redact_preserves_sdk_message_type_and_metadata() -> None:

@@ -2551,10 +2551,10 @@ class TestTelemetryStreamOrdering:
         assert [m.kind for m in mirrors] == [
             f"domain.{e.KIND.value}" for e in domain_rows
         ]
-        # The store holds no telemetry: the legacy events table sees no
-        # writes from the harness anymore.
-        assert store.list_events(lifecycle.run_id) == []
-        assert store.list_sdk_messages(lifecycle.run_id) == []
+        # The store holds no telemetry: the legacy telemetry verbs are
+        # gone from the surface entirely (spec 00025 FR-5).
+        assert not hasattr(store, "list_events")
+        assert not hasattr(store, "list_sdk_messages")
 
     def test_harness_domain_log_replays_to_the_stored_lifecycle(
         self,

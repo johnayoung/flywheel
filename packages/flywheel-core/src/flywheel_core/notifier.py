@@ -3,8 +3,8 @@
 A :class:`RunNotifier` is a *doorbell with a watermark*, not a delivery
 truck. A producer (a store) calls :meth:`notify` with the per-run
 ``sequence`` it just committed; a consumer (the audit follower) calls
-:meth:`wait` and, once woken, re-reads the authoritative records via
-``read_audit_since``. The notification carries only a watermark, never a
+:meth:`wait` and, once woken, re-reads the authoritative records from
+its source. The notification carries only a watermark, never a
 payload, so a dropped or coalesced signal costs latency, never
 correctness — every :meth:`wait` is bounded by a timeout, so the consumer
 makes progress even if a notification is missed entirely.

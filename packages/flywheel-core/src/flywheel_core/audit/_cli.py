@@ -519,6 +519,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--logs-root",
+        default=None,
+        help=(
+            "Telemetry logs root holding runs/<run_id>.jsonl (default: "
+            "the 'logs' directory next to the database)."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit one JSON object per record (NDJSON) instead of the text view.",
@@ -691,9 +699,15 @@ def main(
         if redactor is not None:
             _emit_redaction_notice(err, policy_label=policy_label)
 
+        logs_root = (
+            Path(args.logs_root)
+            if args.logs_root
+            else db_path.parent / "logs"
+        )
         iterator: Iterator[AuditRecord] = stream(
             args.run_id,
             store=store,
+            logs_root=logs_root,
             follow=args.follow,
             poll_interval=args.poll_interval,
         )

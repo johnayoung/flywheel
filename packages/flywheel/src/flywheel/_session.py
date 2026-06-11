@@ -15,9 +15,9 @@ Two surfaces are exported:
   content blocks inside one ``AssistantMessage`` produce multiple
   entries that share the record's ``sequence`` and disambiguate via
   ``sub_index`` so the strict per-run ordering survives a fan-out.
-* :class:`TranscriptTailer` — cursor-incremental reader over
-  :meth:`AuditStore.read_audit_since`. Each ``fetch()`` returns only
-  the records appended since the last call (FR-4 acceptance: tailing
+* :class:`TranscriptTailer` — cursor-incremental reader over the run's
+  telemetry JSONL file (spec 00025 FR-8). Each ``fetch()`` returns only
+  the lines appended since the last call (FR-4 acceptance: tailing
   is cursor-incremental, never re-reading full history per tick).
   Records are piped through the same default :class:`Redactor` policy
   the audit CLI applies on read so the session inherits the operator-
@@ -31,8 +31,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
+from flywheel_core.audit._file import FileCursor, read_records_since
 from flywheel_core.lifecycle import Status
 from flywheel_core.redaction import (
     EnvValueRedactor,
@@ -42,7 +44,6 @@ from flywheel_core.redaction import (
 )
 from flywheel_core.store_protocols import (
     AuditRecord,
-    AuditStore,
     EventRecord,
     SdkMessageRecord,
 )
@@ -1282,32 +1283,33 @@ def build_default_redactor() -> Redactor:
 
 
 class TranscriptTailer:
-    """Cursor-incremental tailer over one run's merged audit stream.
+    """Cursor-incremental tailer over one run's telemetry JSONL file.
 
-    Wraps :meth:`AuditStore.read_audit_since` so each :meth:`fetch` call
-    returns only the records written since the previous call. The
-    cursor is the per-run monotonic sequence the store assigns; it is
-    initialised to ``0`` (drain everything on first fetch) and advances
-    on the maximum sequence observed. Records are piped through the
-    same default :class:`Redactor` policy the audit CLI applies so the
-    session inherits the operator-facing read path's best-effort secret
-    suppression.
-
-    The tailer holds no I/O resources beyond the store handle; closing
-    or reopening the store is the caller's concern.
+    Reads ``<logs_root>/runs/<run_id>.jsonl`` (the per-run stream the
+    harness's :class:`~flywheel_core.store_protocols.TelemetrySink`
+    writes, spec 00025 FR-8) via
+    :func:`flywheel_core.audit._file.read_records_since`, so each
+    :meth:`fetch` call returns only the lines appended since the
+    previous call. The cursor is a byte-offset / line-count pair; a
+    missing file reads as empty (the tailer keeps polling until it
+    appears), and a partial trailing line is withheld until the writer
+    completes it. Records are piped through the same default
+    :class:`Redactor` policy the audit CLI applies so the session
+    inherits the operator-facing read path's best-effort secret
+    suppression. Terminal-status detection stays with the lifecycle
+    row — the session screen samples ``load_lifecycle`` separately.
     """
 
     def __init__(
         self,
-        store: AuditStore,
+        run_file: Path,
         run_id: str,
         *,
         redactor: Redactor | None = None,
-        cursor: int = 0,
     ) -> None:
-        self._store = store
+        self._run_file = Path(run_file)
         self._run_id = run_id
-        self._cursor = cursor
+        self._cursor = FileCursor()
         # ``redactor=None`` callers want explicit raw mode (tests etc.).
         # Construction is lazy via ``build_default_redactor`` so the env
         # var sweep only fires when defaulted -- a custom redactor stays
@@ -1318,13 +1320,13 @@ class TranscriptTailer:
 
     @property
     def cursor(self) -> int:
-        """The most recent sequence the tailer has read past.
+        """The count of complete lines the tailer has consumed.
 
         Public for tests so they can assert cursor-incremental progress
         without re-reading the full history.
         """
 
-        return self._cursor
+        return self._cursor.line
 
     @property
     def run_id(self) -> str:
@@ -1333,34 +1335,31 @@ class TranscriptTailer:
         return self._run_id
 
     def fetch(self) -> list[TranscriptEntry]:
-        """Return every transcript entry written since the last fetch.
+        """Return every transcript entry appended since the last fetch.
 
-        Drains the store via repeated :meth:`AuditStore.read_audit_since`
-        calls until a page comes back empty, exactly the way
-        :func:`flywheel_core.audit._drain` does. Each record passes through
-        the redactor (when set) before classification so the session
-        screen never sees the raw payload.
+        Reads the file from the saved byte offset, consuming only
+        complete lines. Each reconstructed record passes through the
+        redactor (when set) before classification so the session screen
+        never sees the raw payload.
 
         An empty list means "no new activity" -- the caller polls again
         on the next tick. The cursor is unchanged in that case so a
-        future write does not get skipped.
+        future write does not get skipped, and a partial trailing line
+        stays unconsumed until the writer finishes it.
         """
 
+        records, self._cursor = read_records_since(
+            self._run_file, self._cursor
+        )
         new_entries: list[TranscriptEntry] = []
-        while True:
-            page = self._store.read_audit_since(self._run_id, self._cursor)
-            if not page:
-                return new_entries
-            for raw_record in page:
-                record = (
-                    raw_record
-                    if self._redactor is None
-                    else self._redactor.redact(raw_record)
-                )
-                new_entries.extend(classify(record))
-                seq = record.sequence
-                if seq is not None and seq > self._cursor:
-                    self._cursor = seq
+        for raw_record in records:
+            record = (
+                raw_record
+                if self._redactor is None
+                else self._redactor.redact(raw_record)
+            )
+            new_entries.extend(classify(record))
+        return new_entries
 
 
 def is_terminal(status: Status) -> bool:

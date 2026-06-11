@@ -429,7 +429,8 @@ def _run_dashboard(
         for the duration of the screen.
         """
 
-        tailer = TranscriptTailer(store, run_id)
+        run_file = db_path.parent / "logs" / "runs" / f"{run_id}.jsonl"
+        tailer = TranscriptTailer(run_file, run_id)
 
         def fetch() -> list[TranscriptEntry]:
             return tailer.fetch()

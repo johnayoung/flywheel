@@ -14,8 +14,13 @@ from typing import Any
 
 from flywheel_core.lifecycle import Lifecycle, Status
 from flywheel_core.redaction import default_policy
-from flywheel_core.store_protocols import EventRecord, SdkMessageRecord
+from flywheel_core.store_protocols import (
+    EventRecord,
+    SdkMessageRecord,
+    TelemetryRecord,
+)
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 
 from flywheel._session import (
     EntryKind,
@@ -874,6 +879,27 @@ def test_is_terminal_matches_lifecycle_leaf_states() -> None:
     assert Status.DONE in TERMINAL_STATUSES
 
 
+def _append_assistant_line(
+    sink: FileTelemetrySink,
+    run_id: str,
+    payload: dict[str, Any],
+    *,
+    attempt_number: int = 1,
+    iteration_number: int = 1,
+) -> None:
+    """Write one AssistantMessage line the way the harness's sink does."""
+    sink.append_telemetry(
+        TelemetryRecord(
+            run_id=run_id,
+            ts=_NOW,
+            kind="AssistantMessage",
+            payload=payload,
+            attempt_number=attempt_number,
+            iteration_number=iteration_number,
+        )
+    )
+
+
 def _seed_running(store: SqliteStore, task_id: str) -> Lifecycle:
     lc = Lifecycle(task_id=task_id, run_id=f"run-{task_id}")
     lc.transition_to(Status.READY, now=_NOW)
@@ -888,42 +914,34 @@ def test_tailer_returns_only_new_records_per_call(tmp_path: Path) -> None:
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
+    sink = FileTelemetrySink(tmp_path / "logs")
+    run_file = tmp_path / "logs" / "runs"
     try:
         lc = _seed_running(store, "alpha")
-        store.save_sdk_messages(
-            run_id=lc.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "first"}],
-                }
-            ],
+        _append_assistant_line(
+            sink,
+            lc.run_id,
+            {"content": [{"type": "text", "text": "first"}]},
         )
         # Pass redactor=None so this test asserts pure cursor behaviour
         # without depending on the default-policy redactor's identity
         # for plain text.
-        tailer = TranscriptTailer(store, lc.run_id, redactor=None)
+        tailer = TranscriptTailer(
+            run_file / f"{lc.run_id}.jsonl", lc.run_id, redactor=None
+        )
         first = tailer.fetch()
         assert len(first) == 1
         assert first[0].body == "first"
         cursor_after_first = tailer.cursor
         assert cursor_after_first > 0
-        # No new records -> empty list, cursor unchanged.
+        # No new lines -> empty list, cursor unchanged.
         assert tailer.fetch() == []
         assert tailer.cursor == cursor_after_first
-        # New record after the cursor -> returned exactly once.
-        store.save_sdk_messages(
-            run_id=lc.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "second"}],
-                }
-            ],
+        # New line after the cursor -> returned exactly once.
+        _append_assistant_line(
+            sink,
+            lc.run_id,
+            {"content": [{"type": "text", "text": "second"}]},
         )
         second = tailer.fetch()
         assert len(second) == 1
@@ -931,6 +949,7 @@ def test_tailer_returns_only_new_records_per_call(tmp_path: Path) -> None:
         assert tailer.cursor > cursor_after_first
     finally:
         store.close()
+        sink.close()
 
 
 def test_tailer_default_redactor_suppresses_anthropic_keys(
@@ -941,29 +960,25 @@ def test_tailer_default_redactor_suppresses_anthropic_keys(
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
+    sink = FileTelemetrySink(tmp_path / "logs")
     try:
         lc = _seed_running(store, "beta")
         leaked = "sk-ant-api03-" + "A" * 95
-        store.save_sdk_messages(
-            run_id=lc.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [
-                        {"type": "text", "text": f"my key is {leaked}"}
-                    ],
-                }
-            ],
+        _append_assistant_line(
+            sink,
+            lc.run_id,
+            {"content": [{"type": "text", "text": f"my key is {leaked}"}]},
         )
-        tailer = TranscriptTailer(store, lc.run_id)
+        tailer = TranscriptTailer(
+            tmp_path / "logs" / "runs" / f"{lc.run_id}.jsonl", lc.run_id
+        )
         entries = tailer.fetch()
         assert len(entries) == 1
         assert leaked not in entries[0].body
         assert "[REDACTED" in entries[0].body
     finally:
         store.close()
+        sink.close()
 
 
 def test_tailer_custom_redactor_is_honoured(tmp_path: Path) -> None:
@@ -971,26 +986,55 @@ def test_tailer_custom_redactor_is_honoured(tmp_path: Path) -> None:
 
     db = tmp_path / "db.sqlite"
     store = SqliteStore(db)
+    sink = FileTelemetrySink(tmp_path / "logs")
     try:
         lc = _seed_running(store, "gamma")
-        store.save_sdk_messages(
-            run_id=lc.run_id,
-            attempt_number=1,
-            iteration_number=1,
-            messages=[
-                {
-                    "message_type": "AssistantMessage",
-                    "content": [{"type": "text", "text": "hello world"}],
-                }
-            ],
+        _append_assistant_line(
+            sink,
+            lc.run_id,
+            {"content": [{"type": "text", "text": "hello world"}]},
         )
         # default_policy alone (no env redactor) -- the text "hello world"
         # has no secret patterns so the body comes through verbatim.
-        tailer = TranscriptTailer(store, lc.run_id, redactor=default_policy())
+        tailer = TranscriptTailer(
+            tmp_path / "logs" / "runs" / f"{lc.run_id}.jsonl",
+            lc.run_id,
+            redactor=default_policy(),
+        )
         entries = tailer.fetch()
         assert entries[0].body == "hello world"
     finally:
         store.close()
+        sink.close()
+
+
+def test_tailer_missing_file_reads_as_empty_and_survives_deletion(
+    tmp_path: Path,
+) -> None:
+    """FR-8 edge cases: a run with no file yet fetches as empty, and
+    deleting the file mid-tail surfaces end-of-stream gracefully
+    instead of crashing the TUI."""
+
+    run_file = tmp_path / "logs" / "runs" / "run-gone.jsonl"
+    tailer = TranscriptTailer(run_file, "run-gone", redactor=None)
+    # No file yet: empty fetch, cursor untouched.
+    assert tailer.fetch() == []
+    assert tailer.cursor == 0
+
+    sink = FileTelemetrySink(tmp_path / "logs")
+    _append_assistant_line(
+        sink,
+        "run-gone",
+        {"content": [{"type": "text", "text": "hello"}]},
+    )
+    sink.close()
+    entries = tailer.fetch()
+    assert [e.body for e in entries] == ["hello"]
+
+    # Operator deletes the run file mid-tail: subsequent fetches are
+    # empty, never an exception.
+    run_file.unlink()
+    assert tailer.fetch() == []
 
 
 def test_build_default_redactor_is_safe_when_no_env_secrets() -> None:

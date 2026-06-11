@@ -3,10 +3,13 @@
 Split into three layers:
 
 * the :class:`RunNotifier` mechanism in isolation (deterministic, no
-  reliance on wall-clock thresholds beyond a generous timeout),
-* the store signalling its notifier on every audit write, and
-* the audit follow loop consuming push wakeups, plus the poll fallback
-  when a store exposes no notifier.
+  reliance on wall-clock thresholds beyond a generous timeout), and
+* the store signalling its notifier on every write.
+
+The audit follow loop no longer consumes notifier wakeups: since spec
+00025 the observability stream is tailed from the per-run JSONL file
+(see ``test_audit.py``), so the notifier serves in-process store
+consumers (e.g. live dashboards) only.
 """
 
 from __future__ import annotations
@@ -23,7 +26,6 @@ from flywheel_core import (
     Status,
     TransitionedTo,
 )
-from flywheel_core.audit import _resolve_notifier, stream
 
 _BASE = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -122,103 +124,4 @@ def test_store_writes_advance_the_notifier_watermark() -> None:
 
 
 def test_default_store_exposes_a_notifier() -> None:
-    assert _resolve_notifier(InMemoryStore()) is not None
-
-
-# --- Audit follow: push path and poll fallback ------------------------------
-
-
-def _drive_to_running(store: InMemoryStore, run_id: str) -> None:
-    _seed(store, run_id)
-    store.append_domain_event(
-        TransitionedTo(run_id=run_id, ts=_ts(1), target=Status.READY),
-        expected_version=1,
-    )
-    store.append_domain_event(
-        TransitionedTo(run_id=run_id, ts=_ts(2), target=Status.RUNNING),
-        expected_version=2,
-    )
-
-
-def test_follow_delivers_records_written_after_it_started() -> None:
-    """A follower blocked on the notifier collects a record appended later
-    and terminates once the lifecycle goes terminal. poll_interval is set
-    high so the run relies on the push wakeup, not the poll fallback."""
-    store = InMemoryStore()
-    run_id = "run-follow"
-    _drive_to_running(store, run_id)
-
-    def writer() -> None:
-        time.sleep(0.05)
-        store.append_event(
-            EventRecord(
-                run_id=run_id,
-                ts=_ts(3),
-                kind="harness.iteration_completed",
-            )
-        )
-        store.append_domain_event(
-            TransitionedTo(
-                run_id=run_id,
-                ts=_ts(4),
-                target=Status.FAILED,
-                error="boom",
-            ),
-            expected_version=3,
-        )
-
-    thread = threading.Thread(target=writer)
-    thread.start()
-    records = list(
-        stream(run_id, store=store, follow=True, poll_interval=5.0)
-    )
-    thread.join(2.0)
-
-    kinds = [r.kind for r in records if isinstance(r, EventRecord)]
-    assert "harness.iteration_completed" in kinds
-
-
-class _PollOnlyStore:
-    """Wraps a store but hides its notifier, forcing the poll fallback."""
-
-    def __init__(self, inner: InMemoryStore) -> None:
-        self._inner = inner
-
-    def read_audit_since(self, run_id: str, cursor: int) -> list:
-        return self._inner.read_audit_since(run_id, cursor)
-
-    def load_lifecycle(self, run_id: str):
-        return self._inner.load_lifecycle(run_id)
-
-
-def test_follow_without_notifier_falls_back_to_poll() -> None:
-    inner = InMemoryStore()
-    run_id = "run-poll"
-    _drive_to_running(inner, run_id)
-    store = _PollOnlyStore(inner)
-    assert _resolve_notifier(store) is None
-
-    def writer() -> None:
-        time.sleep(0.02)
-        inner.append_event(
-            EventRecord(run_id=run_id, ts=_ts(3), kind="late.event")
-        )
-        inner.append_domain_event(
-            TransitionedTo(
-                run_id=run_id,
-                ts=_ts(4),
-                target=Status.FAILED,
-                error="boom",
-            ),
-            expected_version=3,
-        )
-
-    thread = threading.Thread(target=writer)
-    thread.start()
-    records = list(
-        stream(run_id, store=store, follow=True, poll_interval=0.02)
-    )
-    thread.join(2.0)
-
-    kinds = [r.kind for r in records if isinstance(r, EventRecord)]
-    assert "late.event" in kinds
+    assert isinstance(InMemoryStore().notifier, RunNotifier)

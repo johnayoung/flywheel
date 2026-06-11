@@ -32,6 +32,9 @@ from flywheel_core import (
     attach_logger,
     stream,
 )
+from flywheel_core.store_protocols import TelemetryRecord
+from flywheel_core.telemetry_file import FileTelemetrySink
+
 from flywheel_core.audit._cli import (
     PREVIEW_MAX_CHARS,
     TRUNCATION_HINT,
@@ -56,9 +59,12 @@ def _make_store_with_lifecycle(run_id: str = "r1") -> InMemoryStore:
     return store
 
 
-def _append_event(store: InMemoryStore, run_id: str, kind: str) -> None:
-    store.append_event(
-        EventRecord(
+def _append_event(
+    sink: FileTelemetrySink, run_id: str, kind: str
+) -> None:
+    """Write one harness telemetry line to the run's JSONL file."""
+    sink.append_telemetry(
+        TelemetryRecord(
             run_id=run_id,
             ts=datetime.now(timezone.utc),
             kind=kind,
@@ -68,35 +74,48 @@ def _append_event(store: InMemoryStore, run_id: str, kind: str) -> None:
 
 
 def _save_sdk(
-    store: InMemoryStore,
+    sink: FileTelemetrySink,
     run_id: str,
     payloads: list[dict[str, Any]],
     *,
     attempt_number: int = 1,
     iteration_number: int = 1,
 ) -> None:
-    store.save_sdk_messages(run_id, attempt_number, iteration_number, payloads)
+    """Write one SDK-message line per payload, the sink-era shape."""
+    for payload in payloads:
+        sink.append_telemetry(
+            TelemetryRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind=str(payload.get("message_type", "assistant")),
+                payload=payload,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+            )
+        )
 
 
 # --- (a) stream(follow=False) drains everything in sequence order -----------
 
 
-def test_stream_drains_mixed_records_in_sequence_order() -> None:
+def test_stream_drains_mixed_records_in_sequence_order(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
-    _append_event(store, "r1", "harness.iteration_start")
-    _save_sdk(store, "r1", [{"message_type": "assistant", "text": "hi"}])
-    _append_event(store, "r1", "harness.envelope_observed")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.iteration_start")
+    _save_sdk(sink, "r1", [{"message_type": "assistant", "text": "hi"}])
+    _append_event(sink, "r1", "harness.envelope_observed")
     _save_sdk(
-        store,
+        sink,
         "r1",
         [
             {"message_type": "tool_use", "name": "Read"},
             {"message_type": "tool_result", "content": "ok"},
         ],
     )
-    _append_event(store, "r1", "harness.iteration_end")
+    _append_event(sink, "r1", "harness.iteration_end")
 
-    collected = list(stream("r1", store=store))
+    collected = list(stream("r1", store=store, logs_root=logs_root))
 
     # Six records (3 events + 3 SDK messages) total.
     assert len(collected) == 6
@@ -116,23 +135,29 @@ def test_stream_drains_mixed_records_in_sequence_order() -> None:
 # --- (b) unknown run_id yields nothing --------------------------------------
 
 
-def test_stream_unknown_run_id_yields_nothing() -> None:
+def test_stream_unknown_run_id_yields_nothing(tmp_path: Path) -> None:
     store = InMemoryStore()
-    assert list(stream("does-not-exist", store=store)) == []
+    assert list(stream(
+        "does-not-exist", store=store, logs_root=tmp_path / "logs"
+    )) == []
 
 
-def test_stream_unknown_run_id_with_follow_false_terminates() -> None:
+def test_stream_unknown_run_id_with_follow_false_terminates(tmp_path: Path) -> None:
     store = InMemoryStore()
     # follow=False on an unknown run should also return immediately
     # without spinning or polling.
-    assert list(stream("nope", store=store, follow=False)) == []
+    assert list(stream(
+        "nope", store=store, logs_root=tmp_path / "logs", follow=False
+    )) == []
 
 
 # --- (c) follow=True observes concurrent writes and exits on terminal --------
 
 
-def test_stream_follow_exits_when_lifecycle_reaches_terminal() -> None:
+def test_stream_follow_exits_when_lifecycle_reaches_terminal(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
     collected: list[Any] = []
     errors: list[BaseException] = []
     consumer_started = threading.Event()
@@ -141,7 +166,11 @@ def test_stream_follow_exits_when_lifecycle_reaches_terminal() -> None:
         consumer_started.set()
         try:
             for record in stream(
-                "r1", store=store, follow=True, poll_interval=0.02
+                "r1",
+                store=store,
+                logs_root=logs_root,
+                follow=True,
+                poll_interval=0.02,
             ):
                 collected.append(record)
         except BaseException as exc:  # pragma: no cover - surfaced by assert
@@ -152,11 +181,11 @@ def test_stream_follow_exits_when_lifecycle_reaches_terminal() -> None:
     consumer_started.wait(timeout=1.0)
 
     # Write records while the consumer thread is following.
-    _append_event(store, "r1", "harness.iteration_start")
+    _append_event(sink, "r1", "harness.iteration_start")
     time.sleep(0.05)
-    _save_sdk(store, "r1", [{"message_type": "assistant", "text": "ok"}])
+    _save_sdk(sink, "r1", [{"message_type": "assistant", "text": "ok"}])
     time.sleep(0.05)
-    _append_event(store, "r1", "harness.iteration_end")
+    _append_event(sink, "r1", "harness.iteration_end")
     time.sleep(0.05)
 
     # Transition to a terminal lifecycle state so the follow loop exits.
@@ -178,10 +207,12 @@ def test_stream_follow_exits_when_lifecycle_reaches_terminal() -> None:
     assert [r.sequence for r in collected] == [1, 2, 3]
 
 
-def test_stream_follow_against_already_terminal_run_returns_after_drain() -> None:
+def test_stream_follow_against_already_terminal_run_returns_after_drain(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
-    _append_event(store, "r1", "harness.iteration_start")
-    _append_event(store, "r1", "harness.iteration_end")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.iteration_start")
+    _append_event(sink, "r1", "harness.iteration_end")
     lc = store.load_lifecycle("r1")
     assert lc is not None
     lc.transition_to(Status.VALIDATING)
@@ -193,7 +224,9 @@ def test_stream_follow_against_already_terminal_run_returns_after_drain() -> Non
 
     start = time.monotonic()
     collected = list(
-        stream("r1", store=store, follow=True, poll_interval=5.0)
+        stream(
+            "r1", store=store, logs_root=logs_root, follow=True, poll_interval=5.0
+        )
     )
     elapsed = time.monotonic() - start
     # poll_interval=5.0 would dominate the runtime if the follow loop
@@ -203,7 +236,7 @@ def test_stream_follow_against_already_terminal_run_returns_after_drain() -> Non
     assert len(collected) == 2
 
 
-def test_stream_follow_does_not_drop_final_write_on_terminal() -> None:
+def test_stream_follow_does_not_drop_final_write_on_terminal(tmp_path: Path) -> None:
     """Race-style check for drain-then-exit ordering.
 
     A record committed *after* the terminal transition but *before* the
@@ -212,13 +245,19 @@ def test_stream_follow_does_not_drop_final_write_on_terminal() -> None:
     all before the consumer wakes up for its next poll.
     """
     store = _make_store_with_lifecycle("r1")
-    _append_event(store, "r1", "first")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.first")
 
     collected: list[Any] = []
 
     def consume() -> None:
         for record in stream(
-            "r1", store=store, follow=True, poll_interval=0.05
+            "r1",
+            store=store,
+            logs_root=logs_root,
+            follow=True,
+            poll_interval=0.05,
         ):
             collected.append(record)
 
@@ -238,12 +277,125 @@ def test_stream_follow_does_not_drop_final_write_on_terminal() -> None:
     store.update_lifecycle(lc, expected_version=lc.version - 1)
     # Write the final record after the terminal transition. The follow
     # loop must drain again before exiting.
-    _append_event(store, "r1", "last")
+    _append_event(sink, "r1", "harness.last")
 
     thread.join(timeout=2.0)
     assert not thread.is_alive()
     kinds = [r.kind for r in collected if isinstance(r, EventRecord)]
-    assert kinds == ["first", "last"]
+    assert kinds == ["harness.first", "harness.last"]
+
+
+# --- FR-8 file-cursor edge cases ---------------------------------------------
+
+
+def test_file_reader_withholds_partial_trailing_line(tmp_path: Path) -> None:
+    """A partial trailing line (crash mid-write or a read racing the
+    sink's flush) is withheld until the writer completes it; the cursor
+    does not advance past it."""
+    from flywheel_core.audit._file import FileCursor, read_records_since
+
+    run_file = tmp_path / "runs" / "r1.jsonl"
+    run_file.parent.mkdir(parents=True)
+    complete = json.dumps(
+        {"kind": "harness.one", "run_id": "r1", "ts": "2026-06-11T00:00:00+00:00", "payload": {}}
+    )
+    partial = '{"kind": "harness.two", "run_id": "r1"'
+    run_file.write_text(complete + "\n" + partial, encoding="utf-8")
+
+    records, cursor = read_records_since(run_file, FileCursor())
+    assert [r.kind for r in records if isinstance(r, EventRecord)] == [
+        "harness.one"
+    ]
+    assert len(records) == 1
+    # Re-reading from the same cursor yields nothing new while the
+    # partial line is incomplete.
+    again, cursor2 = read_records_since(run_file, cursor)
+    assert again == []
+    assert cursor2 == cursor
+
+    # The writer completes the line: the withheld record now surfaces.
+    with open(run_file, "a", encoding="utf-8") as handle:
+        handle.write(', "ts": "2026-06-11T00:00:01+00:00", "payload": {}}\n')
+    completed, cursor3 = read_records_since(run_file, cursor2)
+    assert [r.kind for r in completed if isinstance(r, EventRecord)] == [
+        "harness.two"
+    ]
+    assert len(completed) == 1
+    assert cursor3.line == 2
+
+
+def test_file_reader_discards_partial_line_on_eof_final(tmp_path: Path) -> None:
+    """With ``eof_final=True`` (terminal lifecycle, final drain) the
+    partial trailing line is discarded so a finished run re-reads
+    idempotently."""
+    from flywheel_core.audit._file import FileCursor, read_records_since
+
+    run_file = tmp_path / "runs" / "r1.jsonl"
+    run_file.parent.mkdir(parents=True)
+    run_file.write_text(
+        '{"kind": "harness.one", "run_id": "r1", "payload": {}}\n'
+        '{"kind": "harness.tru',
+        encoding="utf-8",
+    )
+
+    records, cursor = read_records_since(
+        run_file, FileCursor(), eof_final=True
+    )
+    assert [r.kind for r in records if isinstance(r, EventRecord)] == [
+        "harness.one"
+    ]
+    assert len(records) == 1
+    # The discarded partial advanced the offset to EOF.
+    again, cursor2 = read_records_since(run_file, cursor, eof_final=True)
+    assert again == []
+    assert cursor2 == cursor
+
+
+def test_stream_missing_file_reads_as_empty(tmp_path: Path) -> None:
+    """FR-8: a run with no file yet is an empty stream, not an error."""
+    store = _make_store_with_lifecycle("r1")
+    assert list(stream("r1", store=store, logs_root=tmp_path / "logs")) == []
+
+
+def test_stream_follow_waits_for_file_to_appear(tmp_path: Path) -> None:
+    """Follow mode keeps polling until the run file exists, then streams
+    its lines."""
+    store = _make_store_with_lifecycle("r1")
+    logs_root = tmp_path / "logs"
+    collected: list[Any] = []
+
+    def consume() -> None:
+        for record in stream(
+            "r1",
+            store=store,
+            logs_root=logs_root,
+            follow=True,
+            poll_interval=0.02,
+        ):
+            collected.append(record)
+
+    thread = threading.Thread(target=consume)
+    thread.start()
+    time.sleep(0.1)
+    assert collected == []  # no file yet
+
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.appeared")
+    sink.close()
+    time.sleep(0.1)
+
+    lc = store.load_lifecycle("r1")
+    assert lc is not None
+    lc.transition_to(Status.VALIDATING)
+    store.update_lifecycle(lc, expected_version=lc.version - 1)
+    lc = store.load_lifecycle("r1")
+    assert lc is not None
+    lc.transition_to(Status.DONE)
+    store.update_lifecycle(lc, expected_version=lc.version - 1)
+
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert [r.kind for r in collected] == ["harness.appeared"]
 
 
 # --- (d) attach_logger captures every record exactly once -------------------
@@ -272,17 +424,23 @@ def _build_isolated_logger(name: str) -> tuple[logging.Logger, _RecordingHandler
     return logger, handler
 
 
-def test_attach_logger_emits_one_record_per_audit_row() -> None:
+def test_attach_logger_emits_one_record_per_audit_row(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
-    _append_event(store, "r1", "harness.iteration_start")
-    _save_sdk(store, "r1", [{"message_type": "assistant", "text": "ok"}])
-    _append_event(store, "r1", "harness.iteration_end")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.iteration_start")
+    _save_sdk(sink, "r1", [{"message_type": "assistant", "text": "ok"}])
+    _append_event(sink, "r1", "harness.iteration_end")
 
     logger, handler = _build_isolated_logger(
         "test_audit.attach_logger.one_per_row"
     )
     handle = attach_logger(
-        logger, run_id="r1", store=store, poll_interval=0.02
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.02,
     )
     try:
         # Wait until all three persisted rows have been emitted.
@@ -302,13 +460,27 @@ def test_attach_logger_emits_one_record_per_audit_row() -> None:
         assert rec.levelno == logging.INFO
 
 
-def test_attach_logger_returns_distinct_handles_when_called_twice() -> None:
+def test_attach_logger_returns_distinct_handles_when_called_twice(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
     logger, _handler = _build_isolated_logger(
         "test_audit.attach_logger.distinct"
     )
-    h1 = attach_logger(logger, run_id="r1", store=store, poll_interval=0.05)
-    h2 = attach_logger(logger, run_id="r1", store=store, poll_interval=0.05)
+    h1 = attach_logger(
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.05,
+    )
+    h2 = attach_logger(
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.05,
+    )
     try:
         assert h1 is not h2
         assert isinstance(h1, AuditLoggerHandle)
@@ -321,13 +493,19 @@ def test_attach_logger_returns_distinct_handles_when_called_twice() -> None:
 # --- (e) detach() stops emission and joins the thread ----------------------
 
 
-def test_detach_stops_emission_and_joins_thread() -> None:
+def test_detach_stops_emission_and_joins_thread(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
-    _append_event(store, "r1", "early")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    _append_event(sink, "r1", "harness.early")
 
     logger, handler = _build_isolated_logger("test_audit.detach.stops")
     handle = attach_logger(
-        logger, run_id="r1", store=store, poll_interval=0.02
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.02,
     )
 
     deadline = time.monotonic() + 2.0
@@ -340,36 +518,48 @@ def test_detach_stops_emission_and_joins_thread() -> None:
 
     # After detach, additional writes must NOT be emitted.
     pre_count = len(handler.records)
-    _append_event(store, "r1", "late")
+    _append_event(sink, "r1", "harness.late")
     time.sleep(0.1)
     assert len(handler.records) == pre_count
 
 
-def test_detach_is_idempotent() -> None:
+def test_detach_is_idempotent(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
     logger, _handler = _build_isolated_logger("test_audit.detach.idempotent")
     handle = attach_logger(
-        logger, run_id="r1", store=store, poll_interval=0.02
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.02,
     )
     handle.detach()
     # Calling detach again must not raise even though the thread is gone.
     handle.detach()
 
 
-def test_detach_during_emission_does_not_raise() -> None:
+def test_detach_during_emission_does_not_raise(tmp_path: Path) -> None:
     """Detach while the background thread is emitting must not deadlock
     or raise. We pre-seed enough records that the thread is busy when
     detach() is called, then assert detach completes within the join
     timeout."""
     store = _make_store_with_lifecycle("r1")
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
     for i in range(50):
-        _append_event(store, "r1", f"e{i}")
+        _append_event(sink, "r1", f"harness.e{i}")
 
     logger, _handler = _build_isolated_logger(
         "test_audit.detach.during_emission"
     )
     handle = attach_logger(
-        logger, run_id="r1", store=store, poll_interval=0.02
+        logger,
+        run_id="r1",
+        store=store,
+        logs_root=logs_root,
+        poll_interval=0.02,
     )
 
     start = time.monotonic()
@@ -384,10 +574,12 @@ def test_detach_during_emission_does_not_raise() -> None:
 # --- Misc -------------------------------------------------------------------
 
 
-def test_stream_is_lazy_iterator() -> None:
+def test_stream_is_lazy_iterator(tmp_path: Path) -> None:
     """``stream`` returns an iterator, not a materialized list."""
     store = _make_store_with_lifecycle("r1")
-    it = stream("r1", store=store)
+    logs_root = tmp_path / "logs"
+    sink = FileTelemetrySink(logs_root)
+    it = stream("r1", store=store, logs_root=logs_root)
     # The audit module is documented as returning an Iterator. The
     # type-level test here is just that next() works without indexing.
     with pytest.raises(StopIteration):
@@ -510,31 +702,43 @@ def _build_sqlite_fixture(
         lc.transition_to(Status.RUNNING)
         store.update_lifecycle(lc, expected_version=2)
 
-        store.append_event(
-            EventRecord(
-                run_id=run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_start",
-                payload={"attempt": 1, "iteration": 1},
-                attempt_number=1,
+        # Telemetry lives in the per-run JSONL file next to the db
+        # (spec 00025); the CLI derives the same logs root from --db.
+        with FileTelemetrySink(db_path.parent / "logs") as sink:
+            sink.append_telemetry(
+                TelemetryRecord(
+                    run_id=run_id,
+                    ts=datetime.now(timezone.utc),
+                    kind="harness.iteration_start",
+                    payload={"attempt": 1, "iteration": 1},
+                    attempt_number=1,
+                )
             )
-        )
-        sdk_payload: dict[str, Any] = {
-            "message_type": "assistant",
-            "text": "hello world",
-        }
-        if extra_payload is not None:
-            sdk_payload.update(extra_payload)
-        store.save_sdk_messages(run_id, 1, 1, [sdk_payload])
-        store.append_event(
-            EventRecord(
-                run_id=run_id,
-                ts=datetime.now(timezone.utc),
-                kind="harness.iteration_end",
-                payload={"attempt": 1, "iteration": 1},
-                attempt_number=1,
+            sdk_payload: dict[str, Any] = {
+                "message_type": "assistant",
+                "text": "hello world",
+            }
+            if extra_payload is not None:
+                sdk_payload.update(extra_payload)
+            sink.append_telemetry(
+                TelemetryRecord(
+                    run_id=run_id,
+                    ts=datetime.now(timezone.utc),
+                    kind="assistant",
+                    payload=sdk_payload,
+                    attempt_number=1,
+                    iteration_number=1,
+                )
             )
-        )
+            sink.append_telemetry(
+                TelemetryRecord(
+                    run_id=run_id,
+                    ts=datetime.now(timezone.utc),
+                    kind="harness.iteration_end",
+                    payload={"attempt": 1, "iteration": 1},
+                    attempt_number=1,
+                )
+            )
 
         if terminal:
             lc = store.load_lifecycle(run_id)
@@ -776,8 +980,11 @@ def _build_sqlite_fixture_with_secret(
         lc.transition_to(Status.RUNNING)
         store.update_lifecycle(lc, expected_version=2)
 
-        store.append_event(
-            EventRecord(
+    finally:
+        store.close()
+    with FileTelemetrySink(db_path.parent / "logs") as sink:
+        sink.append_telemetry(
+            TelemetryRecord(
                 run_id=run_id,
                 ts=datetime.now(timezone.utc),
                 kind="harness.iteration_start",
@@ -785,20 +992,22 @@ def _build_sqlite_fixture_with_secret(
                 attempt_number=1,
             )
         )
-        store.save_sdk_messages(
-            run_id,
-            1,
-            1,
-            [
-                {
+        sink.append_telemetry(
+            TelemetryRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="assistant",
+                payload={
                     "message_type": "assistant",
                     "text": f"key is {secret}",
                     "tool_input": {"command": f"echo {secret}"},
-                }
-            ],
+                },
+                attempt_number=1,
+                iteration_number=1,
+            )
         )
-        store.append_event(
-            EventRecord(
+        sink.append_telemetry(
+            TelemetryRecord(
                 run_id=run_id,
                 ts=datetime.now(timezone.utc),
                 kind="harness.iteration_end",
@@ -806,8 +1015,6 @@ def _build_sqlite_fixture_with_secret(
                 attempt_number=1,
             )
         )
-    finally:
-        store.close()
     return run_id
 
 
@@ -872,12 +1079,15 @@ def test_cli_redact_policy_strict_denylists_tools(tmp_path: Path) -> None:
         assert lc is not None
         lc.transition_to(Status.RUNNING)
         store.update_lifecycle(lc, expected_version=2)
-        store.save_sdk_messages(
-            run_id,
-            1,
-            1,
-            [
-                {
+    finally:
+        store.close()
+    with FileTelemetrySink(db.parent / "logs") as sink:
+        sink.append_telemetry(
+            TelemetryRecord(
+                run_id=run_id,
+                ts=datetime.now(timezone.utc),
+                kind="assistant",
+                payload={
                     "message_type": "assistant",
                     "content": [
                         {
@@ -886,11 +1096,11 @@ def test_cli_redact_policy_strict_denylists_tools(tmp_path: Path) -> None:
                             "input": {"file_path": "/home/me/.env"},
                         }
                     ],
-                }
-            ],
+                },
+                attempt_number=1,
+                iteration_number=1,
+            )
         )
-    finally:
-        store.close()
 
     code, stdout, stderr = _run_cli(
         run_id, "--db", str(db), "--json", "--redact-policy", "strict"

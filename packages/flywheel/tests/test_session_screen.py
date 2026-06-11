@@ -24,7 +24,9 @@ from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Input, Static
 
 from flywheel_core.lifecycle import Lifecycle, Status
+from flywheel_core.store_protocols import TelemetryRecord
 from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.telemetry_file import FileTelemetrySink
 
 from flywheel._dashboard import DashboardApp
 from flywheel._session import EntryKind, TranscriptEntry, TranscriptTailer
@@ -960,34 +962,35 @@ def test_dashboard_enter_opens_session_escape_restores_selection(
         try:
             _write_running_lifecycle(store, "alpha")
             _write_running_lifecycle(store, "beta")
-            store.save_sdk_messages(
-                run_id="run-alpha",
-                attempt_number=1,
-                iteration_number=1,
-                messages=[
-                    {
-                        "message_type": "AssistantMessage",
-                        "content": [{"type": "text", "text": "alpha hello"}],
-                    }
-                ],
-            )
-            store.save_sdk_messages(
-                run_id="run-beta",
-                attempt_number=1,
-                iteration_number=1,
-                messages=[
-                    {
-                        "message_type": "AssistantMessage",
-                        "content": [{"type": "text", "text": "beta hello"}],
-                    }
-                ],
-            )
+            with FileTelemetrySink(tmp_path / "logs") as sink:
+                for run_id, text in (
+                    ("run-alpha", "alpha hello"),
+                    ("run-beta", "beta hello"),
+                ):
+                    sink.append_telemetry(
+                        TelemetryRecord(
+                            run_id=run_id,
+                            ts=datetime.now(timezone.utc),
+                            kind="AssistantMessage",
+                            payload={
+                                "content": [
+                                    {"type": "text", "text": text}
+                                ]
+                            },
+                            attempt_number=1,
+                            iteration_number=1,
+                        )
+                    )
 
             opened_with: list[str] = []
 
             def open_session(run_id: str, task_id: str) -> SessionScreen | None:
                 opened_with.append(run_id)
-                tailer = TranscriptTailer(store, run_id, redactor=None)
+                tailer = TranscriptTailer(
+                    tmp_path / "logs" / "runs" / f"{run_id}.jsonl",
+                    run_id,
+                    redactor=None,
+                )
                 return SessionScreen(
                     run_id=run_id,
                     task_id=task_id,

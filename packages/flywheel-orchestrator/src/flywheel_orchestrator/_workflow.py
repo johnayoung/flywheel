@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 from flywheel_core.harness import (
@@ -67,7 +69,12 @@ from flywheel_orchestrator._sources import (
     iter_active_task_files,
     load_active_tasks,
 )
-from flywheel_orchestrator._store_factory import open_sqlite_bound_store
+from flywheel_orchestrator._store_factory import (
+    PG_DSN_ENV,
+    PG_DSN_FALLBACK_ENV,
+    open_sqlite_bound_store,
+    resolve_postgres_dsn,
+)
 
 DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
 
@@ -1540,14 +1547,12 @@ logs/
 .merge.lock
 """
 
-_INIT_POLICY = """\
+_INIT_POLICY_HEADER = """\
 # Flywheel work policy: where work comes from and where runtime state lives.
 # Committed with the repo; CLI flags always override.
+"""
 
-[source]
-kind = "directory"
-tasks_dir = ".flywheel/tasks"
-
+_INIT_POLICY_TAIL = """\
 [paths]
 db = ".flywheel/flywheel.sqlite"
 sandbox_root = ".flywheel/sandboxes"
@@ -1564,11 +1569,391 @@ sandbox_root = ".flywheel/sandboxes"
 # model = "claude-sonnet-4-5"
 """
 
+_INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
+
+_INIT_SOURCE_KINDS: tuple[str, ...] = ("directory", "github")
+
+_INIT_DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
+
+# owner: GitHub usernames/orgs are alphanumeric with interior hyphens;
+# name: repo names add dots and underscores. Tight enough that a value
+# can be embedded in a TOML basic string without escaping.
+_GITHUB_REPO_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$"
+)
+
+_GITHUB_ORIGIN_RE = re.compile(
+    r"github\.com[:/](?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/"
+    r"(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+
+# Mirrors PostgresStore's identifier-safe schema validation so a bad name
+# fails at the prompt instead of on the worker's first store open.
+_PG_SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class _InitUsageError(Exception):
+    """Inconsistent or invalid ``init`` flag values (exit 2, no policy
+    file written)."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class _InitAnswers:
+    """The resolved init choices, however they were answered (prompt,
+    flag, or default)."""
+
+    store_backend: str
+    store_schema: str | None = None
+    source_kind: str
+    github_repo: str | None = None
+    github_label: str | None = None
+    github_done_action: str = "comment"
+
+
+def _render_init_policy(answers: _InitAnswers) -> str:
+    """Render ``flywheel.toml`` from the answers.
+
+    No credential is ever an input here: the postgres DSN lives only in
+    the environment (spec FR-4), so it cannot appear in the rendered file.
+    """
+    if answers.source_kind == "directory":
+        source_block = (
+            '[source]\n'
+            'kind = "directory"\n'
+            'tasks_dir = ".flywheel/tasks"\n'
+        )
+    else:
+        source_block = (
+            f'[source]\n'
+            f'kind = "github"\n'
+            f'repo = "{answers.github_repo}"\n'
+            f'label = "{answers.github_label}"\n'
+            f'done_action = "{answers.github_done_action}"\n'
+        )
+    store_block = f'[store]\nbackend = "{answers.store_backend}"\n'
+    if answers.store_schema is not None:
+        store_block += f'schema = "{answers.store_schema}"\n'
+    return "".join(
+        (
+            _INIT_POLICY_HEADER,
+            "\n",
+            source_block,
+            "\n",
+            store_block,
+            "\n",
+            _INIT_POLICY_TAIL,
+        )
+    )
+
+
+def _prompt_line(prompt: str) -> str:
+    """One plain stdin/stdout prompt round-trip.
+
+    Raises :class:`EOFError` when stdin is exhausted so a closed pipe
+    mid-flow aborts init instead of silently accepting defaults for the
+    remaining questions.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    line = sys.stdin.readline()
+    if line == "":
+        raise EOFError("stdin closed during init prompts")
+    return line.strip()
+
+
+def _prompt_choice(
+    label: str, choices: tuple[str, ...], default: str
+) -> str:
+    rendered = "/".join(
+        f"[{choice}]" if choice == default else choice for choice in choices
+    )
+    while True:
+        raw = _prompt_line(f"{label} ({rendered}): ")
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(
+            f"  invalid value {raw!r}; choose one of: {', '.join(choices)}"
+        )
+
+
+def _validate_pg_schema(value: str) -> str | None:
+    if not _PG_SCHEMA_RE.match(value):
+        return (
+            f"invalid schema name {value!r}: must match "
+            f"[A-Za-z_][A-Za-z0-9_]*"
+        )
+    return None
+
+
+def _validate_github_repo(value: str) -> str | None:
+    if not _GITHUB_REPO_RE.match(value):
+        return f"invalid repo {value!r}: expected owner/name"
+    return None
+
+
+def _validate_github_label(value: str) -> str | None:
+    if not value or any(ch in value for ch in ('"', "\\", "\n")):
+        return (
+            f"invalid label {value!r}: must be non-empty and contain no "
+            f"quotes or backslashes"
+        )
+    return None
+
+
+def _prompt_pg_schema() -> str | None:
+    while True:
+        raw = _prompt_line("postgres schema [none]: ")
+        if not raw:
+            return None
+        error = _validate_pg_schema(raw)
+        if error is None:
+            return raw
+        print(f"  {error}")
+
+
+def _prompt_github_repo(default: str | None) -> str:
+    suffix = f" [{default}]" if default else ""
+    while True:
+        raw = _prompt_line(f"github repo (owner/name){suffix}: ")
+        value = raw or (default or "")
+        if not value:
+            print("  a repo is required (owner/name)")
+            continue
+        error = _validate_github_repo(value)
+        if error is None:
+            return value
+        print(f"  {error}")
+
+
+def _prompt_github_label() -> str:
+    while True:
+        raw = _prompt_line("issue label [flywheel]: ")
+        value = raw or "flywheel"
+        error = _validate_github_label(value)
+        if error is None:
+            return value
+        print(f"  {error}")
+
+
+def _github_repo_from_origin() -> str | None:
+    """Parse ``owner/name`` from the ``origin`` remote, or ``None``.
+
+    Absent remote, non-GitHub-shaped URL, or any subprocess failure all
+    degrade to "no default" -- the repo prompt then has no pre-fill and
+    the non-interactive github path requires an explicit ``--repo``.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _GITHUB_ORIGIN_RE.search(proc.stdout.strip())
+    if match is None:
+        return None
+    return f"{match.group('owner')}/{match.group('name')}"
+
+
+def _sanitize_connection_error(message: str, dsn: str) -> str:
+    """Strip the DSN (and, defensively, its password) from an error.
+
+    Host and database name surviving in the message is acceptable per
+    spec; the verbatim DSN or password never is.
+    """
+    sanitized = message.replace(dsn, "<dsn>")
+    try:
+        password = urlsplit(dsn).password
+    except ValueError:
+        password = None
+    if password:
+        sanitized = sanitized.replace(password, "<password>")
+    return " ".join(sanitized.split())
+
+
+def _check_postgres_connection(dsn: str) -> str | None:
+    """Test-connect to ``dsn``; return a sanitized error or ``None``.
+
+    A short timeout keeps a wrong DSN from hanging init. Only called
+    when the postgres extra imported successfully, so the local import
+    cannot fail here.
+    """
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn, connect_timeout=5):
+            pass
+    except Exception as exc:
+        return _sanitize_connection_error(str(exc), dsn)
+    return None
+
+
+def _report_postgres_environment() -> None:
+    """Print the postgres readiness report (spec FR-4/FR-5).
+
+    Never raises and never blocks init: a missing extra, an unset DSN
+    env var, and a failed connection each print and return -- the
+    config is written regardless and init exits 0.
+    """
+    extra_ok = True
+    try:
+        import flywheel_core.store_postgres  # noqa: F401
+    except ImportError:
+        extra_ok = False
+        print(
+            "warning: the postgres extra is not installed; "
+            "install with: uv add 'flywheel[postgres]'"
+        )
+    dsn = resolve_postgres_dsn()
+    if dsn is None:
+        print(
+            f"postgres: no DSN found; set {PG_DSN_ENV} (or "
+            f"{PG_DSN_FALLBACK_ENV}) before running flywheel worker"
+        )
+        return
+    if not extra_ok:
+        return
+    error = _check_postgres_connection(dsn)
+    if error is None:
+        print("postgres: connection OK")
+    else:
+        print(f"warning: postgres connection failed: {error}")
+
+
+def _collect_init_answers(
+    args: argparse.Namespace, *, interactive: bool
+) -> _InitAnswers:
+    """Resolve every init choice from flags, prompts, or defaults.
+
+    Each flag suppresses exactly its own prompt (spec FR-2); with
+    ``interactive`` false every unanswered choice takes its default.
+    Flag values fail with the same messages the prompts re-prompt with.
+    """
+    if args.store is not None:
+        backend = args.store
+    elif interactive:
+        backend = _prompt_choice(
+            "store backend", _INIT_STORE_BACKENDS, "sqlite"
+        )
+    else:
+        backend = "sqlite"
+
+    schema: str | None = None
+    if backend == "postgres":
+        if args.pg_schema is not None:
+            flag_schema: str = args.pg_schema.strip()
+            error = _validate_pg_schema(flag_schema)
+            if error is not None:
+                raise _InitUsageError(error)
+            schema = flag_schema
+        elif interactive:
+            schema = _prompt_pg_schema()
+        _report_postgres_environment()
+    elif args.pg_schema is not None:
+        raise _InitUsageError(
+            "--pg-schema applies only to the postgres store backend; "
+            "the selected backend is 'sqlite'"
+        )
+
+    if args.source is not None:
+        kind = args.source
+    elif interactive:
+        kind = _prompt_choice(
+            "work source", _INIT_SOURCE_KINDS, "directory"
+        )
+    else:
+        kind = "directory"
+
+    if kind == "directory":
+        if args.repo is not None or args.label is not None:
+            raise _InitUsageError(
+                "--repo/--label apply only to the github work source; "
+                "the selected source is 'directory'"
+            )
+        return _InitAnswers(
+            store_backend=backend,
+            store_schema=schema,
+            source_kind="directory",
+        )
+
+    origin_default = _github_repo_from_origin()
+    if args.repo is not None:
+        repo = args.repo.strip()
+        error = _validate_github_repo(repo)
+        if error is not None:
+            raise _InitUsageError(error)
+    elif interactive:
+        repo = _prompt_github_repo(origin_default)
+    elif origin_default is not None:
+        repo = origin_default
+    else:
+        raise _InitUsageError(
+            "the github work source needs --repo OWNER/NAME (the origin "
+            "remote is absent or not GitHub-shaped)"
+        )
+
+    if args.label is not None:
+        label = args.label.strip()
+        error = _validate_github_label(label)
+        if error is not None:
+            raise _InitUsageError(error)
+    elif interactive:
+        label = _prompt_github_label()
+    else:
+        label = "flywheel"
+
+    if interactive:
+        done_action = _prompt_choice(
+            "done action", _INIT_DONE_ACTIONS, "comment"
+        )
+    else:
+        done_action = "comment"
+
+    return _InitAnswers(
+        store_backend=backend,
+        store_schema=schema,
+        source_kind="github",
+        github_repo=repo,
+        github_label=label,
+        github_done_action=done_action,
+    )
+
+
+def _print_init_next_steps(store_backend: str | None) -> None:
+    print("Next steps:")
+    print(
+        f"  1. Drop one JSON file per task into "
+        f"{INIT_ROOT}/tasks/active/<phase>/ (see docs/task-schema.md; "
+        f"'goal' and 'graders' are the only required fields)."
+    )
+    print("  2. Run: flywheel worker")
+    print("  3. Watch: flywheel status / live")
+    if store_backend == "postgres":
+        print()
+        print(
+            f"The postgres DSN is read from {PG_DSN_ENV} (fallback: "
+            f"{PG_DSN_FALLBACK_ENV}) at runtime; it is never stored in "
+            f"flywheel.toml."
+        )
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Scaffold ``.flywheel/`` and a ``flywheel.toml`` in the working dir.
 
-    Idempotent: existing files are left untouched and reported, so re-running
-    ``init`` never clobbers a tuned policy or an in-use task queue.
+    Idempotent: existing files are left untouched and reported, so
+    re-running ``init`` never clobbers a tuned policy or an in-use task
+    queue. On a TTY (without ``--defaults``) the store backend and work
+    source are prompted for; flags pre-answer individual prompts; a
+    non-TTY stdin behaves exactly like ``--defaults``. Answers are
+    collected fully before the policy file is written, so aborting
+    mid-prompts (Ctrl-C / EOF) never leaves a partial ``flywheel.toml``.
     """
     created: list[str] = []
     existing: list[str] = []
@@ -1584,21 +1969,46 @@ def _cmd_init(args: argparse.Namespace) -> int:
     ensure_file(INIT_ROOT / "tasks" / "active" / ".gitkeep", "")
     ensure_file(INIT_ROOT / "tasks" / "archive" / ".gitkeep", "")
     ensure_file(INIT_ROOT / ".gitignore", _INIT_GITIGNORE)
-    ensure_file(Path(DEFAULT_POLICY_FILENAME), _INIT_POLICY)
 
     for path in created:
         print(f"created: {path}")
     for path in existing:
         print(f"exists:  {path} (left untouched)")
+
+    policy_path = Path(DEFAULT_POLICY_FILENAME)
+    if policy_path.exists():
+        # Reconfiguring an existing policy is a separate flow; this one
+        # preserves the historical never-touch guarantee.
+        print(f"exists:  {policy_path} (left untouched)")
+        print()
+        _print_init_next_steps(None)
+        return 0
+
+    interactive = sys.stdin.isatty() and not args.defaults
+    try:
+        answers = _collect_init_answers(args, interactive=interactive)
+    except _InitUsageError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        print(
+            "init: interrupted; flywheel.toml was not written",
+            file=sys.stderr,
+        )
+        return 130
+    except EOFError:
+        print(
+            "init: stdin closed before the prompts finished; "
+            "flywheel.toml was not written",
+            file=sys.stderr,
+        )
+        return 1
+
+    policy_path.write_text(_render_init_policy(answers), encoding="utf-8")
+    print(f"created: {policy_path}")
     print()
-    print("Next steps:")
-    print(
-        f"  1. Drop one JSON file per task into "
-        f"{INIT_ROOT}/tasks/active/<phase>/ (see docs/task-schema.md; "
-        f"'goal' and 'graders' are the only required fields)."
-    )
-    print("  2. Run: flywheel worker")
-    print("  3. Watch: flywheel status / live")
+    _print_init_next_steps(answers.store_backend)
     return 0
 
 def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
@@ -1636,7 +2046,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Scaffold .flywheel/ (tasks dir, gitignored runtime state) and "
             "a flywheel.toml work policy in the current directory. "
+            "Prompts for store backend and work source on a TTY; flags "
+            "pre-answer prompts; a non-TTY stdin takes every default. "
             "Idempotent; never overwrites existing files."
+        ),
+    )
+    p_init.add_argument(
+        "--store",
+        choices=_INIT_STORE_BACKENDS,
+        default=None,
+        help=(
+            "Store backend recorded as [store] backend "
+            "(pre-answers the prompt; default: sqlite)."
+        ),
+    )
+    p_init.add_argument(
+        "--pg-schema",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Postgres schema name recorded as [store] schema "
+            "(postgres backend only)."
+        ),
+    )
+    p_init.add_argument(
+        "--source",
+        choices=_INIT_SOURCE_KINDS,
+        default=None,
+        help=(
+            "Work source kind recorded as [source] kind "
+            "(pre-answers the prompt; default: directory)."
+        ),
+    )
+    p_init.add_argument(
+        "--repo",
+        default=None,
+        metavar="OWNER/NAME",
+        help=(
+            "GitHub repo for the github work source "
+            "(default: parsed from the origin remote)."
+        ),
+    )
+    p_init.add_argument(
+        "--label",
+        default=None,
+        help=(
+            "Issue label for the github work source (default: flywheel)."
+        ),
+    )
+    p_init.add_argument(
+        "--defaults",
+        action="store_true",
+        help=(
+            "Accept every default without prompting (a non-TTY stdin "
+            "implies this)."
         ),
     )
     p_init.set_defaults(func=_cmd_init)

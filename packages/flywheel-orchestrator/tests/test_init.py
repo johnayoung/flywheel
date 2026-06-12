@@ -315,25 +315,28 @@ def test_init_github_defaults_without_origin_errors(
 # --- interactive prompts (spec FR-1 / FR-10) ---------------------------------
 
 
-def test_init_interactive_all_defaults_is_two_enters(
+def test_init_interactive_all_defaults_is_three_enters(
     repo: Path, monkeypatch, capsys
 ) -> None:
-    _interactive(monkeypatch, "", "")
+    _interactive(monkeypatch, "", "", "")
     assert main(["init"]) == 0
 
     out = capsys.readouterr().out
     assert "store backend ([sqlite]/postgres): " in out
     assert "work source ([directory]/github): " in out
+    assert "install Claude Code skills" in out
 
     policy = load_policy(repo / "flywheel.toml")
     assert policy.store_backend == "sqlite"
     assert policy.source_kind == "directory"
+    # The skills prompt defaults to yes, so the all-enters path installs.
+    assert (repo / ".claude" / "skills" / "fw-plan" / "SKILL.md").is_file()
 
 
 def test_init_interactive_invalid_choice_reprompts(
     repo: Path, monkeypatch, capsys
 ) -> None:
-    _interactive(monkeypatch, "mysql", "sqlite", "")
+    _interactive(monkeypatch, "mysql", "sqlite", "", "n")
     assert main(["init"]) == 0
     out = capsys.readouterr().out
     assert "invalid value 'mysql'" in out
@@ -354,6 +357,7 @@ def test_init_interactive_postgres_github_flow(
         "octo/widgets",  # repo (no origin default)
         "",  # label -> flywheel
         "close",  # done action
+        "n",  # skills -> no
     )
     assert main(["init"]) == 0
 
@@ -376,7 +380,7 @@ def test_init_interactive_repo_prompt_prefills_origin(
     monkeypatch.setattr(
         _workflow, "_github_repo_from_origin", lambda: "octo/widgets"
     )
-    _interactive(monkeypatch, "", "github", "", "", "")
+    _interactive(monkeypatch, "", "github", "", "", "", "n")
     assert main(["init"]) == 0
     out = capsys.readouterr().out
     assert "github repo (owner/name) [octo/widgets]: " in out
@@ -390,7 +394,7 @@ def test_init_interactive_invalid_repo_reprompts(
         _workflow, "_github_repo_from_origin", lambda: None
     )
     _interactive(
-        monkeypatch, "", "github", "not-a-repo", "octo/widgets", "", ""
+        monkeypatch, "", "github", "not-a-repo", "octo/widgets", "", "", "n"
     )
     assert main(["init"]) == 0
     out = capsys.readouterr().out
@@ -403,7 +407,8 @@ def test_init_interactive_flag_suppresses_its_prompt(
 ) -> None:
     """``--store postgres`` on a TTY skips the backend prompt but still
     asks the remaining questions."""
-    _interactive(monkeypatch, "", "")  # schema -> none, source -> directory
+    # schema -> none, source -> directory, skills -> no
+    _interactive(monkeypatch, "", "", "n")
     assert main(["init", "--store", "postgres"]) == 0
     out = capsys.readouterr().out
     assert "store backend" not in out
@@ -466,6 +471,7 @@ def test_init_reconfigure_round_trip_preserves_hand_tuned_keys(
         "postgres",  # store backend
         "flywheel_ci",  # postgres schema
         "",  # work source -> directory (default)
+        "n",  # skills -> no
     )
 
     assert main(["init"]) == 0
@@ -503,7 +509,8 @@ def test_init_reconfigure_pre_store_config_gains_store_section(
         '[agent]\n'
         'model = "claude-opus-4-7"\n'
     )
-    _interactive(monkeypatch, "y", "", "")  # reconfigure, sqlite, directory
+    # reconfigure, sqlite, directory, no skills
+    _interactive(monkeypatch, "y", "", "", "n")
 
     assert main(["init"]) == 0
 
@@ -530,7 +537,7 @@ def test_init_reconfigure_github_to_directory_drops_github_keys(
         '[store]\n'
         'backend = "sqlite"\n'
     )
-    _interactive(monkeypatch, "y", "", "directory")
+    _interactive(monkeypatch, "y", "", "directory", "n")
 
     assert main(["init"]) == 0
 

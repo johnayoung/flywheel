@@ -72,6 +72,12 @@ from flywheel_orchestrator._policy import (
     build_work_source,
     load_policy,
 )
+from flywheel_orchestrator._skills import (
+    DEFAULT_SKILLS_ROOT,
+    SKILL_NAMES,
+    install_skills,
+    settings_from_policy,
+)
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
     WorkItem,
@@ -1695,6 +1701,11 @@ class _InitAnswers:
     github_repo: str | None = None
     github_label: str | None = None
     github_done_action: str = "comment"
+    # Whether to install the Claude Code skills (fw-spec / fw-plan /
+    # fw-retro / fw-improve) into .claude/skills/. Interactive default
+    # is yes; non-interactive runs install only with an explicit
+    # ``--skills`` flag so ``--defaults`` never writes into .claude/.
+    install_skills: bool = False
 
 
 def _render_source_block(
@@ -1945,6 +1956,46 @@ def _report_postgres_environment() -> None:
         print(f"warning: postgres connection failed: {error}")
 
 
+def _resolve_install_skills(
+    args: argparse.Namespace, *, interactive: bool
+) -> bool:
+    """Resolve the install-skills choice from flag, prompt, or default.
+
+    ``--skills`` / ``--no-skills`` pre-answer the prompt. Interactive
+    runs default to yes; non-interactive runs default to no so a bare
+    ``--defaults`` (or non-TTY stdin) never writes into ``.claude/``
+    without an explicit flag.
+    """
+    if args.skills is not None:
+        return bool(args.skills)
+    if interactive:
+        return _prompt_yes_no(
+            f"install Claude Code skills ({', '.join(SKILL_NAMES)})?",
+            default=True,
+        )
+    return False
+
+
+def _install_skills_from_policy_file(policy_path: Path) -> None:
+    """Render and install the managed skills for the policy on disk.
+
+    The policy is re-loaded from ``policy_path`` (rather than rebuilt
+    from answers) so the render binds to exactly what the file says —
+    including keys init does not own, like a hand-tuned ``tasks_dir``.
+    A missing file renders the built-in defaults.
+    """
+    policy = load_policy(policy_path) if policy_path.is_file() else None
+    report = install_skills(
+        DEFAULT_SKILLS_ROOT, settings_from_policy(policy)
+    )
+    for path in report.created:
+        print(f"created: {path}")
+    for path in report.updated:
+        print(f"updated: {path}")
+    for path in report.skipped:
+        print(f"exists:  {path} (user-owned, left untouched)")
+
+
 def _collect_init_answers(
     args: argparse.Namespace, *, interactive: bool
 ) -> _InitAnswers:
@@ -1999,6 +2050,9 @@ def _collect_init_answers(
             store_backend=backend,
             store_schema=schema,
             source_kind="directory",
+            install_skills=_resolve_install_skills(
+                args, interactive=interactive
+            ),
         )
 
     origin_default = _github_repo_from_origin()
@@ -2041,16 +2095,26 @@ def _collect_init_answers(
         github_repo=repo,
         github_label=label,
         github_done_action=done_action,
+        install_skills=_resolve_install_skills(
+            args, interactive=interactive
+        ),
     )
 
 
-def _print_init_next_steps(store_backend: str | None) -> None:
+def _print_init_next_steps(
+    store_backend: str | None, *, skills_installed: bool = False
+) -> None:
     print("Next steps:")
     print(
         f"  1. Drop one JSON file per task into "
-        f"{INIT_ROOT}/tasks/active/<phase>/ (see docs/task-schema.md; "
-        f"'goal' and 'graders' are the only required fields)."
+        f"{INIT_ROOT}/tasks/active/<phase>/ "
+        f"('goal' and 'graders' are the only required fields)."
     )
+    if skills_installed:
+        print(
+            "     Or, in Claude Code: /fw-spec to spec a feature, "
+            "/fw-plan to queue tasks."
+        )
     print("  2. Run: flywheel worker")
     print("  3. Watch: flywheel status / live")
     if store_backend == "postgres":
@@ -2214,8 +2278,14 @@ def _reconfigure_policy(
         _rewrite_policy_text(original, data, answers), encoding="utf-8"
     )
     print(f"updated: {policy_path}")
+    if answers.install_skills:
+        # Regenerate against the just-rewritten policy so a changed
+        # tasks_dir / work source propagates into the managed skills.
+        _install_skills_from_policy_file(policy_path)
     print()
-    _print_init_next_steps(answers.store_backend)
+    _print_init_next_steps(
+        answers.store_backend, skills_installed=answers.install_skills
+    )
     return 0
 
 
@@ -2259,10 +2329,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if policy_path.exists():
         if not interactive:
             # Non-interactive re-runs preserve the historical never-touch
-            # guarantee (spec FR-3 / FR-9).
+            # guarantee (spec FR-3 / FR-9) for the policy file. An
+            # explicit --skills still (re)generates the managed skills
+            # against the policy as it stands, so a settings change can
+            # be propagated scriptably: edit flywheel.toml, then run
+            # ``flywheel init --skills --defaults``.
             print(f"exists:  {policy_path} (left untouched)")
+            if args.skills:
+                _install_skills_from_policy_file(policy_path)
             print()
-            _print_init_next_steps(None)
+            _print_init_next_steps(
+                None, skills_installed=bool(args.skills)
+            )
             return 0
         return _reconfigure_policy(args, policy_path)
 
@@ -2288,8 +2366,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
     policy_path.write_text(_render_init_policy(answers), encoding="utf-8")
     print(f"created: {policy_path}")
+    if answers.install_skills:
+        _install_skills_from_policy_file(policy_path)
     print()
-    _print_init_next_steps(answers.store_backend)
+    _print_init_next_steps(
+        answers.store_backend, skills_installed=answers.install_skills
+    )
     return 0
 
 def _add_common_tasks_dir(parser: argparse.ArgumentParser) -> None:
@@ -2375,6 +2457,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Issue label for the github work source (default: flywheel)."
+        ),
+    )
+    p_init.add_argument(
+        "--skills",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Install (or regenerate) the Claude Code skills "
+            f"({', '.join(SKILL_NAMES)}) under .claude/skills/ "
+            "(pre-answers the prompt; interactive default: yes, "
+            "non-interactive default: no). With an existing "
+            "flywheel.toml, a non-interactive 'flywheel init --skills' "
+            "regenerates the skills against the current policy without "
+            "touching the policy file."
         ),
     )
     p_init.add_argument(

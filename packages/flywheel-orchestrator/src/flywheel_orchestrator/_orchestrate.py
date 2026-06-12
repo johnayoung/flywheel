@@ -91,6 +91,13 @@ from flywheel_orchestrator._sources import (
     WorkSource,
 )
 from flywheel_orchestrator._store_factory import open_sqlite_bound_store
+from flywheel_orchestrator._strategy import (
+    SandboxProvider,
+    SandboxRequest,
+    SubmitRequest,
+    SubmitStrategy,
+    Submitter,
+)
 from flywheel_orchestrator._workflow import (
     TaskStatusRow,
     _latest_lifecycle_row,
@@ -272,64 +279,6 @@ class OrchestratorReport:
     runs: tuple[RunRecord, ...]
 
 
-@dataclass(frozen=True, kw_only=True)
-class SandboxRequest:
-    """What the orchestrator needs a consumer to provision a run's sandbox.
-
-    Handed to a :data:`SandboxProvider` so a git-aware consumer can create or
-    reuse a worktree (and derive the branch from ``task_file``'s phase) and
-    return the directory the task should run in. ``run_id`` is ``None`` for a
-    fresh run; for a resume/recheck it is the lifecycle being continued.
-    ``mode`` distinguishes the two so the provider can rebase a parked
-    worktree on resume.
-
-    ``task_file`` is populated for file-backed work sources and is an empty
-    ``Path()`` otherwise; ``source_ref`` always carries the source's opaque
-    item handle. Path-deriving providers must treat an empty path as "no
-    file".
-    """
-
-    task_id: str
-    task_file: Path
-    run_id: str | None
-    mode: Literal["fresh", "resume"]
-    source_ref: str = ""
-
-
-@dataclass(frozen=True, kw_only=True)
-class SubmitRequest:
-    """The terminal outcome of one run, handed to a consumer's submit step.
-
-    A git-aware consumer uses this to FF-merge the task branch on ``done`` or
-    park the ``sandbox`` worktree on a non-done terminal status. ``sandbox``
-    is exactly the path the matching :data:`SandboxProvider` returned.
-    ``task_file``/``source_ref`` follow the same convention as
-    :class:`SandboxRequest`.
-
-    ``task`` is the validated core task the run was driven with. It carries
-    everything a submit strategy needs to re-verify the work against the
-    tree it is about to land on (the graders) or to render the outcome
-    elsewhere (the goal), without assuming a file-backed source.
-    """
-
-    task_id: str
-    task_file: Path
-    task: Task
-    run_id: str
-    status: Status
-    sandbox: Path
-    source_ref: str = ""
-
-
-# A consumer maps a SandboxRequest to the directory the task runs in (default:
-# ``sandbox_root/<task-id>``), and is handed a SubmitRequest after each run
-# finalizes — while the lease is still held — to merge or park. ``submit`` MUST
-# NOT raise: it records its own park/merge outcome and swallows git errors, so
-# a submit failure never unwinds the orchestrator and abandons peer tasks.
-SandboxProvider = Callable[[SandboxRequest], Path]
-Submitter = Callable[[SubmitRequest], None]
-
-
 def _is_blocked_interrupted(row: TaskStatusRow) -> bool:
     """A lifecycle parked on a structured block (vs a bare SIGINT pause).
 
@@ -477,6 +426,7 @@ async def orchestrate(
     now: Callable[[], datetime] | None = None,
     prepare_sandbox: SandboxProvider | None = None,
     submit: Submitter | None = None,
+    strategy: SubmitStrategy | None = None,
     reconcile_seconds: float | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task from the work source to quiescence.
@@ -501,6 +451,9 @@ async def orchestrate(
     status (e.g. FF-merge or park). Both run while the task's lease is held,
     so two workers never merge the same task concurrently; all consumer
     git/strategy code stays in these callbacks, never in flywheel.
+    ``strategy`` is the same seam as one object — anything satisfying
+    :class:`~flywheel_orchestrator._strategy.SubmitStrategy` — and is
+    mutually exclusive with passing the callables individually.
 
     After ``submit``, the run's outcome is projected back to the work
     source via :meth:`~flywheel_orchestrator._sources.WorkSource.report`
@@ -527,6 +480,14 @@ async def orchestrate(
         source = DirectoryWorkSource(tasks_dir)
     elif tasks_dir is not None:
         raise ValueError("orchestrate takes tasks_dir or source, not both")
+    if strategy is not None:
+        if prepare_sandbox is not None or submit is not None:
+            raise ValueError(
+                "orchestrate takes strategy or prepare_sandbox/submit, "
+                "not both"
+            )
+        prepare_sandbox = strategy.prepare_sandbox
+        submit = strategy.submit
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)

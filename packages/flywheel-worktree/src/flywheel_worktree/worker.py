@@ -189,9 +189,10 @@ class _ReverifyRecorder:
 class GitWorktreeSubmitter:
     """Provisions per-task worktrees and merges/parks them on completion.
 
-    :meth:`prepare` and :meth:`submit` are the ``orchestrate`` callbacks.
-    ``prepare`` may raise :class:`PrepareSandboxError` (skips that task);
-    ``submit`` never raises (records its own park/merge outcome).
+    The reference :class:`flywheel_orchestrator.SubmitStrategy`:
+    :meth:`prepare_sandbox` may raise :class:`PrepareSandboxError` (skips
+    that task); :meth:`submit` never raises (records its own park/merge
+    outcome). Passed whole to ``orchestrate(strategy=...)``.
     """
 
     def __init__(
@@ -326,7 +327,7 @@ class GitWorktreeSubmitter:
         _git(self.repo_root, "branch", "-D", branch)
         self._add_worktree(worktree, "-b", branch, self.phase_base)
 
-    def prepare(self, req: SandboxRequest) -> Path:
+    def prepare_sandbox(self, req: SandboxRequest) -> Path:
         """Provision (or reuse) the worktree a task runs in; return its path.
         Reuses a parked worktree+branch on retry (rebasing onto base first),
         recreates it when only the branch survived a sweep, and refuses to
@@ -802,8 +803,7 @@ def run_once(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             reconcile_seconds=reconcile_seconds,
-            prepare_sandbox=submitter.prepare,
-            submit=submitter.submit,
+            strategy=submitter,
             stream=stream,
         )
     )

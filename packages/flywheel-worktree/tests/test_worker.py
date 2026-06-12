@@ -38,6 +38,7 @@ from flywheel_orchestrator import (
     SandboxRequest,
     StoreConfigError,
     SubmitRequest,
+    SubmitStrategy,
     WorkPolicy,
     load_effective_policy,
 )
@@ -157,7 +158,7 @@ def test_prepare_creates_worktree_and_branch(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
 
     assert wt == repo / ".flywheel" / "worktrees" / "t1"
     assert wt.is_dir()
@@ -177,7 +178,7 @@ def test_prepare_refuses_to_clobber_unregistered_dir(tmp_path: Path) -> None:
 
     raised = False
     try:
-        s.prepare(_sandbox_req(tf, "t1"))
+        s.prepare_sandbox(_sandbox_req(tf, "t1"))
     except worker.PrepareSandboxError:
         raised = True
     assert raised
@@ -192,7 +193,7 @@ def test_submit_ff_merges_on_done(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     _commit(wt, "feature.txt", "x", "feat")
     base_before = _rev(repo, "main")
 
@@ -210,7 +211,7 @@ def test_submit_parks_on_failed(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     _commit(wt, "feature.txt", "x", "feat")
     base_before = _rev(repo, "main")
 
@@ -228,7 +229,7 @@ def test_submit_zero_commit_done_cleans_up(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     base_before = _rev(repo, "main")
     # No commits beyond base; clean tree.
     s.submit(_submit_req(tf, "t1", wt, Status.DONE))
@@ -244,7 +245,7 @@ def test_submit_uncommitted_done_parks(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     (wt / "dirty.txt").write_text("uncommitted")  # not committed
     base_before = _rev(repo, "main")
 
@@ -266,7 +267,7 @@ def test_prepare_reuses_and_rebases_onto_advanced_base(tmp_path: Path) -> None:
     tf = _task_file(repo, "01-phase", "t1")
 
     # Attempt 1: commit work, then fail -> worktree parked with the branch.
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     _commit(wt, "a.txt", "a", "task work")
     s.submit(_submit_req(tf, "t1", wt, Status.FAILED))
     assert wt.exists()
@@ -277,7 +278,7 @@ def test_prepare_reuses_and_rebases_onto_advanced_base(tmp_path: Path) -> None:
 
     # Retry: prepare reuses the parked worktree and rebases it onto the
     # advanced base, carrying the prior commit forward on top.
-    wt2 = s.prepare(_sandbox_req(tf, "t1", mode="resume"))
+    wt2 = s.prepare_sandbox(_sandbox_req(tf, "t1", mode="resume"))
     assert wt2 == wt
     assert (wt2 / "a.txt").exists()  # prior work preserved
     assert (wt2 / "b.txt").exists()  # base advance picked up by the rebase
@@ -303,7 +304,7 @@ def test_submit_rebase_reverifies_then_merges(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t2")
 
-    wt = s.prepare(_sandbox_req(tf, "t2"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t2"))
     _commit(wt, "feature2.txt", "x", "t2 work")
     # A peer task merges first: the base advances past t2's branch point,
     # so t2's FF fails and submit must rebase.
@@ -333,7 +334,7 @@ def test_submit_rebase_reverify_failure_parks(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t2")
 
-    wt = s.prepare(_sandbox_req(tf, "t2"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t2"))
     _commit(wt, "feature2.txt", "x", "t2 work")
     _commit(repo, "feature1.txt", "y", "peer merged")
     base_after_peer = _rev(repo, "main")
@@ -360,7 +361,7 @@ def test_submit_clean_ff_skips_reverify(tmp_path: Path) -> None:
     marker = tmp_path / "reverify-ran"
     tf = _task_file(repo, "01-phase", "t1")
 
-    wt = s.prepare(_sandbox_req(tf, "t1"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
     _commit(wt, "feature.txt", "x", "feat")
 
     s.submit(_submit_req(tf, "t1", wt, Status.DONE, grader=f"touch {marker}"))
@@ -377,7 +378,7 @@ def test_submit_rebase_with_no_command_graders_merges(tmp_path: Path) -> None:
     s = _submitter(repo)
     tf = _task_file(repo, "01-phase", "t2")
 
-    wt = s.prepare(_sandbox_req(tf, "t2"))
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t2"))
     _commit(wt, "feature2.txt", "x", "t2 work")
     _commit(repo, "feature1.txt", "y", "peer merged")
 
@@ -828,3 +829,11 @@ def test_archive_phases_accepts_repeated_factory_calls(
     SqliteStore(db_path).close()  # seed the schema once
     for _ in range(3):
         worker.archive_phases(tasks_dir, db_path, lambda _m: None, policy=policy)
+
+
+def test_submitter_is_a_submit_strategy(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    # GitWorktreeSubmitter is the reference SubmitStrategy: structural
+    # conformance is what lets run_once pass it whole to orchestrate.
+    assert isinstance(_submitter(repo), SubmitStrategy)

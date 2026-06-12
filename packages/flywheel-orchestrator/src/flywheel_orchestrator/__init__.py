@@ -24,12 +24,15 @@ from flywheel_orchestrator._orchestrate import (
     DEFAULT_RECONCILE_SECONDS,
     OrchestratorReport,
     RunRecord,
+    orchestrate,
+    reconcile_live_runs,
+)
+from flywheel_orchestrator._strategy import (
     SandboxProvider,
     SandboxRequest,
     SubmitRequest,
+    SubmitStrategy,
     Submitter,
-    orchestrate,
-    reconcile_live_runs,
 )
 
 if TYPE_CHECKING:
@@ -147,6 +150,7 @@ __all__ = [
     "SandboxProvider",
     "SandboxRequest",
     "SubmitRequest",
+    "SubmitStrategy",
     "Submitter",
     "TaskState",
     "TaskStatusRow",

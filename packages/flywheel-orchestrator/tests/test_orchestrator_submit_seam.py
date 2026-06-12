@@ -15,6 +15,7 @@ import io
 import json
 from pathlib import Path
 
+import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from flywheel_core import (
@@ -29,6 +30,7 @@ from flywheel_core import (
 from flywheel_orchestrator import (
     SandboxRequest,
     SubmitRequest,
+    SubmitStrategy,
     orchestrate,
 )
 
@@ -309,3 +311,73 @@ def test_default_sandbox_used_when_no_callbacks(tmp_path: Path) -> None:
     assert [r.status for r in report.runs] == [Status.DONE]
     # The default provider runs each task in sandbox_root/<task-id>.
     assert (tmp_path / "sandboxes" / "plain").is_dir()
+
+
+# --- the bundled SubmitStrategy form -----------------------------------------
+
+
+def test_strategy_object_supplies_both_callbacks(tmp_path: Path) -> None:
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    # Same marker trick as the callback test: a DONE proves the run graded
+    # in the strategy-provided dir, and submit saw that exact path.
+    _write_task(phase, "alpha", grader_run="test -f marker")
+
+    class _Strategy:
+        def __init__(self) -> None:
+            self.prepare_calls: list[SandboxRequest] = []
+            self.submit_calls: list[SubmitRequest] = []
+
+        def prepare_sandbox(self, request: SandboxRequest) -> Path:
+            self.prepare_calls.append(request)
+            sandbox = tmp_path / "prepared" / request.task_id
+            sandbox.mkdir(parents=True, exist_ok=True)
+            (sandbox / "marker").write_text("ok")
+            return sandbox
+
+        def submit(self, request: SubmitRequest) -> None:
+            self.submit_calls.append(request)
+
+    strategy = _Strategy()
+    # Structural conformance, no base class.
+    assert isinstance(strategy, SubmitStrategy)
+
+    report = asyncio.run(
+        orchestrate(
+            tasks_dir=tmp_path / "tasks",
+            db_path=tmp_path / "flywheel.sqlite",
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_always_verify(),
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+            strategy=strategy,
+        )
+    )
+
+    assert [r.status for r in report.runs] == [Status.DONE]
+    assert len(strategy.prepare_calls) == 1
+    assert len(strategy.submit_calls) == 1
+    assert strategy.submit_calls[0].sandbox == tmp_path / "prepared" / "alpha"
+    assert strategy.submit_calls[0].task.id == "alpha"
+    assert not (tmp_path / "sandboxes" / "alpha").exists()
+
+
+def test_strategy_and_callbacks_are_mutually_exclusive(tmp_path: Path) -> None:
+    class _Strategy:
+        def prepare_sandbox(self, request: SandboxRequest) -> Path:
+            return tmp_path
+
+        def submit(self, request: SubmitRequest) -> None:
+            return None
+
+    with pytest.raises(ValueError, match="not both"):
+        asyncio.run(
+            orchestrate(
+                tasks_dir=tmp_path / "tasks",
+                db_path=tmp_path / "flywheel.sqlite",
+                sandbox_root=tmp_path / "sandboxes",
+                stream=io.StringIO(),
+                strategy=_Strategy(),
+                submit=lambda req: None,
+            )
+        )

@@ -1,6 +1,8 @@
 [project]
 name = "flywheel"
 version = "0.1.0"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 description = "Unified `flywheel` / `fw` command router and operator console: dashboard + session screen + persistent input bar; delegates verbs to the core single-task, orchestrator, and worker implementations."
 requires-python = ">=3.13"
 authors = [

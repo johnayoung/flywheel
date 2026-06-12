@@ -17,8 +17,9 @@ concerns flywheel deliberately does not:
   :class:`GitWorktreeSubmitter`, injected into ``orchestrate`` through its
   ``prepare_sandbox`` / ``submit`` seam. No git lives in flywheel.
 * **Daemon poll loop** — ``orchestrate`` drains every eligible task to
-  quiescence and exits; this loop re-invokes it after committing newly-dropped
-  task files and archiving completed phases.
+  quiescence and exits; this loop re-invokes it after recording phase base
+  refs and archiving completed phases. The worker never creates commits on
+  the operator's branch.
 
 Selection, prerequisites, reactive unblock/resume, leases + heartbeat,
 stranded recovery, and graceful-shutdown finalization are flywheel's, reused
@@ -72,7 +73,6 @@ from flywheel_core.workflow import (
     DEFAULT_MAX_TURNS,
 )
 from flywheel_orchestrator import (
-    LOOP_BASE_FILENAME,
     LiveRunRow,
     archive_completed_phases,
     collect_live_rows,
@@ -600,60 +600,28 @@ class GitWorktreeSubmitter:
 # --- daemon-side consumer concerns ------------------------------------------
 
 
-def commit_task_files(
-    repo_root: Path, tasks_dir: Path, lock_path: Path, log: Logger
-) -> None:
-    """Commit newly-dropped task JSON so worktrees (branched off the base tip)
-    can see them. Stages only UNTRACKED files under ``active/`` (modified files
-    may be transient rebase state). Flock'd, since it commits to the base."""
-    active_dir = tasks_dir / "active"
-    if not active_dir.is_dir():
-        return
-    with merge_lock(lock_path):
-        status = _git(
-            repo_root, "status", "--porcelain", "--", str(active_dir)
-        ).stdout
-        untracked = [
-            line[3:] for line in status.splitlines() if line.startswith("?? ")
-        ]
-        if not untracked:
-            return
-        for path in untracked:
-            _git(repo_root, "add", "--", path)
-        if _git(repo_root, "diff", "--cached", "--quiet").returncode == 0:
-            return
-        _git(repo_root, "commit", "-m", "chore: stage task files for worker")
-        log("Committed new task files so worktrees can access them")
-
-
 def record_phase_bases(
     repo_root: Path, tasks_dir: Path, lock_path: Path, log: Logger
 ) -> None:
-    """Capture each active phase's base SHA into a committed ``.loop-base``.
+    """Capture each active phase's base SHA as a ``refs/flywheel/loop-base``
+    git ref.
 
-    Runs once per cycle, after :func:`commit_task_files` (so the recorded
-    SHA includes any newly-dropped task JSON) and before any task branch is
-    merged. For each ``active/<phase>`` lacking a ``.loop-base``, writes the
-    current ``HEAD`` SHA into the dotfile and stages+commits it under the
-    merge lock. Idempotent: a phase whose ``.loop-base`` already exists is
-    left untouched (the first-seen SHA is the true base; re-runs must never
-    move it forward).
+    Runs once per cycle, before any task branch is merged. Pure ref
+    plumbing — the worker never creates commits on the operator's branch.
+    Idempotent: a phase whose base is already recorded (ref, or a legacy
+    committed ``.loop-base`` dotfile) is left untouched (the first-seen SHA
+    is the true base; re-runs must never move it forward). Flock'd so two
+    workers do not race the check-and-set.
     """
     if not (tasks_dir / "active").is_dir():
         return
     with merge_lock(lock_path):
-        written: list[Path] = []
+        recorded = 0
         for phase_dir in iter_active_phase_dirs(tasks_dir):
             if write_phase_base_if_missing(repo_root, phase_dir):
-                written.append(phase_dir / LOOP_BASE_FILENAME)
-        if not written:
-            return
-        for path in written:
-            _git(repo_root, "add", "--", str(path))
-        if _git(repo_root, "diff", "--cached", "--quiet").returncode == 0:
-            return
-        _git(repo_root, "commit", "-m", "chore: record phase base sha")
-        log(f"Recorded base sha for {len(written)} phase(s)")
+                recorded += 1
+        if recorded:
+            log(f"Recorded base sha for {recorded} phase(s)")
 
 
 def archive_phases(
@@ -850,10 +818,12 @@ def run_once(
     log: Logger | None = None,
     policy: WorkPolicy | None = None,
 ) -> OrchestratorReport:
-    """One cycle: commit new task files, drain every eligible task to
+    """One cycle: record phase bases, drain every eligible task to
     quiescence through the git-submit seam, archive completed phases.
-    ``invoke`` defaults to the real Claude Code invoker; tests inject a
-    fake.
+    The worker never creates commits on the operator's branch — landing
+    work is the submit strategy's job, and bookkeeping lives in the
+    ``refs/flywheel/`` namespace. ``invoke`` defaults to the real Claude
+    Code invoker; tests inject a fake.
 
     Per-run forensics are the telemetry JSONL files the harness's sink
     writes under ``<db dir>/logs/runs/`` (spec 00025); the worker renders
@@ -865,7 +835,6 @@ def run_once(
     sqlite-on-``db_path`` behavior.
     """
     log = log or submitter.log
-    commit_task_files(submitter.repo_root, tasks_dir, submitter.lock_path, log)
     record_phase_bases(
         submitter.repo_root, tasks_dir, submitter.lock_path, log
     )

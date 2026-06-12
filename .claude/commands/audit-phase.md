@@ -149,7 +149,7 @@ For each finding, pull the **exact** evidence: the row, the event payload JSON s
 
 The archive gate (`archive_completed_phases`, spec `00017-FEATURE-in-loop-verification-gate.md`) refuses to move a loop-path-marked phase into `archive/` without a DONE `in-loop-verification` task or a valid `loop-path-exempt.md` opt-out. The audit's job here is the coverage check on the gate's trigger: re-derive the marker against the **archived** phase's recorded base and surface (a) a watched-symbol diff that slipped through without coverage, and (b) an opt-out whose "no new path" claim is contradicted by the diff.
 
-Do NOT guess signals from prose. The phase's `.loop-base` dotfile travels with the phase into `archive/` (it's a committed file inside the phase dir), so `git diff <.loop-base> HEAD` is the same input the gate would have seen. Re-derive mechanically by running `flywheel.loop_path_marker.detect_loop_path_signals` over `flywheel.workflow.phase_diff_vs_base`, and load the opt-out via `flywheel.workflow.load_loop_path_optout`:
+Do NOT guess signals from prose. The phase's `.loop-base` dotfile travels with the phase into `archive/` (materialized from the phase's loop-base ref at archive time; older phases carry it as a committed file), so `git diff <.loop-base> HEAD` is the same input the gate would have seen. Re-derive mechanically by running `flywheel.loop_path_marker.detect_loop_path_signals` over `flywheel.workflow.phase_diff_vs_base`, and load the opt-out via `flywheel.workflow.load_loop_path_optout`:
 
 ```bash
 uv run python - <<PY

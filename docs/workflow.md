@@ -29,7 +29,9 @@ The loop closes: proposals become specs become phases become audits. Two further
   specs/                    NNNNN-FEATURE-<name>.md (sequential, zero-padded)
   tasks/
     active/NN-<phase>/      one JSON per task; the worker consumes these
-      .loop-base            HEAD SHA when the phase was first seen (committed)
+                            (base SHA for an active phase lives in the
+                            refs/flywheel/loop-base/<phase> git ref; archiving
+                            materializes it into a .loop-base dotfile)
       loop-path-exempt.md   optional gate opt-out (phase/author/reason front-matter)
     archive/NN-<phase>/     moved here by the archive gate when all tasks are DONE
   audits/<phase>.md         committed audit findings
@@ -46,17 +48,16 @@ Phases are plain directories: the `NN-` prefix controls walk order, there is no 
 
 The daemon is invoked as `flywheel worker` (the product shell delegates in-process to `packages/flywheel-worktree/src/flywheel_worktree/worker.py`). Each cycle:
 
-1. Commit any untracked task JSONs under `tasks/active/`.
-2. Record a `.loop-base` SHA for any phase that lacks one.
-3. `orchestrate()` — drive every eligible task to quiescence (`packages/flywheel-orchestrator/`): a task is eligible when its state is FRESH/RETRYABLE/INTERRUPTED and every prerequisite is DONE; each task runs in its own git worktree branched off main and FF-merges back on DONE under the merge lock. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree (still under the lock) before the merge; a red re-run parks the worktree instead of merging — nothing lands that was not verified against the exact base it lands on.
-4. Write per-run logs to `logs/worker/`.
-5. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below.
+1. Record a base SHA (the `refs/flywheel/loop-base/<phase>` ref) for any active phase that lacks one. The worker never creates commits on the operator's branch — landing work is the submit strategy's job, bookkeeping lives in the ref namespace, and versioning task JSONs is the operator's choice.
+2. `orchestrate()` — drive every eligible task to quiescence (`packages/flywheel-orchestrator/`): a task is eligible when its state is FRESH/RETRYABLE/INTERRUPTED and every prerequisite is DONE; each task runs in its own git worktree branched off main and FF-merges back on DONE under the merge lock. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree (still under the lock) before the merge; a red re-run parks the worktree instead of merging — nothing lands that was not verified against the exact base it lands on.
+3. Write per-run logs to `logs/worker/`.
+4. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below.
 
 Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` and `DEFAULT_LOG_DIR = logs/worker` (`flywheel_orchestrator/_workflow.py`), `DEFAULT_DB_PATH = .flywheel/flywheel.sqlite` (`flywheel/workflow.py`). All are overridable via CLI flags.
 
 ### The in-loop-verification gate
 
-`archive_completed_phases` diffs the phase against its `.loop-base` and scans for five watched signals (`flywheel/loop_path_marker.py`): a new `Status`/`Outcome`/transition rule, a new schema column or table, a new `Grader` variant, a new store-Protocol method with dispatch, a new control-command verb. If any trips, the phase cannot archive without either a DONE task tagged `in-loop-verification` (a test that drives the real `orchestrate` loop with a scripted invoker) or a committed `loop-path-exempt.md` opt-out. `/define` flags the trigger at spec time, `/task` emits the tagged slot, and `/audit-phase` re-derives the signals after archive to catch slips and contradicted opt-outs.
+`archive_completed_phases` diffs the phase against its recorded base (the loop-base ref while active; materialized into the archived dir as a `.loop-base` dotfile) and scans for five watched signals (`flywheel/loop_path_marker.py`): a new `Status`/`Outcome`/transition rule, a new schema column or table, a new `Grader` variant, a new store-Protocol method with dispatch, a new control-command verb. If any trips, the phase cannot archive without either a DONE task tagged `in-loop-verification` (a test that drives the real `orchestrate` loop with a scripted invoker) or a committed `loop-path-exempt.md` opt-out. `/define` flags the trigger at spec time, `/task` emits the tagged slot, and `/audit-phase` re-derives the signals after archive to catch slips and contradicted opt-outs.
 
 ## Why it works this way
 

@@ -501,15 +501,14 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
 
 
 def test_record_phase_bases_captures_once_and_idempotent(tmp_path: Path) -> None:
-    """The worker's per-cycle base-capture step records the pre-merge HEAD
-    once per phase dir and never moves it forward on re-run.
+    """The worker's per-cycle base-capture step records HEAD once per phase
+    as a ``refs/flywheel/loop-base/<phase>`` ref and never moves it forward
+    on re-run.
 
-    Mirrors the production sequence: after ``commit_task_files`` lands new
-    task JSON, the worker captures the resulting ``HEAD`` SHA into
-    ``.loop-base`` for each active phase that lacks one, then commits the
-    dotfile. The recorded SHA is the base the future archive gate diffs
-    against -- it must be locked in at phase entry, not derived later when
-    task branches have already been merged.
+    The recorded SHA is the base the future archive gate diffs against --
+    it must be locked in at phase entry, not derived later when task
+    branches have already been merged. Pure ref plumbing: the capture
+    creates no commits and leaves the operator's working tree untouched.
     """
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -522,29 +521,19 @@ def test_record_phase_bases_captures_once_and_idempotent(tmp_path: Path) -> None
 
     worker.record_phase_bases(repo, tasks_dir, lock_path, lambda _m: None)
 
-    base_file = phase_dir / ".loop-base"
-    assert base_file.is_file()
-    # The recorded SHA is the pre-merge HEAD (the captured commit itself
-    # advances HEAD past it, which is fine -- the captured SHA must be
-    # what HEAD pointed at *before* the capture).
-    assert base_file.read_text().strip() == head_at_capture
-    # The dotfile was committed (no untracked entry remains).
-    status = subprocess.run(
-        ["git", "-C", str(repo), "status", "--porcelain", "--", str(base_file)],
-        text=True,
-        capture_output=True,
-        check=True,
-    ).stdout
-    assert status == ""
+    # Recorded as a ref, not a working-tree file, and no commit was made.
+    assert not (phase_dir / ".loop-base").exists()
+    assert _rev(repo, "refs/flywheel/loop-base/01-phase") == head_at_capture
+    assert _rev(repo, "main") == head_at_capture
 
     # Advance base by an unrelated commit (simulating a task FF-merge).
     _commit(repo, "advance.txt", "x", "advance main")
     assert _rev(repo, "main") != head_at_capture
 
-    # Re-run: the dotfile already exists. Must NOT move the recorded base
-    # forward -- the first-seen SHA is the true base.
+    # Re-run: the base is already recorded. Must NOT move it forward --
+    # the first-seen SHA is the true base.
     worker.record_phase_bases(repo, tasks_dir, lock_path, lambda _m: None)
-    assert base_file.read_text().strip() == head_at_capture
+    assert _rev(repo, "refs/flywheel/loop-base/01-phase") == head_at_capture
 
 
 def test_run_once_produces_run_jsonl_and_no_log_files(

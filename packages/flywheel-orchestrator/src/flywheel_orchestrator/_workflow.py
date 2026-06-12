@@ -385,6 +385,8 @@ def archive_completed_phases(
         if dest.exists():
             continue
         shutil.move(str(phase_dir), str(dest))
+        if repo_root is not None:
+            _materialize_loop_base(repo_root, dest)
         moved.append(dest)
     return moved
 
@@ -434,6 +436,21 @@ def _format_gate_refusal(
 
 LOOP_BASE_FILENAME = ".loop-base"
 
+# Active phases record their base SHA here rather than as a committed file:
+# the worker must never create commits on the operator's branch. Archiving
+# materializes the ref into the phase dir as the legacy dotfile (see
+# :func:`archive_completed_phases`), so audits keep one contract — the
+# ``.loop-base`` file travels with every archived phase.
+LOOP_BASE_REF_PREFIX = "refs/flywheel/loop-base/"
+
+def loop_base_ref(phase_dir: Path) -> str:
+    """The git ref recording ``phase_dir``'s base SHA while it is active.
+
+    Keyed by directory name; phase names are sequential (``NN-<name>``),
+    so collisions across a repo's lifetime do not occur in practice.
+    """
+    return f"{LOOP_BASE_REF_PREFIX}{phase_dir.name}"
+
 def _git_capture(repo_root: Path, *args: str) -> tuple[int, str]:
     """Run ``git -C <repo_root> <args>`` and return ``(returncode, stdout)``.
 
@@ -449,38 +466,51 @@ def _git_capture(repo_root: Path, *args: str) -> tuple[int, str]:
     )
     return proc.returncode, proc.stdout
 
-def read_phase_base(phase_dir: Path) -> str | None:
-    """Return the SHA recorded in ``phase_dir/.loop-base`` or ``None``.
+def read_phase_base(
+    phase_dir: Path, repo_root: Path | None = None
+) -> str | None:
+    """Return the SHA recorded as ``phase_dir``'s base, or ``None``.
 
-    Missing file, empty file, or unreadable file all map to ``None`` so the
-    diff helper can degrade safely without raising.
+    The legacy committed ``phase_dir/.loop-base`` dotfile wins when present
+    (pre-ref phases, and every archived phase — archiving materializes the
+    ref into the file). Otherwise, when ``repo_root`` is supplied, the
+    ``refs/flywheel/loop-base/<phase>`` ref is consulted. Missing, empty,
+    or unreadable sources all map to ``None`` so the diff helper can
+    degrade safely without raising.
     """
     base_file = phase_dir / LOOP_BASE_FILENAME
-    if not base_file.is_file():
+    if base_file.is_file():
+        try:
+            sha = base_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            sha = ""
+        if sha:
+            return sha
+    if repo_root is None:
         return None
-    try:
-        sha = base_file.read_text(encoding="utf-8").strip()
-    except OSError:
+    rc, out = _git_capture(
+        repo_root, "rev-parse", "--verify", "--quiet", loop_base_ref(phase_dir)
+    )
+    if rc != 0:
         return None
-    return sha or None
+    return out.strip() or None
 
 def write_phase_base_if_missing(repo_root: Path, phase_dir: Path) -> bool:
-    """Write the current ``HEAD`` SHA into ``phase_dir/.loop-base`` if absent.
+    """Record the current ``HEAD`` SHA as ``phase_dir``'s base if absent.
 
-    Idempotent: returns ``True`` when a fresh ``.loop-base`` was written,
-    ``False`` when one already existed (so the first-seen SHA is preserved
-    -- a re-run must not move the recorded base forward). The caller owns
-    staging/committing the new file under the worker's merge lock; this
-    helper only touches the working tree so the logic is testable without
-    the worker.
+    The base lands as the ``refs/flywheel/loop-base/<phase>`` ref — pure
+    ref plumbing, no working-tree write and nothing for anyone to commit.
+    Idempotent: returns ``True`` when a fresh base was recorded, ``False``
+    when one already existed (ref, or a legacy committed ``.loop-base``
+    file) so the first-seen SHA is preserved — a re-run must not move the
+    recorded base forward.
 
     Returns ``False`` (no write) when ``phase_dir`` does not exist or when
     ``git rev-parse HEAD`` fails -- both signal "no usable base to record."
     """
     if not phase_dir.is_dir():
         return False
-    base_file = phase_dir / LOOP_BASE_FILENAME
-    if base_file.exists():
+    if read_phase_base(phase_dir, repo_root) is not None:
         return False
     rc, out = _git_capture(repo_root, "rev-parse", "HEAD")
     if rc != 0:
@@ -488,20 +518,43 @@ def write_phase_base_if_missing(repo_root: Path, phase_dir: Path) -> bool:
     sha = out.strip()
     if not sha:
         return False
-    base_file.write_text(sha + "\n", encoding="utf-8")
-    return True
+    rc, _ = _git_capture(
+        repo_root, "update-ref", loop_base_ref(phase_dir), sha
+    )
+    return rc == 0
+
+def _materialize_loop_base(repo_root: Path, dest: Path) -> None:
+    """Carry an archived phase's loop-base ref into ``dest`` as the legacy
+    ``.loop-base`` dotfile, then drop the ref.
+
+    Keeps the audit contract — the file travels with every archived phase
+    (``/audit-phase`` re-derives signals from it) — while the ref namespace
+    holds only live phases. Versioning the archived file is the operator's
+    call, exactly like the archive move itself. A phase that already
+    carries a committed dotfile is left as-is.
+    """
+    if (dest / LOOP_BASE_FILENAME).is_file():
+        return
+    ref = loop_base_ref(dest)
+    rc, out = _git_capture(repo_root, "rev-parse", "--verify", "--quiet", ref)
+    if rc != 0:
+        return
+    sha = out.strip()
+    if sha:
+        (dest / LOOP_BASE_FILENAME).write_text(sha + "\n", encoding="utf-8")
+    _git_capture(repo_root, "update-ref", "-d", ref)
 
 def phase_diff_vs_base(repo_root: Path, phase_dir: Path) -> str:
     """Return ``git diff <recorded-base> HEAD`` for ``repo_root`` as text.
 
-    Returns ``""`` when no ``.loop-base`` has been recorded for the phase
-    (degrades safely rather than raising -- callers can treat an empty
-    diff as "no signal"), or when the underlying ``git diff`` exits
-    non-zero (e.g. the recorded SHA has been garbage-collected). The
-    returned text is the raw unified-diff payload from git, suitable for
-    feeding the loop-path marker's symbol-level scans.
+    Returns ``""`` when no base has been recorded for the phase (degrades
+    safely rather than raising -- callers can treat an empty diff as "no
+    signal"), or when the underlying ``git diff`` exits non-zero (e.g. the
+    recorded SHA has been garbage-collected). The returned text is the raw
+    unified-diff payload from git, suitable for feeding the loop-path
+    marker's symbol-level scans.
     """
-    base = read_phase_base(phase_dir)
+    base = read_phase_base(phase_dir, repo_root)
     if base is None:
         return ""
     rc, out = _git_capture(repo_root, "diff", base, "HEAD")

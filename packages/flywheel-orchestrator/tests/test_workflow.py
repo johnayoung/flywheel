@@ -523,12 +523,12 @@ def test_write_phase_base_if_missing_captures_head_and_is_idempotent(
 
     Two invariants:
 
-    * The first call writes the current ``HEAD`` SHA into ``.loop-base``
-      and returns ``True``.
-    * A re-run after ``.loop-base`` already exists must not move the
-      recorded base forward -- the first-seen SHA is the true base. The
-      re-run returns ``False`` and the recorded SHA is unchanged even if
-      ``HEAD`` has advanced.
+    * The first call records the current ``HEAD`` SHA as the phase's
+      ``refs/flywheel/loop-base/<phase>`` ref and returns ``True`` —
+      without touching the working tree.
+    * A re-run after the base is recorded must not move it forward --
+      the first-seen SHA is the true base. The re-run returns ``False``
+      and the recorded SHA is unchanged even if ``HEAD`` has advanced.
     """
     repo = tmp_path / "repo"
     _git_init_repo(repo)
@@ -538,25 +538,40 @@ def test_write_phase_base_if_missing_captures_head_and_is_idempotent(
     head_before = _git_head(repo)
 
     assert write_phase_base_if_missing(repo, phase_dir) is True
-    recorded = read_phase_base(phase_dir)
+    assert not (phase_dir / LOOP_BASE_FILENAME).exists()
+    recorded = read_phase_base(phase_dir, repo)
     assert recorded == head_before
 
     # Advance HEAD to simulate the phase's tasks merging into base.
     _git_commit_file(repo, "advance.txt", "x\n", "advance base")
     assert _git_head(repo) != head_before
 
-    # Re-run must be a no-op: the dotfile already exists, the recorded
-    # SHA must not move forward.
+    # Re-run must be a no-op: the base is already recorded, the SHA must
+    # not move forward.
     assert write_phase_base_if_missing(repo, phase_dir) is False
-    assert read_phase_base(phase_dir) == head_before
+    assert read_phase_base(phase_dir, repo) == head_before
+
+
+def test_read_phase_base_legacy_file_wins_over_ref(tmp_path: Path) -> None:
+    """A committed ``.loop-base`` dotfile (pre-ref phases, archived phases)
+    takes precedence over the ref namespace."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    phase_dir = repo / ".flywheel" / "tasks" / "active" / "01-phase"
+    phase_dir.mkdir(parents=True)
+
+    (phase_dir / LOOP_BASE_FILENAME).write_text("legacy-sha\n")
+    assert read_phase_base(phase_dir, repo) == "legacy-sha"
+    # And the recorder treats the legacy file as "already recorded."
+    assert write_phase_base_if_missing(repo, phase_dir) is False
 
 
 def test_phase_diff_vs_base_returns_added_lines(tmp_path: Path) -> None:
     """The diff helper returns the phase's added lines as unified-diff text.
 
-    Reproduces the production sequence: capture the base, commit the
-    dotfile, then land a task commit -- the diff against the recorded base
-    must include the task's added file content.
+    Reproduces the production sequence: capture the base (a ref — nothing
+    to commit), then land a task commit -- the diff against the recorded
+    base must include the task's added file content.
     """
     repo = tmp_path / "repo"
     _git_init_repo(repo)
@@ -564,15 +579,6 @@ def test_phase_diff_vs_base_returns_added_lines(tmp_path: Path) -> None:
     phase_dir.mkdir(parents=True)
 
     assert write_phase_base_if_missing(repo, phase_dir) is True
-    # Mimic the worker: commit the freshly-written .loop-base dotfile.
-    subprocess.run(
-        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "chore: record phase base sha"],
-        check=True,
-        capture_output=True,
-    )
 
     # The phase's task lands a feature file.
     _git_commit_file(repo, "feature.txt", "hello phase\n", "feat: task work")
@@ -642,7 +648,7 @@ def _setup_loop_path_phase(
     """Build a real-git phase whose cumulative diff hits a watched signal.
 
     Lands a baseline ``src/flywheel/lifecycle.py``, records the phase's
-    base SHA into ``.loop-base``, commits the dotfile, then commits a
+    base SHA (loop-base ref — nothing to commit), then commits a
     follow-up edit that adds a new ``Status`` enum member. The resulting
     ``phase_diff_vs_base(repo, phase_dir)`` contains the new ``Status``
     member -- signal 1 of the FR-1 trigger set -- so the gate fires.
@@ -663,14 +669,6 @@ def _setup_loop_path_phase(
     phase_dir = repo / ".flywheel" / "tasks" / "active" / phase_name
     phase_dir.mkdir(parents=True)
     assert write_phase_base_if_missing(repo, phase_dir) is True
-    subprocess.run(
-        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "chore: record phase base"],
-        check=True,
-        capture_output=True,
-    )
 
     # Land the loop-path-bearing change against the recorded base.
     lifecycle_path.write_text(_LIFECYCLE_WITH_NEW_STATUS)
@@ -3281,3 +3279,49 @@ def test_run_task_object_omits_base_sha_without_worktree(
     ctx = outcome.attempts[0].agent_context
     assert ctx["model_id"] == "claude-code-default"
     assert "base_commit_sha" not in ctx
+
+
+def test_archive_materializes_loop_base_ref_into_dotfile(
+    tmp_path: Path,
+) -> None:
+    """Archiving carries the phase's loop-base ref into the archived dir as
+    the legacy ``.loop-base`` dotfile and drops the ref — audits keep one
+    contract (the file travels with every archived phase), and the ref
+    namespace holds only live phases."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = repo / ".flywheel" / "tasks"
+    phase_dir = tasks_dir / "active" / "02-plain"
+    phase_dir.mkdir(parents=True)
+
+    head = _git_head(repo)
+    assert write_phase_base_if_missing(repo, phase_dir) is True
+
+    # A plain (non-loop-path) change lands; the phase's only task is DONE.
+    _git_commit_file(repo, "feature.txt", "x\n", "feat: task work")
+    _write_task(phase_dir / "plain.json", "plain")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_done(store, "plain")
+        moved = archive_completed_phases(tasks_dir, store, repo_root=repo)
+    finally:
+        store.close()
+
+    assert [p.name for p in moved] == ["02-plain"]
+    archived = tasks_dir / "archive" / "02-plain"
+    assert (archived / LOOP_BASE_FILENAME).read_text().strip() == head
+    ref_check = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/flywheel/loop-base/02-plain",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert ref_check.returncode != 0

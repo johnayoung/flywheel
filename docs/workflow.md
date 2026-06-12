@@ -48,7 +48,7 @@ The daemon is invoked as `flywheel worker` (the product shell delegates in-proce
 
 1. Commit any untracked task JSONs under `tasks/active/`.
 2. Record a `.loop-base` SHA for any phase that lacks one.
-3. `orchestrate()` — drive every eligible task to quiescence (`packages/flywheel-orchestrator/`): a task is eligible when its state is FRESH/RETRYABLE/INTERRUPTED and every prerequisite is DONE; each task runs in its own git worktree branched off main and FF-merges back on DONE under the merge lock.
+3. `orchestrate()` — drive every eligible task to quiescence (`packages/flywheel-orchestrator/`): a task is eligible when its state is FRESH/RETRYABLE/INTERRUPTED and every prerequisite is DONE; each task runs in its own git worktree branched off main and FF-merges back on DONE under the merge lock. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree (still under the lock) before the merge; a red re-run parks the worktree instead of merging — nothing lands that was not verified against the exact base it lands on.
 4. Write per-run logs to `logs/worker/`.
 5. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below.
 

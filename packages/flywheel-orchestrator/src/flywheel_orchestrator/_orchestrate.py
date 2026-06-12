@@ -305,10 +305,16 @@ class SubmitRequest:
     is exactly the path the matching :data:`SandboxProvider` returned.
     ``task_file``/``source_ref`` follow the same convention as
     :class:`SandboxRequest`.
+
+    ``task`` is the validated core task the run was driven with. It carries
+    everything a submit strategy needs to re-verify the work against the
+    tree it is about to land on (the graders) or to render the outcome
+    elsewhere (the goal), without assuming a file-backed source.
     """
 
     task_id: str
     task_file: Path
+    task: Task
     run_id: str
     status: Status
     sandbox: Path
@@ -909,6 +915,7 @@ async def _drive_under_lease(
                 SubmitRequest(
                     task_id=task_id,
                     task_file=row.task_file,
+                    task=row.task,
                     run_id=outcome.lifecycle.run_id,
                     status=outcome.lifecycle.status,
                     sandbox=sandbox,

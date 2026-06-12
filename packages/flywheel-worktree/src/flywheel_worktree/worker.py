@@ -10,7 +10,10 @@ concerns flywheel deliberately does not:
 
 * **Git submit** — each task runs in its own worktree on branch
   ``flywheel/<phase>/<task-id>``; on ``done`` the branch is FF-merged into the
-  base and the worktree removed, otherwise it is parked for forensics. Lives in
+  base and the worktree removed, otherwise it is parked for forensics. When
+  the base advanced under a finished task, the branch is rebased once and its
+  command graders re-run against the rebased tree before the merge — nothing
+  lands that was not verified against the exact base it lands on. Lives in
   :class:`GitWorktreeSubmitter`, injected into ``orchestrate`` through its
   ``prepare_sandbox`` / ``submit`` seam. No git lives in flywheel.
 * **Daemon poll loop** — ``orchestrate`` drains every eligible task to
@@ -48,8 +51,11 @@ from pathlib import Path
 from typing import Callable, Iterator, Sequence, TextIO
 
 from flywheel_core import (
+    CommandGrader,
+    GraderResultRecord,
     InvokeFunc,
     Status,
+    run_command_graders,
 )
 from flywheel_orchestrator import (
     OrchestratorReport,
@@ -150,6 +156,34 @@ def phase_of_task_file(task_file: Path, tasks_dir: Path) -> str:
 
 
 # --- git submit strategy ----------------------------------------------------
+
+
+class _ReverifyRecorder:
+    """Minimal in-memory ``GraderResultStore`` for submit-time re-verification.
+
+    Post-rebase grader runs are a merge gate, not lifecycle history: the
+    run's authoritative receipts were persisted in-run, and the store's
+    ``(run_id, attempt_number, ordinal)`` key has no slot for a re-check.
+    Outcomes are logged instead.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[GraderResultRecord] = []
+
+    def append_grader_result(
+        self, result: GraderResultRecord
+    ) -> GraderResultRecord:
+        self.records.append(result)
+        return result
+
+    def list_grader_results(
+        self, run_id: str, attempt_number: int
+    ) -> list[GraderResultRecord]:
+        return [
+            r
+            for r in self.records
+            if r.run_id == run_id and r.attempt_number == attempt_number
+        ]
 
 
 class GitWorktreeSubmitter:
@@ -391,13 +425,20 @@ class GitWorktreeSubmitter:
                 self._cleanup(worktree, branch)
                 return
 
-            # FF failed (base advanced): rebase once, retry FF, else park.
+            # FF failed (base advanced): rebase once, re-verify, retry FF,
+            # else park.
             self.log(f"FF failed for {branch}; rebasing onto {self.phase_base}")
             if _git(worktree, "rebase", self.phase_base).returncode != 0:
                 _git(worktree, "rebase", "--abort")
                 self.log(
                     f"rebase failed for {branch}; parking worktree at "
                     f"{worktree}"
+                )
+                return
+            if not self._reverify(req, worktree):
+                self.log(
+                    f"post-rebase re-verification failed for {branch}; "
+                    f"parking worktree at {worktree}"
                 )
                 return
             if self._ff_merge(branch):
@@ -411,6 +452,47 @@ class GitWorktreeSubmitter:
                 f"post-rebase FF failed for {branch}; parking worktree at "
                 f"{worktree}"
             )
+
+    def _reverify(self, req: SubmitRequest, worktree: Path) -> bool:
+        """Re-run the task's command graders against the rebased tree.
+
+        A submit-time rebase moves the work onto a base the in-run graders
+        never saw: a textually clean rebase can still be semantically broken
+        against whatever advanced the base, so the run's receipts no longer
+        describe the tree about to land. Nothing merges unless it was
+        verified against the exact base it lands on — command graders re-run
+        here, cwd'd to the rebased worktree and still under the merge lock so
+        the base cannot move again before the FF. Transcript/rubric/manual
+        graders judge the agent's work, not the tree, and stay valid across
+        a clean rebase; a task with no command graders has nothing
+        tree-dependent to re-check.
+        """
+        command_count = sum(
+            isinstance(g, CommandGrader) for g in req.task.graders
+        )
+        if command_count == 0:
+            self.log(
+                f"{req.task_id} has no command graders; nothing to re-verify "
+                f"after rebase"
+            )
+            return True
+        records = run_command_graders(
+            req.task,
+            _ReverifyRecorder(),
+            run_id=req.run_id,
+            # Merge-gate checks sit outside the lifecycle's attempt
+            # numbering; receipts are logged, not persisted.
+            attempt_number=0,
+            cwd=worktree,
+        )
+        for record in records:
+            label = record.grader_name or str(record.grader_spec.get("run", ""))
+            verdict = "pass" if record.passed else "FAIL"
+            self.log(
+                f"re-verify {req.task_id}: {verdict} [{label}] "
+                f"({record.duration_ms}ms)"
+            )
+        return len(records) == command_count and all(r.passed for r in records)
 
     def _commit_count(self, branch: str) -> int:
         res = _git(

@@ -24,11 +24,13 @@ from pathlib import Path
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from flywheel_core import (
+    CommandGrader,
     Intent,
     InvocationRequest,
     InvocationSignals,
     IterationResult,
     Status,
+    Task,
     ValidEnvelope,
 )
 from flywheel_core.store_sqlite import SqliteStore
@@ -114,11 +116,21 @@ def _sandbox_req(tf: Path, task_id: str, mode: str = "fresh") -> SandboxRequest:
 
 
 def _submit_req(
-    tf: Path, task_id: str, sandbox: Path, status: Status
+    tf: Path,
+    task_id: str,
+    sandbox: Path,
+    status: Status,
+    *,
+    grader: str = "true",
 ) -> SubmitRequest:
     return SubmitRequest(
         task_id=task_id,
         task_file=tf,
+        task=Task(
+            id=task_id,
+            goal=f"Goal for {task_id}.",
+            graders=[CommandGrader(run=grader)],
+        ),
         run_id="run-1",
         status=status,
         sandbox=sandbox,
@@ -280,6 +292,109 @@ def test_prepare_reuses_and_rebases_onto_advanced_base(tmp_path: Path) -> None:
     assert not s._branch_exists("flywheel/01-phase/t1")
     # Base moved forward from the advance (the task commit FF'd on top).
     assert _rev(repo, "main") != main_after_advance
+
+
+# --- submit: post-rebase re-verification --------------------------------------
+
+
+def test_submit_rebase_reverifies_then_merges(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    tf = _task_file(repo, "01-phase", "t2")
+
+    wt = s.prepare(_sandbox_req(tf, "t2"))
+    _commit(wt, "feature2.txt", "x", "t2 work")
+    # A peer task merges first: the base advances past t2's branch point,
+    # so t2's FF fails and submit must rebase.
+    _commit(repo, "feature1.txt", "y", "peer merged")
+
+    # This grader passes only against the rebased tree (it needs the peer's
+    # file), proving re-verification ran against the exact base landed on.
+    s.submit(
+        _submit_req(
+            tf,
+            "t2",
+            wt,
+            Status.DONE,
+            grader="test -f feature1.txt && test -f feature2.txt",
+        )
+    )
+
+    assert (repo / "feature1.txt").exists()
+    assert (repo / "feature2.txt").exists()
+    assert not wt.exists()
+    assert not s._branch_exists("flywheel/01-phase/t2")
+
+
+def test_submit_rebase_reverify_failure_parks(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    tf = _task_file(repo, "01-phase", "t2")
+
+    wt = s.prepare(_sandbox_req(tf, "t2"))
+    _commit(wt, "feature2.txt", "x", "t2 work")
+    _commit(repo, "feature1.txt", "y", "peer merged")
+    base_after_peer = _rev(repo, "main")
+
+    # The grader held against t2's original tree but is contradicted by the
+    # peer's change — the semantic conflict a textually clean rebase hides.
+    s.submit(
+        _submit_req(
+            tf, "t2", wt, Status.DONE, grader="test ! -f feature1.txt"
+        )
+    )
+
+    # Re-verification failed: parked for forensics, base untouched.
+    assert wt.exists()
+    assert s._branch_exists("flywheel/01-phase/t2")
+    assert _rev(repo, "main") == base_after_peer
+    assert not (repo / "feature2.txt").exists()
+
+
+def test_submit_clean_ff_skips_reverify(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    marker = tmp_path / "reverify-ran"
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare(_sandbox_req(tf, "t1"))
+    _commit(wt, "feature.txt", "x", "feat")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE, grader=f"touch {marker}"))
+
+    # Base never advanced: pure FF, the in-run receipts already describe the
+    # exact tree that landed, so the graders must not re-run.
+    assert (repo / "feature.txt").exists()
+    assert not marker.exists()
+
+
+def test_submit_rebase_with_no_command_graders_merges(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _submitter(repo)
+    tf = _task_file(repo, "01-phase", "t2")
+
+    wt = s.prepare(_sandbox_req(tf, "t2"))
+    _commit(wt, "feature2.txt", "x", "t2 work")
+    _commit(repo, "feature1.txt", "y", "peer merged")
+
+    # No command graders: nothing tree-dependent to re-check after the
+    # rebase; the merge proceeds.
+    req = SubmitRequest(
+        task_id="t2",
+        task_file=tf,
+        task=Task(id="t2", goal="Goal for t2.", graders=[]),
+        run_id="run-1",
+        status=Status.DONE,
+        sandbox=wt,
+    )
+    s.submit(req)
+
+    assert (repo / "feature2.txt").exists()
+    assert not wt.exists()
 
 
 def test_submit_never_raises_on_git_error(tmp_path: Path) -> None:

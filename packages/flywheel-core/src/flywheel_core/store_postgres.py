@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files

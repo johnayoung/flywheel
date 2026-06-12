@@ -38,15 +38,6 @@ if TYPE_CHECKING:
     )
 
 
-def __getattr__(name: str) -> object:
-    """Lazy re-export so the ``postgres`` extra stays optional."""
-    if name == "PostgresClaimStore":
-        from flywheel_orchestrator._claims_postgres import PostgresClaimStore
-
-        return PostgresClaimStore
-    raise AttributeError(
-        f"module 'flywheel_orchestrator' has no attribute {name!r}"
-    )
 from flywheel_orchestrator._github import GithubWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
@@ -110,6 +101,18 @@ from flywheel_orchestrator._workflow import (
     write_phase_base_if_missing,
 )
 
+
+def __getattr__(name: str) -> object:
+    """Lazy re-export so the ``postgres`` extra stays optional."""
+    if name == "PostgresClaimStore":
+        from flywheel_orchestrator._claims_postgres import PostgresClaimStore
+
+        return PostgresClaimStore
+    raise AttributeError(
+        f"module 'flywheel_orchestrator' has no attribute {name!r}"
+    )
+
+
 __all__ = [
     "AttemptSummary",
     "ClaimLostError",
@@ -165,6 +168,7 @@ __all__ = [
     "iter_active_phase_dirs",
     "iter_active_task_files",
     "load_active_tasks",
+    "load_policy",
     "load_effective_policy",
     "load_loop_path_optout",
     "open_sqlite_bound_store",

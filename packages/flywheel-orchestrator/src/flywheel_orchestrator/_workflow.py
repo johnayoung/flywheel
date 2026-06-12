@@ -84,8 +84,6 @@ from flywheel_orchestrator._sources import (
     WorkSource,
     WorkSourceError,
     iter_active_phase_dirs,
-    iter_active_task_files,
-    load_active_tasks,
 )
 from flywheel_orchestrator._store_factory import (
     PG_DSN_ENV,

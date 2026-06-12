@@ -170,6 +170,7 @@ def hello() -> str:
 
 __all__ = [
     "Attempt",
+    "GraderEvaluated",
     "AttemptFinalized",
     "AttemptStarted",
     "AttemptStore",

@@ -16,7 +16,7 @@ tests assert that:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -559,7 +559,7 @@ class TestHardLimitAndValidationAgree:
     def _observed_after_abort(
         self,
         *,
-        source: list[Message],
+        source: Sequence[Message],
         grader: TranscriptGrader,
         monotonic: _FakeClock | None = None,
     ) -> TranscriptObservation:

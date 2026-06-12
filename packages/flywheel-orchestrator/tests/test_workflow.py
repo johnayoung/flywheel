@@ -41,12 +41,12 @@ from flywheel_orchestrator._workflow import (
     build_status_rows,
     collect_live_rows,
     iter_active_phase_dirs,
-    iter_active_task_files,
     phase_diff_vs_base,
     read_phase_base,
     select_next_task,
     write_phase_base_if_missing,
 )
+from flywheel_orchestrator._sources import iter_active_task_files
 from flywheel_orchestrator._workflow import main as orch_main
 
 
@@ -1972,8 +1972,6 @@ def test_run_task_file_records_crash_for_invoke_runtime_error(
     """
     import asyncio
 
-    from flywheel_core.harness import InvocationRequest
-    from flywheel_core.invoker import IterationResult
     from flywheel_core.workflow import run_task_file
 
     task_file = tmp_path / "task.json"

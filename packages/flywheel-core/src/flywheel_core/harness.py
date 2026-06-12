@@ -151,7 +151,6 @@ from flywheel_core.grader_manual import (
     build_manual_result,
     next_pending_manual_gate,
 )
-from flywheel_core.loaders import task_digest
 from flywheel_core.task import (
     CommandGrader,
     ManualGrader,

@@ -335,7 +335,7 @@ def test_run_once_merges_completed_task(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
     s = _submitter(repo)
-    tf = _task_file(repo, "01-phase", "t1", grader="true")
+    _task_file(repo, "01-phase", "t1", grader="true")
     worktree = repo / ".flywheel" / "worktrees" / "t1"
 
     async def _invoke(request: InvocationRequest) -> IterationResult:
@@ -441,7 +441,7 @@ def test_run_once_produces_run_jsonl_and_no_log_files(
     repo = tmp_path / "repo"
     _init_repo(repo)
     s = _submitter(repo)
-    tf = _task_file(repo, "01-phase", "t1", grader="true")
+    _task_file(repo, "01-phase", "t1", grader="true")
     worktree = repo / ".flywheel" / "worktrees" / "t1"
 
     async def _invoke(request: InvocationRequest) -> IterationResult:

@@ -28,11 +28,9 @@ import os
 import shlex
 import sys
 from collections.abc import Iterable
-from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
-from collections.abc import Mapping, Sequence
 
 from claude_agent_sdk import ClaudeAgentOptions
 

@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 
 from flywheel_core import (
@@ -92,11 +94,12 @@ def test_transcript_grader_rejects_construction_with_no_limits() -> None:
 
 
 def test_transcript_grader_accepts_any_single_limit() -> None:
-    for kwargs in (
+    limits: tuple[dict[str, Any], ...] = (
         {"max_turns": 5},
         {"max_total_tokens": 1000},
         {"max_wall_seconds": 30.0},
-    ):
+    )
+    for kwargs in limits:
         task = Task(goal="g", graders=[TranscriptGrader(**kwargs)])
         task.validate()
 

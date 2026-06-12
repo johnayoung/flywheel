@@ -240,6 +240,7 @@ def _history_run_from_row(
     attempts, tokens, cost, turns = _attempt_rollups(
         store, str(row["run_id"])
     )
+    raw_retries = row["retries"]
     return HistoryRun(
         run_id=str(row["run_id"]),
         task_id=str(row["task_id"]),
@@ -247,7 +248,7 @@ def _history_run_from_row(
         source=str(row["source"] or ""),
         started_at=started,
         finished_at=finished,
-        retries=int(row["retries"] or 0),
+        retries=raw_retries if isinstance(raw_retries, int) else 0,
         error=str(row["error"] or ""),
         attempts=attempts,
         tokens_total=tokens,

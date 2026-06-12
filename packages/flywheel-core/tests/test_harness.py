@@ -2107,7 +2107,7 @@ class TestFinalizeStranded:
 
     def test_finalize_missing_lifecycle_is_noop(self) -> None:
         store = InMemoryStore()
-        sink = _ListSink()
+
         ok = finalize_stranded_lifecycle(store, "run-does-not-exist")
         assert ok is False
 

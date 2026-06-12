@@ -783,7 +783,7 @@ async def run_task_object(
                 backend, lifecycle.run_id, sink=run_sink
             )
             print(
-                f"[workflow] status  : interrupted (worker received signal)",
+                "[workflow] status  : interrupted (worker received signal)",
                 file=out,
                 flush=True,
             )

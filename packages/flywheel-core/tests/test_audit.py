@@ -463,7 +463,7 @@ def test_attach_logger_emits_one_record_per_audit_row(tmp_path: Path) -> None:
 def test_attach_logger_returns_distinct_handles_when_called_twice(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
     logs_root = tmp_path / "logs"
-    sink = FileTelemetrySink(logs_root)
+    FileTelemetrySink(logs_root)
     logger, _handler = _build_isolated_logger(
         "test_audit.attach_logger.distinct"
     )
@@ -526,7 +526,7 @@ def test_detach_stops_emission_and_joins_thread(tmp_path: Path) -> None:
 def test_detach_is_idempotent(tmp_path: Path) -> None:
     store = _make_store_with_lifecycle("r1")
     logs_root = tmp_path / "logs"
-    sink = FileTelemetrySink(logs_root)
+    FileTelemetrySink(logs_root)
     logger, _handler = _build_isolated_logger("test_audit.detach.idempotent")
     handle = attach_logger(
         logger,
@@ -578,7 +578,7 @@ def test_stream_is_lazy_iterator(tmp_path: Path) -> None:
     """``stream`` returns an iterator, not a materialized list."""
     store = _make_store_with_lifecycle("r1")
     logs_root = tmp_path / "logs"
-    sink = FileTelemetrySink(logs_root)
+    FileTelemetrySink(logs_root)
     it = stream("r1", store=store, logs_root=logs_root)
     # The audit module is documented as returning an Iterator. The
     # type-level test here is just that next() works without indexing.
@@ -601,7 +601,6 @@ def test_audit_stream_carries_harness_awaiting_approval_payload_shape(
     from flywheel_core.grader_manual import ManualGate
     from flywheel_core.harness import _enter_manual_gate, _RunTelemetry
     from flywheel_core.lifecycle import Attempt, Outcome
-    from flywheel_core.store_protocols import TelemetryRecord
 
     store = _make_store_with_lifecycle("run-await")
     # Drive RUNNING -> VALIDATING so the in-memory version matches the

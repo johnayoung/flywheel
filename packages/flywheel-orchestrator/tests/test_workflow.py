@@ -40,13 +40,15 @@ from flywheel_orchestrator._workflow import (
     archive_completed_phases,
     build_status_rows,
     collect_live_rows,
-    iter_active_phase_dirs,
     phase_diff_vs_base,
     read_phase_base,
     select_next_task,
     write_phase_base_if_missing,
 )
-from flywheel_orchestrator._sources import iter_active_task_files
+from flywheel_orchestrator._sources import (
+    iter_active_phase_dirs,
+    iter_active_task_files,
+)
 from flywheel_orchestrator._workflow import main as orch_main
 
 

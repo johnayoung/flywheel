@@ -47,7 +47,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Sequence, TextIO
 
 from flywheel_core import (
@@ -204,6 +204,7 @@ class GitWorktreeSubmitter:
         phase_base: str,
         lock_path: Path,
         log: Logger,
+        protected_paths: Sequence[str] = (),
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -211,6 +212,7 @@ class GitWorktreeSubmitter:
         self.phase_base = phase_base
         self.lock_path = lock_path
         self.log = log
+        self.protected_paths = tuple(protected_paths)
 
     def _branch(self, task_id: str, phase: str) -> str:
         return f"flywheel/{phase}/{task_id}"
@@ -418,6 +420,15 @@ class GitWorktreeSubmitter:
                 self._cleanup(worktree, branch)
                 return
 
+            violations = self._protected_violations(branch)
+            if violations:
+                self.log(
+                    f"{task_id} touches protected path(s) "
+                    f"{', '.join(violations)}; refusing to merge, parking "
+                    f"worktree at {worktree}"
+                )
+                return
+
             if self._ff_merge(branch):
                 self.log(
                     f"Merged {branch} into {self.phase_base} "
@@ -453,6 +464,40 @@ class GitWorktreeSubmitter:
                 f"post-rebase FF failed for {branch}; parking worktree at "
                 f"{worktree}"
             )
+
+    def _protected_violations(self, branch: str) -> list[str]:
+        """Repo-relative paths the branch touches that match a protected
+        pattern (``PurePath.full_match`` glob semantics, ``**`` crosses
+        directories).
+
+        The diff is merge-base scoped (``base...branch``) so only the
+        branch's own changes count, never what the base did underneath it.
+        This is the merge-time half of the verification trust boundary:
+        graders execute inside the tree the agent just mutated, so work
+        that rewrites the verification surface itself (grader configs, CI,
+        harness state) can pass its own judges — the gate refuses to land
+        it regardless.
+        """
+        if not self.protected_paths:
+            return []
+        res = _git(
+            self.repo_root,
+            "diff",
+            "--name-only",
+            f"{self.phase_base}...{branch}",
+        )
+        if res.returncode != 0:
+            # Cannot establish what the branch touches: fail closed.
+            return [f"<diff failed: {res.stderr.strip()}>"]
+        return [
+            path
+            for path in res.stdout.splitlines()
+            if path
+            and any(
+                PurePosixPath(path).full_match(pattern)
+                for pattern in self.protected_paths
+            )
+        ]
 
     def _reverify(self, req: SubmitRequest, worktree: Path) -> bool:
         """Re-run the task's command graders against the rebased tree.
@@ -964,6 +1009,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         phase_base=phase_base,
         lock_path=lock_path,
         log=log,
+        protected_paths=policy.protected_paths if policy else (),
     )
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)

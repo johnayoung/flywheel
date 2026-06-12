@@ -93,6 +93,12 @@ done_action = "close"      # or "comment"
 [[defaults.graders]]
 type = "command"
 run = "uv run pytest"
+
+[submit]
+# Glob patterns (** crosses directories) a finished task's branch may not
+# touch; a match refuses the merge and parks the work. Protects the
+# verification surface (grader configs, CI) from the work it judges.
+protected_paths = [".github/**", "flywheel.toml"]
 ```
 
 `flywheel status|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults. The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `flywheel worker [--once]` to drive a phase.

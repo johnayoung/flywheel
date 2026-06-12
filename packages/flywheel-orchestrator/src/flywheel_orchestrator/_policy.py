@@ -41,6 +41,15 @@ Format (TOML, stdlib ``tomllib``)::
     backend = "sqlite"              # or "postgres"
     # schema = "flywheel_ci"        # postgres only; optional
 
+    # Landing policy (optional). protected_paths are glob patterns
+    # (PurePath.full_match semantics, ** crosses directories) matched
+    # against every repo-relative path a finished task's branch touches;
+    # any match refuses the merge and parks the work. Protects the
+    # verification surface itself — grader configs, CI, harness state —
+    # from being rewritten by the work it is supposed to judge.
+    [submit]
+    protected_paths = [".github/**", "flywheel.toml"]
+
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
 default policy is not runnable and never reaches the scheduler.
@@ -90,7 +99,9 @@ class WorkPolicy:
     to its CLI flag / built-in default). ``store_backend``/``store_schema``
     mirror the optional ``[store]`` table; an absent section means sqlite
     with no schema, so every pre-existing policy file keeps loading
-    unchanged.
+    unchanged. ``protected_paths`` mirrors the optional
+    ``[submit] protected_paths`` list; empty when unset (no merge-time
+    path gate).
     """
 
     source_kind: str
@@ -104,6 +115,7 @@ class WorkPolicy:
     model: str | None = None
     store_backend: str = "sqlite"
     store_schema: str | None = None
+    protected_paths: tuple[str, ...] = ()
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -154,6 +166,11 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [store] must be a table")
     store_backend, store_schema = _optional_store(store, policy_file=path)
 
+    submit = data.get("submit") or {}
+    if not isinstance(submit, dict):
+        raise PolicyError(f"{path}: [submit] must be a table")
+    protected_paths = _optional_protected_paths(submit, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -171,6 +188,7 @@ def load_policy(path: Path) -> WorkPolicy:
             model=model,
             store_backend=store_backend,
             store_schema=store_schema,
+            protected_paths=protected_paths,
         )
 
     repo = source.get("repo")
@@ -200,6 +218,7 @@ def load_policy(path: Path) -> WorkPolicy:
         model=model,
         store_backend=store_backend,
         store_schema=store_schema,
+        protected_paths=protected_paths,
     )
 
 
@@ -263,6 +282,29 @@ def _optional_store(
             f"{policy_file}: store.schema must be a non-empty string"
         )
     return backend, schema
+
+
+def _optional_protected_paths(
+    table: dict, *, policy_file: Path
+) -> tuple[str, ...]:
+    """Validate and return the optional ``submit.protected_paths`` list.
+
+    Returns ``()`` when the key is absent so an unconfigured policy has no
+    merge-time path gate. A non-list value, or any entry that is not a
+    non-empty string, raises :class:`PolicyError` so a typo never silently
+    degrades into "nothing protected."
+    """
+    value = table.get("protected_paths")
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise PolicyError(
+            f"{policy_file}: submit.protected_paths must be a list of "
+            f"non-empty strings"
+        )
+    return tuple(value)
 
 
 def build_work_source(policy: WorkPolicy) -> WorkSource:

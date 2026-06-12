@@ -837,3 +837,76 @@ def test_submitter_is_a_submit_strategy(tmp_path: Path) -> None:
     # GitWorktreeSubmitter is the reference SubmitStrategy: structural
     # conformance is what lets run_once pass it whole to orchestrate.
     assert isinstance(_submitter(repo), SubmitStrategy)
+
+
+# --- submit: protected-path merge gate -----------------------------------------
+
+
+def _protected_submitter(
+    repo: Path, patterns: list[str]
+) -> tuple["worker.GitWorktreeSubmitter", list[str]]:
+    logs: list[str] = []
+    worktrees = repo / ".flywheel" / "worktrees"
+    worktrees.mkdir(parents=True, exist_ok=True)
+    s = worker.GitWorktreeSubmitter(
+        repo_root=repo,
+        tasks_dir=repo / ".flywheel" / "tasks",
+        worktrees_dir=worktrees,
+        phase_base="main",
+        lock_path=repo / ".flywheel" / ".merge.lock",
+        log=logs.append,
+        protected_paths=patterns,
+    )
+    return s, logs
+
+
+def test_submit_protected_path_parks(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s, logs = _protected_submitter(repo, ["conftest.py"])
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "conftest.py", "tampered", "edit conftest")
+    base_before = _rev(repo, "main")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE))
+
+    # Work that rewrites the verification surface never lands, even DONE.
+    assert wt.exists()
+    assert s._branch_exists("flywheel/01-phase/t1")
+    assert _rev(repo, "main") == base_before
+    assert any("protected path" in m for m in logs)
+
+
+def test_submit_protected_glob_matches_nested(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s, _logs = _protected_submitter(repo, [".github/**"])
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    (wt / ".github" / "workflows").mkdir(parents=True)
+    _commit(wt, ".github/workflows/ci.yml", "weakened", "edit ci")
+    base_before = _rev(repo, "main")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE))
+
+    assert wt.exists()
+    assert _rev(repo, "main") == base_before
+
+
+def test_submit_unprotected_path_merges(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s, _logs = _protected_submitter(repo, ["conftest.py", ".github/**"])
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "feature.txt", "x", "feat")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE))
+
+    # The gate only bites on protected paths; ordinary work lands as before.
+    assert (repo / "feature.txt").exists()
+    assert not wt.exists()

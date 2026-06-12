@@ -581,3 +581,50 @@ def test_build_github_source_carries_policy(tmp_path: Path) -> None:
     assert source.label == "flywheel"
     assert source.done_action == "close"
     assert len(source.default_graders) == 1
+
+
+# --- [submit] protected_paths -------------------------------------------------
+
+
+def test_protected_paths_default_empty(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.protected_paths == ()
+
+
+def test_protected_paths_parse(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[submit]",
+                    'protected_paths = [".github/**", "conftest.py"]',
+                ]
+            ),
+        )
+    )
+    assert policy.protected_paths == (".github/**", "conftest.py")
+
+
+def test_protected_paths_rejects_non_list(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="protected_paths"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                'protected_paths = ".github/**"\n',
+            )
+        )
+
+
+def test_protected_paths_rejects_empty_entry(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="protected_paths"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                'protected_paths = [".github/**", " "]\n',
+            )
+        )

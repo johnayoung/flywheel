@@ -175,14 +175,22 @@ class SqliteStore:
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
         # Version pin: a database whose schema_version row does not match is
-        # refused with a "must be re-created" error. There is no in-place
-        # migration — the schema is pre-MVP, so an older on-disk shape is
-        # rejected rather than upgraded. The schema_version table has a CHECK
-        # (id = 1) so there is at most one row to read.
+        # refused with a "must be re-created" error. The schema_version table
+        # has a CHECK (id = 1) so there is at most one row to read. The one
+        # supported forward migration (v11 -> v12: add the nullable
+        # lifecycles.source column) is applied in place first — it is purely
+        # additive, so existing history survives the upgrade; any other
+        # mismatch is rejected rather than upgraded.
         row = conn.execute(
             "SELECT version FROM schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
+        if observed == 11:
+            conn.execute("ALTER TABLE lifecycles ADD COLUMN source TEXT")
+            conn.execute(
+                "UPDATE schema_version SET version = 12 WHERE id = 1"
+            )
+            observed = 12
         if observed != CURRENT_SCHEMA_VERSION:
             raise StoreSchemaError(
                 observed_version=observed,
@@ -246,8 +254,8 @@ class SqliteStore:
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
                     timestamps_json, updated_at, blocked_requires_json,
-                    task_content_hash, awaiting_manual_ordinal
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    task_content_hash, awaiting_manual_ordinal, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     lifecycle.run_id,
@@ -265,6 +273,7 @@ class SqliteStore:
                     lifecycle.blocked_requires_json,
                     lifecycle.task_content_hash or None,
                     lifecycle.awaiting_manual_ordinal,
+                    lifecycle.source or None,
                 ),
             )
         except sqlite3.IntegrityError as exc:
@@ -294,7 +303,8 @@ class SqliteStore:
                 updated_at = ?,
                 blocked_requires_json = ?,
                 task_content_hash = ?,
-                awaiting_manual_ordinal = ?
+                awaiting_manual_ordinal = ?,
+                source = ?
             WHERE run_id = ? AND version = ?
             """,
             (
@@ -312,6 +322,7 @@ class SqliteStore:
                 lifecycle.blocked_requires_json,
                 lifecycle.task_content_hash or None,
                 lifecycle.awaiting_manual_ordinal,
+                lifecycle.source or None,
                 lifecycle.run_id,
                 expected_version,
             ),
@@ -337,7 +348,7 @@ class SqliteStore:
             SELECT run_id, task_id, status, version, retries, error,
                    agent_output, session_id, artifacts_dir, worker_id,
                    timestamps_json, blocked_requires_json, task_content_hash,
-                   awaiting_manual_ordinal
+                   awaiting_manual_ordinal, source
             FROM lifecycles
             WHERE run_id = ?
             """,
@@ -363,6 +374,7 @@ class SqliteStore:
                 int(awaiting_raw) if awaiting_raw is not None else None
             ),
             task_content_hash=row["task_content_hash"] or "",
+            source=row["source"] or "",
         )
         lc.attempts = self.list_attempts(run_id)
         return lc

@@ -63,6 +63,7 @@ Key rules:
 | `attempts`        | Full history of all attempts              |
 | `session_id`      | Agent session for resumption              |
 | `artifacts_dir`   | Where attempt artifacts are stored        |
+| `source`          | Opaque provenance label for the work item (task-file path, tracker ref); set once at seed, never interpreted by core |
 
 ## Attempts
 

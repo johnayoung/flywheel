@@ -146,6 +146,12 @@ class Lifecycle:
     # run to a row in the content-addressed `tasks` store. Identity-shaping
     # like task_id/run_id: set once at seed, never copied by replace_from.
     task_content_hash: str = ""
+    # Opaque provenance label for where this run's work item came from (a
+    # task-file path, a tracker ref like "owner/repo#123"). Supplied by the
+    # caller, never interpreted here — flywheel-core stays input-source
+    # agnostic. Identity-shaping like task_content_hash: set once at seed,
+    # never copied by replace_from.
+    source: str = ""
 
     def apply_transition(
         self,

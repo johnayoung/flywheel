@@ -1673,6 +1673,7 @@ async def run_task(
                 worker_id=lifecycle.worker_id,
                 artifacts_dir=lifecycle.artifacts_dir,
                 task_content_hash=task_content_hash,
+                source=lifecycle.source,
             ),
             store=store,
         )

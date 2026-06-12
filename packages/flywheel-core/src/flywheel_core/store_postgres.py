@@ -256,14 +256,26 @@ class PostgresStore:
                 )
                 cur.execute(_read_schema_sql())
                 # Version pin: a schema whose schema_version row does not
-                # match is refused with a "must be re-created" error. There
-                # is no in-place migration — the schema is pre-MVP, so an
-                # older on-disk shape is rejected rather than upgraded.
+                # match is refused with a "must be re-created" error. The
+                # one supported forward migration (v11 -> v12: add the
+                # nullable lifecycles.source column) is applied in place
+                # first — purely additive, so existing history survives;
+                # any other mismatch is rejected rather than upgraded.
                 cur.execute(
                     "SELECT version FROM schema_version WHERE id = 1"
                 )
                 row = cur.fetchone()
-        observed = int(row[0]) if row is not None else None
+                observed = int(row[0]) if row is not None else None
+                if observed == 11:
+                    cur.execute(
+                        "ALTER TABLE lifecycles "
+                        "ADD COLUMN IF NOT EXISTS source TEXT"
+                    )
+                    cur.execute(
+                        "UPDATE schema_version SET version = 12 "
+                        "WHERE id = 1"
+                    )
+                    observed = 12
         if observed != CURRENT_SCHEMA_VERSION:
             raise StoreSchemaError(
                 observed_version=observed,
@@ -416,10 +428,10 @@ class PostgresStore:
                             error, agent_output, session_id, artifacts_dir,
                             worker_id, timestamps_json, updated_at,
                             blocked_requires_json, task_content_hash,
-                            awaiting_manual_ordinal
+                            awaiting_manual_ordinal, source
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s
+                            %s, %s, %s, %s, %s
                         )
                         """,
                         (
@@ -438,6 +450,7 @@ class PostgresStore:
                             lifecycle.blocked_requires_json,
                             lifecycle.task_content_hash or None,
                             lifecycle.awaiting_manual_ordinal,
+                            lifecycle.source or None,
                         ),
                     )
         except psycopg.errors.UniqueViolation as exc:
@@ -467,7 +480,8 @@ class PostgresStore:
                         updated_at = %s,
                         blocked_requires_json = %s,
                         task_content_hash = %s,
-                        awaiting_manual_ordinal = %s
+                        awaiting_manual_ordinal = %s,
+                        source = %s
                     WHERE run_id = %s AND version = %s
                     """,
                     (
@@ -485,6 +499,7 @@ class PostgresStore:
                         lifecycle.blocked_requires_json,
                         lifecycle.task_content_hash or None,
                         lifecycle.awaiting_manual_ordinal,
+                        lifecycle.source or None,
                         lifecycle.run_id,
                         expected_version,
                     ),
@@ -513,7 +528,7 @@ class PostgresStore:
                     SELECT run_id, task_id, status, version, retries, error,
                            agent_output, session_id, artifacts_dir, worker_id,
                            timestamps_json, blocked_requires_json,
-                           task_content_hash, awaiting_manual_ordinal
+                           task_content_hash, awaiting_manual_ordinal, source
                     FROM lifecycles
                     WHERE run_id = %s
                     """,
@@ -540,6 +555,7 @@ class PostgresStore:
                 int(awaiting_raw) if awaiting_raw is not None else None
             ),
             task_content_hash=row["task_content_hash"] or "",
+            source=row["source"] or "",
         )
         lc.attempts = self.list_attempts(run_id)
         return lc

@@ -448,3 +448,120 @@ def test_fresh_store_records_current_schema_version(tmp_path: Path) -> None:
     finally:
         store.close()
 
+
+
+# --- v11 -> v12 forward migration (lifecycles.source) ------------------------
+
+
+def _downgrade_to_v11(db: Path) -> None:
+    """Reshape a fresh store file into the v11 on-disk schema.
+
+    Drops the ``lifecycles.source`` column and pins ``schema_version``
+    back to 11 — exactly what a database written by the previous release
+    looks like.
+    """
+    conn = sqlite3.connect(str(db), isolation_level=None)
+    try:
+        conn.execute("ALTER TABLE lifecycles DROP COLUMN source")
+        conn.execute("UPDATE schema_version SET version = 11 WHERE id = 1")
+    finally:
+        conn.close()
+
+
+def test_v11_database_is_forward_migrated_in_place(tmp_path: Path) -> None:
+    db = tmp_path / "v11.db"
+    store = SqliteStore(db)
+    store.create_lifecycle(Lifecycle(task_id="t1", run_id="run-old"))
+    store.close()
+    _downgrade_to_v11(db)
+
+    migrated = SqliteStore(db)
+    try:
+        row = migrated._connection.execute(
+            "SELECT version FROM schema_version WHERE id = 1"
+        ).fetchone()
+        assert int(row["version"]) == CURRENT_SCHEMA_VERSION
+        # Pre-migration history survives; its source reads back empty.
+        lc = migrated.load_lifecycle("run-old")
+        assert lc is not None
+        assert lc.source == ""
+        # The migrated column is writable like a fresh store's.
+        migrated.create_lifecycle(
+            Lifecycle(
+                task_id="t1",
+                run_id="run-new",
+                source=".flywheel/tasks/active/30-history/t1.json",
+            )
+        )
+        reloaded = migrated.load_lifecycle("run-new")
+        assert reloaded is not None
+        assert reloaded.source == (
+            ".flywheel/tasks/active/30-history/t1.json"
+        )
+    finally:
+        migrated.close()
+
+
+def test_migration_is_idempotent_across_reopens(tmp_path: Path) -> None:
+    db = tmp_path / "v11-reopen.db"
+    SqliteStore(db).close()
+    _downgrade_to_v11(db)
+    SqliteStore(db).close()
+    # Second open after the migration must not try to re-add the column.
+    SqliteStore(db).close()
+
+
+# --- lifecycles.source round-trip --------------------------------------------
+
+
+def test_lifecycle_source_round_trips(tmp_path: Path) -> None:
+    db = tmp_path / "source.db"
+    store = SqliteStore(db)
+    try:
+        store.create_lifecycle(
+            Lifecycle(task_id="t1", run_id="run-a", source="owner/repo#7")
+        )
+        lc = store.load_lifecycle("run-a")
+        assert lc is not None
+        assert lc.source == "owner/repo#7"
+        # Absent source persists as NULL and reads back as "".
+        store.create_lifecycle(Lifecycle(task_id="t1", run_id="run-b"))
+        raw = store._connection.execute(
+            "SELECT source FROM lifecycles WHERE run_id = 'run-b'"
+        ).fetchone()
+        assert raw["source"] is None
+        bare = store.load_lifecycle("run-b")
+        assert bare is not None
+        assert bare.source == ""
+    finally:
+        store.close()
+
+
+def test_seed_event_carries_source_through_fold_and_replay(
+    tmp_path: Path,
+) -> None:
+    from flywheel_core.events import LifecycleInitialized, replay
+
+    db = tmp_path / "seed-source.db"
+    store = SqliteStore(db)
+    try:
+        folded = store.append_domain_event(
+            LifecycleInitialized(
+                run_id="run-s",
+                ts=datetime.now(timezone.utc),
+                task_id="t1",
+                source=".flywheel/tasks/active/30-history/t1.json",
+            ),
+            expected_version=0,
+        )
+        assert folded.source == (
+            ".flywheel/tasks/active/30-history/t1.json"
+        )
+        # The projection row and an event replay agree on the source.
+        lc = store.load_lifecycle("run-s")
+        assert lc is not None
+        assert lc.source == folded.source
+        replayed = replay(store.list_domain_events("run-s"))
+        assert replayed.source == folded.source
+    finally:
+        store.close()

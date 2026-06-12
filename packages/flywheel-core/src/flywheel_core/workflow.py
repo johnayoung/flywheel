@@ -649,10 +649,14 @@ async def run_task_object(
     per run under ``logs/runs/``.
     """
     out = stream if stream is not None else sys.stderr
+    # ``source`` rides the lifecycle into the LifecycleInitialized seed so
+    # the run's provenance is queryable after the fact (e.g. the
+    # orchestrator's history view groups runs by it). On resume the
+    # persisted row's source wins — the seed append is swallowed.
     lifecycle = (
-        Lifecycle(task_id=task.id)
+        Lifecycle(task_id=task.id, source=source or "")
         if run_id is None
-        else Lifecycle(task_id=task.id, run_id=run_id)
+        else Lifecycle(task_id=task.id, run_id=run_id, source=source or "")
     )
 
     db_path.parent.mkdir(parents=True, exist_ok=True)

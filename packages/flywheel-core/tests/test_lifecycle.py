@@ -60,6 +60,7 @@ def test_lifecycle_fields_match_spec_table() -> None:
         "blocked_requires_json",
         "awaiting_manual_ordinal",
         "task_content_hash",
+        "source",
     }
     assert {f.name for f in fields(Lifecycle)} == expected
 

@@ -126,6 +126,14 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   -- blocked_requires_json). Added in schema_version 5 via the forward
   -- migration the store applies on bootstrap.
   awaiting_manual_ordinal INTEGER,
+  -- Opaque provenance label the caller supplied for the run's work item
+  -- (a task-file path for the directory source, a tracker ref like
+  -- "owner/repo#123"). Set once at seed via LifecycleInitialized; never
+  -- interpreted by flywheel-core — consumers (e.g. the orchestrator's
+  -- history view) derive grouping (phase) from it. NULL for runs seeded
+  -- without a source. Added in schema_version 12 via the forward
+  -- migration the store applies on bootstrap.
+  source                  TEXT,
   FOREIGN KEY (task_id) REFERENCES tasks(id)
 );
 
@@ -264,12 +272,13 @@ CREATE INDEX IF NOT EXISTS idx_control_commands_pending
 -- bootstrap (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT
 -- EXISTS above materializes control_commands on an existing database;
 -- v4 -> v5 adds the lifecycles.awaiting_manual_ordinal nullable column;
--- v5 -> v6 drops the unused claude_session_store table — see bootstrap).
+-- v5 -> v6 drops the unused claude_session_store table; v11 -> v12 adds
+-- the lifecycles.source nullable column — see bootstrap).
 CREATE TABLE IF NOT EXISTS schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
-INSERT INTO schema_version (id, version) VALUES (1, 11)
+INSERT INTO schema_version (id, version) VALUES (1, 12)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

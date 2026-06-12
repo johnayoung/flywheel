@@ -81,6 +81,7 @@ class LifecycleInitialized(_DomainEventBase):
     worker_id: str = ""
     artifacts_dir: str = ""
     task_content_hash: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -263,6 +264,7 @@ def _clone(state: Lifecycle) -> Lifecycle:
         blocked_requires_json=state.blocked_requires_json,
         awaiting_manual_ordinal=state.awaiting_manual_ordinal,
         task_content_hash=state.task_content_hash,
+        source=state.source,
     )
 
 
@@ -299,6 +301,7 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
             worker_id=event.worker_id,
             artifacts_dir=event.artifacts_dir,
             task_content_hash=event.task_content_hash,
+            source=event.source,
             status=Status.PENDING,
             version=1,
         )

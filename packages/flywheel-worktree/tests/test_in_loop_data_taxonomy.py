@@ -273,20 +273,25 @@ def test_real_loop_routes_telemetry_aggregates_and_steering(
         store.close()
 
 
-def test_previous_schema_version_store_is_refused(tmp_path: Path) -> None:
+def test_unmigratable_schema_version_store_is_refused(
+    tmp_path: Path,
+) -> None:
     """Spec 00017 FR-4 under 00025's refuse-not-migrate decision: a store
-    at schema_version N-1 is refused by the real SqliteStore with
-    StoreSchemaError, not silently migrated or accepted."""
+    whose schema_version has no supported forward migration is refused by
+    the real SqliteStore with StoreSchemaError, not silently accepted.
+    (v11 is the one exception — it forward-migrates additively to v12;
+    that path is pinned in flywheel-core's test_store_sqlite.)"""
     db_path = tmp_path / "old.sqlite"
     SqliteStore(db_path).close()
 
-    # Stamp the on-disk store at the previous schema version — the shape
-    # a pre-00025 deployment would present on upgrade.
+    # Stamp the on-disk store two versions back — older than the one
+    # supported forward migration, the shape a long-stale deployment
+    # would present on upgrade.
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
             "UPDATE schema_version SET version = ? WHERE id = 1",
-            (CURRENT_SCHEMA_VERSION - 1,),
+            (CURRENT_SCHEMA_VERSION - 2,),
         )
         conn.commit()
     finally:
@@ -294,6 +299,6 @@ def test_previous_schema_version_store_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(StoreSchemaError) as exc_info:
         SqliteStore(db_path)
-    assert exc_info.value.observed_version == CURRENT_SCHEMA_VERSION - 1
+    assert exc_info.value.observed_version == CURRENT_SCHEMA_VERSION - 2
     assert exc_info.value.expected_version == CURRENT_SCHEMA_VERSION
     assert "store must be re-created" in str(exc_info.value)

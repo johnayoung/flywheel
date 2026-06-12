@@ -77,8 +77,10 @@ class LifecycleNotFoundError(StoreConflictError):
 
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
-# raise :class:`StoreSchemaError` when it does not match.
-CURRENT_SCHEMA_VERSION: int = 11
+# raise :class:`StoreSchemaError` when it does not match (v11 databases
+# are forward-migrated in place to v12 by the store bootstraps — the
+# change is purely additive: the nullable lifecycles.source column).
+CURRENT_SCHEMA_VERSION: int = 12
 
 
 class StoreSchemaError(Exception):

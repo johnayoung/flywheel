@@ -43,7 +43,16 @@ _PROG = "fw"
 # (``--policy`` / ``--tasks-dir`` / ``--db`` / ``--json`` / ``--watch``)
 # and exit codes, so the router just hands the argv through.
 _ORCHESTRATOR_VERBS: frozenset[str] = frozenset(
-    {"init", "status", "live", "archive", "recover", "recheck-blocked"}
+    {
+        "init",
+        "status",
+        "live",
+        "history",
+        "show",
+        "archive",
+        "recover",
+        "recheck-blocked",
+    }
 )
 
 # Producer verbs that enqueue control commands against an existing
@@ -71,6 +80,8 @@ Verbs:
   worker [--once]  run the git-worktree daemon loop (or a single drain)
   status [--json]  print every active task's state
   live [--watch N] print one line per in-flight run (optionally tailing)
+  history [--json] list finished runs, one line per task, newest first
+  show ID [--json] show one run in full (accepts a run_id or task id)
   say RUN_ID MSG   inject an operator message into a live run
   interrupt RUN_ID interrupt a live run
   approve RUN_ID   approve a parked manual-approval gate

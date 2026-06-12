@@ -55,6 +55,16 @@ from flywheel_core.workflow import (
     _short,
     recover_stranded_lifecycles,
 )
+from flywheel_orchestrator._history import (
+    TERMINAL_STATUSES,
+    HistoryRow,
+    HistoryRun,
+    RunDetail,
+    build_task_phase_index,
+    collect_history_rows,
+    collect_run_detail,
+    resolve_run_id,
+)
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
     PolicyError,
@@ -1385,6 +1395,230 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_fallback_phases(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> Mapping[str, str] | None:
+    """Task-id -> phase fallback for runs recorded before schema v12.
+
+    Pre-v12 lifecycles carry no ``source``; for directory work sources
+    the task files themselves (active or archived) still name the phase,
+    so the on-disk scan attributes those runs. Tracker sources have no
+    directory layout to scan — return ``None`` and those runs render
+    ungrouped.
+    """
+    if args.tasks_dir:
+        return build_task_phase_index(Path(args.tasks_dir))
+    if policy is None:
+        return build_task_phase_index(DEFAULT_TASKS_DIR)
+    if policy.source_kind == "directory" and policy.tasks_dir is not None:
+        return build_task_phase_index(policy.tasks_dir)
+    return None
+
+
+def _format_history_ts(ts: datetime | None) -> str:
+    return ts.strftime("%Y-%m-%d %H:%M") if ts is not None else "—"
+
+
+def _history_run_to_dict(run: HistoryRun) -> dict[str, Any]:
+    return {
+        "run_id": run.run_id,
+        "task_id": run.task_id,
+        "status": run.status.value,
+        "source": run.source or None,
+        "started_at": (
+            run.started_at.isoformat() if run.started_at else None
+        ),
+        "finished_at": (
+            run.finished_at.isoformat() if run.finished_at else None
+        ),
+        "retries": run.retries,
+        "error": run.error,
+        "attempts": run.attempts,
+        "tokens_total": run.tokens_total,
+        "cost_usd_total": run.cost_usd_total,
+        "turns_total": run.turns_total,
+    }
+
+
+def _format_history_line(row: HistoryRow, *, width: int) -> str:
+    run = row.latest
+    label = f"{row.phase}/{row.task_id}" if row.phase else row.task_id
+    runs_total = 1 + len(row.prior_runs)
+    suffix = f"  -- {run.error}" if run.error else ""
+    return (
+        f"  {label:<{width}}  {run.status.value:<17} "
+        f"{_format_history_ts(run.finished_at)}  "
+        f"runs={runs_total}  tokens={run.tokens_total}  "
+        f"cost=${run.cost_usd_total:.4f}{suffix}"
+    )
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    policy = _load_effective_policy(args)
+    db_path = _resolve_db_path(args, policy)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    statuses = (
+        tuple(Status(s) for s in args.status)
+        if args.status
+        else TERMINAL_STATUSES
+    )
+    store = open_sqlite_bound_store(policy, db_path=db_path)
+    try:
+        rows = collect_history_rows(
+            store,
+            statuses=statuses,
+            phase=args.phase,
+            limit=args.limit,
+            fallback_phases=_resolve_fallback_phases(args, policy),
+        )
+    finally:
+        store.close()
+    if args.json:
+        out = [
+            {
+                "task_id": row.task_id,
+                "phase": row.phase,
+                "latest": _history_run_to_dict(row.latest),
+                "prior_runs": [
+                    _history_run_to_dict(r) for r in row.prior_runs
+                ],
+            }
+            for row in rows
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+    if not rows:
+        print("(no finished runs)")
+        return 0
+    width = max(
+        len(f"{row.phase}/{row.task_id}" if row.phase else row.task_id)
+        for row in rows
+    )
+    for row in rows:
+        print(_format_history_line(row, width=width))
+    return 0
+
+
+def _print_run_detail(detail: RunDetail) -> None:
+    run = detail.run
+    print(f"task     : {run.task_id}")
+    print(f"phase    : {detail.phase or '—'}")
+    print(f"run      : {run.run_id}")
+    print(f"status   : {run.status.value}")
+    if run.source:
+        print(f"source   : {run.source}")
+    print(f"started  : {_format_history_ts(run.started_at)}")
+    print(f"finished : {_format_history_ts(run.finished_at)}")
+    print(f"retries  : {run.retries}")
+    print(
+        f"totals   : tokens={run.tokens_total} "
+        f"cost=${run.cost_usd_total:.4f} turns={run.turns_total}"
+    )
+    if run.error:
+        print(f"error    : {run.error}")
+    if detail.task is not None:
+        print(f"goal     : {detail.task.goal}")
+    if detail.attempts:
+        print("attempts :")
+        for a in detail.attempts:
+            line = (
+                f"  {a.number}  {a.outcome:<18} iter={a.iterations} "
+                f"turns={a.turns} tokens={a.tokens} "
+                f"cost=${a.cost_usd:.4f}"
+            )
+            if a.error:
+                line += f"  -- {_short(a.error, 80)}"
+            print(line)
+    if detail.grader_results:
+        last = detail.attempts[-1].number if detail.attempts else "?"
+        print(f"graders  : (attempt {last})")
+        for g in detail.grader_results:
+            verdict = "pass" if g.passed else "FAIL"
+            name = g.grader_name or g.grader_type
+            print(
+                f"  {verdict}  {g.grader_type:<10} {name}  "
+                f"({g.duration_ms} ms)"
+            )
+    if detail.agent_output:
+        print("agent output:")
+        print(detail.agent_output)
+    if detail.related_runs:
+        print("related runs:")
+        for r in detail.related_runs:
+            print(
+                f"  {r.run_id}  {r.status.value:<17} "
+                f"{_format_history_ts(r.finished_at)}"
+            )
+
+
+def _run_detail_to_dict(detail: RunDetail) -> dict[str, Any]:
+    return {
+        "run": _history_run_to_dict(detail.run),
+        "phase": detail.phase,
+        "goal": detail.task.goal if detail.task is not None else None,
+        "agent_output": detail.agent_output,
+        "attempts": [
+            {
+                "number": a.number,
+                "outcome": a.outcome,
+                "started_at": (
+                    a.started_at.isoformat() if a.started_at else None
+                ),
+                "ended_at": (
+                    a.ended_at.isoformat() if a.ended_at else None
+                ),
+                "iterations": a.iterations,
+                "turns": a.turns,
+                "tokens": a.tokens,
+                "cost_usd": a.cost_usd,
+                "error": a.error,
+            }
+            for a in detail.attempts
+        ],
+        "grader_results": [
+            {
+                "attempt_number": g.attempt_number,
+                "ordinal": g.ordinal,
+                "grader_type": g.grader_type,
+                "grader_name": g.grader_name,
+                "passed": g.passed,
+                "duration_ms": g.duration_ms,
+            }
+            for g in detail.grader_results
+        ],
+        "related_runs": [
+            _history_run_to_dict(r) for r in detail.related_runs
+        ],
+    }
+
+
+def _cmd_show(args: argparse.Namespace) -> int:
+    policy = _load_effective_policy(args)
+    db_path = _resolve_db_path(args, policy)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
+    try:
+        run_id = resolve_run_id(store, args.run_or_task_id)
+        if run_id is None:
+            print(f"{args.run_or_task_id}: no run or task with that id")
+            return 1
+        detail = collect_run_detail(
+            store,
+            run_id,
+            fallback_phases=_resolve_fallback_phases(args, policy),
+        )
+    finally:
+        store.close()
+    if detail is None:
+        print(f"{args.run_or_task_id}: no run or task with that id")
+        return 1
+    if args.json:
+        print(json.dumps(_run_detail_to_dict(detail), indent=2))
+        return 0
+    _print_run_detail(detail)
+    return 0
+
+
 INIT_ROOT = Path(".flywheel")
 
 _INIT_GITIGNORE = """\
@@ -2274,6 +2508,68 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_live.set_defaults(func=_cmd_live)
+
+    p_history = sub.add_parser(
+        "history",
+        help=(
+            "List finished runs (done / failed / failed_validation), one "
+            "line per task, most recently finished first. Retried tasks "
+            "fold into one line (runs=N); 'show' drills into a run."
+        ),
+    )
+    _add_common_tasks_dir(p_history)
+    _add_common_policy(p_history)
+    _add_common_db(p_history)
+    p_history.add_argument(
+        "--status",
+        action="append",
+        choices=[s.value for s in TERMINAL_STATUSES],
+        default=None,
+        help=(
+            "Only list runs whose terminal status matches (repeatable; "
+            "default: all terminal statuses)."
+        ),
+    )
+    p_history.add_argument(
+        "--phase",
+        default=None,
+        help="Only list tasks attributed to this phase directory name.",
+    )
+    p_history.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Cap the number of task rows printed (default: 0 = all).",
+    )
+    p_history.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of a text table.",
+    )
+    p_history.set_defaults(func=_cmd_history)
+
+    p_show = sub.add_parser(
+        "show",
+        help=(
+            "Show one run in full: lifecycle, attempts, grader receipts, "
+            "final agent output, and the task's other runs. Accepts a "
+            "run_id or a task id (resolves to its latest run)."
+        ),
+    )
+    p_show.add_argument(
+        "run_or_task_id",
+        help="Run id, or a task id (its most recent run is shown).",
+    )
+    _add_common_tasks_dir(p_show)
+    _add_common_policy(p_show)
+    _add_common_db(p_show)
+    p_show.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the text report.",
+    )
+    p_show.set_defaults(func=_cmd_show)
 
     p_archive = sub.add_parser(
         "archive",

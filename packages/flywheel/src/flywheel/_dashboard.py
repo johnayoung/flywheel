@@ -39,12 +39,14 @@ from flywheel._quit_prompt import (
     QUIT_STOP,
     QuitPromptScreen,
 )
+from flywheel._history_screen import HistoryScreen
 from flywheel._session_screen import ArchiveAction, SessionScreen
 from flywheel._slash import (
     HELP_TEXT,
     SLASH_APPROVE,
     SLASH_ARCHIVE,
     SLASH_HELP,
+    SLASH_HISTORY,
     SLASH_INTERRUPT,
     SLASH_QUIT,
     SLASH_REJECT,
@@ -69,6 +71,7 @@ _HELP_LINES: tuple[str, ...] = (
     "  up/down     move row selection",
     "  enter       open session view for the selected run",
     "  escape      close the session view (back to dashboard)",
+    "  h           open the finished-run history view",
     "  ctrl+i      focus the input bar (filter + slash commands)",
     "  q / ctrl+c  quit",
     "  ?           toggle this help footer",
@@ -245,6 +248,10 @@ class DashboardApp(App[int]):
         # focus.
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
         Binding("question_mark", "toggle_help", "Help", show=True),
+        # Finished-run history. Non-priority so typing ``h`` into the
+        # focused input bar stays a filter keystroke; with the table
+        # focused (the default) the binding fires.
+        Binding("h", "open_history", "History", show=True),
         # Focus shortcut for the persistent input bar. ``priority=True``
         # so the chord wins even when focus has bounced to a child
         # widget; the input itself does not consume ``ctrl+i`` so
@@ -262,6 +269,7 @@ class DashboardApp(App[int]):
         linger_seconds: int = DEFAULT_LINGER_SECONDS,
         clock: Callable[[], datetime] | None = None,
         open_session: Callable[[str, str], SessionScreen | None] | None = None,
+        open_history: Callable[[], HistoryScreen | None] | None = None,
         enqueue: EnqueueForRun | None = None,
         archive: ArchiveAction | None = None,
         worker_status: WorkerStatusFn | None = None,
@@ -280,6 +288,10 @@ class DashboardApp(App[int]):
         # useful for the existing snapshot-only Pilot tests so they do
         # not need to seed a transcript every time.
         self._open_session = open_session
+        # Factory for the finished-run history screen (``h`` /
+        # ``/history``). ``None`` disables the binding -- the same
+        # degrade shape as ``open_session``.
+        self._open_history = open_history
         self._enqueue = enqueue
         self._archive = archive
         # Worker supervision seams. ``None`` (the default) disables the
@@ -677,6 +689,22 @@ class DashboardApp(App[int]):
             return
         self.push_screen(screen)
 
+    def action_open_history(self) -> None:
+        """Push the finished-run history screen (``h`` / ``/history``).
+
+        No-op when no history factory was supplied (snapshot-only Pilot
+        tests) or while a modal is on top of the stack.
+        """
+
+        if self._quit_prompt_active:
+            return
+        if self._open_history is None:
+            return
+        screen = self._open_history()
+        if screen is None:
+            return
+        self.push_screen(screen)
+
     def _selected_run_id(self) -> str | None:
         """Resolve the currently-selected run id from the visible order.
 
@@ -784,6 +812,13 @@ class DashboardApp(App[int]):
         if verb == SLASH_ARCHIVE:
             self._handle_archive()
             input_widget.value = ""
+            return
+        if verb == SLASH_HISTORY:
+            if self._open_history is None:
+                self._set_notice("/history is not wired on this screen")
+                return
+            input_widget.value = ""
+            self.action_open_history()
             return
         if verb == SLASH_WORKER:
             notice = self.handle_worker_slash(command.argument)

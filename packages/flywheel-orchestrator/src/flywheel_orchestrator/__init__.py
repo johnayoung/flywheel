@@ -66,6 +66,18 @@ from flywheel_orchestrator._sources import (
     iter_active_task_files,
     load_active_tasks,
 )
+from flywheel_orchestrator._history import (
+    TERMINAL_STATUSES,
+    AttemptSummary,
+    HistoryRow,
+    HistoryRun,
+    RunDetail,
+    build_task_phase_index,
+    collect_history_rows,
+    collect_run_detail,
+    phase_from_source,
+    resolve_run_id,
+)
 from flywheel_orchestrator._store_factory import (
     PG_DSN_ENV,
     PG_DSN_FALLBACK_ENV,
@@ -99,8 +111,13 @@ from flywheel_orchestrator._workflow import (
 )
 
 __all__ = [
+    "AttemptSummary",
     "ClaimLostError",
     "ClaimStore",
+    "HistoryRow",
+    "HistoryRun",
+    "RunDetail",
+    "TERMINAL_STATUSES",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
@@ -138,8 +155,13 @@ __all__ = [
     "archive_completed_phases",
     "build_status_rows",
     "build_store",
+    "build_task_phase_index",
     "build_work_source",
+    "collect_history_rows",
     "collect_live_rows",
+    "collect_run_detail",
+    "phase_from_source",
+    "resolve_run_id",
     "iter_active_phase_dirs",
     "iter_active_task_files",
     "load_active_tasks",

@@ -39,8 +39,11 @@ from flywheel_orchestrator import (
     StoreConfigError,
     WorkPolicy,
     WorkSource,
+    HistoryRow,
     archive_completed_phases,
+    build_task_phase_index,
     build_work_source,
+    collect_history_rows,
     load_effective_policy,
     open_sqlite_bound_store,
     resolve_db_path,
@@ -51,6 +54,7 @@ from flywheel._dashboard import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DashboardApp,
 )
+from flywheel._history_screen import HistoryScreen
 from flywheel._session import TranscriptEntry, TranscriptTailer
 from flywheel._session_screen import SessionScreen, SessionStatus
 from flywheel._snapshot import (
@@ -476,9 +480,31 @@ def _run_dashboard(
             archive=archive,
         )
 
+    def open_history() -> HistoryScreen:
+        """Construct the finished-run history screen (``h`` / ``/history``).
+
+        The phase fallback index is rebuilt per open: it scans the task
+        directories for runs recorded before ``lifecycles.source``
+        existed, and an open is rare enough that freshness beats
+        caching. Tracker-source policies have no directory to scan, so
+        those legacy runs render ungrouped.
+        """
+
+        fallback = (
+            build_task_phase_index(archive_tasks_dir)
+            if archive_tasks_dir is not None
+            else None
+        )
+
+        def fetch() -> list[HistoryRow]:
+            return collect_history_rows(store, fallback_phases=fallback)
+
+        return HistoryScreen(fetch=fetch, open_session=open_session)
+
     app = DashboardApp(
         poll=poll,
         open_session=open_session,
+        open_history=open_history,
         enqueue=enqueue_for_run,
         archive=archive,
         worker_status=supervisor.status,

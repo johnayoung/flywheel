@@ -19,16 +19,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-# The eight verbs the input bar honours. ``/worker start|stop`` is
+# The verbs the input bar honours. ``/worker start|stop`` is
 # the supervision handle for the engine-on-launch child the console
 # manages -- ``start`` (re)spawns a worker when none is live, ``stop``
-# sends SIGTERM to the supervised child.
+# sends SIGTERM to the supervised child. ``/history`` opens the
+# finished-run listing (the dashboard shows only in-flight runs).
 SLASH_HELP = "help"
 SLASH_STATUS = "status"
 SLASH_APPROVE = "approve"
 SLASH_REJECT = "reject"
 SLASH_INTERRUPT = "interrupt"
 SLASH_ARCHIVE = "archive"
+SLASH_HISTORY = "history"
 SLASH_WORKER = "worker"
 SLASH_QUIT = "quit"
 
@@ -39,6 +41,7 @@ SLASH_COMMANDS: tuple[str, ...] = (
     SLASH_REJECT,
     SLASH_INTERRUPT,
     SLASH_ARCHIVE,
+    SLASH_HISTORY,
     SLASH_WORKER,
     SLASH_QUIT,
 )
@@ -52,6 +55,7 @@ HELP_LINES: tuple[str, ...] = (
     "  /reject [feedback]  reject the parked manual gate (optional feedback)",
     "  /interrupt          interrupt the run",
     "  /archive            archive completed phases",
+    "  /history            list finished runs (enter opens a run's session)",
     "  /worker start|stop  spawn or gracefully stop the supervised worker",
     "  /quit               exit the console",
 )
@@ -119,6 +123,7 @@ __all__ = [
     "SLASH_ARCHIVE",
     "SLASH_COMMANDS",
     "SLASH_HELP",
+    "SLASH_HISTORY",
     "SLASH_INTERRUPT",
     "SLASH_QUIT",
     "SLASH_REJECT",

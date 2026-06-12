@@ -61,6 +61,8 @@ def test_fw_help_exits_zero_and_prints_verbs(
         "worker",
         "status",
         "live",
+        "history",
+        "show",
         "say",
         "interrupt",
         "approve",
@@ -182,6 +184,39 @@ def test_fw_live_with_no_runs_prints_marker(
     rc = main(["live", "--db", str(db)])
     assert rc == 0
     assert "(no in-flight runs)" in capsys.readouterr().out
+
+
+def test_fw_history_with_no_finished_runs_prints_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``fw history`` delegates to the orchestrator's history verb."""
+    db = tmp_path / "db.sqlite"
+    SqliteStore(db).close()
+    rc = main(
+        ["history", "--db", str(db), "--tasks-dir", str(tmp_path / "tasks")]
+    )
+    assert rc == 0
+    assert "(no finished runs)" in capsys.readouterr().out
+
+
+def test_fw_show_unknown_id_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``fw show`` delegates to the orchestrator's show verb."""
+    db = tmp_path / "db.sqlite"
+    SqliteStore(db).close()
+    rc = main(
+        [
+            "show",
+            "nope",
+            "--db",
+            str(db),
+            "--tasks-dir",
+            str(tmp_path / "tasks"),
+        ]
+    )
+    assert rc == 1
+    assert "no run or task with that id" in capsys.readouterr().out
 
 
 # --- core-routed producer verbs --------------------------------------------

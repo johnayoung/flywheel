@@ -99,6 +99,11 @@ run = "uv run pytest"
 # touch; a match refuses the merge and parks the work. Protects the
 # verification surface (grader configs, CI) from the work it judges.
 protected_paths = [".github/**", "flywheel.toml"]
+
+[sandbox]
+# Shell command run inside every newly created worktree before the agent
+# enters (deps install, codegen). Reused parked worktrees skip it.
+setup = "uv sync"
 ```
 
 `flywheel status|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults. The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `flywheel worker [--once]` to drive a phase.

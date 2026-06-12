@@ -205,6 +205,7 @@ class GitWorktreeSubmitter:
         lock_path: Path,
         log: Logger,
         protected_paths: Sequence[str] = (),
+        setup_command: str | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -213,6 +214,7 @@ class GitWorktreeSubmitter:
         self.lock_path = lock_path
         self.log = log
         self.protected_paths = tuple(protected_paths)
+        self.setup_command = setup_command
 
     def _branch(self, task_id: str, phase: str) -> str:
         return f"flywheel/{phase}/{task_id}"
@@ -333,7 +335,10 @@ class GitWorktreeSubmitter:
         """Provision (or reuse) the worktree a task runs in; return its path.
         Reuses a parked worktree+branch on retry (rebasing onto base first),
         recreates it when only the branch survived a sweep, and refuses to
-        clobber half-present operator state (:class:`PrepareSandboxError`)."""
+        clobber half-present operator state (:class:`PrepareSandboxError`).
+        Every freshly created directory gets the policy's sandbox setup
+        command; a reused parked worktree skips it (its environment
+        survived with it)."""
         task_id = req.task_id
         phase = phase_of_task_file(req.task_file, self.tasks_dir)
         worktree = self._worktree(task_id)
@@ -349,8 +354,10 @@ class GitWorktreeSubmitter:
                     f"refusing to clobber"
                 )
             self.scrub_worktree_locks(worktree, branch)
-            if not self._rebase_parked_branch(worktree, branch):
-                self._discard_and_recreate(worktree, branch)
+            if self._rebase_parked_branch(worktree, branch):
+                return worktree
+            self._discard_and_recreate(worktree, branch)
+            self._run_setup(worktree)
             return worktree
 
         if (not worktree_present) and branch_present:
@@ -361,6 +368,7 @@ class GitWorktreeSubmitter:
             self._add_worktree(worktree, branch)
             if not self._rebase_parked_branch(worktree, branch):
                 self._discard_and_recreate(worktree, branch)
+            self._run_setup(worktree)
             return worktree
 
         if worktree_present and (not branch_present):
@@ -370,7 +378,33 @@ class GitWorktreeSubmitter:
             )
 
         self._add_worktree(worktree, "-b", branch, self.phase_base)
+        self._run_setup(worktree)
         return worktree
+
+    def _run_setup(self, worktree: Path) -> None:
+        """Run the policy's ``[sandbox] setup`` command (shell) inside a
+        newly provisioned worktree — dependency install, codegen — before
+        the agent enters, so tasks never pay discovery cost for a bare
+        checkout. Failure raises :class:`PrepareSandboxError`: the task is
+        skipped this session rather than run in a half-provisioned sandbox.
+        """
+        if self.setup_command is None:
+            return
+        self.log(f"sandbox setup: {self.setup_command!r} in {worktree}")
+        proc = subprocess.run(
+            self.setup_command,
+            shell=True,
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout).strip()[-2000:]
+            raise PrepareSandboxError(
+                f"sandbox setup {self.setup_command!r} failed in {worktree} "
+                f"(exit {proc.returncode}): {tail}"
+            )
 
     def submit(self, req: SubmitRequest) -> None:
         """Merge a DONE task's branch into the base, or park the worktree.
@@ -1010,6 +1044,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         lock_path=lock_path,
         log=log,
         protected_paths=policy.protected_paths if policy else (),
+        setup_command=policy.sandbox_setup if policy else None,
     )
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)

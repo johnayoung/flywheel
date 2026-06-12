@@ -910,3 +910,70 @@ def test_submit_unprotected_path_merges(tmp_path: Path) -> None:
     # The gate only bites on protected paths; ordinary work lands as before.
     assert (repo / "feature.txt").exists()
     assert not wt.exists()
+
+
+# --- prepare: sandbox setup hook -----------------------------------------------
+
+
+def _setup_submitter(
+    repo: Path, setup: str
+) -> "worker.GitWorktreeSubmitter":
+    worktrees = repo / ".flywheel" / "worktrees"
+    worktrees.mkdir(parents=True, exist_ok=True)
+    return worker.GitWorktreeSubmitter(
+        repo_root=repo,
+        tasks_dir=repo / ".flywheel" / "tasks",
+        worktrees_dir=worktrees,
+        phase_base="main",
+        lock_path=repo / ".flywheel" / ".merge.lock",
+        log=lambda _m: None,
+        setup_command=setup,
+    )
+
+
+def test_prepare_runs_setup_in_new_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    setup_log = tmp_path / "setup-log"
+    s = _setup_submitter(repo, f"pwd >> {setup_log}")
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+
+    # Ran exactly once, cwd'd to the new worktree.
+    lines = setup_log.read_text().splitlines()
+    assert len(lines) == 1
+    assert Path(lines[0]).resolve() == wt.resolve()
+
+
+def test_prepare_skips_setup_on_reused_worktree(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    setup_log = tmp_path / "setup-log"
+    s = _setup_submitter(repo, f"echo ran >> {setup_log}")
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "a.txt", "a", "work")
+    s.submit(_submit_req(tf, "t1", wt, Status.FAILED))  # park
+
+    wt2 = s.prepare_sandbox(_sandbox_req(tf, "t1", mode="resume"))
+
+    # The parked worktree's environment survived with it: one setup total.
+    assert wt2 == wt
+    assert len(setup_log.read_text().splitlines()) == 1
+
+
+def test_prepare_setup_failure_raises(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    s = _setup_submitter(repo, "echo broken-env >&2; false")
+    tf = _task_file(repo, "01-phase", "t1")
+
+    raised = False
+    try:
+        s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    except worker.PrepareSandboxError as exc:
+        raised = True
+        assert "broken-env" in str(exc)
+    assert raised

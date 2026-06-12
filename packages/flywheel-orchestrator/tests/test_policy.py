@@ -628,3 +628,31 @@ def test_protected_paths_rejects_empty_entry(tmp_path: Path) -> None:
                 'protected_paths = [".github/**", " "]\n',
             )
         )
+
+
+# --- [sandbox] setup ----------------------------------------------------------
+
+
+def test_sandbox_setup_default_none(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.sandbox_setup is None
+
+
+def test_sandbox_setup_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[sandbox]\nsetup = "uv sync"\n',
+        )
+    )
+    assert policy.sandbox_setup == "uv sync"
+
+
+def test_sandbox_setup_rejects_empty(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="sandbox.setup"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[sandbox]\nsetup = "  "\n',
+            )
+        )

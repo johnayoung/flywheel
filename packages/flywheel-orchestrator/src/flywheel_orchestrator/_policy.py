@@ -41,6 +41,13 @@ Format (TOML, stdlib ``tomllib``)::
     backend = "sqlite"              # or "postgres"
     # schema = "flywheel_ci"        # postgres only; optional
 
+    # Sandbox provisioning (optional). setup runs (shell) inside every
+    # newly created sandbox before the agent enters — dependency install,
+    # codegen — so tasks never pay discovery cost for a bare worktree.
+    # Reused parked sandboxes skip it (their environment survived).
+    [sandbox]
+    setup = "uv sync"
+
     # Landing policy (optional). protected_paths are glob patterns
     # (PurePath.full_match semantics, ** crosses directories) matched
     # against every repo-relative path a finished task's branch touches;
@@ -101,7 +108,8 @@ class WorkPolicy:
     with no schema, so every pre-existing policy file keeps loading
     unchanged. ``protected_paths`` mirrors the optional
     ``[submit] protected_paths`` list; empty when unset (no merge-time
-    path gate).
+    path gate). ``sandbox_setup`` mirrors the optional ``[sandbox] setup``
+    command; ``None`` when unset (new sandboxes are used bare).
     """
 
     source_kind: str
@@ -116,6 +124,7 @@ class WorkPolicy:
     store_backend: str = "sqlite"
     store_schema: str | None = None
     protected_paths: tuple[str, ...] = ()
+    sandbox_setup: str | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -171,6 +180,11 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [submit] must be a table")
     protected_paths = _optional_protected_paths(submit, policy_file=path)
 
+    sandbox = data.get("sandbox") or {}
+    if not isinstance(sandbox, dict):
+        raise PolicyError(f"{path}: [sandbox] must be a table")
+    sandbox_setup = _optional_sandbox_setup(sandbox, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -189,6 +203,7 @@ def load_policy(path: Path) -> WorkPolicy:
             store_backend=store_backend,
             store_schema=store_schema,
             protected_paths=protected_paths,
+            sandbox_setup=sandbox_setup,
         )
 
     repo = source.get("repo")
@@ -219,6 +234,7 @@ def load_policy(path: Path) -> WorkPolicy:
         store_backend=store_backend,
         store_schema=store_schema,
         protected_paths=protected_paths,
+        sandbox_setup=sandbox_setup,
     )
 
 
@@ -305,6 +321,26 @@ def _optional_protected_paths(
             f"non-empty strings"
         )
     return tuple(value)
+
+
+def _optional_sandbox_setup(
+    table: dict, *, policy_file: Path
+) -> str | None:
+    """Validate and return the optional ``sandbox.setup`` command.
+
+    Returns ``None`` when the key is absent so an unconfigured policy
+    provisions sandboxes bare. A non-string or empty/whitespace-only value
+    raises :class:`PolicyError` so a typo never silently degrades into
+    "no setup."
+    """
+    value = table.get("setup")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: sandbox.setup must be a non-empty string"
+        )
+    return value
 
 
 def build_work_source(policy: WorkPolicy) -> WorkSource:

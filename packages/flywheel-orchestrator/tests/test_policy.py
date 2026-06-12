@@ -656,3 +656,45 @@ def test_sandbox_setup_rejects_empty(tmp_path: Path) -> None:
                 '[source]\nkind = "directory"\n[sandbox]\nsetup = "  "\n',
             )
         )
+
+
+# --- [submit] strategy ---------------------------------------------------------
+
+
+def test_submit_strategy_defaults(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.submit_strategy == "merge"
+    assert policy.submit_remote == "origin"
+    assert policy.submit_pr_base is None
+
+
+def test_submit_strategy_pr_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[submit]",
+                    'strategy = "pr"',
+                    'remote = "upstream"',
+                    'pr_base = "develop"',
+                ]
+            ),
+        )
+    )
+    assert policy.submit_strategy == "pr"
+    assert policy.submit_remote == "upstream"
+    assert policy.submit_pr_base == "develop"
+
+
+def test_submit_strategy_rejects_unknown(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.strategy"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                'strategy = "catapult"\n',
+            )
+        )

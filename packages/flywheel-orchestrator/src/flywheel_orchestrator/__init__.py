@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     )
 
 
-from flywheel_orchestrator._github import GithubWorkSource
+from flywheel_orchestrator._github import GhRunner, GithubWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
     PolicyError,
@@ -128,6 +128,7 @@ __all__ = [
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DirectoryWorkSource",
+    "GhRunner",
     "GithubWorkSource",
     "GraderReceipt",
     "InMemoryClaimStore",

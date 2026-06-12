@@ -15,10 +15,15 @@ The named seam is `flywheel_orchestrator.SubmitStrategy` (`_strategy.py`): a str
 
 `submit` running under the task's lease means two workers never land the same task concurrently. The core loop also exposes the `events` table (`harness.*`, streaming) and the terminal `lifecycle.status` row for strategies that observe rather than wrap.
 
-## Reference implementation
+## Shipped strategies
 
-`flywheel_worktree.worker.GitWorktreeSubmitter` is the reference `SubmitStrategy`. Each task runs in its own git worktree on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree before the merge — nothing lands that was not verified against the exact base it lands on. The seam keeps all git in the consumer — flywheel core stays git-free.
+One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb as graders earn trust. Selected per repo via `flywheel.toml` `[submit] strategy`.
+
+- **`merge`** (default) — `flywheel_worktree.worker.GitWorktreeSubmitter`, full autonomy. Each task runs in its own git worktree on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree before the merge — nothing lands that was not verified against the exact base it lands on.
+- **`pr`** — `flywheel_worktree.pr.GitPullRequestSubmitter`, review-gated. Same provisioning; on `done` the branch is pushed to the remote and a PR opened (or refreshed) with the run's grader receipts rendered in the body, so reviewers see how "done" was decided. Nothing merges locally — review/CI own the merge. Park semantics are identical.
+
+Both honor `[submit] protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
 
 ## Future strategies
 
-One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb as graders earn trust: emit a patch artifact (touch no refs), push a branch and open a PR with grader receipts, auto-merge on green, direct FF-merge (the reference, full autonomy). Container-based isolation and non-git submission flows fit the same two hooks. flywheel does not need to know any of them exist.
+Emit a patch artifact (touch no refs), auto-merge on green, container-based isolation, non-git submission flows — all fit the same two hooks. flywheel does not need to know they exist.

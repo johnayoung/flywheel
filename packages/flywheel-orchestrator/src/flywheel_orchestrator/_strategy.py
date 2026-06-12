@@ -32,6 +32,8 @@ from typing import Callable, Literal, Protocol, runtime_checkable
 from flywheel_core.lifecycle import Status
 from flywheel_core.task import Task
 
+from flywheel_orchestrator._sources import GraderReceipt
+
 
 @dataclass(frozen=True, kw_only=True)
 class SandboxRequest:
@@ -71,6 +73,10 @@ class SubmitRequest:
     everything a submit strategy needs to re-verify the work against the
     tree it is about to land on (the graders) or to render the outcome
     elsewhere (the goal), without assuming a file-backed source.
+    ``receipts`` are the final attempt's grader verdicts — the same
+    projection the work source's report receives — so a strategy can
+    render "how done was decided" (e.g. into a PR body). Best-effort:
+    empty when the projection failed.
     """
 
     task_id: str
@@ -80,6 +86,7 @@ class SubmitRequest:
     status: Status
     sandbox: Path
     source_ref: str = ""
+    receipts: tuple[GraderReceipt, ...] = ()
 
 
 # A consumer maps a SandboxRequest to the directory the task runs in (default:

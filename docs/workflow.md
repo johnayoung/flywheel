@@ -95,8 +95,12 @@ type = "command"
 run = "uv run pytest"
 
 [submit]
+# How DONE work lands: "merge" FF-merges into the worker's base (full
+# autonomy, default); "pr" pushes the branch and opens a PR with grader
+# receipts in the body (remote/pr_base configurable) — review owns the merge.
+strategy = "merge"
 # Glob patterns (** crosses directories) a finished task's branch may not
-# touch; a match refuses the merge and parks the work. Protects the
+# touch; a match refuses the landing and parks the work. Protects the
 # verification surface (grader configs, CI) from the work it judges.
 protected_paths = [".github/**", "flywheel.toml"]
 

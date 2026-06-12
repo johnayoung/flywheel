@@ -48,14 +48,22 @@ Format (TOML, stdlib ``tomllib``)::
     [sandbox]
     setup = "uv sync"
 
-    # Landing policy (optional). protected_paths are glob patterns
-    # (PurePath.full_match semantics, ** crosses directories) matched
-    # against every repo-relative path a finished task's branch touches;
-    # any match refuses the merge and parks the work. Protects the
-    # verification surface itself — grader configs, CI, harness state —
-    # from being rewritten by the work it is supposed to judge.
+    # Landing policy (optional). strategy picks how DONE work leaves the
+    # loop: "merge" FF-merges the task branch into the worker's base (full
+    # autonomy, the default); "pr" pushes the branch and opens a pull
+    # request with grader receipts in the body — review/CI own the merge.
+    # protected_paths are glob patterns (PurePath.full_match semantics,
+    # ** crosses directories) matched against every repo-relative path a
+    # finished task's branch touches; any match refuses the landing and
+    # parks the work. Protects the verification surface itself — grader
+    # configs, CI, harness state — from being rewritten by the work it is
+    # supposed to judge.
     [submit]
+    strategy = "merge"              # or "pr"
     protected_paths = [".github/**", "flywheel.toml"]
+    # remote = "origin"             # pr strategy: push target
+    # pr_base = "main"              # pr strategy: PR base branch
+    #                               # (default: the worker's base branch)
 
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
@@ -108,8 +116,11 @@ class WorkPolicy:
     with no schema, so every pre-existing policy file keeps loading
     unchanged. ``protected_paths`` mirrors the optional
     ``[submit] protected_paths`` list; empty when unset (no merge-time
-    path gate). ``sandbox_setup`` mirrors the optional ``[sandbox] setup``
-    command; ``None`` when unset (new sandboxes are used bare).
+    path gate). ``submit_strategy``/``submit_remote``/``submit_pr_base``
+    mirror the rest of the optional ``[submit]`` table; an absent table
+    means the historical merge landing. ``sandbox_setup`` mirrors the
+    optional ``[sandbox] setup`` command; ``None`` when unset (new
+    sandboxes are used bare).
     """
 
     source_kind: str
@@ -124,6 +135,9 @@ class WorkPolicy:
     store_backend: str = "sqlite"
     store_schema: str | None = None
     protected_paths: tuple[str, ...] = ()
+    submit_strategy: str = "merge"
+    submit_remote: str = "origin"
+    submit_pr_base: str | None = None
     sandbox_setup: str | None = None
 
 
@@ -179,6 +193,9 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(submit, dict):
         raise PolicyError(f"{path}: [submit] must be a table")
     protected_paths = _optional_protected_paths(submit, policy_file=path)
+    submit_strategy, submit_remote, submit_pr_base = _optional_submit_strategy(
+        submit, policy_file=path
+    )
 
     sandbox = data.get("sandbox") or {}
     if not isinstance(sandbox, dict):
@@ -203,6 +220,9 @@ def load_policy(path: Path) -> WorkPolicy:
             store_backend=store_backend,
             store_schema=store_schema,
             protected_paths=protected_paths,
+            submit_strategy=submit_strategy,
+            submit_remote=submit_remote,
+            submit_pr_base=submit_pr_base,
             sandbox_setup=sandbox_setup,
         )
 
@@ -234,6 +254,9 @@ def load_policy(path: Path) -> WorkPolicy:
         store_backend=store_backend,
         store_schema=store_schema,
         protected_paths=protected_paths,
+        submit_strategy=submit_strategy,
+        submit_remote=submit_remote,
+        submit_pr_base=submit_pr_base,
         sandbox_setup=sandbox_setup,
     )
 
@@ -321,6 +344,40 @@ def _optional_protected_paths(
             f"non-empty strings"
         )
     return tuple(value)
+
+
+_SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr")
+
+
+def _optional_submit_strategy(
+    table: dict, *, policy_file: Path
+) -> tuple[str, str, str | None]:
+    """Validate and return ``(strategy, remote, pr_base)`` from ``[submit]``.
+
+    Absent keys mean the historical merge landing (``("merge", "origin",
+    None)``) so every pre-existing policy file keeps loading unchanged.
+    An unknown strategy, or a remote/pr_base that is not a non-empty
+    string, raises :class:`PolicyError`.
+    """
+    strategy = table.get("strategy", "merge")
+    if strategy not in _SUBMIT_STRATEGIES:
+        raise PolicyError(
+            f"{policy_file}: submit.strategy must be one of "
+            f"{_SUBMIT_STRATEGIES}, got {strategy!r}"
+        )
+    remote = table.get("remote", "origin")
+    if not isinstance(remote, str) or not remote.strip():
+        raise PolicyError(
+            f"{policy_file}: submit.remote must be a non-empty string"
+        )
+    pr_base = table.get("pr_base")
+    if pr_base is not None and (
+        not isinstance(pr_base, str) or not pr_base.strip()
+    ):
+        raise PolicyError(
+            f"{policy_file}: submit.pr_base must be a non-empty string"
+        )
+    return strategy, remote, pr_base
 
 
 def _optional_sandbox_setup(

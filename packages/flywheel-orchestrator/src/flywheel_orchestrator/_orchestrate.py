@@ -871,6 +871,22 @@ async def _drive_under_lease(
             run_id=run_id,
             source=row.source_ref or None,
         )
+        # Projected once, shared by the consumer submit step and the
+        # work-source report. Best-effort: a store hiccup costs the
+        # receipts, never the landing or the schedule.
+        try:
+            receipts = _final_grader_receipts(
+                control, outcome.lifecycle.run_id
+            )
+        except Exception as exc:  # noqa: BLE001 - projection is best-effort
+            receipts = ()
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: grader receipt projection "
+                    f"failed ({type(exc).__name__}: {exc}); continuing",
+                    file=stream,
+                    flush=True,
+                )
         if submit is not None:
             submit(
                 SubmitRequest(
@@ -881,6 +897,7 @@ async def _drive_under_lease(
                     status=outcome.lifecycle.status,
                     sandbox=sandbox,
                     source_ref=row.source_ref,
+                    receipts=receipts,
                 )
             )
         try:
@@ -891,9 +908,7 @@ async def _drive_under_lease(
                     run_id=outcome.lifecycle.run_id,
                     status=outcome.lifecycle.status,
                     error=outcome.lifecycle.error or "",
-                    graders=_final_grader_receipts(
-                        control, outcome.lifecycle.run_id
-                    ),
+                    graders=receipts,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - adapter code

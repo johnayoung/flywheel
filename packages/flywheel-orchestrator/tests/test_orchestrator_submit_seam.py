@@ -359,6 +359,7 @@ def test_strategy_object_supplies_both_callbacks(tmp_path: Path) -> None:
     assert len(strategy.submit_calls) == 1
     assert strategy.submit_calls[0].sandbox == tmp_path / "prepared" / "alpha"
     assert strategy.submit_calls[0].task.id == "alpha"
+    assert [r.passed for r in strategy.submit_calls[0].receipts] == [True]
     assert not (tmp_path / "sandboxes" / "alpha").exists()
 
 

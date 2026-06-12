@@ -1036,16 +1036,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock_path = repo_root / ".flywheel" / ".merge.lock"
 
     log = make_logger("[worker]")
-    submitter = GitWorktreeSubmitter(
-        repo_root=repo_root,
-        tasks_dir=tasks_dir,
-        worktrees_dir=worktrees_dir,
-        phase_base=phase_base,
-        lock_path=lock_path,
-        log=log,
-        protected_paths=policy.protected_paths if policy else (),
-        setup_command=policy.sandbox_setup if policy else None,
-    )
+    protected_paths = policy.protected_paths if policy else ()
+    setup_command = policy.sandbox_setup if policy else None
+    submitter: GitWorktreeSubmitter
+    if policy is not None and policy.submit_strategy == "pr":
+        # Late import: pr.py imports this module, so a top-level import
+        # here would be circular.
+        from flywheel_worktree.pr import GitPullRequestSubmitter
+
+        submitter = GitPullRequestSubmitter(
+            repo_root=repo_root,
+            tasks_dir=tasks_dir,
+            worktrees_dir=worktrees_dir,
+            phase_base=phase_base,
+            lock_path=lock_path,
+            log=log,
+            protected_paths=protected_paths,
+            setup_command=setup_command,
+            remote=policy.submit_remote,
+            pr_base=policy.submit_pr_base,
+        )
+        log(
+            f"landing strategy: pr (remote={policy.submit_remote} "
+            f"base={policy.submit_pr_base or phase_base})"
+        )
+    else:
+        submitter = GitWorktreeSubmitter(
+            repo_root=repo_root,
+            tasks_dir=tasks_dir,
+            worktrees_dir=worktrees_dir,
+            phase_base=phase_base,
+            lock_path=lock_path,
+            log=log,
+            protected_paths=protected_paths,
+            setup_command=setup_command,
+        )
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)

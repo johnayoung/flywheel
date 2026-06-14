@@ -38,9 +38,10 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from claude_agent_sdk import AssistantMessage, Message, ResultMessage
+if TYPE_CHECKING:
+    from claude_agent_sdk import Message
 
 from flywheel_core.store_protocols import GraderResultRecord, GraderResultStore
 from flywheel_core.task import Task, TranscriptGrader
@@ -135,6 +136,8 @@ class TranscriptCounter:
         return cls(started_at_monotonic=clock(), _monotonic=clock)
 
     def observe(self, msg: Message) -> None:
+        from flywheel_core._sdk import AssistantMessage, ResultMessage
+
         if isinstance(msg, AssistantMessage):
             self.turns += 1
             self.total_tokens += total_tokens_from_usage(msg.usage)

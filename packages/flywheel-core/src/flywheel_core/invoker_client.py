@@ -35,16 +35,17 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from typing import Any
-
-from claude_agent_sdk import (
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ContextUsageResponse,
-    Message,
-)
+from typing import TYPE_CHECKING, Any
 
 from flywheel_core.invoker import IterationResult, invoke_iteration
+
+if TYPE_CHECKING:
+    from claude_agent_sdk import (
+        ClaudeAgentOptions,
+        ClaudeSDKClient,
+        ContextUsageResponse,
+        Message,
+    )
 from flywheel_core.store_protocols import ControlCommandRecord, ControlCommandStore
 
 
@@ -94,7 +95,7 @@ AuditEmit = Callable[[str, Mapping[str, Any]], None]
 # exposes ``get_context_usage`` AND the call returns a reading; absence or
 # error is silently swallowed so the harness's accumulated
 # ``AssistantMessage.usage`` estimate remains the fallback.
-ContextUsageObserver = Callable[[ContextUsageResponse], None]
+ContextUsageObserver = Callable[["ContextUsageResponse"], None]
 
 
 class HarnessRecoveryRequested(Exception):
@@ -363,9 +364,8 @@ async def invoke_iteration_with_client(
     on_message: Callable[[Message], None] | None = None,
     poll_interval: float = DEFAULT_CONTROL_POLL_INTERVAL,
     now: Callable[[], datetime] = _utcnow,
-    client_factory: Callable[
-        [ClaudeAgentOptions], ClaudeSDKClient
-    ] = ClaudeSDKClient,
+    client_factory: Callable[[ClaudeAgentOptions], ClaudeSDKClient]
+    | None = None,
     context_observer: ContextUsageObserver | None = None,
     recovery_interrupt_event: asyncio.Event | None = None,
     on_applied: Callable[[ControlCommandRecord], None] | None = None,
@@ -426,6 +426,12 @@ async def invoke_iteration_with_client(
     recovery_requested: list[bool] = [False]
     stop = asyncio.Event()
 
+    if client_factory is None:
+        # Agent-driving default: import the SDK lazily so this module stays
+        # importable without the optional extra.
+        from flywheel_core._sdk import ClaudeSDKClient
+
+        client_factory = ClaudeSDKClient
     client = client_factory(options)
     async with client:
         await client.query(prompt)

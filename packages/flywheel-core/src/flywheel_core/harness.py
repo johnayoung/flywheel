@@ -63,15 +63,13 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ContextUsageResponse,
-    Message,
-    ResultMessage,
-    TextBlock,
-)
+if TYPE_CHECKING:
+    from claude_agent_sdk import (
+        ContextUsageResponse,
+        Message,
+    )
 
 from flywheel_core.envelope import (
     BlockedRequirement,
@@ -1049,6 +1047,8 @@ def _build_usage_breakdown(messages: Sequence[Message]) -> dict[str, int]:
       ``max(running, total_tokens_from_usage(rm.usage))`` reconciliation in
       :func:`_build_observation`.
     """
+    from flywheel_core._sdk import AssistantMessage, ResultMessage
+
     breakdown: dict[str, int] = {k: 0 for k in _USAGE_TOKEN_KEYS}
     for msg in messages:
         if isinstance(msg, AssistantMessage) and msg.usage:
@@ -1089,6 +1089,8 @@ def _build_observation(
     same totals from the recorded messages so the validation-time
     grader and the hard-limit enforcer converge on identical numbers.
     """
+    from flywheel_core._sdk import AssistantMessage, ResultMessage
+
     turns = 0
     total_tokens = 0
     for msg in messages:
@@ -3007,6 +3009,8 @@ async def _drive_iterations(
                 recovery_interrupt_event.set()
 
         def _on_message(msg: Message) -> None:
+            from flywheel_core._sdk import AssistantMessage, TextBlock
+
             telemetry.sdk_message(
                 msg,
                 attempt_number=attempt_number,

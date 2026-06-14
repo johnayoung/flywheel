@@ -10,28 +10,23 @@ raw messages.
 Envelope extraction delegates entirely to :func:`flywheel_core.envelope.parse_envelope`.
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field
-from typing import Any
-
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKError,
-    HookEventMessage,
-    Message,
-    ProcessError,
-    RateLimitEvent,
-    ResultMessage,
-    TextBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
-from claude_agent_sdk import query as _sdk_query
+from typing import TYPE_CHECKING, Any
 
 from flywheel_core.envelope import EnvelopeResult, parse_envelope
+
+if TYPE_CHECKING:
+    from claude_agent_sdk import (
+        ClaudeAgentOptions,
+        HookEventMessage,
+        Message,
+        RateLimitEvent,
+        ToolUseBlock,
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -157,6 +152,22 @@ async def invoke_iteration(
     The invoker drives exactly one iteration per call. Multi-iteration
     orchestration belongs to the harness.
     """
+
+    # Agent-driving path: import the SDK lazily so importing this module
+    # (and flywheel_core) never requires the optional extra.
+    from flywheel_core._sdk import (
+        AssistantMessage,
+        ClaudeSDKError,
+        HookEventMessage,
+        ProcessError,
+        RateLimitEvent,
+        ResultMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+    from flywheel_core._sdk import query as _sdk_query
 
     messages: list[Message] = []
     transcript_chunks: list[str] = []

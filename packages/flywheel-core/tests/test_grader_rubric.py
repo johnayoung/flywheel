@@ -648,7 +648,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel_core.grader_rubric._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -689,7 +689,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel_core.grader_rubric._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -718,7 +718,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel_core.grader_rubric._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -745,7 +745,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel_core.grader_rubric._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_judge_invoke(
@@ -778,7 +778,7 @@ class TestDefaultJudgeInvoker:
             )
 
         monkeypatch.setattr(
-            "flywheel_core.grader_rubric._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_judge_invoke(

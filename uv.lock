@@ -13,7 +13,7 @@ members = [
 [manifest.dependency-groups]
 dev = [
     { name = "flywheel", editable = "packages/flywheel" },
-    { name = "flywheel-core", extras = ["postgres"], editable = "packages/flywheel-core" },
+    { name = "flywheel-core", extras = ["postgres", "claude"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
     { name = "pyright", specifier = ">=1.1.390" },
@@ -274,7 +274,7 @@ name = "flywheel"
 version = "0.1.0"
 source = { editable = "packages/flywheel" }
 dependencies = [
-    { name = "flywheel-core" },
+    { name = "flywheel-core", extra = ["claude"] },
     { name = "flywheel-orchestrator" },
     { name = "flywheel-worktree" },
     { name = "textual" },
@@ -282,7 +282,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "flywheel-core", editable = "packages/flywheel-core" },
+    { name = "flywheel-core", extras = ["claude"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
     { name = "textual", specifier = ">=0.85" },
@@ -292,11 +292,11 @@ requires-dist = [
 name = "flywheel-core"
 version = "0.1.0"
 source = { editable = "packages/flywheel-core" }
-dependencies = [
-    { name = "claude-agent-sdk" },
-]
 
 [package.optional-dependencies]
+claude = [
+    { name = "claude-agent-sdk" },
+]
 postgres = [
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
@@ -304,11 +304,11 @@ postgres = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", specifier = ">=0.2.83" },
+    { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.83" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
     { name = "psycopg-pool", marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
-provides-extras = ["postgres"]
+provides-extras = ["claude", "postgres"]
 
 [[package]]
 name = "flywheel-orchestrator"

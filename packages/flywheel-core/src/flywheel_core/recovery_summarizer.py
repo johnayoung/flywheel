@@ -38,9 +38,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
-from claude_agent_sdk import query as _sdk_query
-
 from flywheel_core.prompt import RecoveryHandoff
 from flywheel_core.task import Task
 
@@ -284,6 +281,13 @@ def _make_default_summarizer_invoke(
     async def _default_summarizer_invoke(
         prompt: str, worktree: Path | str
     ) -> str:
+        from flywheel_core._sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            TextBlock,
+        )
+        from flywheel_core._sdk import query as _sdk_query
+
         options = ClaudeAgentOptions(
             cwd=str(worktree),
             add_dirs=[str(worktree)],

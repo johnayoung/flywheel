@@ -567,7 +567,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(_assistant_with(_wrap(_well_formed_payload())))
 
         monkeypatch.setattr(
-            "flywheel_core.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(
@@ -603,7 +603,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(_assistant_with(_wrap(_well_formed_payload())))
 
         monkeypatch.setattr(
-            "flywheel_core.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(
@@ -632,7 +632,7 @@ class TestDefaultSummarizerInvoker:
             return _stream(*(_assistant_with(c) for c in chunks))
 
         monkeypatch.setattr(
-            "flywheel_core.recovery_summarizer._sdk_query", fake_query
+            "flywheel_core._sdk.query", fake_query
         )
 
         invoker = _make_default_summarizer_invoke(

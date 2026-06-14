@@ -46,18 +46,10 @@ from collections.abc import (
 )
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    Message,
-    ResultMessage,
-    TextBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-    UserMessage,
-)
+if TYPE_CHECKING:
+    from claude_agent_sdk import Message
 
 from flywheel_core.harness import (
     HarnessConfig,
@@ -220,6 +212,8 @@ def _format_tool_use(name: str, tool_input: Mapping[str, Any]) -> str:
 
 def _summarize_assistant_blocks(content: Sequence[Any]) -> str:
     """Join an assistant turn's text and tool calls into one readable line."""
+    from flywheel_core._sdk import TextBlock, ToolUseBlock
+
     parts: list[str] = []
     for block in content:
         if isinstance(block, TextBlock):
@@ -233,6 +227,8 @@ def _summarize_assistant_blocks(content: Sequence[Any]) -> str:
 
 def _summarize_user_content(content: object) -> str:
     """Summarize a user turn — tool results (with size) or echoed text."""
+    from flywheel_core._sdk import TextBlock, ToolResultBlock
+
     if isinstance(content, str):
         return _short(content, 120)
     if not isinstance(content, Sequence):
@@ -263,6 +259,8 @@ def _summarize_live_message(msg: Message) -> tuple[str, str]:
     tool calls render as ``Write(file_path=...)`` rather than a raw block
     dict — the live stream has the real objects in hand.
     """
+    from flywheel_core._sdk import AssistantMessage, ResultMessage, UserMessage
+
     if isinstance(msg, AssistantMessage):
         return ("ASSISTANT", _summarize_assistant_blocks(msg.content))
     if isinstance(msg, UserMessage):
@@ -442,6 +440,8 @@ def _make_claude_code_invoke(
     the instant it arrives, each isolated by its own ``try/except`` so a
     raising renderer cannot break per-message persistence and vice versa.
     """
+    from flywheel_core._sdk import ClaudeAgentOptions
+
     options = ClaudeAgentOptions(
         cwd=str(sandbox),
         add_dirs=[str(sandbox)],

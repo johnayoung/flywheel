@@ -9,11 +9,15 @@ requires-python = ">=3.13"
 authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }
 ]
-dependencies = [
-    "claude-agent-sdk>=0.2.83",
-]
+# Core's data shapes (Task, Lifecycle, graders, envelopes, store) need no
+# agent SDK; only *driving* an agent does. The SDK is therefore an optional
+# extra (see flywheel_core._sdk) so `import flywheel_core` is dependency-light.
+dependencies = []
 
 [project.optional-dependencies]
+claude = [
+    "claude-agent-sdk>=0.2.83",
+]
 postgres = [
     "psycopg[binary]>=3.2",
     "psycopg_pool>=3.2",

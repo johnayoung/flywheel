@@ -9,7 +9,9 @@ authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }
 ]
 dependencies = [
-    "flywheel-core",
+    # The product shell drives real agents, so it pins the claude extra:
+    # installing `flywheel` yields a working out-of-box agent loop.
+    "flywheel-core[claude]",
     "flywheel-orchestrator",
     "flywheel-worktree",
     "textual>=0.85",

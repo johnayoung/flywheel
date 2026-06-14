@@ -40,7 +40,7 @@ flywheel = { workspace = true }
 
 [dependency-groups]
 dev = [
-    "flywheel-core[postgres]",
+    "flywheel-core[postgres,claude]",
     "flywheel-orchestrator",
     "flywheel-worktree",
     "flywheel",

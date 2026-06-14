@@ -41,9 +41,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
-from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
-from claude_agent_sdk import query as _sdk_query
-
 from flywheel_core.store_protocols import GraderResultRecord, GraderResultStore
 from flywheel_core.task import RubricGrader, Task
 
@@ -307,6 +304,13 @@ def _make_default_judge_invoke(
     async def _default_judge_invoke(
         prompt: str, grader: RubricGrader, worktree: Path | str
     ) -> str:
+        from flywheel_core._sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            TextBlock,
+        )
+        from flywheel_core._sdk import query as _sdk_query
+
         options = ClaudeAgentOptions(
             cwd=str(worktree),
             add_dirs=[str(worktree)],

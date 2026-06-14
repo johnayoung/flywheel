@@ -15,9 +15,15 @@ product package.
 ## Install
 
 ```bash
-uv add flywheel-core                # core
+uv add flywheel-core                # data + lifecycle surface (no agent SDK)
+uv add 'flywheel-core[claude]'      # + claude-agent-sdk, to drive a real agent
 uv add 'flywheel-core[postgres]'    # + Postgres store backend
 ```
+
+The agent SDK is an optional extra: `import flywheel_core` and the whole
+`Task` / `Lifecycle` / grader / store surface work without it. The SDK is
+only needed to actually drive an agent — add the `claude` extra (the
+top-level `flywheel` product bundles it).
 
 ## Run one task
 

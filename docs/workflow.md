@@ -8,7 +8,7 @@ How flywheel develops itself. Every feature since the Postgres store has gone th
 | --------- | -------------------------- | --------------------------- | ---------------------------------------------------------------- |
 | Define    | `/define`                  | vague feature idea          | spec: `.flywheel/specs/NNNNN-FEATURE-<name>.md`                  |
 | Decompose | `/task`                    | spec reference or free text | task JSONs: `.flywheel/tasks/active/NN-<phase>/<id>.json`        |
-| Execute   | `flywheel worker` daemon   | active phase dirs           | commits on main, lifecycles in the store, archived phase         |
+| Execute   | `flywheel worker` daemon   | active phase dirs           | landed work (FF-merge into the base, or a PR), lifecycles in the store, archived phase |
 | Audit     | `/audit-phase`             | store + logs for a phase    | findings: `.flywheel/audits/<phase>.md`                          |
 | Propose   | `/propose-improvements`    | one or more audits          | ranked proposals, each handed to `/define`, `/task`, or "accept" |
 

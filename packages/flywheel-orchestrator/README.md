@@ -81,6 +81,13 @@ sandbox_root = ".flywheel/sandboxes"
 [[defaults.graders]]
 type = "command"
 run = "uv run pytest"
+
+[submit]                   # optional; how DONE work lands (worktree consumer)
+strategy = "merge"         # or "pr"
+protected_paths = [".github/**", "flywheel.toml"]
+
+[sandbox]                  # optional; runs in each fresh worktree
+setup = "uv sync"
 ```
 
 After each driven run the orchestrator calls `source.report(WorkReport)` with
@@ -102,21 +109,22 @@ interrupts anything. Off by default for library callers
 ## The submit seam
 
 `orchestrate()` provisions a sandbox and acts on each task's terminal status
-through two injectable callbacks, so no consumer-specific code (git, merges)
-enters the loop:
+through the `SubmitStrategy` seam — one object bundling `prepare_sandbox` and
+`submit` — so no consumer-specific code (git, merges) enters the loop:
 
 ```python
-from flywheel_orchestrator import orchestrate, SandboxRequest, SubmitRequest
+from flywheel_orchestrator import orchestrate, SubmitStrategy
 
 await orchestrate(
     tasks_dir=tasks_dir, db_path=db, sandbox_root=root,
-    prepare_sandbox=my_prepare,   # SandboxRequest -> Path
-    submit=my_submit,             # SubmitRequest -> None
+    strategy=my_strategy,         # any object with prepare_sandbox + submit
 )
 ```
 
-The `flywheel-worktree` package is a worked example of that seam. Bring your
-own for a different VCS/sandbox/merge strategy.
+`SubmitStrategy` is a runtime-checkable protocol; the standalone
+`prepare_sandbox=` / `submit=` callables remain accepted as the primitive
+form. The `flywheel-worktree` package ships two worked examples (FF-merge and
+pull-request landing). Bring your own for a different VCS/sandbox/merge flow.
 
 ## Persistence
 

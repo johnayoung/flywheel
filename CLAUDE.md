@@ -22,8 +22,11 @@ Authoritative specs in `docs/` override any inferred behavior:
 - `docs/task-lifecycle.md` — `Lifecycle`/`Attempt`/`Status`/`Outcome` and transition rules
 - `docs/loop.md` — iteration envelope (`<!-- LOOP_STATUS -->`) and harness behavior
 - `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`); Postgres mirror lives alongside it
-- `docs/strategy.md` — submission strategy (deferred)
-- `docs/roadmap.md` — ordered build plan; each item depends only on prior items
+- `docs/strategy.md` — the `SubmitStrategy` landing seam and shipped strategies (merge, PR)
+- `docs/workflow.md` — how flywheel develops itself: the define/task/execute/audit pipeline and the runtime loop
+- `docs/data-taxonomy.md` — authoritative state vs. telemetry split
+
+New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.md`).
 
 ## Commands
 
@@ -43,6 +46,8 @@ Python 3.13 required. `uv` is the package manager and task runner — do not inv
 - **IMPORTANT: `Task` is input-source agnostic.** Direct dataclass construction is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source. See memory `feedback_task_schema_input_agnostic.md`.
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.
+- **The agent SDK is an optional extra.** `claude-agent-sdk` is `flywheel-core[claude]`, not a hard dependency: `import flywheel_core` must work without it. Every SDK touch goes through the single lazy boundary `flywheel_core._sdk` (annotations under `TYPE_CHECKING`, a local `from flywheel_core._sdk import ...` inside agent-driving functions). The product `flywheel` dist and the dev group pin the extra. Never add a top-level `import claude_agent_sdk` to a module that `flywheel_core/__init__` imports.
+- **The worker never commits to the operator's branch.** Landing is the `SubmitStrategy`'s job (FF-merge or PR); phase bookkeeping lives in the `refs/flywheel/loop-base/<phase>` ref namespace, materialized into a `.loop-base` dotfile only when a phase archives. Nothing lands that was not verified against the exact base it lands on (submit-time rebase re-runs command graders).
 
 ## Conventions
 

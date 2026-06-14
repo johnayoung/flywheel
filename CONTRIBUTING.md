@@ -21,11 +21,28 @@ uv sync
 
 ## Running tests
 
+Each package keeps its own `tests/` under `packages/<pkg>/tests/`.
+
 ```bash
-uv run pytest                        # full suite
-uv run pytest tests/test_task.py     # one file
-uv run pytest -x -vv                 # stop on first failure, verbose
+uv run pytest                                             # full suite
+uv run pytest packages/flywheel-core/tests/test_task.py   # one file
+uv run pytest -k transcript                                # one keyword
+uv run pytest -x -vv                                       # stop on first failure, verbose
 ```
+
+## Lint and types
+
+CI gates every change on ruff and pyright in addition to the test suite, so
+run all three before opening a PR:
+
+```bash
+uv run ruff check .
+uv run pyright
+uv run pytest
+```
+
+Treat pyright errors as build failures; `uv run pytest` does not surface type
+errors.
 
 ## Commit style
 

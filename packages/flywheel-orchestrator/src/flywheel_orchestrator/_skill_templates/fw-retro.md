@@ -32,7 +32,7 @@ Accepted forms:
 
 - **Read the store ONLY through the flywheel CLI** (`flywheel history`, `flywheel show`, `flywheel audit`). Never query a backend directly, never assume a schema, never re-run the loop. Your diagnosis rests entirely on artifacts durably recorded at execution time. (`git log` is allowed for the shipped-code wall-clock window only — it is context, never a finding's evidence.)
 - **You cannot re-run history.** A clean-looking re-execution would neither prove nor refute anything (agent runs are not reliably reproducible). You infer recurrence and outcome-variance from the *stored run set* — multiple `run_id`s for a scope, grader receipts, audit records — and you label every finding historical-evidence-based.
-- **Stop at diagnosis.** No fixes, no proposals, no "flywheel should add X", no ranked recommendations. When a fix-shaped idea surfaces, you **capture it as a deferred pointer** (see DEFERRED FIX-IDEAS) and move on. Fuller context routinely makes early fixes moot; resolving them here corrupts the diagnosis.
+- **Stop at diagnosis.** No fixes, no proposals, no "flywheel should add X", no ranked recommendations. When a fix-shaped idea surfaces, **drop it and move on** — record only the finding and its pointer. `/fw-improve` re-derives fixes from the cited findings, so naming one here adds nothing and is the remediation drift this stage exists to avoid. Fuller context routinely makes early fixes moot; resolving them here corrupts the diagnosis.
 
 ## STEP 1 — RESOLVE THE SCOPE
 
@@ -152,7 +152,7 @@ Rules while bucketing:
 - **Grade confidence by sample size, and say so.** One or two observations -> low confidence, explicitly labeled. Recurrence across several `run_id`s -> higher confidence. Never assert "systemic" on thin n. A recurring pattern is an evidence-cited **hypothesis worth investigating**, not proof of cause — causation and fixes are `/fw-improve`.
 - **Report the bucket distribution across the phase.** The category counts surface a systemic *type* (e.g. "five of seven misfires were validation-flap") and stop one dramatic run from over-fitting the narrative.
 - **Refuse to crown a single root cause.** Where several conditions co-occurred (a flapping grader + a tight budget + an ambiguous spec), report them as a **set of jointly-sufficient contributing factors**, each separately cited. A clean linear "five-whys" ending in one culprit is forbidden — it is the illusion of understanding.
-- **No counterfactual reproaches.** Findings state what the loop *did* and what state it *observed*, with pointers. "The loop should have retried" / "the agent should have known X" describe a world that did not happen and explain nothing. Counterfactuals are legitimate only as forward prevention — hand them to `/fw-improve` as deferred ideas.
+- **No counterfactual reproaches.** Findings state what the loop *did* and what state it *observed*, with pointers. "The loop should have retried" / "the agent should have known X" describe a world that did not happen and explain nothing. Forward prevention is `/fw-improve`'s job, derived from your cited findings — it does not enter this document.
 - **Hindsight discipline.** Reconstruct what the loop saw *at decision time* from the audit stream, not from the known end-state. Knowing the outcome makes prior signals look more obvious than they were.
 
 ## STEP 7 — WRITE THE REPORT
@@ -210,10 +210,6 @@ One-line health verdict, stated as what the loop DID, gated on friction not outc
 ## Agent-mistake candidates (not loop findings)
 
 - `<task-id>`: clean loop, agent shipped wrong code. Code-review matter, recorded once without moralizing. Pointer: `flywheel show <run-id> --json`.
-
-## Deferred fix-ideas (handoff to /fw-improve — NOT resolved here)
-
-- <fix-shaped idea captured as a pointer to the finding it came from, e.g. "F1 budget squeeze">. Do not evaluate, rank, or sketch a solution.
 ```
 
 **Short note (loop ran nothing in scope, or whole phase verified clean):**
@@ -253,7 +249,7 @@ Wrote `__FW_AUDITS_DIR__/<scope>.md`.
 
 **Every finding carries a re-runnable pointer; un-citable signals were dropped.**
 
-Run /fw-improve to turn these cited findings into ranked proposals. Fixes are deferred — none were proposed here.
+Run /fw-improve to turn these cited findings into ranked proposals. No fixes were proposed here; /fw-improve derives them from these cited findings.
 ```
 
 ## INADMISSIBLE — NEVER SHIP THESE

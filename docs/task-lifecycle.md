@@ -63,6 +63,8 @@ Key rules:
 | `attempts`        | Full history of all attempts              |
 | `session_id`      | Agent session for resumption              |
 | `artifacts_dir`   | Where attempt artifacts are stored        |
+| `blocked_requires_json` | Snapshot of the unsatisfied envelope `requires` predicates while blocked; cleared on every `-> ready` edge |
+| `awaiting_manual_ordinal` | Which manual gate is pending while parked at `awaiting_approval`; cleared on `-> ready` / `-> done` / `-> failed_validation` |
 | `source`          | Opaque provenance label for the work item (task-file path, tracker ref); set once at seed, never interpreted by core |
 
 ## Attempts
@@ -71,7 +73,7 @@ Each execution attempt is recorded as an `Attempt` with:
 
 - `number` — sequential attempt index
 - `started_at` / `ended_at` — wall clock duration
-- `outcome` — one of: `succeeded`, `validation_failed`, `agent_error`, `cancelled`, `internal_error`
+- `outcome` — one of: `succeeded`, `validation_failed`, `agent_error`, `cancelled`, `internal_error`, `recovered`
 - `agent_output`, `error` — context for debugging
 - `agent_context` — model id, model version, agent-SDK version, prompt-template hash; lets later analysis distinguish model swaps from regressions
 - `run_id` — groups attempts within the same run

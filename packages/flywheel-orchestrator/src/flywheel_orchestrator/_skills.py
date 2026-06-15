@@ -4,10 +4,13 @@
 ``.claude/skills/`` so the authoring pipeline (idea -> spec -> tasks ->
 retro -> proposals) is one slash command away in Claude Code:
 
-* ``/fw-spec`` — guided discovery into a numbered spec file
-* ``/fw-plan`` — spec or free text into runnable flywheel tasks
-* ``/fw-retro`` — audit how the loop executed a finished scope
-* ``/fw-improve`` — turn retro findings into ranked proposals
+* ``/fw-spec`` — interview an idea into ungameable, end-state success criteria
+* ``/fw-plan`` — compile a spec or request into right-sized tasks, each spined
+  on the strongest reward-hack-resistant grader the worker runs out-of-band
+* ``/fw-retro`` — forensic audit of how the loop executed a phase; every
+  finding carries a re-runnable CLI pointer and stops at diagnosis
+* ``/fw-improve`` — turn cited retro findings into ranked, scoped proposals,
+  each ending in a handoff (``/fw-spec``, ``/fw-plan``, or accept)
 
 The markdown lives as greenfield templates under ``_skill_templates/``
 (package data) with ``__FW_*__`` placeholder tokens; rendering binds them

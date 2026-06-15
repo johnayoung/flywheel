@@ -132,7 +132,7 @@ A `command` grader that drives a fixture through the real `orchestrate`/harness 
 
 ### Opt-out artifact
 
-A false-positive marker (e.g. docstring fix in a watched file, reverted-within-phase column) is downgraded by committing `active/<phase>/loop-path-exempt.md` with structured front-matter recording phase, author, and reason. `/audit-phase` re-derives the marker from the diff and flags opt-outs whose diff in fact added a watched symbol.
+A false-positive marker (e.g. docstring fix in a watched file, reverted-within-phase column) is downgraded by committing `active/<phase>/loop-path-exempt.md` with structured front-matter recording phase, author, and reason. The loop-retro audit (`/fw-retro`, shipped via `flywheel init --skills`; flywheel's own repo runs the internal `/audit-phase`) re-derives the marker from the diff and flags opt-outs whose diff in fact added a watched symbol.
 
 ## Intervention
 

@@ -72,7 +72,7 @@ These signals are surfaced through the same observability pipeline as other loop
 
 The loop is a Python library.
 
-It is designed to be embedded into larger systems such as CI pipelines, task queues, orchestration services, and review workflows. Operational surfaces on top of the library are left to consumers. 
+It is designed to be embedded into larger systems such as CI pipelines, task queues, orchestration services, and review workflows. The core loop ships no operator UI of its own; rich operational surfaces — the `flywheel`/`fw` shell and operator console — are built above it. 
 
 ### Brain-agnostic
 
@@ -196,15 +196,13 @@ The agent subprocess, SDK layer, verifier infrastructure, storage system, or oth
 
 These distinctions matter for telemetry, retry policy, escalation, and operator understanding. Even if the externally visible lifecycle remains compact, the internal outcome model should preserve these categories. 
 
-## What comes next
+## Where this fits
 
-The orchestration loop is the next building block.
+The single-task loop is flywheel's foundation, shipped as the embeddable `flywheel-core` package. It implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, and preserve execution history. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth — everything in the loop exists to move a task through those states correctly, observably, and reliably.
 
-It sits on top of the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python) Python package and implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, preserve execution history, and coordinate with review and submission layers. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth. Everything in the loop exists to move a task through those states correctly, observably, and reliably. 
+Its first agent backend targets the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python), wired in as an optional extra (`flywheel-core[claude]`) behind a single lazy boundary, so the data and lifecycle surface need no SDK at all.
 
-This is flywheel’s first deliverable: an embeddable Python package implementing the loop.
-
-The building blocks that follow, including task decomposition, multi-task orchestration, persistent knowledge, and richer intervention policy, all depend on this loop being correct and trustworthy. That is why it comes next. 
+The building blocks that depend on a correct, trustworthy loop are built on top of it: multi-task orchestration over a prerequisite DAG (`flywheel-orchestrator`), the git-worktree landing strategies and worker daemon (`flywheel-worktree`), the `flywheel`/`fw` operator shell, and the spec-driven authoring skills installed by `flywheel init --skills`. Task decomposition and richer intervention policy continue to build on the same foundation. 
 
 ## Glossary
 

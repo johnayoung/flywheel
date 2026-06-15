@@ -1,6 +1,6 @@
 # Workflow
 
-How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in `.claude/commands/` (prompt commands run by an operator in Claude Code) and half in `.flywheel/` (artifacts and runtime state; formerly `.workflow/`, cut over wholesale with history preserved). This doc records the current state and rationale as the baseline for promoting pieces of it into first-class flywheel features.
+How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in `.claude/commands/` (prompt commands run by an operator in Claude Code) and half in `.flywheel/` (artifacts and runtime state; formerly `.workflow/`, cut over wholesale with history preserved). This doc records the current state and rationale. The authoring half has since been promoted into shipped code — the `fw-spec`/`fw-plan`/`fw-retro`/`fw-improve` skills that `flywheel init --skills` installs into any repo — and the `.claude/commands/` prompts remain as flywheel's own dogfood source; the rest is the baseline for promoting further pieces.
 
 ## Pipeline at a glance
 
@@ -113,11 +113,11 @@ setup = "uv sync"
 
 `flywheel status|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults. The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `flywheel worker [--once]` to drive a phase.
 
-`flywheel init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
+`flywheel init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`. Idempotent; never overwrites. `flywheel init --skills` additionally renders the authoring-pipeline skills (`fw-spec`/`fw-plan`/`fw-retro`/`fw-improve`) into `.claude/skills/`, parameterized by the work policy (`fw-plan` gets the task-directory or GitHub-issues delivery section to match the source). This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
 
 ## Code vs. convention
 
-What would need promotion for another codebase to use this workflow:
+What it takes for another codebase to run this workflow — most of it now ships as code:
 
 | Piece                                                               | Lives in                                              | Status          |
 | ------------------------------------------------------------------- | ----------------------------------------------------- | --------------- |
@@ -126,9 +126,9 @@ What would need promotion for another codebase to use this workflow:
 | Archive gate, loop-path signals, `.loop-base`, opt-out parsing      | `flywheel-orchestrator` + `flywheel.loop_path_marker` | shipped code    |
 | Worktree-per-task submit strategy, daemon                           | `flywheel-worktree` package (library)                 | shipped code    |
 | Default `.flywheel/` paths                                          | CLI defaults in all three packages                    | shipped code    |
-| `/define`, `/task`, `/audit-phase`, `/propose-improvements` prompts | `.claude/commands/`                                   | repo convention |
-| Spec template and `NNNNN-FEATURE-` numbering                        | prose inside `define.md`                              | repo convention |
-| Audit and proposal doc formats, evidence rules                      | prose inside the command prompts                      | repo convention |
-| Phase naming, the pipeline ordering itself                          | operator habit                                        | repo convention |
+| Authoring pipeline as installable skills (`fw-spec`/`fw-plan`/`fw-retro`/`fw-improve`) | `flywheel-orchestrator` (`_skills`, `_skill_templates/`); installed by `flywheel init --skills` | shipped code |
+| Spec/task/audit/proposal doc formats, `NNNNN-FEATURE-` numbering, evidence rules | rendered inside those skill templates | shipped code |
+| `/define`, `/task`, `/audit-phase`, `/propose-improvements` — flywheel's own dogfood source the skills were promoted from | `.claude/commands/` | repo convention |
+| Phase naming, the pipeline ordering itself | operator habit | repo convention |
 
-The remaining convention column — the command prompts and the document contracts they enforce — is what this workflow would promote next for other codebases to adopt.
+The command prompts and the document contracts they enforce have since been promoted: they ship as the `fw-*` skills `flywheel init --skills` installs into any repo, while `.claude/commands/` stays as flywheel's own dogfood source. What remains convention is the thin operator-habit layer — phase naming and the pipeline ordering itself.

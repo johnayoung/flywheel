@@ -5,7 +5,9 @@ commits; coordinate on the [project tracker](https://github.com/johnayoung/flywh
 before starting non-trivial work.
 
 For project context and scope, read [docs/vision.md](docs/vision.md) before
-opening a pull request.
+opening a pull request. Feature work follows the spec-driven pipeline in
+[docs/workflow.md](docs/workflow.md), installable into any repo as the
+`/fw-*` skills via `flywheel init --skills`.
 
 ## Dev setup
 

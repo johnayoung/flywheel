@@ -15,7 +15,7 @@ The schema is intentionally minimal: one required field (`goal`), the rest optio
 | Field           | Type     | Default   | Description                                |
 | --------------- | -------- | --------- | ------------------------------------------ |
 | `graders`       | []Grader | `[]`      | Verification checks; all must pass for `done`. Empty = unverified run (`done` reflects the agent's own claim, nothing external is checked). |
-| `id`            | string   | `uuid4()` | Unique identifier, no whitespace           |
+| `id`            | string   | `task-<uuid4 hex>` | Unique identifier, no whitespace           |
 | `tags`          | []string | `[]`      | Free-form labels for filtering and grouping |
 | `context`       | Context  | (empty)   | Briefing material the agent reads upfront  |
 

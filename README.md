@@ -8,13 +8,24 @@ Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync                        # install all workspace packages
-uv run flywheel init           # scaffold .flywheel/ and a work policy
+uv run flywheel init           # scaffold .flywheel/, a work policy, and the SDD skills
 uv run flywheel worker --once  # claim one task, run it, exit
 uv run flywheel                # operator console (alias: fw)
 uv run pytest                  # full test suite
 ```
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).
+
+## Authoring skills
+
+Tasks are the input to the loop; flywheel ships the spec-driven pipeline that produces them as four Claude Code skills. `flywheel init` installs them into the repo's `.claude/skills/` (prompted by default in an interactive run; `--skills` / `--no-skills` answer non-interactively), rendered for the repo's work policy (`flywheel.toml` — `/fw-plan` swaps a task-directory vs GitHub-issues delivery section by work source):
+
+- **`/fw-spec`** — interview an idea into ungameable, end-state success criteria, written as a numbered spec.
+- **`/fw-plan`** — compile a spec or request into right-sized tasks, each spined on the strongest reward-hack-resistant grader the worker can run out-of-band.
+- **`/fw-retro`** — forensic audit of how the loop executed a phase; every finding carries a re-runnable CLI pointer and stops at diagnosis.
+- **`/fw-improve`** — turn cited retro findings into ranked, scoped proposals, each ending in a handoff (`/fw-spec`, `/fw-plan`, or accept).
+
+They are project-agnostic templates: re-running `flywheel init` regenerates the managed files and leaves any you have edited untouched. Each skill's cited design rationale lives in [`docs/research/`](docs/research/).
 
 ## How work lands
 

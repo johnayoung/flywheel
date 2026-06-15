@@ -6,7 +6,7 @@ Strategy is the work between "agent finished" and "result committed / merged / s
 
 ## The seam
 
-The named seam is `flywheel_orchestrator.SubmitStrategy` (`_strategy.py`): a structural protocol bundling the two hooks `orchestrate` calls around every run. No registration, no base class — any object with conforming methods works, passed as `orchestrate(strategy=...)` (or as the standalone `prepare_sandbox`/`submit` callables).
+The named seam is `flywheel_orchestrator.SubmitStrategy` (`_strategy.py`): a structural protocol bundling the two hooks `orchestrate` calls around every run. No base class — any object with conforming methods satisfies the protocol, passed as `orchestrate(strategy=...)` (or as the standalone `prepare_sandbox`/`submit` callables). Selecting a built-in strategy by name (the `flywheel.toml` `[submit] strategy` key) routes through the `SUBMIT_STRATEGIES` plugin registry (`flywheel_worktree._submit_registry`), which maps `merge`/`pr` to their submitters.
 
 | Hook              | When                                | Contract                                                                                       |
 | ----------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |

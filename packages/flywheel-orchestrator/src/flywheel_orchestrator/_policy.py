@@ -80,10 +80,14 @@ from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.task import Grader
 
 from flywheel_orchestrator._github import GithubWorkSource
+from flywheel_orchestrator._source_registry import SOURCES
 from flywheel_orchestrator._sources import DirectoryWorkSource, WorkSource
 
 DEFAULT_POLICY_FILENAME = "flywheel.toml"
 
+# Mirrors the names registered in ``_source_registry.SOURCES``; kept here for
+# load-time policy validation (``_optional_source`` rejects an unknown kind
+# before any work source is built). The registry owns construction dispatch.
 _SOURCE_KINDS: tuple[str, ...] = ("directory", "github")
 
 _DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
@@ -400,11 +404,14 @@ def _optional_sandbox_setup(
     return value
 
 
-def build_work_source(policy: WorkPolicy) -> WorkSource:
-    """Construct the :class:`WorkSource` a policy describes."""
-    if policy.source_kind == "directory":
-        assert policy.tasks_dir is not None  # load_policy guarantees it
-        return DirectoryWorkSource(policy.tasks_dir)
+def build_directory_source(policy: WorkPolicy) -> WorkSource:
+    """Build the directory backend (the registry's ``directory`` target)."""
+    assert policy.tasks_dir is not None  # load_policy guarantees it
+    return DirectoryWorkSource(policy.tasks_dir)
+
+
+def build_github_source(policy: WorkPolicy) -> WorkSource:
+    """Build the GitHub-issues backend (the registry's ``github`` target)."""
     assert policy.github_repo is not None and policy.github_label is not None
     return GithubWorkSource(
         repo=policy.github_repo,
@@ -414,10 +421,23 @@ def build_work_source(policy: WorkPolicy) -> WorkSource:
     )
 
 
+def build_work_source(policy: WorkPolicy) -> WorkSource:
+    """Construct the :class:`WorkSource` a policy describes.
+
+    Routes ``policy.source_kind`` through the
+    :data:`~flywheel_orchestrator._source_registry.SOURCES` registry; the
+    per-kind construction lives in :func:`build_directory_source` /
+    :func:`build_github_source`.
+    """
+    return SOURCES.resolve(policy.source_kind)(policy)
+
+
 __all__ = [
     "DEFAULT_POLICY_FILENAME",
     "PolicyError",
     "WorkPolicy",
+    "build_directory_source",
+    "build_github_source",
     "build_work_source",
     "load_policy",
 ]

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from flywheel_core._registry import MissingExtraError
+
 if TYPE_CHECKING:
     # Re-exported for annotation use elsewhere via ``from
     # flywheel_core._sdk import X`` guarded by the importer's own
@@ -73,20 +75,29 @@ if TYPE_CHECKING:
     )
 
 
-class MissingAgentSDKError(ModuleNotFoundError):
-    """Raised when an agent-driving path needs ``claude-agent-sdk`` but the
-    optional extra is not installed.
-
-    The message names the fix so the operator never has to guess which
-    package or extra to add.
-    """
-
-
 _INSTALL_HINT = (
     "driving an agent requires the optional 'claude-agent-sdk' dependency. "
     "Install it with:  pip install 'flywheel-core[claude]'  (or, for the "
     "product shell, 'flywheel' already bundles it)."
 )
+
+
+class MissingAgentSDKError(MissingExtraError):
+    """Raised when an agent-driving path needs ``claude-agent-sdk`` but the
+    optional extra is not installed.
+
+    A member of the shared :class:`~flywheel_core._registry.MissingExtraError`
+    family (so ``except MissingExtraError`` catches every missing-optional
+    failure uniformly), but it keeps its own, more specific hint: the SDK is
+    on the ``claude`` extra of *core*, and the product ``flywheel`` dist
+    already bundles it.
+    """
+
+    def __init__(self, message: str = _INSTALL_HINT) -> None:
+        self.extra = "claude"
+        # Bypass MissingExtraError's generic message format; the SDK hint
+        # above is the established, more actionable one.
+        ModuleNotFoundError.__init__(self, message)
 
 # The SDK symbols this boundary resolves on demand. Anything else (notably
 # the dunders the import system probes, e.g. ``__path__``) must raise a

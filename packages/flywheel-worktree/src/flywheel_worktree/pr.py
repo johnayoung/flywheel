@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Sequence
 
 from flywheel_core import Status
-from flywheel_orchestrator import GhRunner, SubmitRequest
+from flywheel_orchestrator import GhRunner, SubmitRequest, WorkPolicy
 
 from flywheel_worktree.worker import (
     GitWorktreeSubmitter,
@@ -104,6 +104,45 @@ def render_pr_body(req: SubmitRequest) -> str:
         "run's final attempt; agent claims are never authoritative.",
     ]
     return "\n".join(lines)
+
+
+def build_pr_submitter(
+    policy: WorkPolicy | None,
+    *,
+    repo_root: Path,
+    tasks_dir: Path,
+    worktrees_dir: Path,
+    phase_base: str,
+    lock_path: Path,
+    log: Logger,
+    protected_paths: Sequence[str],
+    setup_command: str | None,
+) -> GitPullRequestSubmitter:
+    """Build the PR backend (the registry's ``pr`` target).
+
+    Reads the remote and PR base from ``policy`` and logs the resolved
+    landing target, matching the shared builder signature the submit-strategy
+    registry dispatches on. ``policy`` is non-``None`` here: the worker only
+    selects ``pr`` from a policy that set it.
+    """
+    assert policy is not None  # selection of "pr" requires a policy
+    submitter = GitPullRequestSubmitter(
+        repo_root=repo_root,
+        tasks_dir=tasks_dir,
+        worktrees_dir=worktrees_dir,
+        phase_base=phase_base,
+        lock_path=lock_path,
+        log=log,
+        protected_paths=protected_paths,
+        setup_command=setup_command,
+        remote=policy.submit_remote,
+        pr_base=policy.submit_pr_base,
+    )
+    log(
+        f"landing strategy: pr (remote={policy.submit_remote} "
+        f"base={policy.submit_pr_base or phase_base})"
+    )
+    return submitter
 
 
 class GitPullRequestSubmitter(GitWorktreeSubmitter):

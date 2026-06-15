@@ -80,6 +80,8 @@ from flywheel_orchestrator import (
     write_phase_base_if_missing,
 )
 
+from flywheel_worktree._submit_registry import SUBMIT_STRATEGIES
+
 DEFAULT_RETENTION_DAYS = 7
 DEFAULT_HEARTBEAT_SECONDS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 5
@@ -979,6 +981,36 @@ def _resolve_model(
     return policy.model
 
 
+def build_merge_submitter(
+    policy: WorkPolicy | None,
+    *,
+    repo_root: Path,
+    tasks_dir: Path,
+    worktrees_dir: Path,
+    phase_base: str,
+    lock_path: Path,
+    log: Logger,
+    protected_paths: Sequence[str],
+    setup_command: str | None,
+) -> GitWorktreeSubmitter:
+    """Build the merge backend (the registry's ``merge`` target).
+
+    The fast-forward-merge landing reads nothing extra from ``policy``; the
+    argument is part of the shared builder signature the submit-strategy
+    registry dispatches on (see :mod:`flywheel_worktree._submit_registry`).
+    """
+    return GitWorktreeSubmitter(
+        repo_root=repo_root,
+        tasks_dir=tasks_dir,
+        worktrees_dir=worktrees_dir,
+        phase_base=phase_base,
+        lock_path=lock_path,
+        log=log,
+        protected_paths=protected_paths,
+        setup_command=setup_command,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
@@ -1007,39 +1039,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     log = make_logger("[worker]")
     protected_paths = policy.protected_paths if policy else ()
     setup_command = policy.sandbox_setup if policy else None
-    submitter: GitWorktreeSubmitter
-    if policy is not None and policy.submit_strategy == "pr":
-        # Late import: pr.py imports this module, so a top-level import
-        # here would be circular.
-        from flywheel_worktree.pr import GitPullRequestSubmitter
-
-        submitter = GitPullRequestSubmitter(
-            repo_root=repo_root,
-            tasks_dir=tasks_dir,
-            worktrees_dir=worktrees_dir,
-            phase_base=phase_base,
-            lock_path=lock_path,
-            log=log,
-            protected_paths=protected_paths,
-            setup_command=setup_command,
-            remote=policy.submit_remote,
-            pr_base=policy.submit_pr_base,
-        )
-        log(
-            f"landing strategy: pr (remote={policy.submit_remote} "
-            f"base={policy.submit_pr_base or phase_base})"
-        )
-    else:
-        submitter = GitWorktreeSubmitter(
-            repo_root=repo_root,
-            tasks_dir=tasks_dir,
-            worktrees_dir=worktrees_dir,
-            phase_base=phase_base,
-            lock_path=lock_path,
-            log=log,
-            protected_paths=protected_paths,
-            setup_command=setup_command,
-        )
+    # The registry owns name -> builder dispatch (and lazily imports pr.py
+    # for the "pr" strategy, which is what keeps that import out of this
+    # module's top level). The builders share one signature.
+    strategy = policy.submit_strategy if policy is not None else "merge"
+    submitter: GitWorktreeSubmitter = SUBMIT_STRATEGIES.resolve(strategy)(
+        policy,
+        repo_root=repo_root,
+        tasks_dir=tasks_dir,
+        worktrees_dir=worktrees_dir,
+        phase_base=phase_base,
+        lock_path=lock_path,
+        log=log,
+        protected_paths=protected_paths,
+        setup_command=setup_command,
+    )
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)

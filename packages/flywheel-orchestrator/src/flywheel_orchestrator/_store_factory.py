@@ -19,9 +19,11 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from flywheel_core._registry import MissingExtraError, import_extra, install_hint
 from flywheel_core.store_sqlite import SqliteStore
 
 from flywheel_orchestrator._policy import PolicyError, WorkPolicy
+from flywheel_orchestrator._store_registry import STORES
 
 if TYPE_CHECKING:
     from flywheel_core.store_postgres import PostgresStore
@@ -31,8 +33,6 @@ if TYPE_CHECKING:
 PG_DSN_ENV = "FLYWHEEL_PG_DSN"
 
 PG_DSN_FALLBACK_ENV = "DATABASE_URL"
-
-_POSTGRES_EXTRA_HINT = "install with: uv add 'flywheel[postgres]'"
 
 
 class StoreConfigError(PolicyError):
@@ -65,35 +65,42 @@ def resolve_postgres_dsn(
     return None
 
 
-def build_store(
+def build_sqlite_store(
     policy: WorkPolicy | None,
     *,
     db_path: Path,
     environ: Mapping[str, str] | None = None,
-) -> SqliteStore | PostgresStore:
-    """Construct the core store ``policy`` selects.
+) -> SqliteStore:
+    """Build the sqlite backend (the registry's ``sqlite`` target).
 
-    Backend ``sqlite`` -- or no policy at all -- yields
-    ``SqliteStore(db_path)`` exactly as the command paths constructed it
-    before the factory existed; ``db_path`` must already be resolved by
-    the caller (flag > policy > default, see ``resolve_db_path``).
-
-    Backend ``postgres`` resolves the DSN via
-    :func:`resolve_postgres_dsn`, imports the store lazily so the
-    ``postgres`` extra stays optional, and passes the policy's
-    ``store_schema`` through when set; pool sizing stays at the store's
-    code defaults.
-
-    The factory only resolves and constructs: an unreachable database, or
-    a ``DATABASE_URL`` carrying a non-postgres scheme, surfaces as the
-    store's own connection error -- never a silent sqlite fallback.
-
-    Raises :class:`StoreConfigError` when the backend is postgres and
-    neither ``FLYWHEEL_PG_DSN`` nor ``DATABASE_URL`` is set, or when the
-    postgres extra is not installed.
+    Yields ``SqliteStore(db_path)`` exactly as the command paths
+    constructed it before the factory existed; ``db_path`` must already be
+    resolved by the caller (flag > policy > default, see ``resolve_db_path``).
+    ``policy``/``environ`` are unused but kept for the shared builder
+    signature the registry dispatches on.
     """
-    if policy is None or policy.store_backend != "postgres":
-        return SqliteStore(db_path)
+    return SqliteStore(db_path)
+
+
+def build_postgres_store(
+    policy: WorkPolicy | None,
+    *,
+    db_path: Path,
+    environ: Mapping[str, str] | None = None,
+) -> PostgresStore:
+    """Build the postgres backend (the registry's ``postgres`` target).
+
+    Resolves the DSN via :func:`resolve_postgres_dsn`, imports the store
+    lazily through :func:`~flywheel_core._registry.import_extra` so the
+    ``postgres`` extra stays optional, and passes the policy's
+    ``store_schema`` through when set; pool sizing stays at the store's code
+    defaults. An unreachable database, or a ``DATABASE_URL`` carrying a
+    non-postgres scheme, surfaces as the store's own connection error --
+    never a silent sqlite fallback.
+
+    Raises :class:`StoreConfigError` when neither ``FLYWHEEL_PG_DSN`` nor
+    ``DATABASE_URL`` is set, or when the postgres extra is not installed.
+    """
     dsn = resolve_postgres_dsn(environ)
     if dsn is None:
         raise StoreConfigError(
@@ -102,15 +109,34 @@ def build_store(
             f"connection string"
         )
     try:
-        from flywheel_core.store_postgres import PostgresStore
-    except ImportError as exc:
+        module = import_extra("flywheel_core.store_postgres", "postgres")
+    except MissingExtraError as exc:
         raise StoreConfigError(
             f"store backend is postgres but the postgres extra is not "
-            f"installed; {_POSTGRES_EXTRA_HINT}"
+            f"installed; {install_hint('postgres')}"
         ) from exc
-    if policy.store_schema is not None:
-        return PostgresStore(dsn, schema=policy.store_schema)
-    return PostgresStore(dsn)
+    if policy is not None and policy.store_schema is not None:
+        return module.PostgresStore(dsn, schema=policy.store_schema)
+    return module.PostgresStore(dsn)
+
+
+def build_store(
+    policy: WorkPolicy | None,
+    *,
+    db_path: Path,
+    environ: Mapping[str, str] | None = None,
+) -> SqliteStore | PostgresStore:
+    """Construct the core store ``policy`` selects.
+
+    Routes the policy's ``store_backend`` (``sqlite`` when no policy is
+    given) through the :data:`~flywheel_orchestrator._store_registry.STORES`
+    registry, which owns the unknown-backend and missing-extra failures, then
+    calls the resolved builder. The per-backend construction lives in
+    :func:`build_sqlite_store` / :func:`build_postgres_store`.
+    """
+    backend = policy.store_backend if policy is not None else "sqlite"
+    builder = STORES.resolve(backend)
+    return builder(policy, db_path=db_path, environ=environ)
 
 
 def open_sqlite_bound_store(
@@ -146,6 +172,8 @@ __all__ = [
     "PG_DSN_ENV",
     "PG_DSN_FALLBACK_ENV",
     "StoreConfigError",
+    "build_postgres_store",
+    "build_sqlite_store",
     "build_store",
     "open_sqlite_bound_store",
     "resolve_postgres_dsn",

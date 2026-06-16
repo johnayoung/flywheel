@@ -2,11 +2,13 @@
 
 ``flywheel init`` can drop a set of agent skills into the repo's
 ``.claude/skills/`` so the authoring pipeline (idea -> spec -> tasks ->
-retro -> proposals) is one slash command away in Claude Code:
+held-out oracle -> retro -> proposals) is one slash command away in Claude Code:
 
 * ``/fw-spec`` — interview an idea into ungameable, end-state success criteria
 * ``/fw-plan`` — compile a spec or request into right-sized tasks, each spined
   on the strongest reward-hack-resistant grader the worker runs out-of-band
+* ``/fw-verify`` — blind-author the discriminating held-out test oracle for
+  those tasks before execute, so the agent never writes the test that grades it
 * ``/fw-retro`` — forensic audit of how the loop executed a phase; every
   finding carries a re-runnable CLI pointer and stops at diagnosis
 * ``/fw-improve`` — turn cited retro findings into ranked, scoped proposals,
@@ -39,6 +41,7 @@ from flywheel_orchestrator._policy import WorkPolicy
 SKILL_NAMES: tuple[str, ...] = (
     "fw-spec",
     "fw-plan",
+    "fw-verify",
     "fw-retro",
     "fw-improve",
 )

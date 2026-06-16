@@ -63,6 +63,9 @@ def test_render_binds_default_paths() -> None:
     assert ".flywheel/logs/runs/" in retro
     improve = render_skill("fw-improve", SkillRenderSettings())
     assert ".flywheel/proposals/" in improve
+    verify = render_skill("fw-verify", SkillRenderSettings())
+    assert ".flywheel/tasks/active/" in verify
+    assert ".flywheel/specs/" in verify
 
 
 def test_render_binds_custom_tasks_dir() -> None:

@@ -53,6 +53,7 @@ Thumbs.db
 .flywheel/.merge.lock
 .flywheel/flywheel.sqlite*
 
-# Claude Code local config (commands are tracked; the rest is local)
+# Claude Code local config (commands + workflows are tracked; the rest is local)
 .claude/*
 !.claude/commands/
+!.claude/workflows/

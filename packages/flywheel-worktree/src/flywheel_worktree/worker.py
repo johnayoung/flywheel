@@ -96,6 +96,16 @@ CYCLE_FAILURE_BACKOFF_SECONDS = 10
 Logger = Callable[[str], None]
 
 
+# Fixed, deterministic commit identity established on every worktree the worker
+# provisions, so the agent's own in-sandbox ``git commit`` resolves an
+# author/committer even on a host with no global or system git identity
+# (``GIT_CONFIG_NOSYSTEM=1``, empty ``HOME``). Constant across every worktree in
+# a repo (never random/UUID/timestamp/per-run): the worker authors no commit
+# itself; this only lets the agent's commit succeed.
+WORKTREE_COMMIT_IDENTITY_NAME = "Flywheel Worker"
+WORKTREE_COMMIT_IDENTITY_EMAIL = "worker@flywheel.invalid"
+
+
 class GitError(RuntimeError):
     """A git invocation the worker expected to succeed did not."""
 
@@ -325,6 +335,17 @@ class GitWorktreeSubmitter:
             raise PrepareSandboxError(
                 f"git worktree add failed for {worktree}: {proc.stderr.strip()}"
             )
+        self._set_commit_identity(worktree)
+
+    def _set_commit_identity(self, worktree: Path) -> None:
+        """Establish the fixed commit identity on a freshly provisioned
+        worktree so an in-sandbox ``git commit`` succeeds with no global or
+        system git identity present. Written to the worktree's repo-local
+        config (read by the in-worktree git process regardless of ``HOME`` /
+        ``GIT_CONFIG_NOSYSTEM``); a reused parked worktree already carries it.
+        The worker itself still authors no commit (D-1)."""
+        _git(worktree, "config", "user.name", WORKTREE_COMMIT_IDENTITY_NAME)
+        _git(worktree, "config", "user.email", WORKTREE_COMMIT_IDENTITY_EMAIL)
 
     def _discard_and_recreate(
         self, worktree: Path, branch: str

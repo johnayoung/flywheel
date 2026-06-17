@@ -698,3 +698,84 @@ def test_submit_strategy_rejects_unknown(tmp_path: Path) -> None:
                 'strategy = "catapult"\n',
             )
         )
+
+
+# --- [submit] base ------------------------------------------------------------
+
+
+def test_submit_base_default_none_when_table_absent(tmp_path: Path) -> None:
+    """No [submit] table at all yields submit_base=None (back-compat)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.submit_base is None
+
+
+def test_submit_base_default_none_when_key_absent(tmp_path: Path) -> None:
+    """A [submit] table present but no base key yields submit_base=None
+    and raises no PolicyError (falls back to the checked-out branch)."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\nstrategy = "merge"\n',
+        )
+    )
+    assert policy.submit_base is None
+
+
+def test_submit_base_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\nbase = "main"\n',
+        )
+    )
+    assert policy.submit_base == "main"
+
+
+def test_submit_base_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.base"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\nbase = ""\n',
+            )
+        )
+
+
+def test_submit_base_rejects_whitespace_only_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.base"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\nbase = "   "\n',
+            )
+        )
+
+
+def test_submit_base_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.base"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\nbase = 42\n',
+            )
+        )
+
+
+def test_submit_base_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[submit]",
+                    'base = "release"',
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.submit_base == "release"

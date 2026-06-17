@@ -120,11 +120,14 @@ class WorkPolicy:
     with no schema, so every pre-existing policy file keeps loading
     unchanged. ``protected_paths`` mirrors the optional
     ``[submit] protected_paths`` list; empty when unset (no merge-time
-    path gate). ``submit_strategy``/``submit_remote``/``submit_pr_base``
+    path gate).
+    ``submit_strategy``/``submit_remote``/``submit_pr_base``/``submit_base``
     mirror the rest of the optional ``[submit]`` table; an absent table
-    means the historical merge landing. ``sandbox_setup`` mirrors the
-    optional ``[sandbox] setup`` command; ``None`` when unset (new
-    sandboxes are used bare).
+    means the historical merge landing. ``submit_base`` is the explicit
+    landing/phase-base branch; ``None`` falls back to the checked-out
+    branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
+    mirrors the optional ``[sandbox] setup`` command; ``None`` when unset
+    (new sandboxes are used bare).
     """
 
     source_kind: str
@@ -142,6 +145,7 @@ class WorkPolicy:
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
     submit_pr_base: str | None = None
+    submit_base: str | None = None
     sandbox_setup: str | None = None
 
 
@@ -197,9 +201,12 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(submit, dict):
         raise PolicyError(f"{path}: [submit] must be a table")
     protected_paths = _optional_protected_paths(submit, policy_file=path)
-    submit_strategy, submit_remote, submit_pr_base = _optional_submit_strategy(
-        submit, policy_file=path
-    )
+    (
+        submit_strategy,
+        submit_remote,
+        submit_pr_base,
+        submit_base,
+    ) = _optional_submit_strategy(submit, policy_file=path)
 
     sandbox = data.get("sandbox") or {}
     if not isinstance(sandbox, dict):
@@ -227,6 +234,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
+            submit_base=submit_base,
             sandbox_setup=sandbox_setup,
         )
 
@@ -261,6 +269,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
         submit_pr_base=submit_pr_base,
+        submit_base=submit_base,
         sandbox_setup=sandbox_setup,
     )
 
@@ -355,13 +364,16 @@ _SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr")
 
 def _optional_submit_strategy(
     table: dict, *, policy_file: Path
-) -> tuple[str, str, str | None]:
-    """Validate and return ``(strategy, remote, pr_base)`` from ``[submit]``.
+) -> tuple[str, str, str | None, str | None]:
+    """Validate and return ``(strategy, remote, pr_base, base)`` from
+    ``[submit]``.
 
     Absent keys mean the historical merge landing (``("merge", "origin",
-    None)``) so every pre-existing policy file keeps loading unchanged.
-    An unknown strategy, or a remote/pr_base that is not a non-empty
-    string, raises :class:`PolicyError`.
+    None, None)``) so every pre-existing policy file keeps loading
+    unchanged. An unknown strategy, or a remote/pr_base/base that is not a
+    non-empty string, raises :class:`PolicyError`. ``base`` is the
+    explicit landing/phase-base branch; ``None`` falls back to the
+    checked-out branch (back-compat), mirroring ``pr_base``.
     """
     strategy = table.get("strategy", "merge")
     if strategy not in _SUBMIT_STRATEGIES:
@@ -381,7 +393,14 @@ def _optional_submit_strategy(
         raise PolicyError(
             f"{policy_file}: submit.pr_base must be a non-empty string"
         )
-    return strategy, remote, pr_base
+    base = table.get("base")
+    if base is not None and (
+        not isinstance(base, str) or not base.strip()
+    ):
+        raise PolicyError(
+            f"{policy_file}: submit.base must be a non-empty string"
+        )
+    return strategy, remote, pr_base, base
 
 
 def _optional_sandbox_setup(

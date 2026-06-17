@@ -1711,6 +1711,12 @@ sandbox_root = ".flywheel/sandboxes"
 # verbatim (no allowlist enforced). CLI flags still override.
 # [agent]
 # model = "claude-sonnet-4-5"
+
+# Landing policy. base pins the branch finished work lands on and the
+# worker resolves its phase base from; unset falls back to the
+# checked-out branch (back-compat).
+# [submit]
+# base = "main"
 """
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")

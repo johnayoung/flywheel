@@ -857,6 +857,11 @@ class LiveRunRow:
     # staleness); ``started_at`` answers "how long has this run been
     # going" (the age an operator expects to grow monotonically).
     started_at: datetime | None = None
+    # The persisted ``lifecycles.worker_id`` of the worker driving the
+    # run (SI-11). ``None`` when the column is unset -- never a sentinel
+    # string -- so an operator surface can distinguish "no worker
+    # recorded" from a real worker id.
+    worker_id: str | None = None
 
 def _parse_db_ts(value: str | None) -> datetime | None:
     if value is None:
@@ -889,7 +894,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     lifecycles = conn.execute(
         """
         SELECT run_id, task_id, status, awaiting_manual_ordinal,
-               timestamps_json
+               timestamps_json, worker_id
         FROM lifecycles
         WHERE status IN ('running', 'validating', 'awaiting_approval')
         ORDER BY task_id, run_id
@@ -945,6 +950,9 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 last_detail = f"attempt {attempt} started"
                 last_ts = _parse_db_ts(latest["started_at"])
         started_at = _earliest_lifecycle_ts(lc["timestamps_json"])
+        # Null or empty-string column -> None (never a sentinel), so an
+        # unset worker is distinguishable from a real id (SI-11).
+        worker_id = lc["worker_id"] or None
         status = Status(lc["status"])
         awaiting_instruction = _resolve_awaiting_instruction(
             store,
@@ -968,6 +976,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 iterations_completed=iters_completed,
                 awaiting_instruction=awaiting_instruction,
                 started_at=started_at,
+                worker_id=worker_id,
             )
         )
     return rows
@@ -1227,6 +1236,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         rows = status_rows_for_items(source.list_work(), store)
+        # Map each in-flight run to its persisted worker_id from the same
+        # relational live snapshot the ``live`` view uses, so ``status
+        # --json`` can surface who is driving an active run. Unset
+        # worker_id stays None (never a sentinel) per SI-11.
+        live_worker_ids = {
+            live.run_id: live.worker_id for live in collect_live_rows(store)
+        }
     finally:
         store.close()
     if args.json:
@@ -1244,6 +1260,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 "latest_error": row.latest_error,
                 "prerequisites": list(row.prerequisites),
             }
+            # Surface the in-flight worker_id only for a run that is
+            # actually live and carries a persisted worker id; omit the key
+            # otherwise (mirrors the blocked_requires / awaiting_on
+            # omit-when-absent convention).
+            worker_id = live_worker_ids.get(row.latest_run_id)
+            if worker_id is not None:
+                entry["worker_id"] = worker_id
             parsed = _parse_blocked_requires(row.blocked_requires)
             if parsed is not None:
                 # Spec: omit the key entirely when null; emit the parsed

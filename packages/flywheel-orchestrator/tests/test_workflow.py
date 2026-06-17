@@ -1130,6 +1130,45 @@ def test_live_marks_runs_with_no_activity(tmp_path: Path) -> None:
         store.close()
 
 
+def test_live_worker_id_absent_is_none(tmp_path: Path) -> None:
+    """A running lifecycle with no persisted worker_id surfaces
+    ``LiveRunRow.worker_id is None`` -- never an empty-string or sentinel
+    presented as a real worker (SI-11)."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_running(store, "task-c")  # _seed_running sets no worker_id
+        rows = collect_live_rows(store)
+        assert len(rows) == 1
+        assert rows[0].worker_id is None
+    finally:
+        store.close()
+
+
+def test_live_worker_id_present_is_reported_verbatim(
+    tmp_path: Path,
+) -> None:
+    """A running lifecycle with a persisted worker_id surfaces that exact
+    string on the live snapshot row."""
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(
+            task_id="task-w",
+            run_id="run-task-w-running",
+            worker_id="worker-99",
+        )
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        store.create_lifecycle(lc)
+        rows = collect_live_rows(store)
+        assert len(rows) == 1
+        assert rows[0].worker_id == "worker-99"
+    finally:
+        store.close()
+
+
 def test_live_reads_relational_rows_only(tmp_path: Path) -> None:
     """The relational snapshot is computed from lifecycles/attempts rows
     alone (spec 00025 FR-6). The store exposes no telemetry write or read

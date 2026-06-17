@@ -12,13 +12,13 @@ the protocol traffics in typed dataclasses and ``Mapping`` payloads.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, Protocol, Union, runtime_checkable
 
 from flywheel_core.events import DomainEvent
-from flywheel_core.lifecycle import Attempt, Lifecycle
+from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.task import Task
 
 
@@ -271,6 +271,12 @@ class LifecycleStore(Protocol):
     ``load_lifecycle`` returns a typed ``Lifecycle`` instance with its
     ``attempts`` field populated in ascending ``number`` order, or ``None``
     when the ``run_id`` is unknown.
+
+    ``list_lifecycles`` is the cross-task read: holding only the store, a
+    caller can enumerate every lifecycle and filter by status and/or
+    ``task_id`` without a ``WorkSource`` or on-disk task files. It returns
+    the same fully-folded :class:`Lifecycle` objects ``load_lifecycle``
+    yields (``attempts`` populated), never a stub/projection shape.
     """
 
     def create_lifecycle(self, lifecycle: Lifecycle) -> None: ...
@@ -283,6 +289,35 @@ class LifecycleStore(Protocol):
     ) -> None: ...
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]:
+        """List stored lifecycles, optionally filtered, fully folded.
+
+        Both filters are keyword-only and optional. ``statuses`` is a
+        collection so single-status and active-set callers both fit;
+        ``None`` (the default) applies no status filter. ``task_id``
+        ``None`` applies no task filter. The two filters compose with
+        AND. A filter matching no row returns ``[]`` (never ``None`` and
+        never an error).
+
+        Each returned element is the same fully-folded :class:`Lifecycle`
+        ``load_lifecycle`` returns for that ``run_id`` — ``attempts``
+        populated in ascending ``number`` order — not a stub or column
+        projection.
+
+        Results are ordered ``(updated_at DESC, run_id DESC)`` where
+        ``updated_at`` is the store-set write timestamp (not a
+        :class:`Lifecycle` field): the most-recently-written row first,
+        ties broken by greater ``run_id``. The order is deterministic
+        (identical calls return a byte-identical ``run_id`` sequence) and
+        identical across every backend.
+        """
+        ...
 
 
 @runtime_checkable

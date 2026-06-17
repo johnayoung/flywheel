@@ -54,6 +54,14 @@ class _LifecycleStub:
     def load_lifecycle(self, run_id: str) -> Lifecycle | None:
         return None
 
+    def list_lifecycles(
+        self,
+        *,
+        statuses: object | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]:
+        return []
+
 
 class _AttemptStub:
     def save_attempt(

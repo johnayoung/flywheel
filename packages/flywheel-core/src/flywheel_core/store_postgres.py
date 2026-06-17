@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
@@ -559,6 +559,40 @@ class PostgresStore:
         )
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if statuses is not None:
+            status_values = [s.value for s in statuses]
+            if not status_values:
+                return []
+            placeholders = ", ".join("%s" for _ in status_values)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(status_values)
+        if task_id is not None:
+            clauses.append("task_id = %s")
+            params.append(task_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT run_id
+                    FROM lifecycles
+                    {where}
+                    ORDER BY updated_at DESC, run_id DESC
+                    """,
+                    params,
+                )
+                run_ids = [row["run_id"] for row in cur.fetchall()]
+        folded = [self.load_lifecycle(run_id) for run_id in run_ids]
+        return [lc for lc in folded if lc is not None]
 
     # --- TaskStore --------------------------------------------------------
 

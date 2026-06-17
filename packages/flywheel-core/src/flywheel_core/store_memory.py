@@ -21,7 +21,7 @@ Storage layout follows the table boundaries in
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -34,7 +34,7 @@ from flywheel_core.events import (
     LifecycleInitialized,
     apply,
 )
-from flywheel_core.lifecycle import Attempt, Lifecycle
+from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import deserialize_task, serialize_task, task_digest
 from flywheel_core.notifier import RunNotifier
 from flywheel_core.task import Task
@@ -135,6 +135,13 @@ class InMemoryStore:
         # separate instances fall back to the audit follower's poll.
         self.notifier: RunNotifier = notifier or RunNotifier()
         self._lifecycles: dict[str, Lifecycle] = {}
+        # Write-time ordering surrogate for list_lifecycles' (updated_at DESC,
+        # run_id DESC) contract. ``updated_at`` is not a Lifecycle field, so
+        # the row store stamps a strictly-monotonic write sequence on every
+        # create/update; a later write sorts ahead of an earlier one exactly
+        # as the durable stores' server-set updated_at column does.
+        self._lifecycle_write_seq: int = 0
+        self._lifecycle_updated: dict[str, int] = {}
         self._attempts: dict[tuple[str, int], Attempt] = {}
         # Domain rows only; telemetry never reaches the store.
         self._events: list[EventRecord] = []
@@ -189,6 +196,7 @@ class InMemoryStore:
             lifecycle.task_id, datetime.now(timezone.utc)
         )
         self._lifecycles[lifecycle.run_id] = _clone_lifecycle_row(lifecycle)
+        self._stamp_updated(lifecycle.run_id)
 
     def update_lifecycle(
         self,
@@ -206,6 +214,11 @@ class InMemoryStore:
                 actual_version=stored.version,
             )
         self._lifecycles[lifecycle.run_id] = _clone_lifecycle_row(lifecycle)
+        self._stamp_updated(lifecycle.run_id)
+
+    def _stamp_updated(self, run_id: str) -> None:
+        self._lifecycle_write_seq += 1
+        self._lifecycle_updated[run_id] = self._lifecycle_write_seq
 
     def load_lifecycle(self, run_id: str) -> Lifecycle | None:
         stored = self._lifecycles.get(run_id)
@@ -214,6 +227,25 @@ class InMemoryStore:
         lc = _clone_lifecycle_row(stored)
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]:
+        status_set = set(statuses) if statuses is not None else None
+        matched = [
+            run_id
+            for run_id, stored in self._lifecycles.items()
+            if (status_set is None or stored.status in status_set)
+            and (task_id is None or stored.task_id == task_id)
+        ]
+        # (updated_at DESC, run_id DESC): newest write first, ties (none
+        # under a strict-monotonic write seq) broken by greater run_id.
+        matched.sort(key=lambda rid: (self._lifecycle_updated[rid], rid), reverse=True)
+        folded = [self.load_lifecycle(rid) for rid in matched]
+        return [lc for lc in folded if lc is not None]
 
     # --- TaskStore ---------------------------------------------------------
 

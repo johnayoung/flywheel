@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
@@ -378,6 +378,37 @@ class SqliteStore:
         )
         lc.attempts = self.list_attempts(run_id)
         return lc
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if statuses is not None:
+            status_values = [s.value for s in statuses]
+            if not status_values:
+                return []
+            placeholders = ", ".join("?" for _ in status_values)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(status_values)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._connection.execute(
+            f"""
+            SELECT run_id
+            FROM lifecycles
+            {where}
+            ORDER BY updated_at DESC, run_id DESC
+            """,
+            params,
+        ).fetchall()
+        folded = [self.load_lifecycle(row["run_id"]) for row in rows]
+        return [lc for lc in folded if lc is not None]
 
     # --- TaskStore --------------------------------------------------------
 

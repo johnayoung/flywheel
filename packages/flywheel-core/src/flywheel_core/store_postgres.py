@@ -787,10 +787,10 @@ class PostgresStore:
                     run_id, task_id, status, version, retries, error,
                     agent_output, session_id, artifacts_dir, worker_id,
                     timestamps_json, updated_at, blocked_requires_json,
-                    task_content_hash, awaiting_manual_ordinal
+                    task_content_hash, awaiting_manual_ordinal, source
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s
+                    %s, %s
                 )
                 """,
                 (
@@ -809,6 +809,7 @@ class PostgresStore:
                     lc.blocked_requires_json,
                     lc.task_content_hash or None,
                     lc.awaiting_manual_ordinal,
+                    lc.source or None,
                 ),
             )
 
@@ -832,7 +833,8 @@ class PostgresStore:
                     updated_at = %s,
                     blocked_requires_json = %s,
                     task_content_hash = %s,
-                    awaiting_manual_ordinal = %s
+                    awaiting_manual_ordinal = %s,
+                    source = %s
                 WHERE run_id = %s
                 """,
                 (
@@ -850,6 +852,7 @@ class PostgresStore:
                     lc.blocked_requires_json,
                     lc.task_content_hash or None,
                     lc.awaiting_manual_ordinal,
+                    lc.source or None,
                     lc.run_id,
                 ),
             )
@@ -863,7 +866,7 @@ class PostgresStore:
                 SELECT run_id, task_id, status, version, retries, error,
                        agent_output, session_id, artifacts_dir, worker_id,
                        timestamps_json, blocked_requires_json,
-                       task_content_hash, awaiting_manual_ordinal
+                       task_content_hash, awaiting_manual_ordinal, source
                 FROM lifecycles
                 WHERE run_id = %s
                 FOR UPDATE
@@ -891,6 +894,7 @@ class PostgresStore:
                     int(awaiting_raw) if awaiting_raw is not None else None
                 ),
                 task_content_hash=row["task_content_hash"] or "",
+                source=row["source"] or "",
             )
             cur.execute(
                 """

@@ -92,11 +92,12 @@ DEFAULT_MAX_RETRIES = 1
 
 
 def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
-    cursor = store._connection.execute(  # noqa: SLF001
-        "SELECT 1 FROM lifecycles WHERE task_id = ? AND status = ? LIMIT 1",
-        (task_id, Status.DONE.value),
+    # Read through the public cross-task query seam (SI-3) so this works on
+    # every backend, not just SQLite's private connection — the store factory
+    # now returns a PostgresStore too.
+    return bool(
+        store.list_lifecycles(statuses=[Status.DONE], task_id=task_id)
     )
-    return cursor.fetchone() is not None
 
 
 # --- Stranded-lifecycle recovery -------------------------------------------
@@ -116,17 +117,14 @@ def _stranded_run_ids(store: SqliteStore, task_id: str | None = None) -> list[st
     only at boundaries where it knows no harness is currently running
     that lifecycle (worker start, post-interrupt cleanup, ``recover``).
     """
-    placeholders = ", ".join("?" for _ in _STRANDED_STATUSES)
-    params: list[str] = [s.value for s in _STRANDED_STATUSES]
-    sql = (
-        f"SELECT run_id FROM lifecycles WHERE status IN ({placeholders})"
+    # Read through the public cross-task query seam (SI-3) so this works on
+    # every backend (the store factory now returns a PostgresStore too).
+    # list_lifecycles orders (updated_at DESC, run_id DESC); the historical
+    # contract here is oldest-updated first, so reverse.
+    lifecycles = store.list_lifecycles(
+        statuses=_STRANDED_STATUSES, task_id=task_id
     )
-    if task_id is not None:
-        sql += " AND task_id = ?"
-        params.append(task_id)
-    sql += " ORDER BY updated_at"
-    cursor = store._connection.execute(sql, params)  # noqa: SLF001
-    return [row["run_id"] for row in cursor.fetchall()]
+    return [lc.run_id for lc in reversed(lifecycles)]
 
 
 def recover_stranded_lifecycles(

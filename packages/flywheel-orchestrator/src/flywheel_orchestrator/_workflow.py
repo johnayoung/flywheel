@@ -2360,9 +2360,9 @@ def _init_git_preflight_error() -> str | None:
     init scaffolds state a worker later acts on, so it must not produce a
     state the worker's own preconditions reject. The gate mirrors the
     worktree worker exactly: ``_repo_root`` refuses a non-git working
-    directory (``git rev-parse --show-toplevel``) and ``_phase_base``
-    refuses a detached HEAD (``git rev-parse --abbrev-ref HEAD`` yielding
-    ``""``/``"HEAD"``). A refusal is a hard gate -- the caller writes no
+    directory (``git rev-parse --show-toplevel``) and ``resolve_landing_base``
+    refuses a detached HEAD with no configured base (``git rev-parse
+    --abbrev-ref HEAD`` yielding ``""``/``"HEAD"``). A refusal is a hard gate -- the caller writes no
     ``flywheel.toml`` -- never a warn-and-continue (spec D-1). The
     detached refusal is unconditional here: ``init --defaults`` writes no
     ``[submit] base`` key, so the state init produces is exactly the one

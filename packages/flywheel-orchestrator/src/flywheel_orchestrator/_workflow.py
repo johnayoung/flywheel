@@ -2340,6 +2340,48 @@ def _reconfigure_policy(
     return 0
 
 
+def _init_git_preflight_error() -> str | None:
+    """Return an actionable refusal message, or ``None`` when init may run.
+
+    init scaffolds state a worker later acts on, so it must not produce a
+    state the worker's own preconditions reject. The gate mirrors the
+    worktree worker exactly: ``_repo_root`` refuses a non-git working
+    directory (``git rev-parse --show-toplevel``) and ``_phase_base``
+    refuses a detached HEAD (``git rev-parse --abbrev-ref HEAD`` yielding
+    ``""``/``"HEAD"``). A refusal is a hard gate -- the caller writes no
+    ``flywheel.toml`` -- never a warn-and-continue (spec D-1). The
+    detached refusal is unconditional here: ``init --defaults`` writes no
+    ``[submit] base`` key, so the state init produces is exactly the one
+    the worker rejects (spec SI-8).
+    """
+    toplevel = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if toplevel.returncode != 0:
+        return (
+            "init: the working directory is not a git repository. flywheel "
+            "drives work through git worktrees, so run `git init` (and make "
+            "at least one commit on a branch) before initializing flywheel."
+        )
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    name = branch.stdout.strip()
+    if branch.returncode != 0 or not name or name == "HEAD":
+        return (
+            "init: HEAD is detached. flywheel resolves a worker's phase base "
+            "from the checked-out branch, so check out a branch "
+            "(`git switch -c <branch>`) before initializing flywheel."
+        )
+    return None
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Scaffold ``.flywheel/`` and a ``flywheel.toml`` in the working dir.
 
@@ -2354,7 +2396,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
     With an existing ``flywheel.toml``, an interactive run offers to
     reconfigure it (see :func:`_reconfigure_policy`); a non-interactive
     run never touches it.
+
+    Before any file is written, a git preflight gate refuses (non-zero
+    exit, nothing scaffolded) when the working directory is not a git
+    repository or HEAD is detached, so init never leaves a state the
+    worker's own preconditions later reject (spec D-1 / SI-8).
     """
+    preflight_error = _init_git_preflight_error()
+    if preflight_error is not None:
+        print(preflight_error, file=sys.stderr)
+        return 2
+
     created: list[str] = []
     existing: list[str] = []
 

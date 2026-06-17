@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,8 +23,26 @@ from flywheel_orchestrator import _workflow
 from flywheel_orchestrator._workflow import main
 
 
+def _git_init_attached(path: Path) -> None:
+    """Make ``path`` a git repo on an attached branch with one commit.
+
+    init's git preflight (spec 00028) refuses a non-git working directory
+    or a detached HEAD, so every test that runs ``main(["init"])`` must do
+    so inside a valid attached-branch repo -- the state a legitimate
+    adopter is in. One commit gives HEAD a non-detached attached branch.
+    """
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ["git", *args], cwd=path, check=True, capture_output=True
+    )
+    run("init", "-b", "main")
+    run("config", "user.email", "test@flywheel.invalid")
+    run("config", "user.name", "Flywheel Test")
+    run("commit", "--allow-empty", "-m", "root")
+
+
 @pytest.fixture
 def repo(tmp_path: Path, monkeypatch) -> Path:
+    _git_init_attached(tmp_path)
     monkeypatch.chdir(tmp_path)
     return tmp_path
 
@@ -46,6 +65,65 @@ def _interactive(monkeypatch, *lines: str) -> None:
     monkeypatch.setattr(
         sys, "stdin", _FakeTty("".join(f"{line}\n" for line in lines))
     )
+
+
+# --- git preflight (spec 00028, criteria 1-4) --------------------------------
+
+
+def test_init_git_preflight_refuses_non_repo(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Outside a git repository init exits non-zero and writes nothing."""
+    monkeypatch.chdir(tmp_path)
+    assert main(["init", "--defaults"]) == 2
+    assert not (tmp_path / "flywheel.toml").exists()
+    assert not (tmp_path / ".flywheel").exists()
+
+
+def test_init_git_preflight_message_names_precondition(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The non-git refusal names the missing precondition in operator
+    terms: case-insensitive 'git' plus 'repository'/'repo' (criterion 2)."""
+    monkeypatch.chdir(tmp_path)
+    assert main(["init", "--defaults"]) == 2
+    err = capsys.readouterr().err.lower()
+    assert "git" in err
+    assert "repository" in err or "repo" in err
+
+
+def test_init_detached_head_refuses(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A detached HEAD refuses with a message naming 'detached'
+    (criterion 3), distinct from the non-git refusal."""
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@flywheel.invalid"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "root"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", head], cwd=tmp_path, check=True, capture_output=True
+    )
+    monkeypatch.chdir(tmp_path)
+    assert main(["init", "--defaults"]) == 2
+    assert not (tmp_path / "flywheel.toml").exists()
+    assert "detached" in capsys.readouterr().err.lower()
+
+
+def test_init_happy_path_attached_branch_scaffolds(repo: Path) -> None:
+    """A valid attached-branch repo still scaffolds normally (criterion
+    4): the gate must not block a legitimate adopter."""
+    assert main(["init", "--defaults"]) == 0
+    assert (repo / "flywheel.toml").is_file()
+    assert load_policy(repo / "flywheel.toml").source_kind == "directory"
 
 
 # --- scaffold ----------------------------------------------------------------
@@ -182,6 +260,8 @@ def test_init_non_tty_no_flags_equals_defaults_flag(
     flagged = tmp_path / "flagged"
     plain.mkdir()
     flagged.mkdir()
+    _git_init_attached(plain)
+    _git_init_attached(flagged)
 
     monkeypatch.chdir(plain)
     assert main(["init"]) == 0

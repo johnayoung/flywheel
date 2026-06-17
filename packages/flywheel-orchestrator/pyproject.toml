@@ -10,7 +10,7 @@ authors = [
     { name = "John Young", email = "john.anto.young@gmail.com" }
 ]
 dependencies = [
-    "flywheel-core",
+    "flywheel-core>=0.1.0",
 ]
 
 # Console script removed in the unified-CLI cutover: the orchestrator's verbs

@@ -35,6 +35,7 @@ from flywheel_orchestrator import GhRunner, SubmitRequest, WorkPolicy
 
 from flywheel_worktree.worker import (
     GitWorktreeSubmitter,
+    LandingLedger,
     Logger,
     _git,
     phase_of_task_file,
@@ -117,6 +118,7 @@ def build_pr_submitter(
     log: Logger,
     protected_paths: Sequence[str],
     setup_command: str | None,
+    store: LandingLedger | None = None,
 ) -> GitPullRequestSubmitter:
     """Build the PR backend (the registry's ``pr`` target).
 
@@ -137,6 +139,7 @@ def build_pr_submitter(
         setup_command=setup_command,
         remote=policy.submit_remote,
         pr_base=policy.submit_pr_base,
+        store=store,
     )
     log(
         f"landing strategy: pr (remote={policy.submit_remote} "
@@ -162,6 +165,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         remote: str = "origin",
         pr_base: str | None = None,
         gh: GhRunner | None = None,
+        store: LandingLedger | None = None,
     ) -> None:
         super().__init__(
             repo_root=repo_root,
@@ -172,6 +176,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             log=log,
             protected_paths=protected_paths,
             setup_command=setup_command,
+            store=store,
         )
         self.remote = remote
         self.pr_base = pr_base or phase_base

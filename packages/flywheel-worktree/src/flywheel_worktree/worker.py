@@ -533,6 +533,15 @@ class GitWorktreeSubmitter:
                     f"rebase failed for {branch}; parking worktree at "
                     f"{worktree}"
                 )
+                self._record_landing_park(
+                    req.run_id,
+                    park_kind="divergent-base",
+                    detail=(
+                        f"{branch} cannot fast-forward {self.phase_base}: "
+                        f"rebase onto the diverged base conflicted; worktree "
+                        f"preserved at {worktree}"
+                    ),
+                )
                 return
             if not self._reverify(req, worktree):
                 self.log(
@@ -550,6 +559,15 @@ class GitWorktreeSubmitter:
             self.log(
                 f"post-rebase FF failed for {branch}; parking worktree at "
                 f"{worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind="divergent-base",
+                detail=(
+                    f"{branch} cannot fast-forward {self.phase_base} even after "
+                    f"a clean rebase + re-verify; worktree preserved at "
+                    f"{worktree}"
+                ),
             )
 
     def _protected_violations(self, branch: str) -> list[str]:
@@ -640,9 +658,31 @@ class GitWorktreeSubmitter:
             else 0
         )
 
+    def _base_is_checked_out(self) -> bool:
+        """True when the configured base is the operator's checked-out branch in
+        ``repo_root`` (the back-compat default case)."""
+        return _checked_out_branch(self.repo_root) == self.phase_base
+
     def _ff_merge(self, branch: str) -> bool:
+        """Fast-forward the base to ``branch``'s tip.
+
+        When the base is the operator's checked-out branch (the unconfigured
+        default), advance it in-tree with ``git merge --ff-only`` as before.
+        When the base is NOT checked out (a configured landing base — the
+        safe-landing case), advance its ref out-of-tree via ``git fetch .
+        <branch>:<base>`` so the operator's working tree, index, and HEAD are
+        never touched. Both paths are fast-forward-only: a non-FF advance
+        returns ``False`` and the caller rebases or parks."""
+        if self._base_is_checked_out():
+            return (
+                _git(self.repo_root, "merge", "--ff-only", branch).returncode
+                == 0
+            )
         return (
-            _git(self.repo_root, "merge", "--ff-only", branch).returncode == 0
+            _git(
+                self.repo_root, "fetch", ".", f"{branch}:{self.phase_base}"
+            ).returncode
+            == 0
         )
 
     def _cleanup(self, worktree: Path, branch: str) -> None:
@@ -971,14 +1011,86 @@ def _repo_root() -> Path:
     return Path(proc.stdout.strip())
 
 
-def _phase_base(repo_root: Path) -> str:
+def _checked_out_branch(repo_root: Path) -> str | None:
+    """The operator's currently-checked-out branch, or ``None`` on detached
+    HEAD."""
     branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if not branch or branch == "HEAD":
-        raise SystemExit(
-            "ERROR: worker started on detached HEAD; cannot resolve phase "
-            "base branch."
-        )
+        return None
     return branch
+
+
+def _fetch_base_fresh(
+    repo_root: Path, base: str, log: Logger | None = None
+) -> None:
+    """Best-effort fresh fetch of the configured base ref from its remote so a
+    landing targets the up-to-date base, not a stale local ref (D-3).
+
+    The remote is ``branch.<base>.remote`` when configured, else ``origin``;
+    when neither exists the fetch is a no-op (a purely local repo). The fetch
+    FF-updates the local base ref (``<base>:<base>``); a base that then cannot
+    fast-forward becomes the divergent-base park, never a crash here. The caller
+    guarantees the base is not the operator's checked-out branch, so the refspec
+    fetch into ``refs/heads/<base>`` is not refused by git."""
+    remotes = _git(repo_root, "remote").stdout.split()
+    if not remotes:
+        return
+    configured = _git(
+        repo_root, "config", f"branch.{base}.remote"
+    ).stdout.strip()
+    remote = configured or ("origin" if "origin" in remotes else remotes[0])
+    if remote not in remotes:
+        return
+    res = _git(repo_root, "fetch", remote, f"{base}:{base}")
+    if res.returncode != 0 and log is not None:
+        log(
+            f"fresh fetch of base {base!r} from {remote!r} failed "
+            f"({res.stderr.strip()}); landing will use the local ref"
+        )
+
+
+def resolve_landing_base(
+    repo_root: Path,
+    policy: WorkPolicy | None,
+    *,
+    log: Logger | None = None,
+) -> str:
+    """Resolve the merge-strategy landing base, fetching it fresh (D-1/D-2/D-3).
+
+    The base is ``policy.submit_base`` when configured; otherwise it falls back
+    to the operator's currently-checked-out branch (back-compat). Raises
+    :class:`PolicyError` when:
+
+    * a configured base equals the operator's currently-checked-out branch —
+      refusing to land into the working checkout (D-2 belt; the load-bearing
+      guarantee is that the landing advances a ref the operator does not have
+      checked out), or
+    * ``HEAD`` is detached and no base is configured (D-1: a detached checkout
+      exposes no branch to default to).
+
+    A configured base is fetched fresh from its remote before it is returned, so
+    the landing targets the up-to-date base.
+    """
+    checked_out = _checked_out_branch(repo_root)
+    configured = policy.submit_base if policy is not None else None
+
+    if configured is not None:
+        if checked_out is not None and configured == checked_out:
+            raise PolicyError(
+                f"configured landing base {configured!r} is the operator's "
+                f"currently-checked-out branch; refusing to land into the "
+                f"working checkout (check out a different branch or change "
+                f"[submit] base)"
+            )
+        _fetch_base_fresh(repo_root, configured, log)
+        return configured
+
+    if checked_out is None:
+        raise PolicyError(
+            "worker started on detached HEAD with no [submit] base configured; "
+            "set [submit] base to a landing branch or check out a branch."
+        )
+    return checked_out
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1107,12 +1219,16 @@ def build_merge_submitter(
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
-    phase_base = _phase_base(repo_root)
 
+    log = make_logger("[worker]")
     try:
-        # Loaded once: the same policy resolves the agent model and selects
-        # the store backend for every store this process constructs.
+        # Loaded once: the same policy resolves the agent model, the landing
+        # base, and the store backend for every store this process constructs.
+        # Base resolution reads policy.submit_base, so it must run AFTER the
+        # policy loads (D-1/D-5): a configured base is fetched fresh and the
+        # checked-out-base / detached-HEAD config errors surface as PolicyError.
         policy = load_effective_policy()
+        phase_base = resolve_landing_base(repo_root, policy, log=log)
     except PolicyError as exc:
         print(f"flywheel worker: policy error: {exc}", file=sys.stderr)
         return 2
@@ -1129,9 +1245,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     worktrees_dir = repo_root / ".flywheel" / "worktrees"
     lock_path = repo_root / ".flywheel" / ".merge.lock"
 
-    log = make_logger("[worker]")
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
     protected_paths = policy.protected_paths if policy else ()
     setup_command = policy.sandbox_setup if policy else None
+    # The submitter's own store handle: it records a queryable LANDING_PARKED
+    # event on the run ledger when it parks a DONE branch. Same backing store
+    # (policy-selected) as the run's lifecycle, opened on db_path.
+    submit_store = open_sqlite_bound_store(policy, db_path=db_path)
     # The registry owns name -> builder dispatch (and lazily imports pr.py
     # for the "pr" strategy, which is what keeps that import out of this
     # module's top level). The builders share one signature.
@@ -1146,10 +1268,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         log=log,
         protected_paths=protected_paths,
         setup_command=setup_command,
+        store=submit_store,
     )
-
-    worktrees_dir.mkdir(parents=True, exist_ok=True)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     log(f"started pid={os.getpid()} base={phase_base} db={db_path}")
     log(

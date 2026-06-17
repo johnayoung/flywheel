@@ -141,6 +141,10 @@ from flywheel_core.task import (
     TranscriptGrader,
     ValidationError,
 )
+from flywheel_core.validation import (
+    TaskDefect,
+    validate_task,
+)
 
 if TYPE_CHECKING:
     # Surfaces ``PostgresStore`` to type-checkers without triggering the
@@ -250,6 +254,7 @@ __all__ = [
     "StrategyResult",
     "Subscription",
     "Task",
+    "TaskDefect",
     "TaskLoadError",
     "TaskStore",
     "TelemetryRecord",
@@ -289,4 +294,5 @@ __all__ = [
     "stream",
     "subscribe",
     "total_tokens_from_usage",
+    "validate_task",
 ]

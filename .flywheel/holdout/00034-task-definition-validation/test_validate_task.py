@@ -46,8 +46,17 @@ def test_validate_task_flags_unparseable_and_empty_run(tmp_path: Path) -> None:
     assert any(getattr(d, "task_id", None) == "t-parse" for d in bad), (
         "an unparseable command grader run must be flagged"
     )
-    # An empty run.
-    empty = validate_task(_task("t-empty", ""), repo_root=tmp_path)
+    # An empty run. The schema guard forbids constructing an empty ``run`` at
+    # build time (test_command_grader_rejects_empty_run is a locked invariant),
+    # so the empty value is set past ``__post_init__`` to exercise
+    # validate_task's static empty-run catch -- the defensive layer for a
+    # definition that still reaches the validator.
+    empty_grader = CommandGrader(run="placeholder")
+    empty_grader.run = ""
+    empty = validate_task(
+        Task(id="t-empty", goal="g.", graders=[empty_grader]),
+        repo_root=tmp_path,
+    )
     assert any(getattr(d, "task_id", None) == "t-empty" for d in empty), (
         "an empty command grader run must be flagged"
     )

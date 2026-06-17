@@ -25,6 +25,7 @@ import time
 import tomllib
 from collections.abc import (
     Callable,
+    Collection,
     Iterable,
     Mapping,
 )
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 
@@ -40,7 +41,7 @@ from flywheel_core.harness import (
     RecheckOutcome,
     recheck_blocked_lifecycle,
 )
-from flywheel_core.lifecycle import Status
+from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
 from flywheel_core.store_sqlite import SqliteStore
@@ -806,6 +807,30 @@ _LIVE_STALE_AFTER_SECONDS: int = 90
 
 _LIVE_DETAIL_MAX_WIDTH: int = 120
 
+
+class _LiveReadStore(Protocol):
+    """Backend-agnostic read surface ``collect_live_rows`` consumes.
+
+    The live snapshot reads in-flight lifecycles, each run's attempts, and
+    the run's pinned task definition — all through public protocol methods
+    every concrete store (SQLite and Postgres) implements, never the
+    SQLite-only private connection. Typing on this structural surface
+    (rather than ``SqliteStore``) is what lets ``collect_live_rows`` run
+    unchanged against a ``PostgresStore``.
+    """
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]: ...
+
+    def list_attempts(self, run_id: str) -> list[Attempt]: ...
+
+    def load_task_for_run(self, run_id: str) -> Task | None: ...
+
+
 @dataclass(frozen=True, kw_only=True)
 class LiveRunRow:
     """Per-in-flight-run snapshot used by ``live`` reporting.
@@ -854,15 +879,7 @@ class LiveRunRow:
     # recorded" from a real worker id.
     worker_id: str | None = None
 
-def _parse_db_ts(value: str | None) -> datetime | None:
-    if value is None:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
+def collect_live_rows(store: _LiveReadStore) -> list[LiveRunRow]:
     """Snapshot every in-flight run from relational rows only.
 
     Reads ``lifecycles`` for status in ``{running, validating,
@@ -881,10 +898,11 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     the pending manual-gate instruction. The instruction is resolved
     from the task definition pinned to the run.
     """
-    # Cross-task lifecycle read through the public protocol surface (SI-3),
-    # off the private connection. The per-run attempts join below stays on
-    # the private connection (D-4) — list_attempts already serves it, but
-    # the rolled-up token/cost/turn aggregation is local to this function.
+    # Cross-task lifecycle read AND the per-run attempts join both go through
+    # the public protocol surface (list_lifecycles SI-3 + list_attempts), off
+    # the SQLite-only private connection, so the snapshot computes identically
+    # on SQLite and Postgres. The rolled-up token/cost/turn aggregation stays
+    # local to this function (no telemetry scan — spec 00025 FR-6).
     active_statuses = (
         Status.RUNNING,
         Status.VALIDATING,
@@ -894,36 +912,19 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     # list_lifecycles orders by (updated_at DESC, run_id DESC); the live
     # surface renders sorted by task_id (ties by run_id) per spec 00011.
     lifecycles.sort(key=lambda lc: (lc.task_id, lc.run_id))
-    conn = store._connection  # noqa: SLF001 — attempts join stays per D-4
     rows: list[LiveRunRow] = []
     for lc in lifecycles:
         run_id = lc.run_id
-        attempts = conn.execute(
-            """
-            SELECT number, started_at, input_tokens, output_tokens,
-                   cache_creation_input_tokens, cache_read_input_tokens,
-                   iterations_completed, turns, total_cost_usd,
-                   last_activity_at
-            FROM attempts
-            WHERE run_id = ?
-            ORDER BY number
-            """,
-            (run_id,),
-        ).fetchall()
+        attempts = store.list_attempts(run_id)  # ascending by number
         tokens = 0
         cost = 0.0
         turns = 0
         iters_completed = 0
         for a in attempts:
-            tokens += (
-                int(a["input_tokens"] or 0)
-                + int(a["output_tokens"] or 0)
-                + int(a["cache_creation_input_tokens"] or 0)
-                + int(a["cache_read_input_tokens"] or 0)
-            )
-            cost += float(a["total_cost_usd"] or 0.0)
-            turns += int(a["turns"] or 0)
-            iters_completed += int(a["iterations_completed"] or 0)
+            tokens += a.total_tokens
+            cost += a.total_cost_usd
+            turns += a.turns
+            iters_completed += a.iterations_completed
         iteration: int | None = None
         attempt: int | None = None
         last_kind = "(none)"
@@ -931,19 +932,17 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
         last_ts: datetime | None = None
         if attempts:
             latest = attempts[-1]
-            attempt = int(latest["number"])
-            latest_iters = int(latest["iterations_completed"] or 0)
+            attempt = latest.number
+            latest_iters = latest.iterations_completed
             if latest_iters > 0:
                 iteration = latest_iters
                 last_kind = "ITERATION"
                 last_detail = f"iteration {latest_iters} completed"
-                last_ts = _parse_db_ts(
-                    latest["last_activity_at"]
-                ) or _parse_db_ts(latest["started_at"])
+                last_ts = latest.last_activity_at or latest.started_at
             else:
                 last_kind = "ATTEMPT"
                 last_detail = f"attempt {attempt} started"
-                last_ts = _parse_db_ts(latest["started_at"])
+                last_ts = latest.started_at
         # Earliest recorded transition timestamp off the folded Lifecycle's
         # per-status stamps (retries overwrite ready/running, so the minimum
         # is the stable "when did this run start" answer).
@@ -981,7 +980,7 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     return rows
 
 def _resolve_awaiting_instruction(
-    store: SqliteStore,
+    store: _LiveReadStore,
     *,
     run_id: str,
     status: Status,

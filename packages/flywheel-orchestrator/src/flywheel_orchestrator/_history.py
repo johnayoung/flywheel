@@ -25,15 +25,45 @@ Runs recorded before v12 have no source; callers may supply a
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
+from typing import Protocol
 
-from flywheel_core.lifecycle import Lifecycle, Status
-from flywheel_core.store_sqlite import SqliteStore
+from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.store_protocols import GraderResultRecord
 from flywheel_core.task import Task
+
+
+class _HistoryReadStore(Protocol):
+    """Backend-agnostic read surface the history functions consume.
+
+    The orchestrator history path reads cross-task lifecycles, per-run
+    attempts, the latest attempt's grader receipts, and the run's pinned
+    task — all through public protocol methods that every concrete store
+    (SQLite and Postgres) implements, never the SQLite-only private
+    connection. Typing on this structural surface (rather than
+    ``SqliteStore``) is what lets ``collect_history_rows`` / ``resolve_run_id``
+    / ``collect_run_detail`` run unchanged against a ``PostgresStore``.
+    """
+
+    def list_lifecycles(
+        self,
+        *,
+        statuses: Collection[Status] | None = None,
+        task_id: str | None = None,
+    ) -> list[Lifecycle]: ...
+
+    def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+    def list_attempts(self, run_id: str) -> list[Attempt]: ...
+
+    def list_grader_results(
+        self, run_id: str, attempt_number: int
+    ) -> list[GraderResultRecord]: ...
+
+    def load_task_for_run(self, run_id: str) -> Task | None: ...
 
 # A run is history once it can no longer move on its own. INTERRUPTED and
 # AWAITING_APPROVAL are parked-but-live (an operator owes an action) and
@@ -180,32 +210,25 @@ def build_task_phase_index(tasks_dir: Path) -> dict[str, str]:
 
 
 def _attempt_rollups(
-    store: SqliteStore, run_id: str
+    store: _HistoryReadStore, run_id: str
 ) -> tuple[int, int, float, int]:
-    """``(attempts, tokens_total, cost_usd_total, turns_total)`` for a run."""
-    row = store._connection.execute(  # noqa: SLF001 — read-side, like collect_live_rows
-        """
-        SELECT COUNT(*) AS attempts,
-               COALESCE(SUM(input_tokens + output_tokens
-                   + cache_creation_input_tokens
-                   + cache_read_input_tokens), 0) AS tokens,
-               COALESCE(SUM(total_cost_usd), 0.0) AS cost,
-               COALESCE(SUM(turns), 0) AS turns
-        FROM attempts
-        WHERE run_id = ?
-        """,
-        (run_id,),
-    ).fetchone()
-    return (
-        int(row["attempts"]),
-        int(row["tokens"]),
-        float(row["cost"]),
-        int(row["turns"]),
-    )
+    """``(attempts, tokens_total, cost_usd_total, turns_total)`` for a run.
+
+    Sums the per-attempt rolled-up counters through the backend-agnostic
+    ``list_attempts`` seam so the rollup is identical on SQLite and
+    Postgres. ``tokens_total`` is the four token columns summed across the
+    run's attempts (``Attempt.total_tokens`` per attempt); ``cost`` and
+    ``turns`` are the matching per-attempt sums.
+    """
+    attempts = store.list_attempts(run_id)
+    tokens = sum(a.total_tokens for a in attempts)
+    cost = sum(a.total_cost_usd for a in attempts)
+    turns = sum(a.turns for a in attempts)
+    return (len(attempts), tokens, float(cost), turns)
 
 
 def _history_run_from_row(
-    store: SqliteStore, lifecycle: Lifecycle
+    store: _HistoryReadStore, lifecycle: Lifecycle
 ) -> HistoryRun:
     status = lifecycle.status
     stamps = lifecycle.timestamps
@@ -236,7 +259,7 @@ def _history_run_from_row(
 
 
 def _select_lifecycles(
-    store: SqliteStore,
+    store: _HistoryReadStore,
     *,
     statuses: tuple[Status, ...],
     task_id: str | None = None,
@@ -249,7 +272,7 @@ def _select_lifecycles(
 
 
 def collect_history_rows(
-    store: SqliteStore,
+    store: _HistoryReadStore,
     *,
     statuses: tuple[Status, ...] = TERMINAL_STATUSES,
     phase: str | None = None,
@@ -305,7 +328,7 @@ def collect_history_rows(
     return merged
 
 
-def resolve_run_id(store: SqliteStore, run_or_task_id: str) -> str | None:
+def resolve_run_id(store: _HistoryReadStore, run_or_task_id: str) -> str | None:
     """Resolve a ``show`` argument to a run id.
 
     A literal run id wins; otherwise the argument is treated as a task id
@@ -322,7 +345,7 @@ def resolve_run_id(store: SqliteStore, run_or_task_id: str) -> str | None:
 
 
 def collect_run_detail(
-    store: SqliteStore,
+    store: _HistoryReadStore,
     run_id: str,
     *,
     fallback_phases: Mapping[str, str] | None = None,

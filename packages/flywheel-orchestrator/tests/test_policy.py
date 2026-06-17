@@ -779,3 +779,81 @@ def test_submit_base_carries_on_github_policy(tmp_path: Path) -> None:
     )
     assert policy.source_kind == "github"
     assert policy.submit_base == "release"
+
+
+# --- [phase] verify -----------------------------------------------------------
+
+
+def test_phase_verify_default_none_when_table_absent(tmp_path: Path) -> None:
+    """No [phase] table at all yields phase_verify=None (back-compat)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.phase_verify is None
+
+
+def test_phase_verify_default_none_when_key_absent(tmp_path: Path) -> None:
+    """A [phase] table present but no verify key yields phase_verify=None
+    and raises no PolicyError (no gate, today's archival)."""
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\n[phase]\n')
+    )
+    assert policy.phase_verify is None
+
+
+def test_phase_verify_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[phase]\nverify = "uv run pytest"\n',
+        )
+    )
+    assert policy.phase_verify == "uv run pytest"
+
+
+def test_phase_verify_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="phase.verify"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[phase]\nverify = ""\n',
+            )
+        )
+
+
+def test_phase_verify_rejects_whitespace_only_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="phase.verify"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[phase]\nverify = "   "\n',
+            )
+        )
+
+
+def test_phase_verify_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="phase.verify"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[phase]\nverify = 42\n',
+            )
+        )
+
+
+def test_phase_verify_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[phase]",
+                    'verify = "uv run pytest"',
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.phase_verify == "uv run pytest"

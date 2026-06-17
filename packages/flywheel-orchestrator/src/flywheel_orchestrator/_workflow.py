@@ -1784,6 +1784,12 @@ sandbox_root = ".flywheel/sandboxes"
 # a bare worktree. Unset means new sandboxes are used bare.
 # [sandbox]
 # setup = "uv sync"
+
+# Phase-exit gate. verify runs (shell) against the merged phase base once
+# every task in a phase has landed; a non-zero exit leaves the phase active
+# instead of archiving it. Unset means today's archival (no gate).
+# [phase]
+# verify = "uv run pytest"
 """
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")

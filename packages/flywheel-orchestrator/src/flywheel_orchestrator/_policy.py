@@ -65,6 +65,13 @@ Format (TOML, stdlib ``tomllib``)::
     # pr_base = "main"              # pr strategy: PR base branch
     #                               # (default: the worker's base branch)
 
+    # Phase-exit gate (optional). verify runs (shell) against the merged
+    # phase base in repo_root once every task in a phase has landed; a
+    # non-zero exit leaves the phase active. Unset means today's archival
+    # (no gate).
+    [phase]
+    verify = "uv run pytest"
+
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
 default policy is not runnable and never reaches the scheduler.
@@ -127,7 +134,10 @@ class WorkPolicy:
     landing/phase-base branch; ``None`` falls back to the checked-out
     branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
     mirrors the optional ``[sandbox] setup`` command; ``None`` when unset
-    (new sandboxes are used bare).
+    (new sandboxes are used bare). ``phase_verify`` mirrors the optional
+    ``[phase] verify`` command run against the merged phase base before a
+    phase archives; ``None`` when unset (no phase-exit gate, today's
+    archival behavior).
     """
 
     source_kind: str
@@ -147,6 +157,7 @@ class WorkPolicy:
     submit_pr_base: str | None = None
     submit_base: str | None = None
     sandbox_setup: str | None = None
+    phase_verify: str | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -213,6 +224,11 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [sandbox] must be a table")
     sandbox_setup = _optional_sandbox_setup(sandbox, policy_file=path)
 
+    phase = data.get("phase") or {}
+    if not isinstance(phase, dict):
+        raise PolicyError(f"{path}: [phase] must be a table")
+    phase_verify = _optional_phase_verify(phase, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -236,6 +252,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
             sandbox_setup=sandbox_setup,
+            phase_verify=phase_verify,
         )
 
     repo = source.get("repo")
@@ -271,6 +288,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_pr_base=submit_pr_base,
         submit_base=submit_base,
         sandbox_setup=sandbox_setup,
+        phase_verify=phase_verify,
     )
 
 
@@ -419,6 +437,26 @@ def _optional_sandbox_setup(
     if not isinstance(value, str) or not value.strip():
         raise PolicyError(
             f"{policy_file}: sandbox.setup must be a non-empty string"
+        )
+    return value
+
+
+def _optional_phase_verify(
+    table: dict, *, policy_file: Path
+) -> str | None:
+    """Validate and return the optional ``phase.verify`` command.
+
+    Returns ``None`` when the key is absent so an unconfigured policy keeps
+    today's archival (no phase-exit gate). A non-string or empty/whitespace-
+    only value raises :class:`PolicyError` so a typo never silently degrades
+    into "no gate."
+    """
+    value = table.get("verify")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: phase.verify must be a non-empty string"
         )
     return value
 

@@ -141,31 +141,26 @@ def build_store(
 
 def open_sqlite_bound_store(
     policy: WorkPolicy | None, *, db_path: Path
-) -> SqliteStore:
-    """Build a verb's store through the factory and pin it to sqlite.
+) -> SqliteStore | PostgresStore:
+    """Build a verb's store through the factory.
 
     All construction goes through :func:`build_store`, so the postgres
     fail-fast paths -- no DSN env var, missing extra -- surface with the
     factory's messages (spec FR-8), and a connection failure against an
     unreachable database propagates as the store's own error.
 
-    A postgres store that does construct is closed and refused: the
-    orchestrator's verb read paths still query lifecycle state through
-    sqlite-specific SQL (``_latest_lifecycle_row``, ``collect_live_rows``,
-    and the core status helpers), so handing them a postgres store would
-    fail later on a missing private attribute instead of an actionable
-    message. Lifting this refusal is the postgres read-path port, not
-    this seam.
+    A successfully constructed postgres store is now returned un-closed to
+    the caller: the orchestrator's verb read paths route every cross-task
+    lifecycle, per-run attempts, and aggregate read through the
+    backend-agnostic store protocol (``list_lifecycles``, ``list_attempts``,
+    ``summarize_spend``, ...), so a ``PostgresStore`` answers them
+    identically to a ``SqliteStore`` (spec 00032 read-path port). The name
+    is retained for call-site stability; the seam is no longer
+    sqlite-pinned. The no-DSN and missing-extra fail-fast paths are
+    unchanged -- those raise in :func:`build_postgres_store` before any
+    store is constructed.
     """
-    store = build_store(policy, db_path=db_path)
-    if isinstance(store, SqliteStore):
-        return store
-    store.close()
-    raise StoreConfigError(
-        "this command does not support the postgres store backend yet "
-        "(its status queries are sqlite-specific); configure "
-        '[store] backend = "sqlite" in flywheel.toml'
-    )
+    return build_store(policy, db_path=db_path)
 
 
 __all__ = [

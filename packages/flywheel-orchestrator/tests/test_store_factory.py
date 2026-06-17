@@ -225,17 +225,34 @@ def test_postgres_schema_passes_through(
         store.close()
 
 
-def test_open_sqlite_bound_store_refuses_postgres(
+def test_open_sqlite_bound_store_returns_usable_postgres(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     require_postgres: str,
 ) -> None:
+    """The seam no longer refuses a postgres policy: with a reachable DSN it
+    returns a usable (un-closed) PostgresStore, raising no StoreConfigError.
+
+    Replaces the former refusal assertion with an equal-or-greater accept-
+    and-return check (spec 00032 criterion 9): the read paths now route
+    through the backend-agnostic store protocol, so a PostgresStore answers
+    the verbs' reads identically to a SqliteStore.
+    """
+    from flywheel_core.store_postgres import PostgresStore
+
     monkeypatch.setenv(PG_DSN_ENV, require_postgres)
-    with pytest.raises(StoreConfigError) as excinfo:
-        open_sqlite_bound_store(
-            _policy("postgres"), db_path=tmp_path / "x.sqlite"
-        )
-    assert "postgres store backend" in str(excinfo.value)
+    db_path = tmp_path / "x.sqlite"
+    # No StoreConfigError raised for a reachable postgres store.
+    store = open_sqlite_bound_store(_policy("postgres"), db_path=db_path)
+    try:
+        assert isinstance(store, PostgresStore)
+        # Usable -- not closed before return: an unknown run id reads as None
+        # without raising.
+        assert store.load_lifecycle("run-factory-seam-missing") is None
+        # The sqlite db file is never created for a postgres backend.
+        assert not db_path.exists()
+    finally:
+        store.close()
 
 
 # --- connection failures propagate from the store ----------------------------

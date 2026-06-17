@@ -1,0 +1,70 @@
+{
+  "id": "agg-spend-summary",
+  "goal": "A summarize_spend store-protocol method returns the cross-run token and cost totals over every attempt of every run, identical across the in-memory, SQLite, and Postgres backends, honoring an optional half-open [since, until) window and returning all-zero totals on an empty store.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00031-spend-and-worker-aggregates/ -q",
+      "name": "held-out-spend-contract",
+      "rung": "held-out command (criteria #1 #2 #4 #11): seeds >=2 runs with distinct known token/cost values across all three backends and asserts the independently-computed cross-run sum and the window/empty-window predicate"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-core/tests/test_store_contract.py -q",
+      "name": "store-contract-seam-holdout",
+      "rung": "composition holdout (criterion #4): the parameterized memory+sqlite+postgres store-contract harness proves summarize_spend is implemented identically on every backend the protocol claims, not just one"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-core/tests/test_store_memory.py packages/flywheel-core/tests/test_store_sqlite.py packages/flywheel-core/tests/test_store_postgres.py packages/flywheel-core/tests/test_store_protocols.py packages/flywheel-core/tests/test_store_protocols_module_purity.py -q",
+      "name": "spend-backends-and-purity",
+      "rung": "command (criterion #3 empty-store + purity): per-backend suites cover the empty-store all-zero case and the module-purity guard keeps the new signature from dragging IO/JSON into the pure type module"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest -q",
+      "name": "full-suite-green",
+      "rung": "command (criteria #10 #11): whole suite run out-of-band; no existing store/history test relaxed, deleted, or skipped, proving per-run rollups stay byte-for-byte unchanged"
+    }
+  ],
+  "tags": ["store", "spend", "queryability", "00031"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00031-FEATURE-spend-and-worker-aggregates.md -- the authoritative spec; criteria #1-#4, #10, #11 and SI-4",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- add the summarize_spend protocol method and the SpendSummary frozen dataclass here; export both from the module __all__",
+      "packages/flywheel-core/src/flywheel_core/store_memory.py -- implement summarize_spend on InMemoryStore by summing the _attempts dict",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py -- implement summarize_spend on SqliteStore via a SUM over attempts (input_tokens/output_tokens/cache_creation_input_tokens/cache_read_input_tokens/total_cost_usd) with the window predicate on last_activity_at",
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py -- implement summarize_spend on PostgresStore with the identical SUM/window predicate; same v12 projection, no schema change",
+      "packages/flywheel-core/src/flywheel_core/__init__.py -- export SpendSummary (and the new method is on the existing store classes)",
+      "packages/flywheel-core/tests/test_store_contract.py -- the parameterized memory+sqlite+postgres harness; add the visible empty-store and round-trip parity assertions for summarize_spend here so every backend is exercised (keep all existing assertions green)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_history.py:208 -- _attempt_rollups, the existing per-run sum; summarize_spend is the cross-run analogue but must NOT change this function's output"
+    ],
+    "references": [
+      "packages/flywheel-core/tests/test_store_contract.py:584 -- test_attempt_aggregates_round_trip shows the exact attempt aggregate column names and a seeded fixture to mirror",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py:917-926 -- the existing per-attempt token-sum pattern (input+output+cache_creation+cache_read) to mirror for the four token fields"
+    ],
+    "constraints": [
+      "SI-4 (canonical, fixed contract): signature is summarize_spend(self, *, since: datetime | None = None, until: datetime | None = None) -> SpendSummary. SpendSummary is a frozen dataclass with fields input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens (each int, names mirroring the attempts columns) plus total_cost_usd: float. Do not rename these fields or change the keyword-only window shape -- downstream spec 00032 implements this verbatim on Postgres.",
+      "The window is half-open [since, until) measured against attempts.last_activity_at; an attempt with NULL last_activity_at contributes to the unbounded total but is excluded from any bounded window; the identical predicate runs on every backend so all three return the same totals for the same data.",
+      "SI-9: add NO column, NO index, and do NOT bump CURRENT_SCHEMA_VERSION (stays 12). summarize_spend reads only existing v12 attempts columns.",
+      "Keep flywheel_core.task and flywheel_core.lifecycle pure: SpendSummary and the method live on the store protocol + concrete stores, never in task/lifecycle. The store_protocols module must stay import-pure (no json/pathlib/io/sqlite) -- SpendSummary is a plain frozen dataclass over datetime/int/float.",
+      "Per-run rollups (flywheel history / run-detail token and cost totals) must remain byte-for-byte unchanged: do not edit _attempt_rollups or collect_live_rows in this task.",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting done.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting done."
+    ],
+    "non_goals": [
+      "GRADING SURFACE -- do not create, edit, read, or even open anything under .flywheel/holdout/00031-spend-and-worker-aggregates/. The held-out spend contract test is authored there independently and seeds values your implementation does not see; touching it invalidates the proof.",
+      "Do not weaken, delete, or @skip any existing test under packages/*/tests/; the full suite is run whole as a grader.",
+      "Do not add a spend CLI verb -- the aggregate is a store method only (a verb is spec 00032's call).",
+      "Do not implement list_lifecycles or any filter-by-status read method (separate spec 00030).",
+      "Do not add a schema migration or bump CURRENT_SCHEMA_VERSION."
+    ],
+    "edge_cases": [
+      "Empty store: summarize_spend with and without a window returns all-zero totals (0 tokens, 0.0 cost), never None and never a raise.",
+      "Window containing no attempts returns all-zero totals, NOT the grand total -- a total-ignoring implementation that returns the all-time sum must fail this.",
+      "Half-open boundary: an attempt exactly at `until` is excluded; an attempt exactly at `since` is included.",
+      "Multiple runs: the returned total is the sum across ALL runs' attempts, not the latest run and not a single run -- chosen seeds make no single run equal the grand total.",
+      "A returned constant or a single-run sum must fail the held-out assertion, which compares against a computed multi-run sum."
+    ]
+  }
+}

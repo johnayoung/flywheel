@@ -1,0 +1,56 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00028-onboarding-preflight-and-auth -k 'sandbox_section_rendered or sandbox_setup_uncomment_parses or existing_policy_untouched' -q",
+      "name": "held-out-sandbox-render-roundtrip-and-never-clobber",
+      "rung": "command-end-state-out-of-band"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py -k sandbox_setup -q",
+      "name": "seam-holdout-sandbox-default-and-parse",
+      "rung": "composition-holdout"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_init.py packages/flywheel-orchestrator/tests/test_policy.py -q",
+      "name": "seam-holdout-init-policy-suites",
+      "rung": "composition-holdout"
+    }
+  ],
+  "id": "onboard-sandbox-scaffold",
+  "goal": "The flywheel.toml that init renders carries a commented [sandbox] section with a `setup = \"uv sync\"` example that round-trips through load_policy into WorkPolicy.sandbox_setup when uncommented, and re-running init still leaves an existing flywheel.toml byte-for-byte unchanged.",
+  "tags": ["onboarding", "init", "sandbox", "spec-00028"],
+  "prerequisites": ["onboard-init-git-preflight"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _INIT_POLICY_TAIL (line 1699): append a commented [sandbox] block with a `# setup = \"uv sync\"` example, mirroring the existing commented [agent] / [[defaults.graders]] style so the default stays bare",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _optional_sandbox_setup (387-404) reads `[sandbox] setup` into WorkPolicy.sandbox_setup (default None at line 145); the rendered key name and value must be exactly what this parser reads",
+      "packages/flywheel-orchestrator/tests/test_policy.py:633 -- the [sandbox] setup suite (test_sandbox_setup_default_none / _parses / _rejects_empty) pins the parse contract and the historical `sandbox_setup is None` default; keep all three green",
+      "packages/flywheel-orchestrator/tests/test_init.py:107 test_init_is_idempotent_and_never_clobbers -- the never-clobber guard the [sandbox] addition must not regress",
+      "docs/research/2026-06-17-adoption-readiness-audit.md -- finding B5 (deps-less worktree: 0 tests collected, 'passing')"
+    ],
+    "constraints": [
+      "SHARED INVARIANT SI-2: the only config key is `[sandbox] setup` read into WorkPolicy.sandbox_setup; this is 00028's SOLE addition to the shared _INIT_POLICY_TAIL template. Render the example as `uv sync` (the workspace install command). Do not rename the key or invent a parallel one.",
+      "SHARED INVARIANT SI-1 (boundary): _INIT_POLICY_TAIL is also touched by spec 00026 ([submit] base). Append your [sandbox] block as a NEW commented block; do not rewrite or reorder existing tail content. If 00026 has already landed when this runs, rebase onto it and keep both blocks (distinct tables, no key collision).",
+      "Keep the [sandbox] block COMMENTED by default so a policy that declares no [sandbox] still loads with sandbox_setup is None (must-not-regress); the one-edit (uncomment) path must yield policy.sandbox_setup == \"uv sync\".",
+      "Re-running init against an existing flywheel.toml non-interactively must leave it byte-for-byte unchanged and report it left untouched (criterion 8 / never-clobber).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under .flywheel/holdout/ -- the out-of-band held-out grading surface for criteria 5, 6, 8 (authored separately); do not create, read, or weaken anything there.",
+      "Do not delete or weaken the test_policy.py [sandbox] suite or the test_init.py idempotency test; any relaxed assertion needs a named equal-or-stronger replacement (criterion 10).",
+      "Do not change the default to an UNCOMMENTED setup line -- that would run an install command in every adopter's worktree and change the historical bare-sandbox default (D-2).",
+      "Do not add a [submit] base key or any [submit] scaffolding (owned by spec 00026, SI-1).",
+      "Do not enforce or run the setup command; the worker already reads policy.sandbox_setup -- this task only scaffolds config (out of scope)."
+    ],
+    "edge_cases": [
+      "The rendered text must satisfy BOTH a `[sandbox]` header (possibly commented) and a `setup`-key line referencing `uv sync` -- a header with no setup example, or a setup value that installs nothing, leaves the empty-grader footgun unchanged (criterion 5 defense).",
+      "Uncommenting must strip the leading `# ` from both the header and the setup line and still parse: a key name or value the parser does not read makes the documented edit a silent no-op (criterion 6 defense)."
+    ],
+    "notes": [
+      "Held-out graders for criteria 5, 6, 8 run from .flywheel/holdout/00028-onboarding-preflight-and-auth out-of-band; the visible test_policy.py sandbox suite is the composition seam between the rendered scaffold and the parser."
+    ]
+  }
+}

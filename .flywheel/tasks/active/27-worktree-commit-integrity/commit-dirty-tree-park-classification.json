@@ -1,0 +1,84 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "name": "landing-parked-event-core-roundtrip",
+      "run": "uv run pytest packages/flywheel-core/tests/test_events.py packages/flywheel-core/tests/test_events_module_purity.py packages/flywheel-core/tests/test_store_contract.py"
+    },
+    {
+      "type": "command",
+      "name": "uncommitted-done-preserved-held-out",
+      "run": "uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k uncommitted_done_preserved"
+    },
+    {
+      "type": "command",
+      "name": "uncommitted-park-event-on-ledger-held-out",
+      "run": "uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k uncommitted_park_event_on_ledger"
+    },
+    {
+      "type": "command",
+      "name": "clean-noop-no-park-event-held-out",
+      "run": "uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k clean_noop_no_park_event"
+    },
+    {
+      "type": "command",
+      "name": "submit-never-raises",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py -k submit_never_raises"
+    },
+    {
+      "type": "command",
+      "name": "worktree-suite-intact",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py"
+    }
+  ],
+  "id": "commit-dirty-tree-park-classification",
+  "goal": "At submit of a DONE run the worker preserves the worktree and branch and appends a landing-parked domain event (park_kind=uncommitted-work) to the store ledger when the tree is dirty, while still cleaning up a clean zero-commit no-op and appending no such event.",
+  "prerequisites": ["commit-worktree-identity"],
+  "tags": ["worktree", "commit-integrity", "spec-00027"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/events.py -- add DomainEventKind.LANDING_PARKED (wire value `landing_parked`) and a frozen LandingParked(_DomainEventBase) carrying `park_kind: str` (uncommitted-work | divergent-base) and an optional `detail: str`; add it to the DomainEvent union and fold it in the identity branch of apply() (no lifecycle-state mutation, just the version bump). Keep this module pure -- no json/pathlib/io.",
+      "packages/flywheel-core/src/flywheel_core/event_serde.py -- add event_payload/event_from_record arms for LANDING_PARKED so the event round-trips through the opaque events.payload_json ledger (park_kind/detail as JSON); this is the serde boundary that keeps events.py pure.",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- DomainEventStore.append_domain_event / list_domain_events (store_protocols.py:357-364) is the existing ledger write/read seam the worker uses; no protocol change needed -- the new kind is additive opaque JSON.",
+      "packages/flywheel-core/tests/test_events.py -- keep green and extend with the LANDING_PARKED apply (identity fold advances version, no status change) + event_payload/event_from_record round-trip; this is the agent's own core unit surface (NOT held-out).",
+      "packages/flywheel-core/tests/test_events_module_purity.py -- the events.py purity gate; must stay green (no json/pathlib/io import added to events.py).",
+      "packages/flywheel-core/tests/test_store_contract.py -- the append_domain_event/list_domain_events round-trip contract run against every store backend (sqlite + postgres + memory); extend it so a LANDING_PARKED event round-trips on the ledger and schema_version stays 12 (no migration).",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the HEAD of _submit (worker.py:439-457): the `git status --porcelain` dirty-tree check (currently logs-and-returns) and the `commit_count == 0` no-op branch (currently cleans up). This task owns this region; on the dirty path append the LANDING_PARKED event via the store's append_domain_event (the worker needs a store handle reachable from submit -- thread one if absent, mirroring how 00026 plans to).",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- submit() wraps _submit in a try/except that must never escape into orchestrate; keep that guard intact for the new ledger-append path (criterion 7).",
+      "packages/flywheel-worktree/tests/test_worker.py -- test_submit_uncommitted_done_parks, test_submit_zero_commit_done_cleans_up, test_submit_never_raises_on_git_error: keep all three green (the parking/no-op/never-raise guarantees they pin must survive).",
+      ".flywheel/specs/00027-FEATURE-worktree-commit-integrity.md -- criteria 3, 4, 5, 7; D-6 (park outcomes are a store domain-event append, supersedes D-2); SI-7 REDEFINED (the LANDING_PARKED kind + park_kind vocabulary, owned here, consumed by 00026); D-4 (classification keyed on tree-dirtiness + commit count); SI-9 (schema_version stays 12)"
+    ],
+    "constraints": [
+      "The uncommitted-work park outcome is recorded by appending ONE landing-parked domain event to the store ledger via append_domain_event (SI-7 per D-6): DomainEventKind.LANDING_PARKED (wire value `landing_parked`), with the event's park_kind field equal to `uncommitted-work`. It is queryable via store.list_domain_events(run_id); it is NOT a git marker file or a refs/flywheel/... note (that earlier D-2 design is superseded by D-6).",
+      "The same event KIND is asserted present by the dirty-tree case (criterion 4) and absent by the clean-no-op case (criterion 5); it must be ONE named constant (DomainEventKind.LANDING_PARKED), not two parallel surfaces. The park_kind value -- not a separate kind/namespace -- discriminates uncommitted-work from 00026's divergent-base.",
+      "The event must be queryable from the store API list_domain_events(run_id) alone, never only from worker stderr and never from git state/refs/notes (criteria 4 and 5 read the store API and refuse to read captured logs or git markers).",
+      "Dirty tree at DONE -> preserve worktree AND branch (do not call _cleanup / branch -D) and append the LANDING_PARKED event (criteria 3, 4). Clean tree with zero commits beyond base -> keep the existing no-op cleanup (remove worktree + branch) and append NO LANDING_PARKED event (criterion 5).",
+      "The new event kind is OWNED by this spec and CONSUMED by spec 00026 (its divergent-base park reuses the IDENTICAL kind with park_kind=divergent-base). Define it as ONE shared constant in flywheel_core.events; do not fork a 00026-specific kind. 00026 must agree on the wire contract (`landing_parked` + the park_kind field).",
+      "The worker appends the event but performs NO lifecycle transition: the run already finalized DONE before submit, the harness owns transitions, and DONE is terminal. LANDING_PARKED.apply folds to the identity (advances version only); the lifecycle status stays Status.DONE (criterion 4 asserts status == DONE). No new Status/Outcome is added (D-6, supersedes 00026's earlier D-4).",
+      "Keep the ledger schema additive: the events ledger stores opaque JSON keyed by a kind discriminator, so the new kind needs NO migration and schema_version stays 12 (SI-9). If reading the code proves a migration is genuinely unavoidable, STOP and flag it loudly rather than bumping the schema silently.",
+      "Keep flywheel_core.events pure (no json/pathlib/io); the LandingParked dataclass is frozen with primitive fields and the JSON projection lives in event_serde.py.",
+      "If a git call during the dirty-tree classification OR the ledger append fails, submit must still return without raising and leave the worktree present (criterion 7) -- preserve submit()'s no-escape guard around the new append path.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify the held-out grading surface under .flywheel/holdout/00027-worktree-commit-integrity/; do not weaken or delete any assertion in test_submit_uncommitted_done_parks, test_submit_zero_commit_done_cleans_up, or test_submit_never_raises_on_git_error.",
+      "Do not change _ff_merge (worker.py:592-595), _phase_base/base resolution (worker.py:885-892), the rebase/re-verify gate, the protected-path refusal, or the divergent-base park (worker.py:478-502) -- those are spec 00026's TAIL.",
+      "Do not collapse the two dispositions into always-park (leaks a worktree per no-op) or always-clean (discards recoverable work) -- the two cases must stay externally distinct (D-4).",
+      "Do not add a new lifecycle Status or Outcome, and do not perform any lifecycle transition from submit -- the run stays terminal DONE and LANDING_PARKED folds to the identity (D-6).",
+      "Do not bump schema_version or add a typed events column / migration; the kind is additive opaque JSON on the existing ledger (SI-9).",
+      "Do not add json/pathlib/io imports to flywheel_core.events (test_events_module_purity.py enforces this); the JSON projection belongs in event_serde.py.",
+      "Do not record the uncommitted-work reason on a git marker file or a refs/flywheel/... note -- that D-2 surface is superseded by D-6; the only new persisted signal is the LANDING_PARKED ledger event."
+    ],
+    "edge_cases": [
+      "Untracked-only dirty tree (a new uncommitted file, no modified tracked file) must classify as dirty -> preserve + append LANDING_PARKED, exactly like a modified tracked file; `git status --porcelain` reports both.",
+      "A fix that 'surfaces' the dirty case by logging to stderr but still deletes the branch FAILS criterion 3 (ref-exists assertion) -- the branch and worktree must survive.",
+      "A fix that parks the dirty case with no ledger event (only stderr, or a git marker) FAILS criterion 4 -- the grader reads list_domain_events(run_id) and asserts exactly one LANDING_PARKED event with park_kind=uncommitted-work.",
+      "Minting a lifecycle status/transition from the consumer FAILS criterion 4's status == DONE assertion -- append the audit-witness event, do not transition.",
+      "The clean no-op must append NO LANDING_PARKED event (criterion 5 asserts the ledger contains zero events of that kind) -- appending it unconditionally would fail it."
+    ],
+    "notes": [
+      "Held-out graders run `uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k <keyword>` (authored out-of-band by fw-verify): uncommitted_done_preserved (criterion 3), uncommitted_park_event_on_ledger (criterion 4 -- reads store.list_domain_events(run_id), asserts one LANDING_PARKED event with park_kind=uncommitted-work and status still DONE), clean_noop_no_park_event (criterion 5 -- asserts cleanup AND zero landing_parked events). That holdout path is outside the four pytest testpaths; the grader passes it explicitly. submit_never_raises is the one VISIBLE criterion (#7) -- it lands in packages/flywheel-worktree/tests/ and the implementing agent may author it.",
+      "landing-parked-event-core-roundtrip is the core grader for the SI-7 contract this task owns: it runs the flywheel-core event tests (apply/identity-fold + event_serde round-trip) and the cross-backend store contract (append_domain_event/list_domain_events) so the new kind persists and reloads on the opaque ledger with schema_version 12. These are the agent's own core unit tests (extended in test_events.py / test_store_contract.py), distinct from the held-out worker-behavior graders; the purity test pins events.py against json/pathlib/io."
+    ]
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00026-safe-landing-target/ -k detached_head_lands_on_configured_base",
+      "name": "detached-head-lands-on-configured-base-held-out"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00026-safe-landing-target/ -k refuse_land_into_checked_out_base",
+      "name": "refuse-checked-out-base-held-out"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00026-safe-landing-target/ -k landing_fetches_base_before_merge",
+      "name": "fetch-fresh-base-before-land-held-out"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py -k \"protected or reverify or zero_commit or no_commit\"",
+      "name": "must-not-regress-gate-holdout"
+    },
+    {
+      "type": "command",
+      "run": "test \"$(uv run pytest packages/flywheel-worktree packages/flywheel-orchestrator --collect-only -q 2>/dev/null | grep -c '::')\" -ge 411",
+      "name": "no-tests-dropped-holdout"
+    }
+  ],
+  "id": "land-resolve-base-from-policy",
+  "goal": "The worker resolves its landing base from WorkPolicy.submit_base, fetches it fresh from the remote, refuses to land when the base equals the operator's checked-out branch, and starts without SystemExit on detached HEAD.",
+  "prerequisites": ["land-config-submit-base"],
+  "tags": ["safe-landing", "worker", "base-resolution"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- _phase_base (worker.py:885-892) reads `git rev-parse --abbrev-ref HEAD` and SystemExits on detached HEAD; this slice resolves the base from policy.submit_base, fetches it fresh, and survives detached HEAD when a base is configured",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- main() at worker.py:1016-1022: _phase_base(repo_root) currently runs BEFORE load_effective_policy(); reorder so the loaded policy's submit_base feeds base resolution",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep every existing test green; the gate-holdout and no-tests-dropped graders run this surface as-is"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy.submit_base (added by land-config-submit-base) is the authoritative base when set",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py:357-364 -- append_domain_event / list_domain_events(run_id): if the refuse-checked-out-base case is surfaced as a queryable park rather than a startup PolicyError, criterion 2's store half reads the appended LANDING_PARKED event (SI-12, owned by 00027) here; either observable surface satisfies the criterion.",
+      ".flywheel/holdout/00026-safe-landing-target/ -- per spec 00026 criteria 2/3/4 the held-out pytest oracles (test names containing detached_head_lands_on_configured_base, refuse_land_into_checked_out_base, landing_fetches_base_before_merge) live here, authored out-of-band by the fw-verify step. The -k graders above run this dir explicitly (it is outside the four pytest testpaths). The implementing agent must NOT read or edit these oracles."
+    ],
+    "constraints": [
+      "Detached HEAD with a configured submit_base must complete normally and yield the configured base (no SystemExit, no literal 'HEAD' string). A detached HEAD with submit_base=None remains the surfaced config-error refusal of D-1 -- do not silently invent a base.",
+      "Always fetch the configured base from its remote before resolving its SHA and before any land, so the worker lands onto the up-to-date base, never a stale local ref (D-3). A fetch failure must become a recoverable surfaced outcome, not a crash.",
+      "Refusing to land when the configured base equals the operator's checked-out branch must be observable EITHER as a non-zero startup exit / raised PolicyError-class before any landing, OR as the appended landing-parked domain event (DomainEventKind.LANDING_PARKED via append_domain_event, detail naming the checked-out-base conflict) queryable via list_domain_events(run_id); and it must leave that branch's SHA unchanged (D-2 belt; criterion 1's byte-unchanged tree is the load-bearing guarantee, landed by the next task). The refusal is read from git ref state and the store API, never from stderr.",
+      "MUST NOT regress: the protected-path refusal, post-rebase command-grader re-run, and zero-commit no-op behaviors all stay green (the gate-holdout grader). Any removed/relaxed assertion on those gates must be replaced with an equal-or-greater check.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under packages/flywheel-worktree/tests/ or .flywheel/holdout/00026-safe-landing-target/ (the held-out oracles for criteria 2/3/4); do not weaken or delete assertions. These are the grading surface.",
+      "Do not implement the ref-update-without-touching-operator-tree merge or the divergent-base landing-parked domain event here -- those are criterion 1/5, owned by land-ref-update-and-queryable-park.",
+      "Do not edit the HEAD of _submit (porcelain dirty-tree / no-op classification at worker.py:439-457) -- that region is owned by spec 00027.",
+      "Do not touch the pr strategy's submit_pr_base / submit_remote path."
+    ],
+    "edge_cases": [
+      "Catching SystemExit and re-raising a different exception still fails the detached-head test -- the call must complete and return the configured base.",
+      "Calling `git fetch` but then resolving/merging the stale local ref fails the fetch test, which asserts a remote-only commit (uncomputable by the agent) is an ancestor of the landed/resolved base.",
+      "A startup name-equality check that still prints a warning and proceeds fails the refuse test, which pins the checked-out branch SHA unchanged."
+    ]
+  }
+}

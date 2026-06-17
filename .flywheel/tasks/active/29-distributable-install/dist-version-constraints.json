@@ -1,0 +1,71 @@
+{
+  "id": "dist-version-constraints",
+  "goal": "Every inter-flywheel dependency in the downstream packages' pyproject.toml carries a real version constraint, so a built wheel's Requires-Dist resolves from artifact metadata alone, while the in-repo workspace install and the one-way dependency arrow are unchanged.",
+  "graders": [
+    {
+      "type": "command",
+      "name": "downstream-metadata-is-versioned",
+      "run": "set -e; D=$(mktemp -d); uv build --package flywheel --package flywheel-orchestrator --package flywheel-worktree --out-dir \"$D\" >/dev/null 2>&1; python3 - \"$D\" <<'PY'\nimport sys, zipfile, glob, re, os\ndist = sys.argv[1]\ninter = {\"flywheel-core\", \"flywheel-orchestrator\", \"flywheel-worktree\", \"flywheel\"}\nspec = re.compile(r\"[<>=~!]=?\")\nwheels = glob.glob(os.path.join(dist, \"*.whl\"))\nassert wheels, \"no wheels built\"\nchecked = 0\nfor whl in wheels:\n    z = zipfile.ZipFile(whl)\n    meta = next(n for n in z.namelist() if n.endswith(\".dist-info/METADATA\"))\n    for line in z.read(meta).decode().splitlines():\n        if not line.startswith(\"Requires-Dist:\"):\n            continue\n        body = line.split(\":\", 1)[1].strip()\n        name = re.split(r\"[\\s\\[;(]\", body, 1)[0].strip()\n        if name in inter:\n            assert spec.search(body), f\"{os.path.basename(whl)}: unversioned inter-flywheel dep -> {line!r}\"\n            checked += 1\nassert checked >= 3, f\"expected >=3 versioned inter-flywheel Requires-Dist lines across the downstream wheels, saw {checked}\"\nprint(\"OK versioned inter-flywheel deps:\", checked)\nPY\nrc=$?; rm -rf \"$D\"; exit $rc"
+    },
+    {
+      "type": "command",
+      "name": "core-declares-no-downstream-dep",
+      "run": "set -e; D=$(mktemp -d); uv build --package flywheel-core --out-dir \"$D\" >/dev/null 2>&1; python3 - \"$D\" <<'PY'\nimport sys, zipfile, glob, os\ndist = sys.argv[1]\nbanned = {\"flywheel-orchestrator\", \"flywheel-worktree\", \"flywheel\"}\nwhl = glob.glob(os.path.join(dist, \"flywheel_core-*.whl\"))[0]\nz = zipfile.ZipFile(whl)\nmeta = next(n for n in z.namelist() if n.endswith(\".dist-info/METADATA\"))\nfor line in z.read(meta).decode().splitlines():\n    if line.startswith(\"Requires-Dist:\"):\n        body = line.split(\":\", 1)[1].strip()\n        name = body.split(\" \")[0].split(\"[\")[0].split(\";\")[0].strip()\n        assert name not in banned, f\"core wheel back-points at a downstream package: {line!r}\"\nprint(\"OK core declares no downstream flywheel dependency\")\nPY\nrc=$?; rm -rf \"$D\"; exit $rc"
+    },
+    {
+      "type": "command",
+      "name": "in-repo-uv-sync-and-help",
+      "run": "uv sync && uv run flywheel --help >/dev/null"
+    },
+    {
+      "type": "command",
+      "name": "core-imports-without-sdk",
+      "run": "uv run pytest packages/flywheel-core/tests/test_sdk_optional.py -q"
+    },
+    {
+      "type": "command",
+      "name": "full-suite",
+      "run": "uv run pytest -q"
+    },
+    {
+      "type": "manual",
+      "name": "verification-surface-review",
+      "instruction": "Held-out gate (criterion #10). Diff the test changes. For every assertion removed, relaxed, or skipped in any existing test -- especially packages/flywheel-core/tests/test_task_module_purity.py, test_lifecycle_module_purity.py, test_sdk_optional.py, and any test asserting the one-way dependency arrow or core-without-SDK invariant -- confirm a named replacement check of equal-or-greater strength is present. A dropped or weakened purity / arrow / SDK-optional guard under cover of this packaging change, with no equal replacement, is a blocking defect: reject."
+    }
+  ],
+  "prerequisites": [],
+  "tags": ["packaging", "distribution", "pyproject"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00029-FEATURE-distributable-install.md -- authoritative spec; criteria #5, #6, #7, #8, #9, #10 and Decomposition Hint Layer A",
+      "packages/flywheel-orchestrator/pyproject.toml -- depends on flywheel-core (currently unversioned); add a version constraint",
+      "packages/flywheel-worktree/pyproject.toml -- depends on flywheel-orchestrator (currently unversioned); add a version constraint",
+      "packages/flywheel/pyproject.toml -- depends on flywheel-core[claude], flywheel-orchestrator, flywheel-worktree (all currently unversioned); add version constraints, preserve the [claude] extra marker",
+      "packages/flywheel-core/pyproject.toml -- declares NO downstream dependency today; it must stay that way (criterion #7). Its [claude]/[postgres] optional extras must remain optional.",
+      "pyproject.toml -- the root [tool.uv.sources] { workspace = true } table; it MUST remain so uv sync keeps resolving locally (criterion #8)",
+      "packages/flywheel-core/tests/test_sdk_optional.py -- keep green; proves import flywheel_core works with no claude-agent-sdk (criterion #6)"
+    ],
+    "references": [
+      "All four packages are currently version 0.1.0. Pick ONE constraint style and apply it consistently across the three downstream pyprojects (the spec's shared-invariant note: name the style once here so Layer B/C inherit it). A constraint that the workspace source table can still satisfy on a routine version bump is required -- an over-tight pin that breaks uv sync fails the in-repo-uv-sync grader.",
+      "uv_build already ships non-.py package data (_schema/*.sql, _skill_templates/*.md, py.typed) by default; this task does NOT touch package-data globs -- only the dependency version constraints."
+    ],
+    "constraints": [
+      "Add a non-empty version specifier to every inter-flywheel Requires-Dist edge in the three downstream packages so the foreign install graph resolves from wheel METADATA alone (criterion #5).",
+      "Keep the root [tool.uv.sources] { workspace = true } table intact: uv sync from this checkout must still install all four packages and uv run flywheel --help must exit 0 (criterion #8).",
+      "Do not add any dependency from flywheel-core onto a downstream package; the one-way arrow stays (criterion #7).",
+      "Do not make claude-agent-sdk a hard dependency of flywheel-core; it stays the optional [claude] extra (criterion #6).",
+      "Commit the change with a clear conventional-commit message before reporting done; no emojis."
+    ],
+    "non_goals": [
+      "Do not author, edit, weaken, delete, or read anything under .flywheel/holdout/00029-distributable-install/ -- that fenced held-out grading surface is authored separately.",
+      "Do not modify, weaken, skip, or delete any assertion in packages/*/tests/ -- especially the *_module_purity.py tests, test_sdk_optional.py, or any one-way-arrow guard.",
+      "Do not add a build/publish helper or any foreign-install script here -- that is the dependent dist-foreign-install task.",
+      "Do not change cwd/git-toplevel path-resolution logic, package-data globs, or the build backend.",
+      "Do not pin exact versions so tight that a routine workspace version bump can no longer be satisfied by [tool.uv.sources]."
+    ],
+    "edge_cases": [
+      "A bare unversioned Requires-Dist (just the package name, no specifier) must fail the downstream-metadata-is-versioned grader -- the whole point of criterion #5.",
+      "A constraint that breaks uv sync (e.g. an exact ==X.Y.Z that the dirty workspace tree cannot match) must fail the in-repo-uv-sync grader -- criterion #8 forecloses fixing the foreign path by breaking the dev path."
+    ]
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00026-safe-landing-target/ -k landing_does_not_touch_operator_worktree",
+      "name": "operator-tree-byte-unchanged-held-out"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00026-safe-landing-target/ -k divergent_base_records_park_event",
+      "name": "divergent-base-park-event-held-out"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py -k \"protected or reverify or zero_commit or no_commit\"",
+      "name": "must-not-regress-gate-holdout"
+    },
+    {
+      "type": "command",
+      "run": "test \"$(uv run pytest packages/flywheel-worktree packages/flywheel-orchestrator --collect-only -q 2>/dev/null | grep -c '::')\" -ge 411",
+      "name": "no-tests-dropped-holdout"
+    }
+  ],
+  "id": "land-ref-update-and-queryable-park",
+  "goal": "Landing advances the configured base ref without mutating the operator's working tree/index/HEAD, and a base that cannot fast-forward after rebase + re-verify appends the landing-parked domain event (park_kind == divergent-base, non-empty detail) to the store ledger rather than logging a stderr-only park, leaving the run terminal DONE.",
+  "prerequisites": ["land-resolve-base-from-policy", "commit-dirty-tree-park-classification"],
+  "tags": ["safe-landing", "worker", "landing"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- _ff_merge (worker.py:592-595) runs `git merge --ff-only` in repo_root (the operator's live checkout); the divergent-base park (worker.py:478-502) logs to stderr and returns. This slice advances the base via an out-of-tree ref update and appends the landing-parked domain event for the run.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter.__init__ (worker.py:200-219, kw-only, no store today) and build_merge_submitter (worker.py:~647-656, which already opens a store via open_sqlite_bound_store): thread a store handle into the submitter so submit() can append_domain_event(LandingParked(...)) for req.run_id; the SubmitRequest carries run_id/task_id/status/task but no store.",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep every existing test green; the gate-holdout and no-tests-dropped graders run this surface as-is"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/events.py -- DomainEventKind / the frozen _DomainEventBase events and the identity-fold branch of events.apply (events.py:337, which admits Unblocked/RetryScheduled/GraderEvaluated/CommandApplied without mutating lifecycle state). SI-12's LandingParked (DomainEventKind.LANDING_PARKED, wire tag landing_parked, fields park_kind:str + detail:str='') is OWNED and LANDED by spec 00027 -- this task CONSUMES it with park_kind='divergent-base'. Do NOT define a new event type here.",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py:357-364 -- LifecycleStore.append_domain_event(event, expected_version=...) appends the LandingParked event; list_domain_events(run_id) reads it back. The identity-fold event advances version only and performs NO lifecycle transition.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py:890-902 -- where orchestrate constructs SubmitRequest and calls submit(); the submitter appends its own park event and must not raise.",
+      ".flywheel/holdout/00026-safe-landing-target/ -- per spec 00026 criteria 1/5 the held-out pytest oracles (test names containing landing_does_not_touch_operator_worktree and divergent_base_records_park_event) live here, authored out-of-band by the fw-verify step. The -k graders above run this dir explicitly (it is outside the four pytest testpaths). The implementing agent must NOT read or edit these oracles."
+    ],
+    "constraints": [
+      "Criterion 1 (load-bearing): a full landing must leave the operator's working tree bytes, `git status --porcelain`, and HEAD byte-for-byte identical, while the non-checked-out configured base ref advances to include the task commit. Renaming the base variable but keeping `git merge --ff-only` in repo_root fails this -- the merge must update a ref the operator does not have checked out.",
+      "Criterion 5 (D-6): when the base cannot fast-forward even after the existing rebase + re-verify path, append the landing-parked domain event for the run via append_domain_event -- DomainEventKind.LANDING_PARKED (wire tag landing_parked) with park_kind == 'divergent-base' and a non-empty detail naming the landing failure -- queryable via list_domain_events(run_id). The worktree AND the flywheel/<phase>/<task-id> branch ref are still preserved for forensics. A stderr-only park, an empty detail, the wrong park_kind (the uncommitted-work value), or any kind other than landing_parked fails the held-out check (it reads the store ledger, not the log).",
+      "D-6 (load-bearing): the run stays terminal Status.DONE -- perform NO lifecycle transition. The landing-parked event is an audit-witness on the identity-fold branch of events.apply (advances version only); do NOT mint a new Status/Outcome and do NOT transition off DONE. The held-out check asserts status == DONE after the park.",
+      "SI-12 CONSUMED: LandingParked (DomainEventKind.LANDING_PARKED / wire tag landing_parked, fields park_kind:str + detail:str) is OWNED and LANDED by spec 00027 (its SI-7) as a flywheel_core.events addition. This task only APPENDS that kind with park_kind='divergent-base'; it adds NO new core event type and no schema migration (the events ledger is opaque JSON, schema_version stays 12 -- flag loudly if reading the code proves a migration is unavoidable).",
+      "This divergent-base store-ledger park is DISTINGUISHED from spec 00027's uncommitted-work park only by the park_kind field on the SAME unified LANDING_PARKED event (divergent-base here, uncommitted-work in 00027) -- one named constant, one ledger surface, not two namespaces (D-6).",
+      "MUST NOT regress: protected-path refusal, post-rebase command-grader re-run (verified against the exact base it lands on), and zero-commit no-op cleanup all stay green (gate-holdout grader).",
+      "Agent claims stay untrusted and the harness owns lifecycle transitions; the park is an appended audit-witness domain event, never a trusted agent-reported status and never a status mutation.",
+      "CROSS-SPEC ORDER (SI-6 / D-5 / D-6): this task takes a prerequisite on spec 00027's commit-dirty-tree-park-classification because 00027 (a) splits the _submit HEAD (porcelain dirty-tree / no-op classification at worker.py:439-457) green before this task edits the _submit TAIL (base-ref update + divergent-base park at worker.py:478-502,592-595), AND (b) lands the SI-12 LANDING_PARKED event kind this task appends. Rebase onto that landed gate; do not conflict-merge or re-touch the HEAD region, and do not redefine the event.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under packages/flywheel-worktree/tests/ or .flywheel/holdout/00026-safe-landing-target/ (the held-out oracles for criteria 1/5); do not weaken or delete assertions.",
+      "Do not invent a new Status / Outcome enum member and do not transition the run off DONE -- the park is the appended LANDING_PARKED domain event, an identity-fold audit witness (D-6, supersedes D-4).",
+      "Do not redefine DomainEventKind.LANDING_PARKED / LandingParked or add any new flywheel_core.events type -- SI-12 is owned and landed by spec 00027; this task only consumes/appends it.",
+      "Do not add or require a schema migration -- the events ledger is opaque JSON, schema_version stays 12 (flag loudly if the code proves otherwise).",
+      "Do not edit the HEAD of _submit (porcelain dirty-tree / no-op classification at worker.py:439-457) or the worktree git identity -- spec 00027 owns that region and lands first.",
+      "Do not read or share spec 00027's uncommitted-work park surface as a separate namespace -- both park kinds unify on the one LANDING_PARKED event discriminated by park_kind (D-6).",
+      "Do not add retry scheduling, conflict auto-resolution, or new conflict-resolution UX beyond appending the queryable park event.",
+      "Do not change how protected_paths are matched."
+    ],
+    "edge_cases": [
+      "Skipping the merge entirely passes 'operator tree unchanged' but fails the 'base ref advanced' half -- both halves must hold.",
+      "A fetch failure (no reachable remote for the base) must also become a queryable park, appending the LANDING_PARKED event rather than crashing (folded into criterion 5's surface per D-3).",
+      "Appending the event with an empty detail, the wrong park_kind, or a kind other than landing_parked fails the field assertions; transitioning off DONE fails the status==DONE assertion; discarding the worktree/branch fails the preservation assertion."
+    ]
+  }
+}

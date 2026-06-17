@@ -1,0 +1,45 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00032-postgres-read-path-parity -k \"status and postgres\"",
+      "name": "status-verb-postgres-end-to-end-holdout"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest",
+      "name": "full-suite-composition-holdout"
+    }
+  ],
+  "id": "pg-status-verb-end-to-end",
+  "goal": "flywheel status (and fw status) in a project whose flywheel.toml sets [store] backend = \"postgres\" with a reachable database runs end to end, emits no \"does not support the postgres store backend\" refusal and no unhandled AttributeError/psycopg traceback, and exits 0.",
+  "prerequisites": ["pg-factory-seam"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- main(['status']) is the status verb entry point the flywheel/fw router delegates to; it builds the store via the now-lifted seam and computes status rows through the ported reads",
+      "packages/flywheel/src/flywheel/_cli.py:45-56 -- the flywheel/fw router forwards 'status' to flywheel_orchestrator._workflow.main verbatim, so the orchestrator status path is the end-to-end surface"
+    ],
+    "references": [
+      ".flywheel/holdout/00032-postgres-read-path-parity/ -- the held-out grader writes a flywheel.toml with backend = postgres, sets FLYWHEEL_PG_DSN, invokes the status verb end to end, and asserts exit 0 with neither the refusal string nor a traceback",
+      "packages/flywheel-orchestrator/tests/test_store_factory.py:151-167 -- test_cli_status_postgres_without_env_vars_exits_2 shows the status-verb-through-main fail-fast path that must remain intact"
+    ],
+    "constraints": [
+      "This is a verification task: the prior tasks (pg-read-path-port, pg-factory-seam) deliver the behavior; this task proves the verb runs end to end and the full suite stays green. If the holdout fails, the fix belongs in the upstream tasks' surfaces, not in new special-casing here.",
+      "The full suite (uv run pytest) must exit 0 with no collection failures and the Postgres-parametrized tests executing (not all skipped) on a host where the container is reachable -- a green run that silently dropped coverage by weakening or deleting tests is a defect (criterion 8).",
+      "Commit any change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify, read, or author anything under .flywheel/holdout/00032-postgres-read-path-parity/.",
+      "Do not weaken, skip, or delete any existing test to make uv run pytest pass; the full-suite gate exists to catch exactly that.",
+      "Do not add status-verb-specific Postgres special-casing -- correctness must come from the ported reads and lifted seam, not a verb-local branch.",
+      "Do not change the no-DSN fail-fast behavior of the status verb."
+    ],
+    "edge_cases": [
+      "Swallowing an error and printing nothing useful must fail: exit 0 PLUS absence of a traceback is asserted, so a crash that prints a stack still fails.",
+      "Replacing the refusal with a different hard error must fail the no-traceback assertion."
+    ],
+    "notes": [
+      "The full-suite grader is the composition holdout over the whole 00032 change: it runs every dependent (core contract suite, orchestrator read suites, factory suite, the held-out parity tests) as one, proving the seam between the PostgresStore query impl, the ported reads, and the lifted factory holds together. It adds no requirement beyond the spec criteria."
+    ]
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_init.py -k 'git_preflight_message or init_happy_path' -q",
+      "name": "visible-message-and-happy-path",
+      "rung": "command-end-state"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00028-onboarding-preflight-and-auth -k 'git_preflight or detached_head' -q",
+      "name": "held-out-preflight-refusal",
+      "rung": "command-end-state-out-of-band"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_init.py packages/flywheel-orchestrator/tests/test_policy.py -q",
+      "name": "seam-holdout-init-policy-suites",
+      "rung": "composition-holdout"
+    }
+  ],
+  "id": "onboard-init-git-preflight",
+  "goal": "flywheel init refuses up front (non-zero exit, no flywheel.toml written, actionable message) when the working directory is not a git repository or HEAD is detached, while a valid attached-branch repo still scaffolds normally.",
+  "tags": ["onboarding", "init", "preflight", "spec-00028"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_init (line ~2343): add the git-repo + detached-HEAD preflight gate BEFORE any file (scaffold dirs or flywheel.toml) is written",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- _repo_root (873-882: 'not inside a git repository') and _phase_base (885-892: detached-HEAD/'HEAD' rejection); init's gate must agree with these runtime preconditions so init never passes a state the worker then rejects",
+      "packages/flywheel-orchestrator/tests/test_init.py -- the existing init suite is the grading surface for criteria 2 and 4; its `repo` fixture (line 25) only monkeypatch.chdir(tmp_path) with no `git init`, so every existing test that calls main(['init']) will hit the new gate -- update that fixture (and any test that relies on it) to create a real git repo on an attached branch in the same change",
+      "docs/research/2026-06-17-adoption-readiness-audit.md -- finding G7 (init checks neither git-repo nor non-detached-HEAD)"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/tests/test_init.py:107 test_init_is_idempotent_and_never_clobbers -- must still pass once the fixture is a git repo"
+    ],
+    "constraints": [
+      "SHARED INVARIANT (must update in THIS change): the existing init test fixture/tests in packages/flywheel-orchestrator/tests/test_init.py run main(['init']) in a bare tmp dir; after the gate lands they must run inside a git repo on a normal branch (git init + one commit + a branch), or they regress. Update them here -- criterion 10 requires any relaxed/removed init assertion to be named with an equal-or-stronger replacement.",
+      "The detached-HEAD refusal is unconditional at init time and correct: init --defaults writes no [submit] base key, so the state init produces is exactly the one the worker rejects (spec D-5/SI-8). Do NOT add any [submit] scaffolding or submit_base handling -- that belongs to spec 00026.",
+      "When a precondition is absent, exit non-zero AND write no flywheel.toml (and write no .flywheel scaffold either is acceptable but not required); a warn-and-continue that still exits 0 or still writes the policy file is a defect (D-1).",
+      "The non-git abort message must name the missing precondition in operator terms (case-insensitive 'git' plus 'repository' or 'repo'); the detached abort message must contain case-insensitive 'detached'.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under .flywheel/holdout/ -- that is the out-of-band held-out grading surface authored separately; do not create, read, or weaken anything there.",
+      "Do not delete or weaken assertions in test_init.py or test_policy.py beyond the necessary git-repo fixture update; any relaxed assertion must be replaced with an equal-or-stronger one and named in the commit (criterion 10).",
+      "Do not auto-`git init` the adopter's directory or otherwise mutate their filesystem to satisfy the precondition -- a clear refusal is the decided behavior (D-1).",
+      "Do not add a [submit] base key, submit_base attribute, or any [submit] scaffolding (owned by spec 00026, SI-1).",
+      "Do not change worker execution or the sandbox/auth surfaces -- those are sibling tasks."
+    ],
+    "edge_cases": [
+      "A git repo with a freshly created default branch and at least one commit on an attached branch must pass the happy path (criterion 4) -- a gate strict enough to reject this silently breaks every legitimate adopter.",
+      "Detached HEAD is distinct from non-git: both refuse, but the messages differ ('detached' vs 'git'/'repository'); returning a constant non-zero with an empty message fails criterion 2's message assertion."
+    ],
+    "notes": [
+      "Held-out grader points at .flywheel/holdout/00028-onboarding-preflight-and-auth (fw-verify authors the criteria-1/3 tests there next); it runs out-of-band, so 'the agent's own test passes' cannot stand in for 'the refusal is correct' (criterion 11)."
+    ]
+  },
+  "prerequisites": []
+}

@@ -1,0 +1,74 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "name": "behavior-held-out",
+      "run": "uv run pytest .flywheel/holdout/00030-cross-task-query-surface/ -q"
+    },
+    {
+      "type": "command",
+      "name": "store-contract-parity",
+      "run": "uv run pytest packages/flywheel-core/tests/test_store_contract.py -q"
+    },
+    {
+      "type": "command",
+      "name": "store-protocols-purity",
+      "run": "uv run pytest packages/flywheel-core/tests/test_store_protocols_module_purity.py -q"
+    },
+    {
+      "type": "command",
+      "name": "full-suite",
+      "run": "uv run pytest -q"
+    },
+    {
+      "type": "manual",
+      "name": "relaxed-check-review",
+      "instruction": "Confirm the diff removed no assertion from the store-contract, purity, or any existing suite without a named, equal-or-stronger replacement, and that CURRENT_SCHEMA_VERSION is still 12 with no new column/index/version bump. A relaxed or deleted check with no replacement, or any schema bump, is a blocking defect (criteria V3, #9, SI-9)."
+    }
+  ],
+  "goal": "Holding only a store (any of in-memory, SQLite, Postgres), a caller can list every lifecycle and filter by status and/or task id through a single new public StoreProtocol method that returns fully-folded Lifecycle objects in a deterministic, backend-identical order.",
+  "id": "query-list-lifecycles-backends",
+  "tags": ["store", "query", "spec-00030"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- declare the new LifecycleStore read method (signature + ordering/empty-result/return-shape contract in its docstring); add it to __all__ if needed",
+      "packages/flywheel-core/src/flywheel_core/store_memory.py -- implement on InMemoryStore (load_lifecycle at line 210 shows the fully-folded shape; the row store must track a write-time updated_at to order parity-identically, since updated_at is NOT a Lifecycle field)",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py -- implement on SqliteStore (load_lifecycle at line 345 is the column projection to mirror; updated_at is the server-set _utcnow_iso() column, ORDER BY updated_at DESC, run_id DESC)",
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py -- implement identically on PostgresStore (load_lifecycle at line 523); the Postgres parametrization in the contract suite must run, not raise or fall through",
+      "packages/flywheel-core/tests/test_store_contract.py -- the parametrized memory/sqlite/postgres parity suite; keep it green and let it exercise the new method (criterion 4)",
+      "packages/flywheel-core/tests/test_store_protocols_module_purity.py -- keep green; the new signature must add no json/pathlib/io/sqlite import to the pure type module"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/lifecycle.py -- Status enum members; Lifecycle dataclass shape (attempts populated in ascending number order)",
+      "packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql -- lifecycles columns (status, task_id, updated_at at line 108); no migration is added here"
+    ],
+    "constraints": [
+      "The method signature is canonical and fixed (SI-3): list_lifecycles(self, *, statuses: Collection[Status] | None = None, task_id: str | None = None) -> list[Lifecycle]. Both filters keyword-only and optional; None means no filter; statuses is a collection so single-status and active-set callers both fit. Returns the same fully-folded Lifecycle (attempts populated) that load_lifecycle returns -- not a stub/projection shape.",
+      "Result ordering is canonical and fixed (SI-5): (updated_at DESC, run_id DESC), documented in the method docstring and produced IDENTICALLY by all three backends -- the in-memory store must therefore record a write-time updated_at per row, not derive it from Lifecycle timestamps.",
+      "No schema change (SI-9 / D-3): add no column, no index, no migration; CURRENT_SCHEMA_VERSION stays 12. Filter only over existing lifecycles.status / task_id columns.",
+      "Implement the method on all three backends in this same change so the contract-parity suite passes; do not leave Postgres to a raising or divergent path (criterion 4, audit M1).",
+      "Collection and Status are already-pure imports for store_protocols; do not introduce a serialization helper or a sqlite Row return type that would drag a forbidden import into the pure module (V2).",
+      "Commit the change with a clear conventional-commit message before reporting done; no emojis."
+    ],
+    "non_goals": [
+      "Do not author or edit anything under .flywheel/holdout/00030-cross-task-query-surface/ -- that fenced held-out grading surface is authored separately; do not weaken, delete, or read it to fit an implementation.",
+      "Do not modify, weaken, skip, or delete any assertion in packages/flywheel-core/tests/ (especially the store-contract parity assertions, the Postgres parametrization, and the purity tests).",
+      "Do not add a cost/spend aggregate (SUM/rollup), list_claims, or any ClaimStore method -- those are other specs (audit Q2/Q3).",
+      "Do not persist the prerequisite DAG or add a prerequisites column (D-5, audit Q4).",
+      "Do not bump CURRENT_SCHEMA_VERSION or add any schema column/index.",
+      "Do not migrate the orchestrator call sites here -- that is a separate dependent task."
+    ],
+    "edge_cases": [
+      "A status filter matching no stored lifecycle returns == [] and raises no error (criterion 6); a None/sentinel return that callers must special-case fails the visible test.",
+      "Ordering (criterion 3, recast by D-7) is held-out-graded through three relations that need no caller-injected updated_at: (a) metamorphic determinism -- two identical task-id-filtered calls return a byte-identical run_id sequence (an unordered or run-to-run-churning result fails); (b) recency -- a row whose updated_at the store advanced via a real update_lifecycle write sorts first; (c) the run_id DESC tiebreak decides only same-updated_at rows (the store sets updated_at from its own clock, so a tie is observed opportunistically, never forced). Relying on insertion order (which differs memory vs sqlite vs postgres) fails both ordering (3) and parity (4).",
+      "No-filter call returns one entry per run_id with attempts populated identically to load_lifecycle(run_id).attempts; returning only active rows, or rows with empty/None attempts, fails (criterion 2).",
+      "Reopening a fresh store on an existing v12 db must list prior lifecycles without a re-create (criterion 9); a bumped CURRENT_SCHEMA_VERSION would force a StoreSchemaError re-create and fails.",
+      "Holding only the db file with no .flywheel/tasks tree on disk, the list answers entirely through the protocol (criterion 5); any path that reads task files behind the protocol fails."
+    ],
+    "notes": [
+      "This is spec 00030 (.flywheel/specs/00030-FEATURE-cross-task-query-surface.md). The protocol-contract layer in the decomposition hint has no standalone observable behavior, so it is folded into this task -- the backends are what make the new method observable.",
+      "Criterion 3's ordering contract (SI-5) is held-out-graded by the metamorphic-determinism/recency/run_id-DESC-tiebreak test added under .flywheel/holdout/00030-cross-task-query-surface/ per D-7 (2026-06-17); the behavior-held-out grader runs the whole holdout dir, so this ordering coverage runs with the rest. Implement (updated_at DESC, run_id DESC) so identical calls are byte-identical, a freshly updated row sorts first, and same-updated_at rows fall back to run_id DESC -- do not derive order from insertion sequence.",
+      "Spec 00032 will later re-implement this exact method verbatim on PostgresStore and lift the open_sqlite_bound_store refusal; it depends on this surface, not the reverse. The method must nonetheless work on all three backends now (criterion 4)."
+    ]
+  }
+}

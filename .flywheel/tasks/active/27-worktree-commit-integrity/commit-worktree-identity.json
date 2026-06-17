@@ -1,0 +1,50 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "name": "commit-identity-held-out",
+      "run": "uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k commit_identity"
+    },
+    {
+      "type": "command",
+      "name": "deterministic-identity-held-out",
+      "run": "uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k deterministic_identity"
+    },
+    {
+      "type": "command",
+      "name": "worktree-suite-intact",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py"
+    }
+  ],
+  "id": "commit-worktree-identity",
+  "goal": "The worker establishes a deterministic git identity on every provisioned worktree so an in-sandbox git commit succeeds with no global or system git identity present.",
+  "tags": ["worktree", "commit-integrity", "spec-00027"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter.prepare_sandbox and its _add_worktree/_discard_and_recreate helpers (worktree provisioning); add the identity step on every freshly provisioned worktree here",
+      "packages/flywheel-worktree/tests/test_worker.py -- the existing worktree suite (prepare/submit/run_once); keep every test green",
+      ".flywheel/specs/00027-FEATURE-worktree-commit-integrity.md -- criteria 1, 2 and D-3 (identity reachable WITHOUT a global/system gitconfig); Decomposition Layer A"
+    ],
+    "constraints": [
+      "The committer/author name and email must be fixed module-level constants in worker.py (one named constant each), identical across every worktree this worker provisions in a repo -- not random, UUID, timestamp, or per-run derived (criterion 2).",
+      "The identity must be reachable by a plain `git commit` run inside the worktree under a scrubbed environment (empty HOME/XDG_CONFIG_HOME, GIT_CONFIG_NOSYSTEM=1) -- i.e. it must live on a surface the in-worktree git process reads with no ambient config, such as worktree-local `git config user.name/user.email`. An identity injected only into the worker's own subprocess environment (GIT_AUTHOR_*/GIT_COMMITTER_* on the worker process) is NOT seen by the agent's separate in-sandbox commit and will fail criterion 1.",
+      "Apply the identity on every freshly created worktree path in prepare_sandbox (the brand-new -b branch path, the recreate-on-surviving-branch path, and the discard-and-recreate path); a reused parked worktree already carries its config.",
+      "The worker still authors no commit on the base/operator branch -- this task only makes the AGENT's in-sandbox commit able to succeed; it does NOT add git add/git commit to the worker (D-1).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under packages/flywheel-worktree/tests/ or under .flywheel/holdout/00027-worktree-commit-integrity/ (the held-out grading surface); do not weaken or delete existing assertions.",
+      "Do not touch the dirty-tree-vs-no-op classification at the head of _submit (worker.py:439-457) -- that is the next task.",
+      "Do not touch _ff_merge, _phase_base, base resolution, rebase/re-verify, or the divergent-base park -- those are spec 00026's TAIL.",
+      "Do not add a flywheel.toml config key for the identity; the constants are fixed in code (no [submit]/[sandbox] scaffolding)."
+    ],
+    "edge_cases": [
+      "A per-worktree random/UUID/timestamp identity would pass 'a commit exists' but FAIL the cross-worktree byte-equality assertion -- the identity must be constant across two independently provisioned worktrees.",
+      "Setting identity only in the test repo's own config (the path the scrubbed environment removes) must not be how the commit succeeds -- the worker must establish it itself.",
+      "GIT_CONFIG_NOSYSTEM=1 plus empty HOME means neither system nor global config resolves; only worktree/repo-local config or per-call -c overrides reach the in-worktree commit."
+    ],
+    "notes": [
+      "Held-out graders run `uv run pytest .flywheel/holdout/00027-worktree-commit-integrity/ -k <keyword>`; those tests are authored out-of-band by the fw-verify step (the implementing agent does not write them). The scrubbed-identity environment (empty HOME/XDG_CONFIG_HOME, GIT_CONFIG_NOSYSTEM=1) is a single shared fixture there, exercised by criteria 1, 2 and 6. The holdout path is outside the four pytest testpaths, so a bare `uv run pytest` never collects it; the grader passes the path explicitly."
+    ]
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py -k base",
+      "name": "submit-base-config-behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py packages/flywheel-orchestrator/tests/test_init.py",
+      "name": "policy-and-init-seam-holdout"
+    }
+  ],
+  "id": "land-config-submit-base",
+  "goal": "load_policy exposes WorkPolicy.submit_base from the [submit] base key (default None when absent, PolicyError on empty/non-string), and init renders a commented [submit] base scaffold line.",
+  "tags": ["safe-landing", "config", "policy"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- add submit_base to WorkPolicy and parse [submit] base, mirroring the existing submit_pr_base in _optional_submit_strategy",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _INIT_POLICY_TAIL (~line 1699): append a commented [submit] base scaffold line, leaving the rest of the template untouched",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- keep green; the visible grader runs the -k base subset here",
+      "packages/flywheel-orchestrator/tests/test_init.py -- keep green; the rendered policy must still load_policy without error"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py:356-384 -- _optional_submit_strategy returns (strategy, remote, pr_base); pr_base shows the exact None-default + raise-on-empty/non-string pattern submit_base must mirror"
+    ],
+    "constraints": [
+      "Canonical SI-1: the key is [submit] base, parsed into WorkPolicy.submit_base, default None. None means 'fall back to the checked-out branch' (back-compat); an empty-string or non-string base raises PolicyError. Do NOT rename either surface.",
+      "This task touches only [submit] base. Do NOT add, read, or scaffold a [sandbox] block or any sandbox_setup change -- that surface is owned by spec 00028 and already shipped; appending the [submit] base line must not rewrite or collide with it.",
+      "The [submit] base scaffold line you add to _INIT_POLICY_TAIL is a commented example only; init --defaults must keep writing a policy that load_policy reads as submit_base=None.",
+      "No worker behavior change here -- this slice only extends the config surface. The worker reading submit_base lands in a later task.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under packages/flywheel-orchestrator/tests/ or weaken/delete any assertion; the graders run that surface as-is.",
+      "Do not change worker.py base resolution, _phase_base, _ff_merge, or _submit in this task.",
+      "Do not touch [sandbox] setup / WorkPolicy.sandbox_setup."
+    ],
+    "edge_cases": [
+      "[submit] table present but base key absent must yield submit_base=None and raise no PolicyError (a returned constant of the checked-out branch name here would be wrong).",
+      "No [submit] table at all must still yield submit_base=None (back-compat).",
+      "base = \"\" and base = 42 must each raise PolicyError -- a silent degrade to the checked-out branch must fail the test."
+    ]
+  }
+}

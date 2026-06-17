@@ -1,0 +1,57 @@
+{
+  "id": "agg-list-claims",
+  "goal": "A list_claims method on the ClaimStore protocol and every concrete claim store (in-memory, SQLite, Postgres) enumerates only the currently-held claims, each carrying its task_id, worker_id, claimed_at, lease_expires_at, and version, with released claims absent.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest .flywheel/holdout/00031-spend-and-worker-aggregates/ -q",
+      "name": "held-out-claim-enumeration",
+      "rung": "held-out command (criteria #5 #11): acquires distinct (task_id, worker_id) pairs and asserts set-equality of the enumerated pairs against the set acquired, defeating single-claim / worker-stripped / reconstructed returns"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -q",
+      "name": "claims-contract-seam-holdout",
+      "rung": "composition holdout (criterion #6 + parity): the parameterized memory+sqlite+postgres claims contract harness covers the released-claim-absent case and proves list_claims is implemented identically on every claim backend"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest -q",
+      "name": "full-suite-green",
+      "rung": "command (criteria #10 #11): whole suite run out-of-band; no existing claim test relaxed, deleted, or skipped"
+    }
+  ],
+  "tags": ["orchestrator", "claims", "queryability", "00031"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00031-FEATURE-spend-and-worker-aggregates.md -- the authoritative spec; criteria #5, #6, #10, #11 and SI-10",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- add list_claims to the ClaimStore protocol AND implement it on InMemoryClaimStore (iterate _claims) and SqliteClaimStore (SELECT all task_claims rows)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- implement list_claims on PostgresClaimStore with the same all-rows SELECT over task_claims",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- the parameterized memory+sqlite+postgres claims contract harness; add the visible released-claim-absent assertion here (keep all existing assertions green)"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py:350 -- SqliteClaimStore.load_claim builds a TaskClaim from a single row; list_claims is the all-rows analogue, reusing the same column projection and _parse_iso",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py:180 -- InMemoryClaimStore.load_claim; list_claims returns the live values of the _claims dict"
+    ],
+    "constraints": [
+      "SI-10 (canonical, fixed contract): signature is list_claims(self) -> list[TaskClaim], returning ONE TaskClaim per currently-held claim, each carrying task_id, worker_id, claimed_at, lease_expires_at, version. Do not change this name or shape -- downstream spec 00032 implements it verbatim on Postgres.",
+      "Released/deleted claims (rows removed by release_claim) must be absent from the result; the listing reports raw held-row state, so an expired-but-not-yet-stolen lease still appears (consistent with the existing load_claim contract). Do not filter on lease expiry.",
+      "Claim enumeration stays in the orchestrator layer (flywheel-orchestrator); do NOT add anything claim-related to flywheel-core -- core must not learn about workers.",
+      "SI-9: no schema change to task_claims and no orchestrator_schema_version bump; list_claims reads existing columns only.",
+      "Commit the change with a Conventional Commits message (e.g. 'feat:') before reporting done.",
+      "Run mcp__ide__getDiagnostics on every .py file you touch and fix all Pylance errors before reporting done."
+    ],
+    "non_goals": [
+      "GRADING SURFACE -- do not create, edit, read, or open anything under .flywheel/holdout/00031-spend-and-worker-aggregates/. The held-out claim-enumeration test seeds (task_id, worker_id) pairs your implementation does not see.",
+      "Do not weaken, delete, or @skip any existing test under packages/*/tests/.",
+      "Do not add cross-task selection / scheduling logic (which task runs next) -- that stays above and is out of scope here.",
+      "Do not add a filter-by-worker or filter-by-status parameter to list_claims -- it takes no arguments per SI-10."
+    ],
+    "edge_cases": [
+      "Two or more live claims owned by distinct workers: the enumerated set of (task_id, worker_id) pairs equals the set acquired, order-independent -- a single-claim return must fail.",
+      "Each entry carries the worker_id, not just the task_id -- a task-ids-only return must fail.",
+      "After release_claim on one of two held claims, only the still-held claim's task_id is present -- a stale snapshot that still reports the freed worker must fail.",
+      "Empty claim store returns an empty list, never None and never a raise."
+    ]
+  }
+}

@@ -114,12 +114,18 @@ def test_foreign_offline_install_and_run(dist_dir: Path, tmp_path: Path) -> None
     flywheel_bin = bindir / ("flywheel.exe" if os.name == "nt" else "flywheel")
     assert flywheel_bin.exists(), "the install did not create the `flywheel` console script"
 
-    # 3. A foreign cwd git repo that is NOT this checkout.
+    # 3. A foreign cwd git repo that is NOT this checkout. A legitimate adopter
+    #    runs init in a real repo on an attached branch with at least one commit
+    #    (flywheel's init preflight refuses a detached/unborn HEAD), so seed one.
     repo = tmp_path / "foreign_repo"
     repo.mkdir()
     _run(["git", "init", "-b", "main"], cwd=repo, check=True)
     _run(["git", "config", "user.email", "a@b.invalid"], cwd=repo, check=True)
     _run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+    _run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    (repo / "README.md").write_text("foreign adopter repo\n")
+    _run(["git", "add", "-A"], cwd=repo, check=True)
+    _run(["git", "commit", "-m", "init"], cwd=repo, check=True)
 
     # Scrub the workspace off the subprocess path so a false "it only worked
     # because the source tree was importable" pass cannot happen.

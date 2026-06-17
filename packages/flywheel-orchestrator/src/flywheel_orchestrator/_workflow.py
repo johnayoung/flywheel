@@ -155,35 +155,26 @@ def _latest_lifecycle_row(
     awaiting_manual_ordinal)`` of the most recent lifecycle for
     ``task_id``, or ``None`` if no lifecycle exists.
 
-    Uses the SQLite connection directly because no Protocol method exposes
-    a by-task-id lookup — and adding one would leak workflow concerns into
-    the store contract. ``blocked_requires_json`` is returned verbatim so
-    callers can decide whether to parse it (text status flattens, JSON
-    status emits the decoded list). ``awaiting_manual_ordinal`` is the
-    index in ``task.graders`` of the manual gate a parked
-    ``AWAITING_APPROVAL`` lifecycle is pinned to; ``NULL`` in every
-    other state.
+    The by-task-id lookup goes through the public ``list_lifecycles``
+    surface (SI-3): the most-recently-updated lifecycle for a task is the
+    first element of the ``(updated_at DESC, run_id DESC)`` ordered result
+    ``list_lifecycles(task_id=...)`` returns on every backend.
+    ``blocked_requires_json`` is returned verbatim so callers can decide
+    whether to parse it (text status flattens, JSON status emits the
+    decoded list). ``awaiting_manual_ordinal`` is the index in
+    ``task.graders`` of the manual gate a parked ``AWAITING_APPROVAL``
+    lifecycle is pinned to; ``None`` in every other state.
     """
-    cursor = store._connection.execute(  # noqa: SLF001 — intentional
-        """
-        SELECT run_id, status, error, blocked_requires_json,
-               awaiting_manual_ordinal
-        FROM lifecycles
-        WHERE task_id = ?
-        ORDER BY updated_at DESC, run_id DESC
-        LIMIT 1
-        """,
-        (task_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
+    lifecycles = store.list_lifecycles(task_id=task_id)
+    if not lifecycles:
         return None
+    lc = lifecycles[0]
     return (
-        row["run_id"],
-        Status(row["status"]),
-        row["error"] or "",
-        row["blocked_requires_json"],
-        row["awaiting_manual_ordinal"],
+        lc.run_id,
+        lc.status,
+        lc.error or "",
+        lc.blocked_requires_json,
+        lc.awaiting_manual_ordinal,
     )
 
 def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
@@ -890,19 +881,23 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
     the pending manual-gate instruction. The instruction is resolved
     from the task definition pinned to the run.
     """
-    conn = store._connection  # noqa: SLF001
-    lifecycles = conn.execute(
-        """
-        SELECT run_id, task_id, status, awaiting_manual_ordinal,
-               timestamps_json, worker_id
-        FROM lifecycles
-        WHERE status IN ('running', 'validating', 'awaiting_approval')
-        ORDER BY task_id, run_id
-        """
-    ).fetchall()
+    # Cross-task lifecycle read through the public protocol surface (SI-3),
+    # off the private connection. The per-run attempts join below stays on
+    # the private connection (D-4) — list_attempts already serves it, but
+    # the rolled-up token/cost/turn aggregation is local to this function.
+    active_statuses = (
+        Status.RUNNING,
+        Status.VALIDATING,
+        Status.AWAITING_APPROVAL,
+    )
+    lifecycles = store.list_lifecycles(statuses=active_statuses)
+    # list_lifecycles orders by (updated_at DESC, run_id DESC); the live
+    # surface renders sorted by task_id (ties by run_id) per spec 00011.
+    lifecycles.sort(key=lambda lc: (lc.task_id, lc.run_id))
+    conn = store._connection  # noqa: SLF001 — attempts join stays per D-4
     rows: list[LiveRunRow] = []
     for lc in lifecycles:
-        run_id = lc["run_id"]
+        run_id = lc.run_id
         attempts = conn.execute(
             """
             SELECT number, started_at, input_tokens, output_tokens,
@@ -949,21 +944,25 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
                 last_kind = "ATTEMPT"
                 last_detail = f"attempt {attempt} started"
                 last_ts = _parse_db_ts(latest["started_at"])
-        started_at = _earliest_lifecycle_ts(lc["timestamps_json"])
-        # Null or empty-string column -> None (never a sentinel), so an
-        # unset worker is distinguishable from a real id (SI-11).
-        worker_id = lc["worker_id"] or None
-        status = Status(lc["status"])
+        # Earliest recorded transition timestamp off the folded Lifecycle's
+        # per-status stamps (retries overwrite ready/running, so the minimum
+        # is the stable "when did this run start" answer).
+        started_at = min(lc.timestamps.values()) if lc.timestamps else None
+        # Empty-string worker_id (the unset default) -> None (never a
+        # sentinel), so an unset worker is distinguishable from a real id
+        # (SI-11).
+        worker_id = lc.worker_id or None
+        status = lc.status
         awaiting_instruction = _resolve_awaiting_instruction(
             store,
             run_id=run_id,
             status=status,
-            awaiting_ordinal=lc["awaiting_manual_ordinal"],
+            awaiting_ordinal=lc.awaiting_manual_ordinal,
         )
         rows.append(
             LiveRunRow(
                 run_id=run_id,
-                task_id=lc["task_id"],
+                task_id=lc.task_id,
                 status=status,
                 attempt=attempt,
                 iteration=iteration,
@@ -980,30 +979,6 @@ def collect_live_rows(store: SqliteStore) -> list[LiveRunRow]:
             )
         )
     return rows
-
-def _earliest_lifecycle_ts(timestamps_json: str | None) -> datetime | None:
-    """Earliest transition timestamp recorded on a lifecycle row.
-
-    ``timestamps_json`` is keyed by status, and retries overwrite the
-    ``ready``/``running`` keys with the latest transition -- so the
-    minimum across all recorded values is the only stable "when did
-    this run start" answer. Unparseable JSON or values degrade to
-    ``None`` (the caller renders the age as unknown).
-    """
-    if not timestamps_json:
-        return None
-    try:
-        payload = json.loads(timestamps_json)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    parsed = [
-        ts
-        for value in payload.values()
-        if isinstance(value, str) and (ts := _parse_db_ts(value)) is not None
-    ]
-    return min(parsed) if parsed else None
 
 def _resolve_awaiting_instruction(
     store: SqliteStore,
@@ -1323,16 +1298,17 @@ def _list_blocked_lifecycles(store: SqliteStore) -> list[tuple[str, str]]:
     leave the column NULL) are intentionally excluded so they keep using
     the existing run_task entry-time normalization to resume.
     """
-    cursor = store._connection.execute(  # noqa: SLF001 — intentional
-        """
-        SELECT run_id, task_id
-        FROM lifecycles
-        WHERE status = ? AND blocked_requires_json IS NOT NULL
-        ORDER BY updated_at
-        """,
-        (Status.INTERRUPTED.value,),
-    )
-    return [(row["run_id"], row["task_id"]) for row in cursor.fetchall()]
+    # Cross-task lifecycle read through the public protocol surface (SI-3),
+    # off the private connection. list_lifecycles orders (updated_at DESC,
+    # run_id DESC); reverse to keep the original oldest-updated-first scan
+    # order, then keep only the recheck-eligible rows (non-NULL persisted
+    # requires snapshot).
+    interrupted = store.list_lifecycles(statuses=(Status.INTERRUPTED,))
+    return [
+        (lc.run_id, lc.task_id)
+        for lc in reversed(interrupted)
+        if lc.blocked_requires_json is not None
+    ]
 
 def _format_recheck_line(
     run_id: str, outcome: RecheckOutcome, *, dry_run: bool

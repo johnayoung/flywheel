@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
 
-from flywheel_core.lifecycle import Status
+from flywheel_core.lifecycle import Lifecycle, Status
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.store_protocols import GraderResultRecord
 from flywheel_core.task import Task
@@ -179,32 +179,6 @@ def build_task_phase_index(tasks_dir: Path) -> dict[str, str]:
     return index
 
 
-def _parse_ts(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def _timestamps(timestamps_json: object) -> dict[str, datetime]:
-    if not isinstance(timestamps_json, str) or not timestamps_json:
-        return {}
-    try:
-        payload = json.loads(timestamps_json)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, Mapping):
-        return {}
-    out: dict[str, datetime] = {}
-    for key, value in payload.items():
-        ts = _parse_ts(value)
-        if ts is not None:
-            out[str(key)] = ts
-    return out
-
-
 def _attempt_rollups(
     store: SqliteStore, run_id: str
 ) -> tuple[int, int, float, int]:
@@ -231,25 +205,29 @@ def _attempt_rollups(
 
 
 def _history_run_from_row(
-    store: SqliteStore, row: Mapping[str, object]
+    store: SqliteStore, lifecycle: Lifecycle
 ) -> HistoryRun:
-    status = Status(str(row["status"]))
-    stamps = _timestamps(row["timestamps_json"])
-    finished = stamps.get(status.value) or _parse_ts(row["updated_at"])
+    status = lifecycle.status
+    stamps = lifecycle.timestamps
+    # The terminal transition's timestamp is the honest finish instant; for
+    # a folded Lifecycle the per-status stamps are the only timestamp source
+    # (the store-set updated_at column is not a Lifecycle field). A terminal
+    # run always records its terminal status' stamp, so this resolves in
+    # practice; an unstamped row degrades finished_at to None.
+    finished = stamps.get(status)
     started = min(stamps.values()) if stamps else None
     attempts, tokens, cost, turns = _attempt_rollups(
-        store, str(row["run_id"])
+        store, lifecycle.run_id
     )
-    raw_retries = row["retries"]
     return HistoryRun(
-        run_id=str(row["run_id"]),
-        task_id=str(row["task_id"]),
+        run_id=lifecycle.run_id,
+        task_id=lifecycle.task_id,
         status=status,
-        source=str(row["source"] or ""),
+        source=lifecycle.source or "",
         started_at=started,
         finished_at=finished,
-        retries=raw_retries if isinstance(raw_retries, int) else 0,
-        error=str(row["error"] or ""),
+        retries=lifecycle.retries,
+        error=lifecycle.error or "",
         attempts=attempts,
         tokens_total=tokens,
         cost_usd_total=cost,
@@ -262,24 +240,12 @@ def _select_lifecycles(
     *,
     statuses: tuple[Status, ...],
     task_id: str | None = None,
-) -> list[Mapping[str, object]]:
-    placeholders = ", ".join("?" for _ in statuses)
-    params: list[object] = [s.value for s in statuses]
-    task_clause = ""
-    if task_id is not None:
-        task_clause = "AND task_id = ?"
-        params.append(task_id)
-    cursor = store._connection.execute(  # noqa: SLF001 — read-side, like collect_live_rows
-        f"""
-        SELECT run_id, task_id, status, retries, error, source,
-               timestamps_json, updated_at
-        FROM lifecycles
-        WHERE status IN ({placeholders}) {task_clause}
-        ORDER BY updated_at DESC, run_id DESC
-        """,
-        params,
-    )
-    return cursor.fetchall()
+) -> list[Lifecycle]:
+    # Cross-task lifecycle read through the public protocol surface (SI-3),
+    # off the private connection. list_lifecycles already returns rows in
+    # (updated_at DESC, run_id DESC) order across every backend, so the
+    # latest-for-a-task pick and the history ordering are preserved exactly.
+    return store.list_lifecycles(statuses=statuses, task_id=task_id)
 
 
 def collect_history_rows(
@@ -300,8 +266,8 @@ def collect_history_rows(
     """
     rows: dict[str, HistoryRow] = {}
     priors: dict[str, list[HistoryRun]] = {}
-    for db_row in _select_lifecycles(store, statuses=statuses):
-        run = _history_run_from_row(store, db_row)
+    for lifecycle in _select_lifecycles(store, statuses=statuses):
+        run = _history_run_from_row(store, lifecycle)
         existing = rows.get(run.task_id)
         if existing is None:
             derived = phase_from_source(run.source)
@@ -348,16 +314,11 @@ def resolve_run_id(store: SqliteStore, run_or_task_id: str) -> str | None:
     """
     if store.load_lifecycle(run_or_task_id) is not None:
         return run_or_task_id
-    row = store._connection.execute(  # noqa: SLF001 — read-side, like collect_live_rows
-        """
-        SELECT run_id FROM lifecycles
-        WHERE task_id = ?
-        ORDER BY updated_at DESC, run_id DESC
-        LIMIT 1
-        """,
-        (run_or_task_id,),
-    ).fetchone()
-    return str(row["run_id"]) if row is not None else None
+    # Treat the argument as a task id: the most-recently-updated lifecycle
+    # (any status) is the first element of the (updated_at DESC, run_id DESC)
+    # ordered list_lifecycles result for that task.
+    lifecycles = store.list_lifecycles(task_id=run_or_task_id)
+    return lifecycles[0].run_id if lifecycles else None
 
 
 def collect_run_detail(
@@ -375,16 +336,7 @@ def collect_run_detail(
     lifecycle = store.load_lifecycle(run_id)
     if lifecycle is None:
         return None
-    db_rows = store._connection.execute(  # noqa: SLF001 — read-side, like collect_live_rows
-        """
-        SELECT run_id, task_id, status, retries, error, source,
-               timestamps_json, updated_at
-        FROM lifecycles
-        WHERE run_id = ?
-        """,
-        (run_id,),
-    ).fetchall()
-    run = _history_run_from_row(store, db_rows[0])
+    run = _history_run_from_row(store, lifecycle)
 
     derived = phase_from_source(run.source)
     if derived is None and fallback_phases is not None:
@@ -413,13 +365,13 @@ def collect_run_detail(
         )
 
     related = tuple(
-        _history_run_from_row(store, row)
-        for row in _select_lifecycles(
+        _history_run_from_row(store, other)
+        for other in _select_lifecycles(
             store,
             statuses=tuple(Status),
             task_id=run.task_id,
         )
-        if str(row["run_id"]) != run_id
+        if other.run_id != run_id
     )
 
     return RunDetail(

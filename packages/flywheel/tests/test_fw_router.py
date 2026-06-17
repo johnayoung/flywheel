@@ -9,6 +9,7 @@ unchanged (FR-4 of spec 00021).
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,6 +143,17 @@ def test_fw_init_scaffolds_flywheel_dir(
 ) -> None:
     """``fw init`` delegates to the orchestrator's init, which scaffolds
     ``.flywheel/`` and ``flywheel.toml`` in the working directory."""
+    # init's git preflight (spec 00028) refuses a non-git working dir, so
+    # run inside a real attached-branch repo with one commit.
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "test@flywheel.invalid"),
+        ("config", "user.name", "Flywheel Test"),
+        ("commit", "--allow-empty", "-m", "root"),
+    ):
+        subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True
+        )
     monkeypatch.chdir(tmp_path)
     rc = main(["init"])
     assert rc == 0

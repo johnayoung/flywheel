@@ -638,6 +638,85 @@ def test_attempt_aggregates_default_to_zero(store: object) -> None:
     assert loaded.last_activity_at is None
 
 
+def test_summarize_spend_empty_store_is_all_zero(store: object) -> None:
+    """An empty store sums to all-zero totals (never None, never a raise),
+    both unbounded and inside a bounded window."""
+    assert isinstance(store, LifecycleStore)
+    summary = store.summarize_spend()
+    assert summary.input_tokens == 0
+    assert summary.output_tokens == 0
+    assert summary.cache_creation_tokens == 0
+    assert summary.cache_read_tokens == 0
+    assert summary.total_cost_usd == 0.0
+    windowed = store.summarize_spend(
+        since=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        until=datetime(2024, 1, 2, tzinfo=timezone.utc),
+    )
+    assert windowed.input_tokens == 0
+    assert windowed.total_cost_usd == 0.0
+
+
+def test_summarize_spend_sums_across_runs_and_honors_window(
+    store: object,
+) -> None:
+    """summarize_spend sums every attempt of every run; a half-open
+    [since, until) window on last_activity_at includes the lower bound and
+    excludes the upper bound, and a window covering no attempt returns the
+    all-zero summary rather than the grand total."""
+    assert isinstance(store, LifecycleStore)
+    assert isinstance(store, AttemptStore)
+    _ensure_lifecycle(store, "ra", "ta")
+    _ensure_lifecycle(store, "rb", "tb")
+    early = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    late = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    store.save_attempt(
+        "ra",
+        Attempt(
+            number=1,
+            started_at=early,
+            run_id="ra",
+            input_tokens=100,
+            output_tokens=10,
+            cache_creation_input_tokens=2,
+            cache_read_input_tokens=1,
+            total_cost_usd=0.5,
+            last_activity_at=early,
+        ),
+    )
+    store.save_attempt(
+        "rb",
+        Attempt(
+            number=1,
+            started_at=late,
+            run_id="rb",
+            input_tokens=300,
+            output_tokens=30,
+            cache_creation_input_tokens=6,
+            cache_read_input_tokens=3,
+            total_cost_usd=1.5,
+            last_activity_at=late,
+        ),
+    )
+    grand = store.summarize_spend()
+    assert grand.input_tokens == 400
+    assert grand.output_tokens == 40
+    assert grand.cache_creation_tokens == 8
+    assert grand.cache_read_tokens == 4
+    assert grand.total_cost_usd == 2.0
+    # Half-open window [early, late): includes the lower bound, excludes
+    # the upper bound -> only the "ra" attempt at ``early``.
+    windowed = store.summarize_spend(since=early, until=late)
+    assert windowed.input_tokens == 100
+    assert windowed.total_cost_usd == 0.5
+    # A window covering no attempt is all-zero, not the grand total.
+    empty = store.summarize_spend(
+        since=datetime(2025, 1, 1, tzinfo=timezone.utc),
+        until=datetime(2025, 1, 2, tzinfo=timezone.utc),
+    )
+    assert empty.input_tokens == 0
+    assert empty.total_cost_usd == 0.0
+
+
 def test_save_attempt_with_matching_expected_version_succeeds(
     store: object,
 ) -> None:

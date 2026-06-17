@@ -77,6 +77,7 @@ from flywheel_core.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
+    SpendSummary,
     StoreSchemaError,
 )
 
@@ -593,6 +594,60 @@ class PostgresStore:
                 run_ids = [row["run_id"] for row in cur.fetchall()]
         folded = [self.load_lifecycle(run_id) for run_id in run_ids]
         return [lc for lc in folded if lc is not None]
+
+    def summarize_spend(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> SpendSummary:
+        # SUM over every attempt's four token columns + cost. The window is
+        # half-open [since, until) on last_activity_at; a bounded window
+        # also requires last_activity_at IS NOT NULL so an attempt with an
+        # unknown activity instant counts toward the unbounded grand total
+        # but never lands inside a bounded window — matching the SQLite and
+        # in-memory backends exactly. COALESCE keeps an empty result set
+        # (or empty window) at all-zero totals rather than NULL.
+        clauses: list[str] = []
+        params: list[object] = []
+        if since is not None:
+            clauses.append(
+                "last_activity_at IS NOT NULL AND last_activity_at >= %s"
+            )
+            params.append(since)
+        if until is not None:
+            clauses.append(
+                "last_activity_at IS NOT NULL AND last_activity_at < %s"
+            )
+            params.append(until)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                        COALESCE(SUM(cache_creation_input_tokens), 0)
+                            AS cache_creation_tokens,
+                        COALESCE(SUM(cache_read_input_tokens), 0)
+                            AS cache_read_tokens,
+                        COALESCE(SUM(total_cost_usd), 0.0)
+                            AS total_cost_usd
+                    FROM attempts
+                    {where}
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+        assert row is not None
+        return SpendSummary(
+            input_tokens=int(row["input_tokens"]),
+            output_tokens=int(row["output_tokens"]),
+            cache_creation_tokens=int(row["cache_creation_tokens"]),
+            cache_read_tokens=int(row["cache_read_tokens"]),
+            total_cost_usd=float(row["total_cost_usd"]),
+        )
 
     # --- TaskStore --------------------------------------------------------
 

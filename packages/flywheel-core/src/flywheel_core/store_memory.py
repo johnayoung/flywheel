@@ -46,6 +46,7 @@ from flywheel_core.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
+    SpendSummary,
 )
 
 
@@ -246,6 +247,41 @@ class InMemoryStore:
         matched.sort(key=lambda rid: (self._lifecycle_updated[rid], rid), reverse=True)
         folded = [self.load_lifecycle(rid) for rid in matched]
         return [lc for lc in folded if lc is not None]
+
+    def summarize_spend(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> SpendSummary:
+        input_tokens = 0
+        output_tokens = 0
+        cache_creation_tokens = 0
+        cache_read_tokens = 0
+        total_cost_usd = 0.0
+        for attempt in self._attempts.values():
+            # Half-open [since, until) on last_activity_at. An attempt with
+            # no last_activity_at counts toward the unbounded total but is
+            # excluded from any bounded window.
+            activity = attempt.last_activity_at
+            if since is not None:
+                if activity is None or activity < since:
+                    continue
+            if until is not None:
+                if activity is None or activity >= until:
+                    continue
+            input_tokens += attempt.input_tokens
+            output_tokens += attempt.output_tokens
+            cache_creation_tokens += attempt.cache_creation_input_tokens
+            cache_read_tokens += attempt.cache_read_input_tokens
+            total_cost_usd += attempt.total_cost_usd
+        return SpendSummary(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+            total_cost_usd=total_cost_usd,
+        )
 
     # --- TaskStore ---------------------------------------------------------
 

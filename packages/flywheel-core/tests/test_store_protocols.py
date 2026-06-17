@@ -32,6 +32,7 @@ from flywheel_core import (
     LifecycleStore,
     OptimisticConcurrencyError,
     SdkMessageRecord,
+    SpendSummary,
     StoreConflictError,
     StoreSchemaError,
     TelemetryRecord,
@@ -61,6 +62,14 @@ class _LifecycleStub:
         task_id: str | None = None,
     ) -> list[Lifecycle]:
         return []
+
+    def summarize_spend(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> SpendSummary:
+        return SpendSummary()
 
 
 class _AttemptStub:

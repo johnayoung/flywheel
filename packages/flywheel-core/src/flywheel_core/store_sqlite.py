@@ -62,6 +62,7 @@ from flywheel_core.store_protocols import (
     LifecycleAlreadyExistsError,
     LifecycleNotFoundError,
     OptimisticConcurrencyError,
+    SpendSummary,
     StoreSchemaError,
 )
 
@@ -409,6 +410,53 @@ class SqliteStore:
         ).fetchall()
         folded = [self.load_lifecycle(row["run_id"]) for row in rows]
         return [lc for lc in folded if lc is not None]
+
+    def summarize_spend(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> SpendSummary:
+        # Read the four token columns + cost + the window column for every
+        # attempt and fold in Python. The window is half-open
+        # [since, until) on last_activity_at with NULL excluded from any
+        # bounded window; applying the predicate in Python against parsed
+        # datetimes guarantees byte-identical semantics with the in-memory
+        # and Postgres backends regardless of the stored ISO string's
+        # timezone offset (a raw SQL string compare would not).
+        rows = self._connection.execute(
+            """
+            SELECT input_tokens, output_tokens,
+                   cache_creation_input_tokens, cache_read_input_tokens,
+                   total_cost_usd, last_activity_at
+            FROM attempts
+            """
+        ).fetchall()
+        input_tokens = 0
+        output_tokens = 0
+        cache_creation_tokens = 0
+        cache_read_tokens = 0
+        total_cost_usd = 0.0
+        for row in rows:
+            activity = _parse_iso(row["last_activity_at"])
+            if since is not None and (activity is None or activity < since):
+                continue
+            if until is not None and (activity is None or activity >= until):
+                continue
+            input_tokens += int(row["input_tokens"] or 0)
+            output_tokens += int(row["output_tokens"] or 0)
+            cache_creation_tokens += int(
+                row["cache_creation_input_tokens"] or 0
+            )
+            cache_read_tokens += int(row["cache_read_input_tokens"] or 0)
+            total_cost_usd += float(row["total_cost_usd"] or 0.0)
+        return SpendSummary(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
+            total_cost_usd=total_cost_usd,
+        )
 
     # --- TaskStore --------------------------------------------------------
 

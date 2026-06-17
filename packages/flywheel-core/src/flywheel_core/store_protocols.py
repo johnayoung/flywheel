@@ -252,6 +252,29 @@ class ControlCommandRecord:
     id: int | None = None
 
 
+# --- Aggregate read shapes --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpendSummary:
+    """Cross-run token and cost totals returned by ``summarize_spend``.
+
+    A plain frozen dataclass over primitive fields — it carries no IO or
+    persistence coupling so the pure type module stays import-clean. The
+    four token fields mirror the ``attempts`` aggregate columns
+    (``input_tokens``, ``output_tokens``, ``cache_creation_input_tokens``,
+    ``cache_read_input_tokens``) summed across every attempt of every run;
+    ``total_cost_usd`` is the matching ``SUM(total_cost_usd)``. An empty
+    store (or an empty window) yields all-zero totals, never ``None``.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    total_cost_usd: float = 0.0
+
+
 # --- Store protocols --------------------------------------------------------
 
 
@@ -316,6 +339,35 @@ class LifecycleStore(Protocol):
         ties broken by greater ``run_id``. The order is deterministic
         (identical calls return a byte-identical ``run_id`` sequence) and
         identical across every backend.
+        """
+        ...
+
+    def summarize_spend(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> SpendSummary:
+        """Sum token and cost spend across every attempt of every run.
+
+        The cross-run analogue of the per-run rollup: holding only the
+        store, a caller gets the grand total of the four ``attempts``
+        token columns plus ``total_cost_usd`` as a :class:`SpendSummary`,
+        without a ``WorkSource`` or on-disk task files.
+
+        ``since``/``until`` are keyword-only and optional; when supplied
+        they bound a half-open window ``[since, until)`` on each attempt's
+        ``last_activity_at``. An attempt exactly at ``since`` is included;
+        one exactly at ``until`` is excluded. An attempt whose
+        ``last_activity_at`` is unset (``None``) contributes to the
+        unbounded grand total but is excluded from any bounded window
+        (its activity instant is unknown, so it cannot be placed inside a
+        window). The identical predicate runs on every backend, so all
+        backends return the same totals for the same data.
+
+        An empty store, or a window containing no attempt, returns a
+        :class:`SpendSummary` of all-zero totals — never ``None`` and
+        never the grand total in place of an empty window.
         """
         ...
 
@@ -553,6 +605,7 @@ __all__ = [
     "LifecycleStore",
     "OptimisticConcurrencyError",
     "SdkMessageRecord",
+    "SpendSummary",
     "StoreConflictError",
     "StoreSchemaError",
     "TaskStore",

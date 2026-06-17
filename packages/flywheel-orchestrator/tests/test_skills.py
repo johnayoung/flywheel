@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import io
 from pathlib import Path
@@ -24,6 +25,18 @@ from flywheel_orchestrator._workflow import main
 
 @pytest.fixture
 def repo(tmp_path: Path, monkeypatch) -> Path:
+    # init's git preflight (spec 00028) refuses a non-git working dir, so
+    # the fixture is a real attached-branch repo with one commit -- the
+    # state a legitimate adopter running `flywheel init` is in.
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.email", "test@flywheel.invalid"),
+        ("config", "user.name", "Flywheel Test"),
+        ("commit", "--allow-empty", "-m", "root"),
+    ):
+        subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True
+        )
     monkeypatch.chdir(tmp_path)
     return tmp_path
 

@@ -10,6 +10,7 @@ from flywheel_core.events import (
     DomainEventKind,
     EventReplayError,
     GraderEvaluated,
+    LandingParked,
     LifecycleInitialized,
     RetryScheduled,
     SessionRecorded,
@@ -18,6 +19,7 @@ from flywheel_core.events import (
     apply,
     replay,
 )
+from flywheel_core.event_serde import event_from_record, event_kind, event_payload
 from flywheel_core.lifecycle import Lifecycle, LifecycleTransitionError, Outcome, Status
 
 
@@ -230,6 +232,12 @@ def test_identity_fold_events_only_advance_version() -> None:
             command_payload={"text": "focus on graders"},
             command_id=7,
         ),
+        LandingParked(
+            run_id="run-1",
+            ts=_ts(2),
+            park_kind="uncommitted-work",
+            detail="DONE with an uncommitted tree on flywheel/01/t1",
+        ),
     ):
         after = apply(before, identity_event)
         assert after.version == before.version + 1
@@ -304,3 +312,60 @@ def test_domain_event_kind_discriminator_is_stable() -> None:
     assert TransitionedTo.KIND is DomainEventKind.TRANSITIONED_TO
     assert GraderEvaluated.KIND is DomainEventKind.GRADER_EVALUATED
     assert CommandApplied.KIND is DomainEventKind.COMMAND_APPLIED
+    assert LandingParked.KIND is DomainEventKind.LANDING_PARKED
+    # Wire tag is the stable persisted discriminator (SI-12).
+    assert DomainEventKind.LANDING_PARKED.value == "landing_parked"
+
+
+def test_landing_parked_folds_to_identity_leaving_terminal_done() -> None:
+    # A DONE run that parks at submit: the audit-witness event advances version
+    # only and never moves the run off its terminal DONE status (D-6).
+    done = replay(
+        [
+            _init(0),
+            TransitionedTo(run_id="run-1", ts=_ts(1), target=Status.READY),
+            TransitionedTo(run_id="run-1", ts=_ts(2), target=Status.RUNNING),
+            TransitionedTo(run_id="run-1", ts=_ts(3), target=Status.VALIDATING),
+            TransitionedTo(run_id="run-1", ts=_ts(4), target=Status.DONE),
+        ]
+    )
+    assert done.status is Status.DONE
+
+    parked = apply(
+        done,
+        LandingParked(
+            run_id="run-1",
+            ts=_ts(4),
+            park_kind="divergent-base",
+            detail="base advanced; rebase conflicted",
+        ),
+    )
+    assert parked.status is Status.DONE
+    assert parked.version == done.version + 1
+
+
+def test_landing_parked_round_trips_through_serde() -> None:
+    event = LandingParked(
+        run_id="run-9",
+        ts=_ts(5),
+        attempt_number=None,
+        park_kind="divergent-base",
+        detail="cannot fast-forward landing-base",
+    )
+    assert event_kind(event) == "landing_parked"
+    payload = event_payload(event)
+    assert payload == {
+        "park_kind": "divergent-base",
+        "detail": "cannot fast-forward landing-base",
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, LandingParked)
+    assert restored == event

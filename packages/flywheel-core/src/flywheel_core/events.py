@@ -47,6 +47,7 @@ class DomainEventKind(str, Enum):
     SESSION_RECORDED = "session_recorded"
     GRADER_EVALUATED = "grader_evaluated"
     COMMAND_APPLIED = "command_applied"
+    LANDING_PARKED = "landing_parked"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -216,6 +217,30 @@ class CommandApplied(_DomainEventBase):
     command_id: int | None = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class LandingParked(_DomainEventBase):
+    """Records that a DONE run's branch could not be landed at submit time and
+    its worktree was parked for forensics.
+
+    An audit-witness event (like :class:`Unblocked` / :class:`RetryScheduled`):
+    landing happens after the run already finalized ``DONE``, the harness owns
+    lifecycle transitions, and ``DONE`` is terminal — so this event's fold is
+    the identity (it advances ``version`` only and performs no state change).
+    The run stays ``Status.DONE``.
+
+    ``park_kind`` discriminates the cause on one shared surface:
+    ``"uncommitted-work"`` (the agent reached DONE with an uncommitted tree,
+    spec 00027) or ``"divergent-base"`` (the configured base could not
+    fast-forward even after rebase + re-verify, spec 00026). ``detail`` is a
+    human-readable reason, queryable via ``list_domain_events(run_id)``.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDING_PARKED
+
+    park_kind: str
+    detail: str = ""
+
+
 DomainEvent = (
     LifecycleInitialized
     | TransitionedTo
@@ -228,6 +253,7 @@ DomainEvent = (
     | SessionRecorded
     | GraderEvaluated
     | CommandApplied
+    | LandingParked
 )
 
 
@@ -334,7 +360,8 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
     elif isinstance(event, SessionRecorded):
         new.session_id = event.session_id
     elif isinstance(
-        event, (Unblocked, RetryScheduled, GraderEvaluated, CommandApplied)
+        event,
+        (Unblocked, RetryScheduled, GraderEvaluated, CommandApplied, LandingParked),
     ):
         # Identity fold: these carry audit intent or project a separate table.
         # They still advance version as members of the domain-event sequence.

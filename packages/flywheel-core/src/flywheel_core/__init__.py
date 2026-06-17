@@ -35,6 +35,7 @@ from flywheel_core.events import (
     DomainEventKind,
     EventReplayError,
     GraderEvaluated,
+    LandingParked,
     LifecycleInitialized,
     RetryScheduled,
     SessionRecorded,
@@ -172,6 +173,7 @@ def hello() -> str:
 __all__ = [
     "Attempt",
     "GraderEvaluated",
+    "LandingParked",
     "AttemptFinalized",
     "AttemptStarted",
     "AttemptStore",

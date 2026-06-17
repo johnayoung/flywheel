@@ -49,15 +49,17 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterator, Sequence, TextIO
+from typing import Callable, Iterator, Protocol, Sequence, TextIO
 
 from flywheel_core import (
     CommandGrader,
     GraderResultRecord,
     InvokeFunc,
+    Lifecycle,
     Status,
     run_command_graders,
 )
+from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_orchestrator import (
     OrchestratorReport,
     PolicyError,
@@ -104,6 +106,20 @@ Logger = Callable[[str], None]
 # itself; this only lets the agent's commit succeed.
 WORKTREE_COMMIT_IDENTITY_NAME = "Flywheel Worker"
 WORKTREE_COMMIT_IDENTITY_EMAIL = "worker@flywheel.invalid"
+
+
+class LandingLedger(Protocol):
+    """The store surface the submitter needs to record a landing-parked
+    outcome: read the run's current version, then append the audit-witness
+    :class:`~flywheel_core.events.LandingParked` event under optimistic
+    concurrency. Both ``SqliteStore``/``PostgresStore``/``InMemoryStore``
+    satisfy it."""
+
+    def load_lifecycle(self, run_id: str) -> Lifecycle | None: ...
+
+    def append_domain_event(
+        self, event: DomainEvent, *, expected_version: int
+    ) -> Lifecycle: ...
 
 
 class GitError(RuntimeError):
@@ -218,6 +234,7 @@ class GitWorktreeSubmitter:
         log: Logger,
         protected_paths: Sequence[str] = (),
         setup_command: str | None = None,
+        store: LandingLedger | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -227,6 +244,11 @@ class GitWorktreeSubmitter:
         self.log = log
         self.protected_paths = tuple(protected_paths)
         self.setup_command = setup_command
+        # When present, submit() records a queryable LANDING_PARKED event on
+        # the run's ledger for a park outcome (uncommitted-work or
+        # divergent-base). None (e.g. a bare direct construction) degrades to
+        # the log-only park the worktree still preserves.
+        self.store = store
 
     def _branch(self, task_id: str, phase: str) -> str:
         return f"flywheel/{phase}/{task_id}"
@@ -463,6 +485,14 @@ class GitWorktreeSubmitter:
                     f"DONE with uncommitted changes on {branch}; parking "
                     f"worktree at {worktree}"
                 )
+                self._record_landing_park(
+                    req.run_id,
+                    park_kind="uncommitted-work",
+                    detail=(
+                        f"DONE with an uncommitted tree on {branch}; worktree "
+                        f"preserved at {worktree}"
+                    ),
+                )
                 return
 
             commit_count = self._commit_count(branch)
@@ -618,6 +648,44 @@ class GitWorktreeSubmitter:
     def _cleanup(self, worktree: Path, branch: str) -> None:
         _git(self.repo_root, "worktree", "remove", str(worktree))
         _git(self.repo_root, "branch", "-d", branch)
+
+    def _record_landing_park(
+        self, run_id: str, *, park_kind: str, detail: str
+    ) -> None:
+        """Append a queryable ``LANDING_PARKED`` audit-witness event for a
+        parked DONE run (``park_kind`` ``"uncommitted-work"`` or
+        ``"divergent-base"``).
+
+        The run already finalized ``DONE`` (terminal); this records the park
+        cause on the run's ledger via ``append_domain_event`` WITHOUT any
+        lifecycle transition — ``LandingParked`` folds to the identity, so the
+        status stays ``DONE`` and only ``version`` advances. Best-effort: a
+        missing store handle or any store error is logged, never raised, so
+        ``submit()`` cannot escape into orchestrate (criterion 7)."""
+        if self.store is None:
+            return
+        try:
+            lifecycle = self.store.load_lifecycle(run_id)
+            if lifecycle is None:
+                self.log(
+                    f"cannot record landing-parked event: no lifecycle for "
+                    f"{run_id}"
+                )
+                return
+            self.store.append_domain_event(
+                LandingParked(
+                    run_id=run_id,
+                    ts=datetime.now(timezone.utc),
+                    park_kind=park_kind,
+                    detail=detail,
+                ),
+                expected_version=lifecycle.version,
+            )
+        except Exception as exc:  # noqa: BLE001 - must not escape submit
+            self.log(
+                f"failed to record landing-parked event for {run_id} "
+                f"({type(exc).__name__}: {exc})"
+            )
 
 
 # --- daemon-side consumer concerns ------------------------------------------
@@ -1013,12 +1081,15 @@ def build_merge_submitter(
     log: Logger,
     protected_paths: Sequence[str],
     setup_command: str | None,
+    store: LandingLedger | None = None,
 ) -> GitWorktreeSubmitter:
     """Build the merge backend (the registry's ``merge`` target).
 
     The fast-forward-merge landing reads nothing extra from ``policy``; the
     argument is part of the shared builder signature the submit-strategy
     registry dispatches on (see :mod:`flywheel_worktree._submit_registry`).
+    ``store`` is the run ledger the submitter records a queryable
+    ``LANDING_PARKED`` event on when it parks a DONE branch.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -1029,6 +1100,7 @@ def build_merge_submitter(
         log=log,
         protected_paths=protected_paths,
         setup_command=setup_command,
+        store=store,
     )
 
 

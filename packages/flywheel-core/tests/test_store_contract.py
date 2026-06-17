@@ -39,6 +39,7 @@ from flywheel_core import (
     GraderResultRecord,
     GraderResultStore,
     InMemoryStore,
+    LandingParked,
     Lifecycle,
     LifecycleAlreadyExistsError,
     LifecycleInitialized,
@@ -977,6 +978,42 @@ def _drive_to_done(store: object, run_id: str = "r1") -> None:
         TransitionedTo(run_id=run_id, ts=_dts(7), target=Status.DONE),
         expected_version=7,
     )
+
+
+def test_landing_parked_event_round_trips_on_ledger(store: object) -> None:
+    """The SI-12 LANDING_PARKED kind appends as opaque JSON and reloads on
+    every backend's ledger: the run stays terminal DONE (identity fold) and
+    list_domain_events surfaces the park_kind/detail verbatim. Schema stays v12
+    (no migration); this is the additive-opaque-JSON contract 00027 owns."""
+    assert isinstance(store, DomainEventStore)
+    assert isinstance(store, LifecycleStore)
+    _drive_to_done(store, "r1")
+    done = store.load_lifecycle("r1")
+    assert done is not None
+    assert done.status is Status.DONE
+    version_before = done.version
+
+    folded = store.append_domain_event(
+        LandingParked(
+            run_id="r1",
+            ts=_dts(8),
+            park_kind="divergent-base",
+            detail="base advanced; rebase conflicted",
+        ),
+        expected_version=version_before,
+    )
+    # Identity fold: version advances, status unchanged (no transition).
+    assert folded.status is Status.DONE
+    assert folded.version == version_before + 1
+    assert store.load_lifecycle("r1").status is Status.DONE  # type: ignore[union-attr]
+
+    parked = [
+        e for e in store.list_domain_events("r1")
+        if isinstance(e, LandingParked)
+    ]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "divergent-base"
+    assert parked[0].detail == "base advanced; rebase conflicted"
 
 
 def test_store_satisfies_domain_event_store_protocol(store: object) -> None:

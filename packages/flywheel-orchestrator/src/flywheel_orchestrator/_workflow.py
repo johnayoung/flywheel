@@ -1717,6 +1717,12 @@ sandbox_root = ".flywheel/sandboxes"
 # checked-out branch (back-compat).
 # [submit]
 # base = "main"
+
+# Sandbox provisioning. setup runs (shell) inside every newly created
+# sandbox before the agent enters, so tasks never pay discovery cost for
+# a bare worktree. Unset means new sandboxes are used bare.
+# [sandbox]
+# setup = "uv sync"
 """
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")

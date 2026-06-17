@@ -318,6 +318,7 @@ def archive_completed_phases(
     *,
     repo_root: Path | None = None,
     log: Callable[[str], None] | None = None,
+    phase_verify: str | None = None,
 ) -> list[Path]:
     """Move ``active/<phase>`` dirs to ``archive/`` when every task is done.
 
@@ -335,6 +336,15 @@ def archive_completed_phases(
     uses). An empty marker (no watched signal, no recorded base, or
     ``repo_root`` omitted) archives exactly as before -- the gate is a
     pure addition for the loop-path case.
+
+    ``phase_verify`` is the optional phase-exit integration gate (spec
+    00035): when set (and ``repo_root`` is supplied), the command runs
+    (shell) against the merged phase base in ``repo_root`` -- the landed
+    integration result -- once a phase is eligible to archive. A non-zero
+    exit leaves the phase active and reports the failure via ``log``; exit 0
+    archives exactly as the no-gate path does. ``None`` (the default)
+    preserves today's archival behavior for operators who configured no
+    gate.
     """
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
@@ -371,6 +381,25 @@ def archive_completed_phases(
             ):
                 if log is not None:
                     log(_format_gate_refusal(phase_dir, signals))
+                continue
+
+        # Phase-exit integration gate (spec 00035): run the operator's
+        # phase-verify command against the merged base in repo_root -- the
+        # landed integration result -- and gate archival on its exit code. A
+        # non-zero exit leaves the phase active and surfaces the failure;
+        # exit 0 archives as the no-gate path does. Unset (or no repo_root)
+        # preserves today's archival.
+        if phase_verify is not None and repo_root is not None:
+            result = subprocess.run(
+                phase_verify, shell=True, cwd=repo_root
+            )
+            if result.returncode != 0:
+                if log is not None:
+                    log(
+                        _format_phase_verify_refusal(
+                            phase_dir, phase_verify, result.returncode
+                        )
+                    )
                 continue
 
         dest = archive_root / phase_dir.name
@@ -426,6 +455,19 @@ def _format_gate_refusal(
         f"[{names}] detected and neither a DONE "
         f"{IN_LOOP_VERIFICATION_TAG} task nor a "
         f"{LOOP_PATH_OPTOUT_FILENAME} opt-out is present"
+    )
+
+def _format_phase_verify_refusal(
+    phase_dir: Path, command: str, returncode: int
+) -> str:
+    """Render the refusal message for a phase whose phase-verify gate failed.
+
+    Names the offending phase, the command that ran against the merged base,
+    and its exit code so the operator's next step is unambiguous.
+    """
+    return (
+        f"Refusing to archive phase {phase_dir.name}: phase-verify command "
+        f"{command!r} failed against the merged base (exit {returncode})"
     )
 
 LOOP_BASE_FILENAME = ".loop-base"

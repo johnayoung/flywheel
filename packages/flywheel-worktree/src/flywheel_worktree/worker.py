@@ -775,11 +775,19 @@ def archive_phases(
 
     ``policy`` selects the store backend through the orchestrator's store
     factory; ``None`` keeps the historical sqlite-on-``db_path`` behavior.
+    A configured ``policy.phase_verify`` runs as the phase-exit integration
+    gate (spec 00035): the command runs against the merged base in
+    ``repo_root`` before an eligible phase archives, and a non-zero exit
+    leaves the phase active with the refusal reported via ``log``.
     """
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         moved = archive_completed_phases(
-            tasks_dir, store, repo_root=repo_root, log=log
+            tasks_dir,
+            store,
+            repo_root=repo_root,
+            log=log,
+            phase_verify=policy.phase_verify if policy is not None else None,
         )
     finally:
         store.close()

@@ -160,6 +160,62 @@ def test_task_with_dangling_prerequisite_never_runs(tmp_path: Path) -> None:
     assert report.runs == ()
 
 
+def test_statically_invalid_task_is_skipped_not_dispatched(
+    tmp_path: Path,
+) -> None:
+    # Schedule-time validation gate (spec 00034): a task whose grader
+    # references a repo-relative path that does not exist is statically
+    # invalid -- the orchestrator must skip it (never dispatch its agent),
+    # while a valid peer in the same phase still runs. The invalid task is
+    # absent from report.runs entirely (skipped), not present-but-FAILED
+    # (dispatched then failed) -- that discriminates the gate from a no-op.
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "ok", grader_run="true")
+    _write_task(
+        phase,
+        "broken",
+        grader_run="uv run pytest .flywheel/holdout/does-not-exist/ -q",
+    )
+
+    report = asyncio.run(
+        orchestrate(
+            tasks_dir=tmp_path / "tasks",
+            db_path=tmp_path / "flywheel.sqlite",
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_always_verify(),
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+            repo_root=tmp_path,
+        )
+    )
+
+    ran = {r.task_id for r in report.runs}
+    assert "ok" in ran, "a valid task must still dispatch"
+    assert "broken" not in ran, (
+        "a statically-invalid task must be skipped, never dispatched"
+    )
+
+
+def test_invalid_task_does_not_starve_a_valid_peer_repo_root_default(
+    tmp_path: Path,
+) -> None:
+    # Without repo_root (library-caller default) the gate is disabled, so the
+    # invalid task is dispatched and FAILS its grader exactly as before --
+    # this pins the back-compat default and proves the gate is opt-in.
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(
+        phase,
+        "broken",
+        grader_run="uv run pytest .flywheel/holdout/does-not-exist/ -q",
+    )
+
+    report = _orchestrate(tmp_path, _always_verify())
+
+    ran = {r.task_id for r in report.runs}
+    assert "broken" in ran, "with no repo_root the gate is off (back-compat)"
+
+
 # --- termination ------------------------------------------------------------
 
 

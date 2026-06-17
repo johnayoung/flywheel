@@ -52,6 +52,7 @@ _ORCHESTRATOR_VERBS: frozenset[str] = frozenset(
         "archive",
         "recover",
         "recheck-blocked",
+        "validate",
     }
 )
 
@@ -89,6 +90,7 @@ Verbs:
   archive          move done phases out of active/
   recover          finalize stranded lifecycles
   recheck-blocked  re-evaluate blocked lifecycles' requires
+  validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
 
 Each verb forwards its own --help to the underlying implementation,

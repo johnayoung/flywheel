@@ -72,6 +72,7 @@ from flywheel_core.store_protocols import (
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import Task
+from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
     ClaimLostError,
     SqliteClaimStore,
@@ -428,6 +429,7 @@ async def orchestrate(
     submit: Submitter | None = None,
     strategy: SubmitStrategy | None = None,
     reconcile_seconds: float | None = None,
+    repo_root: Path | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task from the work source to quiescence.
 
@@ -473,6 +475,14 @@ async def orchestrate(
     so a postgres policy fails fast with the factory's DSN / extra errors.
     ``None`` (the default for library callers) keeps the historical
     sqlite-on-``db_path`` behavior byte-for-byte.
+
+    ``repo_root`` enables the schedule-time static-validation gate (spec
+    00034): a picked task whose graders fail :func:`validate_task` (an
+    unparseable command, or a repo-relative path that does not exist) is
+    skipped-and-reported instead of dispatched, mirroring the
+    unprovisionable-task skip so one bad task never starves eligible peers.
+    ``None`` (the default for library callers) disables the gate, preserving
+    prior behavior.
     """
     if source is None:
         if tasks_dir is None:
@@ -714,6 +724,25 @@ async def orchestrate(
                 pick = select_next_task(rows, exclude_ids=frozenset(exclude))
                 if pick is None:
                     break
+                # Schedule-time static-validation gate (spec 00034): refuse to
+                # dispatch a task whose graders are statically broken. Skip it
+                # for the session (exclude from candidacy) and surface the
+                # defect, mirroring the unprovisionable-task skip below so one
+                # bad task never starves eligible peers.
+                if repo_root is not None:
+                    defects = validate_task(pick.task, repo_root=repo_root)
+                    if defects:
+                        attempted_fresh.add(pick.task.id)
+                        if stream is not None:
+                            for defect in defects:
+                                print(
+                                    f"[orchestrate] {pick.task.id}: invalid "
+                                    f"task definition ({defect.detail}); "
+                                    f"skipping",
+                                    file=stream,
+                                    flush=True,
+                                )
+                        continue
                 claim = claims.acquire_claim(
                     pick.task.id,
                     wid,

@@ -47,6 +47,7 @@ from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_sign
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import ManualGrader, Task
+from flywheel_core.validation import TaskDefect, validate_task
 from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
@@ -85,6 +86,7 @@ from flywheel_orchestrator._sources import (
     WorkSource,
     WorkSourceError,
     iter_active_phase_dirs,
+    load_active_tasks,
 )
 from flywheel_orchestrator._store_factory import (
     PG_DSN_ENV,
@@ -1450,6 +1452,67 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _repo_root_for_tasks_dir(tasks_dir: Path) -> Path:
+    """Resolve the repo root a grader's ``run`` path tokens are relative to.
+
+    Tasks live under ``<repo_root>/.flywheel/tasks``; the static path checks
+    in :func:`flywheel_core.validate_task` are repo-relative, so the repo
+    root is the ancestor that contains the ``.flywheel`` directory. A custom
+    ``--tasks-dir`` outside a ``.flywheel`` tree falls back to the current
+    working directory.
+    """
+    resolved = tasks_dir.resolve()
+    for parent in resolved.parents:
+        if parent.name == ".flywheel":
+            return parent.parent
+    return Path.cwd()
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    """Statically validate every active task's graders (spec 00034).
+
+    Runs :func:`flywheel_core.validate_task` over each active task and exits
+    non-zero, naming each invalid task and its defects, when any task is
+    statically broken; exit 0 when all are valid. Same defect shape the
+    schedule-time dispatch consult surfaces.
+    """
+    policy = _load_effective_policy(args)
+    if args.tasks_dir:
+        tasks_dir = Path(args.tasks_dir)
+    elif policy is not None and policy.source_kind == "directory":
+        assert policy.tasks_dir is not None  # load_policy guarantees it
+        tasks_dir = policy.tasks_dir
+    elif policy is not None:
+        raise PolicyError(
+            "validate applies to directory work sources only; the active "
+            "policy selects a tracker source (pass --tasks-dir to validate "
+            "a directory layout explicitly)"
+        )
+    else:
+        tasks_dir = DEFAULT_TASKS_DIR
+    repo_root = _repo_root_for_tasks_dir(tasks_dir)
+    invalid: dict[str, list[TaskDefect]] = {}
+    valid_count = 0
+    for _path, task in load_active_tasks(tasks_dir):
+        defects = validate_task(task, repo_root=repo_root)
+        if defects:
+            invalid.setdefault(task.id, []).extend(defects)
+        else:
+            valid_count += 1
+    if not invalid:
+        print(f"All {valid_count} active task(s) valid.")
+        return 0
+    for task_id in sorted(invalid):
+        print(f"{task_id}: invalid task definition")
+        for defect in invalid[task_id]:
+            print(f"  - {defect.detail}")
+    print(
+        f"{len(invalid)} invalid task(s); {valid_count} valid.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _resolve_fallback_phases(
     args: argparse.Namespace, policy: WorkPolicy | None
 ) -> Mapping[str, str] | None:
@@ -2795,6 +2858,18 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common_policy(p_archive)
     _add_common_db(p_archive)
     p_archive.set_defaults(func=_cmd_archive)
+
+    p_validate = sub.add_parser(
+        "validate",
+        help=(
+            "Statically validate every active task's command graders "
+            "(shell-parse + repo-relative path existence) without running "
+            "them; exit non-zero naming each invalid task."
+        ),
+    )
+    _add_common_tasks_dir(p_validate)
+    _add_common_policy(p_validate)
+    p_validate.set_defaults(func=_cmd_validate)
 
     p_recheck_blocked = sub.add_parser(
         "recheck-blocked",

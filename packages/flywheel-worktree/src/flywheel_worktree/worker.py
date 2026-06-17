@@ -984,6 +984,7 @@ def run_once(
             reconcile_seconds=reconcile_seconds,
             strategy=submitter,
             stream=stream,
+            repo_root=submitter.repo_root,
         )
     )
     archive_phases(

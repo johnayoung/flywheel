@@ -232,6 +232,30 @@ class PostgresClaimStore:
             version=int(row["version"]),
         )
 
+    def list_claims(self) -> list[TaskClaim]:
+        # Every held row, same column projection as load_claim. Released
+        # claims are deleted rows so absent; expiry is not filtered.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT task_id, worker_id, claimed_at, lease_expires_at,
+                           version
+                    FROM task_claims
+                    """
+                )
+                rows = cur.fetchall()
+        return [
+            TaskClaim(
+                task_id=row["task_id"],
+                worker_id=row["worker_id"],
+                claimed_at=row["claimed_at"],
+                lease_expires_at=row["lease_expires_at"],
+                version=int(row["version"]),
+            )
+            for row in rows
+        ]
+
     def close(self) -> None:
         self._pool.close()
 

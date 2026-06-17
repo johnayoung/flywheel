@@ -76,6 +76,11 @@ class ClaimStore(Protocol):
     * ``release_claim`` drops the claim when the token still matches; a no-op
       if it was already stolen or released.
     * ``load_claim`` returns the current claim for a task, or ``None``.
+    * ``list_claims`` enumerates every currently-held claim — one
+      :class:`TaskClaim` per held row — so an operator surface can see who
+      holds what without knowing task ids up front. Released claims are
+      absent; expiry is not filtered (an expired-but-not-yet-stolen lease
+      still appears, consistent with ``load_claim``).
 
     ``now`` is injected (not read from a clock) so lease expiry is
     deterministic and testable.
@@ -101,6 +106,8 @@ class ClaimStore(Protocol):
     def release_claim(self, claim: TaskClaim) -> None: ...
 
     def load_claim(self, task_id: str) -> TaskClaim | None: ...
+
+    def list_claims(self) -> list[TaskClaim]: ...
 
 
 def _iso(ts: datetime) -> str:
@@ -179,6 +186,12 @@ class InMemoryClaimStore:
 
     def load_claim(self, task_id: str) -> TaskClaim | None:
         return self._claims.get(task_id)
+
+    def list_claims(self) -> list[TaskClaim]:
+        # Live held rows only; released claims were removed from the dict.
+        # Expiry is not filtered, matching load_claim. TaskClaim is frozen,
+        # so the stored instances are safe to return directly.
+        return list(self._claims.values())
 
     def close(self) -> None:  # parity with the durable stores
         pass
@@ -362,6 +375,25 @@ class SqliteClaimStore:
             lease_expires_at=_parse_iso(row["lease_expires_at"]),
             version=int(row["version"]),
         )
+
+    def list_claims(self) -> list[TaskClaim]:
+        # Every held row, reusing load_claim's column projection and
+        # _parse_iso. Released claims are deleted rows, so absent; expiry is
+        # not filtered (an expired-but-not-yet-stolen lease still appears).
+        rows = self._connection.execute(
+            "SELECT task_id, worker_id, claimed_at, lease_expires_at, "
+            "version FROM task_claims"
+        ).fetchall()
+        return [
+            TaskClaim(
+                task_id=row["task_id"],
+                worker_id=row["worker_id"],
+                claimed_at=_parse_iso(row["claimed_at"]),
+                lease_expires_at=_parse_iso(row["lease_expires_at"]),
+                version=int(row["version"]),
+            )
+            for row in rows
+        ]
 
     def close(self) -> None:
         self._connection.close()

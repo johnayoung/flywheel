@@ -207,3 +207,27 @@ def test_claims_are_independent_per_task(store: object) -> None:
 def test_load_missing_claim_returns_none(store: object) -> None:
     assert isinstance(store, ClaimStore)
     assert store.load_claim("nope") is None
+
+
+def test_list_claims_empty_store_is_empty_list(store: object) -> None:
+    assert isinstance(store, ClaimStore)
+    assert store.list_claims() == []
+
+
+def test_list_claims_enumerates_held_and_drops_released(
+    store: object,
+) -> None:
+    """list_claims returns one TaskClaim per currently-held claim, each
+    carrying its owning worker; a released claim is absent and its still-
+    held sibling remains."""
+    assert isinstance(store, ClaimStore)
+    a = store.acquire_claim("task-a", "worker-1", now=_t(0), lease_seconds=30)
+    b = store.acquire_claim("task-b", "worker-2", now=_t(0), lease_seconds=30)
+    assert a is not None and b is not None
+    held = {(c.task_id, c.worker_id) for c in store.list_claims()}
+    assert held == {("task-a", "worker-1"), ("task-b", "worker-2")}
+    # Release one: only the still-held claim's pair survives; the freed
+    # worker is no longer reported.
+    store.release_claim(a)
+    remaining = {(c.task_id, c.worker_id) for c in store.list_claims()}
+    assert remaining == {("task-b", "worker-2")}

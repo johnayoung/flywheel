@@ -9,10 +9,13 @@ Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync                        # install all workspace packages
 uv run flywheel init           # scaffold .flywheel/, a work policy, and the SDD skills
+export ANTHROPIC_API_KEY=...   # or run `claude login` — authenticate the agent first
 uv run flywheel worker --once  # claim one task, run it, exit
 uv run flywheel                # operator console (alias: fw)
 uv run pytest                  # full test suite
 ```
+
+The worker drives the Claude agent, so authenticate it before the first run: set `ANTHROPIC_API_KEY` or run `claude login`. Without it the first worker run fails when the agent SDK cannot authenticate.
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).
 

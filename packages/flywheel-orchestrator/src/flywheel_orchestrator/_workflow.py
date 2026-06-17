@@ -2178,8 +2178,12 @@ def _print_init_next_steps(
             "     Or, in Claude Code: /fw-spec to spec a feature, "
             "/fw-plan to queue tasks."
         )
-    print("  2. Run: flywheel worker")
-    print("  3. Watch: flywheel status / live")
+    print(
+        "  2. Authenticate the agent: set ANTHROPIC_API_KEY (or run "
+        "`claude login`) before the first worker run."
+    )
+    print("  3. Run: flywheel worker")
+    print("  4. Watch: flywheel status / live")
     if store_backend == "postgres":
         print()
         print(

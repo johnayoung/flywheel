@@ -16,6 +16,7 @@ from flywheel_orchestrator._pg_preflight import (
     _check_pooler_mode,
     _dsn_port,
     format_report,
+    provisioning_sql,
     run_postgres_preflight,
 )
 
@@ -102,6 +103,22 @@ def test_format_report_renders_status_and_remedy() -> None:
     assert "[OK  ] connection: reached the server" in report
     assert "[BLOCK] privileges: role lacks CREATE" in report
     assert "fix: GRANT ..." in report
+
+
+def test_format_report_indents_multiline_remedy() -> None:
+    report = format_report(
+        [PreflightCheck("privileges", "block", "x", remedy="line1\nline2")]
+    )
+    assert "fix: line1" in report
+    # Continuation lines align under the first, not re-prefixed with "fix:".
+    assert "\n              line2" in report
+    assert report.count("fix:") == 1
+
+
+def test_provisioning_sql_is_idempotent_and_grants_the_role() -> None:
+    sql = provisioning_sql("flywheel", "flywheel_app")
+    assert 'CREATE SCHEMA IF NOT EXISTS "flywheel";' in sql
+    assert 'GRANT ALL ON SCHEMA "flywheel" TO "flywheel_app";' in sql
 
 
 # --- integration against the real container ----------------------------------
@@ -209,6 +226,9 @@ def test_preflight_privileges_block_for_unprivileged_role(
         priv = next(c for c in outcome.checks if c.name == "privileges")
         assert priv.status == "block"
         assert priv.remedy is not None
+        # The block hands back the exact provisioning SQL to copy-paste.
+        assert "CREATE SCHEMA IF NOT EXISTS" in priv.remedy
+        assert "GRANT ALL ON SCHEMA" in priv.remedy
     finally:
         with psycopg.connect(require_postgres, autocommit=True) as conn:
             conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

@@ -1825,7 +1825,7 @@ _INIT_POLICY_HEADER = """\
 # Committed with the repo; CLI flags always override.
 """
 
-_INIT_POLICY_TAIL = """\
+_INIT_POLICY_TAIL_HEAD = """\
 [paths]
 db = ".flywheel/flywheel.sqlite"
 sandbox_root = ".flywheel/sandboxes"
@@ -1840,13 +1840,20 @@ sandbox_root = ".flywheel/sandboxes"
 # verbatim (no allowlist enforced). CLI flags still override.
 # [agent]
 # model = "claude-sonnet-4-5"
+"""
 
+# The commented placeholder used when init could not detect a branch to
+# pin (e.g. no git, detached HEAD -- which the git preflight already
+# rejects, so this is just a defensive fallback).
+_INIT_SUBMIT_BLOCK_COMMENTED = """\
 # Landing policy. base pins the branch finished work lands on and the
 # worker resolves its phase base from; unset falls back to the
 # checked-out branch (back-compat).
 # [submit]
 # base = "main"
+"""
 
+_INIT_POLICY_TAIL_FOOT = """\
 # Sandbox provisioning. setup runs (shell) inside every newly created
 # sandbox before the agent enters, so tasks never pay discovery cost for
 # a bare worktree. Unset means new sandboxes are used bare.
@@ -1859,6 +1866,27 @@ sandbox_root = ".flywheel/sandboxes"
 # [phase]
 # verify = "uv run pytest"
 """
+
+
+def _render_submit_block(submit_base: str | None) -> str:
+    """Render the ``[submit]`` section.
+
+    When init detected the repo's current branch it is pinned as an
+    active ``base`` (a developer-facing tool should record the landing
+    target, not leave it implicit). With no branch detected the original
+    commented placeholder is kept. ``json.dumps`` quoting is valid for a
+    TOML basic string, so an unusual branch name cannot break the file.
+    """
+    if not submit_base:
+        return _INIT_SUBMIT_BLOCK_COMMENTED
+    return (
+        "# Landing policy. base pins the branch finished work lands on and\n"
+        "# the worker resolves its phase base from. Auto-detected from the\n"
+        "# current branch at init; change it to your integration branch if\n"
+        "# different.\n"
+        "[submit]\n"
+        f"base = {json.dumps(submit_base)}\n"
+    )
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
@@ -1899,6 +1927,10 @@ class _InitAnswers:
     github_repo: str | None = None
     github_label: str | None = None
     github_done_action: str = "comment"
+    # The branch finished work lands on, recorded as [submit] base. Auto-
+    # detected from the repo's current branch at init; None falls back to
+    # the commented placeholder (worker then uses the checked-out branch).
+    submit_base: str | None = None
     # Whether to install the Claude Code skills (fw-spec / fw-plan /
     # fw-retro / fw-improve) into .claude/skills/. Interactive default
     # is yes; non-interactive runs install only with an explicit
@@ -1954,7 +1986,11 @@ def _render_init_policy(answers: _InitAnswers) -> str:
             "\n",
             _render_store_block(answers),
             "\n",
-            _INIT_POLICY_TAIL,
+            _INIT_POLICY_TAIL_HEAD,
+            "\n",
+            _render_submit_block(answers.submit_base),
+            "\n",
+            _INIT_POLICY_TAIL_FOOT,
         )
     )
 
@@ -2089,6 +2125,30 @@ def _github_repo_from_origin() -> str | None:
     return f"{match.group('owner')}/{match.group('name')}"
 
 
+def _report_agent_auth() -> None:
+    """Print whether agent credentials are in place (all backends).
+
+    The worker drives the Claude agent SDK, which authenticates from
+    ``ANTHROPIC_API_KEY`` or a ``claude login`` session. This is runtime
+    config the operator may legitimately set later (e.g. init in CI), so a
+    missing credential warns rather than blocks -- but a developer-facing
+    init should surface it as a check, not bury it in next-steps prose.
+    """
+    import os
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        print("agent auth: ANTHROPIC_API_KEY is set")
+        return
+    creds = Path.home() / ".claude" / ".credentials.json"
+    if creds.is_file():
+        print("agent auth: detected a `claude login` credential file")
+        return
+    print(
+        "warning: no agent credentials detected; set ANTHROPIC_API_KEY (or "
+        "run `claude login`) before the first worker run"
+    )
+
+
 def _postgres_preflight(args: argparse.Namespace, schema: str | None) -> None:
     """Guided, failsafe Postgres bring-up at init time.
 
@@ -2184,6 +2244,7 @@ def _collect_init_answers(
     ``interactive`` false every unanswered choice takes its default.
     Flag values fail with the same messages the prompts re-prompt with.
     """
+    submit_base = _current_branch()
     if args.store is not None:
         backend = args.store
     elif interactive:
@@ -2229,6 +2290,7 @@ def _collect_init_answers(
             store_backend=backend,
             store_schema=schema,
             source_kind="directory",
+            submit_base=submit_base,
             install_skills=_resolve_install_skills(
                 args, interactive=interactive
             ),
@@ -2274,6 +2336,7 @@ def _collect_init_answers(
         github_repo=repo,
         github_label=label,
         github_done_action=done_action,
+        submit_base=submit_base,
         install_skills=_resolve_install_skills(
             args, interactive=interactive
         ),
@@ -2475,6 +2538,7 @@ def _reconfigure_policy(
         # Regenerate against the just-rewritten policy so a changed
         # tasks_dir / work source propagates into the managed skills.
         _install_skills_from_policy_file(policy_path)
+    _report_agent_auth()
     print()
     _print_init_next_steps(
         answers.store_backend, skills_installed=answers.install_skills
@@ -2522,6 +2586,25 @@ def _init_git_preflight_error() -> str | None:
             "(`git switch -c <branch>`) before initializing flywheel."
         )
     return None
+
+
+def _current_branch() -> str | None:
+    """Return the repo's current branch name, or ``None`` if undetectable.
+
+    init's git preflight already guarantees an attached branch by the time
+    answers are collected, so this normally returns that branch -- recorded
+    as ``[submit] base`` so the landing target is explicit in the policy.
+    """
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    name = branch.stdout.strip()
+    if branch.returncode != 0 or not name or name == "HEAD":
+        return None
+    return name
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -2630,6 +2713,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     print(f"created: {policy_path}")
     if answers.install_skills:
         _install_skills_from_policy_file(policy_path)
+    _report_agent_auth()
     print()
     _print_init_next_steps(
         answers.store_backend, skills_installed=answers.install_skills

@@ -256,6 +256,21 @@ def _check_pooler_mode(conn: object, dsn: str, password: str | None) -> Prefligh
     )
 
 
+def provisioning_sql(schema: str, role: str) -> str:
+    """The exact SQL to make ``role`` able to own objects in ``schema``.
+
+    Run as a Postgres superuser / privileged role (e.g. ``postgres`` in
+    Supabase). ``CREATE SCHEMA`` is idempotent, and the grant targets the
+    least-privilege role from the operator's DSN. Identifiers are double-
+    quoted; the engine only ever passes regex-validated schema names and a
+    role read back from the live connection, so neither can inject.
+    """
+    return (
+        f'CREATE SCHEMA IF NOT EXISTS "{schema}";\n'
+        f'GRANT ALL ON SCHEMA "{schema}" TO "{role}";'
+    )
+
+
 def _check_privileges(conn: object, schema: str) -> PreflightCheck:
     """Verify the connecting role can create/own the target schema.
 
@@ -292,7 +307,8 @@ def _check_privileges(conn: object, schema: str) -> PreflightCheck:
             "block",
             f"role {role!r} lacks CREATE/USAGE on existing schema "
             f"{schema!r}",
-            remedy=f'GRANT ALL ON SCHEMA "{schema}" TO "{role}";',
+            remedy="run as a privileged role:\n"
+            + provisioning_sql(schema, role),
         )
 
     cur.execute(
@@ -310,11 +326,8 @@ def _check_privileges(conn: object, schema: str) -> PreflightCheck:
         "block",
         f"role {role!r} cannot CREATE SCHEMA in database {database!r} "
         f"and schema {schema!r} does not exist",
-        remedy=(
-            f'CREATE SCHEMA IF NOT EXISTS "{schema}"; '
-            f'GRANT ALL ON SCHEMA "{schema}" TO "{role}";  '
-            f"-- run as a privileged role, or grant CREATE on the database"
-        ),
+        remedy="run as a privileged role (e.g. Supabase 'postgres'):\n"
+        + provisioning_sql(schema, role),
     )
 
 
@@ -409,5 +422,10 @@ def format_report(checks: Sequence[PreflightCheck]) -> str:
     for c in checks:
         lines.append(f"  [{glyph[c.status]}] {c.name}: {c.detail}")
         if c.remedy is not None:
-            lines.append(f"         fix: {c.remedy}")
+            remedy_lines = c.remedy.splitlines() or [""]
+            lines.append(f"         fix: {remedy_lines[0]}")
+            # Continuation lines (e.g. a multi-statement SQL block) align
+            # under the first so the block is copy-pasteable.
+            for extra in remedy_lines[1:]:
+                lines.append(f"              {extra}")
     return "\n".join(lines)

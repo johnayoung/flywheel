@@ -159,6 +159,37 @@ def test_init_policy_is_loadable_and_points_into_flywheel_dir(
     # The default scaffold pins the store backend explicitly.
     assert policy.store_backend == "sqlite"
     assert policy.store_schema is None
+    # init auto-detects the current branch and pins it as the landing base
+    # (the `repo` fixture inits on `main`).
+    assert policy.submit_base == "main"
+
+
+def test_init_pins_submit_base_to_current_branch(repo: Path) -> None:
+    subprocess.run(
+        ["git", "switch", "-c", "integration"], cwd=repo, check=True,
+        capture_output=True,
+    )
+    main(["init"])
+    text = (repo / "flywheel.toml").read_text()
+    assert "[submit]\nbase = \"integration\"" in text
+    assert load_policy(repo / "flywheel.toml").submit_base == "integration"
+
+
+def test_init_reports_agent_auth_present(repo: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-probe")
+    main(["init"])
+    assert "agent auth: ANTHROPIC_API_KEY is set" in capsys.readouterr().out
+
+
+def test_init_warns_when_no_agent_auth(
+    repo: Path, monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Point HOME at an empty dir so a real ~/.claude credential file on the
+    # dev box cannot make the check pass.
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    main(["init"])
+    assert "no agent credentials detected" in capsys.readouterr().out
 
 
 def test_init_policy_agent_example_documented(repo: Path) -> None:

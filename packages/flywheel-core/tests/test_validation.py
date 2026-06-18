@@ -10,6 +10,7 @@ the false positive that flagged the real ``phase-verify-gate`` grader.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from flywheel_core import CommandGrader, Task, validate_task
@@ -19,7 +20,7 @@ def _task(run: str, task_id: str = "t") -> Task:
     return Task(id=task_id, goal="g.", graders=[CommandGrader(run=run)])
 
 
-def _details(defects: list[object]) -> str:
+def _details(defects: Sequence[object]) -> str:
     return " || ".join(getattr(d, "detail", str(d)) for d in defects)
 
 

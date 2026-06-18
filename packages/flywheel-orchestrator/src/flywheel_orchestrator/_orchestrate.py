@@ -54,7 +54,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 from uuid import uuid4
 
 from flywheel_core.harness import (
@@ -71,6 +71,12 @@ from flywheel_core.store_protocols import (
 )
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.telemetry_file import FileTelemetrySink
+
+if TYPE_CHECKING:
+    # Optional postgres backend, typing-only so this module never hard-depends
+    # on the psycopg extra. The store factory returns SqliteStore |
+    # PostgresStore and both answer these reads through the store protocol.
+    from flywheel_core.store_postgres import PostgresStore
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
@@ -134,7 +140,7 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _live_run_rows(control: SqliteStore) -> list[tuple[str, str]]:
+def _live_run_rows(control: SqliteStore | PostgresStore) -> list[tuple[str, str]]:
     """``(run_id, task_id)`` for every lifecycle currently in flight.
 
     Only ``running``/``validating`` qualify: those are the statuses with a
@@ -143,19 +149,17 @@ def _live_run_rows(control: SqliteStore) -> list[tuple[str, str]]:
     session to interrupt, and its disposition belongs to the approve/reject
     resolver, not the steering bridge.
     """
-    cursor = control._connection.execute(  # noqa: SLF001 — intentional
-        """
-        SELECT run_id, task_id
-        FROM lifecycles
-        WHERE status IN ('running', 'validating')
-        ORDER BY run_id
-        """
+    # Backend-agnostic read through the store protocol (not the SQLite-only
+    # ``_connection``) so this works against a PostgresStore too. Sorted by
+    # run_id to preserve the previous ``ORDER BY run_id`` determinism.
+    live = control.list_lifecycles(
+        statuses=(Status.RUNNING, Status.VALIDATING)
     )
-    return [(row["run_id"], row["task_id"]) for row in cursor.fetchall()]
+    return sorted((lc.run_id, lc.task_id) for lc in live)
 
 
 def reconcile_live_runs(
-    control: SqliteStore,
+    control: SqliteStore | PostgresStore,
     wanted_task_ids: frozenset[str],
     *,
     already_signaled: set[str],
@@ -199,7 +203,7 @@ def reconcile_live_runs(
 async def _source_reconcile_loop(
     *,
     source: WorkSource,
-    control: SqliteStore,
+    control: SqliteStore | PostgresStore,
     interval: float,
     now: Callable[[], datetime],
     stream: TextIO | None,
@@ -307,7 +311,7 @@ def _is_awaiting_approval(row: TaskStatusRow) -> bool:
 
 
 def _recover_claimable_stranded(
-    control: SqliteStore,
+    control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
     worker_id: str,
     *,
@@ -826,7 +830,7 @@ async def orchestrate(
 
 
 def _final_grader_receipts(
-    control: SqliteStore, run_id: str
+    control: SqliteStore | PostgresStore, run_id: str
 ) -> tuple[GraderReceipt, ...]:
     """Project the final attempt's grader receipts for a work report.
 
@@ -851,7 +855,7 @@ def _final_grader_receipts(
 
 
 async def _drive_under_lease(
-    control: SqliteStore,
+    control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
     claim: TaskClaim,
     row: TaskStatusRow,
@@ -975,7 +979,7 @@ async def _drive_under_lease(
 
 
 async def _drive_or_relinquish(
-    control: SqliteStore,
+    control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
     claim: TaskClaim,
     row: TaskStatusRow,

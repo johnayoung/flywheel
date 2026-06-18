@@ -24,11 +24,17 @@ import sys
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flywheel_core.lifecycle import Status
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.task import ManualGrader
+
+if TYPE_CHECKING:
+    # Optional postgres backend, typing-only so this module never hard-depends
+    # on the psycopg extra. The store factory returns SqliteStore |
+    # PostgresStore and both answer these reads through the store protocol.
+    from flywheel_core.store_postgres import PostgresStore
 from flywheel_orchestrator import (
     DEFAULT_POLICY_FILENAME,
     DEFAULT_TASKS_DIR,
@@ -324,7 +330,7 @@ def _run_snapshot(
 
 
 def _lookup_awaiting_instruction(
-    store: SqliteStore,
+    store: SqliteStore | PostgresStore,
     *,
     run_id: str,
     status: Status,

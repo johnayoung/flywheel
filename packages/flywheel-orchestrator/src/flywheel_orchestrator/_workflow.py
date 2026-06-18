@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlsplit
 
 
@@ -45,6 +45,12 @@ from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
 from flywheel_core.store_sqlite import SqliteStore
+
+if TYPE_CHECKING:
+    # Optional postgres backend, typing-only so this module never hard-depends
+    # on the psycopg extra. The store factory returns SqliteStore |
+    # PostgresStore and both answer these reads through the store protocol.
+    from flywheel_core.store_postgres import PostgresStore
 from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import ManualGrader, Task
 from flywheel_core.validation import TaskDefect, validate_task
@@ -152,7 +158,7 @@ _ACTIVE_STATUSES: frozenset[Status] = frozenset(
 )
 
 def _latest_lifecycle_row(
-    store: SqliteStore, task_id: str
+    store: SqliteStore | PostgresStore, task_id: str
 ) -> tuple[str, Status, str, str | None, int | None] | None:
     """Return ``(run_id, status, error, blocked_requires_json,
     awaiting_manual_ordinal)`` of the most recent lifecycle for
@@ -180,7 +186,7 @@ def _latest_lifecycle_row(
         lc.awaiting_manual_ordinal,
     )
 
-def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
+def task_state(store: SqliteStore | PostgresStore, task: Task) -> TaskStatusRow:
     """Classify ``task`` based on its lifecycle history in ``store``."""
     latest = _latest_lifecycle_row(store, task.id)
     if latest is None:
@@ -236,7 +242,7 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
     )
 
 def status_rows_for_items(
-    items: Iterable[WorkItem], store: SqliteStore
+    items: Iterable[WorkItem], store: SqliteStore | PostgresStore
 ) -> list[TaskStatusRow]:
     """Classify each work item's task against ``store``, in item order.
 
@@ -265,7 +271,7 @@ def status_rows_for_items(
     return rows
 
 def build_status_rows(
-    tasks_dir: Path, store: SqliteStore
+    tasks_dir: Path, store: SqliteStore | PostgresStore
 ) -> list[TaskStatusRow]:
     """Walk active tasks and return their classified status, in walk order."""
     return status_rows_for_items(
@@ -324,7 +330,7 @@ IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
 
 def archive_completed_phases(
     tasks_dir: Path,
-    store: SqliteStore,
+    store: SqliteStore | PostgresStore,
     *,
     repo_root: Path | None = None,
     log: Callable[[str], None] | None = None,
@@ -424,7 +430,7 @@ def archive_completed_phases(
     return moved
 
 def _loop_path_gate_satisfied(
-    phase_dir: Path, tasks: Iterable[Task], store: SqliteStore
+    phase_dir: Path, tasks: Iterable[Task], store: SqliteStore | PostgresStore
 ) -> bool:
     """Return ``True`` when ``phase_dir`` clears the loop-path archive gate.
 
@@ -1292,7 +1298,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
             # actually live and carries a persisted worker id; omit the key
             # otherwise (mirrors the blocked_requires / awaiting_on
             # omit-when-absent convention).
-            worker_id = live_worker_ids.get(row.latest_run_id)
+            worker_id = (
+                live_worker_ids.get(row.latest_run_id)
+                if row.latest_run_id is not None
+                else None
+            )
             if worker_id is not None:
                 entry["worker_id"] = worker_id
             parsed = _parse_blocked_requires(row.blocked_requires)
@@ -1343,7 +1353,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             print(f"    awaiting_on: {instruction}")
     return 0
 
-def _list_blocked_lifecycles(store: SqliteStore) -> list[tuple[str, str]]:
+def _list_blocked_lifecycles(store: SqliteStore | PostgresStore) -> list[tuple[str, str]]:
     """Return ``(run_id, task_id)`` for every recheckable blocked lifecycle.
 
     Filter mirrors spec FR-7: only ``INTERRUPTED`` rows with a non-NULL

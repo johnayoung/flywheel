@@ -14,9 +14,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from flywheel_core.store_sqlite import SqliteStore
+
+if TYPE_CHECKING:
+    # Optional postgres backend, typing-only so this module never hard-depends
+    # on the psycopg extra. The store factory returns SqliteStore |
+    # PostgresStore and both answer these reads through the store protocol.
+    from flywheel_core.store_postgres import PostgresStore
 from flywheel_orchestrator import (
     LiveRunRow,
     WorkSource,
@@ -89,7 +95,7 @@ class DashboardSnapshot:
 
 
 def build_snapshot(
-    store: SqliteStore,
+    store: SqliteStore | PostgresStore,
     *,
     work_source: WorkSource | None = None,
     now: datetime,

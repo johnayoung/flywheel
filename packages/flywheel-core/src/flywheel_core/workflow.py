@@ -51,6 +51,12 @@ from typing import TYPE_CHECKING, Any, TextIO
 if TYPE_CHECKING:
     from claude_agent_sdk import Message
 
+    # Optional postgres backend: imported for typing only so this module
+    # never hard-depends on the psycopg extra at runtime. The store factory
+    # returns ``SqliteStore | PostgresStore`` and both answer these reads
+    # through the backend-agnostic store protocol.
+    from flywheel_core.store_postgres import PostgresStore
+
 from flywheel_core.harness import (
     HarnessConfig,
     HarnessOutcome,
@@ -91,7 +97,7 @@ DEFAULT_MAX_RETRIES = 1
 # --- Status queries ---------------------------------------------------------
 
 
-def _has_done_lifecycle(store: SqliteStore, task_id: str) -> bool:
+def _has_done_lifecycle(store: SqliteStore | PostgresStore, task_id: str) -> bool:
     # Read through the public cross-task query seam (SI-3) so this works on
     # every backend, not just SQLite's private connection — the store factory
     # now returns a PostgresStore too.
@@ -108,7 +114,7 @@ _STRANDED_STATUSES: frozenset[Status] = frozenset(
 )
 
 
-def _stranded_run_ids(store: SqliteStore, task_id: str | None = None) -> list[str]:
+def _stranded_run_ids(store: SqliteStore | PostgresStore, task_id: str | None = None) -> list[str]:
     """Return run_ids whose lifecycle is mid-attempt with no live worker.
 
     A run is considered stranded when its status sits in ``running`` or
@@ -128,7 +134,7 @@ def _stranded_run_ids(store: SqliteStore, task_id: str | None = None) -> list[st
 
 
 def recover_stranded_lifecycles(
-    store: SqliteStore,
+    store: SqliteStore | PostgresStore,
     *,
     task_id: str | None = None,
     sink: TelemetrySink | None = None,

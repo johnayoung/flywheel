@@ -593,13 +593,17 @@ class PostgresStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                # Encoded to bytes (the _read_schema_sql convention) so this
+                # runtime-assembled query -- constant fragments only, every
+                # value parameterized -- does not trip psycopg's
+                # LiteralString-only static type for str queries.
                 cur.execute(
                     f"""
                     SELECT run_id
                     FROM lifecycles
                     {where}
                     ORDER BY updated_at DESC, run_id DESC
-                    """,
+                    """.encode(),
                     params,
                 )
                 run_ids = [row["run_id"] for row in cur.fetchall()]
@@ -634,6 +638,10 @@ class PostgresStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
+                # Encoded to bytes (the _read_schema_sql convention) so this
+                # runtime-assembled query -- constant fragments only, every
+                # value parameterized -- does not trip psycopg's
+                # LiteralString-only static type for str queries.
                 cur.execute(
                     f"""
                     SELECT
@@ -647,7 +655,7 @@ class PostgresStore:
                             AS total_cost_usd
                     FROM attempts
                     {where}
-                    """,
+                    """.encode(),
                     params,
                 )
                 row = cur.fetchone()

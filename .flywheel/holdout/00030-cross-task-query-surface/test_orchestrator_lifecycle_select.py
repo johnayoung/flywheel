@@ -65,8 +65,9 @@ def _read_source(rel_path: str) -> str:
 # on the private connection per D-4 -- untouched.
 
 # Matches ``<name> = store._connection`` (alias binding the private connection),
-# e.g. ``conn = store._connection  # noqa: SLF001``. ``store._connection`` itself
-# is always a private-connection caller and is added explicitly below.
+# e.g. ``conn = store._connection`` (carrying an SLF001 suppression).
+# ``store._connection`` itself is always a private-connection caller and is
+# added explicitly below.
 _ALIAS_BIND = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*store\._connection\b")
 
 # Matches a ``.execute(`` call whose receiver is a given caller name.

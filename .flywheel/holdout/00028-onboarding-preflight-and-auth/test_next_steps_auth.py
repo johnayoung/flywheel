@@ -32,10 +32,11 @@ def _make_valid_repo(root: Path) -> None:
     must produce an attached-branch repo with one commit and a throwaway
     identity (no reliance on the developer's global git config).
     """
-    run = lambda *args: subprocess.run(
-        ["git", *args], cwd=root, check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    def run(*args: str) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", *args], cwd=root, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     run("init")
     run("config", "user.email", "holdout@example.invalid")
     run("config", "user.name", "Holdout Tester")

@@ -6,3 +6,5 @@ sandboxes/
 worktrees/
 logs/
 .merge.lock
+# Blind held-out oracles authored by /fw-verify: throwaway scratch, never landed.
+verification/

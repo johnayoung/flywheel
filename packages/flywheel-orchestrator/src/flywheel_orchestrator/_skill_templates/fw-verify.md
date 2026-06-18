@@ -5,7 +5,7 @@ argument-hint: [NNNNN-FEATURE-name, a phase dir, one or more task ids, or empty 
 ---
 <!-- managed-by: flywheel init -->
 
-The product of this stage is a held-out test the implementing agent did not author and cannot have shaped: an oracle written BLIND to the implementation and proven to DISCRIMINATE, so "the test passes" is evidence the behavior is right rather than evidence the agent wrote a test it could pass. This stage runs BETWEEN `/fw-plan` and execute (`flywheel worker`), is optional but recommended, and ships ONE thing into this repo: held-out test files at a fenced location, fenced in the owning task's `non_goals`. It writes nothing else flywheel-specific.
+The product of this stage is a held-out test the implementing agent did not author and cannot have shaped: an oracle written BLIND to the implementation and proven to DISCRIMINATE, so "the test passes" is evidence the behavior is right rather than evidence the agent wrote a test it could pass. This stage runs BETWEEN `/fw-plan` and execute (`flywheel worker`) and is optional but recommended. It lands NOTHING runnable into the committed repo: the oracle is authored and run at verify time in a git-ignored scratch location (`.flywheel/verification/`), and the only durable artifact it keeps is the recorded DISCRIMINATION PROOF under `__FW_AUDITS_DIR__`. The criterion's permanent regression guard is the owning task's own tests in the repo's normal suite (run by `/fw-plan`'s command graders and CI), never this throwaway oracle — so the held-out file never persists in the tree, never reaches the implementing agent's worktree, and never erodes the next spec's blindness.
 
 The single causal lever is ACCESS, not separation: an oracle derived from code-in-view encodes the implementation's actual (often buggy) behavior as the assertion. So the spine of this skill is an INFORMATION FENCE: an exact may-see / must-not-see contract, packaged as a self-contained FENCE PACK handed to a blind author who has never seen the implementation, the agent's visible tests, any runtime output, or a reference solution. Every other step exists to keep that author blind, pinned to the DECLARED contract, and producing an oracle that DISCRIMINATES rather than merely exists.
 
@@ -30,7 +30,7 @@ A blind author is handed exactly one criterion and an observable contract and as
 
 **The fence cuts both ways, blindness alone is NOT enough.** A blind author handed a thin criterion hallucinates a canonical spec and tests behavior nobody asked for. So the criterion you hand over must be explicit and project-specific. If it is not, if the author cannot pin a discriminating example or relation from the criterion plus contract alone, that is a fence violation in the OTHER direction, and it routes UPSTREAM (see CONTRACT-PINNING FEEDBACK), never into a fabricated assertion. The two failure modes are symmetric: a vague criterion with no discriminator AND a hidden oracle demanding behavior the contract never stated are BOTH defects, fixed upstream, never papered over here.
 
-**The honest gap (state this plainly; do not oversell).** This stage authors and fences BY CONVENTION. An in-repo holdout the agent can read or write is still gameable: frontier agents demonstrably edit tests and scoring code to inflate a score. Convention raises the COST of gaming; it does not eliminate it. True tamper-resistance, grading out of the worktree after the agent finishes, is complementary orchestrator work and is explicitly OUT OF SCOPE here. fw-verify must never claim authoritativeness it cannot enforce at authoring time. A held-out suite is also a filter, not a correctness proof: a finite oracle can still be slipped past.
+**The honest gap (state this plainly; do not oversell).** This stage proves blind that a discriminating oracle EXISTS for a criterion and records that proof; it does not by itself grade the agent's real run. The oracle stays in a git-ignored scratch dir, so it never lands and never reaches the agent's worktree — but the execute-time gate on the agent's actual work is therefore the task's OWN command graders and tests, not this oracle. An execute-time HELD-OUT gate — the agent graded by a test it never authored or saw — additionally needs out-of-worktree grading owned by the orchestrator (the agent finishes, then a copy of the oracle grades its committed result from outside the sandbox); that is complementary orchestrator work, explicitly OUT OF SCOPE here. fw-verify must never claim authoritativeness it cannot enforce at authoring time. A held-out suite is also a filter, not a correctness proof: a finite oracle can still be slipped past.
 
 ## INPUT
 
@@ -41,11 +41,11 @@ Accepted forms:
 - A phase directory name or one or more task ids -> read those planned task JSONs under `__FW_TASKS_DIR__/active/`, matched back to the spec each was compiled from in `__FW_SPECS_DIR__/`.
 - (empty) -> the most recently planned phase under `__FW_TASKS_DIR__/active/`, matched back to its spec in `__FW_SPECS_DIR__/`. Never author for everything by reflex; confirm scope before fanning out.
 
-You READ specs and tasks; you never edit them. The spec is immutable, and the task definition `/fw-plan` produced is immutable. You WRITE only held-out test files into the repo's held-out location (named in STEP 5), and you PRESENT the one task-side edit (a `command` grader plus a `non_goals` fence) for the operator to apply. Clarifications you discover route upstream (CONTRACT-PINNING FEEDBACK), never into the spec or the task JSON.
+You READ specs and tasks; you never edit them. The spec is immutable, and the task definition `/fw-plan` produced is immutable. You WRITE the held-out oracle only into the git-ignored verification scratch location (named in STEP 5), RECORD its discrimination proof under `__FW_AUDITS_DIR__`, and you PRESENT the one task-side edit (a `non_goals` fence) for the operator to apply. Clarifications you discover route upstream (CONTRACT-PINNING FEEDBACK), never into the spec or the task JSON.
 
 ## WHAT THIS STAGE IS AND IS NOT
 
-- **It IS** the blind-author step for held-out BEHAVIOR criteria with an observable contract. It reads the tasks `/fw-plan` produced and the spec criteria they compile, authors the oracle blind, validates that it discriminates, screens it for flakiness, writes it to a fenced location, and presents the fence to add to the owning task's `non_goals`. It makes `/fw-plan`'s grader-ladder rung-3 (out-of-band / read-only / hidden test surface) and its composition holdout real for the criteria that warrant one.
+- **It IS** the blind-author step for held-out BEHAVIOR criteria with an observable contract. It reads the tasks `/fw-plan` produced and the spec criteria they compile, authors the oracle blind, validates that it discriminates, screens it for flakiness, runs it in the git-ignored verification scratch dir, records the proof, and presents the fence to add to the owning task's `non_goals`. It supplies the blind discrimination EVIDENCE behind `/fw-plan`'s grader-ladder rung-3 for the criteria that warrant one; the execute-time grader on the agent's real work stays `/fw-plan`'s (the task's own command graders and tests), not a landed copy of this throwaway oracle.
 - **It is NOT** a re-plan or a re-spec. You do not invent criteria, add requirements the contract does not state, edit a handed-off task, or rewrite a grader. `/fw-plan` owns the task and grader shape.
 - **It is NOT** authoritative-by-itself. The held-out flag becomes a kept promise only when this blind, discriminating authoring is later paired with run-time grader isolation (out of scope, above).
 
@@ -109,7 +109,7 @@ REPO TEST CONVENTIONS (so the test runs and reads idiomatically here):
   - Framework / runner:  <e.g. pytest, jest, go test>
   - Fixtures to reuse:   <named>
   - One wiring example:  <a short, verbatim existing test showing imports, fixtures, naming>
-  - File location:       <the fenced held-out path you were given>
+  - File location:       .flywheel/verification/<spec>/ (git-ignored scratch; not committed)
 
 WRITE:
   - A test that FAILS a plausible-wrong implementation of this criterion and PASSES
@@ -164,30 +164,32 @@ For each held-out criterion you author, you bind three things together:
 
 **Record the discrimination proof:** which wrong reference died, on which input, and that the correct reference passed. That evidence is the durable artifact of this stage. Discard the synthesized references themselves as throwaway scratch the moment the gate is recorded, they MUST NOT ship into the repo or the agent's view; a reference solution in the worktree is exactly the leak the fence forbids.
 
-## STEP 5: SCREEN FOR EXECUTABILITY AND FLAKINESS, THEN WRITE AND FENCE
+## STEP 5: SCREEN FOR EXECUTABILITY AND FLAKINESS, THEN RECORD AND FENCE
 
 A generated holdout is measurably flakier and more often non-executable than a human one, and a non-deterministic verdict destroys the authoritativeness the whole stage exists for. Screen every gate-passing holdout BEFORE you trust it to grade, against the synthesized correct reference from STEP 4, never the candidate:
 
 - **Executability first.** It must compile/parse and run under this repo's runner. A test that cannot execute detects nothing, fix it (blind, from the contract) or route the criterion to manual.
 - **Flake screen.** Run it at least twice (run-twice / run-N) against the synthesized correct reference. Identical verdict each time, or QUARANTINE it: remove the nondeterminism (pin time, seed, ordering, I/O) or, if it cannot be removed, route the criterion to manual. A flaky holdout is worse than none, it fails correct implementations at random.
 
-Write each passing, discriminating, non-flaky holdout to a DEDICATED held-out location separated from the agent's visible tests, a repo-conventional directory you name for this repo (for example a `holdout/`, `heldout/`, or `acceptance/held_out/` subtree under the existing test root, matching this repo's layout). One holdout per criterion, named for the criterion, not the implementation. The test must invoke the REAL behavior through the real entrypoint and the repo's real runner, not a marker file or a log line. The holdout adds NO requirement beyond the declared criterion: a hidden oracle that demands behavior the contract does not state is itself a defect.
+Write each passing, discriminating, non-flaky holdout to the GIT-IGNORED verification scratch location `.flywheel/verification/<spec-or-phase>/`, separated from the agent's visible tests and NEVER committed: the directory is git-ignored, so the oracle does not land in the tree, never appears in a freshly provisioned worker worktree, and never reaches the implementing agent's view. One holdout per criterion, named for the criterion, not the implementation. The holdout adds NO requirement beyond the declared criterion: a hidden oracle that demands behavior the contract does not state is itself a defect.
 
-Then PRESENT the two task-side edits for the operator to apply (you READ tasks; the operator OWNS the task edit, present these, do not write the task JSON yourself):
+Because this stage runs BEFORE execute, the holdout grades the SYNTHESIZED references from STEP 4 (the discrimination gate), not a real implementation that does not exist yet. Its job here is to PROVE blind that a discriminating oracle exists for the criterion and to RECORD that proof — not to gate the real agent run. The execute-time gate on the agent's actual work stays where `/fw-plan` put it: the task's own `command` graders plus the tests the implementing agent must write into the repo's normal suite (the durable, CI-run regression guard). Do NOT wire this throwaway oracle in as a landed grader — a git-ignored path is absent from the worker's worktree, and committing it to make the grader resolve would re-open the in-repo gameability this relocation exists to close.
 
-- **A `command` grader** whose `run` invokes the holdout via the repo's real runner targeting the fenced location. Name it so the spine is legible (e.g. `heldout-<criterion>`). If the owning task's graders already point at the held-out surface (`/fw-plan` rung 3 / the composition holdout), your file now makes that command real. If they do not, this is the one-line grader addition to propose.
-- **A `non_goals` line** fencing the held-out path so the implementing agent is forbidden from reading, modifying, weakening, or deleting it ("do not read, modify, or weaken tests under `<held-out path>`"), mirroring `/fw-plan`'s grading-surface fence. Access control plus instruction: pin the surface AND forbid touching it. Add the held-out path to the task's protected paths if the work source carries one.
+Then RECORD the durable artifact and PRESENT the one task-side edit (you READ tasks; the operator OWNS the task edit, present it, do not write the task JSON yourself):
+
+- **Record the discrimination proof** for each admitted holdout under `__FW_AUDITS_DIR__`: which synthesized wrong reference died, on which input, that the correct reference passed, and the flake-screen result. This recorded evidence — not a committed test file — is the artifact this stage keeps.
+- **A `non_goals` line** forbidding the implementing agent from reading or writing the verification scratch dir ("do not read or write under `.flywheel/verification/`"), so a future blind oracle for the same criterion is not leaked into the agent's view. Add the path to the task's protected paths if the work source carries one.
 
 ```
 ## Held-out oracles authored for <spec / phase / tasks>
 
-#<n> "<criterion>"  ->  <held-out path>  (task <id>)
+#<n> "<criterion>"  ->  .flywheel/verification/<spec>/<file>  (task <id>)   [git-ignored, uncommitted]
    form: metamorphic (round-trip) | property | concrete-value
    discrimination proof: killed <wrong-ref> on <input>; passed the correct reference
    screened: executable [pass], discriminates [pass], flake-screen run-twice [stable]
-   wire into task <id> (operator applies):
-     grader:    { "type": "command", "run": "<repo runner> <held-out path>", "name": "heldout-<slug>" }
-     non_goals: "Do not read, modify, or weaken tests under <held-out path>"
+   recorded: __FW_AUDITS_DIR__/<record>      (durable artifact)
+   fence to add to task <id> (operator applies):
+     non_goals: "Do not read or write under .flywheel/verification/"
 ```
 
 ## CONTRACT-PINNING FEEDBACK (the upstream loop, do not skip it)
@@ -215,21 +217,23 @@ Show the operator what is now provable, where it is honest about its own limits,
 Held-out oracles authored: <a> for <T> tasks (blind, before execute, discrimination-proven)
 
 Per criterion authored:
-  <task-id> / criterion <n>: <metamorphic|property|concrete> holdout at <held-out path>
+  <task-id> / criterion <n>: <metamorphic|property|concrete> holdout
+    located: .flywheel/verification/<spec>/<file>   (git-ignored, uncommitted)
     discriminates: killed <wrong-ref> on <input>, passed the correct reference
-    flake screen: passed (run-twice); fence to add to <task-id>.non_goals (operator applies)
+    recorded: __FW_AUDITS_DIR__/<record> (durable proof); fence to add to <task-id>.non_goals (operator applies)
 
 Skipped (already un-gameable): <s>          (structural/state/filesystem/schema)
 Routed to manual: <m>                       (subjective, or no discriminating oracle authorable)
 Returned upstream as under-specified: <u>   (criterion + the unstated contract detail)
 
-Fencing is by CONVENTION. An in-repo holdout the agent can read or write is still
-gameable; this raises the cost, it does not eliminate it. True tamper-resistance is
-out-of-worktree grading owned by the orchestrator, out of scope here. A held-out suite
-is a filter, not a correctness guarantee.
+This stage proves blind that a discriminating oracle EXISTS and records that proof; it
+does not itself gate the agent's real run. The execute-time gate is the task's own command
+graders and tests (the durable, CI-run guard). An execute-time HELD-OUT gate — the agent
+graded by a test it never saw — additionally needs out-of-worktree grading owned by the
+orchestrator, out of scope here. A held-out suite is a filter, not a correctness guarantee.
 
-Next: the operator adds each named command grader and non_goals fence to its task, then
-runs the tasks with `flywheel worker` (held-out graders run out-of-band). Return the <u>
+Next: the operator adds the non_goals fence to each task, then runs the tasks with
+`flywheel worker` (graded by the task's own command graders and tests). Return the <u>
 under-specified criteria to /fw-spec before executing.
 ```
 
@@ -247,6 +251,7 @@ under-specified criteria to /fw-spec before executing.
 - **DO NOT** ship a generated holdout without an executability and run-twice flake screen, a non-deterministic verdict destroys authoritativeness.
 - **DO NOT** fan out N authors by default; escalate adaptively only on a failed strength gate or genuine disagreement, and diversify models/prompts when you do.
 - **DO NOT** ship the synthesized reference implementations into the repo or the agent's view, a reference in the worktree is a leaked answer.
-- **DO NOT** edit the spec or a handed-off task's goal or graders; write only the held-out test files, and PRESENT the command grader and `non_goals` fence for the operator to apply.
-- **DO NOT** claim the held-out flag is tamper-proof, it is fenced by convention until paired with out-of-worktree grading; say so plainly.
+- **DO NOT** edit the spec or a handed-off task's goal or graders; write the oracle only into the git-ignored `.flywheel/verification/` scratch dir, record its discrimination proof under `__FW_AUDITS_DIR__`, and PRESENT only the `non_goals` fence for the operator to apply.
+- **DO NOT** land the throwaway oracle into the committed repo or wire it as a `command` grader — a git-ignored path is absent from the worker's worktree, and committing it to make a grader resolve re-opens the in-repo gameability this relocation closes. The execute-time gate is the task's own graders and tests.
+- **DO NOT** claim this stage gates the agent's real run or that the held-out flag is tamper-proof: it proves blind that a discriminating oracle exists and records that proof; an execute-time held-out gate additionally needs out-of-worktree grading owned by the orchestrator. Say so plainly.
 - **DO NOT** use emojis.

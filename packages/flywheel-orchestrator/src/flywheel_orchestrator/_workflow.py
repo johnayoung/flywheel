@@ -1792,6 +1792,9 @@ worktrees/
 # verbatim, sensitive-by-default payloads. Never committed.
 logs/
 .merge.lock
+# Blind held-out oracles authored by /fw-verify: throwaway scratch run at
+# verify time, never landed (the durable artifact is the recorded proof).
+verification/
 """
 
 _INIT_POLICY_HEADER = """\

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Sequence
+from urllib.parse import quote
 
 
 # How long ``stop()`` waits for the child to exit after SIGTERM before
@@ -125,7 +126,12 @@ def has_live_lease(db_path: Path, *, now: datetime | None = None) -> bool:
     moment = now if now is not None else datetime.now(timezone.utc)
     # Open read-only so a misconfigured supervisor cannot accidentally
     # write to the production store; URI form lets us pass ``mode=ro``.
-    uri = f"file:{db_path}?mode=ro"
+    # Percent-encode the path so a ``?`` or ``#`` in it (e.g. a worktree dir
+    # named for a branch) is not parsed as the URI's query/fragment delimiter,
+    # which would silently truncate the path and open a different, table-less
+    # database -- making a live lease read as absent. ``quote`` keeps ``/``
+    # safe so the path structure is preserved.
+    uri = f"file:{quote(str(db_path))}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
         try:
@@ -330,6 +336,16 @@ class WorkerSupervisor:
         self._dead_pid = None
         self._dead_exit = None
         self._last_error = None
+
+        # A DEAD / ERROR status short-circuits status() *before* its
+        # has_live_lease() check, so a live lease (the just-died child's own
+        # not-yet-expired lease, or a peer worker's) would otherwise be missed
+        # and we would spawn a duplicate against a store that already has a
+        # live worker. Now that the DEAD/ERROR flags are cleared, re-evaluate:
+        # a live lease surfaces as DETACHED and we spawn nothing.
+        rechecked = self.status()
+        if rechecked.state == WorkerState.DETACHED:
+            return rechecked
 
         try:
             log_handle = self._open_log()

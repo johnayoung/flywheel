@@ -1229,6 +1229,23 @@ def test_load_task_missing_returns_none(store: object) -> None:
     assert store.load_task("absent", "deadbeef") is None
 
 
+def test_load_task_latest_breaks_created_at_tie_by_insertion_order(
+    store: object,
+) -> None:
+    # Regression (#7): two versions saved at the SAME created_at (a fixed /
+    # injected clock -- the whole test suite, batch imports, deterministic
+    # seeding) must resolve "latest" to the most-recently-saved version, the
+    # same on every backend. Postgres without an insertion-order tie-break
+    # returned a heap-order-dependent (and REINDEX-unstable) row, diverging
+    # from sqlite (rowid) and memory (insertion seq).
+    assert isinstance(store, TaskStore)
+    first = _task(goal="First saved.")
+    second = _task(goal="Second saved.")
+    store.save_task(first, now=_t(0))
+    store.save_task(second, now=_t(0))  # identical created_at
+    assert store.load_task("t") == second
+
+
 def test_save_task_edit_creates_new_version(store: object) -> None:
     assert isinstance(store, TaskStore)
     original = _task(goal="Original goal.")

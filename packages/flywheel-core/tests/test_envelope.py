@@ -188,6 +188,18 @@ class TestMalformedEnvelope:
         assert result.offending is not None
         assert "this-is-not-json" in result.offending
 
+    def test_deeply_nested_payload_is_malformed_not_recursion_error(
+        self,
+    ) -> None:
+        # Untrusted agent output: a payload nested far beyond the JSON
+        # scanner's recursion limit must map to MalformedEnvelope, not leak a
+        # RecursionError out of this closed-contract parser and crash the run.
+        depth = 20000
+        output = _wrap("[" * depth + "]" * depth)
+        result = parse_envelope(output)
+        assert isinstance(result, MalformedEnvelope)
+        assert "deep" in result.reason
+
 
 class TestDuplicateEnvelope:
     def test_two_complete_envelopes_in_same_output(self) -> None:

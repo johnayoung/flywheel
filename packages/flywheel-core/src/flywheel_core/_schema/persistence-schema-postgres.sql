@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- and deduped: re-saving an unchanged definition is a no-op, editing any
 -- hashed field adds a new version row. A run pins the exact version it ran via
 -- lifecycles.task_content_hash, so historical truth survives later edits.
+-- insertion_seq is a monotonic insertion-order key. It exists solely to
+-- break created_at ties in the latest-version lookup deterministically and
+-- stably (heap/ctid order is not stable across REINDEX/VACUUM FULL/restore),
+-- matching the insertion-order tie-break the sqlite (rowid) and in-memory
+-- (insertion seq) backends already use so all three return the same version.
 CREATE TABLE IF NOT EXISTS task_versions (
   task_id       TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
@@ -87,6 +92,7 @@ CREATE TABLE IF NOT EXISTS task_versions (
   tags_json     JSONB NOT NULL,
   context_json  JSONB NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL,
+  insertion_seq BIGINT GENERATED ALWAYS AS IDENTITY,
   PRIMARY KEY (task_id, content_hash),
   FOREIGN KEY (task_id) REFERENCES tasks(id)
 );

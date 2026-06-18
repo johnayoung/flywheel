@@ -2354,6 +2354,37 @@ class TestEntryTimeCrash:
             _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
         assert excinfo.value is sentinel
 
+    def test_entry_crash_finalizes_open_attempt(self) -> None:
+        """A mid-attempt entry crash walks the lifecycle to terminal FAILED;
+        the open attempt must be finalized (INTERNAL_ERROR), never left with
+        ``ended_at=None`` under a terminal lifecycle that finalize_stranded_
+        lifecycle (RUNNING/VALIDATING only) would never repair."""
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-strand")
+        invoke = self._raising_invoke(OSError("too many open files"))
+
+        with pytest.raises(OSError):
+            _run(run_task(task, lifecycle, store, sink=sink, invoke=invoke))
+
+        reloaded = store.load_lifecycle(lifecycle.run_id)
+        assert reloaded is not None
+        assert reloaded.status == Status.FAILED
+
+        attempts = store.list_attempts(lifecycle.run_id)
+        assert len(attempts) == 1
+        # The attempt is closed, not stranded.
+        assert attempts[0].ended_at is not None
+        assert attempts[0].outcome == Outcome.INTERNAL_ERROR
+
         # And the crash event landed before the propagation.
         crash_events = [
             e
@@ -6797,6 +6828,61 @@ class TestSteeringLedger:
         folded = replay(store.list_domain_events("run-steer"))
         assert folded.status == outcome.lifecycle.status
         assert folded.version == outcome.lifecycle.version
+
+    def test_applied_command_ledgered_with_hang_watchdog_enabled(self) -> None:
+        # Regression: _invoke_with_watchdog rebuilds InvocationRequest to wrap
+        # on_message for its heartbeat; it must also thread on_command_applied
+        # through, or the steering ledger (the CommandApplied event AND the
+        # applied-queue-row delete) silently breaks whenever the watchdog is
+        # enabled (hang_timeout_seconds > 0). The _steering_invoker asserts
+        # on_command_applied is not None, so the dropped seam fails here.
+        from flywheel_core.events import CommandApplied
+
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[_ok_command()])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-steer-wd")
+        store.enqueue_command(
+            "run-steer-wd",
+            "say",
+            {"text": "focus on graders"},
+            now=datetime.now(timezone.utc),
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            loop_guard=LoopGuardConfig(
+                repeated_tool_failure_threshold=None,
+                thrash_repeat_threshold=None,
+                thrash_window=None,
+                hang_timeout_seconds=0.1,
+            ),
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=self._steering_invoker(store, "run-steer-wd"),
+                # Non-advancing monotonic clock: silence stays 0, so the
+                # watchdog is active (routing through _invoke_with_watchdog)
+                # but never trips.
+                monotonic=lambda: 0.0,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        steering = [
+            e
+            for e in store.list_domain_events("run-steer-wd")
+            if isinstance(e, CommandApplied)
+        ]
+        assert len(steering) == 1
+        assert steering[0].command_kind == "say"
+        # The applied queue row was deleted after the event committed.
+        assert store._control_commands == []
 
     def test_append_failure_retains_queue_row(
         self, capsys: pytest.CaptureFixture[str]

@@ -100,6 +100,7 @@ from flywheel_orchestrator._strategy import (
     Submitter,
 )
 from flywheel_orchestrator._workflow import (
+    TaskState,
     TaskStatusRow,
     _latest_lifecycle_row,
     select_next_task,
@@ -753,8 +754,21 @@ async def orchestrate(
                     held.add(pick.task.id)
                     continue
                 attempted_fresh.add(pick.task.id)
+                # A bare-interrupted lifecycle (operator SIGINT or in-band
+                # ``interrupt`` with no structured block — blocked-interrupted
+                # rows are excluded from fresh selection above) must RESUME on
+                # its own run_id so run_task's entry-time INTERRUPTED -> READY
+                # normalization fires and the paused work continues. Minting a
+                # fresh run_id instead would drive a brand-new lifecycle from
+                # scratch and orphan the paused one (docs/task-lifecycle.md).
+                resume_run_id = (
+                    pick.latest_run_id
+                    if pick.state == TaskState.INTERRUPTED
+                    else None
+                )
+                select_mode = "resume" if resume_run_id is not None else "fresh"
                 try:
-                    sandbox = resolve_sandbox(pick, None, "fresh")
+                    sandbox = resolve_sandbox(pick, resume_run_id, select_mode)
                 except Exception as exc:  # noqa: BLE001 - consumer code
                     # A failing provider skips this task for the session
                     # (already in attempted_fresh) and keeps draining the
@@ -777,7 +791,7 @@ async def orchestrate(
                     sandbox=sandbox,
                     submit=submit,
                     work_source=source,
-                    run_id=None,
+                    run_id=resume_run_id,
                     worker_id=wid,
                     lease_seconds=lease_seconds,
                     heartbeat_interval=heartbeat_interval,

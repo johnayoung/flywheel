@@ -256,6 +256,17 @@ class PostgresStore:
                     )
                 )
                 cur.execute(_read_schema_sql())
+                # Additive, version-neutral convergence: a task_versions table
+                # created before insertion_seq existed gains it here. Idempotent
+                # (IF NOT EXISTS), so fresh DBs -- where the CREATE TABLE above
+                # already added it -- are unaffected. The column is purely
+                # additive and ignorable by older readers, so it needs no
+                # schema-version bump: every store ends bootstrap with it.
+                cur.execute(
+                    "ALTER TABLE task_versions "
+                    "ADD COLUMN IF NOT EXISTS insertion_seq "
+                    "BIGINT GENERATED ALWAYS AS IDENTITY"
+                )
                 # Version pin: a schema whose schema_version row does not
                 # match is refused with a "must be re-created" error. The
                 # one supported forward migration (v11 -> v12: add the
@@ -701,7 +712,8 @@ class PostgresStore:
                     cur.execute(
                         "SELECT goal, graders_json, tags_json, context_json "
                         "FROM task_versions "
-                        "WHERE task_id = %s ORDER BY created_at DESC LIMIT 1",
+                        "WHERE task_id = %s "
+                        "ORDER BY created_at DESC, insertion_seq DESC LIMIT 1",
                         (task_id,),
                     )
                 row = cur.fetchone()

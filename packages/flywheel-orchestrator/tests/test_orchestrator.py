@@ -317,6 +317,47 @@ def test_still_blocked_task_is_not_resumed_or_rerun(tmp_path: Path) -> None:
     assert stuck[0].status is Status.INTERRUPTED
 
 
+def test_bare_interrupted_task_resumes_on_same_run_id(tmp_path: Path) -> None:
+    """A bare operator-interrupted lifecycle (INTERRUPTED with no structured
+    block) must RESUME on its own run_id so run_task's entry-time
+    INTERRUPTED -> READY normalization fires. Minting a fresh run_id instead
+    drives a new lifecycle from scratch and orphans the paused one."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "paused")
+
+    db_path = tmp_path / "flywheel.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="paused", run_id="run-paused")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.INTERRUPTED, now=now)  # no blocked_requires
+        store.create_lifecycle(lc)
+    finally:
+        store.close()
+
+    report = _orchestrate(tmp_path, _always_verify())
+
+    # Resumed on the SAME run_id (mode "resume"), reaching DONE.
+    paused = [r for r in report.runs if r.task_id == "paused"]
+    assert len(paused) == 1
+    assert paused[0].mode == "resume"
+    assert paused[0].run_id == "run-paused"
+    assert paused[0].status is Status.DONE
+
+    # Exactly one lifecycle for the task: the paused one was resumed, not
+    # orphaned alongside a freshly-minted run_id.
+    store = SqliteStore(db_path)
+    try:
+        lifecycles = store.list_lifecycles(task_id="paused")
+        assert [lc.run_id for lc in lifecycles] == ["run-paused"]
+        assert lifecycles[0].status is Status.DONE
+    finally:
+        store.close()
+
+
 # --- stranded recovery at entry --------------------------------------------
 
 

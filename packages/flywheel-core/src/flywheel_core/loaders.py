@@ -164,6 +164,50 @@ def _build_grader(entry: dict[str, Any], source: str, idx: int) -> Grader:
     )
 
 
+def _str_list_field(value: Any, field: str, source: str) -> list[str]:
+    """Coerce an optional JSON list-of-strings field.
+
+    ``None``/absent yields ``[]``. A non-list (notably a bare string, the
+    common authoring typo ``"tags": "http"``) is rejected rather than silently
+    iterated into a per-character list -- ``list("http")`` would corrupt the
+    field into ``['h', 't', 't', 'p']``, which ``Task.validate`` does not catch.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TaskLoadError(
+            f"{source}: '{field}' must be a list of strings, "
+            f"got {type(value).__name__}"
+        )
+    return list(value)
+
+
+def _notes_field(value: Any, source: str) -> str:
+    """Coerce an optional ``context.notes`` field to a string.
+
+    ``None``/absent yields ``""``. A string passes through. A list of strings
+    (a common multi-paragraph authoring convention across the repo's task
+    files) is joined with blank lines so ``Context.notes`` is always the
+    ``str`` the prompt builder (``ctx.notes.strip()``) requires. Any other type
+    -- or a list with a non-string entry -- is rejected at load time rather
+    than passed through to crash later, far from the malformed source.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if not all(isinstance(item, str) for item in value):
+            raise TaskLoadError(
+                f"{source}: 'context.notes' list entries must all be strings"
+            )
+        return "\n\n".join(value)
+    raise TaskLoadError(
+        f"{source}: 'context.notes' must be a string or list of strings, "
+        f"got {type(value).__name__}"
+    )
+
+
 def _task_from_dict(data: Any, source: str) -> Task:
     if not isinstance(data, dict):
         raise TaskLoadError(
@@ -176,12 +220,22 @@ def _task_from_dict(data: Any, source: str) -> Task:
             f"{source}: 'context' must be an object, got {type(context_data).__name__}"
         )
     context = Context(
-        relevant=list(context_data.get("relevant") or []),
-        references=list(context_data.get("references") or []),
-        constraints=list(context_data.get("constraints") or []),
-        non_goals=list(context_data.get("non_goals") or []),
-        edge_cases=list(context_data.get("edge_cases") or []),
-        notes=context_data.get("notes") or "",
+        relevant=_str_list_field(
+            context_data.get("relevant"), "context.relevant", source
+        ),
+        references=_str_list_field(
+            context_data.get("references"), "context.references", source
+        ),
+        constraints=_str_list_field(
+            context_data.get("constraints"), "context.constraints", source
+        ),
+        non_goals=_str_list_field(
+            context_data.get("non_goals"), "context.non_goals", source
+        ),
+        edge_cases=_str_list_field(
+            context_data.get("edge_cases"), "context.edge_cases", source
+        ),
+        notes=_notes_field(context_data.get("notes"), source),
     )
 
     raw_graders = data.get("graders", [])
@@ -206,7 +260,7 @@ def _task_from_dict(data: Any, source: str) -> Task:
     if "id" in data:
         kwargs["id"] = data["id"]
     if "tags" in data:
-        kwargs["tags"] = list(data["tags"])
+        kwargs["tags"] = _str_list_field(data["tags"], "tags", source)
     # ``prerequisites`` is an orchestration-layer concept (the inter-task DAG),
     # not part of a single task's definition — flywheel core ignores it here.
     # Consumers that schedule across tasks parse it from the task source

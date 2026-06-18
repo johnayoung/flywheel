@@ -114,6 +114,19 @@ def _seed_interrupted(store: SqliteStore, task_id: str) -> Lifecycle:
     return lc
 
 
+def _seed_internal_error(store: SqliteStore, task_id: str) -> Lifecycle:
+    """A lifecycle stranded in INTERNAL_ERROR by a dead worker (the process
+    persisted the infrastructure-failure status but died before run_task's
+    loop could advance it to READY/FAILED)."""
+    now = datetime.now(timezone.utc)
+    lc = Lifecycle(task_id=task_id, run_id=f"run-{task_id}-ierr")
+    lc.transition_to(Status.READY, now=now)
+    lc.transition_to(Status.RUNNING, now=now)
+    lc.transition_to(Status.INTERNAL_ERROR, error="infra blew up", now=now)
+    store.create_lifecycle(lc)
+    return lc
+
+
 def _seed_blocked(
     store: SqliteStore,
     task_id: str,
@@ -301,6 +314,26 @@ def test_select_next_retries_failed_task(tmp_path: Path) -> None:
         rows = build_status_rows(tmp_path, store)
         pick = select_next_task(rows)
         assert pick is not None and pick.task.id == "broken"
+        assert pick.state == TaskState.RETRYABLE
+    finally:
+        store.close()
+
+
+def test_select_next_retries_internal_error_task(tmp_path: Path) -> None:
+    """A persisted INTERNAL_ERROR (dead-worker strand) is recoverable like
+    FAILED_VALIDATION: it must classify RETRYABLE and be re-selectable, not
+    fall to the IN_PROGRESS catch-all where it wedges forever (never
+    re-selected, never finalized by the RUNNING/VALIDATING stranded sweep,
+    its phase never archives)."""
+    phase = tmp_path / "active" / "01-phase"
+    _write_task(phase / "stranded.json", "stranded")
+
+    store = SqliteStore(":memory:")
+    try:
+        _seed_internal_error(store, "stranded")
+        rows = build_status_rows(tmp_path, store)
+        pick = select_next_task(rows)
+        assert pick is not None and pick.task.id == "stranded"
         assert pick.state == TaskState.RETRYABLE
     finally:
         store.close()

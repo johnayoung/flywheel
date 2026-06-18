@@ -205,6 +205,31 @@ def test_submit_ff_merges_on_done(tmp_path: Path) -> None:
     assert not s._branch_exists("flywheel/01-phase/t1")
 
 
+def test_submit_cleans_branch_when_base_not_checked_out(tmp_path: Path) -> None:
+    # Safe-landing config: the landing base ("main") is NOT the operator's
+    # checked-out branch, so _ff_merge advances it out-of-tree. _cleanup must
+    # still delete the landed branch. ``git branch -d`` would check mergedness
+    # against the checked-out HEAD ("operator") rather than the landing base and
+    # refuse, silently leaking the ref; ``-D`` deletes against the established
+    # containment.
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    # Move the operator's HEAD off "main" so the landing base is not checked out.
+    _git(repo, "checkout", "-b", "operator")
+    s = _submitter(repo)
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "feature.txt", "x", "feat")
+    base_before = _rev(repo, "main")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE))
+
+    assert _rev(repo, "main") != base_before  # base advanced out-of-tree
+    assert not wt.exists()
+    assert not s._branch_exists("flywheel/01-phase/t1")  # ref not leaked
+
+
 def test_submit_parks_on_failed(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)

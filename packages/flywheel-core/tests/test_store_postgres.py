@@ -29,12 +29,14 @@ import pytest
 from flywheel_core import (
     CURRENT_SCHEMA_VERSION,
     Attempt,
+    CommandGrader,
     GraderResultRecord,
     Lifecycle,
     LifecycleInitialized,
     OptimisticConcurrencyError,
     Status,
     StoreSchemaError,
+    Task,
 )
 
 
@@ -263,6 +265,30 @@ def test_raw_delete_on_grader_results_is_rejected(pg_store: Any) -> None:
     assert "append-only" in str(exc.value)
     # Row is still present after the rejected delete.
     assert len(pg_store.list_grader_results("r1", 1)) == 1
+
+
+def test_latest_task_version_survives_reindex(pg_store: Any) -> None:
+    # Regression (#7): two versions saved at the SAME created_at must resolve
+    # "latest" to the most-recently-saved one, STABLY -- even after a REINDEX
+    # rebuilds the (task_id, created_at) index. Without a deterministic
+    # secondary sort, the equal-created_at order tracks physical/index layout,
+    # so a REINDEX (or VACUUM FULL / dump-restore) silently flips load_task to
+    # the stale older version and diverges from the sqlite/memory backends.
+    now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
+    older = Task(id="t", goal="older-saved", graders=[CommandGrader(run="true")])
+    newer = Task(id="t", goal="newer-saved", graders=[CommandGrader(run="true")])
+    pg_store.save_task(older, now=now)
+    pg_store.save_task(newer, now=now)  # identical created_at, saved later
+
+    assert pg_store.load_task("t").goal == "newer-saved"
+
+    # Rebuild the index: equal-created_at tuples are re-laid-out, which without
+    # the insertion_seq tie-break flips the LIMIT 1 backward scan to the older.
+    with pg_store._pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("REINDEX INDEX idx_task_versions_id_created")
+
+    assert pg_store.load_task("t").goal == "newer-saved"
 
 
 # ---------------------------------------------------------------------------

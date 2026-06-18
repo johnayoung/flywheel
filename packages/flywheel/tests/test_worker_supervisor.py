@@ -121,6 +121,27 @@ def test_has_live_lease_false_when_lease_expired(tmp_path: Path) -> None:
     assert has_live_lease(db) is False
 
 
+def test_has_live_lease_handles_query_char_in_path(tmp_path: Path) -> None:
+    """A store path containing ``?`` (or ``#``) must be read correctly.
+
+    Regression (#12): the read-only URI interpolated the path raw, so SQLite
+    parsed everything after the first ``?`` as the URI query -- truncating the
+    path, opening a different (table-less) database, and reporting a live lease
+    as absent. The path is now percent-encoded.
+    """
+
+    db = tmp_path / "store?x.sqlite"
+    claims = SqliteClaimStore(db)
+    try:
+        claims.acquire_claim(
+            "task-1", "worker-A", now=datetime.now(timezone.utc),
+            lease_seconds=60.0,
+        )
+    finally:
+        claims.close()
+    assert has_live_lease(db) is True
+
+
 # --- build_default_spawn_argv ----------------------------------------------
 
 
@@ -238,6 +259,50 @@ def test_supervisor_does_not_spawn_when_lease_is_live(tmp_path: Path) -> None:
     assert not (tmp_path / "logs").exists() or not list(
         (tmp_path / "logs").glob("supervisor-*.log")
     )
+
+
+def test_supervisor_does_not_respawn_when_dead_and_lease_live(
+    tmp_path: Path,
+) -> None:
+    """Regression (#13): once the supervised child has died (DEAD), status()
+    short-circuits before its live-lease check. ``start()`` must still consult
+    ``task_claims`` after clearing the DEAD flag -- a live lease (a peer
+    worker, or the dead child's not-yet-expired lease) means a worker is
+    already running, so ``start()`` must return DETACHED, not spawn a
+    duplicate.
+    """
+
+    db = tmp_path / "store.sqlite"
+    sup = WorkerSupervisor(
+        db_path=db,
+        log_dir=tmp_path / "logs",
+        # A child that exits immediately drives the supervisor to DEAD.
+        spawn_argv=[sys.executable, "-c", "pass"],
+    )
+    first = sup.start()
+    assert first.state == WorkerState.SUPERVISED
+
+    # Let the child exit and be reaped; status() then reports DEAD.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if sup.status().state == WorkerState.DEAD:
+            break
+        time.sleep(0.05)
+    assert sup.status().state == WorkerState.DEAD
+
+    # A live lease now exists (peer worker / lingering lease).
+    claims = SqliteClaimStore(db)
+    try:
+        claims.acquire_claim(
+            "task-x", "worker-peer", now=datetime.now(timezone.utc),
+            lease_seconds=60.0,
+        )
+    finally:
+        claims.close()
+
+    result = sup.start()
+    assert result.state == WorkerState.DETACHED
+    assert sup.owns_supervised_child() is False
 
 
 def test_supervisor_detach_keeps_child_alive(tmp_path: Path) -> None:

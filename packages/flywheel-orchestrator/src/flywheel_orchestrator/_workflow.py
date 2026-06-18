@@ -207,7 +207,17 @@ def task_state(store: SqliteStore, task: Task) -> TaskStatusRow:
         state = TaskState.AWAITING_APPROVAL
     elif status == Status.INTERRUPTED:
         state = TaskState.INTERRUPTED
-    elif status in (Status.FAILED, Status.FAILED_VALIDATION):
+    elif status in (
+        Status.FAILED,
+        Status.FAILED_VALIDATION,
+        Status.INTERNAL_ERROR,
+    ):
+        # A persisted INTERNAL_ERROR is a dead-worker strand (run_task's own
+        # loop never exits in this state — it retries or walks to FAILED), so
+        # it is recoverable exactly like FAILED_VALIDATION. Without this it
+        # falls to the IN_PROGRESS catch-all below: never re-selected, never
+        # finalized by the RUNNING/VALIDATING stranded sweep, and its phase
+        # never archives -- the task wedges forever.
         state = TaskState.RETRYABLE
     elif status == Status.PENDING:
         state = TaskState.IN_PROGRESS

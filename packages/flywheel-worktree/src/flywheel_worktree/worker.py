@@ -687,7 +687,14 @@ class GitWorktreeSubmitter:
 
     def _cleanup(self, worktree: Path, branch: str) -> None:
         _git(self.repo_root, "worktree", "remove", str(worktree))
-        _git(self.repo_root, "branch", "-d", branch)
+        # Force-delete: every caller has already proven ``branch`` is contained
+        # in ``phase_base`` (commit_count == 0, or a successful out-of-tree
+        # FF-merge). ``git branch -d`` checks mergedness against the *checked-out
+        # HEAD*, not the landing base, so when the base is not the operator's
+        # HEAD (the configured safe-landing case) ``-d`` refuses and silently
+        # leaks the ref — which a later re-queue then "reuses", skipping sandbox
+        # setup. ``-D`` deletes against the established containment instead.
+        _git(self.repo_root, "branch", "-D", branch)
 
     def _record_landing_park(
         self, run_id: str, *, park_kind: str, detail: str

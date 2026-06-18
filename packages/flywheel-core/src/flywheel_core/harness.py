@@ -1882,6 +1882,33 @@ async def _run_attempt(
             clock=clock,
         )
         raise
+    except Exception as exc:
+        # Any other exception escaping the attempt body (e.g. an OSError from
+        # run_command_graders during validation, or a store write failure) is
+        # an entry-class crash. run_task's top-level handler emits one
+        # harness.crash and walks the lifecycle to FAILED, but it holds no
+        # reference to this attempt -- finalize the open attempt here (as the
+        # interrupt and hang paths do) so a terminal FAILED lifecycle never
+        # strands an attempt with ended_at=None, which finalize_stranded_
+        # lifecycle (RUNNING/VALIDATING only) would never repair. Re-raise
+        # unchanged so the crash still propagates and the worker exits non-zero.
+        if attempt.ended_at is None:
+            try:
+                _finalize_attempt(
+                    store=store,
+                    telemetry=telemetry,
+                    lifecycle=lifecycle,
+                    attempt=attempt,
+                    outcome=Outcome.INTERNAL_ERROR,
+                    error=f"attempt crashed: {type(exc).__name__}: {exc}",
+                    clock=clock,
+                )
+            except Exception:
+                # A secondary failure (often the same store error that caused
+                # the crash) must not mask the original; the stranded-recovery
+                # sweep remains the backstop.
+                pass
+        raise
 
 
 async def _run_attempt_body(
@@ -2698,6 +2725,7 @@ async def _invoke_with_watchdog(
         on_message=watchdog_on_message,
         context_observer=request.context_observer,
         recovery_interrupt_event=request.recovery_interrupt_event,
+        on_command_applied=request.on_command_applied,
     )
 
     # Wrap the invoker call in a coroutine so asyncio.create_task gets a

@@ -507,3 +507,63 @@ def test_direct_task_construction_remains_unchanged() -> None:
     )
     task.validate()
     assert task.context.relevant == ["src/foo.py"]
+
+
+def test_string_tags_rejected_not_exploded_into_chars() -> None:
+    # Regression (#10): a bare string for ``tags`` (the common authoring typo
+    # "tags": "http") must be rejected, not silently iterated into
+    # ['h', 't', 't', 'p'] -- Task.validate does not type-check tags, so the
+    # corruption would otherwise surface nowhere.
+    from flywheel_core import load_task_data
+
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_data({"goal": "g", "graders": [], "tags": "http"})
+    assert "tags" in str(exc.value)
+
+
+def test_string_context_field_rejected_not_exploded() -> None:
+    # Regression (#10): a bare string for a context list-field must be
+    # rejected, not exploded into one bullet per character in the agent
+    # briefing.
+    from flywheel_core import load_task_data
+
+    with pytest.raises(TaskLoadError) as exc:
+        load_task_data(
+            {
+                "goal": "g",
+                "graders": [],
+                "context": {"relevant": "src/foo.py"},
+            }
+        )
+    assert "context.relevant" in str(exc.value)
+
+
+def test_invalid_notes_type_rejected_at_load_time() -> None:
+    # Regression (#11): a non-string, non-list ``notes`` must be rejected at
+    # load time, not passed through to crash later at prompt build
+    # (ctx.notes.strip()). A list with a non-string entry is likewise rejected.
+    from flywheel_core import load_task_data
+
+    for bad in (123, {"a": 1}, ["ok", 5]):
+        with pytest.raises(TaskLoadError) as exc:
+            load_task_data(
+                {"goal": "g", "graders": [], "context": {"notes": bad}}
+            )
+        assert "context.notes" in str(exc.value)
+
+
+def test_list_notes_is_joined_into_a_string() -> None:
+    # The repo-wide convention authors ``notes`` as a list of paragraphs; the
+    # loader joins them into the single ``str`` Context.notes is typed as, so
+    # the prompt builder's ctx.notes.strip() never sees a list.
+    from flywheel_core import load_task_data
+
+    task = load_task_data(
+        {
+            "goal": "g",
+            "graders": [],
+            "context": {"notes": ["first para", "second para"]},
+        }
+    )
+    assert task.context.notes == "first para\n\nsecond para"
+    assert isinstance(task.context.notes, str)

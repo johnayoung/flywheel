@@ -31,16 +31,22 @@ from flywheel_core.task import CommandGrader, Task
 # risk a false positive on a pattern whose expansion we cannot resolve.
 _GLOB_CHARS = ("*", "?", "[", "]")
 
-# Shell-dynamic metacharacters: a ``shlex``-split token carrying one of these
-# is not a literal path but unparsed shell syntax -- a command substitution
-# (``$(...)`` / backticks), a variable expansion (``${...}`` / ``$VAR``), a
-# redirection, a pipe, or a statement separator. Its real value is only known
-# at run time, exactly like an unresolvable glob, so it is left unchecked
-# rather than ``stat``-ed as if it were a path. ``shlex.split`` does not
-# interpret these operators, so they survive inside (often quoted) tokens such
-# as ``"$(... pkg/dir ...)"`` whose embedded ``/`` would otherwise mislead the
-# path heuristic.
-_SHELL_DYNAMIC_CHARS = ("$", "`", "|", ">", "<", ";", "&")
+# The shell operators ``shlex`` splits off as standalone tokens when
+# ``punctuation_chars`` is enabled. Tokenizing with these makes operators their
+# own tokens (a separator/pipe/redirection/substitution-paren) instead of
+# gluing onto an adjacent word -- so a real path abutting an operator
+# (``dir;echo``) is no longer hidden inside one token, and a process
+# substitution's closing paren (``a/b)``) is no longer mistaken for part of the
+# path. Matches ``shlex``'s default punctuation set.
+_PUNCTUATION_CHARS = frozenset("();<>|&")
+
+# Substitution / expansion markers: a word token carrying one of these is not a
+# literal path but a command substitution (backtick) or a variable expansion
+# (``${...}`` / ``$VAR``). Its real value is only known at run time, exactly
+# like an unresolvable glob, so it is left unchecked rather than ``stat``-ed.
+# ``$(...)`` command substitutions are handled structurally (their body is
+# skipped by paren depth), so this only needs the in-word markers.
+_SUBST_CHARS = ("$", "`")
 
 
 @dataclass(frozen=True)
@@ -121,30 +127,57 @@ def _missing_path_tokens(run: str, repo_root: Path) -> list[str]:
     """Return the normalized repo-relative path tokens in ``run`` that are
     absent under ``repo_root`` (D-2's conservative heuristic).
 
-    A token is a path reference only when it contains ``/``, does not start
-    with ``-`` (a flag), contains no ``://`` (a URL), carries no shell-dynamic
-    metacharacter (a command substitution, variable expansion, redirection,
-    pipe, or separator -- :data:`_SHELL_DYNAMIC_CHARS`), and is not absolute. A
-    trailing ``/*`` glob segment and a trailing ``/`` are stripped; a token
-    still carrying glob metacharacters after that is left unchecked. Only
-    such tokens are existence-checked, so flags, URLs, substitutions, and bare
-    words are never flagged.
+    ``run`` is tokenized with ``shlex``'s ``punctuation_chars`` mode so shell
+    operators become their own tokens rather than gluing onto an adjacent word.
+    A word token is then existence-checked only when it contains ``/``, does
+    not start with ``-`` (a flag), contains no ``://`` (a URL), carries no
+    substitution/expansion marker (:data:`_SUBST_CHARS`), is not absolute, and
+    is neither inside a ``$(...)`` / ``<(...)`` substitution body (skipped by
+    paren depth) nor the target of a redirection (skipped after a ``<``/``>``
+    operator). A trailing ``/*`` glob segment and a trailing ``/`` are
+    stripped; a token still carrying glob metacharacters is left unchecked.
+
+    The operator-aware tokenization is what lets a real path abutting a
+    separator (``dir;echo``) still be flagged while a process substitution's
+    closing paren (``a/b)``) and a redirection's output target are not
+    mistaken for missing paths.
     """
     missing: list[str] = []
+    lexer = shlex.shlex(run, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
     try:
-        tokens = shlex.split(run)
+        tokens = list(lexer)
     except ValueError:
         # An unbalanced quote slipped past bash -n in some shells; treat the
         # command as having no resolvable path tokens rather than crash.
         return missing
+
+    subst_depth = 0  # inside a $(...) / <(...) / (...) group
+    pending_redirect = False  # previous token was a < / > redirection operator
     for token in tokens:
+        if token and all(ch in _PUNCTUATION_CHARS for ch in token):
+            # A standalone shell operator. A ``(`` (bare, ``$(``, or ``<(``)
+            # opens a substitution/group whose body is run-time-only; a ``)``
+            # closes it. A ``<``/``>`` (but not ``<(``/``>(``) introduces a
+            # redirection whose next word is an output target, not a path arg.
+            if "(" in token:
+                subst_depth += 1
+            if ")" in token:
+                subst_depth = max(0, subst_depth - 1)
+            pending_redirect = ("<" in token or ">" in token) and "(" not in token
+            continue
+        if subst_depth > 0:
+            continue
+        if pending_redirect:
+            pending_redirect = False
+            continue
         if token.startswith("-"):
             continue
         if "/" not in token:
             continue
         if "://" in token:
             continue
-        if any(ch in token for ch in _SHELL_DYNAMIC_CHARS):
+        if any(ch in token for ch in _SUBST_CHARS):
             continue
         if Path(token).is_absolute():
             continue

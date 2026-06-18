@@ -62,6 +62,38 @@ def test_a_genuine_missing_path_alongside_a_substitution_still_flags(
     assert "date" not in blob, f"the substitution must not be flagged; got {blob!r}"
 
 
+def test_missing_path_glued_to_separator_is_still_flagged(
+    tmp_path: Path,
+) -> None:
+    # Regression (#8): a real missing path abutting a statement separator
+    # (``dir;echo`` with no surrounding spaces) must still be flagged. The
+    # operator is split off as its own token so the path is no longer hidden
+    # inside one ``shlex`` word -- detection no longer depends on incidental
+    # whitespace.
+    glued = validate_task(
+        _task("pytest tests/missing/dir;echo done"), repo_root=tmp_path
+    )
+    spaced = validate_task(
+        _task("pytest tests/missing/dir ; echo done"), repo_root=tmp_path
+    )
+    assert "tests/missing/dir" in _details(glued)
+    assert "tests/missing/dir" in _details(spaced)
+
+
+def test_process_substitution_does_not_false_flag_existing_path(
+    tmp_path: Path,
+) -> None:
+    # Regression (#9): a process substitution ``<(... a/b)`` glues the closing
+    # paren onto the final arg under a naive split (``a/b)``), which then never
+    # matches the real, existing path ``a/b`` and is reported missing. The
+    # paren is now a distinct token, so the existing path is not false-flagged.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a" / "b").write_text("x")
+    assert (
+        validate_task(_task("diff <(sort a/b) other"), repo_root=tmp_path) == []
+    )
+
+
 def test_existing_literal_path_checks_are_unchanged(tmp_path: Path) -> None:
     # Regression guard: a plain missing literal path still flags, and an
     # existing one passes -- the new skip does not disturb the base behavior.

@@ -345,6 +345,15 @@ def parse_envelope(output: str) -> EnvelopeResult:
             reason=f"envelope payload is not valid JSON: {exc.msg}",
             offending=_truncate(inner),
         )
+    except RecursionError:
+        # Deeply-nested untrusted agent output overflows the C JSON scanner's
+        # recursion. RecursionError is a RuntimeError, not JSONDecodeError, so
+        # it would otherwise escape this closed-contract parser and crash the
+        # harness. Treat it as a malformed payload like any other decode failure.
+        return MalformedEnvelope(
+            reason="envelope payload nests too deeply to parse",
+            offending=_truncate(inner),
+        )
 
     if not isinstance(data, dict):
         return MalformedEnvelope(

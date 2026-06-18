@@ -10,12 +10,13 @@ identically with or without any optional extra installed.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import json
 import sys
 import textwrap
 from pathlib import Path
 from types import ModuleType
-from typing import Iterator
+from typing import Callable, Iterator
 
 import pytest
 
@@ -299,18 +300,113 @@ def test_register_replacement_does_not_reorder_other_names() -> None:
 
 
 # --------------------------------------------------------------------------
-# Contract 8: discovery hook is a no-op; resolve works on built-ins alone.
+# Contract 8: entry-point discovery registers third-party backends, with
+# built-ins winning a name collision; resolve works on built-ins alone too.
 # --------------------------------------------------------------------------
 
 
 def test_resolve_succeeds_without_any_entry_point_discovery() -> None:
-    # _maybe_discover_entry_points is disabled; built-in registration suffices.
+    # No package advertises the test group, so discovery finds nothing and
+    # built-in registration alone suffices.
     reg = _registry()
     assert reg.resolve("default") is json.JSONDecoder
+    assert reg.names() == ("default", "optional")
 
 
-def test_discovery_hook_is_a_no_op() -> None:
+@pytest.fixture
+def _install_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[str, str, str, str], None]]:
+    """Materialize a real ``*.dist-info`` on ``sys.path`` advertising an entry
+    point, so the genuine ``importlib.metadata.entry_points`` discovers it.
+
+    This is a held-out oracle: it proves discovery through the real packaging
+    machinery (not a monkeypatched ``entry_points``), exactly the path a
+    pip/uv-installed third-party plugin would take.
+    """
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+
+    def _install(dist_name: str, group: str, name: str, value: str) -> None:
+        dist_info = site / f"{dist_name}-0.0.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {dist_name}\nVersion: 0.0.0\n"
+        )
+        (dist_info / "entry_points.txt").write_text(
+            f"[{group}]\n{name} = {value}\n"
+        )
+        importlib.invalidate_caches()
+
+    yield _install
+
+
+def test_discovery_registers_a_real_third_party_plugin(
+    _install_entry_point: Callable[[str, str, str, str], None],
+) -> None:
+    # An installed dist advertising flywheel.widgets/ext resolves through the
+    # identical "module:attr" path as a built-in.
+    _install_entry_point("ext_widget", "flywheel.widgets", "ext", "json:JSONEncoder")
     reg = _registry()
-    assert reg._maybe_discover_entry_points() is None
-    # Calling it does not mutate the registered set.
+    assert reg.resolve("ext") is json.JSONEncoder
+    # It appears in diagnostics (after the built-ins).
+    assert "ext" in reg.names()
+    assert reg.names()[:2] == ("default", "optional")
+    spec = next(s for s in reg.specs() if s.name == "ext")
+    assert spec.target == "json:JSONEncoder"
+
+
+def test_names_and_specs_trigger_discovery_without_a_resolve(
+    _install_entry_point: Callable[[str, str, str, str], None],
+) -> None:
+    # A "list backends" caller that never resolves still sees discovered names.
+    _install_entry_point("ext_widget", "flywheel.widgets", "ext", "json:JSONEncoder")
+    reg = _registry()
+    assert "ext" in reg.names()
+    assert any(s.name == "ext" for s in reg.specs())
+
+
+def test_builtin_wins_on_name_collision_with_a_discovered_plugin(
+    _install_entry_point: Callable[[str, str, str, str], None],
+) -> None:
+    # A plugin advertising a built-in's name must NOT shadow the shipped
+    # backend: resolution stays deterministic on the built-in target.
+    _install_entry_point(
+        "rogue_widget", "flywheel.widgets", "default", "json:JSONEncoder"
+    )
+    reg = _registry()  # built-in default -> json:JSONDecoder
+    assert reg.resolve("default") is json.JSONDecoder
+    assert reg.names().count("default") == 1
+
+
+def test_discovery_scans_at_most_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The scan is cached: resolve/names/specs do not re-walk entry points.
+    calls: list[str] = []
+
+    def _counting_entry_points(*, group: str) -> list[importlib.metadata.EntryPoint]:
+        calls.append(group)
+        return []
+
+    monkeypatch.setattr(
+        importlib.metadata, "entry_points", _counting_entry_points
+    )
+    reg = _registry()
+    reg.resolve("default")
+    reg.resolve("default")
+    reg.names()
+    reg.specs()
+    assert calls.count("flywheel.widgets") == 1
+
+
+def test_discovery_with_no_entry_points_leaves_builtins_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda *, group: [],
+    )
+    reg = _registry()
     assert reg.names() == ("default", "optional")

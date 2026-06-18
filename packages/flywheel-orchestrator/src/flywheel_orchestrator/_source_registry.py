@@ -6,10 +6,11 @@ binds each to a builder in :mod:`flywheel_orchestrator._policy` (which owns
 circular import; this module depends only on the core registry).
 
 Both shipped kinds are always importable, so neither carries an ``extra`` --
-``github`` drives the ``gh`` CLI rather than a Python dependency. The value of
-the seam is forward-looking: project-management adapters (Jira, Linear, a
-queue) register under the ``flywheel.work_sources`` entry-point group once
-third-party discovery is enabled.
+``github`` drives the ``gh`` CLI rather than a Python dependency. The seam is
+open to extension: an installed project-management adapter (Jira, Linear, a
+queue) is discovered and selectable simply by advertising a
+``flywheel.work_sources`` entry point, with no fork (built-ins win a name
+collision).
 """
 
 from __future__ import annotations

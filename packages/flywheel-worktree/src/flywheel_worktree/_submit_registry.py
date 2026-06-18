@@ -9,9 +9,10 @@ signature so the worker dispatches by name with no per-strategy branch.
 Resolving ``pr`` lazily imports :mod:`flywheel_worktree.pr` (which imports
 ``worker``), so routing through :meth:`Registry.resolve` is what dissolves the
 old hand-written late import in ``worker.main`` — the registry is the seam
-that breaks the cycle. Neither shipped strategy needs an optional extra.
-Third-party landing strategies register under the
-``flywheel.submit_strategies`` entry-point group once discovery is enabled.
+that breaks the cycle. Neither shipped strategy needs an optional extra. A
+third-party landing strategy is discovered and selectable by advertising a
+``flywheel.submit_strategies`` entry point, with no fork (built-ins win a name
+collision).
 """
 
 from __future__ import annotations

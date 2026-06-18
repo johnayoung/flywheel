@@ -25,11 +25,12 @@ Two kinds of failure are branded in exactly one place:
   ``store_postgres`` and the store factory).
 
 The ``"module:attr"`` target form is deliberate: it is exactly the encoding a
-Python packaging entry point uses for ``ep.value``. So the same specs that are
-registered in-process today can be *discovered* from installed third-party
-packages later by enabling :meth:`Registry._maybe_discover_entry_points` —
-without touching a single call site, because every caller already routes
-through :meth:`resolve`.
+Python packaging entry point uses for ``ep.value``. So a built-in spec and one
+*discovered* from an installed third-party package resolve through the
+identical path: :meth:`Registry._maybe_discover_entry_points` reads
+``importlib.metadata.entry_points(group=...)`` on first access and registers
+any advertised backend not already built in — without touching a single call
+site, because every caller already routes through :meth:`resolve`.
 
 This module uses ``importlib`` and therefore is never imported by the pure
 ``flywheel_core.task`` / ``flywheel_core.lifecycle`` modules (their purity
@@ -40,6 +41,7 @@ that the data shapes themselves do not touch.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
@@ -137,17 +139,20 @@ class Registry:
         self._family = family
         self._group = group
         self._specs: dict[str, PluginSpec] = {}
+        self._discovered = False
 
     def register(self, spec: PluginSpec) -> None:
         """Add a built-in backend. Re-registering a name replaces it."""
         self._specs[spec.name] = spec
 
     def names(self) -> tuple[str, ...]:
-        """The registered backend names, in registration order."""
+        """The backend names, built-ins first then discovered plugins."""
+        self._maybe_discover_entry_points()
         return tuple(self._specs)
 
     def specs(self) -> tuple[PluginSpec, ...]:
-        """The registered specs, in registration order (for diagnostics)."""
+        """The registered specs (built-ins then discovered) for diagnostics."""
+        self._maybe_discover_entry_points()
         return tuple(self._specs.values())
 
     def resolve(self, name: str) -> Any:
@@ -171,16 +176,31 @@ class Registry:
         return getattr(module, attr)
 
     def _maybe_discover_entry_points(self) -> None:
-        """Hook for third-party backend discovery (disabled today).
+        """Register third-party backends advertised under this family's group.
 
-        When flywheel starts shipping a public plugin surface, this becomes a
-        scan of ``importlib.metadata.entry_points(group=self._group)`` that
-        registers any spec not already built in (built-ins win on a name
-        collision, keeping resolution deterministic). Because every caller
-        already routes through :meth:`resolve`, turning that on is a change to
-        this one method — no call site moves.
+        Scans ``importlib.metadata.entry_points(group=self._group)`` once per
+        registry and adds any name not already built in — **built-ins win on a
+        name collision**, so an installed package can *extend* the choices but
+        never silently shadow a shipped backend, keeping resolution
+        deterministic. Each entry point's ``value`` (``"module:attr"``) becomes
+        the spec ``target``, resolving through the identical path as a built-in;
+        a discovered spec declares no ``extra``, so a missing dependency in the
+        plugin's own module surfaces as the raw ``ImportError`` it raises. The
+        scan runs at most once — afterwards the cached flag short-circuits, so
+        :meth:`resolve` stays cheap on the hot path. Because every caller routes
+        through :meth:`resolve`, enabling discovery moved no call site.
         """
-        return None
+        if self._discovered:
+            return
+        self._discovered = True
+        for entry_point in importlib.metadata.entry_points(group=self._group):
+            if entry_point.name in self._specs:
+                continue
+            self._specs[entry_point.name] = PluginSpec(
+                name=entry_point.name,
+                target=entry_point.value,
+                summary=f"third-party plugin ({entry_point.value})",
+            )
 
 
 __all__ = [

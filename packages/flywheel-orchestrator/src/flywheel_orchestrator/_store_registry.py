@@ -9,9 +9,9 @@ unknown-name and missing-extra failures.
 The ``postgres`` spec carries ``extra="postgres"`` so that resolving it
 without ``psycopg`` installed surfaces as the shared
 :class:`~flywheel_core._registry.MissingExtraError` (which the factory maps
-to its operator-facing ``StoreConfigError``). Third-party store backends will
-register under the ``flywheel.stores`` entry-point group once discovery is
-enabled.
+to its operator-facing ``StoreConfigError``). A third-party store backend is
+discovered and selectable by advertising a ``flywheel.stores`` entry point,
+with no fork (built-ins win a name collision).
 """
 
 from __future__ import annotations

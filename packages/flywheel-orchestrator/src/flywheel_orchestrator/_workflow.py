@@ -34,7 +34,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlsplit
 
 
 from flywheel_core.harness import (
@@ -99,6 +98,10 @@ from flywheel_orchestrator._store_factory import (
     PG_DSN_FALLBACK_ENV,
     open_sqlite_bound_store,
     resolve_postgres_dsn,
+)
+from flywheel_orchestrator._pg_preflight import (
+    format_report,
+    run_postgres_preflight,
 )
 
 DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
@@ -2086,69 +2089,50 @@ def _github_repo_from_origin() -> str | None:
     return f"{match.group('owner')}/{match.group('name')}"
 
 
-def _sanitize_connection_error(message: str, dsn: str) -> str:
-    """Strip the DSN (and, defensively, its password) from an error.
+def _postgres_preflight(args: argparse.Namespace, schema: str | None) -> None:
+    """Guided, failsafe Postgres bring-up at init time.
 
-    Host and database name surviving in the message is acceptable per
-    spec; the verbatim DSN or password never is.
+    With no DSN resolvable from the environment, this stays advisory and
+    non-blocking (the DSN is runtime config the operator may set later):
+    it points at the env vars and returns, init writes the policy and
+    exits 0. Once a DSN *is* present, the ordered checks in
+    :mod:`._pg_preflight` run -- pooler mode, privileges, schema version,
+    and optional provisioning. The full report prints regardless; if any
+    check blocks and ``--allow-unverified`` was not passed, this raises
+    :class:`_InitUsageError`, which both init callers turn into a
+    non-zero exit that writes no ``flywheel.toml`` -- so a misconfigured
+    target never yields a config that looks ready.
     """
-    sanitized = message.replace(dsn, "<dsn>")
-    try:
-        password = urlsplit(dsn).password
-    except ValueError:
-        password = None
-    if password:
-        sanitized = sanitized.replace(password, "<password>")
-    return " ".join(sanitized.split())
-
-
-def _check_postgres_connection(dsn: str) -> str | None:
-    """Test-connect to ``dsn``; return a sanitized error or ``None``.
-
-    A short timeout keeps a wrong DSN from hanging init. Only called
-    when the postgres extra imported successfully, so the local import
-    cannot fail here.
-    """
-    import psycopg
-
-    try:
-        with psycopg.connect(dsn, connect_timeout=5):
-            pass
-    except Exception as exc:
-        return _sanitize_connection_error(str(exc), dsn)
-    return None
-
-
-def _report_postgres_environment() -> None:
-    """Print the postgres readiness report (spec FR-4/FR-5).
-
-    Never raises and never blocks init: a missing extra, an unset DSN
-    env var, and a failed connection each print and return -- the
-    config is written regardless and init exits 0.
-    """
-    extra_ok = True
-    try:
-        import flywheel_core.store_postgres  # noqa: F401
-    except ImportError:
-        extra_ok = False
-        print(
-            "warning: the postgres extra is not installed; "
-            "install with: uv add 'flywheel[postgres]'"
-        )
     dsn = resolve_postgres_dsn()
     if dsn is None:
+        try:
+            import flywheel_core.store_postgres  # noqa: F401
+        except ImportError:
+            print(
+                "warning: the postgres extra is not installed; "
+                "install with: uv add 'flywheel[postgres]'"
+            )
         print(
             f"postgres: no DSN found; set {PG_DSN_ENV} (or "
             f"{PG_DSN_FALLBACK_ENV}) before running flywheel worker"
         )
         return
-    if not extra_ok:
-        return
-    error = _check_postgres_connection(dsn)
-    if error is None:
-        print("postgres: connection OK")
-    else:
-        print(f"warning: postgres connection failed: {error}")
+
+    provision = bool(getattr(args, "provision", False))
+    allow_unverified = bool(getattr(args, "allow_unverified", False))
+    outcome = run_postgres_preflight(
+        dsn,
+        schema or "public",
+        provision=provision,
+        allow_unverified=allow_unverified,
+    )
+    print(format_report(outcome.checks))
+    if outcome.blocked and not allow_unverified:
+        raise _InitUsageError(
+            "postgres preflight found blocking issues (see the report "
+            "above); fix them, or re-run with --allow-unverified to "
+            "scaffold the policy anyway"
+        )
 
 
 def _resolve_install_skills(
@@ -2219,7 +2203,7 @@ def _collect_init_answers(
             schema = flag_schema
         elif interactive:
             schema = _prompt_pg_schema()
-        _report_postgres_environment()
+        _postgres_preflight(args, schema)
     elif args.pg_schema is not None:
         raise _InitUsageError(
             "--pg-schema applies only to the postgres store backend; "
@@ -2322,6 +2306,16 @@ def _print_init_next_steps(
             f"The postgres DSN is read from {PG_DSN_ENV} (fallback: "
             f"{PG_DSN_FALLBACK_ENV}) at runtime; it is never stored in "
             f"flywheel.toml."
+        )
+        print(
+            "  Use a session connection (not a transaction-mode pooler): "
+            "for Supabase the Session pooler (port 5432) or the direct "
+            "connection, never port 6543."
+        )
+        print(
+            "  Re-run 'flywheel init --provision' with the DSN set to "
+            "create the schema and tables now instead of on the first "
+            "worker run."
         )
 
 
@@ -2588,6 +2582,23 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print(f"exists:  {policy_path} (left untouched)")
             if args.skills:
                 _install_skills_from_policy_file(policy_path)
+            # --provision against an already-configured repo re-runs the
+            # postgres preflight (and bootstrap) over the committed policy:
+            # set the DSN, then `flywheel init --provision` to verify and
+            # create the schema without rewriting flywheel.toml.
+            if getattr(args, "provision", False):
+                existing = load_policy(policy_path)
+                if existing is not None and existing.store_backend == "postgres":
+                    try:
+                        _postgres_preflight(args, existing.store_schema)
+                    except _InitUsageError as exc:
+                        print(f"error: {exc}", file=sys.stderr)
+                        return 2
+                else:
+                    print(
+                        "note: --provision applies only to the postgres "
+                        "store backend; nothing to provision"
+                    )
             print()
             _print_init_next_steps(
                 None, skills_installed=bool(args.skills)
@@ -2683,6 +2694,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Postgres schema name recorded as [store] schema "
             "(postgres backend only)."
+        ),
+    )
+    p_init.add_argument(
+        "--provision",
+        action="store_true",
+        help=(
+            "After the postgres preflight passes, create the schema and "
+            "run the store's bootstrap DDL now (postgres backend with a "
+            "resolvable DSN only), so tables exist before the first "
+            "worker run instead of being created lazily by it."
+        ),
+    )
+    p_init.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help=(
+            "Scaffold the policy even when the postgres preflight reports "
+            "a blocking issue (unreachable DSN, transaction-mode pooler, "
+            "missing privileges, incompatible schema version). The report "
+            "still prints; this only downgrades the blocks to warnings."
         ),
     )
     p_init.add_argument(

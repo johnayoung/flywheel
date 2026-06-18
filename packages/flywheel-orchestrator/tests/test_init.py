@@ -692,19 +692,46 @@ def test_init_ctrl_c_mid_prompts_writes_no_policy_file(
 # --- postgres DSN validation (spec FR-4 / FR-5) -------------------------------
 
 
-def test_init_postgres_unreachable_dsn_warns_and_still_writes(
+def test_init_postgres_unreachable_dsn_blocks_and_writes_nothing(
     repo: Path, monkeypatch, capsys
 ) -> None:
+    """An unreachable DSN is a blocking preflight failure: init exits
+    non-zero and writes no policy, so a broken target never yields a
+    config that looks ready. The DSN and password stay redacted."""
     pytest.importorskip("psycopg")
     dsn = "postgresql://flywheel:secretpw@127.0.0.1:1/flywheel"
     monkeypatch.setenv("FLYWHEEL_PG_DSN", dsn)
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    assert main(["init", "--store", "postgres", "--defaults"]) == 0
+    assert main(["init", "--store", "postgres", "--defaults"]) == 2
 
     captured = capsys.readouterr()
-    assert "warning: postgres connection failed" in captured.out
+    assert "[BLOCK] connection" in captured.out
+    assert "preflight found blocking issues" in captured.err
+    assert not (repo / "flywheel.toml").exists()
     # The DSN and its password never appear anywhere (spec FR-4).
+    for stream in (captured.out, captured.err):
+        assert dsn not in stream
+        assert "secretpw" not in stream
+
+
+def test_init_postgres_unreachable_dsn_allow_unverified_writes(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """--allow-unverified downgrades the block to a warning: the report
+    still prints (redacted), but the policy is scaffolded and exit is 0."""
+    pytest.importorskip("psycopg")
+    dsn = "postgresql://flywheel:secretpw@127.0.0.1:1/flywheel"
+    monkeypatch.setenv("FLYWHEEL_PG_DSN", dsn)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    assert (
+        main(["init", "--store", "postgres", "--defaults", "--allow-unverified"])
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert "[BLOCK] connection" in captured.out
     for stream in (captured.out, captured.err):
         assert dsn not in stream
         assert "secretpw" not in stream
@@ -720,12 +747,14 @@ def test_init_postgres_dsn_priority_flywheel_var_wins(
     pytest.importorskip("psycopg")
     monkeypatch.setenv("FLYWHEEL_PG_DSN", "postgresql://primary/db")
     monkeypatch.setenv("DATABASE_URL", "postgresql://fallback/db")
+    from flywheel_orchestrator._pg_preflight import PreflightOutcome
+
     seen: list[str] = []
 
-    def fake_check(dsn: str) -> str | None:
+    def fake(dsn: str, schema: str, **kwargs: object) -> PreflightOutcome:
         seen.append(dsn)
-        return None
+        return PreflightOutcome(checks=[])
 
-    monkeypatch.setattr(_workflow, "_check_postgres_connection", fake_check)
+    monkeypatch.setattr(_workflow, "run_postgres_preflight", fake)
     assert main(["init", "--store", "postgres", "--defaults"]) == 0
     assert seen == ["postgresql://primary/db"]

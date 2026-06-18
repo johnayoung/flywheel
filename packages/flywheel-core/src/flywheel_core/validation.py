@@ -31,6 +31,17 @@ from flywheel_core.task import CommandGrader, Task
 # risk a false positive on a pattern whose expansion we cannot resolve.
 _GLOB_CHARS = ("*", "?", "[", "]")
 
+# Shell-dynamic metacharacters: a ``shlex``-split token carrying one of these
+# is not a literal path but unparsed shell syntax -- a command substitution
+# (``$(...)`` / backticks), a variable expansion (``${...}`` / ``$VAR``), a
+# redirection, a pipe, or a statement separator. Its real value is only known
+# at run time, exactly like an unresolvable glob, so it is left unchecked
+# rather than ``stat``-ed as if it were a path. ``shlex.split`` does not
+# interpret these operators, so they survive inside (often quoted) tokens such
+# as ``"$(... pkg/dir ...)"`` whose embedded ``/`` would otherwise mislead the
+# path heuristic.
+_SHELL_DYNAMIC_CHARS = ("$", "`", "|", ">", "<", ";", "&")
+
 
 @dataclass(frozen=True)
 class TaskDefect:
@@ -111,11 +122,13 @@ def _missing_path_tokens(run: str, repo_root: Path) -> list[str]:
     absent under ``repo_root`` (D-2's conservative heuristic).
 
     A token is a path reference only when it contains ``/``, does not start
-    with ``-`` (a flag), contains no ``://`` (a URL), and is not absolute. A
+    with ``-`` (a flag), contains no ``://`` (a URL), carries no shell-dynamic
+    metacharacter (a command substitution, variable expansion, redirection,
+    pipe, or separator -- :data:`_SHELL_DYNAMIC_CHARS`), and is not absolute. A
     trailing ``/*`` glob segment and a trailing ``/`` are stripped; a token
     still carrying glob metacharacters after that is left unchecked. Only
-    such tokens are existence-checked, so flags, URLs, and bare words are
-    never flagged.
+    such tokens are existence-checked, so flags, URLs, substitutions, and bare
+    words are never flagged.
     """
     missing: list[str] = []
     try:
@@ -130,6 +143,8 @@ def _missing_path_tokens(run: str, repo_root: Path) -> list[str]:
         if "/" not in token:
             continue
         if "://" in token:
+            continue
+        if any(ch in token for ch in _SHELL_DYNAMIC_CHARS):
             continue
         if Path(token).is_absolute():
             continue

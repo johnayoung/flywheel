@@ -1,5 +1,7 @@
 # Workflow
 
+This is the home of flywheel's **intent-authoring pipeline** — the write-half of the binding the [vision](vision.md) North Star describes (authoring intent an agent cannot game, then compiling it into `Task`/`Grader`). It ships as the `fw-*` skills `flywheel init --skills` installs into any repo; this doc is also the record of how flywheel runs that pipeline on itself.
+
 How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in `.claude/commands/` (prompt commands run by an operator in Claude Code) and half in `.flywheel/` (artifacts and runtime state; formerly `.workflow/`, cut over wholesale with history preserved). This doc records the current state and rationale. The authoring half has since been promoted into shipped code — the `fw-spec`/`fw-plan`/`fw-retro`/`fw-improve` skills that `flywheel init --skills` installs into any repo — and the `.claude/commands/` prompts remain as flywheel's own dogfood source; the rest is the baseline for promoting further pieces.
 
 ## Pipeline at a glance

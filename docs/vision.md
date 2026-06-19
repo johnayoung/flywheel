@@ -23,6 +23,25 @@ The loop is responsible for:
 
 Higher-level systems may still decide which tasks to run, what budgets to apply, when to escalate, and how to coordinate many tasks at once. But for one task at a time, the loop is the execution controller. 
 
+## North star (forward bets)
+
+> A forward-looking thesis (2026-06-19), held loosely and meant to be falsified. The rest of this document describes, in the present tense, what the loop *is*. This section describes where it is *heading* and why. Revisit and rewrite it whenever a bet is confirmed or broken.
+
+As agent-driven generation gets cheap and abundant, the scarce thing stops being *writing code* and becomes *agreeing on what to build and proving it is correct*. Four falsifiable bets, each something a reasonable expert could reject:
+
+1. **Line-by-line human review stops being the merge gate.** With many agent threads per engineer, the gate moves to spec + acceptance evidence. *Falsified if* review time per change stays flat over the next 18-36 months.
+2. **The durable asset becomes the spec + graders, not the code.** Teams regenerate modules from intent + acceptance rather than hand-patch them. *Falsified if* patching hand-written code stays dominant.
+3. **Surface area per engineer explodes, so cross-thread coordination becomes the dominant cost.** *Falsified if* shipped distinct surfaces per engineer stays flat.
+4. **Status decouples from self-report, or it dies.** Once a human touches little of the work, only evidence-backed status survives. *Falsified if* self-reported cards remain how agent work is tracked.
+
+**The binding constraint these imply:** a single, verifiable statement of intent that simultaneously binds agents (`Task` + graders) and informs humans (legible status). Flywheel already owns half of it — `Task`/`Grader` is machine-checkable acceptance. The missing half is the human-legible projection over it.
+
+**What this commits flywheel to — and what it does not.** Flywheel stays an execution engine and surfaces the intent + acceptance graph as a first-class artifact with an evidence-derived read projection. It is the system of record for *verified build-conformance* ("this is built and meets its stated acceptance") and is explicit that it does **not** verify *value* ("is this the right thing to build"). Prioritization and product judgment stay human and stay elsewhere; flywheel owns the binding between stated intent and verified reality. This is deliberately **not** a planning/roadmap layer: a roadmap is a *view* of the Task DAG, never a separate surface to drag cards on.
+
+**The honest limit.** Graders cover mechanical correctness, not desirability. As nodes climb toward stakeholder altitude, the grader-backed share of status falls — so the claim is scoped to conformance + structural rollup, never "this is valuable." Overclaim past that line and the thesis breaks.
+
+**First disprovable step (shipped):** `flywheel status --rollup` — a phase-grouped projection whose every node status is *derived* from grader receipts (`verified` vs `accepted` vs blocked / failed / not-started), never operator-set. The test: does an evidence-only rollup get trusted and used in place of manual status reporting? If it gets overridden or explained around, the gap is value-judgment, not verification — and the upward direction is wrong.
+
 ## Core principles
 
 ### Task-based

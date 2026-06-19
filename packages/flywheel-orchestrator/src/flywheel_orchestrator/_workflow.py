@@ -1265,7 +1265,36 @@ def _awaiting_instruction_for_row(row: TaskStatusRow) -> str | None:
         return None
     return grader.instruction
 
+def _cmd_status_rollup(args: argparse.Namespace) -> int:
+    # Evidence-derived projection: classify every task from grader receipts
+    # and lifecycle state, then render the phase-grouped rollup. Imported
+    # locally so _rollup can import this module's TaskStatusRow/TaskState at
+    # its top level without a circular import.
+    from flywheel_orchestrator._rollup import (
+        build_rollup,
+        render_rollup_text,
+        rollup_to_json,
+    )
+
+    policy = _load_effective_policy(args)
+    source = _resolve_work_source(args, policy)
+    db_path = _resolve_db_path(args, policy)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = open_sqlite_bound_store(policy, db_path=db_path)
+    try:
+        rollup = build_rollup(status_rows_for_items(source.list_work(), store), store)
+    finally:
+        store.close()
+    if args.json:
+        print(json.dumps(rollup_to_json(rollup), indent=2))
+        return 0
+    print(render_rollup_text(rollup))
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
+    if getattr(args, "rollup", False):
+        return _cmd_status_rollup(args)
     policy = _load_effective_policy(args)
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
@@ -2946,6 +2975,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of a text table.",
+    )
+    p_status.add_argument(
+        "--rollup",
+        action="store_true",
+        help=(
+            "Render a phase-grouped, evidence-derived rollup: each task's "
+            "status is computed from grader receipts (verified vs accepted "
+            "vs blocked/failed/not-started), never self-reported."
+        ),
     )
     p_status.set_defaults(func=_cmd_status)
 

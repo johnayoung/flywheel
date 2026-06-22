@@ -220,11 +220,30 @@ class SandboxPolicy:
     retention: SandboxRetention = field(default_factory=SandboxRetention)
 
 
-# Named presets are code-owned frozen constants (factor V: build-time). Only
-# ``fast`` exists in this increment; ``balanced``/``hardened`` are defined as
-# their enforcement lands so a preset never advertises a guarantee it cannot
-# enforce. ``fast``'s values are the dataclass defaults above (== today).
-_SANDBOX_PRESETS: dict[str, SandboxPolicy] = {"fast": SandboxPolicy(preset="fast")}
+# Named presets are code-owned frozen constants (factor V: build-time).
+# ``fast``'s values are the dataclass defaults above (== today). ``balanced``
+# adds strict MCP gating (no implicit servers) while keeping full coding
+# capability and autonomy. ``hardened`` further locks the tool allowlist to a
+# minimal coding set, scopes settings to the project, and enables bash exec
+# isolation. Every preset keeps ``permission_mode == "bypassPermissions"``;
+# deferred aspects (env/limits/network/retention) stay at ``fast`` so a preset
+# never advertises a guarantee it cannot enforce.
+_SANDBOX_PRESETS: dict[str, SandboxPolicy] = {
+    "fast": SandboxPolicy(preset="fast"),
+    "balanced": SandboxPolicy(
+        preset="balanced",
+        capabilities=SandboxCapabilities(mcp_strict=True),
+    ),
+    "hardened": SandboxPolicy(
+        preset="hardened",
+        capabilities=SandboxCapabilities(
+            allowed_tools=("Bash", "Edit", "Glob", "Grep", "Read", "Write"),
+            setting_sources=("project",),
+            mcp_strict=True,
+        ),
+        exec=SandboxExec(enabled=True),
+    ),
+}
 
 _NETWORK_POLICIES: tuple[str, ...] = ("allow", "deny")
 _RETENTION_ON_DONE: tuple[str, ...] = ("destroy", "preserve")

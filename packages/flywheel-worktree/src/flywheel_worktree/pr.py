@@ -118,6 +118,8 @@ def build_pr_submitter(
     log: Logger,
     protected_paths: Sequence[str],
     setup_command: str | None,
+    on_done: str = "destroy",
+    on_failure: str = "park",
     store: LandingLedger | None = None,
 ) -> GitPullRequestSubmitter:
     """Build the PR backend (the registry's ``pr`` target).
@@ -137,6 +139,8 @@ def build_pr_submitter(
         log=log,
         protected_paths=protected_paths,
         setup_command=setup_command,
+        on_done=on_done,
+        on_failure=on_failure,
         remote=policy.submit_remote,
         pr_base=policy.submit_pr_base,
         store=store,
@@ -162,6 +166,8 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         log: Logger,
         protected_paths: Sequence[str] = (),
         setup_command: str | None = None,
+        on_done: str = "destroy",
+        on_failure: str = "park",
         remote: str = "origin",
         pr_base: str | None = None,
         gh: GhRunner | None = None,
@@ -176,6 +182,8 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             log=log,
             protected_paths=protected_paths,
             setup_command=setup_command,
+            on_done=on_done,
+            on_failure=on_failure,
             store=store,
         )
         self.remote = remote
@@ -189,10 +197,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         branch = self._branch(task_id, phase)
 
         if req.status != Status.DONE:
-            self.log(
-                f"Lifecycle {req.status.value}; worktree preserved at "
-                f"{worktree}"
-            )
+            self._teardown_on_failure(worktree, branch, req.status)
             return
 
         porcelain = _git(worktree, "status", "--porcelain").stdout
@@ -241,10 +246,11 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             f"merge is review/CI's call"
         )
         # The remote branch + PR now hold the work; local copies are done.
-        # -D, not -d: the branch is deliberately unmerged locally — the
-        # push above already succeeded, so the commits are safe remotely.
-        _git(self.repo_root, "worktree", "remove", str(worktree))
-        _git(self.repo_root, "branch", "-D", branch)
+        # -D, not -d (inside _cleanup): the branch is deliberately unmerged
+        # locally — the push above already succeeded, so the commits are safe
+        # remotely. ``on_done="preserve"`` keeps the local worktree+branch for
+        # inspection instead.
+        self._teardown_on_done(worktree, branch)
 
     def _ensure_pr(self, branch: str, req: SubmitRequest) -> str:
         """Open a PR for ``branch``, or refresh the body of the open one."""

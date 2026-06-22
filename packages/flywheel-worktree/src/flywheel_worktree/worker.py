@@ -234,6 +234,8 @@ class GitWorktreeSubmitter:
         log: Logger,
         protected_paths: Sequence[str] = (),
         setup_command: str | None = None,
+        on_done: str = "destroy",
+        on_failure: str = "park",
         store: LandingLedger | None = None,
     ) -> None:
         self.repo_root = repo_root
@@ -244,6 +246,14 @@ class GitWorktreeSubmitter:
         self.log = log
         self.protected_paths = tuple(protected_paths)
         self.setup_command = setup_command
+        # Submit-time retention ([sandbox.retention], spec 00041). Defaults
+        # reproduce today's hardcoded behavior: a DONE branch's worktree is
+        # destroyed after the merge, a non-DONE worktree is parked for
+        # forensics. ``on_done="preserve"`` keeps a merged worktree for
+        # inspection; ``on_failure="destroy"`` removes a failed one (no
+        # forensics).
+        self.on_done = on_done
+        self.on_failure = on_failure
         # When present, submit() records a queryable LANDING_PARKED event on
         # the run's ledger for a park outcome (uncommitted-work or
         # divergent-base). None (e.g. a bare direct construction) degrades to
@@ -470,11 +480,9 @@ class GitWorktreeSubmitter:
         branch = self._branch(task_id, phase)
 
         if req.status != Status.DONE:
-            # failed / interrupted / any non-done terminal: park for forensics.
-            self.log(
-                f"Lifecycle {req.status.value}; worktree preserved at "
-                f"{worktree}"
-            )
+            # failed / interrupted / any non-done terminal: park for forensics
+            # (default), or destroy when [sandbox.retention] on_failure asks.
+            self._teardown_on_failure(worktree, branch, req.status)
             return
 
         # All base-branch mutations are serialized across worker processes.
@@ -521,7 +529,7 @@ class GitWorktreeSubmitter:
                     f"Merged {branch} into {self.phase_base} "
                     f"({commit_count} commit(s))"
                 )
-                self._cleanup(worktree, branch)
+                self._teardown_on_done(worktree, branch)
                 return
 
             # FF failed (base advanced): rebase once, re-verify, retry FF,
@@ -554,7 +562,7 @@ class GitWorktreeSubmitter:
                     f"Merged {branch} into {self.phase_base} after rebase "
                     f"({commit_count} commit(s))"
                 )
-                self._cleanup(worktree, branch)
+                self._teardown_on_done(worktree, branch)
                 return
             self.log(
                 f"post-rebase FF failed for {branch}; parking worktree at "
@@ -695,6 +703,42 @@ class GitWorktreeSubmitter:
         # leaks the ref — which a later re-queue then "reuses", skipping sandbox
         # setup. ``-D`` deletes against the established containment instead.
         _git(self.repo_root, "branch", "-D", branch)
+
+    def _teardown_on_done(self, worktree: Path, branch: str) -> None:
+        """Dispose a worktree whose branch has just landed in the base.
+
+        ``on_done="destroy"`` (default) removes the worktree+branch as before;
+        ``on_done="preserve"`` keeps the worktree dir and branch ref for
+        inspection — the work has already merged either way. The empty-branch
+        (zero-commit-DONE) case is not routed here; it always cleans up.
+        """
+        if self.on_done == "preserve":
+            self.log(
+                f"on_done=preserve; keeping landed worktree at {worktree} "
+                f"for inspection"
+            )
+            return
+        self._cleanup(worktree, branch)
+
+    def _teardown_on_failure(
+        self, worktree: Path, branch: str, status: Status
+    ) -> None:
+        """Dispose a non-DONE terminal worktree.
+
+        ``on_failure="park"`` (default) preserves the worktree+branch for
+        forensics as before; ``on_failure="destroy"`` removes both, leaving no
+        forensics behind.
+        """
+        if self.on_failure == "destroy":
+            self.log(
+                f"Lifecycle {status.value}; on_failure=destroy, removing "
+                f"worktree at {worktree}"
+            )
+            self._cleanup(worktree, branch)
+            return
+        self.log(
+            f"Lifecycle {status.value}; worktree preserved at {worktree}"
+        )
 
     def _record_landing_park(
         self, run_id: str, *, park_kind: str, detail: str
@@ -1209,6 +1253,8 @@ def build_merge_submitter(
     log: Logger,
     protected_paths: Sequence[str],
     setup_command: str | None,
+    on_done: str = "destroy",
+    on_failure: str = "park",
     store: LandingLedger | None = None,
 ) -> GitWorktreeSubmitter:
     """Build the merge backend (the registry's ``merge`` target).
@@ -1216,8 +1262,10 @@ def build_merge_submitter(
     The fast-forward-merge landing reads nothing extra from ``policy``; the
     argument is part of the shared builder signature the submit-strategy
     registry dispatches on (see :mod:`flywheel_worktree._submit_registry`).
-    ``store`` is the run ledger the submitter records a queryable
-    ``LANDING_PARKED`` event on when it parks a DONE branch.
+    ``on_done``/``on_failure`` are the submit-time ``[sandbox.retention]``
+    knobs (defaults reproduce today's destroy/park behavior). ``store`` is the
+    run ledger the submitter records a queryable ``LANDING_PARKED`` event on
+    when it parks a DONE branch.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -1228,6 +1276,8 @@ def build_merge_submitter(
         log=log,
         protected_paths=protected_paths,
         setup_command=setup_command,
+        on_done=on_done,
+        on_failure=on_failure,
         store=store,
     )
 
@@ -1266,6 +1316,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     protected_paths = policy.protected_paths if policy else ()
     setup_command = policy.sandbox_setup if policy else None
+    # Submit-time retention knobs ([sandbox.retention], spec 00041). Defaults
+    # reproduce today's destroy-on-done / park-on-failure behavior.
+    on_done = policy.sandbox.retention.on_done if policy else "destroy"
+    on_failure = policy.sandbox.retention.on_failure if policy else "park"
     # The submitter's own store handle: it records a queryable LANDING_PARKED
     # event on the run ledger when it parks a DONE branch. Same backing store
     # (policy-selected) as the run's lifecycle, opened on db_path.
@@ -1284,6 +1338,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         log=log,
         protected_paths=protected_paths,
         setup_command=setup_command,
+        on_done=on_done,
+        on_failure=on_failure,
         store=submit_store,
     )
 

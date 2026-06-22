@@ -1,0 +1,38 @@
+{
+  "id": "sandbox-limit-threading",
+  "goal": "policy.sandbox.limits.max_cost_usd decomposes via _sandbox_limit_primitives and threads through run_task_object into HarnessConfig.max_cost_usd, so a flywheel.toml [sandbox.limits] cost ceiling caps a real run.",
+  "prerequisites": ["sandbox-budget-ceilings"],
+  "tags": ["sandbox", "spec-00039", "config"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-backcompat" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_sandbox_limit_threading.py", "name": "limit-threading-oracle" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00039-sandbox-budget-ceilings.md -- SC-4 and the threading contract",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _sandbox_agent_primitives (~line 418) to mirror; add _sandbox_limit_primitives and pass the value into run_task_object via orchestrate",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- run_task_object builds HarnessConfig(max_retries=..., ...) (~line 866); add a max_cost_usd parameter passed through to HarnessConfig.max_cost_usd",
+      "packages/flywheel-orchestrator/tests/test_sandbox_limit_threading.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- SandboxLimits.max_cost_usd (~line 182), already parsed"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _sandbox_agent_primitives already decomposes policy.sandbox into primitives passed to run_task_object; _sandbox_limit_primitives is the limits mirror (consumed by HarnessConfig, not build_agent_options), with the same None-policy -> fast-defaults behavior"
+    ],
+    "constraints": [
+      "Add _sandbox_limit_primitives(policy: WorkPolicy | None) -> dict returning {\"max_cost_usd\": <float>} from policy.sandbox.limits, defaulting to 0.0 for an absent section or a None policy.",
+      "Thread the value through orchestrate -> run_task_object -> HarnessConfig.max_cost_usd as a plain primitive (float); no SDK or policy type enters core signatures.",
+      "Do not change behavior when the ceiling is 0.0 (the default); fast runs stay byte-identical.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not thread max_tokens, wall_clock_seconds, max_turns, max_retries, or lease_seconds (out of scope this increment).",
+      "Do not change harness enforcement (that landed in the prerequisite task).",
+      "Do not modify files under tests/; do not weaken the held-out oracle, increment A/B oracles, or the existing suite."
+    ],
+    "edge_cases": [
+      "An absent [sandbox.limits] section decomposes to max_cost_usd=0.0 (unenforced).",
+      "A None policy (library callers) decomposes to the fast default 0.0.",
+      "A configured [sandbox.limits] max_cost_usd reaches HarnessConfig so the harness enforcement (prerequisite task) caps the run."
+    ]
+  }
+}

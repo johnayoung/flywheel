@@ -1,0 +1,35 @@
+{
+  "id": "sandbox-budget-ceilings",
+  "goal": "The harness enforces a per-run cumulative cost ceiling: once total_cost_usd across all attempts reaches HarnessConfig.max_cost_usd, the run ends Status.FAILED (non-retryable) with a harness.budget_ceiling_breached event.",
+  "tags": ["sandbox", "spec-00039", "core"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite-and-budget-oracle" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00039-sandbox-budget-ceilings.md -- SC-1/2/3 and the per-run/terminal-FAILED design",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- HarnessConfig (~line 310); the per-iteration cost rollup `attempt.total_cost_usd += cost` (~3196-3198) where the cumulative check belongs; the ABORT terminal path (~2111-2125, direct to Status.FAILED) the breach mirrors",
+      "packages/flywheel-core/tests/test_budget_ceilings.py -- the held-out oracle for this task; make it green, do not edit it"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- the ABORT path finalizes the attempt (Outcome.AGENT_ERROR) and transitions directly to Status.FAILED bypassing the retry arm; the budget breach reuses that shape (no new Outcome variant)"
+    ],
+    "constraints": [
+      "Add HarnessConfig.max_cost_usd: float = 0.0 (0 = unenforced, the fast default; back-compat).",
+      "The ceiling is PER-RUN cumulative: sum total_cost_usd across all attempts of the run (finalized attempts + the current one), checked after the per-iteration cost rollup and BEFORE grading, so a breach pre-empts the grade.",
+      "On breach: finalize the current attempt, emit a harness.budget_ceiling_breached telemetry event with payload {\"ceiling\": \"cost_usd\", \"limit\": <ceiling>, \"observed\": <run_total>}, and transition directly to Status.FAILED (terminal, non-retryable) mirroring the ABORT path.",
+      "Do not enforce max_tokens or wall_clock_seconds (out of scope); reuse Outcome.AGENT_ERROR for the breached attempt.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not thread the ceiling from flywheel.toml/policy -- that is sandbox-limit-threading.",
+      "Do not enforce token or wall-clock ceilings; do not add a new Outcome or Status variant.",
+      "Do not change behavior when max_cost_usd is 0 (the default); do not modify files under tests/ or weaken the held-out oracle or increment A/B oracles."
+    ],
+    "edge_cases": [
+      "max_cost_usd=0.0 (default) never breaches, even at huge cost (back-compat with fast).",
+      "A breach in attempt 2 after attempt 1 failed validation must still fire (per-run accumulation across attempts), ending FAILED with two attempts.",
+      "The breach event fires before the grader runs -- a run that blew its budget does not pass."
+    ]
+  }
+}

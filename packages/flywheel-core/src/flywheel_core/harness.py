@@ -315,6 +315,15 @@ class HarnessConfig:
     :meth:`Lifecycle.is_retry_eligible` — the harness delegates the rule,
     it does not re-derive it.
 
+    ``max_cost_usd`` is the PER-RUN cumulative cost ceiling in USD (spec
+    00039). The harness sums ``total_cost_usd`` across *all* attempts of
+    the run and, after the per-iteration rollup but before grading, ends
+    the run ``Status.FAILED`` (terminal, non-retryable — mirroring the
+    ABORT path) once the run total reaches the ceiling, emitting a
+    ``harness.budget_ceiling_breached`` event so audit tells a budget kill
+    from an agent error. The default ``0.0`` disables the ceiling
+    (byte-identical to today's behavior and the ``fast`` default).
+
     ``max_iterations_per_attempt`` caps the inner ``intent=continue``
     loop within one ``Attempt``. The default of 1 means a single
     invocation per Attempt; raise it to allow multi-turn agents to
@@ -394,6 +403,7 @@ class HarnessConfig:
     """
 
     max_retries: int = 0
+    max_cost_usd: float = 0.0
     max_iterations_per_attempt: int = 1
     artifacts_root: str | os.PathLike[str] | None = None
     agent_context: Mapping[str, str] = field(default_factory=dict)
@@ -2101,6 +2111,58 @@ async def _run_attempt_body(
             clock=clock,
         )
         return
+
+    # Per-run cost ceiling (spec 00039). Sum total_cost_usd across all
+    # attempts of the run — the finalized prior attempts plus this one's
+    # rolled-up cost — and check it after the per-iteration rollup but
+    # BEFORE grading, so a breach pre-empts the grade (a run that blew its
+    # budget does not get to pass). The current attempt may already appear
+    # in list_attempts via its in-loop save_attempt, so it is excluded from
+    # the prior sum and re-added from the in-memory object to avoid double
+    # counting. A zero ceiling (the fast default) is unenforced. On breach,
+    # finalize this attempt (Outcome.AGENT_ERROR, reusing the ABORT shape)
+    # and transition RUNNING -> FAILED directly (terminal, non-retryable),
+    # emitting a distinct harness.budget_ceiling_breached event so audit
+    # tells a budget kill from an agent error.
+    if config.max_cost_usd > 0:
+        prior_cost = sum(
+            a.total_cost_usd
+            for a in store.list_attempts(lifecycle.run_id)
+            if a.number != attempt.number
+        )
+        run_total_cost = prior_cost + attempt.total_cost_usd
+        if run_total_cost >= config.max_cost_usd:
+            breach_error = (
+                f"budget ceiling breached: cost_usd {run_total_cost} "
+                f">= limit {config.max_cost_usd}"
+            )
+            _finalize_attempt(
+                store=store,
+                telemetry=telemetry,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.AGENT_ERROR,
+                error=breach_error,
+                agent_output=iteration_result.transcript,
+                clock=clock,
+            )
+            telemetry.emit(
+                kind="harness.budget_ceiling_breached",
+                payload={
+                    "ceiling": "cost_usd",
+                    "limit": config.max_cost_usd,
+                    "observed": run_total_cost,
+                },
+                attempt_number=attempt_number,
+            )
+            _transition(
+                lifecycle,
+                Status.FAILED,
+                store=store,
+                error=breach_error,
+                now=clock,
+            )
+            return
 
     envelope = iteration_result.envelope
 

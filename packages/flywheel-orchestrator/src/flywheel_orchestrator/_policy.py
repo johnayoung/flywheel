@@ -80,7 +80,7 @@ default policy is not runnable and never reaches the scheduler.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from flywheel_core.loaders import TaskLoadError, load_graders
@@ -108,6 +108,127 @@ class PolicyError(ValueError):
     The message always identifies the offending file (and key, where
     applicable) so the operator's fix is unambiguous.
     """
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxExec:
+    """``[sandbox.exec]`` — bash command isolation (SDK ``sandbox`` option).
+
+    Parsed-but-inert in this increment; the ``fast`` baseline disables it.
+    """
+
+    enabled: bool = False
+    auto_allow: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxCapabilities:
+    """``[sandbox.capabilities]`` (+ ``.mcp``) — skills/tools/MCP surface.
+
+    ``setting_sources`` uses an omit-on-unset ``None`` sentinel: the ``fast``
+    baseline sets nothing so the SDK keeps deriving ``["user", "project"]``
+    from ``skills="all"`` exactly as today. ``skills`` is ``"all"``/``"none"``
+    or an explicit tuple of skill names.
+    """
+
+    skills: str | tuple[str, ...] = "all"
+    allowed_tools: tuple[str, ...] = ()
+    denied_tools: tuple[str, ...] = ()
+    setting_sources: tuple[str, ...] | None = None
+    mcp_servers: tuple[str, ...] = ()
+    mcp_strict: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxNetwork:
+    """``[sandbox.network]`` — network policy.
+
+    Carried on the policy but enforces nothing under the worktree backend
+    (advisory until the container backend lands in increment G).
+    """
+
+    policy: str = "allow"
+    allow_hosts: tuple[str, ...] = ()
+    allow_unix_sockets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxEnv:
+    """``[sandbox.env]`` — credential/secret name allowlist (declaration half).
+
+    ``passthrough`` mirrors the ``pass`` name allowlist; ``set_values`` mirrors
+    the inline ``set`` literals. The ``fast`` baseline inherits the operator's
+    full ambient environment (``inherit_home`` true, no explicit scoping).
+    Inert until increment C wires the resolver.
+    """
+
+    passthrough: tuple[str, ...] = ()
+    set_values: dict[str, str] = field(default_factory=dict)
+    inherit_home: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxLimits:
+    """``[sandbox.limits]`` — resource/budget ceilings.
+
+    The ``fast`` baseline carries today's turns/retries/lease with every
+    ceiling unenforced (``0``). Inert until increment D hooks the harness loop.
+    """
+
+    max_turns: int = 500
+    max_retries: int = 1
+    lease_seconds: int = 300
+    wall_clock_seconds: int = 0
+    max_cost_usd: float = 0.0
+    max_tokens: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxRetention:
+    """``[sandbox.retention]`` — teardown/disposal policy.
+
+    Mirrors today's hardcoded worker behavior (done destroy, fail park, 7d
+    sweep). Inert until increment E wires the ``teardown()`` seam.
+    """
+
+    on_done: str = "destroy"
+    on_failure: str = "park"
+    sweep_days: int = 7
+
+
+@dataclass(frozen=True, kw_only=True)
+class SandboxPolicy:
+    """Resolved ``[sandbox.*]`` configuration: a preset baseline with sparse
+    per-key repo overrides merged on top, frozen at load.
+
+    The defaults of this dataclass (and its nested sub-dataclasses) *are* the
+    ``fast`` preset and equal today's hardcoded construction verbatim, with
+    omit-on-unset sentinels so downstream option construction stays
+    byte-identical. Only ``fast`` is defined in this increment; selecting any
+    other preset fails fast. Holds only primitives — no SDK types — to
+    preserve the optional-SDK boundary.
+    """
+
+    preset: str = "fast"
+    backend: str = "worktree"
+    permission_mode: str = "bypassPermissions"
+    exec: SandboxExec = field(default_factory=SandboxExec)
+    capabilities: SandboxCapabilities = field(default_factory=SandboxCapabilities)
+    network: SandboxNetwork = field(default_factory=SandboxNetwork)
+    env: SandboxEnv = field(default_factory=SandboxEnv)
+    limits: SandboxLimits = field(default_factory=SandboxLimits)
+    retention: SandboxRetention = field(default_factory=SandboxRetention)
+
+
+# Named presets are code-owned frozen constants (factor V: build-time). Only
+# ``fast`` exists in this increment; ``balanced``/``hardened`` are defined as
+# their enforcement lands so a preset never advertises a guarantee it cannot
+# enforce. ``fast``'s values are the dataclass defaults above (== today).
+_SANDBOX_PRESETS: dict[str, SandboxPolicy] = {"fast": SandboxPolicy(preset="fast")}
+
+_NETWORK_POLICIES: tuple[str, ...] = ("allow", "deny")
+_RETENTION_ON_DONE: tuple[str, ...] = ("destroy", "preserve")
+_RETENTION_ON_FAILURE: tuple[str, ...] = ("park", "destroy")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -158,6 +279,7 @@ class WorkPolicy:
     submit_base: str | None = None
     sandbox_setup: str | None = None
     phase_verify: str | None = None
+    sandbox: SandboxPolicy = field(default_factory=SandboxPolicy)
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -223,6 +345,7 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(sandbox, dict):
         raise PolicyError(f"{path}: [sandbox] must be a table")
     sandbox_setup = _optional_sandbox_setup(sandbox, policy_file=path)
+    sandbox_policy = _optional_sandbox_policy(sandbox, policy_file=path)
 
     phase = data.get("phase") or {}
     if not isinstance(phase, dict):
@@ -253,6 +376,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_base=submit_base,
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
+            sandbox=sandbox_policy,
         )
 
     repo = source.get("repo")
@@ -289,6 +413,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_base=submit_base,
         sandbox_setup=sandbox_setup,
         phase_verify=phase_verify,
+        sandbox=sandbox_policy,
     )
 
 
@@ -461,6 +586,330 @@ def _optional_phase_verify(
     return value
 
 
+def _sandbox_subtable(
+    table: dict, key: str, *, policy_file: Path, path: str
+) -> dict:
+    """Return a nested ``[sandbox.*]`` sub-table, or ``{}`` when absent.
+
+    A present-but-non-table value fails fast so a scalar typed where a table
+    belongs never silently degrades to defaults.
+    """
+    value = table.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PolicyError(f"{policy_file}: [{path}] must be a table")
+    return value
+
+
+def _override_bool(
+    table: dict, key: str, default: bool, *, path: str, policy_file: Path
+) -> bool:
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, bool):
+        raise PolicyError(f"{policy_file}: {path} must be a boolean")
+    return value
+
+
+def _override_int(
+    table: dict, key: str, default: int, *, path: str, policy_file: Path
+) -> int:
+    if key not in table:
+        return default
+    value = table[key]
+    # bool is an int subclass; reject it so ``= true`` is a typo, not 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PolicyError(f"{policy_file}: {path} must be an integer")
+    return value
+
+
+def _override_float(
+    table: dict, key: str, default: float, *, path: str, policy_file: Path
+) -> float:
+    if key not in table:
+        return default
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise PolicyError(f"{policy_file}: {path} must be a number")
+    return float(value)
+
+
+def _override_str(
+    table: dict,
+    key: str,
+    default: str,
+    *,
+    path: str,
+    policy_file: Path,
+    choices: tuple[str, ...] | None = None,
+) -> str:
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(f"{policy_file}: {path} must be a non-empty string")
+    if choices is not None and value not in choices:
+        raise PolicyError(
+            f"{policy_file}: {path} must be one of {choices}, got {value!r}"
+        )
+    return value
+
+
+def _override_str_tuple(
+    table: dict,
+    key: str,
+    default: tuple[str, ...] | None,
+    *,
+    path: str,
+    policy_file: Path,
+) -> tuple[str, ...] | None:
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise PolicyError(
+            f"{policy_file}: {path} must be a list of non-empty strings"
+        )
+    return tuple(value)
+
+
+def _override_str_dict(
+    table: dict,
+    key: str,
+    default: dict[str, str],
+    *,
+    path: str,
+    policy_file: Path,
+) -> dict[str, str]:
+    if key not in table:
+        return default
+    value = table[key]
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise PolicyError(
+            f"{policy_file}: {path} must be a table of string values"
+        )
+    return dict(value)
+
+
+def _override_skills(
+    table: dict,
+    key: str,
+    default: str | tuple[str, ...],
+    *,
+    path: str,
+    policy_file: Path,
+) -> str | tuple[str, ...]:
+    """Resolve ``skills``: ``"all"``/``"none"`` (or any name) or a list."""
+    if key not in table:
+        return default
+    value = table[key]
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, list) and all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        return tuple(value)
+    raise PolicyError(
+        f"{policy_file}: {path} must be \"all\", \"none\", or a list of "
+        f"non-empty strings"
+    )
+
+
+def _optional_sandbox_policy(
+    sandbox: dict, *, policy_file: Path
+) -> SandboxPolicy:
+    """Resolve the ``[sandbox.*]`` tables into a frozen :class:`SandboxPolicy`.
+
+    Selects the named preset (default ``fast``; an unknown name fails fast),
+    then merges sparse per-key overrides from each sub-table onto that
+    baseline with list-replace semantics. Absent keys (and unknown keys under
+    any ``[sandbox.*]`` table) keep the preset value, mirroring the
+    forward-compat ``_optional_*`` pattern. The existing flat ``setup`` key is
+    left to :func:`_optional_sandbox_setup`; this resolver ignores it.
+    """
+    preset_name = sandbox.get("preset", "fast")
+    base = (
+        _SANDBOX_PRESETS.get(preset_name)
+        if isinstance(preset_name, str)
+        else None
+    )
+    if base is None:
+        raise PolicyError(
+            f"{policy_file}: sandbox.preset {preset_name!r} is not available "
+            f"(defined presets: {tuple(_SANDBOX_PRESETS)})"
+        )
+
+    backend = _override_str(
+        sandbox, "backend", base.backend,
+        path="sandbox.backend", policy_file=policy_file,
+    )
+    permission_mode = _override_str(
+        sandbox, "permission_mode", base.permission_mode,
+        path="sandbox.permission_mode", policy_file=policy_file,
+    )
+
+    exec_tbl = _sandbox_subtable(
+        sandbox, "exec", policy_file=policy_file, path="sandbox.exec"
+    )
+    sandbox_exec = SandboxExec(
+        enabled=_override_bool(
+            exec_tbl, "enabled", base.exec.enabled,
+            path="sandbox.exec.enabled", policy_file=policy_file,
+        ),
+        auto_allow=_override_bool(
+            exec_tbl, "auto_allow", base.exec.auto_allow,
+            path="sandbox.exec.auto_allow", policy_file=policy_file,
+        ),
+    )
+
+    cap_tbl = _sandbox_subtable(
+        sandbox, "capabilities",
+        policy_file=policy_file, path="sandbox.capabilities",
+    )
+    mcp_tbl = _sandbox_subtable(
+        cap_tbl, "mcp",
+        policy_file=policy_file, path="sandbox.capabilities.mcp",
+    )
+    capabilities = SandboxCapabilities(
+        skills=_override_skills(
+            cap_tbl, "skills", base.capabilities.skills,
+            path="sandbox.capabilities.skills", policy_file=policy_file,
+        ),
+        allowed_tools=_override_str_tuple(
+            cap_tbl, "allowed_tools", base.capabilities.allowed_tools,
+            path="sandbox.capabilities.allowed_tools", policy_file=policy_file,
+        )
+        or (),
+        denied_tools=_override_str_tuple(
+            cap_tbl, "denied_tools", base.capabilities.denied_tools,
+            path="sandbox.capabilities.denied_tools", policy_file=policy_file,
+        )
+        or (),
+        setting_sources=_override_str_tuple(
+            cap_tbl, "setting_sources", base.capabilities.setting_sources,
+            path="sandbox.capabilities.setting_sources", policy_file=policy_file,
+        ),
+        mcp_servers=_override_str_tuple(
+            mcp_tbl, "servers", base.capabilities.mcp_servers,
+            path="sandbox.capabilities.mcp.servers", policy_file=policy_file,
+        )
+        or (),
+        mcp_strict=_override_bool(
+            mcp_tbl, "strict", base.capabilities.mcp_strict,
+            path="sandbox.capabilities.mcp.strict", policy_file=policy_file,
+        ),
+    )
+
+    net_tbl = _sandbox_subtable(
+        sandbox, "network", policy_file=policy_file, path="sandbox.network"
+    )
+    network = SandboxNetwork(
+        policy=_override_str(
+            net_tbl, "policy", base.network.policy,
+            path="sandbox.network.policy", policy_file=policy_file,
+            choices=_NETWORK_POLICIES,
+        ),
+        allow_hosts=_override_str_tuple(
+            net_tbl, "allow_hosts", base.network.allow_hosts,
+            path="sandbox.network.allow_hosts", policy_file=policy_file,
+        )
+        or (),
+        allow_unix_sockets=_override_str_tuple(
+            net_tbl, "allow_unix_sockets", base.network.allow_unix_sockets,
+            path="sandbox.network.allow_unix_sockets", policy_file=policy_file,
+        )
+        or (),
+    )
+
+    env_tbl = _sandbox_subtable(
+        sandbox, "env", policy_file=policy_file, path="sandbox.env"
+    )
+    sandbox_env = SandboxEnv(
+        passthrough=_override_str_tuple(
+            env_tbl, "pass", base.env.passthrough,
+            path="sandbox.env.pass", policy_file=policy_file,
+        )
+        or (),
+        set_values=_override_str_dict(
+            env_tbl, "set", base.env.set_values,
+            path="sandbox.env.set", policy_file=policy_file,
+        ),
+        inherit_home=_override_bool(
+            env_tbl, "inherit_home", base.env.inherit_home,
+            path="sandbox.env.inherit_home", policy_file=policy_file,
+        ),
+    )
+
+    limits_tbl = _sandbox_subtable(
+        sandbox, "limits", policy_file=policy_file, path="sandbox.limits"
+    )
+    limits = SandboxLimits(
+        max_turns=_override_int(
+            limits_tbl, "max_turns", base.limits.max_turns,
+            path="sandbox.limits.max_turns", policy_file=policy_file,
+        ),
+        max_retries=_override_int(
+            limits_tbl, "max_retries", base.limits.max_retries,
+            path="sandbox.limits.max_retries", policy_file=policy_file,
+        ),
+        lease_seconds=_override_int(
+            limits_tbl, "lease_seconds", base.limits.lease_seconds,
+            path="sandbox.limits.lease_seconds", policy_file=policy_file,
+        ),
+        wall_clock_seconds=_override_int(
+            limits_tbl, "wall_clock_seconds", base.limits.wall_clock_seconds,
+            path="sandbox.limits.wall_clock_seconds", policy_file=policy_file,
+        ),
+        max_cost_usd=_override_float(
+            limits_tbl, "max_cost_usd", base.limits.max_cost_usd,
+            path="sandbox.limits.max_cost_usd", policy_file=policy_file,
+        ),
+        max_tokens=_override_int(
+            limits_tbl, "max_tokens", base.limits.max_tokens,
+            path="sandbox.limits.max_tokens", policy_file=policy_file,
+        ),
+    )
+
+    retention_tbl = _sandbox_subtable(
+        sandbox, "retention",
+        policy_file=policy_file, path="sandbox.retention",
+    )
+    retention = SandboxRetention(
+        on_done=_override_str(
+            retention_tbl, "on_done", base.retention.on_done,
+            path="sandbox.retention.on_done", policy_file=policy_file,
+            choices=_RETENTION_ON_DONE,
+        ),
+        on_failure=_override_str(
+            retention_tbl, "on_failure", base.retention.on_failure,
+            path="sandbox.retention.on_failure", policy_file=policy_file,
+            choices=_RETENTION_ON_FAILURE,
+        ),
+        sweep_days=_override_int(
+            retention_tbl, "sweep_days", base.retention.sweep_days,
+            path="sandbox.retention.sweep_days", policy_file=policy_file,
+        ),
+    )
+
+    return SandboxPolicy(
+        preset=preset_name,
+        backend=backend,
+        permission_mode=permission_mode,
+        exec=sandbox_exec,
+        capabilities=capabilities,
+        network=network,
+        env=sandbox_env,
+        limits=limits,
+        retention=retention,
+    )
+
+
 def build_directory_source(policy: WorkPolicy) -> WorkSource:
     """Build the directory backend (the registry's ``directory`` target)."""
     assert policy.tasks_dir is not None  # load_policy guarantees it
@@ -492,6 +941,13 @@ def build_work_source(policy: WorkPolicy) -> WorkSource:
 __all__ = [
     "DEFAULT_POLICY_FILENAME",
     "PolicyError",
+    "SandboxCapabilities",
+    "SandboxEnv",
+    "SandboxExec",
+    "SandboxLimits",
+    "SandboxNetwork",
+    "SandboxPolicy",
+    "SandboxRetention",
     "WorkPolicy",
     "build_directory_source",
     "build_github_source",

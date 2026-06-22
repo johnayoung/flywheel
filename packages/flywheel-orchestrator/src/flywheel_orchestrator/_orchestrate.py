@@ -49,6 +49,7 @@ git.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
@@ -427,6 +428,17 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     """
     sandbox = policy.sandbox if policy is not None else SandboxPolicy()
     cap = sandbox.capabilities
+    env = sandbox.env
+    # Resolve [sandbox.env]: declared ``pass`` names forwarded from os.environ
+    # (present-only -- an absent name is dropped, never blank-substituted)
+    # merged with the inline ``set`` literals, which win on key collision.
+    # Both empty (the fast default and a None policy) resolves to {}.
+    agent_env = {
+        name: os.environ[name]
+        for name in env.passthrough
+        if name in os.environ
+    }
+    agent_env.update(env.set_values)
     return dict(
         permission_mode=sandbox.permission_mode,
         skills=cap.skills,
@@ -437,6 +449,7 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
         mcp_strict=cap.mcp_strict,
         exec_enabled=sandbox.exec.enabled,
         exec_auto_allow=sandbox.exec.auto_allow,
+        agent_env=agent_env,
     )
 
 
@@ -927,6 +940,7 @@ async def _drive_under_lease(
     mcp_strict: bool,
     exec_enabled: bool,
     exec_auto_allow: bool,
+    agent_env: dict[str, str],
     max_cost_usd: float,
     stream: TextIO | None,
     now: Callable[[], datetime],
@@ -978,6 +992,7 @@ async def _drive_under_lease(
             mcp_strict=mcp_strict,
             exec_enabled=exec_enabled,
             exec_auto_allow=exec_auto_allow,
+            agent_env=agent_env,
             max_cost_usd=max_cost_usd,
             invoke=invoke,
             stream=stream,

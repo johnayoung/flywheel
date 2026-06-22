@@ -1,0 +1,37 @@
+{
+  "id": "sandbox-retention",
+  "goal": "GitWorktreeSubmitter honors [sandbox.retention] on_done (destroy|preserve) and on_failure (park|destroy) for submit-time teardown, threaded from policy; defaults reproduce today's destroy/park behavior.",
+  "tags": ["sandbox", "spec-00041", "worktree"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/", "name": "worktree-suite-and-retention-oracle" },
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-backcompat" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00041-sandbox-retention.md -- SC-1/2/3 and the scope (submit-time only)",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter.__init__ (add on_done/on_failure), _submit (~line 466: the non-DONE park branch and the DONE merge -> _cleanup), build_merge_submitter (~line 1201), main (~line 1267)",
+      "packages/flywheel-worktree/tests/test_sandbox_retention.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- SandboxRetention (on_done, on_failure, sweep_days; ~line 187), already parsed"
+    ],
+    "references": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- existing policy-derived submitter args (protected_paths, setup_command) thread main -> build_merge_submitter -> GitWorktreeSubmitter; on_done/on_failure follow the same path from policy.sandbox.retention"
+    ],
+    "constraints": [
+      "Add on_done: str = \"destroy\" and on_failure: str = \"park\" to GitWorktreeSubmitter; defaults reproduce today's behavior exactly (back-compat).",
+      "In _submit: on DONE with on_done=\"preserve\", still FF-merge the branch but skip _cleanup so the worktree is kept; on a non-DONE status with on_failure=\"destroy\", _cleanup (remove worktree + branch) instead of parking.",
+      "Thread policy.sandbox.retention.on_done/on_failure through build_merge_submitter (and the _submit_registry builder signature) and worker.main, mirroring how protected_paths/sandbox_setup thread today. If GitPullRequestSubmitter has separate park logic, apply the same config there.",
+      "Keep today's zero-commit-DONE cleanup unchanged (the empty-branch case is not a preserve target).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not thread sweep_days from policy (it stays the --worktree-retention-days CLI flag); do not add a general SubmitStrategy.teardown() seam (that is the container backend, increment G).",
+      "Do not change provisioning, merge, rebase/reverify, or protected-path behavior.",
+      "Do not modify files under tests/; do not weaken the held-out oracle or increment A-D oracles."
+    ],
+    "edge_cases": [
+      "on_done=\"preserve\": the branch still merges into the base; only the worktree dir + branch ref are kept.",
+      "on_failure=\"destroy\": the worktree dir and the flywheel/<phase>/<task-id> branch are both removed (no forensics).",
+      "Defaults (destroy/park) leave every existing test green."
+    ]
+  }
+}

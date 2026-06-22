@@ -1,0 +1,38 @@
+{
+  "id": "sandbox-capability-presets",
+  "goal": "load_policy resolves selectable balanced and hardened presets that lock down the capability surface, and a resolved hardened policy composes through build_agent_options into least-privilege agent options.",
+  "prerequisites": ["sandbox-exec-wiring"],
+  "tags": ["sandbox", "spec-00038", "config"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-backcompat-and-seam" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_sandbox_presets.py", "name": "presets-oracle" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00038-sandbox-capability-presets.md -- SC-1/2/4/5 and the exact preset values to add",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _SANDBOX_PRESETS (add balanced + hardened), SandboxCapabilities/SandboxExec, _optional_sandbox_policy (per-key override already implemented)",
+      "packages/flywheel-orchestrator/tests/test_sandbox_presets.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- build_agent_options, consumed by the seam-holdout test (exec params provided by the prerequisite task)"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _SANDBOX_PRESETS already holds {\"fast\": SandboxPolicy(preset=\"fast\")}; add two entries with the exact values from spec 00038, then resolution + override work unchanged"
+    ],
+    "constraints": [
+      "balanced = SandboxPolicy(preset=\"balanced\", capabilities=SandboxCapabilities(mcp_strict=True)); everything else equals fast.",
+      "hardened = SandboxPolicy(preset=\"hardened\", capabilities=SandboxCapabilities(allowed_tools=(\"Bash\",\"Edit\",\"Glob\",\"Grep\",\"Read\",\"Write\"), setting_sources=(\"project\",), mcp_strict=True), exec=SandboxExec(enabled=True)).",
+      "permission_mode stays bypassPermissions in every preset; do not change env, limits, network, or retention from fast (their enforcement is deferred -- no false promises).",
+      "A per-key override (e.g. [sandbox.capabilities] allowed_tools) must REPLACE the preset's list value, while untouched keys keep the preset value.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not enforce env, limits, network, or retention; do not add a third preset.",
+      "Do not wire the judge/recovery/example option sites; do not change permission_mode.",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle, increment A's oracles, or the existing suite."
+    ],
+    "edge_cases": [
+      "Selecting an unknown preset still fails fast with a PolicyError naming the preset.",
+      "A resolved hardened policy fed through build_agent_options yields allowed_tools=the six, strict_mcp_config=True, setting_sources=[\"project\"], sandbox.enabled=True.",
+      "Deferred aspects (network.policy, env.inherit_home, limits.max_cost_usd) stay at their fast values under hardened."
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "sandbox-exec-wiring",
+  "goal": "build_agent_options maps exec_enabled/exec_auto_allow onto ClaudeAgentOptions.sandbox (the SDK bash SandboxSettings), omitted when disabled so the fast construction stays byte-identical.",
+  "tags": ["sandbox", "spec-00038", "core"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite-and-exec-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/ --ignore=packages/flywheel-orchestrator/tests/test_sandbox_presets.py", "name": "orchestrator-backcompat" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00038-sandbox-capability-presets.md -- SC-3 and the exec wiring contract",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- build_agent_options, _make_claude_code_invoke, run_task_object; add the exec primitives here mirroring the existing capability primitives",
+      "packages/flywheel-core/tests/test_sandbox_exec_wiring.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- SandboxExec(enabled, auto_allow); the policy.sandbox.exec fields the threading decomposes"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- the existing skills/allowed_tools/mcp_strict primitives thread policy.sandbox -> run_task_object -> build_agent_options with omit-on-unset; mirror that exact pattern for exec_enabled/exec_auto_allow",
+      ".venv/lib/python3.13/site-packages/claude_agent_sdk/types.py -- SandboxSettings TypedDict (keys enabled, autoAllowBashIfSandboxed) and ClaudeAgentOptions.sandbox"
+    ],
+    "constraints": [
+      "Add exec_enabled: bool = False and exec_auto_allow: bool = True params to build_agent_options (and _make_claude_code_invoke); when exec_enabled, set ClaudeAgentOptions.sandbox = {\"enabled\": True, \"autoAllowBashIfSandboxed\": exec_auto_allow}; when disabled, leave sandbox unset (None) so fast is byte-identical.",
+      "Thread the exec primitives from run_task_object (decomposing policy.sandbox.exec) exactly as the other capability primitives already thread; no ClaudeAgentOptions or SDK type may enter WorkPolicy/HarnessConfig/orchestrate/run_task_object signatures.",
+      "Do not change behavior under the fast preset (exec disabled).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not define the balanced or hardened presets -- that is sandbox-capability-presets.",
+      "Do not wire excludedCommands, the bash sandbox network sub-config, or the judge/recovery/example option sites.",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle or increment A's oracles."
+    ],
+    "edge_cases": [
+      "exec disabled (fast) leaves options.sandbox at None -- nothing added to the construction.",
+      "exec_auto_allow=False must be carried through to autoAllowBashIfSandboxed, not dropped."
+    ]
+  }
+}

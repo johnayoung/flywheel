@@ -423,6 +423,8 @@ def build_agent_options(
     setting_sources: tuple[str, ...] | None = None,
     mcp_servers: tuple[str, ...] = (),
     mcp_strict: bool = False,
+    exec_enabled: bool = False,
+    exec_auto_allow: bool = True,
 ) -> ClaudeAgentOptions:
     """Construct the task-agent ``ClaudeAgentOptions`` from sandbox primitives.
 
@@ -437,6 +439,12 @@ def build_agent_options(
     tuple, ``setting_sources=None`` (the SDK derives ``["user", "project"]``
     from ``skills="all"``), and ``mcp_strict=False`` leave those fields at
     their SDK defaults rather than setting them explicitly.
+
+    ``exec_enabled`` maps onto the SDK ``sandbox`` bash-isolation setting
+    (``SandboxSettings``): when enabled, ``sandbox`` becomes
+    ``{"enabled": True, "autoAllowBashIfSandboxed": exec_auto_allow}``; when
+    disabled (the ``fast`` default) ``sandbox`` is left at its ``None``
+    sentinel so the construction stays byte-identical (SC-3).
     """
     from flywheel_core._sdk import ClaudeAgentOptions
 
@@ -458,6 +466,11 @@ def build_agent_options(
         kwargs["mcp_servers"] = list(mcp_servers)
     if mcp_strict:
         kwargs["strict_mcp_config"] = mcp_strict
+    if exec_enabled:
+        kwargs["sandbox"] = {
+            "enabled": True,
+            "autoAllowBashIfSandboxed": exec_auto_allow,
+        }
     return ClaudeAgentOptions(**kwargs)
 
 
@@ -473,6 +486,8 @@ def _make_claude_code_invoke(
     setting_sources: tuple[str, ...] | None = None,
     mcp_servers: tuple[str, ...] = (),
     mcp_strict: bool = False,
+    exec_enabled: bool = False,
+    exec_auto_allow: bool = True,
     on_message: Callable[[Message], None] | None = None,
     control_store: ControlCommandStore | None = None,
     run_id: str | None = None,
@@ -512,6 +527,8 @@ def _make_claude_code_invoke(
         setting_sources=setting_sources,
         mcp_servers=mcp_servers,
         mcp_strict=mcp_strict,
+        exec_enabled=exec_enabled,
+        exec_auto_allow=exec_auto_allow,
     )
 
     if control_store is None or run_id is None:
@@ -680,6 +697,8 @@ async def run_task_object(
     setting_sources: tuple[str, ...] | None = None,
     mcp_servers: tuple[str, ...] = (),
     mcp_strict: bool = False,
+    exec_enabled: bool = False,
+    exec_auto_allow: bool = True,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
@@ -765,6 +784,8 @@ async def run_task_object(
             setting_sources=setting_sources,
             mcp_servers=mcp_servers,
             mcp_strict=mcp_strict,
+            exec_enabled=exec_enabled,
+            exec_auto_allow=exec_auto_allow,
             on_message=_make_message_observer(events, out=sys.stdout),
             control_store=backend,
             run_id=lifecycle.run_id,

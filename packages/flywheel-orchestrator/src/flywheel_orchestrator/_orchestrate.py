@@ -435,6 +435,8 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
         setting_sources=cap.setting_sources,
         mcp_servers=cap.mcp_servers,
         mcp_strict=cap.mcp_strict,
+        exec_enabled=sandbox.exec.enabled,
+        exec_auto_allow=sandbox.exec.auto_allow,
     )
 
 
@@ -905,6 +907,8 @@ async def _drive_under_lease(
     setting_sources: tuple[str, ...] | None,
     mcp_servers: tuple[str, ...],
     mcp_strict: bool,
+    exec_enabled: bool,
+    exec_auto_allow: bool,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -953,6 +957,8 @@ async def _drive_under_lease(
             setting_sources=setting_sources,
             mcp_servers=mcp_servers,
             mcp_strict=mcp_strict,
+            exec_enabled=exec_enabled,
+            exec_auto_allow=exec_auto_allow,
             invoke=invoke,
             stream=stream,
             run_id=run_id,

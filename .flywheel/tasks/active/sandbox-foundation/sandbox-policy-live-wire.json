@@ -1,0 +1,40 @@
+{
+  "id": "sandbox-policy-live-wire",
+  "goal": "The task agent's ClaudeAgentOptions is built from the resolved SandboxPolicy via a build_agent_options seam, byte-identical under the fast preset and changing when a non-fast policy is injected.",
+  "prerequisites": ["sandbox-policy-surface"],
+  "tags": ["sandbox", "spec-00037", "core"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-backcompat-and-seam" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_sandbox_policy_wiring.py", "name": "live-wire-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "purity" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00037-sandbox-config-foundation.md -- SC-1 (back-compat golden), SC-5 (live-wire), SC-6 (purity/optional-SDK), and the fast baseline table",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- _make_claude_code_invoke (the ClaudeAgentOptions site at line ~449) and run_task_object; extract build_agent_options and thread the sandbox primitives here",
+      "packages/flywheel-core/tests/test_sandbox_policy_wiring.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- threads the policy into run_task_object; decompose policy.sandbox into primitives here"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- the existing `model` knob threads policy -> options as a plain primitive (run_task_object -> _make_claude_code_invoke -> ClaudeAgentOptions); mirror that exact path for the sandbox primitives"
+    ],
+    "constraints": [
+      "Expose build_agent_options(sandbox, *, model, max_turns, permission_mode, skills, allowed_tools, denied_tools, setting_sources, mcp_servers, mcp_strict) -> ClaudeAgentOptions and call it from _make_claude_code_invoke, so the construction has one tested home.",
+      "The sandbox config reaches the option site as PLAIN PRIMITIVES (str/tuple/dict/bool/int/float). No ClaudeAgentOptions or claude_agent_sdk type may appear in the signatures of WorkPolicy, HarnessConfig, orchestrate, or run_task_object -- preserving `import flywheel_core` without the [claude] extra.",
+      "Under the fast preset the constructed options must be byte-identical to today (same set fields, same values); omit fields at their unset sentinel -- notably leave setting_sources unset so the SDK keeps deriving it from skills=all.",
+      "Scope the live-wire to the task-agent invocation site only; leave the rubric-judge, recovery-summarizer, and hello-example ClaudeAgentOptions sites unchanged (judge/recovery profiles are a later increment).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change agent behavior in any way under the default (fast) config.",
+      "Do not wire the judge, recovery-summarizer, or example option sites.",
+      "Do not implement secrets scoping, budget ceilings, teardown, or network enforcement.",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle or the existing suite."
+    ],
+    "edge_cases": [
+      "Injecting a policy with skills != 'all' or permission_mode != 'bypassPermissions' must change the constructed options (proves the path is live, not dead).",
+      "A flywheel.toml with [sandbox] setup only resolves to fast and changes nothing about the agent invocation.",
+      "setting_sources stays omitted under fast so the SDK's skills-derived default is preserved."
+    ]
+  }
+}

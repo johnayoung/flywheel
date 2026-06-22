@@ -1,0 +1,39 @@
+{
+  "id": "sandbox-policy-surface",
+  "goal": "load_policy parses the [sandbox.*] tables into a frozen SandboxPolicy on WorkPolicy, resolving the fast preset, rejecting unknown presets and malformed values, and ignoring unknown keys.",
+  "tags": ["sandbox", "spec-00037", "config"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite-and-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "purity" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00037-sandbox-config-foundation.md -- the acceptance criteria SC-2/3/4/7 this task satisfies, and the fast baseline table",
+      ".flywheel/specs/00036-sandbox-deploy-model.md -- section 3 (schema) and section 4 (presets)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy and load_policy; add SandboxPolicy + sub-dataclasses + [sandbox.*] parsing here",
+      "packages/flywheel-orchestrator/tests/test_sandbox_policy.py -- the held-out oracle for this task; make it green, do not edit it"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- mirror the existing _optional_* strict-validate / forward-compat validator pattern (keyed PolicyError messages, unknown keys ignored)"
+    ],
+    "constraints": [
+      "The fast preset values must equal today verbatim (00037 baseline table), using omit-on-unset sentinels (e.g. capabilities.setting_sources defaults to None) so downstream option construction can stay byte-identical.",
+      "Add exactly one nested frozen field WorkPolicy.sandbox: SandboxPolicy holding frozen sub-dataclasses (capabilities, network, env, limits, retention, exec); leave the existing flat sandbox_setup field and its callers untouched.",
+      "No claude_agent_sdk import anywhere in this change; SandboxPolicy holds only primitives.",
+      "Only the fast preset is defined; any other preset name fails fast with a PolicyError naming the preset. Present-but-malformed values fail fast with a {path}: sandbox.<key> message; unknown keys under any [sandbox.*] table are ignored.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not wire anything to ClaudeAgentOptions or the agent invocation -- that is the sandbox-policy-live-wire task.",
+      "Do not define the balanced or hardened presets.",
+      "Do not enforce network, env, limits, retention, or exec -- this task only parses them onto the policy (they are inert until later increments).",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle."
+    ],
+    "edge_cases": [
+      "An absent [sandbox] section (or [sandbox] setup only) resolves to the fast preset.",
+      "A per-key override (e.g. [sandbox.limits] max_turns) changes only that key; untouched keys and tables keep their fast values.",
+      "[sandbox.network] policy = \"deny\" parses and is carried on the policy but enforces nothing (advisory until increment G).",
+      "List-replace vs append cannot be discriminated while every preset list is empty; that semantics is exercised in a later increment, not here."
+    ]
+  }
+}

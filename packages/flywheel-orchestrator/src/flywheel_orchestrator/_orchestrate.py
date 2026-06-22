@@ -440,6 +440,21 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     )
 
 
+def _sandbox_limit_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
+    """Decompose the resolved ``SandboxLimits`` into the plain primitives the
+    harness consumes (spec 00039 SC-4, increment D of 00036).
+
+    The limits mirror of :func:`_sandbox_agent_primitives`: where that feeds
+    ``build_agent_options`` capabilities, this feeds ``HarnessConfig``. Only a
+    ``float`` crosses into ``run_task_object``, keeping the optional-SDK and
+    policy-type boundaries intact. A ``None`` policy (library callers) or an
+    absent ``[sandbox.limits]`` section decomposes the ``fast`` default of an
+    unenforced ceiling (``0.0``), so a fast run stays byte-identical.
+    """
+    sandbox = policy.sandbox if policy is not None else SandboxPolicy()
+    return dict(max_cost_usd=sandbox.limits.max_cost_usd)
+
+
 async def orchestrate(
     *,
     tasks_dir: Path | None = None,
@@ -532,6 +547,7 @@ async def orchestrate(
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
     sandbox_primitives = _sandbox_agent_primitives(policy)
+    limit_primitives = _sandbox_limit_primitives(policy)
 
     def resolve_sandbox(
         row: TaskStatusRow,
@@ -674,6 +690,7 @@ async def orchestrate(
                         max_turns=max_turns,
                         max_retries=max_retries,
                         **sandbox_primitives,
+                        **limit_primitives,
                         stream=stream,
                         now=clock,
                     )
@@ -831,6 +848,7 @@ async def orchestrate(
                     max_turns=max_turns,
                     max_retries=max_retries,
                     **sandbox_primitives,
+                    **limit_primitives,
                     stream=stream,
                     now=clock,
                 )
@@ -909,6 +927,7 @@ async def _drive_under_lease(
     mcp_strict: bool,
     exec_enabled: bool,
     exec_auto_allow: bool,
+    max_cost_usd: float,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -959,6 +978,7 @@ async def _drive_under_lease(
             mcp_strict=mcp_strict,
             exec_enabled=exec_enabled,
             exec_auto_allow=exec_auto_allow,
+            max_cost_usd=max_cost_usd,
             invoke=invoke,
             stream=stream,
             run_id=run_id,

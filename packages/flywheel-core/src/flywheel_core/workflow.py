@@ -699,6 +699,7 @@ async def run_task_object(
     mcp_strict: bool = False,
     exec_enabled: bool = False,
     exec_auto_allow: bool = True,
+    max_cost_usd: float = 0.0,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
@@ -865,6 +866,7 @@ async def run_task_object(
                 backend,
                 config=HarnessConfig(
                     max_retries=max_retries,
+                    max_cost_usd=max_cost_usd,
                     agent_context=agent_context,
                     worktree=sandbox,
                 ),

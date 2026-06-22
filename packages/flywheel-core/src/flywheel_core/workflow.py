@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 if TYPE_CHECKING:
-    from claude_agent_sdk import Message
+    from claude_agent_sdk import ClaudeAgentOptions, Message
 
     # Optional postgres backend: imported for typing only so this module
     # never hard-depends on the psycopg extra at runtime. The store factory
@@ -411,11 +411,68 @@ def _compose_message_observers(
     return _combined
 
 
+def build_agent_options(
+    sandbox: Path,
+    *,
+    model: str | None,
+    max_turns: int,
+    permission_mode: str = "bypassPermissions",
+    skills: str | tuple[str, ...] = "all",
+    allowed_tools: tuple[str, ...] = (),
+    denied_tools: tuple[str, ...] = (),
+    setting_sources: tuple[str, ...] | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    mcp_strict: bool = False,
+) -> ClaudeAgentOptions:
+    """Construct the task-agent ``ClaudeAgentOptions`` from sandbox primitives.
+
+    The single tested home for the task-agent option construction (spec 00037
+    SC-5 live-wire). The resolved ``SandboxPolicy`` is decomposed into PLAIN
+    PRIMITIVES upstream (``run_task_object`` -> here), exactly as ``model``
+    already threads, so core never imports the orchestrator's policy type and
+    ``import flywheel_core`` stays SDK-free.
+
+    Fields are *omitted at their unset sentinel* so the ``fast`` primitives
+    reproduce today's construction byte-for-byte (SC-1): an empty tool/MCP
+    tuple, ``setting_sources=None`` (the SDK derives ``["user", "project"]``
+    from ``skills="all"``), and ``mcp_strict=False`` leave those fields at
+    their SDK defaults rather than setting them explicitly.
+    """
+    from flywheel_core._sdk import ClaudeAgentOptions
+
+    kwargs: dict[str, Any] = dict(
+        cwd=str(sandbox),
+        add_dirs=[str(sandbox)],
+        permission_mode=permission_mode,
+        skills=list(skills) if isinstance(skills, tuple) else skills,
+        max_turns=max_turns,
+        model=model,
+    )
+    if allowed_tools:
+        kwargs["allowed_tools"] = list(allowed_tools)
+    if denied_tools:
+        kwargs["disallowed_tools"] = list(denied_tools)
+    if setting_sources is not None:
+        kwargs["setting_sources"] = list(setting_sources)
+    if mcp_servers:
+        kwargs["mcp_servers"] = list(mcp_servers)
+    if mcp_strict:
+        kwargs["strict_mcp_config"] = mcp_strict
+    return ClaudeAgentOptions(**kwargs)
+
+
 def _make_claude_code_invoke(
     sandbox: Path,
     *,
     model: str | None,
     max_turns: int,
+    permission_mode: str = "bypassPermissions",
+    skills: str | tuple[str, ...] = "all",
+    allowed_tools: tuple[str, ...] = (),
+    denied_tools: tuple[str, ...] = (),
+    setting_sources: tuple[str, ...] | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    mcp_strict: bool = False,
     on_message: Callable[[Message], None] | None = None,
     control_store: ControlCommandStore | None = None,
     run_id: str | None = None,
@@ -444,15 +501,17 @@ def _make_claude_code_invoke(
     the instant it arrives, each isolated by its own ``try/except`` so a
     raising renderer cannot break per-message persistence and vice versa.
     """
-    from flywheel_core._sdk import ClaudeAgentOptions
-
-    options = ClaudeAgentOptions(
-        cwd=str(sandbox),
-        add_dirs=[str(sandbox)],
-        permission_mode="bypassPermissions",
-        skills="all",
-        max_turns=max_turns,
+    options = build_agent_options(
+        sandbox,
         model=model,
+        max_turns=max_turns,
+        permission_mode=permission_mode,
+        skills=skills,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
+        setting_sources=setting_sources,
+        mcp_servers=mcp_servers,
+        mcp_strict=mcp_strict,
     )
 
     if control_store is None or run_id is None:
@@ -614,6 +673,13 @@ async def run_task_object(
     model: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    permission_mode: str = "bypassPermissions",
+    skills: str | tuple[str, ...] = "all",
+    allowed_tools: tuple[str, ...] = (),
+    denied_tools: tuple[str, ...] = (),
+    setting_sources: tuple[str, ...] | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    mcp_strict: bool = False,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
@@ -692,6 +758,13 @@ async def run_task_object(
             sandbox,
             model=model,
             max_turns=max_turns,
+            permission_mode=permission_mode,
+            skills=skills,
+            allowed_tools=allowed_tools,
+            denied_tools=denied_tools,
+            setting_sources=setting_sources,
+            mcp_servers=mcp_servers,
+            mcp_strict=mcp_strict,
             on_message=_make_message_observer(events, out=sys.stdout),
             control_store=backend,
             run_id=lifecycle.run_id,
@@ -1365,6 +1438,7 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MAX_TURNS",
+    "build_agent_options",
     "build_inline_task",
     "main",
     "recover_stranded_lifecycles",

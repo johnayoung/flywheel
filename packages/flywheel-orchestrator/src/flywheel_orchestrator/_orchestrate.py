@@ -90,7 +90,7 @@ from flywheel_core.workflow import (
     _stranded_run_ids,
     run_task_object,
 )
-from flywheel_orchestrator._policy import WorkPolicy
+from flywheel_orchestrator._policy import SandboxPolicy, WorkPolicy
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
     GraderReceipt,
@@ -415,6 +415,29 @@ class _ClaimHeartbeat:
             return self._claim
 
 
+def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
+    """Decompose the resolved ``SandboxPolicy`` into the plain primitives the
+    core option site consumes (spec 00037 SC-5/SC-6).
+
+    Keeps the optional-SDK boundary intact: the orchestrator owns the policy
+    type, but only ``str``/``tuple``/``bool`` values cross into
+    ``run_task_object``, exactly as ``model`` already does. A ``None`` policy
+    (library callers) decomposes the ``fast`` defaults, so the construction is
+    byte-identical to today's hardcoded one.
+    """
+    sandbox = policy.sandbox if policy is not None else SandboxPolicy()
+    cap = sandbox.capabilities
+    return dict(
+        permission_mode=sandbox.permission_mode,
+        skills=cap.skills,
+        allowed_tools=cap.allowed_tools,
+        denied_tools=cap.denied_tools,
+        setting_sources=cap.setting_sources,
+        mcp_servers=cap.mcp_servers,
+        mcp_strict=cap.mcp_strict,
+    )
+
+
 async def orchestrate(
     *,
     tasks_dir: Path | None = None,
@@ -506,6 +529,7 @@ async def orchestrate(
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
+    sandbox_primitives = _sandbox_agent_primitives(policy)
 
     def resolve_sandbox(
         row: TaskStatusRow,
@@ -647,6 +671,7 @@ async def orchestrate(
                         model=model,
                         max_turns=max_turns,
                         max_retries=max_retries,
+                        **sandbox_primitives,
                         stream=stream,
                         now=clock,
                     )
@@ -803,6 +828,7 @@ async def orchestrate(
                     model=model,
                     max_turns=max_turns,
                     max_retries=max_retries,
+                    **sandbox_primitives,
                     stream=stream,
                     now=clock,
                 )
@@ -872,6 +898,13 @@ async def _drive_under_lease(
     model: str | None,
     max_turns: int,
     max_retries: int,
+    permission_mode: str,
+    skills: str | tuple[str, ...],
+    allowed_tools: tuple[str, ...],
+    denied_tools: tuple[str, ...],
+    setting_sources: tuple[str, ...] | None,
+    mcp_servers: tuple[str, ...],
+    mcp_strict: bool,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -913,6 +946,13 @@ async def _drive_under_lease(
             model=model,
             max_turns=max_turns,
             max_retries=max_retries,
+            permission_mode=permission_mode,
+            skills=skills,
+            allowed_tools=allowed_tools,
+            denied_tools=denied_tools,
+            setting_sources=setting_sources,
+            mcp_servers=mcp_servers,
+            mcp_strict=mcp_strict,
             invoke=invoke,
             stream=stream,
             run_id=run_id,

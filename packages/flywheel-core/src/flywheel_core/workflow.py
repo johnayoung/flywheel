@@ -425,6 +425,7 @@ def build_agent_options(
     mcp_strict: bool = False,
     exec_enabled: bool = False,
     exec_auto_allow: bool = True,
+    agent_env: Mapping[str, str] | None = None,
 ) -> ClaudeAgentOptions:
     """Construct the task-agent ``ClaudeAgentOptions`` from sandbox primitives.
 
@@ -445,6 +446,13 @@ def build_agent_options(
     ``{"enabled": True, "autoAllowBashIfSandboxed": exec_auto_allow}``; when
     disabled (the ``fast`` default) ``sandbox`` is left at its ``None``
     sentinel so the construction stays byte-identical (SC-3).
+
+    ``agent_env`` is the resolved environment mapping injected onto
+    ``ClaudeAgentOptions.env`` (additive — the SDK merges it over the
+    inherited environment). It follows the same omit-on-unset shape as the
+    other primitives: when truthy, ``env`` is set to ``dict(agent_env)``;
+    when ``None`` or empty, ``env`` is left at its SDK default ``{}`` so the
+    no-env (``fast``) construction is byte-identical (SC-1).
     """
     from flywheel_core._sdk import ClaudeAgentOptions
 
@@ -471,6 +479,8 @@ def build_agent_options(
             "enabled": True,
             "autoAllowBashIfSandboxed": exec_auto_allow,
         }
+    if agent_env:
+        kwargs["env"] = dict(agent_env)
     return ClaudeAgentOptions(**kwargs)
 
 
@@ -488,6 +498,7 @@ def _make_claude_code_invoke(
     mcp_strict: bool = False,
     exec_enabled: bool = False,
     exec_auto_allow: bool = True,
+    agent_env: Mapping[str, str] | None = None,
     on_message: Callable[[Message], None] | None = None,
     control_store: ControlCommandStore | None = None,
     run_id: str | None = None,
@@ -529,6 +540,7 @@ def _make_claude_code_invoke(
         mcp_strict=mcp_strict,
         exec_enabled=exec_enabled,
         exec_auto_allow=exec_auto_allow,
+        agent_env=agent_env,
     )
 
     if control_store is None or run_id is None:

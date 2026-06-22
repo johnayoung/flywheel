@@ -1,0 +1,34 @@
+{
+  "id": "sandbox-env-builder",
+  "goal": "build_agent_options injects a resolved agent_env mapping onto ClaudeAgentOptions.env, leaving env at the SDK default {} when no env is given so the fast construction is byte-identical.",
+  "tags": ["sandbox", "spec-00040", "core"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite-and-env-builder-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/ --ignore=packages/flywheel-orchestrator/tests/test_sandbox_env_decomposition.py", "name": "orchestrator-backcompat" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00040-sandbox-env-injection.md -- SC-1 and the additive-env constraint",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- build_agent_options and _make_claude_code_invoke; add the agent_env param mirroring how the other primitives thread (omit-on-unset)",
+      "packages/flywheel-core/tests/test_sandbox_env_builder.py -- the held-out oracle for this task; make it green, do not edit it"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- existing capability primitives use omit-on-unset (only set the ClaudeAgentOptions field when non-default); agent_env follows the same shape (set options.env only when the mapping is truthy)"
+    ],
+    "constraints": [
+      "Add agent_env: Mapping[str, str] | None = None to build_agent_options (and _make_claude_code_invoke); when truthy, set ClaudeAgentOptions.env to dict(agent_env); when None or empty, do not set env (leave the SDK default {}), so the no-env construction is byte-identical to today.",
+      "Thread agent_env as a plain primitive; no SDK or policy type may enter WorkPolicy/HarnessConfig/orchestrate/run_task_object signatures.",
+      "Do not change behavior when agent_env is absent (the fast default).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not resolve [sandbox.env] from policy here -- that is sandbox-env-decomposition.",
+      "Do not implement default-deny scrubbing, read-path redaction, or inherit_home handling (those fold into the container backend, increment G).",
+      "Do not modify files under tests/; do not weaken the held-out oracle or increment A/B/D oracles."
+    ],
+    "edge_cases": [
+      "agent_env=None and agent_env={} both leave options.env at the default {} (back-compat with fast).",
+      "agent_env={\"FOO\": \"bar\"} sets options.env to exactly that mapping."
+    ]
+  }
+}

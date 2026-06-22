@@ -1,0 +1,38 @@
+{
+  "id": "sandbox-env-decomposition",
+  "goal": "_sandbox_agent_primitives resolves [sandbox.env] into an agent_env mapping (declared pass names forwarded from os.environ, merged with set literals) and threads it into build_agent_options.",
+  "prerequisites": ["sandbox-env-builder"],
+  "tags": ["sandbox", "spec-00040", "config"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest", "name": "full-suite-backcompat" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_sandbox_env_decomposition.py", "name": "env-decomposition-oracle" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00040-sandbox-env-injection.md -- SC-2 and the resolution rules",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _sandbox_agent_primitives (~line 418); add the agent_env key and thread it through to build_agent_options",
+      "packages/flywheel-orchestrator/tests/test_sandbox_env_decomposition.py -- the held-out oracle for this task; make it green, do not edit it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- SandboxEnv (passthrough, set_values, inherit_home; ~line 156), already parsed",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- build_agent_options agent_env param (from the prerequisite task) that consumes this value"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _sandbox_agent_primitives already decomposes policy.sandbox into the dict passed to run_task_object; add agent_env the same way (None policy decomposes the fast default, here {})"
+    ],
+    "constraints": [
+      "agent_env = {name: os.environ[name] for name in env.passthrough if name in os.environ} merged with dict(env.set_values), where set literals win on key collisions; an absent declared name is dropped (never blank-substituted); resolve to {} when both passthrough and set_values are empty and for a None policy.",
+      "Thread agent_env through orchestrate -> run_task_object -> build_agent_options as a plain dict; no SDK or policy type enters core signatures.",
+      "Do not change behavior for the fast preset (empty [sandbox.env] -> agent_env {} -> options.env unchanged).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not implement default-deny scrubbing, read-path redaction seeding, or inherit_home enforcement (folds into increment G).",
+      "Do not change harness or capability/limit threading.",
+      "Do not modify files under tests/; do not weaken the held-out oracle, increment A/B/D oracles, or the existing suite."
+    ],
+    "edge_cases": [
+      "A declared pass name absent from os.environ is dropped, not forwarded as empty.",
+      "A set literal overrides a forwarded value of the same name.",
+      "An absent [sandbox.env] section and a None policy both resolve to agent_env == {} (byte-identical fast construction)."
+    ]
+  }
+}

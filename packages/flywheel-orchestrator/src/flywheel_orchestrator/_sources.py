@@ -210,8 +210,17 @@ class DirectoryWorkSource:
     gate) is a separate directory-shaped flow driven by the worker.
     """
 
+    #: Provenance ``source_kind`` stamped on every emitted item and on the
+    #: ``source_syncs`` row recording a sync over this source.
+    source_kind = "directory"
+
     def __init__(self, tasks_dir: Path) -> None:
         self.tasks_dir = tasks_dir
+
+    @property
+    def source_name(self) -> str:
+        """The source's locus for ``source_syncs`` (D-4): the tasks_dir path."""
+        return str(self.tasks_dir)
 
     def list_work(self) -> list[WorkItem]:
         items: list[WorkItem] = []

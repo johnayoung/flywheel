@@ -16,6 +16,7 @@ from flywheel_orchestrator._claims import (
     ClaimLostError,
     ClaimStore,
     InMemoryClaimStore,
+    SourceSyncRecord,
     SqliteClaimStore,
     TaskClaim,
     WorkItemRecord,
@@ -27,6 +28,7 @@ from flywheel_orchestrator._orchestrate import (
     RunRecord,
     orchestrate,
     reconcile_live_runs,
+    sync_work_source,
 )
 from flywheel_orchestrator._strategy import (
     SandboxHandle,
@@ -156,6 +158,7 @@ __all__ = [
     "SandboxHandle",
     "SandboxProvider",
     "SandboxRequest",
+    "SourceSyncRecord",
     "SubmitRequest",
     "SubmitStrategy",
     "Submitter",
@@ -193,6 +196,7 @@ __all__ = [
     "resolve_postgres_dsn",
     "select_next_task",
     "status_rows_for_items",
+    "sync_work_source",
     "task_state",
     "write_phase_base_if_missing",
 ]

@@ -181,6 +181,9 @@ class GithubWorkSource:
     are visible rather than silently absent.
     """
 
+    #: Provenance ``source_kind`` for emitted items and ``source_syncs`` rows.
+    source_kind = "github_issue"
+
     def __init__(
         self,
         *,
@@ -202,6 +205,11 @@ class GithubWorkSource:
         self.done_action = done_action
         self._run = runner if runner is not None else _default_runner
         self._log = log
+
+    @property
+    def source_name(self) -> str:
+        """The source's locus for ``source_syncs`` (D-4): the ``owner/repo``."""
+        return self.repo
 
     # -- inbound --------------------------------------------------------
 

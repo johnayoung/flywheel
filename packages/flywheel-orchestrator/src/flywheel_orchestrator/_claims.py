@@ -31,10 +31,12 @@ if TYPE_CHECKING:
 # change. Versioned independently of flywheel-core's schema_version so the two
 # can share one backend without colliding.
 #
-# v2 adds the additive WorkGraph persistence tables (``work_items`` and
-# ``work_item_dependencies``); the 1 -> 2 bump is a pure forward migration
-# (``CREATE TABLE IF NOT EXISTS`` on open), so a pre-existing v1 store keeps its
-# ``task_claims`` rows.
+# v2 adds the additive WorkGraph persistence tables (``work_items``,
+# ``work_item_dependencies``, and ``source_syncs``); the 1 -> 2 bump is a pure
+# forward migration (``CREATE TABLE IF NOT EXISTS`` on open), so a pre-existing
+# v1 store keeps its ``task_claims`` rows. All three tables are part of the same
+# v2 DDL block, so a store opened at v2 by an earlier build that predates the
+# ``source_syncs`` table gains it on the next open without a further bump.
 CURRENT_ORCH_SCHEMA_VERSION: int = 2
 
 
@@ -98,6 +100,31 @@ class WorkItemRecord:
     first_seen_at: datetime
     last_seen_at: datetime
     disappeared_at: datetime | None
+    metadata_json: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class SourceSyncRecord:
+    """A persisted ``source_syncs`` row read back from the orchestrator store.
+
+    Immutable snapshot of one sync run over a :class:`WorkSource`. A row is
+    written at the start of a pass (``status='running'``, ``finished_at`` NULL)
+    and finished when the pass settles: ``status='ok'`` with ``observed_count``
+    equal to the number of items the pass observed, or ``status='error'`` with
+    a non-empty ``error`` when ``list_work()`` failed. ``source_name`` is the
+    source's locus (D-4): the ``tasks_dir`` path for a directory source, the
+    ``owner/repo`` for a GitHub source. ``metadata_json`` is a canonical JSON
+    string carried at its default (``'{}'``); nothing populates it this spec.
+    """
+
+    id: int
+    source_kind: str
+    source_name: str
+    started_at: datetime
+    finished_at: datetime | None
+    status: str
+    observed_count: int
+    error: str | None
     metadata_json: str
 
 
@@ -177,6 +204,21 @@ def _row_to_work_item_record(row: sqlite3.Row) -> WorkItemRecord:
         disappeared_at=(
             _parse_iso(disappeared) if disappeared is not None else None
         ),
+        metadata_json=row["metadata_json"],
+    )
+
+
+def _row_to_source_sync_record(row: sqlite3.Row) -> SourceSyncRecord:
+    finished = row["finished_at"]
+    return SourceSyncRecord(
+        id=int(row["id"]),
+        source_kind=row["source_kind"],
+        source_name=row["source_name"],
+        started_at=_parse_iso(row["started_at"]),
+        finished_at=_parse_iso(finished) if finished is not None else None,
+        status=row["status"],
+        observed_count=int(row["observed_count"]),
+        error=row["error"],
         metadata_json=row["metadata_json"],
     )
 
@@ -302,6 +344,18 @@ CREATE TABLE IF NOT EXISTS work_item_dependencies (
 
 CREATE INDEX IF NOT EXISTS idx_work_item_dependencies_prerequisite
   ON work_item_dependencies (prerequisite_task_id);
+
+CREATE TABLE IF NOT EXISTS source_syncs (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_kind    TEXT NOT NULL,
+  source_name    TEXT NOT NULL,
+  started_at     TEXT NOT NULL,
+  finished_at    TEXT,
+  status         TEXT NOT NULL,
+  observed_count INTEGER NOT NULL DEFAULT 0,
+  error          TEXT,
+  metadata_json  TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 
@@ -619,6 +673,77 @@ class SqliteClaimStore:
         ).fetchall()
         return [(row["task_id"], row["prerequisite_task_id"]) for row in rows]
 
+    # -- source-sync recording (schema v2) ---------------------------------
+
+    def record_source_sync_start(
+        self,
+        source_kind: str,
+        source_name: str,
+        *,
+        now: datetime,
+    ) -> int:
+        """Open a ``source_syncs`` row for a pass and return its id.
+
+        The row starts ``status='running'`` with ``finished_at`` NULL; the
+        returned id is handed to :meth:`record_source_sync_finish` to settle
+        the row once the pass succeeds or fails.
+        """
+        with self._transaction():
+            cursor = self._connection.execute(
+                "INSERT INTO source_syncs ("
+                "  source_kind, source_name, started_at, status, "
+                "  observed_count"
+                ") VALUES (?, ?, ?, 'running', 0)",
+                (source_kind, source_name, _iso(now)),
+            )
+            row_id = cursor.lastrowid
+            assert row_id is not None  # AUTOINCREMENT INSERT always sets it
+            return int(row_id)
+
+    def record_source_sync_finish(
+        self,
+        sync_id: int,
+        *,
+        status: str,
+        observed_count: int = 0,
+        error: str | None = None,
+        now: datetime,
+    ) -> None:
+        """Settle the ``source_syncs`` row ``sync_id``.
+
+        ``status='ok'`` carries ``observed_count`` (the number of items the
+        pass observed); ``status='error'`` carries a non-empty ``error``.
+        ``finished_at`` is stamped to ``now`` either way. Recording a finish
+        does NOT touch ``work_items`` — the failed-pass-marks-nothing posture
+        (D-3) lives in the caller, which simply skips the mark-disappeared
+        step on the error path.
+        """
+        with self._transaction():
+            self._connection.execute(
+                "UPDATE source_syncs SET status = ?, observed_count = ?, "
+                "error = ?, finished_at = ? WHERE id = ?",
+                (status, observed_count, error, _iso(now), sync_id),
+            )
+
+    def load_source_sync(self, sync_id: int) -> SourceSyncRecord | None:
+        row = self._connection.execute(
+            "SELECT id, source_kind, source_name, started_at, finished_at, "
+            "status, observed_count, error, metadata_json "
+            "FROM source_syncs WHERE id = ?",
+            (sync_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_source_sync_record(row)
+
+    def list_source_syncs(self) -> list[SourceSyncRecord]:
+        rows = self._connection.execute(
+            "SELECT id, source_kind, source_name, started_at, finished_at, "
+            "status, observed_count, error, metadata_json "
+            "FROM source_syncs ORDER BY id"
+        ).fetchall()
+        return [_row_to_source_sync_record(row) for row in rows]
+
     def close(self) -> None:
         self._connection.close()
 
@@ -630,6 +755,7 @@ __all__ = [
     "InMemoryClaimStore",
     "SqliteClaimStore",
     "OrchestratorSchemaError",
+    "SourceSyncRecord",
     "TaskClaim",
     "WorkItemRecord",
 ]

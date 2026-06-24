@@ -78,10 +78,12 @@ if TYPE_CHECKING:
     # on the psycopg extra. The store factory returns SqliteStore |
     # PostgresStore and both answer these reads through the store protocol.
     from flywheel_core.store_postgres import PostgresStore
+    from flywheel_orchestrator._claims_postgres import PostgresClaimStore
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
     ClaimLostError,
+    SourceSyncRecord,
     SqliteClaimStore,
     TaskClaim,
 )
@@ -261,6 +263,62 @@ async def _source_reconcile_loop(
                     file=stream,
                     flush=True,
                 )
+
+
+def sync_work_source(
+    source: WorkSource,
+    store: SqliteClaimStore | PostgresClaimStore,
+    *,
+    source_kind: str,
+    source_name: str,
+    now: datetime,
+) -> SourceSyncRecord:
+    """Run one ``list_work()`` pass and persist it as a ``source_syncs`` run.
+
+    Mirrors :func:`_source_reconcile_loop`'s posture at the storage layer
+    (D-3): a sync opens a ``source_syncs`` row, runs the source's
+    ``list_work()``, then settles. On success it upserts every observed item,
+    replaces each item's dependency edges with the current graph, marks
+    previously-seen-but-now-absent items disappeared, and finishes the run
+    ``status='ok'`` with ``observed_count`` equal to the number observed. On a
+    failed ``list_work()`` it finishes ``status='error'`` with a non-empty
+    error and marks **nothing** disappeared — a tracker hiccup is never read as
+    task disappearance (criterion #7). ``source_kind`` / ``source_name`` are the
+    source's provenance/locus (D-4); read them off the adapter
+    (``source.source_kind`` / ``source.source_name``). Returns the settled
+    :class:`SourceSyncRecord`.
+    """
+    sync_id = store.record_source_sync_start(
+        source_kind, source_name, now=now
+    )
+    try:
+        items = list(source.list_work())
+    except Exception as exc:  # noqa: BLE001 - adapter/transport failure
+        # Failed listing: record the error and leave the catalog untouched.
+        # NOTHING is marked disappeared (D-3 / criterion #7).
+        store.record_source_sync_finish(
+            sync_id,
+            status="error",
+            error=f"{type(exc).__name__}: {exc}",
+            now=now,
+        )
+        settled = store.load_source_sync(sync_id)
+        assert settled is not None  # just written above
+        return settled
+    for item in items:
+        store.upsert_work_item(item, now=now)
+        store.replace_work_item_dependencies(
+            item.task.id, item.prerequisites, now=now
+        )
+    store.mark_work_items_disappeared(
+        [item.task.id for item in items], now=now
+    )
+    store.record_source_sync_finish(
+        sync_id, status="ok", observed_count=len(items), now=now
+    )
+    settled = store.load_source_sync(sync_id)
+    assert settled is not None  # just written above
+    return settled
 
 
 @dataclass(frozen=True, kw_only=True)

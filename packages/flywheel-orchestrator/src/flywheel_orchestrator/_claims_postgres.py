@@ -31,6 +31,7 @@ from flywheel_orchestrator._claims import (
     CURRENT_ORCH_SCHEMA_VERSION,
     ClaimLostError,
     OrchestratorSchemaError,
+    SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
 )
@@ -61,6 +62,27 @@ _WORK_ITEM_SELECT = """
            metadata_json::text AS metadata_json
     FROM work_items
 """
+
+
+_SOURCE_SYNC_SELECT = """
+    SELECT id, source_kind, source_name, started_at, finished_at, status,
+           observed_count, error, metadata_json::text AS metadata_json
+    FROM source_syncs
+"""
+
+
+def _row_to_source_sync_record(row: dict[str, Any]) -> SourceSyncRecord:
+    return SourceSyncRecord(
+        id=int(row["id"]),
+        source_kind=row["source_kind"],
+        source_name=row["source_name"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        status=row["status"],
+        observed_count=int(row["observed_count"]),
+        error=row["error"],
+        metadata_json=row["metadata_json"],
+    )
 
 
 def _row_to_work_item_record(row: dict[str, Any]) -> WorkItemRecord:
@@ -190,6 +212,21 @@ class PostgresClaimStore:
                     CREATE INDEX IF NOT EXISTS
                       idx_work_item_dependencies_prerequisite
                       ON work_item_dependencies (prerequisite_task_id)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS source_syncs (
+                      id             BIGSERIAL PRIMARY KEY,
+                      source_kind    TEXT NOT NULL,
+                      source_name    TEXT NOT NULL,
+                      started_at     TIMESTAMPTZ NOT NULL,
+                      finished_at    TIMESTAMPTZ,
+                      status         TEXT NOT NULL,
+                      observed_count INTEGER NOT NULL DEFAULT 0,
+                      error          TEXT,
+                      metadata_json  JSONB NOT NULL DEFAULT '{}'::jsonb
+                    )
                     """
                 )
                 cur.execute(
@@ -479,6 +516,85 @@ class PostgresClaimStore:
                 )
                 rows = cur.fetchall()
         return [(row["task_id"], row["prerequisite_task_id"]) for row in rows]
+
+    # -- source-sync recording (schema v2) ---------------------------------
+
+    def record_source_sync_start(
+        self,
+        source_kind: str,
+        source_name: str,
+        *,
+        now: datetime,
+    ) -> int:
+        """Open a ``source_syncs`` row for a pass and return its id.
+
+        The row starts ``status='running'`` with ``finished_at`` NULL; the
+        returned id is handed to :meth:`record_source_sync_finish` to settle
+        the row once the pass succeeds or fails.
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO source_syncs (
+                        source_kind, source_name, started_at, status,
+                        observed_count
+                    ) VALUES (%s, %s, %s, 'running', 0)
+                    RETURNING id
+                    """,
+                    (source_kind, source_name, now),
+                )
+                row = cur.fetchone()
+        assert row is not None  # RETURNING id always yields a row
+        return int(row[0])
+
+    def record_source_sync_finish(
+        self,
+        sync_id: int,
+        *,
+        status: str,
+        observed_count: int = 0,
+        error: str | None = None,
+        now: datetime,
+    ) -> None:
+        """Settle the ``source_syncs`` row ``sync_id``.
+
+        ``status='ok'`` carries ``observed_count`` (the number of items the
+        pass observed); ``status='error'`` carries a non-empty ``error``.
+        ``finished_at`` is stamped to ``now`` either way. Recording a finish
+        does NOT touch ``work_items`` — the failed-pass-marks-nothing posture
+        (D-3) lives in the caller, which simply skips the mark-disappeared
+        step on the error path.
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE source_syncs
+                    SET status = %s, observed_count = %s, error = %s,
+                        finished_at = %s
+                    WHERE id = %s
+                    """,
+                    (status, observed_count, error, now, sync_id),
+                )
+
+    def load_source_sync(self, sync_id: int) -> SourceSyncRecord | None:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _SOURCE_SYNC_SELECT + " WHERE id = %s", (sync_id,)
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_source_sync_record(row)
+
+    def list_source_syncs(self) -> list[SourceSyncRecord]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_SOURCE_SYNC_SELECT + " ORDER BY id")
+                rows = cur.fetchall()
+        return [_row_to_source_sync_record(row) for row in rows]
 
     def close(self) -> None:
         self._pool.close()

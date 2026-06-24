@@ -30,11 +30,29 @@ def test_cost_ceiling_decomposes_from_policy(tmp_path: Path) -> None:
     assert _sandbox_limit_primitives(pol)["max_cost_usd"] == 0.5
 
 
+def test_token_and_walltime_ceilings_decompose_from_policy(tmp_path: Path) -> None:
+    # spec 00042: max_tokens + wall_clock_seconds join max_cost_usd as the
+    # plain primitives the harness consumes.
+    pol = _policy(
+        tmp_path,
+        "[sandbox.limits]\nmax_tokens = 200000\nwall_clock_seconds = 1800\n",
+    )
+    prims = _sandbox_limit_primitives(pol)
+    assert prims["max_tokens"] == 200000
+    assert prims["wall_clock_seconds"] == 1800
+
+
 def test_absent_limits_default_to_unenforced(tmp_path: Path) -> None:
     pol = _policy(tmp_path, "")
-    assert _sandbox_limit_primitives(pol)["max_cost_usd"] == 0.0
+    prims = _sandbox_limit_primitives(pol)
+    assert prims["max_cost_usd"] == 0.0
+    assert prims["max_tokens"] == 0
+    assert prims["wall_clock_seconds"] == 0
 
 
 def test_none_policy_decomposes_to_unenforced() -> None:
-    # Library callers pass no policy; the fast default is an unenforced ceiling.
-    assert _sandbox_limit_primitives(None)["max_cost_usd"] == 0.0
+    # Library callers pass no policy; the fast default is unenforced ceilings.
+    prims = _sandbox_limit_primitives(None)
+    assert prims["max_cost_usd"] == 0.0
+    assert prims["max_tokens"] == 0
+    assert prims["wall_clock_seconds"] == 0

@@ -458,14 +458,19 @@ def _sandbox_limit_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     harness consumes (spec 00039 SC-4, increment D of 00036).
 
     The limits mirror of :func:`_sandbox_agent_primitives`: where that feeds
-    ``build_agent_options`` capabilities, this feeds ``HarnessConfig``. Only a
-    ``float`` crosses into ``run_task_object``, keeping the optional-SDK and
+    ``build_agent_options`` capabilities, this feeds ``HarnessConfig``. Only
+    plain numbers cross into ``run_task_object`` (``max_cost_usd`` float,
+    ``max_tokens``/``wall_clock_seconds`` ints), keeping the optional-SDK and
     policy-type boundaries intact. A ``None`` policy (library callers) or an
     absent ``[sandbox.limits]`` section decomposes the ``fast`` default of an
-    unenforced ceiling (``0.0``), so a fast run stays byte-identical.
+    unenforced ceiling (``0.0``/``0``), so a fast run stays byte-identical.
     """
     sandbox = policy.sandbox if policy is not None else SandboxPolicy()
-    return dict(max_cost_usd=sandbox.limits.max_cost_usd)
+    return dict(
+        max_cost_usd=sandbox.limits.max_cost_usd,
+        max_tokens=sandbox.limits.max_tokens,
+        wall_clock_seconds=sandbox.limits.wall_clock_seconds,
+    )
 
 
 async def orchestrate(
@@ -942,6 +947,8 @@ async def _drive_under_lease(
     exec_auto_allow: bool,
     agent_env: dict[str, str],
     max_cost_usd: float,
+    max_tokens: int,
+    wall_clock_seconds: int,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -994,6 +1001,8 @@ async def _drive_under_lease(
             exec_auto_allow=exec_auto_allow,
             agent_env=agent_env,
             max_cost_usd=max_cost_usd,
+            max_tokens=max_tokens,
+            wall_clock_seconds=wall_clock_seconds,
             invoke=invoke,
             stream=stream,
             run_id=run_id,

@@ -324,6 +324,18 @@ class HarnessConfig:
     from an agent error. The default ``0.0`` disables the ceiling
     (byte-identical to today's behavior and the ``fast`` default).
 
+    ``max_tokens`` and ``wall_clock_seconds`` are the token and wall-clock
+    companions of ``max_cost_usd`` (spec 00042, completing increment D of
+    00036). Both share its exact semantics — PER-RUN cumulative, checked
+    after the rollup but before grading, terminal ``Status.FAILED`` and
+    non-retryable on breach, emitting the same
+    ``harness.budget_ceiling_breached`` event (``payload["ceiling"]`` is
+    ``"tokens"`` / ``"wall_clock_seconds"`` respectively). ``max_tokens``
+    sums ``Attempt.total_tokens`` across all attempts; ``wall_clock_seconds``
+    measures elapsed wall time from the run's earliest attempt
+    ``started_at`` to ``clock()``. Each defaults to ``0`` (unenforced =
+    today = ``fast``); independent of one another and of ``max_cost_usd``.
+
     ``max_iterations_per_attempt`` caps the inner ``intent=continue``
     loop within one ``Attempt``. The default of 1 means a single
     invocation per Attempt; raise it to allow multi-turn agents to
@@ -404,6 +416,8 @@ class HarnessConfig:
 
     max_retries: int = 0
     max_cost_usd: float = 0.0
+    max_tokens: int = 0
+    wall_clock_seconds: int = 0
     max_iterations_per_attempt: int = 1
     artifacts_root: str | os.PathLike[str] | None = None
     agent_context: Mapping[str, str] = field(default_factory=dict)
@@ -2112,57 +2126,73 @@ async def _run_attempt_body(
         )
         return
 
-    # Per-run cost ceiling (spec 00039). Sum total_cost_usd across all
-    # attempts of the run — the finalized prior attempts plus this one's
-    # rolled-up cost — and check it after the per-iteration rollup but
-    # BEFORE grading, so a breach pre-empts the grade (a run that blew its
-    # budget does not get to pass). The current attempt may already appear
-    # in list_attempts via its in-loop save_attempt, so it is excluded from
-    # the prior sum and re-added from the in-memory object to avoid double
-    # counting. A zero ceiling (the fast default) is unenforced. On breach,
-    # finalize this attempt (Outcome.AGENT_ERROR, reusing the ABORT shape)
-    # and transition RUNNING -> FAILED directly (terminal, non-retryable),
-    # emitting a distinct harness.budget_ceiling_breached event so audit
-    # tells a budget kill from an agent error.
-    if config.max_cost_usd > 0:
-        prior_cost = sum(
-            a.total_cost_usd
+    # Per-run budget ceilings (cost: spec 00039; tokens + wall-clock: spec
+    # 00042, completing increment D of 00036). All three share one shape:
+    # PER-RUN cumulative, checked after the per-iteration rollup but BEFORE
+    # grading so a breach pre-empts the grade (a run that blew its budget
+    # does not get to pass), terminal Status.FAILED and non-retryable on
+    # breach. The current attempt may already appear in list_attempts via
+    # its in-loop save_attempt, so it is excluded from the prior set and
+    # re-added from the in-memory object to avoid double counting. A zero
+    # ceiling (the fast default) is unenforced. Cost is checked first, then
+    # tokens, then wall-clock; the first breach ends the run.
+    if config.max_cost_usd > 0 or config.max_tokens > 0 or config.wall_clock_seconds > 0:
+        prior = [
+            a
             for a in store.list_attempts(lifecycle.run_id)
             if a.number != attempt.number
-        )
-        run_total_cost = prior_cost + attempt.total_cost_usd
-        if run_total_cost >= config.max_cost_usd:
-            breach_error = (
-                f"budget ceiling breached: cost_usd {run_total_cost} "
-                f">= limit {config.max_cost_usd}"
+        ]
+        if config.max_cost_usd > 0:
+            run_total_cost = sum(a.total_cost_usd for a in prior) + attempt.total_cost_usd
+            if run_total_cost >= config.max_cost_usd:
+                _finalize_budget_breach(
+                    store=store,
+                    telemetry=telemetry,
+                    lifecycle=lifecycle,
+                    attempt=attempt,
+                    attempt_number=attempt_number,
+                    ceiling="cost_usd",
+                    limit=config.max_cost_usd,
+                    observed=run_total_cost,
+                    transcript=iteration_result.transcript,
+                    clock=clock,
+                )
+                return
+        if config.max_tokens > 0:
+            run_total_tokens = sum(a.total_tokens for a in prior) + attempt.total_tokens
+            if run_total_tokens >= config.max_tokens:
+                _finalize_budget_breach(
+                    store=store,
+                    telemetry=telemetry,
+                    lifecycle=lifecycle,
+                    attempt=attempt,
+                    attempt_number=attempt_number,
+                    ceiling="tokens",
+                    limit=config.max_tokens,
+                    observed=run_total_tokens,
+                    transcript=iteration_result.transcript,
+                    clock=clock,
+                )
+                return
+        if config.wall_clock_seconds > 0:
+            run_started = min(
+                [a.started_at for a in prior] + [attempt.started_at]
             )
-            _finalize_attempt(
-                store=store,
-                telemetry=telemetry,
-                lifecycle=lifecycle,
-                attempt=attempt,
-                outcome=Outcome.AGENT_ERROR,
-                error=breach_error,
-                agent_output=iteration_result.transcript,
-                clock=clock,
-            )
-            telemetry.emit(
-                kind="harness.budget_ceiling_breached",
-                payload={
-                    "ceiling": "cost_usd",
-                    "limit": config.max_cost_usd,
-                    "observed": run_total_cost,
-                },
-                attempt_number=attempt_number,
-            )
-            _transition(
-                lifecycle,
-                Status.FAILED,
-                store=store,
-                error=breach_error,
-                now=clock,
-            )
-            return
+            elapsed_seconds = (clock() - run_started).total_seconds()
+            if elapsed_seconds >= config.wall_clock_seconds:
+                _finalize_budget_breach(
+                    store=store,
+                    telemetry=telemetry,
+                    lifecycle=lifecycle,
+                    attempt=attempt,
+                    attempt_number=attempt_number,
+                    ceiling="wall_clock_seconds",
+                    limit=config.wall_clock_seconds,
+                    observed=elapsed_seconds,
+                    transcript=iteration_result.transcript,
+                    clock=clock,
+                )
+                return
 
     envelope = iteration_result.envelope
 
@@ -3695,6 +3725,53 @@ def _emit_rubric_events(
             },
             attempt_number=attempt_number,
         )
+
+
+def _finalize_budget_breach(
+    *,
+    store: HarnessStore,
+    telemetry: _RunTelemetry,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    attempt_number: int,
+    ceiling: str,
+    limit: float,
+    observed: float,
+    transcript: str,
+    clock: Callable[[], datetime],
+) -> None:
+    """End a run that breached a per-run budget ceiling (specs 00039/00042).
+
+    Shared by the cost, token, and wall-clock guards: finalize the current
+    attempt ``Outcome.AGENT_ERROR`` (reusing the ABORT shape), emit the
+    distinct ``harness.budget_ceiling_breached`` event so audit tells a
+    budget kill from an agent error, then transition RUNNING -> FAILED
+    directly (terminal, non-retryable). ``ceiling`` names the dimension
+    (``cost_usd`` / ``tokens`` / ``wall_clock_seconds``).
+    """
+    breach_error = f"budget ceiling breached: {ceiling} {observed} >= limit {limit}"
+    _finalize_attempt(
+        store=store,
+        telemetry=telemetry,
+        lifecycle=lifecycle,
+        attempt=attempt,
+        outcome=Outcome.AGENT_ERROR,
+        error=breach_error,
+        agent_output=transcript,
+        clock=clock,
+    )
+    telemetry.emit(
+        kind="harness.budget_ceiling_breached",
+        payload={"ceiling": ceiling, "limit": limit, "observed": observed},
+        attempt_number=attempt_number,
+    )
+    _transition(
+        lifecycle,
+        Status.FAILED,
+        store=store,
+        error=breach_error,
+        now=clock,
+    )
 
 
 def _finalize_attempt(

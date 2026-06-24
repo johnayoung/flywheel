@@ -713,6 +713,8 @@ async def run_task_object(
     exec_auto_allow: bool = True,
     agent_env: Mapping[str, str] | None = None,
     max_cost_usd: float = 0.0,
+    max_tokens: int = 0,
+    wall_clock_seconds: int = 0,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
@@ -881,6 +883,8 @@ async def run_task_object(
                 config=HarnessConfig(
                     max_retries=max_retries,
                     max_cost_usd=max_cost_usd,
+                    max_tokens=max_tokens,
+                    wall_clock_seconds=wall_clock_seconds,
                     agent_context=agent_context,
                     worktree=sandbox,
                 ),

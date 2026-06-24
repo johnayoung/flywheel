@@ -5,8 +5,7 @@
   "prerequisites": ["workgraph-builder"],
   "graders": [
     { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_orchestrator.py", "name": "selection-and-orchestrator-holdout" },
-    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
-    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "workgraph-oracle" }
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
   ],
   "context": {
     "relevant": [

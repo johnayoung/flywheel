@@ -4,7 +4,7 @@
   "tags": ["workgraph", "spec-00047", "orchestrator"],
   "prerequisites": ["workgraph-model"],
   "graders": [
-    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "builder-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "builder-oracle" },
     { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_source_registry.py", "name": "source-seam" }
   ],
   "context": {

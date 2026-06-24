@@ -3,7 +3,7 @@
   "goal": "A new orchestrator WorkGraph, built from WorkItem objects, validates structure on construction (raising WorkGraphValidationError naming duplicate-id / self-dep / cycle members), records missing-prerequisite GraphValidationIssues without raising, and answers ready_set(states, excluded) with exactly the currently-runnable items.",
   "tags": ["workgraph", "spec-00047", "orchestrator"],
   "graders": [
-    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "workgraph-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "workgraph-oracle" },
     { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "core-purity" }
   ],
   "context": {

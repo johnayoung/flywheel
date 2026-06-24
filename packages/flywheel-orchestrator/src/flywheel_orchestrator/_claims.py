@@ -15,17 +15,27 @@ before the task definition is recorded and deleted on completion.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from flywheel_core.loaders import task_digest
+
+if TYPE_CHECKING:
+    from flywheel_orchestrator._sources import WorkItem
 
 # Bump if the orchestrator's persisted schema gains a backwards-incompatible
 # change. Versioned independently of flywheel-core's schema_version so the two
 # can share one backend without colliding.
-CURRENT_ORCH_SCHEMA_VERSION: int = 1
+#
+# v2 adds the additive WorkGraph persistence tables (``work_items`` and
+# ``work_item_dependencies``); the 1 -> 2 bump is a pure forward migration
+# (``CREATE TABLE IF NOT EXISTS`` on open), so a pre-existing v1 store keeps its
+# ``task_claims`` rows.
+CURRENT_ORCH_SCHEMA_VERSION: int = 2
 
 
 class ClaimLostError(Exception):
@@ -57,6 +67,38 @@ class TaskClaim:
     claimed_at: datetime
     lease_expires_at: datetime
     version: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class WorkItemRecord:
+    """A persisted ``work_items`` row read back from the orchestrator store.
+
+    Immutable snapshot of one observed work item's catalog entry.
+    ``first_seen_at`` is stamped once on the first observation and never
+    moves; ``last_seen_at`` advances on every observation; ``disappeared_at``
+    is set when a *successful* sync no longer observes the item and is cleared
+    (back to ``None``) the moment it is observed again.
+
+    ``priority`` / ``required_capabilities_json`` / ``conflict_keys_json`` /
+    ``metadata_json`` are forward-compat columns carried at their defaults
+    (``0`` / ``'[]'`` / ``'[]'`` / ``'{}'``); nothing populates them from a
+    ``WorkItem`` field until spec 00049. The ``*_json`` fields are canonical
+    JSON strings on both backends.
+    """
+
+    task_id: str
+    source_kind: str | None
+    source_ref: str | None
+    source_url: str | None
+    source_version: str | None
+    task_content_hash: str | None
+    priority: int
+    required_capabilities_json: str
+    conflict_keys_json: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    disappeared_at: datetime | None
+    metadata_json: str
 
 
 @runtime_checkable
@@ -116,6 +158,27 @@ def _iso(ts: datetime) -> str:
 
 def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _row_to_work_item_record(row: sqlite3.Row) -> WorkItemRecord:
+    disappeared = row["disappeared_at"]
+    return WorkItemRecord(
+        task_id=row["task_id"],
+        source_kind=row["source_kind"],
+        source_ref=row["source_ref"],
+        source_url=row["source_url"],
+        source_version=row["source_version"],
+        task_content_hash=row["task_content_hash"],
+        priority=int(row["priority"]),
+        required_capabilities_json=row["required_capabilities_json"],
+        conflict_keys_json=row["conflict_keys_json"],
+        first_seen_at=_parse_iso(row["first_seen_at"]),
+        last_seen_at=_parse_iso(row["last_seen_at"]),
+        disappeared_at=(
+            _parse_iso(disappeared) if disappeared is not None else None
+        ),
+        metadata_json=row["metadata_json"],
+    )
 
 
 class InMemoryClaimStore:
@@ -213,6 +276,32 @@ CREATE TABLE IF NOT EXISTS orchestrator_schema_version (
   id      INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS work_items (
+  task_id                    TEXT PRIMARY KEY,
+  source_kind                TEXT,
+  source_ref                 TEXT,
+  source_url                 TEXT,
+  source_version             TEXT,
+  task_content_hash          TEXT,
+  priority                   INTEGER NOT NULL DEFAULT 0,
+  required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+  conflict_keys_json         TEXT NOT NULL DEFAULT '[]',
+  first_seen_at              TEXT NOT NULL,
+  last_seen_at               TEXT NOT NULL,
+  disappeared_at             TEXT,
+  metadata_json              TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS work_item_dependencies (
+  task_id              TEXT NOT NULL,
+  prerequisite_task_id TEXT NOT NULL,
+  created_at           TEXT NOT NULL,
+  PRIMARY KEY (task_id, prerequisite_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_item_dependencies_prerequisite
+  ON work_item_dependencies (prerequisite_task_id);
 """
 
 
@@ -255,6 +344,16 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
+        # Additive forward migration v1 -> v2: the new WorkGraph tables were
+        # already created above by the CREATE TABLE IF NOT EXISTS DDL, so a
+        # pre-existing v1 store gains them with its task_claims rows intact.
+        # Converge the sentinel rather than refusing the store.
+        if observed == 1:
+            conn.execute(
+                "UPDATE orchestrator_schema_version SET version = 2 "
+                "WHERE id = 1"
+            )
+            observed = 2
         if observed != CURRENT_ORCH_SCHEMA_VERSION:
             raise OrchestratorSchemaError(
                 observed=observed, expected=CURRENT_ORCH_SCHEMA_VERSION
@@ -395,6 +494,131 @@ class SqliteClaimStore:
             for row in rows
         ]
 
+    # -- WorkGraph persistence (schema v2) ---------------------------------
+
+    def upsert_work_item(self, item: WorkItem, *, now: datetime) -> None:
+        """Insert or refresh the ``work_items`` row for an observed item.
+
+        ``first_seen_at`` is set only on the initial insert; ``last_seen_at``
+        is set to ``now`` on every observation and any prior
+        ``disappeared_at`` is cleared. ``task_content_hash`` is
+        ``task_digest(item.task)`` (D-1). The forward-compat columns
+        (priority / required_capabilities_json / conflict_keys_json /
+        metadata_json) are left at their column defaults.
+        """
+        with self._transaction():
+            self._connection.execute(
+                "INSERT INTO work_items ("
+                "  task_id, source_kind, source_ref, source_url, "
+                "  source_version, task_content_hash, first_seen_at, "
+                "  last_seen_at, disappeared_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "  source_kind = excluded.source_kind, "
+                "  source_ref = excluded.source_ref, "
+                "  source_url = excluded.source_url, "
+                "  source_version = excluded.source_version, "
+                "  task_content_hash = excluded.task_content_hash, "
+                "  last_seen_at = excluded.last_seen_at, "
+                "  disappeared_at = NULL",
+                (
+                    item.task.id,
+                    item.source_kind,
+                    item.source_ref,
+                    item.source_url,
+                    item.source_version,
+                    task_digest(item.task),
+                    _iso(now),
+                    _iso(now),
+                ),
+            )
+
+    def replace_work_item_dependencies(
+        self,
+        task_id: str,
+        prerequisite_task_ids: Iterable[str],
+        *,
+        now: datetime,
+    ) -> None:
+        """Replace the dependency edge set for ``task_id`` with the given
+        prerequisites (the current-graph edges); duplicates collapse."""
+        with self._transaction():
+            self._connection.execute(
+                "DELETE FROM work_item_dependencies WHERE task_id = ?",
+                (task_id,),
+            )
+            for prerequisite in dict.fromkeys(prerequisite_task_ids):
+                self._connection.execute(
+                    "INSERT INTO work_item_dependencies "
+                    "(task_id, prerequisite_task_id, created_at) "
+                    "VALUES (?, ?, ?)",
+                    (task_id, prerequisite, _iso(now)),
+                )
+
+    def mark_work_items_disappeared(
+        self,
+        observed_task_ids: Iterable[str],
+        *,
+        now: datetime,
+    ) -> None:
+        """Stamp ``disappeared_at`` on previously-seen items absent from the
+        current observed set, without deleting any row. Items already marked
+        disappeared keep their original timestamp."""
+        observed = list(dict.fromkeys(observed_task_ids))
+        with self._transaction():
+            if observed:
+                placeholders = ",".join("?" for _ in observed)
+                self._connection.execute(
+                    "UPDATE work_items SET disappeared_at = ? "
+                    "WHERE disappeared_at IS NULL "
+                    f"AND task_id NOT IN ({placeholders})",
+                    (_iso(now), *observed),
+                )
+            else:
+                self._connection.execute(
+                    "UPDATE work_items SET disappeared_at = ? "
+                    "WHERE disappeared_at IS NULL",
+                    (_iso(now),),
+                )
+
+    def load_work_item(self, task_id: str) -> WorkItemRecord | None:
+        row = self._connection.execute(
+            "SELECT task_id, source_kind, source_ref, source_url, "
+            "source_version, task_content_hash, priority, "
+            "required_capabilities_json, conflict_keys_json, first_seen_at, "
+            "last_seen_at, disappeared_at, metadata_json "
+            "FROM work_items WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_work_item_record(row)
+
+    def list_work_items(self) -> list[WorkItemRecord]:
+        rows = self._connection.execute(
+            "SELECT task_id, source_kind, source_ref, source_url, "
+            "source_version, task_content_hash, priority, "
+            "required_capabilities_json, conflict_keys_json, first_seen_at, "
+            "last_seen_at, disappeared_at, metadata_json "
+            "FROM work_items"
+        ).fetchall()
+        return [_row_to_work_item_record(row) for row in rows]
+
+    def load_work_item_dependencies(self, task_id: str) -> list[str]:
+        rows = self._connection.execute(
+            "SELECT prerequisite_task_id FROM work_item_dependencies "
+            "WHERE task_id = ? ORDER BY prerequisite_task_id",
+            (task_id,),
+        ).fetchall()
+        return [row["prerequisite_task_id"] for row in rows]
+
+    def list_work_item_dependencies(self) -> list[tuple[str, str]]:
+        rows = self._connection.execute(
+            "SELECT task_id, prerequisite_task_id FROM work_item_dependencies "
+            "ORDER BY task_id, prerequisite_task_id"
+        ).fetchall()
+        return [(row["task_id"], row["prerequisite_task_id"]) for row in rows]
+
     def close(self) -> None:
         self._connection.close()
 
@@ -407,4 +631,5 @@ __all__ = [
     "SqliteClaimStore",
     "OrchestratorSchemaError",
     "TaskClaim",
+    "WorkItemRecord",
 ]

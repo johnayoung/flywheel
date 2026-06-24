@@ -18,6 +18,7 @@ from flywheel_orchestrator._claims import (
     InMemoryClaimStore,
     SqliteClaimStore,
     TaskClaim,
+    WorkItemRecord,
 )
 from flywheel_orchestrator._orchestrate import (
     DEFAULT_LEASE_SECONDS,
@@ -161,6 +162,7 @@ __all__ = [
     "TaskState",
     "TaskStatusRow",
     "WorkItem",
+    "WorkItemRecord",
     "WorkPolicy",
     "WorkReport",
     "WorkSource",

@@ -10,8 +10,9 @@ touching the other's tables.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 try:
     import psycopg
@@ -24,12 +25,18 @@ except ImportError as exc:  # pragma: no cover - exercised via env
         "install psycopg / psycopg_pool"
     ) from exc
 
+from flywheel_core.loaders import task_digest
+
 from flywheel_orchestrator._claims import (
     CURRENT_ORCH_SCHEMA_VERSION,
     ClaimLostError,
     OrchestratorSchemaError,
     TaskClaim,
+    WorkItemRecord,
 )
+
+if TYPE_CHECKING:
+    from flywheel_orchestrator._sources import WorkItem
 
 _SCHEMA_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -41,6 +48,37 @@ def _validate_schema(schema: str) -> str:
             f"[A-Za-z_][A-Za-z0-9_]*"
         )
     return schema
+
+
+# JSONB columns are cast to text so the read-back ``*_json`` fields are
+# canonical JSON strings, matching the SQLite backend's TEXT storage.
+_WORK_ITEM_SELECT = """
+    SELECT task_id, source_kind, source_ref, source_url, source_version,
+           task_content_hash, priority,
+           required_capabilities_json::text AS required_capabilities_json,
+           conflict_keys_json::text AS conflict_keys_json,
+           first_seen_at, last_seen_at, disappeared_at,
+           metadata_json::text AS metadata_json
+    FROM work_items
+"""
+
+
+def _row_to_work_item_record(row: dict[str, Any]) -> WorkItemRecord:
+    return WorkItemRecord(
+        task_id=row["task_id"],
+        source_kind=row["source_kind"],
+        source_ref=row["source_ref"],
+        source_url=row["source_url"],
+        source_version=row["source_version"],
+        task_content_hash=row["task_content_hash"],
+        priority=int(row["priority"]),
+        required_capabilities_json=row["required_capabilities_json"],
+        conflict_keys_json=row["conflict_keys_json"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+        disappeared_at=row["disappeared_at"],
+        metadata_json=row["metadata_json"],
+    )
 
 
 class PostgresClaimStore:
@@ -116,9 +154,56 @@ class PostgresClaimStore:
                     """
                 )
                 cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS work_items (
+                      task_id                    TEXT PRIMARY KEY,
+                      source_kind                TEXT,
+                      source_ref                 TEXT,
+                      source_url                 TEXT,
+                      source_version             TEXT,
+                      task_content_hash          TEXT,
+                      priority                   INTEGER NOT NULL DEFAULT 0,
+                      required_capabilities_json JSONB NOT NULL
+                                                 DEFAULT '[]'::jsonb,
+                      conflict_keys_json         JSONB NOT NULL
+                                                 DEFAULT '[]'::jsonb,
+                      first_seen_at              TIMESTAMPTZ NOT NULL,
+                      last_seen_at               TIMESTAMPTZ NOT NULL,
+                      disappeared_at             TIMESTAMPTZ,
+                      metadata_json              JSONB NOT NULL
+                                                 DEFAULT '{}'::jsonb
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS work_item_dependencies (
+                      task_id              TEXT NOT NULL,
+                      prerequisite_task_id TEXT NOT NULL,
+                      created_at           TIMESTAMPTZ NOT NULL,
+                      PRIMARY KEY (task_id, prerequisite_task_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_work_item_dependencies_prerequisite
+                      ON work_item_dependencies (prerequisite_task_id)
+                    """
+                )
+                cur.execute(
                     "INSERT INTO orchestrator_schema_version (id, version) "
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
+                )
+                # Additive forward migration v1 -> v2: the new WorkGraph
+                # tables were just created above, so a pre-existing v1 store
+                # gains them with its task_claims rows intact. Converge the
+                # sentinel rather than refusing the store.
+                cur.execute(
+                    "UPDATE orchestrator_schema_version SET version = 2 "
+                    "WHERE id = 1 AND version = 1"
                 )
                 cur.execute(
                     "SELECT version FROM orchestrator_schema_version "
@@ -255,6 +340,145 @@ class PostgresClaimStore:
             )
             for row in rows
         ]
+
+    # -- WorkGraph persistence (schema v2) ---------------------------------
+
+    def upsert_work_item(self, item: WorkItem, *, now: datetime) -> None:
+        """Insert or refresh the ``work_items`` row for an observed item.
+
+        ``first_seen_at`` is set only on the initial insert; ``last_seen_at``
+        is set to ``now`` on every observation and any prior
+        ``disappeared_at`` is cleared. ``task_content_hash`` is
+        ``task_digest(item.task)`` (D-1). The forward-compat columns are left
+        at their column defaults.
+        """
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO work_items (
+                        task_id, source_kind, source_ref, source_url,
+                        source_version, task_content_hash, first_seen_at,
+                        last_seen_at, disappeared_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                    ON CONFLICT (task_id) DO UPDATE SET
+                        source_kind = EXCLUDED.source_kind,
+                        source_ref = EXCLUDED.source_ref,
+                        source_url = EXCLUDED.source_url,
+                        source_version = EXCLUDED.source_version,
+                        task_content_hash = EXCLUDED.task_content_hash,
+                        last_seen_at = EXCLUDED.last_seen_at,
+                        disappeared_at = NULL
+                    """,
+                    (
+                        item.task.id,
+                        item.source_kind,
+                        item.source_ref,
+                        item.source_url,
+                        item.source_version,
+                        task_digest(item.task),
+                        now,
+                        now,
+                    ),
+                )
+
+    def replace_work_item_dependencies(
+        self,
+        task_id: str,
+        prerequisite_task_ids: Iterable[str],
+        *,
+        now: datetime,
+    ) -> None:
+        """Replace the dependency edge set for ``task_id`` with the given
+        prerequisites (the current-graph edges); duplicates collapse."""
+        prerequisites = list(dict.fromkeys(prerequisite_task_ids))
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM work_item_dependencies WHERE task_id = %s",
+                    (task_id,),
+                )
+                for prerequisite in prerequisites:
+                    cur.execute(
+                        """
+                        INSERT INTO work_item_dependencies
+                            (task_id, prerequisite_task_id, created_at)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (task_id, prerequisite, now),
+                    )
+
+    def mark_work_items_disappeared(
+        self,
+        observed_task_ids: Iterable[str],
+        *,
+        now: datetime,
+    ) -> None:
+        """Stamp ``disappeared_at`` on previously-seen items absent from the
+        current observed set, without deleting any row. Items already marked
+        disappeared keep their original timestamp."""
+        observed = list(dict.fromkeys(observed_task_ids))
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                if observed:
+                    cur.execute(
+                        """
+                        UPDATE work_items SET disappeared_at = %s
+                        WHERE disappeared_at IS NULL
+                          AND task_id <> ALL(%s)
+                        """,
+                        (now, observed),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE work_items SET disappeared_at = %s
+                        WHERE disappeared_at IS NULL
+                        """,
+                        (now,),
+                    )
+
+    def load_work_item(self, task_id: str) -> WorkItemRecord | None:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_WORK_ITEM_SELECT + " WHERE task_id = %s", (task_id,))
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_work_item_record(row)
+
+    def list_work_items(self) -> list[WorkItemRecord]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_WORK_ITEM_SELECT)
+                rows = cur.fetchall()
+        return [_row_to_work_item_record(row) for row in rows]
+
+    def load_work_item_dependencies(self, task_id: str) -> list[str]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT prerequisite_task_id FROM work_item_dependencies
+                    WHERE task_id = %s ORDER BY prerequisite_task_id
+                    """,
+                    (task_id,),
+                )
+                rows = cur.fetchall()
+        return [row["prerequisite_task_id"] for row in rows]
+
+    def list_work_item_dependencies(self) -> list[tuple[str, str]]:
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT task_id, prerequisite_task_id
+                    FROM work_item_dependencies
+                    ORDER BY task_id, prerequisite_task_id
+                    """
+                )
+                rows = cur.fetchall()
+        return [(row["task_id"], row["prerequisite_task_id"]) for row in rows]
 
     def close(self) -> None:
         self._pool.close()

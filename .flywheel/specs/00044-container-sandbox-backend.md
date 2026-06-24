@@ -67,7 +67,7 @@ assigned when scheduled):
 
 | # | Sub-increment | Scope | Depends |
 | --- | --- | --- | --- |
-| **G1** | **`teardown()` seam** | Add optional `teardown(self)` to `SubmitStrategy`; `orchestrate` calls it best-effort after `submit` (must not raise); worktree/PR strategies get a no-op. Small, self-contained, useful alone. | — |
+| **G1** | **`teardown` seam** | Add optional `teardown: Callable[[], None] \| None` to `SandboxHandle` (per-task, closure-captured over the container — symmetric with `invoke_wrapper`, not a `SubmitStrategy` method which a shared strategy instance couldn't key to one task's container). `orchestrate` calls `handle.teardown()` best-effort after `submit` (must not raise). The worktree path (bare `Path` → `teardown=None`) is untouched — no no-op needed. Matches sandcastle's `handle.close()`. Small, self-contained, useful alone. | — |
 | **G2** | **Plain-dict usage path in core** | `IterationResult` gains optional `usage: Mapping[str,int] \| None`; the harness rollup (`harness.py:3207`) reads it when set, falling back to `_build_usage_breakdown(messages)` when not. Lets a message-less (SDK-free) invoker feed token accounting + the D token ceiling. SDK-free, ~no behavior change for the SDK path. | — |
 | **G3** | **Container lifecycle primitives** | `flywheel-container` package scaffold + `run -d` / `exec` (line-streamed, bounded tail) / `cp` / stop+rm, UID/GID-aligned `--user`, pre-flight image+UID check, sync shutdown-registry. Verified against the live daemon. | G1 |
 | **G4** | **stream-json → IterationResult adapter** | Pure parser: JSONL lines → accumulated transcript, `session_id`, `result`, token `usage` (4 fields), `total_cost_usd`, `num_turns`; `envelope = parse_envelope(transcript)` (reuse core); `signals = InvocationSignals(...)`. Fixture-tested. | G2 |
@@ -162,7 +162,7 @@ limit mapping (natural follow-on to `[sandbox.limits]`); synthesizing
 ## Anchor files
 
 - `packages/flywheel-orchestrator/src/flywheel_orchestrator/_strategy.py` —
-  `SubmitStrategy` (+ `teardown()`), `SandboxHandle` (the seam, shipped).
+  `SandboxHandle` (the seam, shipped; G1 adds `teardown`).
 - `packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py` —
   call `strategy.teardown()` after `submit` in the drive path.
 - `packages/flywheel-core/src/flywheel_core/harness.py` — `IterationResult`
@@ -175,9 +175,11 @@ limit mapping (natural follow-on to `[sandbox.limits]`); synthesizing
 
 ## Decision gates (resolve in each sub-increment's fw-spec)
 
-- **G1:** `teardown()` ordering — after `submit`, before or after lease release?
-  (Recommend after submit, before release, best-effort, must-not-raise — mirrors
-  `submit`'s contract.)
+- **G1:** `teardown` lives on the `SandboxHandle` (resolved — per-task closure,
+  symmetric with `invoke_wrapper`), called after `submit`, before lease release,
+  best-effort/must-not-raise (mirrors `submit`'s contract). Arg-less for now;
+  status-conditional preserve (retention-aware container teardown) is a G5
+  refinement that widens the callable then.
 - **G2:** `usage` on `IterationResult` vs `InvocationSignals`? (Recommend
   `IterationResult` — it already carries `messages`; `usage` is the message-less
   peer, keeping `InvocationSignals` about the result/stop signals.)

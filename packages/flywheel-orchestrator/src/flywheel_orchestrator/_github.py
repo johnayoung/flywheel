@@ -42,6 +42,7 @@ extends to ticket transitions.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Sequence
@@ -299,6 +300,9 @@ class GithubWorkSource:
             task=task,
             prerequisites=prerequisites,
             source_ref=source_ref,
+            source_kind="github_issue",
+            source_version=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            source_url=url,
         )
 
     # -- outbound -------------------------------------------------------

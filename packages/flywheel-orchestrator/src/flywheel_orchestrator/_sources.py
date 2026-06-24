@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from flywheel_core.lifecycle import Status
-from flywheel_core.loaders import load_task_file
+from flywheel_core.loaders import load_task_file, task_digest
 from flywheel_core.task import Task
 
 
@@ -63,12 +63,22 @@ class WorkItem:
     that derive meaning from an on-disk location (e.g. the worktree
     submitter's phase-from-directory branch naming) read it, and
     non-file sources leave it ``None``.
+
+    ``source_kind``/``source_version``/``source_url`` carry the item's
+    provenance for persistence: where it came from (``"directory"``,
+    ``"github_issue"``), a stable content hash that changes when the
+    operator edits the underlying definition, and a locator (a file path,
+    an issue URL). All three are optional so direct ``WorkItem``
+    construction without provenance still compiles; adapters populate them.
     """
 
     task: Task
     prerequisites: tuple[str, ...] = ()
     source_ref: str
     local_path: Path | None = None
+    source_kind: str | None = None
+    source_version: str | None = None
+    source_url: str | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -212,6 +222,9 @@ class DirectoryWorkSource:
                     prerequisites=_read_prerequisites(path),
                     source_ref=str(path),
                     local_path=path,
+                    source_kind="directory",
+                    source_version=task_digest(task),
+                    source_url=str(path),
                 )
             )
         return items

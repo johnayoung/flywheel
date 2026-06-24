@@ -27,6 +27,11 @@ from flywheel_container._docker import (
     remove_container,
     start_container,
 )
+from flywheel_container._stream import (
+    StreamOutcome,
+    iteration_result_from_stream,
+    parse_stream_json,
+)
 
 __all__ = [
     "DEFAULT_AGENT_HOME",
@@ -34,6 +39,7 @@ __all__ = [
     "DEFAULT_WORKDIR",
     "DockerError",
     "ExecResult",
+    "StreamOutcome",
     "VolumeMount",
     "build_exec_argv",
     "build_run_argv",
@@ -41,6 +47,8 @@ __all__ = [
     "exec_in_container",
     "force_remove_container_sync",
     "image_exists",
+    "iteration_result_from_stream",
+    "parse_stream_json",
     "register_container_cleanup",
     "remove_container",
     "start_container",

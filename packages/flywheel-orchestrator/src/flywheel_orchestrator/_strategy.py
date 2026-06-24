@@ -111,6 +111,15 @@ class SandboxHandle:
       so the agent iteration executes in the backend (e.g. ``docker exec``
       into the container) instead of the worker process. ``None`` runs
       in-process exactly as today.
+    * ``teardown`` — disposes the provisioned environment after the run lands
+      (e.g. ``docker stop``/``rm`` the container). The orchestrator calls it
+      best-effort after ``submit`` and before releasing the lease; it MUST NOT
+      raise (a teardown failure never unwinds the worker). Per-task by
+      construction — the provider captures the container/handle identity in the
+      closure at ``prepare_sandbox`` time — which is why it lives here rather
+      than on :class:`SubmitStrategy` (a single shared strategy instance could
+      not key teardown to one task's sandbox). ``None`` (every worktree
+      backend) means there is nothing to dispose.
 
     Frozen and kw-only, mirroring :class:`SandboxRequest`/:class:`SubmitRequest`.
     """
@@ -118,6 +127,7 @@ class SandboxHandle:
     path: Path
     env_contribution: Mapping[str, str] = field(default_factory=dict)
     invoke_wrapper: Callable[[InvokeFunc], InvokeFunc] | None = None
+    teardown: Callable[[], None] | None = None
 
 
 def _as_handle(result: Path | SandboxHandle) -> SandboxHandle:

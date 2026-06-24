@@ -746,6 +746,7 @@ async def orchestrate(
                         db_path=db_path,
                         sandbox=sandbox,
                         submit=submit,
+                        teardown=handle.teardown,
                         work_source=source,
                         run_id=run_id,
                         worker_id=wid,
@@ -908,6 +909,7 @@ async def orchestrate(
                     db_path=db_path,
                     sandbox=sandbox,
                     submit=submit,
+                    teardown=handle.teardown,
                     work_source=source,
                     run_id=resume_run_id,
                     worker_id=wid,
@@ -979,6 +981,7 @@ async def _drive_under_lease(
     db_path: Path,
     sandbox: Path,
     submit: Submitter | None,
+    teardown: Callable[[], None] | None,
     work_source: WorkSource,
     run_id: str | None,
     worker_id: str,
@@ -1019,6 +1022,12 @@ async def _drive_under_lease(
     exclusivity that kept peers off the task. It must not raise; a graceful
     SIGTERM cancels the run before this point, so an interrupted task's
     sandbox is left untouched (parked) for the next attempt to reuse.
+
+    ``teardown`` (the run's :class:`SandboxHandle` teardown, when the provider
+    supplied one) runs after ``submit`` and before the lease is released, so a
+    container backend disposes its sandbox under the same exclusivity. Like
+    ``submit`` it MUST NOT raise; any error is contained here and logged, so a
+    failed teardown never unwinds the worker or loses the run record.
 
     ``work_source.report`` runs after ``submit`` (still under the lease) so
     the external system hears about the outcome only once the consumer's
@@ -1089,6 +1098,21 @@ async def _drive_under_lease(
                     receipts=receipts,
                 )
             )
+        if teardown is not None:
+            # Dispose the run's sandbox (e.g. docker stop/rm) after landing,
+            # still under the lease. Best-effort and must not raise: a teardown
+            # failure leaks a container at worst, never costs the run record or
+            # the schedule.
+            try:
+                teardown()
+            except Exception as exc:  # noqa: BLE001 - consumer code
+                if stream is not None:
+                    print(
+                        f"[orchestrate] {task_id}: sandbox teardown failed "
+                        f"({type(exc).__name__}: {exc}); continuing",
+                        file=stream,
+                        flush=True,
+                    )
         try:
             work_source.report(
                 WorkReport(

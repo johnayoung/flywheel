@@ -1,7 +1,9 @@
 # 00044 — Container sandbox backend (increment G of 00036)
 
-Status: design + spec. Increment G of [00036](00036-sandbox-deploy-model.md): a
-new `flywheel-container` workspace package providing a `ContainerSubmitStrategy`
+Status: IMPLEMENTED (G1–G6 shipped; SC-9 live end-to-end remains gated on a built
+image + agent auth — see Success criteria). Increment G of
+[00036](00036-sandbox-deploy-model.md): a new `flywheel-container` workspace
+package providing a `ContainerSubmitStrategy`
 that runs the task agent **inside a Docker container** against a bind-mounted
 worktree, with a `teardown()` lifecycle hook and `[sandbox.network]` enforcement
 via Docker networking. The major increment; the seam it plugs into

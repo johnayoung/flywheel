@@ -102,6 +102,7 @@ class ContainerSubmitStrategy:
         env: Mapping[str, str] | None = None,
         cpus: float | None = None,
         workdir: str = DEFAULT_WORKDIR,
+        exec_timeout: float | None = None,
         preflight: bool = True,
         runtime: ContainerRuntime | None = None,
     ) -> None:
@@ -119,6 +120,7 @@ class ContainerSubmitStrategy:
         self._env = dict(env or {})
         self._cpus = cpus
         self._workdir = workdir
+        self._exec_timeout = exec_timeout
         self._preflight = preflight
         self._runtime = runtime or ContainerRuntime()
 
@@ -191,10 +193,12 @@ class ContainerSubmitStrategy:
         agent = self._agent
         runtime = self._runtime
         workdir = self._workdir
+        exec_timeout = self._exec_timeout
 
-        def wrapper(_base_invoke: InvokeFunc) -> InvokeFunc:
+        def wrapper(_base_invoke: InvokeFunc | None) -> InvokeFunc:
             # The host SDK invoker is replaced wholesale: the agent runs in the
-            # container, not the worker process.
+            # container, not the worker process. The base invoke (``None`` in
+            # normal operation) is intentionally ignored.
             async def _invoke(request: InvocationRequest) -> IterationResult:
                 command, stdin = agent.build_command(request.prompt)
                 lines: list[str] = []
@@ -205,6 +209,7 @@ class ContainerSubmitStrategy:
                     stdin=stdin,
                     on_line=lines.append,
                     cwd=workdir,
+                    timeout=exec_timeout,
                 )
                 outcome = parse_stream_json(lines)
                 failure = None

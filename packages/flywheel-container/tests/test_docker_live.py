@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from flywheel_container._docker import (
+    DockerError,
     ExecResult,
     VolumeMount,
     exec_in_container,
@@ -81,6 +82,17 @@ def test_exec_nonzero_exit_is_reported(container: str) -> None:
 def test_exec_pipes_stdin(container: str) -> None:
     result = exec_in_container(container, "cat", stdin="piped-prompt")
     assert result.stdout == "piped-prompt"
+
+
+def test_exec_timeout_bounds_a_silent_hang(container: str) -> None:
+    # A command that holds stdout open and produces nothing must still be
+    # killed at the timeout — the kill-timer, not proc.wait(), enforces it.
+    import time
+
+    start = time.monotonic()
+    with pytest.raises(DockerError, match="timed out"):
+        exec_in_container(container, "sleep 30", timeout=2.0)
+    assert time.monotonic() - start < 15  # killed promptly, not after 30s
 
 
 def test_bind_mount_uid_alignment(tmp_path: Path) -> None:

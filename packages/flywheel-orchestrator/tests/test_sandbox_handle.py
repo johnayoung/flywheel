@@ -12,8 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from flywheel_orchestrator import SandboxHandle
 from flywheel_orchestrator._orchestrate import (
     _apply_handle,
@@ -76,7 +74,20 @@ def test_apply_handle_wraps_invoke(tmp_path: Path) -> None:
     assert seen["inner"] is _invoke
 
 
-def test_apply_handle_invoke_wrapper_requires_base_invoke(tmp_path: Path) -> None:
-    h = SandboxHandle(path=tmp_path, invoke_wrapper=lambda inner: inner)
-    with pytest.raises(ValueError, match="requires a base invoke"):
-        _apply_handle(h, _sandbox_agent_primitives(None), None)
+def test_apply_handle_invoke_wrapper_runs_with_none_base(tmp_path: Path) -> None:
+    # In normal operation orchestrate is driven with invoke=None (the SDK
+    # invoker is built downstream). A replacing wrapper (container backend)
+    # must still be applied — it is handed the None base and ignores it.
+    seen: dict[str, object] = {}
+
+    async def replacement(request: object) -> object:
+        return "in-container"
+
+    def wrapper(inner: object) -> object:
+        seen["inner"] = inner
+        return replacement
+
+    h = SandboxHandle(path=tmp_path, invoke_wrapper=wrapper)  # type: ignore[arg-type]
+    eff, inv = _apply_handle(h, _sandbox_agent_primitives(None), None)
+    assert inv is replacement
+    assert seen["inner"] is None  # base invoke was None, passed through

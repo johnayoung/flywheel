@@ -110,7 +110,10 @@ class SandboxHandle:
     * ``invoke_wrapper`` — wraps the run's :data:`~flywheel_core.InvokeFunc`
       so the agent iteration executes in the backend (e.g. ``docker exec``
       into the container) instead of the worker process. ``None`` runs
-      in-process exactly as today.
+      in-process exactly as today. It is handed the base invoke, which is
+      ``None`` in normal operation (orchestrate is driven with ``invoke=None``
+      and the SDK invoker is built downstream); a replacing wrapper ignores
+      it, an augmenting one composes it.
     * ``teardown`` — disposes the provisioned environment after the run lands
       (e.g. ``docker stop``/``rm`` the container). The orchestrator calls it
       best-effort after ``submit`` and before releasing the lease; it MUST NOT
@@ -126,7 +129,7 @@ class SandboxHandle:
 
     path: Path
     env_contribution: Mapping[str, str] = field(default_factory=dict)
-    invoke_wrapper: Callable[[InvokeFunc], InvokeFunc] | None = None
+    invoke_wrapper: Callable[[InvokeFunc | None], InvokeFunc] | None = None
     teardown: Callable[[], None] | None = None
 
 

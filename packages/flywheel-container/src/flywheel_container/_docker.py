@@ -301,6 +301,22 @@ def exec_in_container(
     stderr_thread.start()
     threads.append(stderr_thread)
 
+    # Bound the WHOLE operation, not just proc.wait(): a child that holds
+    # stdout open and silent would block the `for raw in proc.stdout` read
+    # forever. A timer kills the process on expiry, which closes stdout and
+    # ends the loop. Without this the per-run wall-clock ceiling cannot help —
+    # it is only checked after the iteration returns.
+    timed_out = threading.Event()
+    timer: threading.Timer | None = None
+    if timeout is not None:
+        def _on_timeout() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(timeout, _on_timeout)
+        timer.daemon = True
+        timer.start()
+
     assert proc.stdout is not None
     try:
         for raw in proc.stdout:
@@ -308,13 +324,15 @@ def exec_in_container(
             stdout_tail.push(line)
             if on_line is not None:
                 on_line(line)
-        exit_code = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        raise DockerError(f"docker exec timed out after {timeout}s")
+        exit_code = proc.wait()
     finally:
+        if timer is not None:
+            timer.cancel()
         for t in threads:
             t.join(timeout=5.0)
+
+    if timed_out.is_set():
+        raise DockerError(f"docker exec timed out after {timeout}s")
 
     return ExecResult(
         stdout=str(stdout_tail),

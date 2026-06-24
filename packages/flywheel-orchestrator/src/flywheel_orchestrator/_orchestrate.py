@@ -500,11 +500,12 @@ def _apply_handle(
         }
     effective_invoke = invoke
     if handle.invoke_wrapper is not None:
-        if invoke is None:
-            raise ValueError(
-                "SandboxHandle.invoke_wrapper requires a base invoke; "
-                "orchestrate was given none"
-            )
+        # The wrapper receives the base invoke, which is ``None`` in normal
+        # operation: orchestrate is called with ``invoke=None`` and the SDK
+        # invoker is built downstream in ``run_task_object``. A *replacing*
+        # wrapper (the container backend, which execs the agent CLI) ignores
+        # the base; an augmenting one would compose it. Either way orchestrate
+        # does not require a base invoke to exist here.
         effective_invoke = handle.invoke_wrapper(invoke)
     return effective, effective_invoke
 
@@ -1098,21 +1099,6 @@ async def _drive_under_lease(
                     receipts=receipts,
                 )
             )
-        if teardown is not None:
-            # Dispose the run's sandbox (e.g. docker stop/rm) after landing,
-            # still under the lease. Best-effort and must not raise: a teardown
-            # failure leaks a container at worst, never costs the run record or
-            # the schedule.
-            try:
-                teardown()
-            except Exception as exc:  # noqa: BLE001 - consumer code
-                if stream is not None:
-                    print(
-                        f"[orchestrate] {task_id}: sandbox teardown failed "
-                        f"({type(exc).__name__}: {exc}); continuing",
-                        file=stream,
-                        flush=True,
-                    )
         try:
             work_source.report(
                 WorkReport(
@@ -1133,6 +1119,24 @@ async def _drive_under_lease(
                     flush=True,
                 )
     finally:
+        # Dispose the run's sandbox (e.g. docker stop/rm) on EVERY exit path —
+        # clean finalize, grader failure, crash, in-band interrupt, or
+        # claim-loss — still under the lease, so a container is never leaked
+        # when run_task_object raises before submit. Best-effort and must not
+        # raise (a teardown failure leaks at worst, never costs the schedule);
+        # a None teardown (every worktree backend) is a no-op. The worktree
+        # backend keeps parking its dir via submit, unaffected.
+        if teardown is not None:
+            try:
+                teardown()
+            except Exception as exc:  # noqa: BLE001 - consumer code
+                if stream is not None:
+                    print(
+                        f"[orchestrate] {task_id}: sandbox teardown failed "
+                        f"({type(exc).__name__}: {exc}); continuing",
+                        file=stream,
+                        flush=True,
+                    )
         latest = heartbeat.stop()
         claims.release_claim(latest)
     return RunRecord(

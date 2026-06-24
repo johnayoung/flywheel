@@ -90,12 +90,25 @@ The adapter produces an `IterationResult{transcript, messages:(), envelope:
 parse_envelope(transcript), signals: InvocationSignals(stop_reason, num_turns,
 total_cost_usd, …), usage:{…}, failure}`. `messages=()` is why G2 exists.
 
-**Known v1 limitation:** `InvocationRequest.on_message` is the harness's
-per-message persistence/telemetry observer over SDK `Message` objects. A
-message-less container invoker cannot call it, so live per-message telemetry is
-absent for container runs (the JSONL stream is still captured wholesale; the
-envelope/signals/usage land). Documented, not silently dropped. Closing it later
-means synthesizing message records — out of scope here.
+**Known v1 limitations (documented, not silently dropped):**
+
+- `InvocationRequest.on_message` is the harness's per-message observer over SDK
+  `Message` objects. A message-less container invoker cannot call it, so live
+  per-message telemetry is absent (the JSONL stream is still captured wholesale;
+  envelope/signals/usage land). **Consequence:** the harness *hang watchdog*
+  reads its heartbeat from `on_message` (`harness.py`), so it cannot see a
+  container run's liveness — with `hang_timeout_seconds` set it would false-trip
+  a healthy long run, and unset it provides no bound. **Mitigation:**
+  `ContainerSubmitStrategy(exec_timeout=...)` bounds the whole `docker exec`
+  (a kill-timer in `exec_in_container`, effective even when the agent holds
+  stdout open and silent); operators set it instead of the host watchdog.
+  Synthesizing `Message` records to feed the watchdog is a later refinement.
+- `[sandbox.env]` (increment C) resolves into the run's `agent_env` and is
+  threaded into the *host* SDK options — which the container path bypasses. So
+  policy-declared env does not currently reach the in-container agent; only the
+  operator-set `ContainerSubmitStrategy(env=...)` does. Closing this means
+  threading `agent_env` to `prepare_sandbox` (via `SandboxRequest`) so the
+  container is started with it — a follow-on, not in G5.
 
 ## Network model (G6) — honest teeth
 

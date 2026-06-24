@@ -37,6 +37,7 @@ from flywheel_orchestrator import (
 
 from flywheel_container import _docker
 from flywheel_container._docker import DEFAULT_WORKDIR, ExecResult, VolumeMount
+from flywheel_container._network import DEFAULT_INTERNAL_NETWORK, resolve_network
 from flywheel_container._stream import iteration_result_from_stream, parse_stream_json
 
 
@@ -73,6 +74,7 @@ class ContainerRuntime:
     register_cleanup: Callable[[str], Callable[[], None]] = (
         _docker.register_container_cleanup
     )
+    ensure_internal_network: Callable[[str], None] = _docker.ensure_internal_network
 
 
 class ContainerSubmitStrategy:
@@ -92,6 +94,10 @@ class ContainerSubmitStrategy:
         container_uid: int | None = None,
         container_gid: int | None = None,
         network: str | Sequence[str] | None = None,
+        network_policy: str | None = None,
+        allow_hosts: Sequence[str] = (),
+        egress_network: str | None = None,
+        internal_network: str = DEFAULT_INTERNAL_NETWORK,
         mounts: Sequence[VolumeMount] = (),
         env: Mapping[str, str] | None = None,
         cpus: float | None = None,
@@ -105,6 +111,10 @@ class ContainerSubmitStrategy:
         self._uid = container_uid if container_uid is not None else os.getuid()
         self._gid = container_gid if container_gid is not None else os.getgid()
         self._network = network
+        self._network_policy = network_policy
+        self._allow_hosts = tuple(allow_hosts)
+        self._egress_network = egress_network
+        self._internal_network = internal_network
         self._user_mounts = tuple(mounts)
         self._env = dict(env or {})
         self._cpus = cpus
@@ -136,7 +146,7 @@ class ContainerSubmitStrategy:
             mounts=mounts,
             workdir=self._workdir,
             user=f"{self._uid}:{self._gid}",
-            network=self._network,
+            network=self._resolve_network(),
             cpus=self._cpus,
         )
         unregister = self._runtime.register_cleanup(name)
@@ -153,6 +163,21 @@ class ContainerSubmitStrategy:
             invoke_wrapper=self._make_invoke_wrapper(name),
             teardown=_teardown,
         )
+
+    def _resolve_network(self) -> str | Sequence[str] | None:
+        """The container's ``--network``: ``[sandbox.network]`` policy when
+        configured (G6), otherwise the raw ``network`` override."""
+        if self._network_policy is None:
+            return self._network
+        resolved = resolve_network(
+            policy=self._network_policy,
+            allow_hosts=self._allow_hosts,
+            egress_network=self._egress_network,
+            internal_network=self._internal_network,
+        )
+        if resolved.ensure_internal and resolved.name is not None:
+            self._runtime.ensure_internal_network(resolved.name)
+        return resolved.name
 
     def submit(self, request: SubmitRequest) -> None:
         # Landing is host-side and backend-agnostic: the worktree the inner

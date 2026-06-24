@@ -323,6 +323,29 @@ def exec_in_container(
     )
 
 
+def network_exists(name: str) -> bool:
+    """Whether a Docker network named ``name`` exists."""
+    try:
+        _run_docker(["docker", "network", "inspect", name, "--format", "{{.Id}}"])
+        return True
+    except DockerError:
+        return False
+
+
+def ensure_internal_network(name: str) -> None:
+    """Create ``name`` as a Docker ``--internal`` network if absent (idempotent).
+
+    Internal networks have no external connectivity — Docker provisions no
+    gateway — so a container attached to one cannot egress. This is the real
+    enforcement for ``[sandbox.network] policy = "deny"`` with no ``allow_hosts``
+    (spec 00044 G6); fine-grained ``allow_hosts`` is delegated to an
+    operator-provisioned egress-proxy network instead.
+    """
+    if network_exists(name):
+        return
+    _run_docker(["docker", "network", "create", "--internal", name])
+
+
 def remove_container(name: str) -> None:
     """Stop and remove a container, best-effort (ignores 'not found')."""
     for sub in (["docker", "stop", name], ["docker", "rm", name]):

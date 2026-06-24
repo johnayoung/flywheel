@@ -100,11 +100,13 @@ from flywheel_orchestrator._sources import (
 )
 from flywheel_orchestrator._store_factory import open_sqlite_bound_store
 from flywheel_orchestrator._strategy import (
+    SandboxHandle,
     SandboxProvider,
     SandboxRequest,
     SubmitRequest,
     SubmitStrategy,
     Submitter,
+    _as_handle,
 )
 from flywheel_orchestrator._workflow import (
     TaskState,
@@ -473,6 +475,40 @@ def _sandbox_limit_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     )
 
 
+def _apply_handle(
+    handle: SandboxHandle,
+    sandbox_primitives: dict[str, Any],
+    invoke: InvokeFunc | None,
+) -> tuple[dict[str, Any], InvokeFunc | None]:
+    """Fold a :class:`SandboxHandle`'s contributions into the per-run drive
+    arguments (spec 00043, increment F of 00036).
+
+    Returns the effective ``sandbox_primitives`` (with ``env_contribution``
+    merged onto the policy-resolved ``agent_env``, the handle winning on key
+    collision) and the effective invoker (wrapped by ``invoke_wrapper`` when
+    set, so a container backend runs the agent inside the sandbox). An
+    empty-contribution handle — every worktree backend, via :func:`_as_handle`
+    — returns the inputs unchanged, keeping the drive byte-identical.
+    """
+    if not handle.env_contribution and handle.invoke_wrapper is None:
+        return sandbox_primitives, invoke
+    effective = dict(sandbox_primitives)
+    if handle.env_contribution:
+        effective["agent_env"] = {
+            **sandbox_primitives["agent_env"],
+            **handle.env_contribution,
+        }
+    effective_invoke = invoke
+    if handle.invoke_wrapper is not None:
+        if invoke is None:
+            raise ValueError(
+                "SandboxHandle.invoke_wrapper requires a base invoke; "
+                "orchestrate was given none"
+            )
+        effective_invoke = handle.invoke_wrapper(invoke)
+    return effective, effective_invoke
+
+
 async def orchestrate(
     *,
     tasks_dir: Path | None = None,
@@ -571,18 +607,26 @@ async def orchestrate(
         row: TaskStatusRow,
         run_id: str | None,
         mode: Literal["fresh", "resume"],
-    ) -> Path:
-        """The directory a task runs in: consumer-provisioned or the default
-        ``sandbox_root/<task-id>``."""
+    ) -> SandboxHandle:
+        """The sandbox a task runs in: consumer-provisioned or the default
+        ``sandbox_root/<task-id>``.
+
+        Always returns a :class:`SandboxHandle`; a provider returning a bare
+        ``Path`` (every worktree backend) is adapted to an empty-contribution
+        handle (spec 00043), so the handle-aware drive path is byte-identical
+        for it.
+        """
         if prepare_sandbox is None:
-            return sandbox_root / row.task.id
-        return prepare_sandbox(
-            SandboxRequest(
-                task_id=row.task.id,
-                task_file=row.task_file,
-                run_id=run_id,
-                mode=mode,
-                source_ref=row.source_ref,
+            return SandboxHandle(path=sandbox_root / row.task.id)
+        return _as_handle(
+            prepare_sandbox(
+                SandboxRequest(
+                    task_id=row.task.id,
+                    task_file=row.task_file,
+                    run_id=run_id,
+                    mode=mode,
+                    source_ref=row.source_ref,
+                )
             )
         )
 
@@ -664,7 +708,7 @@ async def orchestrate(
                     # session (it never starves peers) rather than unwinding
                     # the worker; the finally releases the claim.
                     try:
-                        sandbox = resolve_sandbox(row, run_id, "resume")
+                        handle = resolve_sandbox(row, run_id, "resume")
                     except Exception as exc:  # noqa: BLE001 - consumer code
                         attempted_resume.add(run_id)
                         if stream is not None:
@@ -676,6 +720,10 @@ async def orchestrate(
                                 flush=True,
                             )
                         continue
+                    sandbox = handle.path
+                    drive_primitives, drive_invoke = _apply_handle(
+                        handle, sandbox_primitives, invoke
+                    )
                     try:
                         outcome = recheck_blocked_lifecycle(
                             control,
@@ -703,11 +751,11 @@ async def orchestrate(
                         worker_id=wid,
                         lease_seconds=lease_seconds,
                         heartbeat_interval=heartbeat_interval,
-                        invoke=invoke,
+                        invoke=drive_invoke,
                         model=model,
                         max_turns=max_turns,
                         max_retries=max_retries,
-                        **sandbox_primitives,
+                        **drive_primitives,
                         **limit_primitives,
                         stream=stream,
                         now=clock,
@@ -834,7 +882,7 @@ async def orchestrate(
                 )
                 select_mode = "resume" if resume_run_id is not None else "fresh"
                 try:
-                    sandbox = resolve_sandbox(pick, resume_run_id, select_mode)
+                    handle = resolve_sandbox(pick, resume_run_id, select_mode)
                 except Exception as exc:  # noqa: BLE001 - consumer code
                     # A failing provider skips this task for the session
                     # (already in attempted_fresh) and keeps draining the
@@ -848,6 +896,10 @@ async def orchestrate(
                             flush=True,
                         )
                     continue
+                sandbox = handle.path
+                drive_primitives, drive_invoke = _apply_handle(
+                    handle, sandbox_primitives, invoke
+                )
                 record = await _drive_or_relinquish(
                     control,
                     claims,
@@ -861,11 +913,11 @@ async def orchestrate(
                     worker_id=wid,
                     lease_seconds=lease_seconds,
                     heartbeat_interval=heartbeat_interval,
-                    invoke=invoke,
+                    invoke=drive_invoke,
                     model=model,
                     max_turns=max_turns,
                     max_retries=max_retries,
-                    **sandbox_primitives,
+                    **drive_primitives,
                     **limit_primitives,
                     stream=stream,
                     now=clock,

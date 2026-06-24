@@ -25,10 +25,12 @@ policy (merge to base, open a PR, emit a patch), passed to
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal, Protocol, runtime_checkable
 
+from flywheel_core import InvokeFunc
 from flywheel_core.lifecycle import Status
 from flywheel_core.task import Task
 
@@ -89,12 +91,54 @@ class SubmitRequest:
     receipts: tuple[GraderReceipt, ...] = ()
 
 
+@dataclass(frozen=True, kw_only=True)
+class SandboxHandle:
+    """A provisioned sandbox plus how a run should attach to it.
+
+    The richer return shape of a :data:`SandboxProvider` (spec 00043,
+    increment F of 00036). The git-worktree backend provisions a plain
+    directory and needs only ``path``, so a provider may still return a bare
+    ``Path`` — the orchestrator adapts it via :func:`_as_handle` to
+    ``SandboxHandle(path=...)`` with empty contributions, byte-identical to
+    the pre-handle behavior. A non-worktree backend (e.g. a container)
+    populates the optional fields so the orchestrator runs the agent *inside*
+    the provisioned environment:
+
+    * ``env_contribution`` — extra environment merged onto the policy-resolved
+      ``[sandbox.env]`` agent env (the handle wins on key collision), for env
+      a backend must inject (a container's ``PATH``, a forwarded socket).
+    * ``invoke_wrapper`` — wraps the run's :data:`~flywheel_core.InvokeFunc`
+      so the agent iteration executes in the backend (e.g. ``docker exec``
+      into the container) instead of the worker process. ``None`` runs
+      in-process exactly as today.
+
+    Frozen and kw-only, mirroring :class:`SandboxRequest`/:class:`SubmitRequest`.
+    """
+
+    path: Path
+    env_contribution: Mapping[str, str] = field(default_factory=dict)
+    invoke_wrapper: Callable[[InvokeFunc], InvokeFunc] | None = None
+
+
+def _as_handle(result: Path | SandboxHandle) -> SandboxHandle:
+    """Adapt a provider return to a :class:`SandboxHandle`.
+
+    Back-compat seam: a provider that returns a bare ``Path`` (every shipped
+    worktree provider) becomes a handle with empty contributions, so the
+    orchestrator's handle-aware path stays byte-identical for it.
+    """
+    if isinstance(result, SandboxHandle):
+        return result
+    return SandboxHandle(path=result)
+
+
 # A consumer maps a SandboxRequest to the directory the task runs in (default:
-# ``sandbox_root/<task-id>``), and is handed a SubmitRequest after each run
-# finalizes — while the lease is still held — to merge or park. ``submit`` MUST
-# NOT raise: it records its own park/merge outcome and swallows git errors, so
-# a submit failure never unwinds the orchestrator and abandons peer tasks.
-SandboxProvider = Callable[[SandboxRequest], Path]
+# ``sandbox_root/<task-id>``) — or a :class:`SandboxHandle` describing it — and
+# is handed a SubmitRequest after each run finalizes — while the lease is still
+# held — to merge or park. ``submit`` MUST NOT raise: it records its own
+# park/merge outcome and swallows git errors, so a submit failure never unwinds
+# the orchestrator and abandons peer tasks.
+SandboxProvider = Callable[[SandboxRequest], "Path | SandboxHandle"]
 Submitter = Callable[[SubmitRequest], None]
 
 
@@ -106,10 +150,14 @@ class SubmitStrategy(Protocol):
     methods satisfies it — no registration, no base class. The two methods
     carry the same contracts as the standalone callables above
     (``prepare_sandbox`` may raise to skip the task; ``submit`` must not
-    raise). Pass one to ``orchestrate(strategy=...)`` instead of wiring the
-    callables individually.
+    raise). ``prepare_sandbox`` may return either a bare ``Path`` (the
+    worktree backend) or a :class:`SandboxHandle` (a container backend); the
+    orchestrator adapts a ``Path`` to a handle. Pass one to
+    ``orchestrate(strategy=...)`` instead of wiring the callables individually.
     """
 
-    def prepare_sandbox(self, request: SandboxRequest, /) -> Path: ...
+    def prepare_sandbox(
+        self, request: SandboxRequest, /
+    ) -> Path | SandboxHandle: ...
 
     def submit(self, request: SubmitRequest, /) -> None: ...

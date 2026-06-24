@@ -28,6 +28,7 @@ from flywheel_orchestrator._orchestrate import (
     reconcile_live_runs,
 )
 from flywheel_orchestrator._strategy import (
+    SandboxHandle,
     SandboxProvider,
     SandboxRequest,
     SubmitRequest,
@@ -151,6 +152,7 @@ __all__ = [
     "PG_DSN_ENV",
     "PG_DSN_FALLBACK_ENV",
     "RunRecord",
+    "SandboxHandle",
     "SandboxProvider",
     "SandboxRequest",
     "SubmitRequest",

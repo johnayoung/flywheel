@@ -29,6 +29,11 @@ from flywheel_container._docker import (
     remove_container,
     start_container,
 )
+from flywheel_container._auth import (
+    API_KEY_ENV,
+    OAUTH_TOKEN_ENV,
+    ClaudeAuth,
+)
 from flywheel_container._network import (
     DEFAULT_INTERNAL_NETWORK,
     ResolvedNetwork,
@@ -46,11 +51,14 @@ from flywheel_container._submit import (
 )
 
 __all__ = [
+    "API_KEY_ENV",
+    "ClaudeAuth",
     "ClaudeCliAgent",
     "ContainerRuntime",
     "ContainerSubmitStrategy",
     "DEFAULT_AGENT_HOME",
     "DEFAULT_INTERNAL_NETWORK",
+    "OAUTH_TOKEN_ENV",
     "DEFAULT_MAX_TAIL_CHARS",
     "DEFAULT_WORKDIR",
     "DockerError",

@@ -137,9 +137,14 @@ operator egress network attached.
 A `.flywheel/Dockerfile` template (init scaffolds it):
 `FROM <base>`; install git + the agent CLI; `ARG AGENT_UID/GID` defaulted to the
 host user; `USER`; `ENTRYPOINT ["sleep","infinity"]`; worktree bind-mounted at a
-fixed workdir. Agent auth (`ANTHROPIC_API_KEY`, …) is injected as `-e` env at
-`docker run` — sourced from `[sandbox.env]` resolution (increment C), not baked
-into the image.
+fixed workdir.
+
+Agent auth is a first-class knob — `ContainerSubmitStrategy(auth=ClaudeAuth.…)`:
+`oauth_token` (a `claude setup-token` subscription token → `CLAUDE_CODE_OAUTH_TOKEN`
+env; the recommended container path, no API key), `session` (bind-mount the
+host's `~/.claude` login, read-write for refresh), or `api_key`. Subscription
+modes refuse to coexist with an `ANTHROPIC_API_KEY` in the container env (the CLI
+prefers the key and would ignore the session). Never baked into the image.
 
 ## Success criteria (each → grader; tier noted)
 

@@ -36,6 +36,7 @@ from flywheel_orchestrator import (
 )
 
 from flywheel_container import _docker
+from flywheel_container._auth import ClaudeAuth
 from flywheel_container._docker import DEFAULT_WORKDIR, ExecResult, VolumeMount
 from flywheel_container._network import DEFAULT_INTERNAL_NETWORK, resolve_network
 from flywheel_container._stream import iteration_result_from_stream, parse_stream_json
@@ -100,6 +101,7 @@ class ContainerSubmitStrategy:
         internal_network: str = DEFAULT_INTERNAL_NETWORK,
         mounts: Sequence[VolumeMount] = (),
         env: Mapping[str, str] | None = None,
+        auth: ClaudeAuth | None = None,
         cpus: float | None = None,
         workdir: str = DEFAULT_WORKDIR,
         exec_timeout: float | None = None,
@@ -118,6 +120,13 @@ class ContainerSubmitStrategy:
         self._internal_network = internal_network
         self._user_mounts = tuple(mounts)
         self._env = dict(env or {})
+        if auth is not None:
+            # Auth env/mounts are validated against the operator-supplied env
+            # (e.g. a subscription mode rejects a stray ANTHROPIC_API_KEY) and
+            # then folded in, so the container starts already authenticated.
+            auth_env, auth_mounts = auth.resolve(self._env)
+            self._env.update(auth_env)
+            self._user_mounts = (*self._user_mounts, *auth_mounts)
         self._cpus = cpus
         self._workdir = workdir
         self._exec_timeout = exec_timeout

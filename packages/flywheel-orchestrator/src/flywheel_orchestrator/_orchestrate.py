@@ -101,6 +101,7 @@ from flywheel_orchestrator._sources import (
     WorkSource,
 )
 from flywheel_orchestrator._store_factory import open_sqlite_bound_store
+from flywheel_orchestrator._work_graph import WorkGraph, WorkGraphBuilder
 from flywheel_orchestrator._strategy import (
     SandboxHandle,
     SandboxProvider,
@@ -114,7 +115,6 @@ from flywheel_orchestrator._workflow import (
     TaskState,
     TaskStatusRow,
     _latest_lifecycle_row,
-    select_next_task,
     status_rows_for_items,
 )
 
@@ -228,7 +228,16 @@ async def _source_reconcile_loop(
     while True:
         await asyncio.sleep(interval)
         try:
-            wanted = frozenset(item.task.id for item in source.list_work())
+            # Consume the validated graph: aggregate + validate the source's
+            # items, then take the wanted ids from the built graph rather than
+            # from a raw list_work(). A structural defect (duplicate id,
+            # self-dependency, cycle) or a listing failure raises here and is
+            # contained by the except below -- the tick is skipped and nothing
+            # is interrupted, exactly the posture a bare list_work() failure
+            # already had (a tracker hiccup is never read as "all work
+            # vanished").
+            graph = WorkGraphBuilder.build(source).graph
+            wanted = frozenset(item.task.id for item in graph.items)
         except Exception as exc:  # noqa: BLE001 - adapter code
             if stream is not None:
                 print(
@@ -730,7 +739,18 @@ async def orchestrate(
         attempted_approve: set[str] = set()
 
         while True:
-            rows = status_rows_for_items(source.list_work(), control)
+            items = list(source.list_work())
+            rows = status_rows_for_items(items, control)
+            # Build (and structurally validate) the WorkGraph from the same
+            # items the rows derive from -- one list_work() pass feeds both.
+            # Fresh selection below reads runnable tasks from this validated
+            # graph instead of resolving prerequisite edges ad hoc. A
+            # structural defect (duplicate id, self-dependency, cycle) raises
+            # here, before any task dispatches; a missing prerequisite is a
+            # recorded issue and keeps its task ineligible / out of the ready
+            # set exactly as today (spec 00047, decision D-1).
+            graph = WorkGraph.build(items).graph
+            states: dict[str, TaskState] = {r.task.id: r.state for r in rows}
             task_by_id: dict[str, Task] = {r.task.id: r.task for r in rows}
             row_by_id: dict[str, TaskStatusRow] = {
                 r.task.id: r for r in rows
@@ -896,7 +916,19 @@ async def orchestrate(
             ran_fresh = False
             while True:
                 exclude = attempted_fresh | blocked_ids | held
-                pick = select_next_task(rows, exclude_ids=frozenset(exclude))
+                # First-eligible-in-walk-order over the validated graph:
+                # ready_set returns every runnable item (own state eligible,
+                # all prerequisites DONE, id not excluded) in construction
+                # (walk) order, so taking the first preserves
+                # select_next_task's deterministic selection byte-for-byte
+                # while sourcing eligibility from the validated graph. An
+                # excluded id drops from candidacy but still satisfies a
+                # dependent's prerequisite (ready_set grades prerequisites off
+                # ``states``, not ``excluded``), matching exclude_ids
+                # semantics. A dangling prerequisite keeps its task out of the
+                # ready set -- it never runs -- exactly as before.
+                ready = graph.ready_set(states, excluded=exclude)
+                pick = row_by_id[ready[0].task.id] if ready else None
                 if pick is None:
                     break
                 # Schedule-time static-validation gate (spec 00034): refuse to

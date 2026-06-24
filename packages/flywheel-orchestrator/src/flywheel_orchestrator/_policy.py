@@ -101,6 +101,8 @@ _DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
 
 _STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
+_EXECUTION_MODES: tuple[str, ...] = ("local", "distributed")
+
 
 class PolicyError(ValueError):
     """Raised when a policy file is missing, unparseable, or invalid.
@@ -292,7 +294,12 @@ class WorkPolicy:
     path gate).
     ``submit_strategy``/``submit_remote``/``submit_pr_base``/``submit_base``
     mirror the rest of the optional ``[submit]`` table; an absent table
-    means the historical merge landing. ``submit_base`` is the explicit
+    means the historical merge landing. ``execution_mode`` mirrors the
+    optional ``[execution] mode`` key (``"local"`` default, or
+    ``"distributed"``); it is a pure load-time validation assertion that
+    gates no runtime scheduling/claim/lease behavior, so an absent
+    ``[execution]`` table resolves to ``local`` with no behavior change.
+    ``submit_base`` is the explicit
     landing/phase-base branch; ``None`` falls back to the checked-out
     branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
     mirrors the optional ``[sandbox] setup`` command; ``None`` when unset
@@ -313,6 +320,7 @@ class WorkPolicy:
     model: str | None = None
     store_backend: str = "sqlite"
     store_schema: str | None = None
+    execution_mode: str = "local"
     protected_paths: tuple[str, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
@@ -371,6 +379,17 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [store] must be a table")
     store_backend, store_schema = _optional_store(store, policy_file=path)
 
+    execution = data.get("execution") or {}
+    if not isinstance(execution, dict):
+        raise PolicyError(f"{path}: [execution] must be a table")
+    execution_mode = _optional_execution_mode(execution, policy_file=path)
+    if execution_mode == "distributed" and store_backend != "postgres":
+        raise PolicyError(
+            f"{path}: execution.mode = 'distributed' requires "
+            f"store.backend = 'postgres', got store.backend = "
+            f"{store_backend!r}"
+        )
+
     submit = data.get("submit") or {}
     if not isinstance(submit, dict):
         raise PolicyError(f"{path}: [submit] must be a table")
@@ -410,6 +429,7 @@ def load_policy(path: Path) -> WorkPolicy:
             model=model,
             store_backend=store_backend,
             store_schema=store_schema,
+            execution_mode=execution_mode,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -447,6 +467,7 @@ def load_policy(path: Path) -> WorkPolicy:
         model=model,
         store_backend=store_backend,
         store_schema=store_schema,
+        execution_mode=execution_mode,
         protected_paths=protected_paths,
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
@@ -518,6 +539,28 @@ def _optional_store(
             f"{policy_file}: store.schema must be a non-empty string"
         )
     return backend, schema
+
+
+def _optional_execution_mode(
+    table: dict, *, policy_file: Path
+) -> str:
+    """Validate and return the optional ``[execution] mode`` value.
+
+    Returns ``"local"`` when the section (or the ``mode`` key) is absent so
+    every pre-existing policy file keeps loading unchanged. A present-but-
+    unrecognized mode raises :class:`PolicyError` naming ``execution.mode``
+    and the offending value, mirroring the strict-validate convention of
+    ``store.backend``/``source.kind`` so a typo never silently coerces to
+    ``local``. Unknown *keys* under ``[execution]`` are ignored
+    (forward-compat), matching the ``_optional_*`` pattern.
+    """
+    mode = table.get("mode", "local")
+    if mode not in _EXECUTION_MODES:
+        raise PolicyError(
+            f"{policy_file}: execution.mode must be one of "
+            f"{_EXECUTION_MODES}, got {mode!r}"
+        )
+    return mode
 
 
 def _optional_protected_paths(

@@ -37,7 +37,12 @@ from flywheel_orchestrator import (
 
 from flywheel_container import _docker
 from flywheel_container._auth import ClaudeAuth
-from flywheel_container._docker import DEFAULT_WORKDIR, ExecResult, VolumeMount
+from flywheel_container._docker import (
+    DEFAULT_AGENT_HOME,
+    DEFAULT_WORKDIR,
+    ExecResult,
+    VolumeMount,
+)
 from flywheel_container._network import DEFAULT_INTERNAL_NETWORK, resolve_network
 from flywheel_container._stream import iteration_result_from_stream, parse_stream_json
 
@@ -50,13 +55,23 @@ class ClaudeCliAgent:
     G4 adapter parses; the prompt is delivered on stdin (``-p -``) to dodge the
     Linux per-arg ``ARG_MAX`` limit. The model is deployment config — the host
     SDK invoker is bypassed entirely, so it cannot be inferred from there.
+
+    ``dangerously_skip_permissions`` defaults ``True`` (mirroring the SDK path's
+    ``permission_mode="bypassPermissions"``): a headless ``--print`` run has no
+    TTY to approve tool use, so without it the CLI blocks forever the first time
+    the agent writes a file or runs a command.
     """
 
     model: str
+    dangerously_skip_permissions: bool = True
     extra_flags: tuple[str, ...] = ()
 
     def build_command(self, prompt: str) -> tuple[str, str]:
-        flags = "".join(f" {flag}" for flag in self.extra_flags)
+        parts: list[str] = []
+        if self.dangerously_skip_permissions:
+            parts.append("--dangerously-skip-permissions")
+        parts.extend(self.extra_flags)
+        flags = "".join(f" {flag}" for flag in parts)
         command = (
             "claude --print --verbose --output-format stream-json "
             f"--model {shlex.quote(self.model)}{flags} -p -"
@@ -120,6 +135,11 @@ class ContainerSubmitStrategy:
         self._internal_network = internal_network
         self._user_mounts = tuple(mounts)
         self._env = dict(env or {})
+        # The agent CLI resolves its config/cache/credentials under $HOME
+        # (~/.claude). A `docker run --user <uid>` numeric override leaves HOME
+        # unset (or "/"), which the agent cannot write to — it stalls or fails.
+        # Always point HOME at the agent home unless the operator set it.
+        self._env.setdefault("HOME", DEFAULT_AGENT_HOME)
         if auth is not None:
             # Auth env/mounts are validated against the operator-supplied env
             # (e.g. a subscription mode rejects a stray ANTHROPIC_API_KEY) and

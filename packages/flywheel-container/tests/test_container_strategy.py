@@ -99,11 +99,20 @@ def _strategy(inner, rec, *, exit_code=0):
 
 def test_claude_cli_agent_build_command() -> None:
     cmd, stdin = ClaudeCliAgent(model="claude-opus-4-8").build_command("the prompt")
+    # --dangerously-skip-permissions is on by default (headless has no TTY to
+    # approve tool use).
     assert cmd == (
         "claude --print --verbose --output-format stream-json "
-        "--model claude-opus-4-8 -p -"
+        "--model claude-opus-4-8 --dangerously-skip-permissions -p -"
     )
     assert stdin == "the prompt"
+
+
+def test_claude_cli_agent_can_disable_skip_permissions() -> None:
+    cmd, _ = ClaudeCliAgent(
+        model="m", dangerously_skip_permissions=False
+    ).build_command("p")
+    assert "--dangerously-skip-permissions" not in cmd
 
 
 def test_prepare_bind_mounts_worktree_and_returns_handle(tmp_path: Path) -> None:
@@ -123,6 +132,30 @@ def test_prepare_bind_mounts_worktree_and_returns_handle(tmp_path: Path) -> None
     mount = start["mounts"][0]
     assert mount.host_path == str(worktree)
     assert mount.sandbox_path.endswith("/workspace")
+
+
+def test_container_always_gets_home_env(tmp_path: Path) -> None:
+    # A numeric --user leaves HOME unset; the agent CLI needs it for ~/.claude.
+    rec = _RuntimeRecorder()
+    _strategy(_FakeInner(tmp_path), rec).prepare_sandbox(_request())
+    from flywheel_container import DEFAULT_AGENT_HOME
+
+    assert rec.start_calls[0]["env"]["HOME"] == DEFAULT_AGENT_HOME
+
+
+def test_operator_home_override_is_respected(tmp_path: Path) -> None:
+    rec = _RuntimeRecorder()
+    ContainerSubmitStrategy(
+        _FakeInner(tmp_path),
+        image="img",
+        agent=ClaudeCliAgent(model="m"),
+        env={"HOME": "/custom/home"},
+        container_uid=1000,
+        container_gid=1000,
+        preflight=False,
+        runtime=rec.as_runtime(),
+    ).prepare_sandbox(_request())
+    assert rec.start_calls[0]["env"]["HOME"] == "/custom/home"
 
 
 def test_teardown_removes_container_and_unregisters(tmp_path: Path) -> None:

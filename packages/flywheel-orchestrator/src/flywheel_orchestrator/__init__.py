@@ -64,6 +64,13 @@ from flywheel_orchestrator._sources import (
     iter_active_task_files,
     load_active_tasks,
 )
+from flywheel_orchestrator._work_graph import (
+    GraphValidationIssue,
+    GraphValidationResult,
+    WorkGraph,
+    WorkGraphBuilder,
+    WorkGraphValidationError,
+)
 from flywheel_orchestrator._history import (
     TERMINAL_STATUSES,
     AttemptSummary,
@@ -137,6 +144,8 @@ __all__ = [
     "GhRunner",
     "GithubWorkSource",
     "GraderReceipt",
+    "GraphValidationIssue",
+    "GraphValidationResult",
     "InMemoryClaimStore",
     "PolicyError",
     "PostgresClaimStore",
@@ -164,6 +173,9 @@ __all__ = [
     "Submitter",
     "TaskState",
     "TaskStatusRow",
+    "WorkGraph",
+    "WorkGraphBuilder",
+    "WorkGraphValidationError",
     "WorkItem",
     "WorkItemRecord",
     "WorkPolicy",

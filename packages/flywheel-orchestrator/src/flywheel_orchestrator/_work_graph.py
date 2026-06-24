@@ -36,7 +36,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from flywheel_orchestrator._sources import WorkItem
+from flywheel_orchestrator._sources import WorkItem, WorkSource
 
 # Eligibility mirrors ``TaskState`` (see ``_workflow.TaskState`` ~110-118)
 # without importing it, keeping this graph-model module decoupled from the
@@ -292,6 +292,73 @@ class WorkGraph:
         return tuple(runnable)
 
 
+class WorkGraphBuilder:
+    """Aggregates ``list_work()`` across sources into one validated graph.
+
+    The builder is the multi-source seam: it asks each :class:`WorkSource`
+    for its current items, concatenates them into a single combined set, and
+    only THEN hands that set to :meth:`WorkGraph.build`. Validation over the
+    aggregate — never per source — is the load-bearing property (spec 00047,
+    decision D-1): a prerequisite declared by an item from one source and
+    satisfied by an item from another resolves as a real edge, while a
+    reference unresolved in *every* source becomes a non-fatal
+    :class:`GraphValidationIssue` rather than aborting the build. Structural
+    corruption in the combined set (a duplicate id whose two members come from
+    different sources, a self-dependency, a cycle) still raises
+    :class:`WorkGraphValidationError`, exactly as constructing the model
+    directly would.
+
+    The builder depends only on the ``list_work()`` protocol, so it is
+    source-kind agnostic: a :class:`DirectoryWorkSource`, a
+    ``GithubWorkSource``, or any future adapter compose identically. A single
+    source is just the degenerate aggregation — its graph is identical in
+    edges and issues to building the model straight from that source's items.
+    """
+
+    @classmethod
+    def build(
+        cls,
+        *sources: WorkSource | Iterable[WorkSource],
+    ) -> GraphValidationResult:
+        """Aggregate every source's items, then build and validate the graph.
+
+        Accepts the sources either as positional arguments
+        (``build(source_a, source_b)``) or as a single iterable
+        (``build([source_a, source_b])``); both normalize to the same flat
+        sequence. Each source's :meth:`WorkSource.list_work` is called once,
+        in argument order, and the items are concatenated preserving that
+        order so selection ties still break deterministically. The combined
+        set is constructed through :meth:`WorkGraph.build`, which raises
+        :class:`WorkGraphValidationError` on structural corruption and records
+        missing-prerequisite :class:`GraphValidationIssue`\\ s otherwise.
+        """
+        items: list[WorkItem] = []
+        for source in _flatten_sources(sources):
+            items.extend(source.list_work())
+        return WorkGraph.build(items)
+
+
+def _flatten_sources(
+    sources: Iterable[WorkSource | Iterable[WorkSource]],
+) -> list[WorkSource]:
+    """Normalize varargs-or-single-iterable into a flat list of sources.
+
+    A value carrying ``list_work`` is itself a source; any other iterable is
+    a container of sources and is flattened one level. This lets callers pass
+    ``build(a, b)`` or ``build([a, b])`` interchangeably without changing the
+    aggregation semantics.
+    """
+    flat: list[WorkSource] = []
+    for entry in sources:
+        if hasattr(entry, "list_work"):
+            flat.append(entry)  # type: ignore[arg-type]
+        elif isinstance(entry, Iterable):
+            flat.extend(entry)
+        else:
+            flat.append(entry)  # type: ignore[arg-type]
+    return flat
+
+
 def _cycle_members(resolved: Mapping[str, tuple[str, ...]]) -> frozenset[str]:
     """Return every node id that participates in a directed cycle.
 
@@ -360,5 +427,6 @@ __all__ = [
     "GraphValidationIssue",
     "GraphValidationResult",
     "WorkGraph",
+    "WorkGraphBuilder",
     "WorkGraphValidationError",
 ]

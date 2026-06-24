@@ -26,6 +26,7 @@ testpaths = [
     "packages/flywheel-core/tests",
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
+    "packages/flywheel-container/tests",
     "packages/flywheel/tests",
 ]
 
@@ -36,6 +37,7 @@ members = ["packages/*"]
 flywheel-core = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
+flywheel-container = { workspace = true }
 flywheel = { workspace = true }
 
 [dependency-groups]
@@ -43,6 +45,7 @@ dev = [
     "flywheel-core[postgres,claude]",
     "flywheel-orchestrator",
     "flywheel-worktree",
+    "flywheel-container",
     "flywheel",
     "pytest>=9.0.3",
     "testcontainers>=4.0",

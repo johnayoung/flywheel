@@ -197,6 +197,26 @@ class SandboxRetention:
 
 
 @dataclass(frozen=True, kw_only=True)
+class SandboxContainer:
+    """``[sandbox.container]`` — container backend config (spec 00045).
+
+    Inert unless ``[sandbox] backend = "container"``, at which point ``image``
+    is required. ``auth`` declares a MODE and ``auth_env`` the env var NAME the
+    token is read from at run time — the value never lives in the policy file,
+    mirroring ``[sandbox.env]``. ``model`` falls back to the worker's resolved
+    agent model when empty. ``egress_network`` is the operator-provisioned
+    network for ``[sandbox.network]`` ``allow_hosts``.
+    """
+
+    image: str = ""
+    model: str = ""
+    auth: str = "oauth"
+    auth_env: str = ""
+    exec_timeout: int = 1800
+    egress_network: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
 class SandboxPolicy:
     """Resolved ``[sandbox.*]`` configuration: a preset baseline with sparse
     per-key repo overrides merged on top, frozen at load.
@@ -218,6 +238,7 @@ class SandboxPolicy:
     env: SandboxEnv = field(default_factory=SandboxEnv)
     limits: SandboxLimits = field(default_factory=SandboxLimits)
     retention: SandboxRetention = field(default_factory=SandboxRetention)
+    container: SandboxContainer = field(default_factory=SandboxContainer)
 
 
 # Named presets are code-owned frozen constants (factor V: build-time).
@@ -246,6 +267,7 @@ _SANDBOX_PRESETS: dict[str, SandboxPolicy] = {
 }
 
 _NETWORK_POLICIES: tuple[str, ...] = ("allow", "deny")
+_CONTAINER_AUTH_MODES: tuple[str, ...] = ("oauth", "session", "api_key", "none")
 _RETENTION_ON_DONE: tuple[str, ...] = ("destroy", "preserve")
 _RETENTION_ON_FAILURE: tuple[str, ...] = ("park", "destroy")
 
@@ -916,6 +938,42 @@ def _optional_sandbox_policy(
         ),
     )
 
+    container_tbl = _sandbox_subtable(
+        sandbox, "container", policy_file=policy_file, path="sandbox.container"
+    )
+    container = SandboxContainer(
+        image=_override_str(
+            container_tbl, "image", base.container.image,
+            path="sandbox.container.image", policy_file=policy_file,
+        ),
+        model=_override_str(
+            container_tbl, "model", base.container.model,
+            path="sandbox.container.model", policy_file=policy_file,
+        ),
+        auth=_override_str(
+            container_tbl, "auth", base.container.auth,
+            path="sandbox.container.auth", policy_file=policy_file,
+            choices=_CONTAINER_AUTH_MODES,
+        ),
+        auth_env=_override_str(
+            container_tbl, "auth_env", base.container.auth_env,
+            path="sandbox.container.auth_env", policy_file=policy_file,
+        ),
+        exec_timeout=_override_int(
+            container_tbl, "exec_timeout", base.container.exec_timeout,
+            path="sandbox.container.exec_timeout", policy_file=policy_file,
+        ),
+        egress_network=_override_str(
+            container_tbl, "egress_network", base.container.egress_network,
+            path="sandbox.container.egress_network", policy_file=policy_file,
+        ),
+    )
+    if backend == "container" and not container.image:
+        raise PolicyError(
+            f"{policy_file}: [sandbox.container] image is required when "
+            f"sandbox.backend = 'container'"
+        )
+
     return SandboxPolicy(
         preset=preset_name,
         backend=backend,
@@ -926,6 +984,7 @@ def _optional_sandbox_policy(
         env=sandbox_env,
         limits=limits,
         retention=retention,
+        container=container,
     )
 
 

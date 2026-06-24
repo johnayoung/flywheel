@@ -34,6 +34,7 @@ from flywheel_container._auth import (
     OAUTH_TOKEN_ENV,
     ClaudeAuth,
 )
+from flywheel_container._config import build_container_strategy, resolve_auth
 from flywheel_container._network import (
     DEFAULT_INTERNAL_NETWORK,
     ResolvedNetwork,
@@ -66,6 +67,7 @@ __all__ = [
     "ResolvedNetwork",
     "StreamOutcome",
     "VolumeMount",
+    "build_container_strategy",
     "build_exec_argv",
     "build_run_argv",
     "check_image_uid",
@@ -78,6 +80,7 @@ __all__ = [
     "parse_stream_json",
     "register_container_cleanup",
     "remove_container",
+    "resolve_auth",
     "resolve_network",
     "start_container",
 ]

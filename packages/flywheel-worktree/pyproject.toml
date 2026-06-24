@@ -13,6 +13,12 @@ dependencies = [
     "flywheel-orchestrator>=0.1.0",
 ]
 
+# The container backend ([sandbox] backend = "container", spec 00045) is an
+# optional extra: importing the worker never requires it (lazy import in
+# maybe_wrap_for_backend), so the worktree backend stays dependency-light.
+[project.optional-dependencies]
+container = ["flywheel-container>=0.1.0"]
+
 # Console script removed in the unified-CLI cutover: the worker is launched
 # through ``flywheel worker [--once]`` (the product shell delegates to
 # :func:`flywheel_worktree.worker.main` in-process) and remains runnable as

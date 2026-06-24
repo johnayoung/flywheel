@@ -49,6 +49,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from collections.abc import Mapping
 from typing import Callable, Iterator, Protocol, Sequence, TextIO
 
 from flywheel_core import (
@@ -65,6 +66,7 @@ from flywheel_orchestrator import (
     PolicyError,
     SandboxRequest,
     SubmitRequest,
+    SubmitStrategy,
     WorkPolicy,
     load_effective_policy,
     open_sqlite_bound_store,
@@ -1007,6 +1009,7 @@ def run_once(
     stream: TextIO | None = None,
     log: Logger | None = None,
     policy: WorkPolicy | None = None,
+    strategy: SubmitStrategy | None = None,
 ) -> OrchestratorReport:
     """One cycle: record phase bases, drain every eligible task to
     quiescence through the git-submit seam, archive completed phases.
@@ -1023,6 +1026,12 @@ def run_once(
     constructs (orchestrate's, the archive sweep's) through the
     orchestrator's store factory; ``None`` keeps the historical
     sqlite-on-``db_path`` behavior.
+
+    ``strategy`` is the submit strategy handed to ``orchestrate``; it defaults
+    to ``submitter`` (the git-worktree backend). The container backend
+    (spec 00045) passes a ``ContainerSubmitStrategy`` *wrapping* ``submitter``,
+    so the worker still drives worktree provisioning/landing through
+    ``submitter`` while the agent runs in a container.
     """
     log = log or submitter.log
     record_phase_bases(
@@ -1041,7 +1050,7 @@ def run_once(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             reconcile_seconds=reconcile_seconds,
-            strategy=submitter,
+            strategy=strategy if strategy is not None else submitter,
             stream=stream,
             repo_root=submitter.repo_root,
         )
@@ -1282,6 +1291,61 @@ def build_merge_submitter(
     )
 
 
+def maybe_wrap_for_backend(
+    submitter: GitWorktreeSubmitter,
+    policy: WorkPolicy | None,
+    *,
+    model: str | None,
+    env: Mapping[str, str],
+    log: Logger,
+) -> SubmitStrategy:
+    """Select the run's submit strategy from ``[sandbox] backend`` (spec 00045).
+
+    ``backend = "worktree"`` (default) returns ``submitter`` unchanged. ``backend
+    = "container"`` wraps it in a ``ContainerSubmitStrategy`` (lazy-imported, so
+    ``flywheel-container`` stays an optional extra) configured from
+    ``[sandbox.container]`` / ``[sandbox.network]``: the worktree backend still
+    provisions and lands; the agent runs in the container. A missing
+    ``flywheel-container`` is a clear install error.
+    """
+    sandbox = policy.sandbox if policy is not None else None
+    if sandbox is None or sandbox.backend != "container":
+        return submitter
+    try:
+        from flywheel_container import build_container_strategy, resolve_auth
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise RuntimeError(
+            "sandbox.backend = 'container' requires the flywheel-container "
+            "package. Install it (e.g. 'flywheel-worktree[container]') or use "
+            "the 'flywheel' product, which bundles it."
+        ) from exc
+    container = sandbox.container
+    resolved_model = container.model or model
+    if not resolved_model:
+        raise RuntimeError(
+            "sandbox.backend = 'container' needs an explicit model: set "
+            "[sandbox.container] model, [agent] model, or --model (the agent "
+            "CLI is invoked with --model and has no implicit default here)."
+        )
+    auth = resolve_auth(
+        container.auth, env=env, token_env=container.auth_env or None
+    )
+    log(
+        f"backend=container image={container.image} model={resolved_model} "
+        f"auth={container.auth} network={sandbox.network.policy}"
+    )
+    return build_container_strategy(
+        submitter,
+        image=container.image,
+        model=resolved_model,
+        exec_timeout=container.exec_timeout,
+        network_policy=sandbox.network.policy,
+        allow_hosts=sandbox.network.allow_hosts,
+        egress_network=container.egress_network or None,
+        auth=auth,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
@@ -1342,6 +1406,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         on_failure=on_failure,
         store=submit_store,
     )
+    # Select the run's submit strategy from [sandbox] backend: worktree
+    # (submitter unchanged) or container (wrap it) — spec 00045.
+    run_strategy = maybe_wrap_for_backend(
+        submitter, policy, model=model, env=os.environ, log=log
+    )
 
     log(f"started pid={os.getpid()} base={phase_base} db={db_path}")
     log(
@@ -1385,6 +1454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     stream=sys.stderr,
                     log=log,
                     policy=policy,
+                    strategy=run_strategy,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log(

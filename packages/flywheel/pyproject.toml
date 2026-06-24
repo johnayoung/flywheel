@@ -14,6 +14,9 @@ dependencies = [
     "flywheel-core[claude]>=0.1.0",
     "flywheel-orchestrator>=0.1.0",
     "flywheel-worktree>=0.1.0",
+    # The container backend ([sandbox] backend = "container") ships turnkey in
+    # the product so `flywheel worker` can run it from flywheel.toml alone.
+    "flywheel-container>=0.1.0",
     "textual>=0.85",
 ]
 

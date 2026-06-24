@@ -276,6 +276,7 @@ name = "flywheel"
 version = "0.1.0"
 source = { editable = "packages/flywheel" }
 dependencies = [
+    { name = "flywheel-container" },
     { name = "flywheel-core", extra = ["claude"] },
     { name = "flywheel-orchestrator" },
     { name = "flywheel-worktree" },
@@ -284,6 +285,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "flywheel-container", editable = "packages/flywheel-container" },
     { name = "flywheel-core", extras = ["claude"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
@@ -342,8 +344,17 @@ dependencies = [
     { name = "flywheel-orchestrator" },
 ]
 
+[package.optional-dependencies]
+container = [
+    { name = "flywheel-container" },
+]
+
 [package.metadata]
-requires-dist = [{ name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" }]
+requires-dist = [
+    { name = "flywheel-container", marker = "extra == 'container'", editable = "packages/flywheel-container" },
+    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
+]
+provides-extras = ["container"]
 
 [[package]]
 name = "h11"

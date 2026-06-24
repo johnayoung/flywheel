@@ -32,8 +32,16 @@ from flywheel_container._stream import (
     iteration_result_from_stream,
     parse_stream_json,
 )
+from flywheel_container._submit import (
+    ClaudeCliAgent,
+    ContainerRuntime,
+    ContainerSubmitStrategy,
+)
 
 __all__ = [
+    "ClaudeCliAgent",
+    "ContainerRuntime",
+    "ContainerSubmitStrategy",
     "DEFAULT_AGENT_HOME",
     "DEFAULT_MAX_TAIL_CHARS",
     "DEFAULT_WORKDIR",

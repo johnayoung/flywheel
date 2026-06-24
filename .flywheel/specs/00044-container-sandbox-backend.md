@@ -1,7 +1,9 @@
 # 00044 — Container sandbox backend (increment G of 00036)
 
-Status: IMPLEMENTED (G1–G6 shipped; SC-9 live end-to-end remains gated on a built
-image + agent auth — see Success criteria). Increment G of
+Status: IMPLEMENTED + LIVE-VERIFIED (G1–G6 shipped; SC-9 confirmed end-to-end on
+2026-06-24 — a real task ran agent-in-container to DONE via
+`examples/container/run_e2e.py`, authenticated with a Claude subscription
+session, no API key). Increment G of
 [00036](00036-sandbox-deploy-model.md): a new `flywheel-container` workspace
 package providing a `ContainerSubmitStrategy`
 that runs the task agent **inside a Docker container** against a bind-mounted
@@ -166,10 +168,13 @@ prefers the key and would ignore the session). Never baked into the image.
   worktree teardown is a no-op; a raising teardown does not unwind the worker.
 - **SC-8 (unit)** — `import flywheel_container` succeeds with `claude_agent_sdk`
   absent (SDK-free).
-- **SC-9 (live, gated — NOT default CI)** — E2E: a built image with the agent CLI
-  + valid auth runs a real task in-container and lands it. Requires image + auth;
-  shipped as a marked/manual test. **This is the only criterion not verifiable
-  without external prerequisites — stated explicitly so "G is done" is honest.**
+- **SC-9 (live — VERIFIED 2026-06-24)** — E2E: a built image with the agent CLI
+  + valid auth runs a real task in-container and lands it. Confirmed via
+  `examples/container/run_e2e.py` against a host Docker daemon with a Claude
+  subscription session (`CLAUDE_CODE_OAUTH_TOKEN`, no API key): a fresh run
+  reached `Status.DONE` with the agent's file written through the bind mount and
+  the container torn down. Requires image + auth, so it stays a marked/manual
+  test rather than default CI.
 
 ## Out of scope
 

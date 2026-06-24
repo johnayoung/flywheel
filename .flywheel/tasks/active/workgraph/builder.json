@@ -1,0 +1,37 @@
+{
+  "id": "workgraph-builder",
+  "goal": "WorkGraphBuilder.build() aggregates list_work() across one or more WorkSources into a single validated WorkGraph: a cross-source prerequisite resolves as a real edge, a reference unresolved in every source surfaces as a GraphValidationIssue without raising, and structural corruption still raises WorkGraphValidationError.",
+  "tags": ["workgraph", "spec-00047", "orchestrator"],
+  "prerequisites": ["workgraph-model"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "builder-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_source_registry.py", "name": "source-seam" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00047-workgraph-validation.md -- the acceptance criteria SC-12, SC-13 this task satisfies, and the D-1 missing-prereq decision",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkSource Protocol (list_work() is SYNC), DirectoryWorkSource, WorkItem; build() aggregates list_work() across the given sources",
+      "packages/flywheel-orchestrator/tests/test_work_graph.py -- the held-out oracle for this task; make it green, do not edit it"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- GithubWorkSource is the second concrete WorkSource; build() must be source-kind agnostic (depend only on the list_work() protocol)"
+    ],
+    "constraints": [
+      "Add WorkGraphBuilder.build() taking one or more WorkSources; it calls list_work() on each, aggregates all WorkItems, then constructs and validates the graph through the workgraph-model value (reuse it, do not reimplement validation).",
+      "Validation happens AFTER full aggregation: a prerequisite satisfied by an item from a DIFFERENT source resolves as a real edge (no issue), and only a reference unresolved in EVERY source becomes a GraphValidationIssue (D-1).",
+      "Structural corruption (duplicate id across the combined item set, self-dep, cycle) raises WorkGraphValidationError exactly as the model task defines, after aggregation.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not add any field to WorkItem and do not touch core flywheel_core.task.Task.",
+      "Do not change WorkSource.list_work() to async or alter its signature.",
+      "Do not wire the builder into the orchestrate scheduling loop here -- that is the workgraph-scheduler-integration task.",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle or in test_source_registry.py."
+    ],
+    "edge_cases": [
+      "A single DirectoryWorkSource (the common case) must build a graph identical in edges/issues to constructing the model directly from its WorkItems.",
+      "Two sources where source A's task depends on source B's task: the edge resolves and no issue names that pair.",
+      "A duplicate id where the two colliding items come from DIFFERENT sources must still raise (the collision is in the combined set)."
+    ]
+  }
+}

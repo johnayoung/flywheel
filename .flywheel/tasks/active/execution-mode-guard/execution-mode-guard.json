@@ -1,0 +1,41 @@
+{
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite-and-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py packages/flywheel-orchestrator/tests/test_store_factory.py packages/flywheel-orchestrator/tests/test_store_registry.py", "name": "store-and-policy-must-not-regress" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "purity" }
+  ],
+  "id": "execution-mode-guard",
+  "goal": "load_policy parses a new top-level [execution] mode (default local) onto WorkPolicy and raises a path-keyed PolicyError at load time when mode is distributed and store.backend is not postgres, while leaving all runtime scheduling/claim/lease behavior unchanged.",
+  "tags": ["execution-mode", "spec-00046", "config"],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00046-execution-mode-guard.md -- the acceptance criteria SC-1 through SC-8 this task satisfies, plus the Decisions Log (D-1..D-4) it must honor",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy, load_policy, _STORE_BACKENDS, and the existing _optional_* validators; add the [execution] mode field + parse + the cross-section guard here",
+      "packages/flywheel-orchestrator/tests/test_execution_mode.py -- the held-out oracle for this task; make it green, do not create or edit it (the grading harness owns it)",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- pre-existing policy suite that must stay green; its store/source assertions are unchanged"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py:971-975 -- mirror this cross-section fail-fast pattern (PolicyError keyed by policy_file, message naming both conditions) for the distributed+non-postgres guard",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _optional_store (~496) for the strict-validate / forward-compat (unknown keys ignored) validator shape to copy for [execution] mode"
+    ],
+    "constraints": [
+      "Default mode is local: a flywheel.toml with no [execution] table must resolve to local with no behavior change, so every existing config and test keeps passing.",
+      "The guard is the ONLY enforced effect of mode: it fires at load_policy time (after both mode and store.backend are resolved), raising PolicyError keyed by the policy file path and naming both the distributed mode and the store/backend. distributed+sqlite is the single rejected cell; local+sqlite, local+postgres, and distributed+postgres are all valid.",
+      "Strict-validate the mode value (an unrecognized mode raises a path-keyed PolicyError naming execution.mode and the value); ignore unknown KEYS under [execution], matching the _optional_* forward-compat convention.",
+      "Use PolicyError, not StoreConfigError, and do not add a new exception type; do not touch _store_factory.py or the store.backend default.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not wire mode into scheduling, claim acquisition, lease renewal, or any multi-worker coordination path -- those are already always-on and mode must not gate them (spec D-4).",
+      "Do not validate Postgres reachability, DSN presence, pooler mode, or privileges -- only the mode/backend pairing is checked here.",
+      "Do not add any [execution] key other than mode, and do not introduce a third mode value.",
+      "Do not modify, create, or weaken files under packages/flywheel-orchestrator/tests/ (including the held-out oracle test_execution_mode.py); do not delete or soften any existing store/policy assertion."
+    ],
+    "edge_cases": [
+      "An absent [execution] table resolves to mode=local (criterion #1).",
+      "distributed+postgres must succeed -- a blanket 'reject all distributed' implementation passes the distributed+sqlite rejection but fails this cell (criterion #4).",
+      "A present-but-unrecognized mode (e.g. 'cluster') fails fast with a path-keyed message naming execution.mode; it must NOT silently coerce to local (criterion #6).",
+      "An unknown key under [execution] (e.g. workers = 4) alongside a valid mode is ignored, not rejected (criterion #7)."
+    ]
+  }
+}

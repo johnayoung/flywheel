@@ -1,0 +1,40 @@
+{
+  "id": "workgraph-scheduler-integration",
+  "goal": "The orchestrator's scheduling and reconcile passes consume the validated WorkGraph while preserving select_next_task's deterministic first-eligible-in-walk-order selection, so the existing selection and orchestrator suites pass unchanged.",
+  "tags": ["workgraph", "spec-00047", "orchestrator", "integration"],
+  "prerequisites": ["workgraph-builder"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_orchestrator.py", "name": "selection-and-orchestrator-holdout" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "workgraph-oracle" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00047-workgraph-validation.md -- the acceptance criteria SC-14, SC-15 this task satisfies (verification-surface DoD)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- select_next_task (~284-330) MUST keep its first-eligible-in-walk-order semantics; status_rows_for_items (~247-274)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the scheduling loop (~674-936, consumes WorkItems at ~675) and the reconcile loop (~206-260, lists items at ~229); route selection through the validated graph here",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- the must-stay-green selection suite (test_select_next_picks_first_fresh_in_walk_order, test_select_next_respects_prerequisites, test_select_next_returns_none_when_prereq_missing, test_select_next_returns_none_when_all_done, test_select_next_spans_phases)",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- test_task_with_dangling_prerequisite_never_runs (dangling prereq yields report.runs == ())"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the existing multi-worker claim-fallback at ~839-933 is already shipped; do not re-implement it, only have its selection read from the validated graph"
+    ],
+    "constraints": [
+      "Selection over the validated graph must preserve select_next_task's exact deterministic first-eligible-in-walk-order behavior; a missing prerequisite must keep its task silently ineligible (it never runs) -- the dangling-prereq tests stay green unchanged (D-1).",
+      "A dangling prerequisite must NOT abort the scheduling pass: report.runs == () for the dangling-only case, exactly as today.",
+      "The single-DirectoryWorkSource path must behave identically to today (same order, same eligibility, same orchestrate outcomes).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify files under tests/; do not weaken, relax, skip, or delete any assertion in test_workflow.py or test_orchestrator.py -- those committed suites are the authoritative holdout.",
+      "Do not change select_next_task's first-eligible semantics or introduce priority/weighting (spec 00049, out of scope).",
+      "Do not add any field to WorkItem and do not touch core flywheel_core.task.Task.",
+      "Do not change the already-shipped claim-fallback control flow beyond pointing its selection at the validated graph."
+    ],
+    "edge_cases": [
+      "exclude_ids removes a task from candidacy but it must still satisfy a dependent's prerequisite (the DONE-dependency-still-promotes case in the existing loop).",
+      "A graph that surfaces a missing-prerequisite issue must still let every other eligible task schedule -- one dangling edge never starves peers.",
+      "Phases span correctly: a DONE task in an earlier phase promotes a dependent in a later phase (test_select_next_spans_phases)."
+    ]
+  }
+}

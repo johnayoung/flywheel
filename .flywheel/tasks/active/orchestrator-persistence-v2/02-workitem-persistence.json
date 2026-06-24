@@ -1,0 +1,42 @@
+{
+  "id": "workitem-persistence",
+  "goal": "The orchestrator store migrates additively to schema version 2 and persists observed work items and their dependency edges -- upserting items with first_seen_at/last_seen_at, clearing disappeared_at on re-observation, and marking absent items disappeared -- on both the SQLite and Postgres backends.",
+  "prerequisites": ["workitem-provenance"],
+  "tags": ["orchestrator", "spec-00048", "persistence", "migration"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite-unchanged" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00048-orchestrator-persistence-v2.md -- criteria #4, #5, #6, #9, #10 (work_items/work_item_dependencies parts) and decisions D-1, D-3, D-5",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the sibling store pattern: CURRENT_ORCH_SCHEMA_VERSION (bump 1 -> 2), the inline SQLite DDL _SCHEMA_SQL (~line 200), the bootstrap-on-open + sentinel + additive-forward-migration at _bootstrap (~line 244); add the new tables and persistence methods here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- the Postgres mirror: DDL in _bootstrap (~line 100, JSONB/TIMESTAMPTZ/BIGSERIAL), sentinel ON CONFLICT DO NOTHING; mirror the new tables and methods here",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py -- lines 162-199: the bootstrap version-sentinel + additive ALTER ... ADD COLUMN forward-migration to mirror",
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py -- lines 243-295: the same additive-migration pattern on Postgres to mirror",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- the closest sibling store test; keep it green and follow its both-backends parametrization style",
+      "conftest.py (repo root) -- session-scoped postgres_dsn fixture (testcontainers postgres:16-alpine) and require_postgres skip; use these so Postgres cases auto-skip without Docker"
+    ],
+    "constraints": [
+      "Bump CURRENT_ORCH_SCHEMA_VERSION 1 -> 2 and make the bootstrap an ADDITIVE forward-migration: on open, CREATE TABLE IF NOT EXISTS the new tables and converge the sentinel to 2 WITHOUT dropping or recreating task_claims and without erroring on a pre-existing v1 store (criterion #9).",
+      "work_items columns: task_id (PK), source_kind, source_ref, source_url, source_version, task_content_hash, priority INT default 0, required_capabilities_json default '[]', conflict_keys_json default '[]', first_seen_at, last_seen_at, disappeared_at (nullable), metadata_json default '{}'. work_item_dependencies: PK (task_id, prerequisite_task_id), created_at, plus an index on prerequisite_task_id. SQLite uses TEXT for the *_json/timestamp columns; Postgres uses JSONB/TIMESTAMPTZ.",
+      "task_content_hash MUST be flywheel_core.loaders.task_digest(item.task) (D-1).",
+      "Upsert semantics: set first_seen_at only on insert; set last_seen_at every observation; clear disappeared_at (set NULL) on re-observation. mark-disappeared sets disappeared_at on previously-seen items absent from the CURRENT observed set WITHOUT deleting the row. replace-edges replaces the dependency edge set for the current graph/task.",
+      "Implement every new method on BOTH SqliteClaimStore and PostgresClaimStore so criterion #10 (both backends) holds.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT populate priority / required_capabilities_json / conflict_keys_json from any WorkItem field -- leave them at column defaults (D-5); those WorkItem fields do not exist until spec 00049.",
+      "Do NOT add the source_syncs recording or the failed-listing-safety behavior here -- that is the next task (it only adds source_syncs + the failed-pass posture).",
+      "Do NOT store telemetry (poll ticks, token streams, SDK logs, spans) in these tables -- they are operational/decision-analytics STATE only (docs/data-taxonomy.md).",
+      "Do NOT touch flywheel-core schema, schema_version, or task_versions.",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "Opening a store that already holds task_claims at sentinel version 1 must converge to version 2, gain the new tables, and preserve the existing claim rows (criterion #9) -- an additive bump, never a 'must be re-created' error.",
+      "Re-observing an item must NOT reset first_seen_at and MUST clear a stale disappeared_at (criterion #5).",
+      "An item absent from a successful observed set must be marked (disappeared_at set), not deleted (criterion #6).",
+      "The Postgres cases must run when Docker is present and skip (never fail) when it is absent."
+    ]
+  }
+}

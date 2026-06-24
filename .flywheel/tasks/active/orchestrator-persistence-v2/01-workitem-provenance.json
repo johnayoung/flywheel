@@ -1,0 +1,35 @@
+{
+  "id": "workitem-provenance",
+  "goal": "WorkItem exposes optional source_kind/source_version/source_url fields, and DirectoryWorkSource and GithubWorkSource populate them from each observed item's provenance.",
+  "tags": ["orchestrator", "spec-00048", "work-sources"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "core-purity" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00048-orchestrator-persistence-v2.md -- acceptance criteria #1, #2, #3 and decisions D-1, D-2, D-4 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem dataclass and DirectoryWorkSource.list_work; add the three optional fields and populate them in DirectoryWorkSource (kind=\"directory\", url/path = the file path, version = task_digest(task))",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- GithubWorkSource._compile_issue; populate kind=\"github_issue\", url = issue url, version = a stable hash of the issue body",
+      "packages/flywheel-core/src/flywheel_core/loaders.py -- task_digest(task) is the reused content hash (D-1); import it for DirectoryWorkSource's source_version",
+      "packages/flywheel-orchestrator/tests/test_work_sources.py -- keep this suite green; it constructs WorkItem and DirectoryWorkSource",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- keep this suite green; it drives GithubWorkSource with an injected gh runner"
+    ],
+    "constraints": [
+      "The three new WorkItem fields (source_kind, source_version, source_url) MUST be optional with defaults (None/empty) so WorkItem stays frozen + kw_only and every existing WorkItem(...) construction without them still compiles. Update every WorkItem constructor (both adapters) in this same change.",
+      "DirectoryWorkSource.source_version MUST equal flywheel_core.loaders.task_digest(item.task) -- reuse the core digest, do not invent a new hash (D-1).",
+      "GithubWorkSource.source_version MUST be derived from issue content that changes when the operator edits the issue (the body), and source_url MUST be the issue url. Use the gh fields already listed in _LIST_FIELDS (number,title,body,url); do not add a new gh query field.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add priority, conflict_keys, or required_capabilities fields to WorkItem -- those are spec 00049 (D-5).",
+      "Do NOT touch the orchestrator store, claim store, or any schema in this task -- persistence is a later task.",
+      "Do NOT modify flywheel-core schema, schema_version, or task_versions.",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A WorkItem constructed with only task= and source_ref= (no provenance) must still construct, with the three fields at their defaults.",
+      "Two GitHub issues with different bodies must yield different source_version values; a constant would fail criterion #3."
+    ]
+  }
+}

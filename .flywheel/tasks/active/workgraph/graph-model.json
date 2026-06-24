@@ -1,0 +1,38 @@
+{
+  "id": "workgraph-model",
+  "goal": "A new orchestrator WorkGraph, built from WorkItem objects, validates structure on construction (raising WorkGraphValidationError naming duplicate-id / self-dep / cycle members), records missing-prerequisite GraphValidationIssues without raising, and answers ready_set(states, excluded) with exactly the currently-runnable items.",
+  "tags": ["workgraph", "spec-00047", "orchestrator"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_graph.py", "name": "workgraph-oracle" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "core-purity" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00047-workgraph-validation.md -- the acceptance criteria SC-1..SC-11 this task satisfies, and the D-1 missing-prereq decision",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem (task, prerequisites, source_ref, local_path); build the graph FROM these objects",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- select_next_task (lines ~284-330) and TaskState enum (~110-118); ready_set must answer the same eligibility question (prereqs DONE, own state eligible, id not excluded) without changing this function",
+      "packages/flywheel-orchestrator/tests/test_work_graph.py -- the held-out oracle for this task; make it green, do not edit it"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- mirror the frozen, kw_only dataclass style for the new value types"
+    ],
+    "constraints": [
+      "Add a new module under packages/flywheel-orchestrator/src/flywheel_orchestrator/ exposing WorkGraph, GraphValidationResult, GraphValidationIssue, and WorkGraphValidationError; the graph is constructed from a sequence of WorkItem.",
+      "Structural corruption hard-fails: duplicate task id, a self-dependency, or a cycle each raise WorkGraphValidationError, and the message must name the offending id(s) -- for a cycle, every participating member id (D-1).",
+      "A prerequisite that resolves to no item is NOT a raise: record a GraphValidationIssue naming the referencing task id and the missing prerequisite id on the returned result, and keep that task out of ready_set (D-1).",
+      "ready_set(states, excluded) returns every item whose prerequisites are all DONE, whose own state is eligible, and whose id is not in excluded -- and only those; it does not early-return after the first match (parallel children must all surface).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not add any field to WorkItem and do not touch core flywheel_core.task.Task (it has no prerequisites field and stays input-source agnostic).",
+      "Do not add priority ordering, weighting, or a Scheduler.choose -- selection stays deterministic first-eligible (spec 00049, out of scope).",
+      "Do not modify files under tests/; do not weaken or delete assertions in the held-out oracle.",
+      "Do not aggregate across multiple WorkSources here -- that is the workgraph-builder task; this task constructs a graph from an already-collected WorkItem sequence."
+    ],
+    "edge_cases": [
+      "A self-edge (task lists its own id) is a 1-cycle and must raise, not be silently dropped.",
+      "A 3-node cycle (a->b->c->a) must name all three members in the error, not only a 2-cycle.",
+      "An empty WorkItem sequence builds an empty graph with no issues and an empty ready_set (no crash)."
+    ]
+  }
+}

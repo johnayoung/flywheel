@@ -1,0 +1,40 @@
+{
+  "id": "source-sync-recording",
+  "goal": "A sync over a work source records a source_syncs run -- status=ok with observed_count on success, status=error on a failed list_work -- and a failed pass marks NOTHING disappeared, on both the SQLite and Postgres backends.",
+  "prerequisites": ["workitem-persistence"],
+  "tags": ["orchestrator", "spec-00048", "persistence", "source-sync"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite-unchanged" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00048-orchestrator-persistence-v2.md -- criteria #7 (headline failed-pass safety), #8, the source_syncs part of #10, and decisions D-3, D-4",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- add the source_syncs table to _SCHEMA_SQL (already at version 2 after the prior task) and the start/finish recording methods here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the source_syncs table (BIGSERIAL id, JSONB, TIMESTAMPTZ) and the recording methods",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- reconcile_live_runs / _source_reconcile_loop (lines 164-263): the runtime posture to mirror at the storage layer -- a FAILED list_work interrupts/marks NOTHING; persistence must record the error and leave disappeared_at untouched",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkSource.list_work and DirectoryWorkSource (source_name = tasks_dir path); _github.py GithubWorkSource (source_name = repo) per D-4",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- the sibling store test to keep green and extend in the same both-backends style",
+      "conftest.py (repo root) -- postgres_dsn fixture + require_postgres skip so Postgres source_syncs cases auto-skip without Docker"
+    ],
+    "constraints": [
+      "source_syncs columns: id (autoincrement / BIGSERIAL), source_kind, source_name, started_at, finished_at (nullable), status, observed_count INT default 0, error (nullable), metadata_json. SQLite uses INTEGER PRIMARY KEY AUTOINCREMENT + TEXT; Postgres uses BIGSERIAL + JSONB/TIMESTAMPTZ.",
+      "A sync = record source_syncs start -> run list_work() -> on SUCCESS: persist observed items + replace edges + mark absent-as-disappeared (the methods from the prior task) + finish status='ok' with observed_count = number observed and finished_at set; on FAILURE: finish status='error' with a non-empty error and mark NOTHING disappeared (D-3).",
+      "source_name follows D-4: directory -> tasks_dir path string; github -> repo (owner/repo).",
+      "Implement on BOTH SqliteClaimStore and PostgresClaimStore so criterion #10 holds for source_syncs too.",
+      "Grade the STORE end-state (rows present/updated/marked), not a fixed call order.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change the runtime reconcile_live_runs / _source_reconcile_loop interrupt behavior -- this task persists the catalog/sync; it does not alter who gets interrupted.",
+      "Do NOT store telemetry (per-tick poll exhaust, token streams, SDK logs, spans) in source_syncs -- it is operational/decision-analytics STATE only.",
+      "Do NOT touch flywheel-core schema, schema_version, or task_versions.",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A FAILED list_work must record a source_syncs row with status='error' and a non-empty error AND leave every previously-seen item's disappeared_at NULL (criterion #7) -- a tracker hiccup is never task disappearance.",
+      "observed_count on a successful sync must equal the number of items observed; a constant 0 must fail (criterion #8).",
+      "The Postgres source_syncs cases run with Docker and skip (never fail) without it."
+    ]
+  }
+}

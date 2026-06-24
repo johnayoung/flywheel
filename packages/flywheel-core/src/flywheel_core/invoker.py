@@ -13,7 +13,7 @@ Envelope extraction delegates entirely to :func:`flywheel_core.envelope.parse_en
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import AsyncIterable, Callable
+from collections.abc import AsyncIterable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -118,6 +118,16 @@ class IterationResult:
     including a ``parse_envelope`` verdict (typically
     :class:`~flywheel_core.envelope.MissingEnvelope` or
     :class:`~flywheel_core.envelope.TruncatedEnvelope`).
+
+    ``usage`` is the iteration's token breakdown as a plain mapping
+    (``input_tokens`` / ``output_tokens`` / ``cache_creation_input_tokens`` /
+    ``cache_read_input_tokens``). It exists for invokers that produce no SDK
+    :class:`Message` objects — chiefly a container backend that drives the
+    agent CLI in stream-json mode (spec 00044) and so cannot carry usage on
+    ``messages``. When ``None`` (the SDK-backed default and every existing
+    invoker), the harness derives the breakdown from ``messages`` exactly as
+    before; when set, the harness uses it verbatim. SDK-free: a plain mapping,
+    no agent-SDK types.
     """
 
     transcript: str
@@ -125,6 +135,7 @@ class IterationResult:
     envelope: EnvelopeResult
     signals: InvocationSignals
     failure: InvocationFailure | None = None
+    usage: Mapping[str, int] | None = None
 
 
 async def invoke_iteration(

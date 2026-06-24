@@ -3234,7 +3234,18 @@ async def _drive_iterations(
         # holds no running counter. ``total_cost_usd`` and ``num_turns`` are
         # forwarded verbatim from the SDK's ResultMessage and are
         # session-cumulative as the SDK reports them; do NOT delta them.
-        usage_breakdown = _build_usage_breakdown(iteration_result.messages)
+        # Token breakdown: prefer an explicit plain-dict ``usage`` (a
+        # message-less invoker, e.g. the container backend driving the agent
+        # CLI in stream-json mode — spec 00044) and otherwise derive it from
+        # the SDK messages exactly as before. Both feed the same rollup, the
+        # context-pressure telemetry, and the per-run token ceiling (00042).
+        if iteration_result.usage is not None:
+            usage_breakdown = {
+                key: int(iteration_result.usage.get(key, 0))
+                for key in _USAGE_TOKEN_KEYS
+            }
+        else:
+            usage_breakdown = _build_usage_breakdown(iteration_result.messages)
         usage_payload: dict[str, Any] = dict(usage_breakdown)
         usage_payload["total_tokens"] = total_tokens_from_usage(usage_breakdown)
         telemetry.emit(

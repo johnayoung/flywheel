@@ -18,9 +18,11 @@ import pytest
 from flywheel_core._registry import UnknownPluginError
 from flywheel_core.task import CommandGrader
 from flywheel_orchestrator._github import GithubWorkSource
+from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._policy import (
     WorkPolicy,
     build_directory_source,
+    build_github_ci_source,
     build_github_source,
     build_work_source,
     load_policy,
@@ -40,6 +42,25 @@ def _directory_policy(tmp_path: Path, *, tasks_dir: str = "queue") -> WorkPolicy
         _write(
             tmp_path,
             f'[source]\nkind = "directory"\ntasks_dir = "{tasks_dir}"\n',
+        )
+    )
+
+
+def _github_ci_policy(tmp_path: Path) -> WorkPolicy:
+    return load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github_ci"',
+                    'repo = "octo/widgets"',
+                    'failure_filter = "failure"',
+                    "[[defaults.graders]]",
+                    'type = "command"',
+                    'run = "uv run pytest"',
+                ]
+            ),
         )
     )
 
@@ -67,8 +88,8 @@ def _github_policy(tmp_path: Path) -> WorkPolicy:
 # --- registry table ---------------------------------------------------------
 
 
-def test_registry_names_are_the_two_builtins() -> None:
-    assert SOURCES.names() == ("directory", "github")
+def test_registry_names_are_the_builtins() -> None:
+    assert SOURCES.names() == ("directory", "github", "github_ci")
 
 
 def test_resolve_directory_returns_policy_builder() -> None:
@@ -79,6 +100,10 @@ def test_resolve_directory_returns_policy_builder() -> None:
 
 def test_resolve_github_returns_policy_builder() -> None:
     assert SOURCES.resolve("github") is build_github_source
+
+
+def test_resolve_github_ci_returns_policy_builder() -> None:
+    assert SOURCES.resolve("github_ci") is build_github_ci_source
 
 
 def test_resolve_unknown_kind_raises_listing_known_names() -> None:
@@ -160,6 +185,41 @@ def test_build_github_source_builder_returns_github_source(
     source = build_github_source(_github_policy(tmp_path))
     assert isinstance(source, GithubWorkSource)
     assert source.repo == "octo/widgets"
+
+
+def test_build_work_source_github_ci_propagates_policy_fields(
+    tmp_path: Path,
+) -> None:
+    policy = _github_ci_policy(tmp_path)
+    source = build_work_source(policy)
+    assert isinstance(source, GithubCiWorkSource)
+    assert source.repo == policy.github_ci_repo == "octo/widgets"
+    assert source.failure_filter == policy.github_ci_failure_filter
+    assert source.default_graders == policy.default_graders
+    assert len(source.default_graders) == 1
+    assert isinstance(source.default_graders[0], CommandGrader)
+
+
+def test_build_github_ci_source_builder_returns_ci_source(
+    tmp_path: Path,
+) -> None:
+    source = build_github_ci_source(_github_ci_policy(tmp_path))
+    assert isinstance(source, GithubCiWorkSource)
+    assert source.repo == "octo/widgets"
+
+
+def test_round_trip_github_ci_kind_routes_to_ci_source(
+    tmp_path: Path,
+) -> None:
+    policy = _github_ci_policy(tmp_path)
+    assert policy.source_kind == "github_ci"
+    assert isinstance(build_work_source(policy), GithubCiWorkSource)
+
+
+def test_github_ci_builder_asserts_repo_present() -> None:
+    inconsistent = WorkPolicy(source_kind="directory", tasks_dir=Path("queue"))
+    with pytest.raises(AssertionError):
+        build_github_ci_source(inconsistent)
 
 
 # --- selection is driven by source_kind alone -------------------------------

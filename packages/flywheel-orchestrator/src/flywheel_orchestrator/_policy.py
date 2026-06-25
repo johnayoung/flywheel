@@ -8,13 +8,17 @@ tracker is a committed config change, not a flywheel code change.
 Format (TOML, stdlib ``tomllib``)::
 
     [source]
-    kind = "directory"              # or "github"
+    kind = "directory"              # or "github" / "github_ci"
     tasks_dir = ".flywheel/tasks"   # directory kind (optional, default shown)
 
     # github kind:
     # repo = "owner/name"           # required
     # label = "flywheel"            # required: only issues with this label
     # done_action = "comment"       # or "close" (default "comment")
+
+    # github_ci kind:
+    # repo = "owner/name"           # required
+    # failure_filter = "failure"    # gh run --status filter (optional default)
 
     # Where runtime state lives (optional). CLI flags still win; without
     # these the built-in .flywheel/ defaults apply.
@@ -106,6 +110,7 @@ from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.task import Grader
 
 from flywheel_orchestrator._github import GithubWorkSource
+from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._source_registry import SOURCES
 from flywheel_orchestrator._sources import DirectoryWorkSource, WorkSource
 
@@ -114,7 +119,7 @@ DEFAULT_POLICY_FILENAME = "flywheel.toml"
 # Mirrors the names registered in ``_source_registry.SOURCES``; kept here for
 # load-time policy validation (``_optional_source`` rejects an unknown kind
 # before any work source is built). The registry owns construction dispatch.
-_SOURCE_KINDS: tuple[str, ...] = ("directory", "github")
+_SOURCE_KINDS: tuple[str, ...] = ("directory", "github", "github_ci")
 
 _DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
 
@@ -299,7 +304,8 @@ class WorkPolicy:
 
     ``tasks_dir`` is populated for ``kind = "directory"``;
     ``github_repo``/``github_label``/``github_done_action`` for
-    ``kind = "github"``. ``default_graders`` is empty when the file
+    ``kind = "github"``; ``github_ci_repo``/``github_ci_failure_filter`` for
+    ``kind = "github_ci"``. ``default_graders`` is empty when the file
     declares none. ``db_path``/``sandbox_root`` mirror the optional
     ``[paths]`` table and are ``None`` when unset (the CLI then falls
     back to its built-in defaults). ``model`` mirrors the optional
@@ -346,6 +352,8 @@ class WorkPolicy:
     github_repo: str | None = None
     github_label: str | None = None
     github_done_action: str = "comment"
+    github_ci_repo: str | None = None
+    github_ci_failure_filter: str = "failure"
     default_graders: tuple[Grader, ...] = ()
     db_path: Path | None = None
     sandbox_root: Path | None = None
@@ -465,6 +473,40 @@ def load_policy(path: Path) -> WorkPolicy:
         return WorkPolicy(
             source_kind="directory",
             tasks_dir=Path(raw_dir) if raw_dir else DEFAULT_TASKS_DIR,
+            default_graders=default_graders,
+            db_path=db_path,
+            sandbox_root=sandbox_root,
+            model=model,
+            store_backend=store_backend,
+            store_schema=store_schema,
+            execution_mode=execution_mode,
+            execution_capabilities=execution_capabilities,
+            protected_paths=protected_paths,
+            submit_strategy=submit_strategy,
+            submit_remote=submit_remote,
+            submit_pr_base=submit_pr_base,
+            submit_base=submit_base,
+            sandbox_setup=sandbox_setup,
+            phase_verify=phase_verify,
+            held_out_root=held_out_root,
+            sandbox=sandbox_policy,
+        )
+
+    if kind == "github_ci":
+        ci_repo = source.get("repo")
+        if not isinstance(ci_repo, str) or not ci_repo:
+            raise PolicyError(
+                f"{path}: source.repo is required for kind = \"github_ci\""
+            )
+        failure_filter = source.get("failure_filter", "failure")
+        if not isinstance(failure_filter, str) or not failure_filter:
+            raise PolicyError(
+                f"{path}: source.failure_filter must be a non-empty string"
+            )
+        return WorkPolicy(
+            source_kind="github_ci",
+            github_ci_repo=ci_repo,
+            github_ci_failure_filter=failure_filter,
             default_graders=default_graders,
             db_path=db_path,
             sandbox_root=sandbox_root,
@@ -1145,6 +1187,16 @@ def build_github_source(policy: WorkPolicy) -> WorkSource:
     )
 
 
+def build_github_ci_source(policy: WorkPolicy) -> WorkSource:
+    """Build the GitHub-CI backend (the registry's ``github_ci`` target)."""
+    assert policy.github_ci_repo is not None  # load_policy guarantees it
+    return GithubCiWorkSource(
+        repo=policy.github_ci_repo,
+        default_graders=policy.default_graders,
+        failure_filter=policy.github_ci_failure_filter,
+    )
+
+
 def build_work_source(policy: WorkPolicy) -> WorkSource:
     """Construct the :class:`WorkSource` a policy describes.
 
@@ -1168,6 +1220,7 @@ __all__ = [
     "SandboxRetention",
     "WorkPolicy",
     "build_directory_source",
+    "build_github_ci_source",
     "build_github_source",
     "build_work_source",
     "load_policy",

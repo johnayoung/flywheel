@@ -507,6 +507,54 @@ def test_github_requires_repo_and_label(tmp_path: Path) -> None:
         )
 
 
+def test_github_ci_requires_repo(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="source.repo is required"):
+        load_policy(_write(tmp_path, '[source]\nkind = "github_ci"\n'))
+
+
+def test_github_ci_failure_filter_defaults_to_failure(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "github_ci"\nrepo = "a/b"\n')
+    )
+    assert policy.source_kind == "github_ci"
+    assert policy.github_ci_repo == "a/b"
+    assert policy.github_ci_failure_filter == "failure"
+
+
+def test_github_ci_failure_filter_override(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github_ci"',
+                    'repo = "a/b"',
+                    'failure_filter = "timed_out"',
+                ]
+            ),
+        )
+    )
+    assert policy.github_ci_failure_filter == "timed_out"
+
+
+def test_github_ci_empty_failure_filter_raises(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="source.failure_filter"):
+        load_policy(
+            _write(
+                tmp_path,
+                "\n".join(
+                    [
+                        "[source]",
+                        'kind = "github_ci"',
+                        'repo = "a/b"',
+                        'failure_filter = ""',
+                    ]
+                ),
+            )
+        )
+
+
 def test_bad_done_action_raises(tmp_path: Path) -> None:
     with pytest.raises(PolicyError, match="source.done_action"):
         load_policy(

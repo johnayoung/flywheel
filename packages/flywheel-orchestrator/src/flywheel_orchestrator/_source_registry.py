@@ -33,5 +33,12 @@ SOURCES.register(
         summary="labeled GitHub issues via the gh CLI",
     )
 )
+SOURCES.register(
+    PluginSpec(
+        name="github_ci",
+        target="flywheel_orchestrator._policy:build_github_ci_source",
+        summary="failed GitHub CI runs via the gh CLI",
+    )
+)
 
 __all__ = ["SOURCES"]

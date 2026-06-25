@@ -56,10 +56,12 @@ from flywheel_orchestrator._held_out_gate import (
     write_oracle_registration,
 )
 from flywheel_orchestrator._github import GhRunner, GithubWorkSource
+from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
     PolicyError,
     WorkPolicy,
+    build_github_ci_source,
     build_work_source,
     load_policy,
 )
@@ -155,6 +157,7 @@ __all__ = [
     "GateOutcome",
     "GateVerdict",
     "GhRunner",
+    "GithubCiWorkSource",
     "GithubWorkSource",
     "GraderReceipt",
     "HeldOutGraderError",
@@ -198,6 +201,7 @@ __all__ = [
     "WorkSource",
     "WorkSourceError",
     "archive_completed_phases",
+    "build_github_ci_source",
     "build_oracle_registration",
     "build_status_rows",
     "build_store",

@@ -1,0 +1,38 @@
+{
+  "id": "scheduling-metadata-fields",
+  "goal": "WorkItem exposes optional priority/required_capabilities/conflict_keys fields, DirectoryWorkSource populates them from each task file, and a sync persists them into the work_items priority/required_capabilities_json/conflict_keys_json columns.",
+  "tags": ["orchestrator", "spec-00049", "scheduling-metadata"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "core-purity" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00049-distributed-scheduling-metadata.md -- acceptance criteria #1, #2, #3 and decisions D-1, D-5, D-7 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem dataclass (add the three optional fields) and DirectoryWorkSource.list_work; read the new keys from the task file the way _read_prerequisites already reads prerequisites (top-level JSON keys)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the work_items upsert/persistence that must write the three values into the EXISTING priority/required_capabilities_json/conflict_keys_json columns (created by 00048 with defaults)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the same persistence write on the Postgres backend",
+      "packages/flywheel-core/src/flywheel_core/loaders.py -- task_digest stays the content hash; do not invent a new one here",
+      "packages/flywheel-orchestrator/tests/test_work_sources.py -- keep this suite green; it constructs WorkItem and DirectoryWorkSource",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; it drives the claim store / work_items persistence on both backends"
+    ],
+    "constraints": [
+      "The three new WorkItem fields MUST be optional with defaults (priority: int = 0, required_capabilities: frozenset[str] = frozenset(), conflict_keys: frozenset[str] = frozenset()), preserving frozen + kw_only, so every existing WorkItem(...) construction without them still compiles.",
+      "DirectoryWorkSource MUST read priority/required_capabilities/conflict_keys from each task file's top-level JSON, mirroring _read_prerequisites; an absent key yields the default. Core flywheel ignores these keys (they are orchestration metadata, not part of the single-task definition).",
+      "Persistence MUST write the item's values into the existing work_items columns (priority, required_capabilities_json, conflict_keys_json) on BOTH the SQLite and Postgres backends. Do not re-create, rename, or re-default those columns -- 00048 already created them.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT populate these fields from GithubWorkSource -- github items stay at defaults this spec (D-7).",
+      "Do NOT change select_next_task, WorkGraph.ready_set, or the claim store acquire/renew/release/sweep -- scheduling and claim behavior are later tasks.",
+      "Do NOT change the work_items schema or bump orchestrator_schema_version -- the columns already exist; this is a data change, not a schema change.",
+      "Do NOT modify flywheel-core schema, schema_version, or task_versions.",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A WorkItem constructed with only task= and source_ref= (no scheduling metadata) must construct with priority 0 and both sets empty.",
+      "A non-default item (priority 7, required_capabilities {\"gpu\"}, conflict_keys {\"deploy\"}) must round-trip through the work_items columns -- read back as 7 and the two json columns decoding (order-insensitively) to the supplied sets; a persistence path that writes the 00048 defaults (0 / [] / []) must fail.",
+      "A task file omitting all three keys must not raise and must yield the defaults."
+    ]
+  }
+}

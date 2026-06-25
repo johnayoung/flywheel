@@ -1,0 +1,36 @@
+{
+  "id": "conflict-key-exclusion",
+  "goal": "The claim store refuses to acquire an item that shares a conflict_key with a different live claim, so two conflicting items never hold concurrent claims, and the refusal clears when the conflicting claim is released or swept.",
+  "prerequisites": ["scheduling-metadata-fields"],
+  "tags": ["orchestrator", "spec-00049", "claims", "distributed"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00049-distributed-scheduling-metadata.md -- acceptance criteria #8, #9, #10, #13 (conflict part), #15, #17 and decisions D-3, D-4, D-5 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the ClaimStore protocol and SqliteClaimStore.acquire_claim (~line 427): supply each item's conflict keys at acquire time and refuse on overlap with a different live claim",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the same exclusion on the Postgres backend",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; it pins acquire/renew/release/list on both backends (the v1 sentinel, expiry-steal, same-worker re-acquire)"
+    ],
+    "constraints": [
+      "Conflict keys are supplied to the claim store at acquire time (D-4), so exclusion does not depend on work_items being freshly synced. Refuse the acquire (return no claim) when a DIFFERENT live claim holds an overlapping conflict key; a same-worker re-acquire of its own task still succeeds (existing behavior).",
+      "The refusal must clear when the conflicting claim is released or its lease lapses and it is swept -- a previously-refused item becomes acquirable again.",
+      "If enforcing exclusion requires persisting conflict keys on a claim, add the column additively and bump orchestrator_schema_version additively: a pre-existing store (holding task_claims and work_items rows) opened by the new code MUST keep every row and converge -- no drop-and-recreate, no hard version-mismatch error (mirrors 00048 criterion #9).",
+      "The behavior holds on BOTH the SQLite and Postgres claim-store backends.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT block or queue-until-clear -- exclusion is refuse-and-skip; the worker falls through to the next ready item (the already-shipped 'claim fails -> try next' fallback) (D-3).",
+      "Do NOT enforce conflict in the scheduler / ready_set -- the claim store is the single cross-worker mutual-exclusion point.",
+      "Do NOT alter acquire/renew/release/list semantics for non-conflicting claims, including the lease/version bump on an ordinary claim (#17).",
+      "Do NOT perform a destructive migration or raise a hard version mismatch on the additive bump (#15).",
+      "Do NOT modify flywheel-core; do NOT modify files under tests/ or weaken existing claim assertions."
+    ],
+    "edge_cases": [
+      "A (conflict_keys {\"k\"}) claimed by worker-1, then B (conflict_keys {\"k\"}) attempted by worker-2: B is refused while A stays live and owned by worker-1; after A is released, B becomes acquirable.",
+      "A (conflict_keys {\"k1\"}) and B (conflict_keys {\"k2\"} or {}) can hold concurrent live claims -- exclusion fires only on actual key overlap, never on any second concurrent claim.",
+      "A worker re-acquiring its own already-held task must still succeed with the version bump intact."
+    ]
+  }
+}

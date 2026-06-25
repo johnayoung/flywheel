@@ -1,0 +1,37 @@
+{
+  "id": "priority-capability-scheduling",
+  "goal": "select_next_task and WorkGraph.ready_set offer ready items highest-priority-first (ties in walk order) and exclude items whose required_capabilities are not a subset of the worker's advertised capability set.",
+  "prerequisites": ["scheduling-metadata-fields"],
+  "tags": ["orchestrator", "spec-00049", "scheduling"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00049-distributed-scheduling-metadata.md -- acceptance criteria #4, #5, #6, #7 and decisions D-1, D-2 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- select_next_task (~line 284): order eligible candidates by descending priority (stable, walk-order tie-break) and apply the capability filter",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py -- WorkGraph.ready_set (~line 257): same priority ordering and capability filter over the runnable set",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy and the [execution] table (execution_mode ~line 323): add the per-worker capability set config (default empty), threaded into selection",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep this suite green; it pins select_next_task's selection/ordering"
+    ],
+    "constraints": [
+      "Priority is a stable descending sort over the current candidate sequence: among equal-priority items, existing enumeration/walk order is preserved. Default priority 0 means an all-default set sorts to its original walk order -- today's first-eligible behavior exactly.",
+      "Capability filter: an item is selectable/runnable by a worker iff its required_capabilities is a subset of the worker's advertised capability set. An item with empty required_capabilities is selectable by any worker, including a worker with an empty capability set.",
+      "The worker's capability set is an explicit per-worker configuration value (its home is the [execution] table), defaulting to empty. Thread it into selection so the default (empty) preserves current signatures' behavior and no caller is forced to pass it.",
+      "Both behaviors apply in both execution modes (local and distributed).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT reuse or rename [sandbox.capabilities] / SandboxCapabilities -- that is the agent tool/skill/MCP surface, a different concept (D-2).",
+      "Do NOT touch the claim store -- conflict-key exclusion and the liveness sweep are later tasks.",
+      "Do NOT add WorkItem fields or change persistence -- the prerequisite task owns those.",
+      "Do NOT modify flywheel-core.",
+      "Do NOT modify files under tests/; do not weaken or delete existing selection assertions."
+    ],
+    "edge_cases": [
+      "Priorities [1, 9, 5] in walk order must be offered 9, 5, 1; priorities [3, 3, 3] must preserve walk order -- a sort that reorders equal-priority items (e.g. by id) must fail.",
+      "An empty-capability worker must still be offered every existing (zero-requirement) item; adding one item requiring {\"gpu\"} must withhold that item alone while the rest are unaffected.",
+      "A worker with capability set {\"gpu\"} must be offered an item requiring {} and one requiring {\"gpu\"} but not one requiring {\"gpu\",\"cuda\"}."
+    ]
+  }
+}

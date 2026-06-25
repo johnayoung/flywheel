@@ -1,0 +1,35 @@
+{
+  "id": "claim-liveness-sweep",
+  "goal": "A claim-store liveness sweep batch-releases every claim whose lease has lapsed at an injected now -- returning those tasks to the acquirable pool and dropping them from list_claims -- including all of one dead worker's claims in a single pass, while leaving still-valid claims held.",
+  "prerequisites": ["conflict-key-exclusion"],
+  "tags": ["orchestrator", "spec-00049", "claims", "distributed"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00049-distributed-scheduling-metadata.md -- acceptance criteria #11, #12, #13 (sweep part), #17 and decision D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the ClaimStore protocol and SqliteClaimStore: add the sweep operation reading lease_expires_at against an injected now; note list_claims today does not filter expiry",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the same sweep on the Postgres backend",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; it pins acquire/renew/release/list and injects now for deterministic lease expiry"
+    ],
+    "constraints": [
+      "The sweep takes an injected now and releases every claim whose lease_expires_at <= now: those task ids become acquirable by any worker and are no longer reported as live-held by list_claims. A claim whose lease is still valid at now stays held, owned by its worker, and not acquirable by another worker.",
+      "A single sweep releases ALL lapsed claims belonging to the same worker in one pass -- per-worker dead-worker reaping, not one task at a time.",
+      "now MUST be injected (do not read a wall clock) so lease expiry stays deterministic and testable, matching the existing claim store.",
+      "The behavior holds on BOTH the SQLite and Postgres claim-store backends.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add a heartbeat_at column -- lease_expires_at already encodes liveness; heartbeat is the existing lease renewal (D-6).",
+      "Do NOT write a persistent reclaim/heartbeat event ledger -- that is spec 00051 (D-6); the sweep's effect is graded on claim-store end-state only.",
+      "Do NOT change acquire/renew/release semantics for non-lapsed claims (#17).",
+      "Do NOT modify flywheel-core; do NOT modify files under tests/ or weaken existing claim assertions."
+    ],
+    "edge_cases": [
+      "Two claims with different lease windows, now advanced past only one: after the sweep the lapsed task is absent from list_claims and freshly acquirable, while the still-valid claim remains listed, owned, and not acquirable by another worker.",
+      "One worker holding three lapsed claims: a single sweep frees all three (not one-at-a-time).",
+      "A sweep with no lapsed claims is a no-op leaving every claim held and owned."
+    ]
+  }
+}

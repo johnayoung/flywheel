@@ -414,6 +414,22 @@ class PostgresClaimStore:
             for row in rows
         ]
 
+    def sweep_expired_claims(self, *, now: datetime) -> list[str]:
+        # Batch-delete every lapsed row (lease_expires_at <= now) in one
+        # statement, returning the freed task ids. TIMESTAMPTZ comparison is
+        # temporal (not lexical), matching acquire's "lease_expires_at > now
+        # means live" test. Released rows leave list_claims and are
+        # immediately re-acquirable; still-valid claims are untouched.
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM task_claims WHERE lease_expires_at <= %s "
+                    "RETURNING task_id",
+                    (now,),
+                )
+                rows = cur.fetchall()
+        return [row[0] for row in rows]
+
     # -- WorkGraph persistence (schema v2) ---------------------------------
 
     def upsert_work_item(self, item: WorkItem, *, now: datetime) -> None:

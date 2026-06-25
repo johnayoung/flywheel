@@ -164,6 +164,14 @@ class ClaimStore(Protocol):
       holds what without knowing task ids up front. Released claims are
       absent; expiry is not filtered (an expired-but-not-yet-stolen lease
       still appears, consistent with ``load_claim``).
+    * ``sweep_expired_claims`` batch-releases every claim whose lease lapsed
+      at the injected ``now`` (``lease_expires_at <= now``) in a single pass,
+      returning those task ids to the acquirable pool and dropping them from
+      ``list_claims`` — reaping all of one dead worker's lapsed claims at
+      once, not one task at a time. A claim still valid at ``now`` stays held
+      and owned. Returns the released task ids. ``acquire_claim`` /
+      ``renew_claim`` / ``release_claim`` semantics for non-lapsed claims are
+      unchanged (the sweep only drops already-lapsed rows).
 
     ``now`` is injected (not read from a clock) so lease expiry is
     deterministic and testable.
@@ -192,6 +200,8 @@ class ClaimStore(Protocol):
     def load_claim(self, task_id: str) -> TaskClaim | None: ...
 
     def list_claims(self) -> list[TaskClaim]: ...
+
+    def sweep_expired_claims(self, *, now: datetime) -> list[str]: ...
 
 
 def _iso(ts: datetime) -> str:
@@ -358,6 +368,21 @@ class InMemoryClaimStore:
         # Expiry is not filtered, matching load_claim. TaskClaim is frozen,
         # so the stored instances are safe to return directly.
         return list(self._claims.values())
+
+    def sweep_expired_claims(self, *, now: datetime) -> list[str]:
+        # Drop every lapsed claim in one pass: those task ids leave the held
+        # set (so they vanish from list_claims and become acquirable), while
+        # claims still valid at now are untouched. Materialize the doomed ids
+        # before mutating so the iteration is not over a changing dict.
+        released = [
+            task_id
+            for task_id, claim in self._claims.items()
+            if claim.lease_expires_at <= now
+        ]
+        for task_id in released:
+            del self._claims[task_id]
+            self._conflict_keys.pop(task_id, None)
+        return released
 
     def close(self) -> None:  # parity with the durable stores
         pass
@@ -666,6 +691,27 @@ class SqliteClaimStore:
             )
             for row in rows
         ]
+
+    def sweep_expired_claims(self, *, now: datetime) -> list[str]:
+        # Batch-delete every lapsed row (lease_expires_at <= now) in one
+        # transaction, returning the freed task ids. Lexical comparison on the
+        # ISO timestamp string matches load/acquire's "> now means live" test
+        # (same encoding used by _has_conflicting_live_claim). Released rows
+        # leave list_claims and are immediately re-acquirable; still-valid
+        # claims are not touched.
+        now_iso = _iso(now)
+        with self._transaction():
+            rows = self._connection.execute(
+                "SELECT task_id FROM task_claims WHERE lease_expires_at <= ?",
+                (now_iso,),
+            ).fetchall()
+            released = [row["task_id"] for row in rows]
+            if released:
+                self._connection.execute(
+                    "DELETE FROM task_claims WHERE lease_expires_at <= ?",
+                    (now_iso,),
+                )
+        return released
 
     # -- WorkGraph persistence (schema v2) ---------------------------------
 

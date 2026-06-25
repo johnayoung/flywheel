@@ -1,0 +1,41 @@
+{
+  "id": "event-ledger-postgres",
+  "goal": "The Postgres claim store mirrors the orchestrator_events ledger so that, given an identical sequence of claim transitions, the SQLite and Postgres backends produce equal event records (type, worker, version, ordering), and a pre-existing v3 Postgres store migrates additively to v4 keeping its rows.",
+  "prerequisites": ["event-ledger-store"],
+  "tags": ["orchestrator", "spec-00054", "claims", "events", "postgres"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00054-orchestrator-events-ledger.md -- acceptance criteria #10 (cross-backend parity) and #11 (postgres migration) and decisions D-1, D-5, D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the orchestrator_events table in _bootstrap, the same-transaction event emit inside acquire_claim/renew_claim/release_claim/sweep_expired_claims, and the read API, matching the contract established on the SQLite backend",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the OrchestratorEventRecord shape, the five-member event-type taxonomy, and CURRENT_ORCH_SCHEMA_VERSION=4 are the fixed contract this task mirrors; do not change them",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; add the cross-backend parity assertion here, parametrized so it skips cleanly when no postgres_dsn is configured (the root conftest provides postgres_dsn session-scoped; None skips)"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py:435 -- upsert_work_item shows the existing Postgres same-transaction write to mirror",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py:148 -- _bootstrap shows the additive CREATE TABLE IF NOT EXISTS + sentinel converge to mirror for v3->v4 on Postgres"
+    ],
+    "constraints": [
+      "The Postgres ledger semantics must be IDENTICAL to the SQLite backend (criterion #10): the same acquire/renew/steal/sweep/release sequence yields equal event lists -- same type spellings, worker ids, versions, and insertion order -- after dropping the backend-assigned row id. This parity test is the composition holdout over the shared OrchestratorEventRecord/taxonomy invariant; it adds no requirement beyond the spec.",
+      "The event is INSERTed in the same Postgres transaction as the task_claims mutation it describes (D-1): committed transitions get their event; refused acquire / stale renew / no-op release write none.",
+      "Bump-aware additive migration (D-5/criterion #11): a pre-existing v3 Postgres store (holding task_claims and work_items rows) opened by the v4 code MUST keep every row, open without OrchestratorSchemaError, and expose an empty orchestrator_events ledger -- no drop-and-recreate.",
+      "Reuse the in-memory/SQLite OrchestratorEventRecord and event-type taxonomy from _claims.py unchanged; this task only adds the Postgres backing for them.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change the event-type taxonomy, the OrchestratorEventRecord shape, the read API surface, or CURRENT_ORCH_SCHEMA_VERSION established by the prerequisite task.",
+      "Do NOT add pruning/retention or source-sync events; do NOT add a 'lost' event.",
+      "Do NOT alter Postgres acquire/renew/release/sweep return values, conflict-key refusal, or optimistic-concurrency semantics.",
+      "Do NOT modify flywheel-core or the persistence-schema*.sql files; do NOT weaken or delete existing claim assertions under tests/.",
+      "Do NOT make the parity test hard-fail when no postgres_dsn is configured -- it must skip cleanly, matching the existing postgres-backend cases."
+    ],
+    "edge_cases": [
+      "Drive the identical acquire(A) -> renew -> steal(B) -> sweep -> release sequence against SqliteClaimStore and PostgresClaimStore; the read-back event lists are equal after dropping row ids -- a divergent type spelling (e.g. 'STOLEN' vs 'stolen') or a missing renew on one backend must fail.",
+      "A v3 Postgres store with existing task_claims and work_items rows opens under v4 with rows intact, no OrchestratorSchemaError, and an empty events ledger.",
+      "JSONB/text column choices must round-trip the same record content the SQLite backend stores (mirroring the encode/decode parity already used for conflict_keys_json)."
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "event-ledger-store",
+  "goal": "The orchestrator claim store records each committed claim-lease transition (acquired, stolen, renewed, released, expired) as one immutable row in an append-only orchestrator_events ledger, written in the same transaction as the state change, readable as a global stream and a per-task timeline, on the in-memory and SQLite backends.",
+  "tags": ["orchestrator", "spec-00054", "claims", "events"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00054-orchestrator-events-ledger.md -- acceptance criteria #1-9, #12, and #11 (sqlite/memory backends) and decisions D-1, D-2, D-3, D-5, D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- add the orchestrator_events table to _SCHEMA_SQL, bump CURRENT_ORCH_SCHEMA_VERSION 3->4 additively, and emit one event inside each committed transition of InMemoryClaimStore and SqliteClaimStore (acquire_claim, renew_claim, release_claim, sweep_expired_claims); add the read API",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; it pins acquire/renew/release/list/sweep on memory+sqlite (v1 sentinel, expiry-steal, same-worker re-acquire, conflict-key exclusion). Add the new event-ledger assertions here, parametrized over the memory and sqlite backends like the existing cases"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py:718 -- upsert_work_item shows the existing same-transaction write pattern and the WorkItemRecord/SourceSyncRecord dataclasses to mirror for OrchestratorEventRecord",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py:474 -- _bootstrap shows the additive CREATE TABLE IF NOT EXISTS + sentinel converge-forward migration to mirror for v3->v4"
+    ],
+    "constraints": [
+      "The event is INSERTed in the SAME store transaction as the task_claims mutation it describes (D-1): a committed acquire/steal/renew/release always has its event; a refused acquire (returns None), a stale renew (raises ClaimLostError), and a no-op release (deletes no row) each write NO event. The emit point is the store method, not the orchestrate loop.",
+      "Event taxonomy is exactly five types, one per committed task_claims insert/update/delete (D-2): acquired (fresh insert or a same-worker re-acquire), stolen (acquire over a DIFFERENT worker's lapsed lease), renewed, released (an actual row deletion), expired (one per claim reaped by sweep_expired_claims). stolen MUST be distinct from acquired so reclaim is observable.",
+      "Each event row carries: task_id, worker_id (the worker the event pertains to; for expired, the reaped holder), event type, the claim version after the transition, the lease expiry, the injected occurred-at timestamp (now), and a monotonic insertion id. occurred_at is the injected now, never a wall clock, so the ledger is deterministic and testable.",
+      "The ledger is append-only (D-2/criterion #9): N committed state changes on one task produce N events in insertion order, never deduped, upserted, or overwritten; re-acquiring after release appends a further acquired event. Provide a read API for the global stream (all events in id order) and a per-task timeline (one task's events in id order); provide NO method that updates or deletes an event.",
+      "Bump CURRENT_ORCH_SCHEMA_VERSION 3->4 additively (D-5): add orchestrator_events via CREATE TABLE IF NOT EXISTS and converge the sentinel forward, mirroring the v2/v3 migration. A pre-existing v3 store (holding task_claims and work_items rows) opened by the new code MUST keep every row, open without OrchestratorSchemaError, and expose an empty orchestrator_events ledger (criterion #11) -- no drop-and-recreate.",
+      "InMemoryClaimStore must record events too (it is the test substrate and the operator-parity surface); its event store mirrors the durable backends' semantics.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add a 'lost' event on a failed renew -- a rejected renew changes no committed state, so there is nothing to attach an event to; the new holder's stolen event and the sweep's expired event capture reclaim (D-2).",
+      "Do NOT wire sweep_expired_claims into the orchestrate loop -- this task only proves the store emits expired events when sweep is invoked.",
+      "Do NOT add pruning, retention, rotation, or any growth cap; do NOT record source-sync events (those stay in source_syncs).",
+      "Do NOT alter acquire/renew/release/sweep/list return values, conflict-key refusal (00049), or optimistic-concurrency rejection.",
+      "Do NOT modify flywheel-core or the persistence-schema*.sql files; do NOT weaken or delete existing claim assertions under tests/.",
+      "Defer the Postgres backend to the dependent task -- this task delivers in-memory and SQLite only."
+    ],
+    "edge_cases": [
+      "A acquires t (acquired); now advances past the lease; B acquires t -> a stolen event for B distinct from acquired, leaving the timeline [acquired(A), stolen(B)].",
+      "A acquires t; B steals t; A.renew_claim(stale) raises ClaimLostError and writes no event; A.release_claim(stale) deletes no row and writes no released event (timeline stays [acquired(A), stolen(B)]).",
+      "Two lapsed claims (A on t1, B on t2) plus one still-valid claim (C on t3): sweep writes exactly two expired events (t1/A, t2/B) and none for t3.",
+      "A refused acquire (live lease held by another worker, OR a conflict-key overlap) returns None and writes no event.",
+      "acquire -> renew -> renew -> release on one task yields exactly [acquired, renewed, renewed, released] in id order; a returned-constant or upserting ledger that collapses the two renews must fail."
+    ]
+  }
+}

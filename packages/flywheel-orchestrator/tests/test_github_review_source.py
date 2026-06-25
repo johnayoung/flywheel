@@ -58,6 +58,7 @@ def _thread(
     is_resolved: bool = False,
     is_outdated: bool = False,
     comments: list[dict] | None = None,
+    comment_truncated: bool = False,
 ) -> dict:
     return {
         "id": node_id,
@@ -65,7 +66,7 @@ def _thread(
         "isOutdated": is_outdated,
         "comments": {
             "nodes": comments if comments is not None else [_comment()],
-            "pageInfo": {"hasNextPage": False},
+            "pageInfo": {"hasNextPage": comment_truncated},
         },
     }
 
@@ -246,6 +247,76 @@ def test_truncated_pages_are_logged() -> None:
 
     assert len(items) == 1
     assert any("truncated" in line for line in lines)
+
+
+def test_each_truncated_axis_emits_one_shared_warning() -> None:
+    # All three GraphQL axes (open PRs, review threads, comments) report a
+    # next page -> one uniform warning per axis through the shared emitter.
+    gh = _FakeGh(
+        _payload(
+            pr_truncated=True,
+            thread_truncated=True,
+            threads=[_thread(comment_truncated=True)],
+        )
+    )
+    lines: list[str] = []
+    items = _source(gh, log=lines.append).list_work()
+
+    assert len(items) == 1
+    warnings = [ln for ln in lines if "truncated at one page" in ln]
+    assert len(warnings) == 3
+    assert all("[github_review]" in ln for ln in warnings)
+    assert all("some items were not read this pass" in ln for ln in warnings)
+    whats = " ".join(warnings)
+    assert "open pull requests" in whats
+    assert "review threads" in whats
+    assert "comments" in whats
+
+
+def test_no_truncation_emits_no_warning() -> None:
+    gh = _FakeGh(_payload())
+    lines: list[str] = []
+    _source(gh, log=lines.append).list_work()
+
+    assert [ln for ln in lines if "truncated" in ln] == []
+
+
+def test_truncation_warning_is_a_side_channel() -> None:
+    page = _payload(
+        pr_truncated=True,
+        thread_truncated=True,
+        threads=[_thread(comment_truncated=True)],
+    )
+    with_log = _source(_FakeGh(page), log=[].append).list_work()
+    without_log = _source(_FakeGh(page)).list_work()
+
+    assert [i.task.id for i in with_log] == [i.task.id for i in without_log]
+
+
+def test_truncated_page_with_log_none_does_not_crash() -> None:
+    gh = _FakeGh(
+        _payload(
+            pr_truncated=True,
+            thread_truncated=True,
+            threads=[_thread(comment_truncated=True)],
+        )
+    )
+    items = _source(gh).list_work()
+
+    assert len(items) == 1
+
+
+def test_failed_listing_raises_and_never_returns_empty() -> None:
+    def _failing(argv) -> str:
+        raise WorkSourceError("gh api graphql failed (exit 1): boom")
+
+    source = GithubReviewWorkSource(
+        repo="octo/widgets",
+        default_graders=(CommandGrader(run="uv run pytest"),),
+        runner=_failing,
+    )
+    with pytest.raises(WorkSourceError, match="failed"):
+        source.list_work()
 
 
 def test_invalid_list_payload_raises() -> None:

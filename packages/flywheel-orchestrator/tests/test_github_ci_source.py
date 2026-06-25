@@ -186,6 +186,71 @@ def test_provenance_stamps() -> None:
     assert item.source_version  # non-empty digest
 
 
+def _full_page() -> str:
+    # A page filled to the single-page cap, each run a distinct (workflow,
+    # branch) so dedup does not collapse them.
+    return json.dumps(
+        [
+            _run(workflow=f"CI-{n}", branch=f"b-{n}", head_sha=f"sha-{n}")
+            for n in range(200)
+        ]
+    )
+
+
+def test_full_page_emits_one_truncation_warning() -> None:
+    gh = _FakeGh(_full_page())
+    lines: list[str] = []
+    items = _source(gh, log=lines.append).list_work()
+
+    assert len(items) == 200
+    warnings = [ln for ln in lines if "truncated at one page" in ln]
+    assert len(warnings) == 1
+    assert "[github_ci]" in warnings[0]
+    assert "some items were not read this pass" in warnings[0]
+
+
+def test_below_cap_emits_no_truncation_warning() -> None:
+    gh = _FakeGh(
+        json.dumps(
+            [
+                _run(workflow=f"CI-{n}", branch=f"b-{n}", head_sha=f"sha-{n}")
+                for n in range(199)
+            ]
+        )
+    )
+    lines: list[str] = []
+    _source(gh, log=lines.append).list_work()
+
+    assert [ln for ln in lines if "truncated" in ln] == []
+
+
+def test_truncation_warning_is_a_side_channel() -> None:
+    page = _full_page()
+    with_log = _source(_FakeGh(page), log=[].append).list_work()
+    without_log = _source(_FakeGh(page)).list_work()
+
+    assert [i.task.id for i in with_log] == [i.task.id for i in without_log]
+
+
+def test_full_page_with_log_none_does_not_crash() -> None:
+    items = _source(_FakeGh(_full_page())).list_work()
+
+    assert len(items) == 200
+
+
+def test_failed_listing_raises_and_never_returns_empty() -> None:
+    def _failing(argv) -> str:
+        raise WorkSourceError("gh run list failed (exit 1): boom")
+
+    source = GithubCiWorkSource(
+        repo="octo/widgets",
+        default_graders=(CommandGrader(run="uv run pytest"),),
+        runner=_failing,
+    )
+    with pytest.raises(WorkSourceError, match="failed"):
+        source.list_work()
+
+
 def test_invalid_list_payload_raises() -> None:
     gh = _FakeGh("not json at all")
     with pytest.raises(WorkSourceError, match="invalid JSON"):

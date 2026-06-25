@@ -56,6 +56,7 @@ from flywheel_orchestrator._github import (
     GhRunner,
     _default_runner,
     _format_report_body,
+    emit_truncation_warning,
 )
 from flywheel_orchestrator._sources import (
     WorkItem,
@@ -217,7 +218,9 @@ class GithubReviewWorkSource:
         )
         pr_nodes = _nodes(pull_requests, "pullRequests")
         if _truncated(pull_requests):
-            self._note_truncation("open pull requests")
+            emit_truncation_warning(
+                self._log, source="github_review", what="open pull requests"
+            )
 
         items: list[WorkItem] = []
         for pr in pr_nodes:
@@ -233,7 +236,11 @@ class GithubReviewWorkSource:
                 f"pullRequest(#{number}).reviewThreads",
             )
             if _truncated(review_threads):
-                self._note_truncation(f"review threads on PR #{number}")
+                emit_truncation_warning(
+                    self._log,
+                    source="github_review",
+                    what=f"review threads on PR #{number}",
+                )
             for thread in _nodes(
                 review_threads, f"pullRequest(#{number}).reviewThreads"
             ):
@@ -259,12 +266,16 @@ class GithubReviewWorkSource:
             return None
 
         is_outdated = bool(thread_obj.get("isOutdated"))
-        comments = _nodes(
-            _require_object(
-                thread_obj.get("comments"), "reviewThread.comments"
-            ),
-            "reviewThread.comments",
+        comments_conn = _require_object(
+            thread_obj.get("comments"), "reviewThread.comments"
         )
+        if _truncated(comments_conn):
+            emit_truncation_warning(
+                self._log,
+                source="github_review",
+                what=f"comments on a review thread on PR #{pr_number}",
+            )
+        comments = _nodes(comments_conn, "reviewThread.comments")
 
         bodies: list[str] = []
         authors: list[str] = []
@@ -338,13 +349,6 @@ class GithubReviewWorkSource:
             ).hexdigest(),
             source_url=thread_url,
         )
-
-    def _note_truncation(self, what: str) -> None:
-        if self._log is not None:
-            self._log(
-                f"[github_review] {what} listing truncated at one page; "
-                f"some threads were not read this pass"
-            )
 
     # -- outbound -------------------------------------------------------
 

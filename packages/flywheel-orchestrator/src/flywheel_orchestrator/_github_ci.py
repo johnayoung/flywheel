@@ -47,6 +47,7 @@ from flywheel_orchestrator._github import (
     GhRunner,
     _default_runner,
     _format_report_body,
+    emit_truncation_warning,
 )
 from flywheel_orchestrator._sources import (
     WorkItem,
@@ -161,6 +162,15 @@ class GithubCiWorkSource:
         if not isinstance(runs, list):
             raise WorkSourceError(
                 f"gh run list returned {type(runs).__name__}, expected a list"
+            )
+
+        # A page filled to the cap may have dropped overflow runs: gh's REST
+        # ``run list`` exposes no ``hasNextPage``, so a full page is the only
+        # available truncation evidence (D-4). Measured on the raw page, before
+        # the (workflow, branch) dedup collapses it.
+        if len(runs) == int(_LIST_LIMIT):
+            emit_truncation_warning(
+                self._log, source="github_ci", what="run"
             )
 
         # Dedup to one item per (workflow, branch), keeping the most recent

@@ -1,0 +1,41 @@
+{
+  "id": "held-out-gate-activation",
+  "goal": "The shipped `flywheel worker` activates the 00050 execute-time held-out gate when `flywheel.toml` declares a `[held_out] root` (resolved relative to the repo root) and stays inert when it does not, so a registered task is gated while landing is otherwise byte-identical to today.",
+  "tags": ["orchestrator", "worktree", "spec-00051", "held-out-gate"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/", "name": "worktree-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00051-held-out-oracle-registration.md -- acceptance criteria #1, #2, #3, #7 and decisions D-1, D-3, D-5 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy dataclass (~line 287-348) and load_policy (~line 351); add an optional `[held_out] root` key parsed into a new WorkPolicy field (default unset), mirroring how [execution] is parsed at ~line 399-405 with an _optional_* validator. An absent [held_out] table must load unchanged.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- main() (~line 1357-1471) loads the policy via load_effective_policy() and calls run_once() WITHOUT held_out_source today; construct a FilesystemHeldOutGraderSource at the configured root (resolved relative to repo_root) only when [held_out] root is set, and pass it through run_once -> orchestrate. When unset, pass no source (None).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- FilesystemHeldOutGraderSource(root=...) already exists (00050); construct it, do not reimplement it. evaluate_held_out_gate and the gate semantics are 00050's and unchanged.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- run_once (~line 1012) and run_worker already accept and forward held_out_source to orchestrate; this task only constructs and supplies it from policy.",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- existing land/block tests build trivial registrations ([{\"type\": \"command\", \"run\": \"true\", \"name\": \"ok\"}] for pass, exit-non-zero for fail); reuse this pattern to assert end-to-end land/block under an active [held_out] root. Keep this suite green.",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- keep green; add cases for the new [held_out] root key (set / absent / relative-resolution).",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep green; the worker-entry activation path is asserted here."
+    ],
+    "constraints": [
+      "Activation is opt-in: construct a held-out source ONLY when [held_out] root is configured. When absent, build no source and run the gate for no task -- landing is byte-identical to today (D-3 at the config layer, criterion #2).",
+      "Resolve a relative [held_out] root against the repo root, so it points at <repo_root>/<root> regardless of the worker's cwd or any sandbox path (criterion #3).",
+      "The held-out root and any registered oracle are git-ignored payload behind a committed pointer; a fresh agent worktree must not contain the registration root or the oracle during the run (D-1, criterion #7). Do not copy or materialize them into the worktree.",
+      "Reuse 00050's FilesystemHeldOutGraderSource and gate engine unchanged (D-5); this task supplies the source, it does not re-decide gate behavior.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT modify the 00050 gate engine (_held_out_gate.py: evaluate_held_out_gate, GateVerdict, fail-closed/exit-code/before-submit semantics) (criterion is to construct + activate only).",
+      "Do NOT default [held_out] root to a conventional path -- a default that silently activates gating on upgrade for a stray file is forbidden (criterion #2, D-3).",
+      "Do NOT define the oracle-from-admission registration shape here -- that is the held-out-registration-shape task; this task gates with trivial registrations in its tests.",
+      "Do NOT modify flywheel-core: no change to Task, Grader, the lifecycle, the harness, or core's schema (criterion #10).",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A relative [held_out] root resolves to <repo_root>/<root>; a registration at that resolved path is honored while an identically named file elsewhere (e.g. under cwd) is not (criterion #3).",
+      "With NO [held_out] table configured, a task that happens to have a <task_id>.json on disk somewhere is NOT gated -- the worker builds no source and the task lands as today (criterion #2).",
+      "With the gate active, neither the held-out root nor any registered oracle file is present anywhere under the agent's worktree during its run (criterion #7)."
+    ]
+  }
+}

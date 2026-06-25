@@ -1,0 +1,37 @@
+{
+  "id": "held-out-registration-shape",
+  "goal": "An admitted held-out oracle is expressed as a `<root>/<task_id>.json` command-grader registration that 00050's FilesystemHeldOutGraderSource loads without error and that reproduces the oracle's discrimination through the gate -- passing a committed tree with a correct implementation and failing one with a plausible-wrong implementation -- with the oracle referenced by absolute path and run with the committed tree as its working directory.",
+  "tags": ["orchestrator", "core", "spec-00051", "held-out-gate", "registration"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00051-held-out-oracle-registration.md -- acceptance criteria #4, #5, #6 and decisions D-2, D-5 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- FilesystemHeldOutGraderSource.graders_for (~line 145-184) loads `<root>/<task_id>.json` as a command-grader registration; evaluate_held_out_gate (~line 204) runs them with cwd = committed_tree. The registration this task defines MUST round-trip through these unchanged.",
+      "packages/flywheel-core/src/flywheel_core/grader_command.py -- run_command_graders (~line 93-147) runs each command grader with shell=True, cwd = the supplied committed tree, env inherited from the worker; an oracle invoked by absolute path with cwd = committed tree therefore loads the agent's committed code.",
+      "packages/flywheel-core/src/flywheel_core/loaders.py -- load_graders is what FilesystemHeldOutGraderSource uses to validate registration entries; the registration shape is the same per-entry command-grader shape as a Task's graders field.",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate.py -- existing source-loading and fail-closed tests (~line 77-428); mirror their fixtures and extend them for the oracle-shaped registration. Keep this suite green."
+    ],
+    "constraints": [
+      "The registration is a `<root>/<task_id>.json` file holding one or more command graders that FilesystemHeldOutGraderSource.graders_for loads WITHOUT raising HeldOutGraderError (criterion #4). It is the same on-disk contract 00050's source already reads -- do not change the source.",
+      "The registration's command grader invokes the admitted oracle by its ABSOLUTE operator path; the gate runs it with the committed tree as cwd, so the oracle imports/loads the committed code while the oracle source stays outside that tree (D-2, criterion #6).",
+      "Discrimination must survive the round-trip: through evaluate_held_out_gate, a committed tree with a correct reference yields PASS and a committed tree with a seeded plausible-wrong reference yields FAIL -- the same kill-and-pass an oracle proves at authoring time (criterion #5).",
+      "Command graders only (D-5). A non-command or malformed registration must still fail closed via the existing source (criterion #4).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT modify FilesystemHeldOutGraderSource or evaluate_held_out_gate semantics (load path, fail-closed, exit-code verdict, cwd = committed tree); this task produces a registration the EXISTING source consumes.",
+      "Do NOT copy or stage the oracle file into the committed tree at gate time (it would re-land the oracle into the agent's view) -- reference it by absolute path from outside the tree (D-2).",
+      "Do NOT use a relative oracle path -- under cwd = committed tree it would resolve into the worktree where the oracle does not exist and fail closed on every run (D-2).",
+      "Do NOT modify flywheel-core's Task/Grader/lifecycle/schema (criterion #10); reuse load_graders / run_command_graders as-is.",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A malformed or non-command registration still fails closed (HeldOutGraderError -> FAIL), unchanged from 00050 (criterion #4).",
+      "The oracle file lives outside the committed tree (an absolute path) yet the verdict depends on the committed content -- a test must prove the gate's cwd is the committed tree, not the oracle's directory (criteria #5, #6).",
+      "If the registration ran the oracle with the wrong cwd, the oracle would import nothing and pass-on-everything (lost discrimination) -- the discrimination test must fail in that case, pinning cwd = committed tree."
+    ]
+  }
+}

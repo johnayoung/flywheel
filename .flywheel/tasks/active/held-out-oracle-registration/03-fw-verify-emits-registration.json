@@ -1,0 +1,34 @@
+{
+  "id": "fw-verify-emits-registration",
+  "goal": "The rendered `fw-verify` skill instructs writing an admitted oracle's registration to the configured held-out root keyed by task id, while still forbidding committing the oracle into the tracked repo or wiring it as an in-repo grader, and the skill renders with no leftover placeholder token.",
+  "prerequisites": ["held-out-registration-shape"],
+  "tags": ["orchestrator", "skills", "spec-00051", "held-out-gate", "fw-verify"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00051-held-out-oracle-registration.md -- acceptance criterion #8 and decision D-4 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-verify.md -- the template to edit: STEP 5 (record + fence, ~line 167-193) and STEP 6 (present, ~line 212-238), plus ANTI-PATTERNS (~line 240-257). Add a step that, when a held-out root is configured, writes the admitted oracle's `<root>/<task_id>.json` registration (the shape defined by the held-out-registration-shape task) keyed by task id and referencing the oracle by absolute path -- the sanctioned out-of-worktree channel 00050 created.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skills.py -- render_skill (~line 164-191) substitutes __FW_* tokens from SkillRenderSettings and ERRORS on any leftover __FW_ token after substitution. If the new step uses a __FW_HELD_OUT_DIR__ placeholder, wire it into SkillRenderSettings and the replacements map; otherwise reference [held_out] root descriptively. Either way no __FW_ token may survive.",
+      "packages/flywheel-orchestrator/tests/test_skills.py -- the skills render suite; keep green and add assertions that the rendered fw-verify text (a) instructs registration at the held-out root keyed by task id and (b) retains the no-commit-into-repo / no-in-repo-grader fence."
+    ],
+    "constraints": [
+      "The rendered fw-verify skill MUST simultaneously (a) instruct writing the admitted oracle's registration to the configured held-out root keyed by task id, and (b) retain the existing fence forbidding committing the oracle into the tracked repo or wiring it as an in-repo command grader (D-4, criterion #8). The two are distinct: registration writes to the git-ignored, out-of-worktree root; the forbidden move commits into the tracked tree.",
+      "render_skill must produce no leftover __FW_ token for the fw-verify template (criterion #8).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT remove or weaken the existing fw-verify anti-patterns against committing the oracle into the repo or wiring it as an in-repo grader -- the registration is the out-of-worktree channel, not a replacement for that fence (D-4).",
+      "Do NOT change where fw-verify authors oracles (still git-ignored .flywheel/verification/) or its discrimination / flake-screen gates.",
+      "Do NOT modify the held-out gate engine, FilesystemHeldOutGraderSource, or the registration shape (owned by the prerequisite task).",
+      "Do NOT modify flywheel-core (criterion #10).",
+      "Do NOT modify the test runner or other skill templates to make the render assertions pass; assert against the real rendered fw-verify output."
+    ],
+    "edge_cases": [
+      "The registration step and the no-commit fence must coexist in the rendered text without contradiction -- the distinction is out-of-worktree-git-ignored-root (registration) vs commit-into-tracked-tree (forbidden).",
+      "If a new __FW_HELD_OUT_DIR__ placeholder is introduced it must substitute cleanly for every rendered skill, leaving no __FW_ token (the render_skill leftover-token check)."
+    ]
+  }
+}

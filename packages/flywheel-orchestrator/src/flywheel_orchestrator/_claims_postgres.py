@@ -34,6 +34,7 @@ from flywheel_orchestrator._claims import (
     SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
+    encode_str_set,
 )
 
 if TYPE_CHECKING:
@@ -386,8 +387,10 @@ class PostgresClaimStore:
         ``first_seen_at`` is set only on the initial insert; ``last_seen_at``
         is set to ``now`` on every observation and any prior
         ``disappeared_at`` is cleared. ``task_content_hash`` is
-        ``task_digest(item.task)`` (D-1). The forward-compat columns are left
-        at their column defaults.
+        ``task_digest(item.task)`` (D-1). ``priority`` /
+        ``required_capabilities_json`` / ``conflict_keys_json`` are written
+        from the item's scheduling metadata (spec 00049); ``metadata_json``
+        is left at its column default.
         """
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -395,15 +398,23 @@ class PostgresClaimStore:
                     """
                     INSERT INTO work_items (
                         task_id, source_kind, source_ref, source_url,
-                        source_version, task_content_hash, first_seen_at,
-                        last_seen_at, disappeared_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                        source_version, task_content_hash, priority,
+                        required_capabilities_json, conflict_keys_json,
+                        first_seen_at, last_seen_at, disappeared_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s::jsonb, %s, %s, NULL
+                    )
                     ON CONFLICT (task_id) DO UPDATE SET
                         source_kind = EXCLUDED.source_kind,
                         source_ref = EXCLUDED.source_ref,
                         source_url = EXCLUDED.source_url,
                         source_version = EXCLUDED.source_version,
                         task_content_hash = EXCLUDED.task_content_hash,
+                        priority = EXCLUDED.priority,
+                        required_capabilities_json =
+                            EXCLUDED.required_capabilities_json,
+                        conflict_keys_json = EXCLUDED.conflict_keys_json,
                         last_seen_at = EXCLUDED.last_seen_at,
                         disappeared_at = NULL
                     """,
@@ -414,6 +425,9 @@ class PostgresClaimStore:
                         item.source_url,
                         item.source_version,
                         task_digest(item.task),
+                        item.priority,
+                        encode_str_set(item.required_capabilities),
+                        encode_str_set(item.conflict_keys),
                         now,
                         now,
                     ),

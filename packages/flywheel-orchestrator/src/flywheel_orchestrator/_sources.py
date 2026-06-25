@@ -70,6 +70,13 @@ class WorkItem:
     operator edits the underlying definition, and a locator (a file path,
     an issue URL). All three are optional so direct ``WorkItem``
     construction without provenance still compiles; adapters populate them.
+
+    ``priority``/``required_capabilities``/``conflict_keys`` are the
+    orchestration-layer scheduling metadata (spec 00049). They are not part
+    of the core single-task definition, so core ``flywheel`` ignores them;
+    file-backed sources read them from the task file's top-level JSON.
+    All three default (priority ``0``, both sets empty) so direct
+    construction without scheduling metadata still compiles.
     """
 
     task: Task
@@ -79,6 +86,9 @@ class WorkItem:
     source_kind: str | None = None
     source_version: str | None = None
     source_url: str | None = None
+    priority: int = 0
+    required_capabilities: frozenset[str] = frozenset()
+    conflict_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -158,6 +168,45 @@ def _read_prerequisites(path: Path) -> tuple[str, ...]:
     return tuple(str(p) for p in raw) if isinstance(raw, list) else ()
 
 
+def _read_str_set(raw: object) -> frozenset[str]:
+    """Coerce a JSON list-of-strings into a ``frozenset``; else empty."""
+    return (
+        frozenset(str(x) for x in raw) if isinstance(raw, list) else frozenset()
+    )
+
+
+def _read_scheduling_metadata(
+    path: Path,
+) -> tuple[int, frozenset[str], frozenset[str]]:
+    """Read a task file's orchestration scheduling metadata (spec 00049).
+
+    ``priority`` (int, default ``0``), ``required_capabilities`` and
+    ``conflict_keys`` (string sets, default empty) are orchestration-layer
+    keys core ``flywheel`` ignores, so the orchestrator parses them straight
+    from the task source, mirroring :func:`_read_prerequisites`. An absent or
+    malformed key yields its default. ``bool`` (a JSON ``true``/``false``) is
+    rejected as a priority — it is an ``int`` subclass but never a valid
+    priority value.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return (0, frozenset(), frozenset())
+    if not isinstance(data, dict):
+        return (0, frozenset(), frozenset())
+    raw_priority = data.get("priority")
+    priority = (
+        raw_priority
+        if isinstance(raw_priority, int) and not isinstance(raw_priority, bool)
+        else 0
+    )
+    return (
+        priority,
+        _read_str_set(data.get("required_capabilities")),
+        _read_str_set(data.get("conflict_keys")),
+    )
+
+
 def iter_active_phase_dirs(tasks_dir: Path) -> Iterator[Path]:
     """Yield ``active/<phase>`` subdirectories in deterministic order.
 
@@ -225,6 +274,9 @@ class DirectoryWorkSource:
     def list_work(self) -> list[WorkItem]:
         items: list[WorkItem] = []
         for path, task in load_active_tasks(self.tasks_dir):
+            priority, required_capabilities, conflict_keys = (
+                _read_scheduling_metadata(path)
+            )
             items.append(
                 WorkItem(
                     task=task,
@@ -234,6 +286,9 @@ class DirectoryWorkSource:
                     source_kind="directory",
                     source_version=task_digest(task),
                     source_url=str(path),
+                    priority=priority,
+                    required_capabilities=required_capabilities,
+                    conflict_keys=conflict_keys,
                 )
             )
         return items

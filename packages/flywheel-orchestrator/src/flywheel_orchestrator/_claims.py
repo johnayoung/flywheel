@@ -14,6 +14,7 @@ before the task definition is recorded and deleted on completion.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -81,11 +82,12 @@ class WorkItemRecord:
     is set when a *successful* sync no longer observes the item and is cleared
     (back to ``None``) the moment it is observed again.
 
-    ``priority`` / ``required_capabilities_json`` / ``conflict_keys_json`` /
-    ``metadata_json`` are forward-compat columns carried at their defaults
-    (``0`` / ``'[]'`` / ``'[]'`` / ``'{}'``); nothing populates them from a
-    ``WorkItem`` field until spec 00049. The ``*_json`` fields are canonical
-    JSON strings on both backends.
+    ``priority`` / ``required_capabilities_json`` / ``conflict_keys_json``
+    carry the item's scheduling metadata (spec 00049): an integer priority
+    and two canonical (sorted) JSON-array string sets, written from the
+    matching ``WorkItem`` fields. ``metadata_json`` remains a forward-compat
+    column carried at its default (``'{}'``); nothing populates it yet. The
+    ``*_json`` fields are canonical JSON strings on both backends.
     """
 
     task_id: str
@@ -181,6 +183,16 @@ class ClaimStore(Protocol):
 
 def _iso(ts: datetime) -> str:
     return ts.isoformat()
+
+
+def encode_str_set(values: frozenset[str]) -> str:
+    """Canonical JSON-array encoding of a string set (order-insensitive).
+
+    Sorted so the persisted ``*_json`` value is deterministic regardless of
+    set iteration order; the read-back decodes back to the same set. Shared by
+    both backends so SQLite TEXT and Postgres JSONB store identical content.
+    """
+    return json.dumps(sorted(values))
 
 
 def _parse_iso(value: str) -> datetime:
@@ -556,23 +568,29 @@ class SqliteClaimStore:
         ``first_seen_at`` is set only on the initial insert; ``last_seen_at``
         is set to ``now`` on every observation and any prior
         ``disappeared_at`` is cleared. ``task_content_hash`` is
-        ``task_digest(item.task)`` (D-1). The forward-compat columns
-        (priority / required_capabilities_json / conflict_keys_json /
-        metadata_json) are left at their column defaults.
+        ``task_digest(item.task)`` (D-1). ``priority`` /
+        ``required_capabilities_json`` / ``conflict_keys_json`` are written
+        from the item's scheduling metadata (spec 00049); ``metadata_json``
+        is left at its column default.
         """
         with self._transaction():
             self._connection.execute(
                 "INSERT INTO work_items ("
                 "  task_id, source_kind, source_ref, source_url, "
-                "  source_version, task_content_hash, first_seen_at, "
-                "  last_seen_at, disappeared_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL) "
+                "  source_version, task_content_hash, priority, "
+                "  required_capabilities_json, conflict_keys_json, "
+                "  first_seen_at, last_seen_at, disappeared_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) "
                 "ON CONFLICT(task_id) DO UPDATE SET "
                 "  source_kind = excluded.source_kind, "
                 "  source_ref = excluded.source_ref, "
                 "  source_url = excluded.source_url, "
                 "  source_version = excluded.source_version, "
                 "  task_content_hash = excluded.task_content_hash, "
+                "  priority = excluded.priority, "
+                "  required_capabilities_json = "
+                "    excluded.required_capabilities_json, "
+                "  conflict_keys_json = excluded.conflict_keys_json, "
                 "  last_seen_at = excluded.last_seen_at, "
                 "  disappeared_at = NULL",
                 (
@@ -582,6 +600,9 @@ class SqliteClaimStore:
                     item.source_url,
                     item.source_version,
                     task_digest(item.task),
+                    item.priority,
+                    encode_str_set(item.required_capabilities),
+                    encode_str_set(item.conflict_keys),
                     _iso(now),
                     _iso(now),
                 ),

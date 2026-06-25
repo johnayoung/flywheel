@@ -45,6 +45,14 @@ if TYPE_CHECKING:
     )
 
 
+from flywheel_orchestrator._held_out_gate import (
+    FilesystemHeldOutGraderSource,
+    GateOutcome,
+    GateVerdict,
+    HeldOutGraderError,
+    HeldOutGraderSource,
+    evaluate_held_out_gate,
+)
 from flywheel_orchestrator._github import GhRunner, GithubWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
@@ -141,9 +149,14 @@ __all__ = [
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DirectoryWorkSource",
+    "FilesystemHeldOutGraderSource",
+    "GateOutcome",
+    "GateVerdict",
     "GhRunner",
     "GithubWorkSource",
     "GraderReceipt",
+    "HeldOutGraderError",
+    "HeldOutGraderSource",
     "GraphValidationIssue",
     "GraphValidationResult",
     "InMemoryClaimStore",
@@ -190,6 +203,7 @@ __all__ = [
     "collect_history_rows",
     "collect_live_rows",
     "collect_run_detail",
+    "evaluate_held_out_gate",
     "phase_from_source",
     "resolve_run_id",
     "iter_active_phase_dirs",

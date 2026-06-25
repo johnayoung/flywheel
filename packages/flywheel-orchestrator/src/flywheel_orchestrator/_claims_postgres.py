@@ -34,6 +34,7 @@ from flywheel_orchestrator._claims import (
     SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
+    decode_str_set,
     encode_str_set,
 )
 
@@ -160,12 +161,23 @@ class PostgresClaimStore:
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS task_claims (
-                      task_id          TEXT PRIMARY KEY,
-                      worker_id        TEXT NOT NULL,
-                      claimed_at       TIMESTAMPTZ NOT NULL,
-                      lease_expires_at TIMESTAMPTZ NOT NULL,
-                      version          INTEGER NOT NULL
+                      task_id            TEXT PRIMARY KEY,
+                      worker_id          TEXT NOT NULL,
+                      claimed_at         TIMESTAMPTZ NOT NULL,
+                      lease_expires_at   TIMESTAMPTZ NOT NULL,
+                      version            INTEGER NOT NULL,
+                      conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb
                     )
+                    """
+                )
+                # Additive v3 migration: a pre-existing v1/v2 store has a
+                # task_claims table predating the conflict-keys column. ADD
+                # COLUMN IF NOT EXISTS adds it in place (default '[]', so every
+                # existing claim row survives); new stores already have it.
+                cur.execute(
+                    """
+                    ALTER TABLE task_claims ADD COLUMN IF NOT EXISTS
+                      conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb
                     """
                 )
                 cur.execute(
@@ -235,13 +247,16 @@ class PostgresClaimStore:
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
                 )
-                # Additive forward migration v1 -> v2: the new WorkGraph
-                # tables were just created above, so a pre-existing v1 store
-                # gains them with its task_claims rows intact. Converge the
-                # sentinel rather than refusing the store.
+                # Additive forward migration v1/v2 -> v3: the WorkGraph tables
+                # (v2) and the conflict-keys column (v3) were just materialized
+                # above, so a pre-existing store keeps its task_claims /
+                # work_items rows intact. Converge any older sentinel forward
+                # rather than refusing the store; a newer-than-current version
+                # still trips the mismatch guard below.
                 cur.execute(
-                    "UPDATE orchestrator_schema_version SET version = 2 "
-                    "WHERE id = 1 AND version = 1"
+                    "UPDATE orchestrator_schema_version SET version = %s "
+                    "WHERE id = 1 AND version < %s",
+                    (CURRENT_ORCH_SCHEMA_VERSION, CURRENT_ORCH_SCHEMA_VERSION),
                 )
                 cur.execute(
                     "SELECT version FROM orchestrator_schema_version "
@@ -261,26 +276,46 @@ class PostgresClaimStore:
         *,
         now: datetime,
         lease_seconds: float,
+        conflict_keys: frozenset[str] = frozenset(),
     ) -> TaskClaim | None:
         lease_expires = now + timedelta(seconds=lease_seconds)
+        incoming = frozenset(conflict_keys)
+        keys_json = encode_str_set(incoming)
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                # Refuse on conflict-key overlap with a *different* live claim.
+                # Run in the same transaction as the upsert; the task's own row
+                # is excluded and lapsed claims do not block, so the refusal
+                # clears once the conflicting claim is released or expires.
+                if incoming:
+                    cur.execute(
+                        """
+                        SELECT conflict_keys_json::text
+                        FROM task_claims
+                        WHERE task_id <> %s AND lease_expires_at > %s
+                        """,
+                        (task_id, now),
+                    )
+                    for other in cur.fetchall():
+                        if decode_str_set(other[0]) & incoming:
+                            return None
                 cur.execute(
                     """
                     INSERT INTO task_claims (
                         task_id, worker_id, claimed_at, lease_expires_at,
-                        version
-                    ) VALUES (%s, %s, %s, %s, 1)
+                        version, conflict_keys_json
+                    ) VALUES (%s, %s, %s, %s, 1, %s::jsonb)
                     ON CONFLICT (task_id) DO UPDATE SET
                         worker_id = EXCLUDED.worker_id,
                         claimed_at = EXCLUDED.claimed_at,
                         lease_expires_at = EXCLUDED.lease_expires_at,
-                        version = task_claims.version + 1
+                        version = task_claims.version + 1,
+                        conflict_keys_json = EXCLUDED.conflict_keys_json
                     WHERE task_claims.lease_expires_at <= EXCLUDED.claimed_at
                        OR task_claims.worker_id = EXCLUDED.worker_id
                     RETURNING version
                     """,
-                    (task_id, worker_id, now, lease_expires),
+                    (task_id, worker_id, now, lease_expires, keys_json),
                 )
                 row = cur.fetchone()
         if row is None:

@@ -38,7 +38,14 @@ if TYPE_CHECKING:
 # v1 store keeps its ``task_claims`` rows. All three tables are part of the same
 # v2 DDL block, so a store opened at v2 by an earlier build that predates the
 # ``source_syncs`` table gains it on the next open without a further bump.
-CURRENT_ORCH_SCHEMA_VERSION: int = 2
+#
+# v3 adds the additive ``task_claims.conflict_keys_json`` column (spec 00049,
+# D-4/D-5): each live claim records its item's conflict keys so ``acquire_claim``
+# can refuse an item overlapping a different live claim. The bump is additive --
+# pre-existing v1/v2 stores gain the column via ``ALTER TABLE ADD COLUMN`` (the
+# column defaults to ``'[]'``, so every surviving claim row keeps its data) and
+# converge their sentinel forward; no drop-and-recreate, no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 3
 
 
 class ClaimLostError(Exception):
@@ -141,7 +148,12 @@ class ClaimStore(Protocol):
     * ``acquire_claim`` returns a :class:`TaskClaim` when the task is free, the
       existing lease has expired (the new claim *steals* it), or the caller
       already holds it (idempotent re-acquire). It returns ``None`` when a
-      *live* lease is held by a different worker. The check-and-write is atomic.
+      *live* lease is held by a different worker, or when the item's
+      ``conflict_keys`` overlap those of a *different* live claim (so two
+      conflicting items never hold concurrent claims; spec 00049 D-3/D-4). The
+      refusal clears once the conflicting claim is released or its lease lapses.
+      ``conflict_keys`` defaults to empty, in which case acquisition is never
+      refused on a conflict basis. The check-and-write is atomic.
     * ``renew_claim`` extends the lease, bumping ``version``; it raises
       :class:`ClaimLostError` when the caller's token no longer matches.
     * ``release_claim`` drops the claim when the token still matches; a no-op
@@ -164,6 +176,7 @@ class ClaimStore(Protocol):
         *,
         now: datetime,
         lease_seconds: float,
+        conflict_keys: frozenset[str] = frozenset(),
     ) -> TaskClaim | None: ...
 
     def renew_claim(
@@ -193,6 +206,15 @@ def encode_str_set(values: frozenset[str]) -> str:
     both backends so SQLite TEXT and Postgres JSONB store identical content.
     """
     return json.dumps(sorted(values))
+
+
+def decode_str_set(value: str) -> frozenset[str]:
+    """Inverse of :func:`encode_str_set` -- a canonical JSON array to a set.
+
+    Shared by both backends so the conflict-key overlap check reads identical
+    content whether the column was stored as SQLite TEXT or Postgres JSONB.
+    """
+    return frozenset(json.loads(value))
 
 
 def _parse_iso(value: str) -> datetime:
@@ -240,6 +262,7 @@ class InMemoryClaimStore:
 
     def __init__(self) -> None:
         self._claims: dict[str, TaskClaim] = {}
+        self._conflict_keys: dict[str, frozenset[str]] = {}
 
     def acquire_claim(
         self,
@@ -248,6 +271,7 @@ class InMemoryClaimStore:
         *,
         now: datetime,
         lease_seconds: float,
+        conflict_keys: frozenset[str] = frozenset(),
     ) -> TaskClaim | None:
         existing = self._claims.get(task_id)
         free = (
@@ -256,6 +280,11 @@ class InMemoryClaimStore:
             or existing.worker_id == worker_id
         )
         if not free:
+            return None
+        incoming = frozenset(conflict_keys)
+        if incoming and self._has_conflicting_live_claim(
+            task_id, incoming, now=now
+        ):
             return None
         version = existing.version + 1 if existing is not None else 1
         claim = TaskClaim(
@@ -266,7 +295,26 @@ class InMemoryClaimStore:
             version=version,
         )
         self._claims[task_id] = claim
+        self._conflict_keys[task_id] = incoming
         return claim
+
+    def _has_conflicting_live_claim(
+        self,
+        task_id: str,
+        incoming: frozenset[str],
+        *,
+        now: datetime,
+    ) -> bool:
+        # A *different* live claim (another task whose lease has not lapsed)
+        # whose conflict keys overlap the incoming set blocks the acquire.
+        for other_id, other_claim in self._claims.items():
+            if other_id == task_id:
+                continue
+            if other_claim.lease_expires_at <= now:
+                continue
+            if self._conflict_keys.get(other_id, frozenset()) & incoming:
+                return True
+        return False
 
     def renew_claim(
         self,
@@ -300,6 +348,7 @@ class InMemoryClaimStore:
             and existing.worker_id == claim.worker_id
         ):
             del self._claims[claim.task_id]
+            self._conflict_keys.pop(claim.task_id, None)
 
     def load_claim(self, task_id: str) -> TaskClaim | None:
         return self._claims.get(task_id)
@@ -319,11 +368,12 @@ PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS task_claims (
-  task_id          TEXT PRIMARY KEY,
-  worker_id        TEXT NOT NULL,
-  claimed_at       DATETIME NOT NULL,
-  lease_expires_at DATETIME NOT NULL,
-  version          INTEGER NOT NULL
+  task_id            TEXT PRIMARY KEY,
+  worker_id          TEXT NOT NULL,
+  claimed_at         DATETIME NOT NULL,
+  lease_expires_at   DATETIME NOT NULL,
+  version            INTEGER NOT NULL,
+  conflict_keys_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS orchestrator_schema_version (
@@ -401,6 +451,20 @@ class SqliteClaimStore:
         conn.executescript(_SCHEMA_SQL)
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA busy_timeout = 5000;")
+        # Additive v3 migration: a pre-existing v1/v2 store has a task_claims
+        # table that predates the conflict-keys column. CREATE TABLE IF NOT
+        # EXISTS leaves that older table untouched, so add the column in place
+        # (defaulting to '[]', preserving every existing claim row). New stores
+        # already have it from the CREATE TABLE above, so the ALTER is skipped.
+        columns = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(task_claims)").fetchall()
+        }
+        if "conflict_keys_json" not in columns:
+            conn.execute(
+                "ALTER TABLE task_claims "
+                "ADD COLUMN conflict_keys_json TEXT NOT NULL DEFAULT '[]'"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO orchestrator_schema_version (id, version) "
             "VALUES (1, ?)",
@@ -410,16 +474,18 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1 -> v2: the new WorkGraph tables were
-        # already created above by the CREATE TABLE IF NOT EXISTS DDL, so a
-        # pre-existing v1 store gains them with its task_claims rows intact.
-        # Converge the sentinel rather than refusing the store.
-        if observed == 1:
+        # Additive forward migration v1/v2 -> v3: the WorkGraph tables (v2) and
+        # the conflict-keys column (v3) were already materialized above, so a
+        # pre-existing store keeps its task_claims/work_items rows intact.
+        # Converge the sentinel forward rather than refusing the store; a
+        # newer-than-current version still trips the mismatch guard below.
+        if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
-                "UPDATE orchestrator_schema_version SET version = 2 "
-                "WHERE id = 1"
+                "UPDATE orchestrator_schema_version SET version = ? "
+                "WHERE id = 1",
+                (CURRENT_ORCH_SCHEMA_VERSION,),
             )
-            observed = 2
+            observed = CURRENT_ORCH_SCHEMA_VERSION
         if observed != CURRENT_ORCH_SCHEMA_VERSION:
             raise OrchestratorSchemaError(
                 observed=observed, expected=CURRENT_ORCH_SCHEMA_VERSION
@@ -443,20 +509,43 @@ class SqliteClaimStore:
         *,
         now: datetime,
         lease_seconds: float,
+        conflict_keys: frozenset[str] = frozenset(),
     ) -> TaskClaim | None:
         lease_expires = now + timedelta(seconds=lease_seconds)
+        incoming = frozenset(conflict_keys)
+        keys_json = encode_str_set(incoming)
         with self._transaction():
             row = self._connection.execute(
                 "SELECT worker_id, lease_expires_at, version "
                 "FROM task_claims WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
+            if (
+                row is not None
+                and _parse_iso(row["lease_expires_at"]) > now
+                and row["worker_id"] != worker_id
+            ):
+                return None
+            # Refuse on conflict-key overlap with a *different* live claim. The
+            # task's own row (re-acquire / expiry-steal of the same task_id) is
+            # excluded, and lapsed claims do not block -- so the refusal clears
+            # once the conflicting claim is released or its lease expires.
+            if incoming and self._has_conflicting_live_claim(
+                task_id, incoming, now=now
+            ):
+                return None
             if row is None:
                 self._connection.execute(
                     "INSERT INTO task_claims (task_id, worker_id, "
-                    "claimed_at, lease_expires_at, version) "
-                    "VALUES (?, ?, ?, ?, 1)",
-                    (task_id, worker_id, _iso(now), _iso(lease_expires)),
+                    "claimed_at, lease_expires_at, version, "
+                    "conflict_keys_json) VALUES (?, ?, ?, ?, 1, ?)",
+                    (
+                        task_id,
+                        worker_id,
+                        _iso(now),
+                        _iso(lease_expires),
+                        keys_json,
+                    ),
                 )
                 return TaskClaim(
                     task_id=task_id,
@@ -465,18 +554,17 @@ class SqliteClaimStore:
                     lease_expires_at=lease_expires,
                     version=1,
                 )
-            existing_expires = _parse_iso(row["lease_expires_at"])
-            if existing_expires > now and row["worker_id"] != worker_id:
-                return None
             new_version = int(row["version"]) + 1
             self._connection.execute(
                 "UPDATE task_claims SET worker_id = ?, claimed_at = ?, "
-                "lease_expires_at = ?, version = ? WHERE task_id = ?",
+                "lease_expires_at = ?, version = ?, conflict_keys_json = ? "
+                "WHERE task_id = ?",
                 (
                     worker_id,
                     _iso(now),
                     _iso(lease_expires),
                     new_version,
+                    keys_json,
                     task_id,
                 ),
             )
@@ -487,6 +575,25 @@ class SqliteClaimStore:
                 lease_expires_at=lease_expires,
                 version=new_version,
             )
+
+    def _has_conflicting_live_claim(
+        self,
+        task_id: str,
+        incoming: frozenset[str],
+        *,
+        now: datetime,
+    ) -> bool:
+        # A *different* live claim (another task_id whose lease has not lapsed)
+        # whose stored conflict keys overlap the incoming set blocks acquire.
+        rows = self._connection.execute(
+            "SELECT conflict_keys_json FROM task_claims "
+            "WHERE task_id != ? AND lease_expires_at > ?",
+            (task_id, _iso(now)),
+        ).fetchall()
+        for row in rows:
+            if decode_str_set(row["conflict_keys_json"]) & incoming:
+                return True
+        return False
 
     def renew_claim(
         self,

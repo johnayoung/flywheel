@@ -555,6 +555,23 @@ def test_github_ci_empty_failure_filter_raises(tmp_path: Path) -> None:
         )
 
 
+def test_github_review_requires_repo(tmp_path: Path) -> None:
+    # criterion #9: kind = "github_review" without source.repo raises
+    # PolicyError naming the missing repo key.
+    with pytest.raises(PolicyError, match="source.repo is required"):
+        load_policy(_write(tmp_path, '[source]\nkind = "github_review"\n'))
+
+
+def test_github_review_kind_and_repo_loads(tmp_path: Path) -> None:
+    # criterion #8: a kind+repo policy resolves source_kind == "github_review"
+    # and carries the repo onto the policy.
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "github_review"\nrepo = "a/b"\n')
+    )
+    assert policy.source_kind == "github_review"
+    assert policy.github_review_repo == "a/b"
+
+
 def test_bad_done_action_raises(tmp_path: Path) -> None:
     with pytest.raises(PolicyError, match="source.done_action"):
         load_policy(

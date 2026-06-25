@@ -63,6 +63,7 @@ from flywheel_orchestrator._policy import (
     PolicyError,
     WorkPolicy,
     build_github_ci_source,
+    build_github_review_source,
     build_work_source,
     load_policy,
 )
@@ -204,6 +205,7 @@ __all__ = [
     "WorkSourceError",
     "archive_completed_phases",
     "build_github_ci_source",
+    "build_github_review_source",
     "build_oracle_registration",
     "build_status_rows",
     "build_store",

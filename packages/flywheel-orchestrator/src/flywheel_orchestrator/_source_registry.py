@@ -40,5 +40,12 @@ SOURCES.register(
         summary="failed GitHub CI runs via the gh CLI",
     )
 )
+SOURCES.register(
+    PluginSpec(
+        name="github_review",
+        target="flywheel_orchestrator._policy:build_github_review_source",
+        summary="unresolved GitHub PR review threads via the gh CLI",
+    )
+)
 
 __all__ = ["SOURCES"]

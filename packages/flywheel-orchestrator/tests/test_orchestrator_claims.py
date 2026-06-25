@@ -13,6 +13,7 @@ import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -29,6 +30,9 @@ from flywheel_orchestrator import (
     InMemoryClaimStore,
     SqliteClaimStore,
 )
+
+if TYPE_CHECKING:
+    from flywheel_orchestrator import PostgresClaimStore
 
 # The Postgres container is provided session-scoped by the root conftest
 # (``postgres_dsn``); a None DSN skips the postgres cases.
@@ -1157,5 +1161,280 @@ def test_v3_postgres_store_opens_under_v4_with_rows_and_empty_ledger(
         assert claim is not None and claim.worker_id == "worker-1"
         assert store.load_work_item("task-a") is not None
         assert store.list_events() == []
+    finally:
+        store.close()
+
+
+# -- cross-backend snapshot parity + Postgres migration (spec 00055) --------
+
+
+def _drive_snapshot_sequence(
+    store: SqliteClaimStore | PostgresClaimStore,
+) -> None:
+    """Record one identical snapshot sequence against any durable backend.
+
+    Exercises every dimension the parity holdout must cover: a snapshot taken
+    at cursor 0 (empty ledger), claim events that advance the
+    ``orchestrator_events`` high-water mark, a snapshot past that mark holding a
+    mixed-provenance ready+held item and a blocked unheld item with a non-empty
+    resolved-prerequisites set, and an empty-graph snapshot.
+    """
+    # Snapshot #1: cursor 0, before any claim event lands.
+    store.record_graph_snapshot(
+        [GraphSnapshotItem(task_id="seed", state="pending", ready=False)],
+        captured_at=_t(0),
+    )
+    # Append claim events so the ledger high-water mark advances past 0.
+    a = store.acquire_claim("task-a", "worker-1", now=_t(1), lease_seconds=30)
+    assert a is not None
+    a = store.renew_claim(a, now=_t(5), lease_seconds=30)
+    b = store.acquire_claim("task-b", "worker-3", now=_t(2), lease_seconds=30)
+    assert b is not None
+    # Snapshot #2: past the high-water mark, mixed provenance + ready/blocked.
+    item_a = GraphSnapshotItem(
+        task_id="task-a",
+        source_kind="directory",
+        source_ref="/tasks/a.json",
+        source_url="/tasks/a.json",
+        source_version="hash-a",
+        priority=5,
+        required_capabilities=frozenset({"gpu", "linux"}),
+        conflict_keys=frozenset({"resource-x"}),
+        state="running",
+        ready=True,
+        claim_holder="worker-1",
+        resolved_prerequisites=frozenset(),
+    )
+    item_b = GraphSnapshotItem(
+        task_id="task-b",
+        source_kind="github_issue",
+        source_ref="owner/repo#7",
+        source_url="https://example/7",
+        source_version="hash-b",
+        priority=0,
+        required_capabilities=frozenset(),
+        conflict_keys=frozenset(),
+        state="blocked",
+        ready=False,
+        claim_holder=None,
+        resolved_prerequisites=frozenset({"task-a", "task-z"}),
+    )
+    store.record_graph_snapshot([item_a, item_b], captured_at=_t(6))
+    # Snapshot #3: an empty graph still records a valid snapshot.
+    store.record_graph_snapshot([], captured_at=_t(8))
+
+
+def _snapshot_header_tuples(records: list) -> list[tuple]:
+    # Drop the backend-assigned snapshot id; compare recorded content + order.
+    return [(r.captured_at, r.item_count, r.last_event_id) for r in records]
+
+
+def test_sqlite_postgres_graph_snapshot_parity(
+    tmp_path: Path,
+    postgres_dsn: str | None,
+) -> None:
+    # Criterion #9: the same record_graph_snapshot input sequence yields equal
+    # snapshot streams and item rows across backends -- same item field
+    # spellings, states, holders, captured-at, cursors, and insertion order --
+    # after dropping the backend-assigned snapshot ids. This is the composition
+    # holdout over the shared snapshot-record invariant.
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    from flywheel_orchestrator import PostgresClaimStore
+
+    sqlite_store = SqliteClaimStore(tmp_path / "snap_parity.db")
+    pg_store = PostgresClaimStore(
+        postgres_dsn,
+        schema=f"flywheel_claims_test_{uuid4().hex[:12]}",
+        pool_min=1,
+        pool_max=4,
+    )
+    try:
+        _drive_snapshot_sequence(sqlite_store)
+        _drive_snapshot_sequence(pg_store)
+        sqlite_stream = sqlite_store.list_graph_snapshots()
+        pg_stream = pg_store.list_graph_snapshots()
+        # Header streams equal modulo the backend-assigned ids.
+        assert _snapshot_header_tuples(
+            sqlite_stream
+        ) == _snapshot_header_tuples(pg_stream)
+        # Cursor coverage: the first snapshot is at cursor 0 and a later one is
+        # stamped at the live ledger high-water mark -- a missing/zero cursor on
+        # one backend must fail.
+        cursors = [r.last_event_id for r in sqlite_stream]
+        assert cursors[0] == 0
+        assert max(cursors) == sqlite_store.list_events()[-1].id
+        assert max(cursors) == pg_store.list_events()[-1].id
+        # Item rows equal per snapshot (read-back GraphSnapshotItems are id-free
+        # so compare directly), in the same task_id order.
+        for s_rec, p_rec in zip(sqlite_stream, pg_stream):
+            assert sqlite_store.list_graph_snapshot_items(
+                s_rec.id
+            ) == pg_store.list_graph_snapshot_items(p_rec.id)
+        # Latest equals modulo id.
+        s_latest = sqlite_store.latest_graph_snapshot()
+        p_latest = pg_store.latest_graph_snapshot()
+        assert s_latest is not None and p_latest is not None
+        assert (
+            s_latest.captured_at,
+            s_latest.item_count,
+            s_latest.last_event_id,
+        ) == (
+            p_latest.captured_at,
+            p_latest.item_count,
+            p_latest.last_event_id,
+        )
+    finally:
+        sqlite_store.close()
+        pg_store.close()
+
+
+def _build_v4_postgres_store(dsn: str, schema: str) -> None:
+    """Materialize a schema-v4 Postgres orchestrator store (pre-snapshot).
+
+    Mirrors the v4 DDL (task_claims + conflict_keys_json, the sentinel,
+    work_items, source_syncs, orchestrator_events) in a fresh schema and seeds
+    claim, work-item, source-sync, and event rows, so the v5 build's additive
+    migration can be exercised against a real pre-existing Postgres store -- no
+    graph_snapshots / graph_snapshot_items tables present.
+    """
+    import psycopg
+    from psycopg import sql
+
+    conn = psycopg.connect(dsn)
+    try:
+        conn.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(schema)
+            )
+        )
+        conn.execute(
+            sql.SQL("SET search_path TO {}, public").format(
+                sql.Identifier(schema)
+            )
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_claims (
+              task_id            TEXT PRIMARY KEY,
+              worker_id          TEXT NOT NULL,
+              claimed_at         TIMESTAMPTZ NOT NULL,
+              lease_expires_at   TIMESTAMPTZ NOT NULL,
+              version            INTEGER NOT NULL,
+              conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE orchestrator_schema_version (
+              id      INTEGER PRIMARY KEY CHECK (id = 1),
+              version INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE work_items (
+              task_id           TEXT PRIMARY KEY,
+              source_kind       TEXT,
+              source_ref        TEXT,
+              source_url        TEXT,
+              source_version    TEXT,
+              task_content_hash TEXT,
+              priority          INTEGER NOT NULL DEFAULT 0,
+              required_capabilities_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              first_seen_at     TIMESTAMPTZ NOT NULL,
+              last_seen_at      TIMESTAMPTZ NOT NULL,
+              disappeared_at    TIMESTAMPTZ,
+              metadata_json     JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE source_syncs (
+              id             BIGSERIAL PRIMARY KEY,
+              source_kind    TEXT NOT NULL,
+              source_name    TEXT NOT NULL,
+              started_at     TIMESTAMPTZ NOT NULL,
+              finished_at    TIMESTAMPTZ,
+              status         TEXT NOT NULL,
+              observed_count INTEGER NOT NULL DEFAULT 0,
+              error          TEXT,
+              metadata_json  JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE orchestrator_events (
+              id               BIGSERIAL PRIMARY KEY,
+              task_id          TEXT NOT NULL,
+              worker_id        TEXT NOT NULL,
+              event_type       TEXT NOT NULL,
+              version          INTEGER NOT NULL,
+              lease_expires_at TIMESTAMPTZ NOT NULL,
+              occurred_at      TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_claims (task_id, worker_id, claimed_at, "
+            "lease_expires_at, version, conflict_keys_json) "
+            "VALUES ('task-a', 'worker-1', %s, %s, 1, '[]'::jsonb)",
+            (_t(0), _t(30)),
+        )
+        conn.execute(
+            "INSERT INTO work_items (task_id, first_seen_at, last_seen_at) "
+            "VALUES ('task-a', %s, %s)",
+            (_t(0), _t(0)),
+        )
+        conn.execute(
+            "INSERT INTO source_syncs (source_kind, source_name, started_at, "
+            "status, observed_count) VALUES ('directory', '/tasks', %s, "
+            "'ok', 1)",
+            (_t(0),),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_events (task_id, worker_id, event_type, "
+            "version, lease_expires_at, occurred_at) "
+            "VALUES ('task-a', 'worker-1', 'acquired', 1, %s, %s)",
+            (_t(30), _t(0)),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_schema_version (id, version) "
+            "VALUES (1, 4)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v4_postgres_store_opens_under_v5_with_rows_and_empty_snapshots(
+    postgres_dsn: str | None,
+) -> None:
+    # Criterion #10: a pre-existing v4 Postgres store opens under the v5 build
+    # without OrchestratorSchemaError, keeps its task_claims / work_items /
+    # source_syncs / orchestrator_events rows, and exposes an empty snapshot
+    # stream -- the additive, non-destructive bump.
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    from flywheel_orchestrator import PostgresClaimStore
+
+    schema = f"flywheel_claims_test_{uuid4().hex[:12]}"
+    _build_v4_postgres_store(postgres_dsn, schema)
+    store = PostgresClaimStore(
+        postgres_dsn, schema=schema, pool_min=1, pool_max=4
+    )
+    try:
+        claim = store.load_claim("task-a")
+        assert claim is not None and claim.worker_id == "worker-1"
+        assert store.load_work_item("task-a") is not None
+        assert len(store.list_source_syncs()) == 1
+        assert len(store.list_events()) == 1
+        assert store.list_graph_snapshots() == []
+        assert store.latest_graph_snapshot() is None
     finally:
         store.close()

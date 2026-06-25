@@ -35,6 +35,8 @@ from flywheel_orchestrator._claims import (
     EVENT_RENEWED,
     EVENT_STOLEN,
     ClaimLostError,
+    GraphSnapshotItem,
+    GraphSnapshotRecord,
     OrchestratorEventRecord,
     OrchestratorSchemaError,
     SourceSyncRecord,
@@ -84,6 +86,55 @@ _ORCH_EVENT_SELECT = """
            lease_expires_at, occurred_at
     FROM orchestrator_events
 """
+
+
+_GRAPH_SNAPSHOT_SELECT = """
+    SELECT id, captured_at, item_count, last_event_id
+    FROM graph_snapshots
+"""
+
+
+# JSONB set columns are cast to text so the read-back ``*_json`` content decodes
+# through the same ``decode_str_set`` the SQLite TEXT columns use -- identical
+# required_capabilities / conflict_keys / resolved-prerequisites sets across
+# backends regardless of storage representation.
+_GRAPH_SNAPSHOT_ITEM_SELECT = """
+    SELECT task_id, source_kind, source_ref, source_url, source_version,
+           priority,
+           required_capabilities_json::text AS required_capabilities_json,
+           conflict_keys_json::text AS conflict_keys_json,
+           state, ready, claim_holder,
+           resolved_prerequisites_json::text AS resolved_prerequisites_json
+    FROM graph_snapshot_items
+"""
+
+
+def _row_to_graph_snapshot_record(row: dict[str, Any]) -> GraphSnapshotRecord:
+    return GraphSnapshotRecord(
+        id=int(row["id"]),
+        captured_at=row["captured_at"],
+        item_count=int(row["item_count"]),
+        last_event_id=int(row["last_event_id"]),
+    )
+
+
+def _row_to_graph_snapshot_item(row: dict[str, Any]) -> GraphSnapshotItem:
+    return GraphSnapshotItem(
+        task_id=row["task_id"],
+        source_kind=row["source_kind"],
+        source_ref=row["source_ref"],
+        source_url=row["source_url"],
+        source_version=row["source_version"],
+        priority=int(row["priority"]),
+        required_capabilities=decode_str_set(row["required_capabilities_json"]),
+        conflict_keys=decode_str_set(row["conflict_keys_json"]),
+        state=row["state"],
+        ready=bool(row["ready"]),
+        claim_holder=row["claim_holder"],
+        resolved_prerequisites=decode_str_set(
+            row["resolved_prerequisites_json"]
+        ),
+    )
 
 
 def _row_to_orchestrator_event_record(
@@ -292,18 +343,66 @@ class PostgresClaimStore:
                       ON orchestrator_events (task_id, id)
                     """
                 )
+                # Additive v5 migration: the append-only WorkGraph snapshot
+                # record (header + per-item rows). CREATE TABLE IF NOT EXISTS
+                # materializes both tables on open, so a pre-existing
+                # v1/v2/v3/v4 store keeps every task_claims / work_items /
+                # source_syncs / orchestrator_events row and simply gains an
+                # empty snapshot stream -- no drop-and-recreate.
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS graph_snapshots (
+                      id            BIGSERIAL PRIMARY KEY,
+                      captured_at   TIMESTAMPTZ NOT NULL,
+                      item_count    INTEGER NOT NULL,
+                      last_event_id BIGINT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS graph_snapshot_items (
+                      snapshot_id                 BIGINT NOT NULL,
+                      task_id                     TEXT NOT NULL,
+                      source_kind                 TEXT,
+                      source_ref                  TEXT,
+                      source_url                  TEXT,
+                      source_version              TEXT,
+                      priority                    INTEGER NOT NULL DEFAULT 0,
+                      required_capabilities_json  JSONB NOT NULL
+                                                  DEFAULT '[]'::jsonb,
+                      conflict_keys_json          JSONB NOT NULL
+                                                  DEFAULT '[]'::jsonb,
+                      state                       TEXT NOT NULL,
+                      ready                       BOOLEAN NOT NULL,
+                      claim_holder                TEXT,
+                      resolved_prerequisites_json JSONB NOT NULL
+                                                  DEFAULT '[]'::jsonb,
+                      PRIMARY KEY (snapshot_id, task_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_graph_snapshot_items_snapshot
+                      ON graph_snapshot_items (snapshot_id)
+                    """
+                )
                 cur.execute(
                     "INSERT INTO orchestrator_schema_version (id, version) "
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
                 )
-                # Additive forward migration v1/v2/v3 -> v4: the WorkGraph
-                # tables (v2), the conflict-keys column (v3), and the
-                # orchestrator_events ledger (v4) were just materialized above,
-                # so a pre-existing store keeps its task_claims / work_items
-                # rows intact. Converge any older sentinel forward rather than
-                # refusing the store; a newer-than-current version still trips
-                # the mismatch guard below.
+                # Additive forward migration v1/v2/v3/v4 -> v5: the WorkGraph
+                # tables (v2), the conflict-keys column (v3), the
+                # orchestrator_events ledger (v4), and the graph_snapshots /
+                # graph_snapshot_items tables (v5) were just materialized above,
+                # so a pre-existing store keeps its task_claims / work_items /
+                # source_syncs / orchestrator_events rows intact. Converge any
+                # older sentinel forward rather than refusing the store; a
+                # newer-than-current version still trips the mismatch guard
+                # below.
                 cur.execute(
                     "UPDATE orchestrator_schema_version SET version = %s "
                     "WHERE id = 1 AND version < %s",
@@ -619,6 +718,115 @@ class PostgresClaimStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_orchestrator_event_record(row) for row in rows]
+
+    # -- WorkGraph snapshots (schema v5) -----------------------------------
+
+    def record_graph_snapshot(
+        self,
+        items: Iterable[GraphSnapshotItem],
+        *,
+        captured_at: datetime,
+    ) -> GraphSnapshotRecord:
+        """Record one WorkGraph snapshot atomically (spec 00055, D-3).
+
+        The header row and every item row commit in a single transaction, so a
+        reader never sees a snapshot whose item rows are a subset of what it
+        captured (criterion #3). ``last_event_id`` is stamped by the store as
+        the live ``orchestrator_events`` max id read *inside* this transaction
+        (0 when the ledger is empty, D-2), never caller-supplied, so it cannot
+        drift from the ledger. An empty ``items`` still records a valid snapshot
+        with item count 0 (criterion #11). Append-only: a fresh snapshot id per
+        call, never overwriting an earlier one.
+        """
+        materialized = list(items)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM orchestrator_events"
+                )
+                hwm_row = cur.fetchone()
+                assert hwm_row is not None  # COALESCE aggregate always rows
+                last_event_id = int(hwm_row[0])
+                cur.execute(
+                    """
+                    INSERT INTO graph_snapshots
+                        (captured_at, item_count, last_event_id)
+                    VALUES (%s, %s, %s)
+                    RETURNING id
+                    """,
+                    (captured_at, len(materialized), last_event_id),
+                )
+                id_row = cur.fetchone()
+                assert id_row is not None  # RETURNING id always yields a row
+                snapshot_id = int(id_row[0])
+                for item in materialized:
+                    cur.execute(
+                        """
+                        INSERT INTO graph_snapshot_items (
+                            snapshot_id, task_id, source_kind, source_ref,
+                            source_url, source_version, priority,
+                            required_capabilities_json, conflict_keys_json,
+                            state, ready, claim_holder,
+                            resolved_prerequisites_json
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb
+                        )
+                        """,
+                        (
+                            snapshot_id,
+                            item.task_id,
+                            item.source_kind,
+                            item.source_ref,
+                            item.source_url,
+                            item.source_version,
+                            item.priority,
+                            encode_str_set(item.required_capabilities),
+                            encode_str_set(item.conflict_keys),
+                            item.state,
+                            item.ready,
+                            item.claim_holder,
+                            encode_str_set(item.resolved_prerequisites),
+                        ),
+                    )
+        return GraphSnapshotRecord(
+            id=snapshot_id,
+            captured_at=captured_at,
+            item_count=len(materialized),
+            last_event_id=last_event_id,
+        )
+
+    def list_graph_snapshots(self) -> list[GraphSnapshotRecord]:
+        # Snapshot stream: every recorded header in id (insertion) order.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_GRAPH_SNAPSHOT_SELECT + " ORDER BY id")
+                rows = cur.fetchall()
+        return [_row_to_graph_snapshot_record(row) for row in rows]
+
+    def list_graph_snapshot_items(
+        self, snapshot_id: int
+    ) -> list[GraphSnapshotItem]:
+        # One snapshot's item rows in task_id order. Unknown id -> empty list.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _GRAPH_SNAPSHOT_ITEM_SELECT
+                    + " WHERE snapshot_id = %s ORDER BY task_id",
+                    (snapshot_id,),
+                )
+                rows = cur.fetchall()
+        return [_row_to_graph_snapshot_item(row) for row in rows]
+
+    def latest_graph_snapshot(self) -> GraphSnapshotRecord | None:
+        # Most recently recorded snapshot header; None on an empty store.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _GRAPH_SNAPSHOT_SELECT + " ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+        return _row_to_graph_snapshot_record(row) if row is not None else None
 
     # -- WorkGraph persistence (schema v2) ---------------------------------
 

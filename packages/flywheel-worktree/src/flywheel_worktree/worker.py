@@ -62,6 +62,7 @@ from flywheel_core import (
 )
 from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_orchestrator import (
+    FilesystemHeldOutGraderSource,
     HeldOutGraderSource,
     OrchestratorReport,
     PolicyError,
@@ -1354,6 +1355,29 @@ def maybe_wrap_for_backend(
     )
 
 
+def build_held_out_source(
+    policy: WorkPolicy | None, repo_root: Path
+) -> HeldOutGraderSource | None:
+    """Construct the execute-time held-out grader source from policy, or ``None``.
+
+    Activation is opt-in (spec 00051, criterion #2, decision D-3): a source is
+    built only when ``[held_out] root`` is configured. When the key is absent
+    the worker supplies no source, so :func:`orchestrate` runs the gate for no
+    task and landing is byte-identical to today.
+
+    A relative ``[held_out] root`` resolves against ``repo_root`` so it points
+    at ``<repo_root>/<root>`` regardless of the worker's cwd or any sandbox path
+    (criterion #3); an absolute root is honored as written. The 00050
+    :class:`FilesystemHeldOutGraderSource` is reused unchanged (D-5) -- this
+    only supplies it, it does not re-decide gate behavior. The root is *not*
+    materialized into any agent worktree; the orchestrator reads it out of band
+    (D-1, criterion #7).
+    """
+    if policy is None or policy.held_out_root is None:
+        return None
+    return FilesystemHeldOutGraderSource(root=repo_root / policy.held_out_root)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
@@ -1420,6 +1444,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         submitter, policy, model=model, env=os.environ, log=log
     )
 
+    # Execute-time held-out landing gate (spec 00051): opt-in, built only when
+    # [held_out] root is configured, resolved against repo_root. When unset this
+    # is None and landing is byte-identical to today.
+    held_out_source = build_held_out_source(policy, repo_root)
+    if held_out_source is not None and policy is not None:
+        log(f"held-out gate active root={repo_root / policy.held_out_root}")
+
     log(f"started pid={os.getpid()} base={phase_base} db={db_path}")
     log(
         f"tasks={tasks_dir} worktrees={worktrees_dir} "
@@ -1463,6 +1494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     log=log,
                     policy=policy,
                     strategy=run_strategy,
+                    held_out_source=held_out_source,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 log(

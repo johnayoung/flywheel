@@ -35,6 +35,7 @@ from flywheel_core import (
 )
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
+    FilesystemHeldOutGraderSource,
     SandboxRequest,
     StoreConfigError,
     SubmitRequest,
@@ -851,6 +852,52 @@ def test_submitter_is_a_submit_strategy(tmp_path: Path) -> None:
     # GitWorktreeSubmitter is the reference SubmitStrategy: structural
     # conformance is what lets run_once pass it whole to orchestrate.
     assert isinstance(_submitter(repo), SubmitStrategy)
+
+
+# --- held-out gate activation (spec 00051) ----------------------------------
+
+
+def test_build_held_out_source_none_when_policy_none(tmp_path: Path) -> None:
+    """No policy => no source: landing byte-identical to today (criterion #2)."""
+    assert worker.build_held_out_source(None, tmp_path) is None
+
+
+def test_build_held_out_source_none_when_root_unset(tmp_path: Path) -> None:
+    """A policy without [held_out] root builds no source -- the gate is opt-in
+    and stays inert on upgrade (criterion #2, D-3)."""
+    policy = WorkPolicy(source_kind="directory", tasks_dir=tmp_path)
+    assert policy.held_out_root is None
+    assert worker.build_held_out_source(policy, tmp_path) is None
+
+
+def test_build_held_out_source_resolves_relative_against_repo_root(
+    tmp_path: Path,
+) -> None:
+    """A relative [held_out] root resolves to <repo_root>/<root> regardless of
+    cwd (criterion #3), constructing the 00050 source unchanged (D-5)."""
+    repo_root = tmp_path / "repo"
+    policy = WorkPolicy(
+        source_kind="directory",
+        tasks_dir=repo_root,
+        held_out_root=Path(".flywheel/held-out"),
+    )
+    source = worker.build_held_out_source(policy, repo_root)
+    assert isinstance(source, FilesystemHeldOutGraderSource)
+    assert source.root == repo_root / ".flywheel" / "held-out"
+
+
+def test_build_held_out_source_honors_absolute_root(tmp_path: Path) -> None:
+    """An absolute [held_out] root is honored verbatim, not re-rooted."""
+    repo_root = tmp_path / "repo"
+    abs_root = tmp_path / "elsewhere" / "held-out"
+    policy = WorkPolicy(
+        source_kind="directory",
+        tasks_dir=repo_root,
+        held_out_root=abs_root,
+    )
+    source = worker.build_held_out_source(policy, repo_root)
+    assert isinstance(source, FilesystemHeldOutGraderSource)
+    assert source.root == abs_root
 
 
 # --- submit: protected-path merge gate -----------------------------------------

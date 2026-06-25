@@ -81,6 +81,16 @@ Format (TOML, stdlib ``tomllib``)::
     [phase]
     verify = "uv run pytest"
 
+    # Held-out landing gate (optional). root is the directory of
+    # operator-declared held-out grader registrations the execute-time gate
+    # (spec 00050) reads, one ``<task_id>.json`` per gated task. The worker
+    # resolves a relative root against the repo root. Unset means no gate is
+    # activated: the worker builds no held-out source and landing is
+    # byte-identical to today (spec 00051). There is deliberately no default
+    # root -- a default would silently activate gating on upgrade.
+    [held_out]
+    root = ".flywheel/held-out"
+
 The defaults keep flywheel's readiness gate mechanical without forcing
 every ticket author to write graders: an issue with no graders and no
 default policy is not runnable and never reaches the scheduler.
@@ -322,7 +332,13 @@ class WorkPolicy:
     (new sandboxes are used bare). ``phase_verify`` mirrors the optional
     ``[phase] verify`` command run against the merged phase base before a
     phase archives; ``None`` when unset (no phase-exit gate, today's
-    archival behavior).
+    archival behavior). ``held_out_root`` mirrors the optional
+    ``[held_out] root`` key -- the directory of operator-declared held-out
+    grader registrations the execute-time landing gate (spec 00050) reads,
+    resolved relative to the repo root by the worker; ``None`` when unset so
+    the worker builds no held-out source and landing stays byte-identical
+    (spec 00051, criterion #2, decision D-3). A default that silently
+    activates gating on upgrade is deliberately absent.
     """
 
     source_kind: str
@@ -345,6 +361,7 @@ class WorkPolicy:
     submit_base: str | None = None
     sandbox_setup: str | None = None
     phase_verify: str | None = None
+    held_out_root: Path | None = None
     sandbox: SandboxPolicy = field(default_factory=SandboxPolicy)
 
 
@@ -432,6 +449,11 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [phase] must be a table")
     phase_verify = _optional_phase_verify(phase, policy_file=path)
 
+    held_out = data.get("held_out") or {}
+    if not isinstance(held_out, dict):
+        raise PolicyError(f"{path}: [held_out] must be a table")
+    held_out_root = _optional_held_out_root(held_out, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -458,6 +480,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_base=submit_base,
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
+            held_out_root=held_out_root,
             sandbox=sandbox_policy,
         )
 
@@ -497,6 +520,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_base=submit_base,
         sandbox_setup=sandbox_setup,
         phase_verify=phase_verify,
+        held_out_root=held_out_root,
         sandbox=sandbox_policy,
     )
 
@@ -717,6 +741,30 @@ def _optional_phase_verify(
             f"{policy_file}: phase.verify must be a non-empty string"
         )
     return value
+
+
+def _optional_held_out_root(
+    table: dict, *, policy_file: Path
+) -> Path | None:
+    """Validate and return the optional ``held_out.root`` path.
+
+    Returns ``None`` when the section (or the ``root`` key) is absent so an
+    unconfigured policy never activates the execute-time held-out gate (spec
+    00051, criterion #2, decision D-3): the worker builds no held-out source
+    and landing stays byte-identical. A non-string or empty/whitespace-only
+    value raises :class:`PolicyError` so a typo never silently leaves the gate
+    inert. The path is returned as written; the worker resolves a relative
+    value against the repo root so it points at ``<repo_root>/<root>``
+    regardless of the worker's cwd (criterion #3).
+    """
+    value = table.get("root")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: held_out.root must be a non-empty string"
+        )
+    return Path(value)
 
 
 def _sandbox_subtable(

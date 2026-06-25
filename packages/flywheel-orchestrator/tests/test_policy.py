@@ -857,3 +857,94 @@ def test_phase_verify_carries_on_github_policy(tmp_path: Path) -> None:
     )
     assert policy.source_kind == "github"
     assert policy.phase_verify == "uv run pytest"
+
+
+# --- [held_out] root (spec 00051) -------------------------------------------
+
+
+def test_held_out_root_default_none_when_table_absent(tmp_path: Path) -> None:
+    """No [held_out] table at all yields held_out_root=None (no gate, D-3)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.held_out_root is None
+
+
+def test_held_out_root_default_none_when_key_absent(tmp_path: Path) -> None:
+    """A [held_out] table present but no root key yields held_out_root=None
+    and raises no PolicyError (gate stays inert)."""
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\n[held_out]\n')
+    )
+    assert policy.held_out_root is None
+
+
+def test_held_out_root_parses_relative(tmp_path: Path) -> None:
+    """A relative root is returned verbatim as a Path; resolution against the
+    repo root is the worker's job (criterion #3)."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            '[held_out]\nroot = ".flywheel/held-out"\n',
+        )
+    )
+    assert policy.held_out_root == Path(".flywheel/held-out")
+
+
+def test_held_out_root_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="held_out.root"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[held_out]\nroot = ""\n',
+            )
+        )
+
+
+def test_held_out_root_rejects_whitespace_only_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="held_out.root"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[held_out]\nroot = "   "\n',
+            )
+        )
+
+
+def test_held_out_root_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="held_out.root"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[held_out]\nroot = 42\n',
+            )
+        )
+
+
+def test_held_out_table_rejects_non_table(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match=r"\[held_out\] must be a table"):
+        load_policy(
+            _write(
+                tmp_path,
+                'held_out = "nope"\n[source]\nkind = "directory"\n',
+            )
+        )
+
+
+def test_held_out_root_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[held_out]",
+                    'root = "ops/held-out"',
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.held_out_root == Path("ops/held-out")

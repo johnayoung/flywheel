@@ -35,12 +35,14 @@ Invariants this engine enforces (and the spec criteria they defend):
 from __future__ import annotations
 
 import json
+import os
+import shlex
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from flywheel_core.grader_command import run_command_graders
 from flywheel_core.loaders import TaskLoadError, load_graders
@@ -201,6 +203,111 @@ class FilesystemHeldOutGraderSource:
         return candidate
 
 
+def build_oracle_registration(
+    oracle_path: str | os.PathLike[str],
+    *,
+    name: str | None = None,
+    interpreter: str | None = None,
+) -> dict[str, Any]:
+    """Express an admitted held-out oracle as a registration the gate loads.
+
+    Returns the JSON-serializable registration body for an admitted ``fw-verify``
+    oracle: a single held-out **command** grader (D-5) whose ``run`` invokes the
+    oracle by its **absolute** operator path. Written to ``<root>/<task_id>.json``
+    (see :func:`write_oracle_registration`), it is loaded verbatim by
+    :meth:`FilesystemHeldOutGraderSource.graders_for` and run by
+    :func:`evaluate_held_out_gate` with the agent's committed tree as ``cwd`` — so
+    the oracle, invoked by an out-of-tree absolute path, observes the committed
+    code through its working directory while the oracle source stays outside that
+    tree (D-2, criteria #5/#6).
+
+    ``interpreter`` (e.g. ``"python3"``) prefixes the command for oracles that are
+    not directly executable; omit it for a self-executable oracle.
+
+    Raises :class:`ValueError` for a relative ``oracle_path``: under
+    ``cwd = committed tree`` a relative path resolves into the agent's worktree,
+    where the oracle does not exist, so the gate would fail closed on every run
+    (D-2). The returned shape is validated through the *same* loader the gate's
+    source uses, so a registration this builder produces always round-trips
+    through :meth:`FilesystemHeldOutGraderSource.graders_for` without raising.
+    """
+    path = Path(oracle_path)
+    if not path.is_absolute():
+        raise ValueError(
+            f"held-out oracle path must be absolute, not {str(path)!r}: under "
+            f"cwd = committed tree a relative path resolves into the agent's "
+            f"worktree where the oracle does not exist, failing the gate closed "
+            f"on every run (D-2)"
+        )
+
+    quoted = shlex.quote(str(path))
+    run = f"{interpreter} {quoted}" if interpreter else quoted
+    grader: dict[str, Any] = {
+        "type": "command",
+        "run": run,
+        "name": name or f"held-out-oracle:{path.name}",
+    }
+    registration: dict[str, Any] = {"graders": [grader]}
+
+    # Validate the produced shape parses through the loader the gate's source
+    # uses (load_graders) and yields command graders only (D-5). A registration
+    # the gate cannot parse fails closed and blocks every run, so building one
+    # the source already accepts is part of the shape's contract (#4).
+    try:
+        graders = load_graders(
+            registration["graders"], source="<oracle registration>"
+        )
+    except TaskLoadError as exc:  # pragma: no cover - constructed shape is valid
+        raise ValueError(
+            f"built held-out oracle registration is not loadable: {exc}"
+        ) from exc
+    if not graders or not all(isinstance(g, CommandGrader) for g in graders):
+        raise ValueError(  # pragma: no cover - constructed shape is command-only
+            "held-out oracle registration must be command graders only (D-5)"
+        )
+    return registration
+
+
+def write_oracle_registration(
+    root: str | os.PathLike[str],
+    task_id: str,
+    oracle_path: str | os.PathLike[str],
+    *,
+    name: str | None = None,
+    interpreter: str | None = None,
+) -> Path:
+    """Write an admitted oracle's registration to ``<root>/<task_id>.json``.
+
+    The on-disk half of :func:`build_oracle_registration`: keyed by task id under
+    the operator's held-out ``root`` — the git-ignored payload directory the
+    orchestrator points the source at, never the agent's committed tree. Creates
+    ``root`` if absent and overwrites any existing registration for the task id.
+    Returns the path written.
+
+    Raises :class:`ValueError` when ``task_id`` would escape ``root`` (a
+    separator or ``..``), mirroring the source's path-traversal refusal so a
+    malformed id never writes outside the held-out root.
+    """
+    root_path = Path(root)
+    registration = build_oracle_registration(
+        oracle_path, name=name, interpreter=interpreter
+    )
+
+    target = (root_path / f"{task_id}.json").resolve()
+    if target.parent != root_path.resolve():
+        raise ValueError(
+            f"task id {task_id!r} does not resolve to a file directly under "
+            f"{root_path} (path traversal refused)"
+        )
+
+    root_path.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(registration, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
 def evaluate_held_out_gate(
     task: Task,
     source: HeldOutGraderSource,
@@ -353,5 +460,7 @@ __all__ = [
     "GateVerdict",
     "HeldOutGraderError",
     "HeldOutGraderSource",
+    "build_oracle_registration",
     "evaluate_held_out_gate",
+    "write_oracle_registration",
 ]

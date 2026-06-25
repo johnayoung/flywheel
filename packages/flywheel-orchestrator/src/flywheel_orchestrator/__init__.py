@@ -51,7 +51,9 @@ from flywheel_orchestrator._held_out_gate import (
     GateVerdict,
     HeldOutGraderError,
     HeldOutGraderSource,
+    build_oracle_registration,
     evaluate_held_out_gate,
+    write_oracle_registration,
 )
 from flywheel_orchestrator._github import GhRunner, GithubWorkSource
 from flywheel_orchestrator._policy import (
@@ -196,6 +198,7 @@ __all__ = [
     "WorkSource",
     "WorkSourceError",
     "archive_completed_phases",
+    "build_oracle_registration",
     "build_status_rows",
     "build_store",
     "build_task_phase_index",
@@ -224,5 +227,6 @@ __all__ = [
     "status_rows_for_items",
     "sync_work_source",
     "task_state",
+    "write_oracle_registration",
     "write_phase_base_if_missing",
 ]

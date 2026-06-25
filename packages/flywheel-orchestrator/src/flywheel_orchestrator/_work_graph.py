@@ -258,6 +258,8 @@ class WorkGraph:
         self,
         states: Mapping[str, Any],
         excluded: Iterable[str] = frozenset(),
+        *,
+        worker_capabilities: frozenset[str] = frozenset(),
     ) -> tuple[WorkItem, ...]:
         """Every currently-runnable item — and only those.
 
@@ -266,13 +268,25 @@ class WorkGraph:
         * its id is not in ``excluded``, AND
         * its own state (``states[id]``) is eligible — fresh, retryable, or
           interrupted (mirrors ``select_next_task``), AND
-        * every prerequisite resolves to a node whose state is DONE.
+        * every prerequisite resolves to a node whose state is DONE, AND
+        * its ``required_capabilities`` is a subset of
+          ``worker_capabilities``.
 
         ``states`` maps task id to its ``TaskState`` (or the equivalent
         string). A task with a dangling prerequisite, an unknown/ineligible
         own state, or an excluded id is omitted. Unlike ``select_next_task``,
         this returns *all* matches (no early return) so parallel children all
-        surface; order follows construction (walk) order.
+        surface.
+
+        The returned items are ordered by descending ``priority``, ties
+        broken by construction (walk) order via a *stable* sort (spec 00049,
+        decision D-1) — so the caller's first element is the highest-priority
+        runnable item, and an all-default (priority 0) set keeps pure walk
+        order. ``worker_capabilities`` is the worker's advertised capability
+        set (decision D-2): an item with empty ``required_capabilities`` is
+        runnable by any worker, including one with an empty set; the default
+        empty set preserves today's behavior for every existing zero-
+        requirement item. Both behaviors apply in both execution modes.
         """
         excluded_ids = set(excluded)
         runnable: list[WorkItem] = []
@@ -282,6 +296,8 @@ class WorkGraph:
                 continue
             if _state_value(states.get(task_id)) not in _ELIGIBLE_STATE_VALUES:
                 continue
+            if not item.required_capabilities <= worker_capabilities:
+                continue
             prereqs_satisfied = all(
                 prereq_id in self._by_id
                 and _state_value(states.get(prereq_id)) == _DONE_STATE_VALUE
@@ -289,6 +305,10 @@ class WorkGraph:
             )
             if prereqs_satisfied:
                 runnable.append(item)
+        # Stable descending-priority sort: equal-priority items keep walk
+        # order, so an all-default set is byte-identical to the prior
+        # construction-order result.
+        runnable.sort(key=lambda item: item.priority, reverse=True)
         return tuple(runnable)
 
 

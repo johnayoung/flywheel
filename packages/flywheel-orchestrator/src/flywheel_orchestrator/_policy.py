@@ -41,6 +41,15 @@ Format (TOML, stdlib ``tomllib``)::
     backend = "sqlite"              # or "postgres"
     # schema = "flywheel_ci"        # postgres only; optional
 
+    # Execution policy (optional). mode is "local" (default) or
+    # "distributed". capabilities is this worker's advertised capability set
+    # (default empty): the scheduler offers this worker only items whose
+    # required_capabilities is a subset of it. Distinct from
+    # [sandbox.capabilities] (the agent's tool/skill/MCP surface).
+    [execution]
+    mode = "local"
+    capabilities = ["gpu", "cuda"]
+
     # Sandbox provisioning (optional). setup runs (shell) inside every
     # newly created sandbox before the agent enters — dependency install,
     # codegen — so tasks never pay discovery cost for a bare worktree.
@@ -299,6 +308,13 @@ class WorkPolicy:
     ``"distributed"``); it is a pure load-time validation assertion that
     gates no runtime scheduling/claim/lease behavior, so an absent
     ``[execution]`` table resolves to ``local`` with no behavior change.
+    ``execution_capabilities`` mirrors the optional ``[execution]
+    capabilities`` list -- this worker's advertised capability set (spec
+    00049, decision D-2), distinct from ``[sandbox.capabilities]`` (the
+    agent's tool/skill/MCP surface). The scheduler offers this worker only
+    items whose ``required_capabilities`` is a subset of it; empty (the
+    default, an absent key) preserves today's behavior -- every existing
+    zero-requirement item is selectable.
     ``submit_base`` is the explicit
     landing/phase-base branch; ``None`` falls back to the checked-out
     branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
@@ -321,6 +337,7 @@ class WorkPolicy:
     store_backend: str = "sqlite"
     store_schema: str | None = None
     execution_mode: str = "local"
+    execution_capabilities: frozenset[str] = frozenset()
     protected_paths: tuple[str, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
@@ -383,6 +400,9 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(execution, dict):
         raise PolicyError(f"{path}: [execution] must be a table")
     execution_mode = _optional_execution_mode(execution, policy_file=path)
+    execution_capabilities = _optional_execution_capabilities(
+        execution, policy_file=path
+    )
     if execution_mode == "distributed" and store_backend != "postgres":
         raise PolicyError(
             f"{path}: execution.mode = 'distributed' requires "
@@ -430,6 +450,7 @@ def load_policy(path: Path) -> WorkPolicy:
             store_backend=store_backend,
             store_schema=store_schema,
             execution_mode=execution_mode,
+            execution_capabilities=execution_capabilities,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -468,6 +489,7 @@ def load_policy(path: Path) -> WorkPolicy:
         store_backend=store_backend,
         store_schema=store_schema,
         execution_mode=execution_mode,
+        execution_capabilities=execution_capabilities,
         protected_paths=protected_paths,
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
@@ -561,6 +583,33 @@ def _optional_execution_mode(
             f"{_EXECUTION_MODES}, got {mode!r}"
         )
     return mode
+
+
+def _optional_execution_capabilities(
+    table: dict, *, policy_file: Path
+) -> frozenset[str]:
+    """Validate and return the optional ``[execution] capabilities`` set.
+
+    This worker's advertised capability set (spec 00049, decision D-2):
+    the scheduler offers this worker only items whose
+    ``required_capabilities`` is a subset of it. Returns ``frozenset()``
+    when the section (or the ``capabilities`` key) is absent so every
+    pre-existing policy file keeps loading unchanged and every existing
+    zero-requirement item stays selectable. A non-list value, or any entry
+    that is not a non-empty string, raises :class:`PolicyError` so a typo
+    never silently degrades into "no capabilities advertised."
+    """
+    value = table.get("capabilities")
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise PolicyError(
+            f"{policy_file}: execution.capabilities must be a list of "
+            f"non-empty strings"
+        )
+    return frozenset(value)
 
 
 def _optional_protected_paths(

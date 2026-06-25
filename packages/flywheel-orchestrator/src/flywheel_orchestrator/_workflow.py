@@ -143,6 +143,14 @@ class TaskStatusRow:
     :class:`flywheel_orchestrator._sources.WorkItem`). ``task_file`` is the
     on-disk path for file-backed sources and an empty ``Path()`` otherwise —
     path-deriving consumers must treat an empty path as "no file".
+
+    ``priority`` and ``required_capabilities`` mirror the item's
+    orchestration-layer scheduling metadata (spec 00049), carried on the row
+    so :func:`select_next_task` can offer ready items highest-priority-first
+    and withhold an item whose ``required_capabilities`` is not a subset of
+    the worker's advertised capability set. Both default (priority ``0``,
+    empty set) so a default-metadata row sorts to its original walk order and
+    is selectable by any worker.
     """
 
     task_file: Path
@@ -155,6 +163,8 @@ class TaskStatusRow:
     awaiting_manual_ordinal: int | None = None
     prerequisites: tuple[str, ...] = ()
     source_ref: str = ""
+    priority: int = 0
+    required_capabilities: frozenset[str] = frozenset()
 
 _ACTIVE_STATUSES: frozenset[Status] = frozenset(
     {Status.READY, Status.RUNNING, Status.VALIDATING}
@@ -269,6 +279,8 @@ def status_rows_for_items(
                 awaiting_manual_ordinal=snapshot.awaiting_manual_ordinal,
                 prerequisites=item.prerequisites,
                 source_ref=item.source_ref,
+                priority=item.priority,
+                required_capabilities=item.required_capabilities,
             )
         )
     return rows
@@ -285,15 +297,24 @@ def select_next_task(
     rows: Iterable[TaskStatusRow],
     *,
     exclude_ids: frozenset[str] = frozenset(),
+    worker_capabilities: frozenset[str] = frozenset(),
 ) -> TaskStatusRow | None:
-    """Pick the first eligible task from ``rows``.
+    """Pick the highest-priority eligible task from ``rows``.
 
     A task is eligible when:
 
     * its ``id`` is not in ``exclude_ids``, AND
     * its state is :attr:`TaskState.FRESH`, :attr:`TaskState.RETRYABLE`,
       or :attr:`TaskState.INTERRUPTED`, AND
-    * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`.
+    * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`,
+      AND
+    * its ``required_capabilities`` is a subset of ``worker_capabilities``.
+
+    Among the eligible candidates the offer order is descending ``priority``,
+    ties broken by walk (enumeration) order via a *stable* sort (spec 00049,
+    decision D-1). With every candidate at the default priority (0) this
+    reduces to the original first-eligible-in-walk-order pick exactly, so an
+    all-default set is byte-identical to the pre-feature behavior.
 
     Tasks whose prerequisites are missing from the workspace are treated
     as ineligible so a dangling reference never silently runs.
@@ -303,6 +324,12 @@ def select_next_task(
     orchestrator) can skip an already-attempted or still-blocked task while
     that task can still satisfy a dependent's prerequisite. The default
     empty set preserves the pull-based CLI's behavior exactly.
+
+    ``worker_capabilities`` is the worker's advertised capability set (spec
+    00049, decision D-2). An item with empty ``required_capabilities`` is
+    selectable by any worker, including one with an empty set; the default
+    empty set preserves today's behavior for every existing zero-requirement
+    item. The same filter applies in both execution modes.
 
     Interrupted tasks resume because ``run_task`` normalizes an entry-time
     ``INTERRUPTED`` lifecycle back to ``READY`` (see harness ``run_task``
@@ -315,10 +342,13 @@ def select_next_task(
         TaskState.RETRYABLE,
         TaskState.INTERRUPTED,
     )
+    candidates: list[TaskStatusRow] = []
     for row in by_id.values():
         if row.task.id in exclude_ids:
             continue
         if row.state not in eligible_states:
+            continue
+        if not row.required_capabilities <= worker_capabilities:
             continue
         if not all(
             (dep := by_id.get(prereq_id)) is not None
@@ -326,8 +356,14 @@ def select_next_task(
             for prereq_id in row.prerequisites
         ):
             continue
-        return row
-    return None
+        candidates.append(row)
+    if not candidates:
+        return None
+    # Stable descending-priority sort: equal-priority candidates keep their
+    # walk order, so an all-default (priority 0) set returns the first
+    # eligible candidate exactly as before.
+    candidates.sort(key=lambda row: row.priority, reverse=True)
+    return candidates[0]
 
 IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
 
@@ -811,9 +847,12 @@ def _cmd_next(args: argparse.Namespace) -> int:
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = open_sqlite_bound_store(policy, db_path=db_path)
+    worker_capabilities = (
+        policy.execution_capabilities if policy is not None else frozenset()
+    )
     try:
         rows = status_rows_for_items(source.list_work(), store)
-        pick = select_next_task(rows)
+        pick = select_next_task(rows, worker_capabilities=worker_capabilities)
     finally:
         store.close()
     if pick is None:

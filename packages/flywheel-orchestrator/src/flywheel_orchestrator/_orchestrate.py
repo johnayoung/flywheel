@@ -667,6 +667,13 @@ async def orchestrate(
         submit = strategy.submit
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
+    # This worker's advertised capability set (spec 00049, decision D-2):
+    # ready_set withholds any item whose required_capabilities is not a
+    # subset of it. Empty (the default, an absent [execution] capabilities
+    # key) keeps every existing zero-requirement item runnable.
+    worker_capabilities = (
+        policy.execution_capabilities if policy is not None else frozenset()
+    )
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
     sandbox_primitives = _sandbox_agent_primitives(policy)
     limit_primitives = _sandbox_limit_primitives(policy)
@@ -916,18 +923,25 @@ async def orchestrate(
             ran_fresh = False
             while True:
                 exclude = attempted_fresh | blocked_ids | held
-                # First-eligible-in-walk-order over the validated graph:
-                # ready_set returns every runnable item (own state eligible,
-                # all prerequisites DONE, id not excluded) in construction
-                # (walk) order, so taking the first preserves
-                # select_next_task's deterministic selection byte-for-byte
-                # while sourcing eligibility from the validated graph. An
-                # excluded id drops from candidacy but still satisfies a
-                # dependent's prerequisite (ready_set grades prerequisites off
-                # ``states``, not ``excluded``), matching exclude_ids
-                # semantics. A dangling prerequisite keeps its task out of the
-                # ready set -- it never runs -- exactly as before.
-                ready = graph.ready_set(states, excluded=exclude)
+                # Highest-priority-first over the validated graph: ready_set
+                # returns every runnable item (own state eligible, all
+                # prerequisites DONE, required_capabilities a subset of this
+                # worker's set, id not excluded) ordered by descending
+                # priority with a stable walk-order tie-break, so taking the
+                # first preserves select_next_task's deterministic selection
+                # byte-for-byte (and, at all-default priority, the prior pure
+                # walk order) while sourcing eligibility from the validated
+                # graph. An excluded id drops from candidacy but still
+                # satisfies a dependent's prerequisite (ready_set grades
+                # prerequisites off ``states``, not ``excluded``), matching
+                # exclude_ids semantics. A dangling prerequisite keeps its
+                # task out of the ready set -- it never runs -- exactly as
+                # before.
+                ready = graph.ready_set(
+                    states,
+                    excluded=exclude,
+                    worker_capabilities=worker_capabilities,
+                )
                 pick = row_by_id[ready[0].task.id] if ready else None
                 if pick is None:
                     break

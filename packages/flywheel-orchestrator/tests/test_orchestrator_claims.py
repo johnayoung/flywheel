@@ -618,3 +618,190 @@ def test_v3_store_opens_under_v4_with_rows_and_empty_ledger(
         assert store.list_events() == []
     finally:
         store.close()
+
+
+# -- cross-backend parity + Postgres migration (spec 00054, #10/#11) -------
+
+
+def _drive_lease_sequence(store: object) -> None:
+    """Drive one identical acquire/renew/steal/sweep/release sequence.
+
+    Touches every event type: ``acquired`` (task-a fresh, task-b fresh),
+    ``renewed`` (task-a), ``stolen`` (task-a reclaimed after its lease lapses),
+    ``expired`` (task-b reaped by the sweep), ``released`` (task-a dropped).
+    """
+    assert isinstance(store, ClaimStore)
+    a = store.acquire_claim("task-a", "worker-1", now=_t(0), lease_seconds=20)
+    assert a is not None
+    a = store.renew_claim(a, now=_t(5), lease_seconds=20)
+    b = store.acquire_claim("task-b", "worker-3", now=_t(2), lease_seconds=10)
+    assert b is not None
+    stolen = store.acquire_claim(
+        "task-a", "worker-2", now=_t(26), lease_seconds=30
+    )
+    assert stolen is not None
+    reaped = store.sweep_expired_claims(now=_t(30))
+    assert reaped == ["task-b"]
+    store.release_claim(stolen, now=_t(40))  # type: ignore[call-arg]
+
+
+def _event_tuples(events: list) -> list[tuple]:
+    # Drop the backend-assigned row id; compare the recorded content + order.
+    return [
+        (
+            e.task_id,
+            e.worker_id,
+            e.event_type,
+            e.version,
+            e.lease_expires_at,
+            e.occurred_at,
+        )
+        for e in events
+    ]
+
+
+def test_sqlite_postgres_event_ledger_parity(
+    tmp_path: Path,
+    postgres_dsn: str | None,
+) -> None:
+    # Criterion #10: the same transition sequence yields equal event lists
+    # across backends -- same type spellings, worker ids, versions, lease /
+    # occurred timestamps, and insertion order -- after dropping row ids.
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    from flywheel_orchestrator import PostgresClaimStore
+
+    sqlite_store = SqliteClaimStore(tmp_path / "parity.db")
+    pg_store = PostgresClaimStore(
+        postgres_dsn,
+        schema=f"flywheel_claims_test_{uuid4().hex[:12]}",
+        pool_min=1,
+        pool_max=4,
+    )
+    try:
+        _drive_lease_sequence(sqlite_store)
+        _drive_lease_sequence(pg_store)
+        sqlite_global = _event_tuples(sqlite_store.list_events())
+        assert sqlite_global == _event_tuples(pg_store.list_events())
+        # The five event types are all exercised, so the parity holds over the
+        # whole taxonomy rather than a subset.
+        assert {row[2] for row in sqlite_global} == {
+            EVENT_ACQUIRED,
+            EVENT_RENEWED,
+            EVENT_STOLEN,
+            EVENT_EXPIRED,
+            EVENT_RELEASED,
+        }
+        for task_id in ("task-a", "task-b"):
+            assert _event_tuples(
+                sqlite_store.list_task_events(task_id)
+            ) == _event_tuples(pg_store.list_task_events(task_id))
+    finally:
+        sqlite_store.close()
+        pg_store.close()
+
+
+def _build_v3_postgres_store(dsn: str, schema: str) -> None:
+    """Materialize a schema-v3 Postgres orchestrator store (pre-ledger).
+
+    Mirrors the v3 DDL (task_claims + conflict_keys_json, the sentinel,
+    work_items) in a fresh schema and seeds claim + work-item rows, so the v4
+    build's additive migration can be exercised against a real pre-existing
+    Postgres store -- no orchestrator_events table present.
+    """
+    import psycopg
+    from psycopg import sql
+
+    conn = psycopg.connect(dsn)
+    try:
+        conn.execute(
+            sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                sql.Identifier(schema)
+            )
+        )
+        conn.execute(
+            sql.SQL("SET search_path TO {}, public").format(
+                sql.Identifier(schema)
+            )
+        )
+        conn.execute(
+            """
+            CREATE TABLE task_claims (
+              task_id            TEXT PRIMARY KEY,
+              worker_id          TEXT NOT NULL,
+              claimed_at         TIMESTAMPTZ NOT NULL,
+              lease_expires_at   TIMESTAMPTZ NOT NULL,
+              version            INTEGER NOT NULL,
+              conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE orchestrator_schema_version (
+              id      INTEGER PRIMARY KEY CHECK (id = 1),
+              version INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE work_items (
+              task_id           TEXT PRIMARY KEY,
+              source_kind       TEXT,
+              source_ref        TEXT,
+              source_url        TEXT,
+              source_version    TEXT,
+              task_content_hash TEXT,
+              priority          INTEGER NOT NULL DEFAULT 0,
+              required_capabilities_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+              first_seen_at     TIMESTAMPTZ NOT NULL,
+              last_seen_at      TIMESTAMPTZ NOT NULL,
+              disappeared_at    TIMESTAMPTZ,
+              metadata_json     JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_claims (task_id, worker_id, claimed_at, "
+            "lease_expires_at, version, conflict_keys_json) "
+            "VALUES ('task-a', 'worker-1', %s, %s, 1, '[]'::jsonb)",
+            (_t(0), _t(30)),
+        )
+        conn.execute(
+            "INSERT INTO work_items (task_id, first_seen_at, last_seen_at) "
+            "VALUES ('task-a', %s, %s)",
+            (_t(0), _t(0)),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_schema_version (id, version) "
+            "VALUES (1, 3)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_v3_postgres_store_opens_under_v4_with_rows_and_empty_ledger(
+    postgres_dsn: str | None,
+) -> None:
+    # Criterion #11: a pre-existing v3 Postgres store opens under the v4 build
+    # without OrchestratorSchemaError, keeps its task_claims and work_items
+    # rows, and exposes an empty ledger -- the additive, non-destructive bump.
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    from flywheel_orchestrator import PostgresClaimStore
+
+    schema = f"flywheel_claims_test_{uuid4().hex[:12]}"
+    _build_v3_postgres_store(postgres_dsn, schema)
+    store = PostgresClaimStore(
+        postgres_dsn, schema=schema, pool_min=1, pool_max=4
+    )
+    try:
+        claim = store.load_claim("task-a")
+        assert claim is not None and claim.worker_id == "worker-1"
+        assert store.load_work_item("task-a") is not None
+        assert store.list_events() == []
+    finally:
+        store.close()

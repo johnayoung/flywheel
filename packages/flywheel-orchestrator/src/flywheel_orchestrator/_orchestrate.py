@@ -93,6 +93,12 @@ from flywheel_core.workflow import (
     _stranded_run_ids,
     run_task_object,
 )
+from flywheel_orchestrator._held_out_gate import (
+    GateOutcome,
+    GateVerdict,
+    HeldOutGraderSource,
+    evaluate_held_out_gate,
+)
 from flywheel_orchestrator._policy import SandboxPolicy, WorkPolicy
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
@@ -332,13 +338,26 @@ def sync_work_source(
 
 @dataclass(frozen=True, kw_only=True)
 class RunRecord:
-    """One task execution the orchestrator drove, in launch order."""
+    """One task execution the orchestrator drove, in launch order.
+
+    ``gate`` is the held-out landing gate's verdict for this run (spec 00050,
+    D-6): ``None`` when the gate did not run (no held-out source configured,
+    or a non-landing terminal status), ``GateOutcome.NO_GATE``/``PASS`` when
+    the task landed, and ``GateOutcome.FAIL`` when the gate blocked the land.
+    This makes a gate failure distinguishable from both a clean land (``gate``
+    is never ``FAIL`` there) and an agent-run failure (``status`` is not
+    ``DONE`` there): only a gate-blocked land carries ``status == DONE`` with
+    ``gate is GateOutcome.FAIL`` (criterion #6). ``gate_reason`` is the
+    operator-readable summary behind that marker, empty when no gate ran.
+    """
 
     task_id: str
     run_id: str
     status: Status
     mode: Literal["fresh", "resume"]
     worker_id: str
+    gate: GateOutcome | None = None
+    gate_reason: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -597,6 +616,7 @@ async def orchestrate(
     strategy: SubmitStrategy | None = None,
     reconcile_seconds: float | None = None,
     repo_root: Path | None = None,
+    held_out_source: HeldOutGraderSource | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task from the work source to quiescence.
 
@@ -650,6 +670,17 @@ async def orchestrate(
     unprovisionable-task skip so one bad task never starves eligible peers.
     ``None`` (the default for library callers) disables the gate, preserving
     prior behavior.
+
+    ``held_out_source`` enables the execute-time held-out landing gate (spec
+    00050): after a task's run finalizes with the landing status (``DONE``) and
+    while its lease is still held, the orchestrator loads that task's
+    operator-declared held-out command graders from this source (the agent
+    never saw them), runs them against the committed sandbox out of band, and
+    blocks the land on any failure -- ``submit`` is not invoked, the sandbox is
+    left parked for forensics, and the run's :class:`RunRecord` carries a
+    distinct ``GateOutcome.FAIL`` marker. A task with no registration in the
+    source lands byte-identically to today, as does every task when
+    ``held_out_source`` is ``None`` (the default).
     """
     if source is None:
         if tasks_dir is None:
@@ -834,6 +865,7 @@ async def orchestrate(
                         submit=submit,
                         teardown=handle.teardown,
                         work_source=source,
+                        held_out_source=held_out_source,
                         run_id=run_id,
                         worker_id=wid,
                         lease_seconds=lease_seconds,
@@ -1016,6 +1048,7 @@ async def orchestrate(
                     submit=submit,
                     teardown=handle.teardown,
                     work_source=source,
+                    held_out_source=held_out_source,
                     run_id=resume_run_id,
                     worker_id=wid,
                     lease_seconds=lease_seconds,
@@ -1077,6 +1110,46 @@ def _final_grader_receipts(
     )
 
 
+def _evaluate_landing_gate(
+    held_out_source: HeldOutGraderSource | None,
+    task: Task,
+    *,
+    status: Status,
+    sandbox: Path,
+    run_id: str,
+    task_id: str,
+    stream: TextIO | None,
+) -> GateVerdict | None:
+    """Compute the held-out landing verdict for a finalized run, or ``None``.
+
+    Returns ``None`` (the gate did not run) when no held-out source is wired or
+    the run did not reach the landing status (``DONE``) -- a non-landing
+    terminal is already parked by ``submit``, so there is nothing to gate, and
+    the behavior is byte-identical to today (D-7). Otherwise it runs the task's
+    held-out command graders against ``sandbox`` (the committed tree) via the
+    engine, which fails closed on an unrunnable registration (D-3). The verdict
+    is logged when it is anything other than ``NO_GATE`` so a blocked land is
+    visible in the run's timeline.
+    """
+    if held_out_source is None or status is not Status.DONE:
+        return None
+    verdict = evaluate_held_out_gate(
+        task,
+        held_out_source,
+        committed_tree=sandbox,
+        run_id=run_id,
+    )
+    if stream is not None and verdict.outcome is not GateOutcome.NO_GATE:
+        marker = "BLOCKED" if verdict.blocks_landing else "passed"
+        print(
+            f"[orchestrate] {task_id}: held-out landing gate {marker} "
+            f"({verdict.reason})",
+            file=stream,
+            flush=True,
+        )
+    return verdict
+
+
 async def _drive_under_lease(
     control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
@@ -1088,6 +1161,7 @@ async def _drive_under_lease(
     submit: Submitter | None,
     teardown: Callable[[], None] | None,
     work_source: WorkSource,
+    held_out_source: HeldOutGraderSource | None,
     run_id: str | None,
     worker_id: str,
     lease_seconds: float,
@@ -1190,7 +1264,27 @@ async def _drive_under_lease(
                     file=stream,
                     flush=True,
                 )
-        if submit is not None:
+        # Execute-time held-out landing gate (spec 00050, D-1): while the lease
+        # is still held and BEFORE submit, grade the committed sandbox with the
+        # task's operator-declared held-out command graders (the agent never
+        # saw them). Only the landing status (DONE) is gated -- a non-landing
+        # terminal already parks via submit, so there is nothing to block. The
+        # verdict is the out-of-band grader exit code, never the agent's
+        # self-report (D-4); a registered-but-unrunnable grader fails closed
+        # (D-3). A blocked gate suppresses the submit landing effect: submit is
+        # not invoked, so the worktree backend leaves the sandbox parked for
+        # forensics and no merge/PR happens.
+        gate = _evaluate_landing_gate(
+            held_out_source,
+            row.task,
+            status=outcome.lifecycle.status,
+            sandbox=sandbox,
+            run_id=outcome.lifecycle.run_id,
+            task_id=task_id,
+            stream=stream,
+        )
+        gate_blocked = gate is not None and gate.blocks_landing
+        if submit is not None and not gate_blocked:
             submit(
                 SubmitRequest(
                     task_id=task_id,
@@ -1249,6 +1343,8 @@ async def _drive_under_lease(
         status=outcome.lifecycle.status,
         mode="resume" if run_id is not None else "fresh",
         worker_id=worker_id,
+        gate=gate.outcome if gate is not None else None,
+        gate_reason=gate.reason if gate is not None else "",
     )
 
 

@@ -62,6 +62,7 @@ from flywheel_core import (
 )
 from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_orchestrator import (
+    HeldOutGraderSource,
     OrchestratorReport,
     PolicyError,
     SandboxRequest,
@@ -1010,6 +1011,7 @@ def run_once(
     log: Logger | None = None,
     policy: WorkPolicy | None = None,
     strategy: SubmitStrategy | None = None,
+    held_out_source: HeldOutGraderSource | None = None,
 ) -> OrchestratorReport:
     """One cycle: record phase bases, drain every eligible task to
     quiescence through the git-submit seam, archive completed phases.
@@ -1032,6 +1034,11 @@ def run_once(
     (spec 00045) passes a ``ContainerSubmitStrategy`` *wrapping* ``submitter``,
     so the worker still drives worktree provisioning/landing through
     ``submitter`` while the agent runs in a container.
+
+    ``held_out_source`` is forwarded to ``orchestrate`` to enable the
+    execute-time held-out landing gate (spec 00050): a DONE task whose
+    operator-declared held-out graders fail is blocked from landing and its
+    worktree parked. ``None`` (the default) leaves landing byte-identical.
     """
     log = log or submitter.log
     record_phase_bases(
@@ -1053,6 +1060,7 @@ def run_once(
             strategy=strategy if strategy is not None else submitter,
             stream=stream,
             repo_root=submitter.repo_root,
+            held_out_source=held_out_source,
         )
     )
     archive_phases(

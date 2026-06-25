@@ -1,0 +1,38 @@
+{
+  "id": "held-out-gate-engine",
+  "goal": "The orchestrator computes a pass/fail landing verdict for a task by running operator-registered held-out command graders (excluded from the agent's Task and worktree) against the committed result out-of-band, failing closed when a held-out grader cannot run.",
+  "tags": ["orchestrator", "spec-00050", "held-out-gate"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00050-held-out-landing-gate.md -- acceptance criteria #3, #4, #5, #9 and decisions D-2, D-3, D-4, D-5 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _drive_under_lease (~line 1080-1252) holds the committed sandbox path, task, and run id; the gate engine is the orchestrator-owned function that grades the committed result there (this task builds the engine; wiring the land decision is the next task)",
+      "packages/flywheel-core/src/flywheel_core/grader_command.py -- run_command_graders is the existing out-of-band command-grader runner (cwd = a working tree, subprocess); reuse it to run held-out command graders against the committed result, do not invent a second runner",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- _reverify (~line 617-656) is the existing precedent: command graders re-run in a subprocess against a worktree outside the agent's turn; mirror that posture",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep this suite green",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green"
+    ],
+    "constraints": [
+      "Held-out graders are loaded from an operator-owned location keyed by task id that the orchestrator reads. They MUST NOT be added to the Task object handed to the harness/agent and MUST NOT be written into the agent's worktree -- the agent must be unable to read them during its run (D-2).",
+      "The verdict is computed from each held-out grader's subprocess exit code against the committed result; the agent's self-reported terminal status is never authoritative (D-4). An agent that reports DONE while a held-out grader exits non-zero yields a FAIL verdict.",
+      "FAIL CLOSED (D-3): a registered held-out grader that cannot be located or executed produces a FAIL verdict -- never a pass and never a silent skip. A task with NO registered held-out graders produces a distinct 'no gate' verdict (not a fail).",
+      "Held-out graders are command graders only (D-5), evaluated against the committed result as their working tree.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT wire the land/block decision, worktree parking, or outcome recording in this task -- that is the held-out-landing-integration task. This task produces the verdict only.",
+      "Do NOT modify flywheel-core: no change to Task, Grader, the lifecycle, the harness verification loop, or core's schema (criterion #11). Add a hidden grader field to Task is forbidden.",
+      "Do NOT support held-out transcript/rubric/manual graders -- command only.",
+      "Do NOT source held-out graders from the git-ignored .flywheel/verification/ fw-verify scratch; that is throwaway oracle scratch, not the operator-owned held-out grader source.",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A held-out grader that errors on launch (missing file, non-executable, nonzero on startup) MUST yield a FAIL verdict, not a skip or pass -- the fail-closed anti-hack.",
+      "A task with no held-out graders registered MUST yield a 'no gate' verdict distinct from FAIL, so the integration layer can land it unchanged.",
+      "The held-out grader content must be absent from the agent's worktree during the run and absent from the Task passed to the harness, yet still execute against the committed tree afterward."
+    ]
+  }
+}

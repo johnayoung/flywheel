@@ -1,0 +1,40 @@
+{
+  "id": "held-out-landing-integration",
+  "goal": "A held-out gate failure blocks a task from landing (no merge/PR effect, worktree parked) and is recorded as a distinct outcome, while a passing or absent gate lands the task byte-identically to today.",
+  "prerequisites": ["held-out-gate-engine"],
+  "tags": ["orchestrator", "spec-00050", "held-out-gate", "landing"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/", "name": "worktree-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00050-held-out-landing-gate.md -- acceptance criteria #1, #2, #6, #7, #8 and decisions D-1, D-6, D-7 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _drive_under_lease calls SubmitStrategy.submit under the lease (~line 1193); run the gate engine's verdict AFTER the run finalizes and BEFORE submit, and gate the land on it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_strategy.py -- SubmitStrategy protocol and SubmitRequest (~line 158-176): submit is the landing hook; a blocked task must not produce submit's landing effect",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter.submit (~line 466-576) is where the merge/PR landing effect happens and where finished worktrees are parked; the gate decision must prevent the landing effect and keep the worktree parked",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_submit_seam.py -- keep this suite green; it pins the submit seam",
+      "packages/flywheel-worktree/tests/ -- keep the worktree submit/landing suites green"
+    ],
+    "constraints": [
+      "The gate runs while the task's lease is held and BEFORE SubmitStrategy.submit is invoked (D-1), so a gate-blocked task is never submitted and two workers never land the same task concurrently.",
+      "On an all-pass verdict: land exactly as today (submit invoked, merge/PR effect unchanged). On any FAIL verdict (including the fail-closed case): produce NO landing effect, retain the agent's worktree (parked for forensics), and record a distinct gate-failed outcome.",
+      "The recorded gate-failed outcome MUST be distinguishable from both a clean land and an agent-run failure when read back (D-6) -- use the orchestrator's existing run-record / work-report surface, not a new events ledger.",
+      "On a 'no gate' verdict (no held-out graders registered): the gate does not run and landing is byte-identical to today (D-7).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT mark the core lifecycle status FAILED on a gate failure -- the held-out gate is a landing decision, not a re-judgement of the agent's attempt (mirrors _reverify, which records outside lifecycle numbering).",
+      "Do NOT add an orchestrator_events ledger -- record via the existing run-record/report surface.",
+      "Do NOT change merge/pr submit behavior for tasks with no held-out graders (criterion #7).",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema) (criterion #11).",
+      "Do NOT modify files under tests/; do not weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A task with no held-out graders must land exactly as before -- the existing orchestrator and worktree submit suites must stay green unchanged.",
+      "A gate-blocked task's submit hook must not produce a merge or PR; the worktree/branch must remain parked.",
+      "Reading back the recorded result: gate-failed must differ from landed-ok AND from agent-failed -- three distinguishable outcomes."
+    ]
+  }
+}

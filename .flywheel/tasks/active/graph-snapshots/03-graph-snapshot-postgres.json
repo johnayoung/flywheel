@@ -1,0 +1,42 @@
+{
+  "id": "graph-snapshot-postgres",
+  "goal": "The Postgres claim store mirrors the graph-snapshot record so that, given identical snapshot inputs, the SQLite and Postgres backends produce equal snapshot records (item fields, states, holders, cursors, ordering modulo backend-assigned ids), and a pre-existing v4 Postgres store migrates additively to v5 keeping its rows.",
+  "prerequisites": ["graph-snapshot-store"],
+  "tags": ["orchestrator", "spec-00055", "claims", "snapshots", "postgres"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00055-graph-snapshots.md -- acceptance criteria #9 (cross-backend parity) and #10 (postgres migration), and decisions D-2, D-3, D-5 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- mirror the graph_snapshots + graph_snapshot_items tables in _bootstrap, the atomic single-transaction record_graph_snapshot with the store-stamped orchestrator_events cursor, and the read API, matching the contract established on the SQLite backend",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the snapshot-header and snapshot-item record shapes, the record_graph_snapshot/read-API surface, and CURRENT_ORCH_SCHEMA_VERSION=5 are the fixed contract this task mirrors; do not change them",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; add the cross-backend parity assertion here, parametrized so it skips cleanly when no postgres_dsn is configured (the root conftest provides postgres_dsn session-scoped; None skips), mirroring the existing 00054 event-ledger parity case"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- the 00054 orchestrator_events Postgres mirror (table in _bootstrap, same-transaction emit, list_events read API) is the precedent for backing the snapshot record on Postgres; the orchestrator_events max id is the cursor stamped here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- _bootstrap shows the additive CREATE TABLE IF NOT EXISTS + sentinel converge migration (the v3->v4 step) to mirror for v4->v5 on Postgres"
+    ],
+    "constraints": [
+      "The Postgres snapshot semantics must be IDENTICAL to the SQLite backend (criterion #9): the same sequence of record_graph_snapshot inputs yields equal snapshot streams and item rows -- same item field spellings, states, holders, captured-at, and store-stamped cursors, in the same insertion order -- after dropping the backend-assigned ids. This parity test is the composition holdout over the shared snapshot-record invariant; it adds no requirement beyond the spec.",
+      "The snapshot header and all item rows are written in the SAME Postgres transaction (D-3), and last_event_id is the max orchestrator_events id computed by the store inside that transaction (D-2) -- never caller-supplied, 0 on an empty ledger.",
+      "Bump-aware additive migration (D-5/criterion #10): a pre-existing v4 Postgres store (holding task_claims, work_items, source_syncs, orchestrator_events rows) opened by the v5 code MUST keep every row, open without OrchestratorSchemaError, and expose an empty snapshot stream -- no drop-and-recreate.",
+      "Reuse the snapshot record shapes, the read API, and the event-cursor semantics from _claims.py unchanged; this task only adds the Postgres backing for them.",
+      "Round-trip the JSONB/text column content identically to the SQLite backend (mirror the conflict_keys_json encode/decode parity) so required_capabilities, conflict_keys, and resolved-prerequisites sets read back equal across backends.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change the snapshot record shapes, the read API surface, the cursor semantics, or CURRENT_ORCH_SCHEMA_VERSION established by the prerequisite task.",
+      "Do NOT wire snapshot capture into the orchestrate loop (that is the graph-snapshot-loop-integration task); do NOT add pruning/retention/throttling (D-6).",
+      "Do NOT alter Postgres acquire/renew/release/sweep return values, conflict-key refusal, optimistic-concurrency semantics, or the 00054 event ledger.",
+      "Do NOT modify flywheel-core or the persistence-schema*.sql files; do NOT weaken or delete existing claim/event assertions under tests/.",
+      "Do NOT make the parity test hard-fail when no postgres_dsn is configured -- it must skip cleanly, matching the existing postgres-backend cases."
+    ],
+    "edge_cases": [
+      "Record the identical sequence of snapshots (mixed provenance, a ready+held item and a blocked item, an empty-graph snapshot, and snapshots taken at cursor 0 and after appended claim events) against SqliteClaimStore and PostgresClaimStore; the read-back snapshot streams and item rows are equal after dropping backend-assigned ids -- a divergent field spelling or a missing/zero cursor on one backend must fail.",
+      "A v4 Postgres store with existing task_claims, work_items, source_syncs, and orchestrator_events rows opens under v5 with rows intact, no OrchestratorSchemaError, and an empty snapshot stream.",
+      "JSONB column choices round-trip the same required_capabilities / conflict_keys / resolved-prerequisites content the SQLite backend stores."
+    ]
+  }
+}

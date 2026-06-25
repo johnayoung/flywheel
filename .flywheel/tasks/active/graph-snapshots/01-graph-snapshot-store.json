@@ -1,0 +1,46 @@
+{
+  "id": "graph-snapshot-store",
+  "goal": "The orchestrator claim store records a point-in-time WorkGraph snapshot as one header row plus one row per work item (provenance, priority, capabilities, conflict keys, lifecycle state, readiness, claim holder, resolved prerequisites), written atomically in a single transaction that stamps the snapshot with the current orchestrator_events high-water mark, readable as an append-only snapshot stream / per-snapshot items / latest, on the in-memory and SQLite backends.",
+  "tags": ["orchestrator", "spec-00055", "claims", "snapshots"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00055-graph-snapshots.md -- acceptance criteria #1-6, #11, and #3/#10 (sqlite/memory backends), and decisions D-1, D-2, D-3, D-5, D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- add the graph_snapshots + graph_snapshot_items tables to _SCHEMA_SQL, bump CURRENT_ORCH_SCHEMA_VERSION 4->5 additively, add a record_graph_snapshot write + the read API to InMemoryClaimStore and SqliteClaimStore; introduce the snapshot-header and snapshot-item record dataclasses",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep this suite green; it pins acquire/renew/release/list/sweep and the 00054 event ledger on memory+sqlite. Add the new snapshot assertions here, parametrized over the memory and sqlite backends like the existing cases"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the OrchestratorEventRecord dataclass, list_events()/list_task_events() read API, and the _append_event same-transaction emit (00054) are the precedent to mirror for the snapshot record shapes and read API; the orchestrator_events max id is the cursor this task stamps",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- _bootstrap shows the additive CREATE TABLE IF NOT EXISTS + sentinel converge-forward migration (the v3->v4 step) to mirror for v4->v5",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem carries source_kind/source_ref/source_url/source_version/priority/required_capabilities/conflict_keys; these are the provenance fields a snapshot item records"
+    ],
+    "constraints": [
+      "A snapshot is written ATOMICALLY in one store transaction (D-3): the header row and every item row commit together or not at all. No reader ever sees a snapshot whose item rows are a subset of what it captured (criterion #3) -- the header's declared item count equals the number of item rows read back and the size of the captured graph.",
+      "Each snapshot ITEM records the item's full materialized state (D-1/criteria #1,#2): task_id, source kind/ref/url/version, priority, required capabilities, conflict keys, lifecycle state, a readiness flag, the current claim holder worker id (or none), and the resolved prerequisite ids. The recorded readiness flag, claim holder, and lifecycle state MUST equal the values the caller passed for that item -- a constant (all-ready, all-unheld, or a fixed state) that misrepresents the graph must fail.",
+      "Each snapshot HEADER records: a monotonic snapshot id, an injected captured-at timestamp (passed in like 00054's occurred-at now, never a wall clock so the record is deterministic and testable), the declared item count, and last_event_id -- the maximum orchestrator_events id at the instant of the write, computed by the store INSIDE the snapshot's own write transaction, 0 when the ledger is empty (D-2/criterion #4). The cursor is store-computed, NEVER caller-supplied, so it cannot drift from the ledger; a snapshot recorded after further claim transitions carries a strictly greater cursor.",
+      "The snapshot record is APPEND-ONLY (criterion #5): successive record_graph_snapshot calls yield distinct accumulating snapshots in insertion order; re-recording never overwrites or mutates an earlier snapshot. Provide a read API for the snapshot stream (all headers in id order), one snapshot's item rows, and the latest snapshot (null on an empty store); provide NO method that updates or deletes a snapshot or its item rows.",
+      "An EMPTY graph still records a valid snapshot (criterion #11): zero item rows, a declared item count of 0, and the current cursor -- the write is never skipped when the graph is empty.",
+      "Bump CURRENT_ORCH_SCHEMA_VERSION 4->5 additively (D-5): add the snapshot tables via CREATE TABLE IF NOT EXISTS and converge the sentinel forward, mirroring the v3->v4 migration. A pre-existing v4 store (holding task_claims, work_items, source_syncs, orchestrator_events rows) opened by the new code MUST keep every row, open without OrchestratorSchemaError, and expose an empty snapshot stream (criterion #10) -- no drop-and-recreate.",
+      "InMemoryClaimStore must record snapshots too (it is the test substrate and the operator-parity surface); its snapshot store mirrors the durable backends' semantics, including the store-stamped cursor read from its in-memory event list.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT wire snapshot capture into the orchestrate loop -- that is the dependent graph-snapshot-loop-integration task. This task only proves the store records, stamps, and reads back snapshots correctly.",
+      "Do NOT add the Postgres backing -- that is the dependent graph-snapshot-postgres task. This task delivers in-memory and SQLite only.",
+      "Do NOT add pruning, retention, rotation, throttling, or any growth cap (D-6); do NOT add a reconstruction/replay helper that materializes graph state from a snapshot plus events (out of scope -- the cursor only enables it).",
+      "Do NOT alter acquire/renew/release/sweep/list return values, conflict-key refusal (00049), optimistic-concurrency rejection, or the 00054 event ledger (list_events/list_task_events) behavior.",
+      "Do NOT modify flywheel-core or the persistence-schema*.sql files; do NOT weaken or delete existing claim/event assertions under tests/."
+    ],
+    "edge_cases": [
+      "Record a snapshot of a graph where item X is ready (in ready_set) and holds a live claim by worker A, and item Y is not ready (unsatisfied prerequisite) and is unheld: the read-back shows ready=true/holder=A for X and ready=false/holder=none for Y, and state equals what was passed for each. A constant readiness or holder must fail.",
+      "On a fresh store, a recorded snapshot has cursor 0; after acquire_claim then renew_claim (two events), the next snapshot's cursor equals the latest event id; after one more event, the next snapshot's cursor advances again. A stale or zero cursor on a non-empty ledger must fail.",
+      "Record three snapshots: the stream returns all three distinct headers in insertion order; an item accessor returns exactly one snapshot's rows; the latest accessor returns the most recent; re-recording does not replace an earlier snapshot.",
+      "Record a snapshot for an empty graph (no items): the stream gains one entry with item count 0, empty item rows, and the current cursor.",
+      "A pre-existing v4 store with task_claims, work_items, source_syncs, and orchestrator_events rows opens under v5 with rows intact, no OrchestratorSchemaError, and an empty snapshot stream.",
+      "An item with a non-empty resolved-prerequisites set round-trips that set exactly (mirror the conflict_keys_json encode/decode parity already in _claims.py)."
+    ]
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "id": "graph-snapshot-loop-integration",
+  "goal": "Each orchestrate scheduling pass records one graph snapshot of the graph it built, before dispatch, whose item set and per-item state (provenance, lifecycle state, readiness, claim holder, resolved prerequisites) reflect that pass's actual graph, so a driven run leaves a sequence of snapshots that tracks the graph evolving as tasks complete.",
+  "prerequisites": ["graph-snapshot-store"],
+  "tags": ["orchestrator", "spec-00055", "loop", "snapshots"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00055-graph-snapshots.md -- acceptance criteria #7, #8 and decisions D-3, D-4 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- at the top of each while-True pass (after items=source.list_work(), graph=WorkGraph.build(items).graph, states=..., and before fresh selection/dispatch) assemble the per-item materialized state and call the store's record_graph_snapshot once for that pass",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep this suite green; it drives orchestrate() with fake source/invoke/submit. Add the snapshot-recording assertions here, driving orchestrate to its no-progress return and reading the orchestrator store's snapshot stream"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the pass already has every input the snapshot needs: WorkItem provenance/priority/required_capabilities/conflict_keys from items, lifecycle state from states, readiness from graph.ready_set(states, ...), the claim holder from claims.list_claims(), and resolved edges from graph.resolved_prerequisites(task_id)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- record_graph_snapshot and the snapshot record shapes delivered by the graph-snapshot-store task are the fixed contract this task consumes unchanged; captured_at is injected (pass the loop's clock())"
+    ],
+    "constraints": [
+      "Capture at the TOP of each scheduling pass, AFTER the graph and states are built and readiness is known, and BEFORE any task is dispatched (D-4): the recorded readiness and claim holders must reflect the state the scheduler saw when it made that pass's decision. One snapshot per pass (D-6) -- not after dispatch, not only on the first pass.",
+      "Snapshotting is a pure read-and-record side channel (criterion: must-not-regress): the orchestrate loop's selection and dispatch decisions are byte-for-byte unchanged by the presence of snapshotting. It observes; it never changes which task is dispatched, nor any claim/lease behavior.",
+      "The recorded per-item state must equal the pass's actual graph (criterion #7): the latest snapshot after driving a pass has an item set equal to that pass's work items with their lifecycle states; readiness equals ready_set membership; holder equals the current claim.",
+      "Successive snapshots reflect the graph evolving (criterion #8): when a task reaches done across passes, a later snapshot shows it done and absent from that snapshot's ready set, while an earlier snapshot showed it not-done -- proving capture is per-pass, not cached or recorded once.",
+      "Use the injected clock for captured_at so the driven-test assertions are deterministic, matching how now is injected elsewhere in the loop.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change record_graph_snapshot, the snapshot record shapes, the read API, or CURRENT_ORCH_SCHEMA_VERSION established by the graph-snapshot-store prerequisite.",
+      "Do NOT add throttling, an interval gate, a new [execution] config knob, retention, or pruning (D-6) -- per-pass capture is the shipped behavior.",
+      "Do NOT alter selection, prerequisite promotion, claim/lease handling, the held-out landing gate, or any dispatch behavior -- snapshotting must not steer the loop.",
+      "Do NOT add a Postgres-specific path here; the loop is backend-agnostic and uses whatever claim store it already holds.",
+      "Do NOT weaken or delete existing orchestrate assertions under tests/."
+    ],
+    "edge_cases": [
+      "Drive orchestrate over a single fresh task to its no-progress return: the orchestrator store's snapshot stream is non-empty and the latest snapshot's item set equals the source's work items with their states for that pass.",
+      "Drive orchestrate over a two-task chain (B depends on A) so A runs and reaches done before B: an earlier snapshot shows A not-done with B not ready; a later snapshot shows A done with B ready. A single cached/first-pass-only snapshot must fail.",
+      "An empty source (no work) still records a snapshot for the terminal no-progress pass (the store records the empty cross-section per criterion #11).",
+      "A pass that makes no progress before the loop returns still records its snapshot (the terminal graph state is captured)."
+    ]
+  }
+}

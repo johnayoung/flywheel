@@ -649,6 +649,140 @@ def test_awaiting_approval_with_no_pending_command_stays_parked(
         store.close()
 
 
+# --- per-pass graph snapshots (spec 00055) ---------------------------------
+
+
+def test_each_scheduling_pass_records_a_graph_snapshot(tmp_path: Path) -> None:
+    """Criterion #7: driving a single fresh task to its no-progress return
+    leaves a non-empty snapshot stream whose latest snapshot's item set equals
+    the source's work items with their (terminal) state."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+
+    report = _orchestrate(tmp_path, _always_verify())
+    assert [r.task_id for r in report.runs] == ["solo"]
+    assert report.runs[0].status is Status.DONE
+
+    claims = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        snapshots = claims.list_graph_snapshots()
+        assert snapshots, "a driven run must leave at least one snapshot"
+        latest = claims.latest_graph_snapshot()
+        assert latest is not None
+        items = claims.list_graph_snapshot_items(latest.id)
+        # Item set equals the pass's work items, with their terminal state.
+        assert {i.task_id for i in items} == {"solo"}
+        solo = next(i for i in items if i.task_id == "solo")
+        assert solo.state == "done"
+        # A done task is absent from the ready set.
+        assert solo.ready is False
+        assert solo.claim_holder is None  # the lease was released
+    finally:
+        claims.close()
+
+
+def test_successive_snapshots_track_the_graph_evolving(tmp_path: Path) -> None:
+    """Criterion #8: across a two-task chain (B depends on A) an earlier
+    snapshot shows A not-done with B not ready, while a later, distinct
+    snapshot shows A done with B ready -- proving capture is per-pass, not
+    cached or recorded once."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "a")
+    _write_task(phase, "b", prerequisites=["a"])
+
+    report = _orchestrate(tmp_path, _always_verify())
+    assert [r.task_id for r in report.runs] == ["a", "b"]
+
+    claims = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        snapshots = claims.list_graph_snapshots()
+        assert len(snapshots) >= 2, "per-pass capture must leave >1 snapshot"
+
+        def by_task(snapshot_id: int) -> dict[str, object]:
+            return {
+                i.task_id: i
+                for i in claims.list_graph_snapshot_items(snapshot_id)
+            }
+
+        early_id = next(
+            (
+                s.id
+                for s in snapshots
+                if (m := by_task(s.id))["a"].state != "done"  # type: ignore[attr-defined]
+                and not m["b"].ready  # type: ignore[attr-defined]
+            ),
+            None,
+        )
+        late_id = next(
+            (
+                s.id
+                for s in snapshots
+                if (m := by_task(s.id))["a"].state == "done"  # type: ignore[attr-defined]
+                and m["b"].ready  # type: ignore[attr-defined]
+            ),
+            None,
+        )
+        assert early_id is not None, (
+            "an early pass must show A not-done and B not ready"
+        )
+        assert late_id is not None, (
+            "a later pass must show A done and B ready"
+        )
+        # Distinct snapshots: a single cached/first-pass-only snapshot fails.
+        assert early_id != late_id
+    finally:
+        claims.close()
+
+
+def test_empty_source_still_records_a_terminal_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Criterion #11: an empty source makes no progress, but the terminal
+    no-progress pass still records its (empty) cross-section."""
+    (tmp_path / "tasks" / "active").mkdir(parents=True)
+
+    report = _orchestrate(tmp_path, _always_verify())
+    assert report.runs == ()
+
+    claims = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        snapshots = claims.list_graph_snapshots()
+        assert len(snapshots) == 1
+        assert snapshots[0].item_count == 0
+        assert claims.list_graph_snapshot_items(snapshots[0].id) == []
+    finally:
+        claims.close()
+
+
+def test_snapshot_captured_at_uses_the_injected_clock(tmp_path: Path) -> None:
+    """The capture timestamp is the injected ``now``, never a wall clock, so
+    driven-test assertions are deterministic."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+    fixed = datetime(2026, 6, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    asyncio.run(
+        orchestrate(
+            tasks_dir=tmp_path / "tasks",
+            db_path=tmp_path / "flywheel.sqlite",
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_always_verify(),
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+            now=lambda: fixed,
+        )
+    )
+
+    claims = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        snapshots = claims.list_graph_snapshots()
+        assert snapshots
+        assert all(s.captured_at == fixed for s in snapshots)
+    finally:
+        claims.close()
+
+
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
     from flywheel_orchestrator._orchestrate import _ClaimHeartbeat
 

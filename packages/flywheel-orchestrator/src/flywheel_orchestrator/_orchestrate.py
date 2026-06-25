@@ -83,6 +83,7 @@ from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
     ClaimLostError,
+    GraphSnapshotItem,
     SourceSyncRecord,
     SqliteClaimStore,
     TaskClaim,
@@ -103,6 +104,7 @@ from flywheel_orchestrator._policy import SandboxPolicy, WorkPolicy
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
     GraderReceipt,
+    WorkItem,
     WorkReport,
     WorkSource,
 )
@@ -334,6 +336,55 @@ def sync_work_source(
     settled = store.load_source_sync(sync_id)
     assert settled is not None  # just written above
     return settled
+
+
+def _assemble_graph_snapshot_items(
+    items: list[WorkItem],
+    graph: WorkGraph,
+    states: dict[str, TaskState],
+    *,
+    worker_capabilities: frozenset[str],
+    claims: SqliteClaimStore,
+) -> list[GraphSnapshotItem]:
+    """Materialize each pass work item's full cross-section for one snapshot.
+
+    A pure read (spec 00055, D-4): per-item provenance and scheduling metadata
+    come off the pass's :class:`WorkItem`s, lifecycle ``state`` and ``ready``
+    membership off the same ``states`` + ``graph.ready_set`` the scheduler
+    grades eligibility from, ``claim_holder`` off the live claim store, and
+    ``resolved_prerequisites`` off the validated graph. It observes the
+    scheduler's inputs and never mutates them, so recording a snapshot cannot
+    steer dispatch.
+    """
+    ready_ids = {
+        item.task.id
+        for item in graph.ready_set(
+            states, worker_capabilities=worker_capabilities
+        )
+    }
+    holders = {
+        claim.task_id: claim.worker_id for claim in claims.list_claims()
+    }
+    snapshot_items: list[GraphSnapshotItem] = []
+    for item in items:
+        task_id = item.task.id
+        snapshot_items.append(
+            GraphSnapshotItem(
+                task_id=task_id,
+                source_kind=item.source_kind,
+                source_ref=item.source_ref,
+                source_url=item.source_url,
+                source_version=item.source_version,
+                priority=item.priority,
+                required_capabilities=item.required_capabilities,
+                conflict_keys=item.conflict_keys,
+                state=states[task_id].value,
+                ready=task_id in ready_ids,
+                claim_holder=holders.get(task_id),
+                resolved_prerequisites=graph.resolved_prerequisites(task_id),
+            )
+        )
+    return snapshot_items
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -795,6 +846,28 @@ async def orchestrate(
             }
             blocked_ids = frozenset(
                 r.task.id for r in rows if _is_blocked_interrupted(r)
+            )
+
+            # Graph snapshot (spec 00055, D-4/D-6): record one immutable
+            # cross-section of the graph this pass built -- per-item provenance,
+            # lifecycle state, ready-set membership, claim holder, and resolved
+            # prerequisites -- at the TOP of the pass, after the graph/states/
+            # readiness are known and BEFORE any task is dispatched, stamped
+            # with the injected clock. A pure read-and-record side channel: it
+            # observes the scheduler's inputs and never changes which task is
+            # dispatched nor any claim/lease behavior. Exactly one snapshot per
+            # pass -- including the terminal no-progress pass and an empty
+            # source's pass (criterion #11), so a driven run leaves a sequence
+            # tracking the graph evolving as tasks complete.
+            claims.record_graph_snapshot(
+                _assemble_graph_snapshot_items(
+                    items,
+                    graph,
+                    states,
+                    worker_capabilities=worker_capabilities,
+                    claims=claims,
+                ),
+                captured_at=clock(),
             )
 
             # 1. Reactive unblock + resume, claim-gated so only one worker

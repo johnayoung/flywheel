@@ -1,0 +1,41 @@
+{
+  "id": "truncation-warning-issue-source",
+  "goal": "The GitHub issue work source logs a truncation warning when its bounded `gh issue list` page fills the single-page cap, stays silent when the page is below the cap, returns the same bounded WorkItems whether or not a log sink is attached, and still raises WorkSourceError on a failed gh listing -- emitting that warning through a single shared truncation-warning emitter the other GitHub sources can reuse.",
+  "tags": ["orchestrator", "spec-00056", "github", "worksource", "truncation"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00056-github-source-listing-truncation.md -- acceptance criteria #1, #2, #3, #4, #5 (for the issue source) and decisions D-1, D-2, D-3, D-4, D-5 this task satisfies.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- the issue adapter to change: `GithubWorkSource.list_work` (~line 216) runs `gh issue list ... --limit 200` (`_LIST_LIMIT`, ~line 71) and returns one bounded page, silently dropping overflow today; `self._log` is the already-present sink. Add the full-page truncation warning here, and introduce the ONE shared truncation-warning emitter alongside the existing shared seam (`_default_runner`/`GhRunner`/`_format_report_body`, ~line 62-172) so the CI and review sources can reuse it (D-3). Preserve `_default_runner`'s raise-on-nonzero-exit (~line 82).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_review.py -- the EXISTING truncation logging to generalize: `_note_truncation` (~line 342) emits `[github_review] {what} listing truncated at one page; some threads were not read this pass`. Mirror its shape in the shared emitter (the uniform wording is `items`, not `threads`). Reference only; the review source itself is routed through the shared emitter in the prerequisite-of task 02.",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- the `_FakeGh` runner pattern (records argv, returns canned stdout) to mirror for the new truncation tests; keep this suite green.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem / WorkSourceError shapes; reuse unchanged."
+    ],
+    "constraints": [
+      "When `list_work`'s bounded page comes back filled to the single-page cap (returned issue count equals `_LIST_LIMIT`), emit one truncation warning through `self._log` that names the source and signals some items were not read this pass (criterion #1, D-4).",
+      "When the page is below the cap, emit NO truncation warning (criterion #2) -- the per-item 'not runnable' skip log is unrelated and unchanged.",
+      "The truncation warning is a side channel: the returned WorkItem sequence (ids, order, count) is identical whether or not a `log` sink is attached; logging never drops, trims, or reorders items (criterion #3).",
+      "A failed gh listing (nonzero exit) raises WorkSourceError and never returns `[]` or a partial list; keep `_default_runner` raising on nonzero exit (criterion #4, D-2 -- the failed-listing-is-not-disappearance anti-hack).",
+      "Introduce ONE shared truncation-warning emitter (alongside `_default_runner`/`GhRunner`/`_format_report_body` in `_github.py`) producing the uniform warning shape; the issue source calls it, and task 02 routes the CI and review sources through the same emitter (D-3).",
+      "Emit only through the injected `self._log`; a source built with `log=None` over a truncated page completes without error and writes nothing to stdout (criterion #5).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add cursor / multi-page pagination (`gh --paginate`, page loops) -- surface truncation, do not drain past the cap (D-1).",
+      "Do NOT add rate-limit backoff/retry and do NOT swallow a gh error into an empty/partial list to look robust -- the runner stays fail-closed (D-2, criterion #4).",
+      "Do NOT make the cap configurable or change its 200 value (D-5).",
+      "Do NOT change issue->Task compilation: stable `gh-<number>` ids, spec-block / default-grader resolution, the per-item 'not runnable' skip log, or `report()` posting.",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema) and do NOT touch the orchestrator store schema -- this is a source-adapter-only change.",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "Exactly `_LIST_LIMIT` runnable issues returned -> one truncation warning (a conservative 'may have more' is the accepted trade vs a silent drop, D-4).",
+      "Fewer than the cap returned -> no truncation warning (criterion #2).",
+      "`log=None` with a full page -> returns the page, no crash, no stdout output (criterion #5).",
+      "Injected runner raising WorkSourceError (mimics nonzero gh exit) -> propagates, never `[]` (criterion #4)."
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "truncation-warning-ci-review-sources",
+  "goal": "The GitHub CI-failure source logs the shared truncation warning when its bounded `gh run list` page fills the cap (and stays silent below it), and the PR review-thread source's existing per-axis truncation logging is routed through the one shared warning emitter so all three GitHub sources signal truncation uniformly -- each still returning its unchanged bounded page, staying silent without a log sink, and raising WorkSourceError on a failed listing.",
+  "prerequisites": ["truncation-warning-issue-source"],
+  "tags": ["orchestrator", "spec-00056", "github-ci", "github-review", "worksource", "truncation"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00056-github-source-listing-truncation.md -- acceptance criteria #1, #2, #3, #4, #5 (for the CI and review sources, including the review per-axis must-not-regress) and decisions D-1, D-2, D-3, D-4 this task satisfies.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- the shared truncation-warning emitter introduced by the prerequisite task (alongside `_default_runner`/`GhRunner`/`_format_report_body`); both sources here call it.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_ci.py -- the CI adapter to change: `GithubCiWorkSource.list_work` (~line 140) runs `gh run list ... --limit 200` (`_LIST_LIMIT`, ~line 66) and silently drops overflow today; `self._log` is the present sink. Add full-page detection (returned run count equals the cap, before the (workflow, branch) dedup) calling the shared emitter (criterion #1, D-4).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_review.py -- the review adapter to route through the shared emitter: `_note_truncation` (~line 342) and its three callsites at the open-PRs / review-threads / comments axes (`_truncated(...)` checks ~line 219, 235). Replace the inline string with a call to the shared emitter while KEEPING one warning per truncated axis (criterion #1 + must-not-regress).",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- the `_FakeGh` runner pattern (issue + CI + review fakes) to mirror for the new truncation tests; keep this suite green.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem / WorkSourceError shapes; reuse unchanged."
+    ],
+    "constraints": [
+      "CI source: when the bounded `gh run list` page comes back filled to the cap (returned run count equals `_LIST_LIMIT`, measured before dedup), emit one truncation warning through the shared emitter; below the cap emit none (criteria #1, #2, D-4).",
+      "Review source: route its three per-axis truncation logs through the shared emitter, still emitting one warning per truncated GraphQL axis (open PRs, review threads, comments) whose `pageInfo.hasNextPage` is true (criterion #1 + must-not-regress).",
+      "Both sources: the returned WorkItem sequence is identical with or without a `log` sink; the warning never drops, trims, or reorders items (criterion #3).",
+      "Both sources: a failed gh listing (nonzero exit) raises WorkSourceError and never returns `[]` or a partial list (criterion #4, D-2).",
+      "Both sources: emit only through `self._log`; with `log=None` a truncated listing completes without error and writes nothing to stdout (criterion #5).",
+      "All three GitHub sources now signal truncation through the one shared emitter with the uniform warning shape (D-3).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add cursor / multi-page pagination to either source (D-1).",
+      "Do NOT add rate-limit backoff/retry and do NOT swallow a gh error into `[]`/partial -- fail-closed stays (D-2, criterion #4).",
+      "Do NOT make any cap configurable or change its value (200 REST; 50/50/50 GraphQL).",
+      "Do NOT change CI per-(workflow, branch) stable-keying / dedup or the review per-thread-node stable ids and never-resolve report posting.",
+      "Do NOT change item->Task compilation, the per-item 'not runnable' skip logs, or `report()` write-back for either source.",
+      "Do NOT modify flywheel-core or the orchestrator store schema -- source-adapter-only change.",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "CI: exactly `_LIST_LIMIT` failed runs returned -> one truncation warning (conservative 'may have more', D-4); fewer -> none (criterion #2).",
+      "Review: `hasNextPage` true at the review-threads axis -> a per-axis truncation warning via the shared emitter (must-not-regress); all axes false -> no warning.",
+      "Either source with `log=None` and a truncated page -> returns the page, no crash, no stdout (criterion #5).",
+      "Either source's injected runner raising WorkSourceError -> propagates, never `[]` (criterion #4)."
+    ]
+  }
+}

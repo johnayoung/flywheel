@@ -25,6 +25,7 @@ from flywheel_orchestrator import (
     EVENT_STOLEN,
     ClaimLostError,
     ClaimStore,
+    GraphSnapshotItem,
     InMemoryClaimStore,
     SqliteClaimStore,
 )
@@ -616,6 +617,359 @@ def test_v3_store_opens_under_v4_with_rows_and_empty_ledger(
         assert claim is not None and claim.worker_id == "worker-1"
         assert store.load_work_item("task-a") is not None
         assert store.list_events() == []
+    finally:
+        store.close()
+
+
+# -- WorkGraph snapshots (spec 00055) -------------------------------------
+#
+# The snapshot record lives on the in-memory and SQLite backends this slice
+# (Layer A); Postgres is a dependent task, so these cases parametrize over
+# memory + sqlite only, mirroring the lease/event cases above.
+_SNAPSHOT_BACKENDS = ("memory", "sqlite")
+
+
+@pytest.fixture(params=_SNAPSHOT_BACKENDS, ids=_SNAPSHOT_BACKENDS)
+def snapshot_store(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> Iterator[InMemoryClaimStore | SqliteClaimStore]:
+    if request.param == "memory":
+        instance: InMemoryClaimStore | SqliteClaimStore = InMemoryClaimStore()
+    else:
+        instance = SqliteClaimStore(tmp_path / "snapshots.db")
+    try:
+        yield instance
+    finally:
+        instance.close()
+
+
+def test_snapshot_round_trips_full_per_item_state(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #1: every field of every item round-trips -- mixed provenance,
+    # priorities, one ready and one blocked item, a held and an unheld item,
+    # and an item with a non-empty resolved-prerequisites set.
+    item_a = GraphSnapshotItem(
+        task_id="task-a",
+        source_kind="directory",
+        source_ref="/tasks/a.json",
+        source_url="/tasks/a.json",
+        source_version="hash-a",
+        priority=5,
+        required_capabilities=frozenset({"gpu", "linux"}),
+        conflict_keys=frozenset({"resource-x"}),
+        state="pending",
+        ready=True,
+        claim_holder="worker-1",
+        resolved_prerequisites=frozenset(),
+    )
+    item_b = GraphSnapshotItem(
+        task_id="task-b",
+        source_kind="github_issue",
+        source_ref="owner/repo#7",
+        source_url="https://example/7",
+        source_version="hash-b",
+        priority=0,
+        required_capabilities=frozenset(),
+        conflict_keys=frozenset(),
+        state="blocked",
+        ready=False,
+        claim_holder=None,
+        resolved_prerequisites=frozenset({"task-a", "task-z"}),
+    )
+    record = snapshot_store.record_graph_snapshot(
+        [item_a, item_b], captured_at=_t(0)
+    )
+    assert record.item_count == 2
+    items = {
+        i.task_id: i
+        for i in snapshot_store.list_graph_snapshot_items(record.id)
+    }
+    assert items["task-a"] == item_a
+    assert items["task-b"] == item_b
+
+
+def test_snapshot_readiness_holder_state_match_passed_values(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #2: the recorded ready flag, holder, and state equal the
+    # per-item values passed -- a constant (all-ready/all-unheld/fixed-state)
+    # that misrepresents the graph must fail.
+    ready_held = GraphSnapshotItem(
+        task_id="x",
+        state="running",
+        ready=True,
+        claim_holder="worker-A",
+    )
+    blocked_unheld = GraphSnapshotItem(
+        task_id="y",
+        state="pending",
+        ready=False,
+        claim_holder=None,
+    )
+    record = snapshot_store.record_graph_snapshot(
+        [ready_held, blocked_unheld], captured_at=_t(1)
+    )
+    items = {
+        i.task_id: i
+        for i in snapshot_store.list_graph_snapshot_items(record.id)
+    }
+    assert items["x"].ready is True
+    assert items["x"].claim_holder == "worker-A"
+    assert items["x"].state == "running"
+    assert items["y"].ready is False
+    assert items["y"].claim_holder is None
+    assert items["y"].state == "pending"
+    # The two items disagree on every captured dimension, so a constant would
+    # be wrong for at least one of them.
+    assert items["x"].ready != items["y"].ready
+    assert items["x"].claim_holder != items["y"].claim_holder
+    assert items["x"].state != items["y"].state
+
+
+def test_snapshot_item_count_equals_rows_and_input_size(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #3: the header's declared item count equals the number of item
+    # rows read back and the size of the input graph -- across sizes including
+    # an empty graph.
+    sizes = [0, 1, 3]
+    records = []
+    for n, size in enumerate(sizes):
+        items = [
+            GraphSnapshotItem(task_id=f"t{n}-{i}", state="pending", ready=False)
+            for i in range(size)
+        ]
+        records.append(snapshot_store.record_graph_snapshot(items, captured_at=_t(n)))
+    for size, record in zip(sizes, records):
+        rows = snapshot_store.list_graph_snapshot_items(record.id)
+        assert record.item_count == size
+        assert len(rows) == size
+
+
+def test_snapshot_cursor_tracks_event_high_water_mark(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #4: cursor is 0 on a fresh ledger, equals the latest event id
+    # after transitions, and advances strictly as more events land.
+    first = snapshot_store.record_graph_snapshot([], captured_at=_t(0))
+    assert first.last_event_id == 0
+    claim = snapshot_store.acquire_claim(
+        "task-a", "worker-1", now=_t(1), lease_seconds=30
+    )
+    assert claim is not None
+    claim = snapshot_store.renew_claim(claim, now=_t(5), lease_seconds=30)
+    latest_event_id = snapshot_store.list_events()[-1].id
+    second = snapshot_store.record_graph_snapshot([], captured_at=_t(6))
+    assert second.last_event_id == latest_event_id
+    assert second.last_event_id > first.last_event_id
+    snapshot_store.release_claim(claim, now=_t(7))
+    third = snapshot_store.record_graph_snapshot([], captured_at=_t(8))
+    assert third.last_event_id == snapshot_store.list_events()[-1].id
+    assert third.last_event_id > second.last_event_id
+
+
+def test_snapshot_record_is_append_only(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #5: successive records yield distinct, accumulating snapshots
+    # in insertion order; re-recording never replaces an earlier one; the store
+    # exposes no snapshot-updating or -deleting method.
+    r1 = snapshot_store.record_graph_snapshot(
+        [GraphSnapshotItem(task_id="a", state="pending", ready=False)],
+        captured_at=_t(0),
+    )
+    r2 = snapshot_store.record_graph_snapshot([], captured_at=_t(1))
+    r3 = snapshot_store.record_graph_snapshot(
+        [GraphSnapshotItem(task_id="b", state="done", ready=True)],
+        captured_at=_t(2),
+    )
+    stream = snapshot_store.list_graph_snapshots()
+    assert [s.id for s in stream] == [r1.id, r2.id, r3.id]
+    assert len(set(s.id for s in stream)) == 3
+    assert stream[0].id < stream[1].id < stream[2].id
+    # The first snapshot's single item row is unchanged by later records.
+    first_items = snapshot_store.list_graph_snapshot_items(r1.id)
+    assert [i.task_id for i in first_items] == ["a"]
+    for forbidden in (
+        "update_graph_snapshot",
+        "delete_graph_snapshot",
+        "edit_graph_snapshot",
+        "remove_graph_snapshot",
+        "clear_graph_snapshots",
+    ):
+        assert not hasattr(snapshot_store, forbidden)
+
+
+def test_snapshot_read_api_stream_items_latest(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #6: empty store -> empty stream + null latest; after records,
+    # the stream returns headers in id order, an item accessor returns one
+    # snapshot's rows, and latest returns the most recent.
+    assert snapshot_store.list_graph_snapshots() == []
+    assert snapshot_store.latest_graph_snapshot() is None
+    r1 = snapshot_store.record_graph_snapshot(
+        [GraphSnapshotItem(task_id="a", state="pending", ready=False)],
+        captured_at=_t(0),
+    )
+    r2 = snapshot_store.record_graph_snapshot(
+        [GraphSnapshotItem(task_id="b", state="running", ready=True)],
+        captured_at=_t(1),
+    )
+    assert [s.id for s in snapshot_store.list_graph_snapshots()] == [r1.id, r2.id]
+    assert [
+        i.task_id for i in snapshot_store.list_graph_snapshot_items(r1.id)
+    ] == ["a"]
+    latest = snapshot_store.latest_graph_snapshot()
+    assert latest is not None and latest.id == r2.id
+    assert latest.item_count == 1
+
+
+def test_snapshot_of_empty_graph_is_valid(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #11: an empty graph still records a valid snapshot -- one stream
+    # entry, item count 0, empty item rows, the current cursor.
+    claim = snapshot_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    record = snapshot_store.record_graph_snapshot([], captured_at=_t(1))
+    stream = snapshot_store.list_graph_snapshots()
+    assert len(stream) == 1
+    assert record.item_count == 0
+    assert snapshot_store.list_graph_snapshot_items(record.id) == []
+    assert record.last_event_id == snapshot_store.list_events()[-1].id
+
+
+def test_snapshot_prerequisites_set_round_trips_exactly(
+    snapshot_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Edge case: a non-empty resolved-prerequisites set round-trips exactly,
+    # mirroring the conflict_keys_json encode/decode parity.
+    prereqs = frozenset({"p-3", "p-1", "p-2"})
+    item = GraphSnapshotItem(
+        task_id="t",
+        state="blocked",
+        ready=False,
+        resolved_prerequisites=prereqs,
+    )
+    record = snapshot_store.record_graph_snapshot([item], captured_at=_t(0))
+    (read_back,) = snapshot_store.list_graph_snapshot_items(record.id)
+    assert read_back.resolved_prerequisites == prereqs
+
+
+def _build_v4_sqlite_store(path: Path) -> None:
+    """Materialize a schema-v4 orchestrator store (pre-snapshot) with rows.
+
+    Mirrors the v4 DDL (task_claims + conflict_keys_json, work_items,
+    source_syncs, orchestrator_events, the sentinel) so the v5 build's additive
+    migration can be exercised against a real pre-existing store carrying
+    claim, work-item, source-sync, and event rows.
+    """
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE task_claims (
+              task_id            TEXT PRIMARY KEY,
+              worker_id          TEXT NOT NULL,
+              claimed_at         DATETIME NOT NULL,
+              lease_expires_at   DATETIME NOT NULL,
+              version            INTEGER NOT NULL,
+              conflict_keys_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE orchestrator_schema_version (
+              id      INTEGER PRIMARY KEY CHECK (id = 1),
+              version INTEGER NOT NULL
+            );
+            CREATE TABLE work_items (
+              task_id                    TEXT PRIMARY KEY,
+              source_kind                TEXT,
+              source_ref                 TEXT,
+              source_url                 TEXT,
+              source_version             TEXT,
+              task_content_hash          TEXT,
+              priority                   INTEGER NOT NULL DEFAULT 0,
+              required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+              conflict_keys_json         TEXT NOT NULL DEFAULT '[]',
+              first_seen_at              TEXT NOT NULL,
+              last_seen_at               TEXT NOT NULL,
+              disappeared_at             TEXT,
+              metadata_json              TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE source_syncs (
+              id             INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_kind    TEXT NOT NULL,
+              source_name    TEXT NOT NULL,
+              started_at     TEXT NOT NULL,
+              finished_at    TEXT,
+              status         TEXT NOT NULL,
+              observed_count INTEGER NOT NULL DEFAULT 0,
+              error          TEXT,
+              metadata_json  TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE orchestrator_events (
+              id               INTEGER PRIMARY KEY AUTOINCREMENT,
+              task_id          TEXT NOT NULL,
+              worker_id        TEXT NOT NULL,
+              event_type       TEXT NOT NULL,
+              version          INTEGER NOT NULL,
+              lease_expires_at TEXT NOT NULL,
+              occurred_at      TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_claims (task_id, worker_id, claimed_at, "
+            "lease_expires_at, version, conflict_keys_json) "
+            "VALUES ('task-a', 'worker-1', ?, ?, 1, '[]')",
+            (_t(0).isoformat(), _t(30).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO work_items (task_id, first_seen_at, last_seen_at) "
+            "VALUES ('task-a', ?, ?)",
+            (_t(0).isoformat(), _t(0).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO source_syncs (source_kind, source_name, started_at, "
+            "status, observed_count) VALUES ('directory', '/tasks', ?, 'ok', 1)",
+            (_t(0).isoformat(),),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_events (task_id, worker_id, event_type, "
+            "version, lease_expires_at, occurred_at) "
+            "VALUES ('task-a', 'worker-1', 'acquired', 1, ?, ?)",
+            (_t(30).isoformat(), _t(0).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_schema_version (id, version) "
+            "VALUES (1, 4)"
+        )
+    finally:
+        conn.close()
+
+
+def test_v4_store_opens_under_v5_with_rows_and_empty_snapshots(
+    tmp_path: Path,
+) -> None:
+    # Criterion #10: a pre-existing v4 store opens under the v5 build without
+    # error, keeps its task_claims/work_items/source_syncs/orchestrator_events
+    # rows, and exposes an empty snapshot stream -- the additive,
+    # non-destructive bump.
+    path = tmp_path / "v4.db"
+    _build_v4_sqlite_store(path)
+    store = SqliteClaimStore(path)
+    try:
+        claim = store.load_claim("task-a")
+        assert claim is not None and claim.worker_id == "worker-1"
+        assert store.load_work_item("task-a") is not None
+        assert len(store.list_source_syncs()) == 1
+        assert len(store.list_events()) == 1
+        assert store.list_graph_snapshots() == []
+        assert store.latest_graph_snapshot() is None
     finally:
         store.close()
 

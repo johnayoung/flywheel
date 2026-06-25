@@ -54,7 +54,17 @@ if TYPE_CHECKING:
 # pre-existing v1/v2/v3 store keeps every ``task_claims``/``work_items`` row and
 # simply gains an empty ledger; the sentinel converges forward, no
 # drop-and-recreate, no hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 4
+#
+# v5 adds the additive append-only WorkGraph snapshot record (spec 00055,
+# D-1/D-2/D-5): a ``graph_snapshots`` header table plus a
+# ``graph_snapshot_items`` table holding one row per captured work item, written
+# atomically (header + all item rows in one transaction) and stamped with the
+# live ``orchestrator_events`` high-water mark. The bump is additive --
+# ``CREATE TABLE IF NOT EXISTS`` materializes both tables on open, so a
+# pre-existing v1/v2/v3/v4 store keeps every existing row and simply gains an
+# empty snapshot stream; the sentinel converges forward, no drop-and-recreate,
+# no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 5
 
 # The five event types the ledger records, one per committed ``task_claims``
 # insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
@@ -190,6 +200,61 @@ class OrchestratorEventRecord:
     version: int
     lease_expires_at: datetime
     occurred_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class GraphSnapshotItem:
+    """One captured work item inside a WorkGraph snapshot (spec 00055, D-1).
+
+    The full materialized state of a single item as a scheduling pass saw it:
+    its source provenance (``source_kind``/``source_ref``/``source_url``/
+    ``source_version``), scheduling metadata (``priority``,
+    ``required_capabilities``, ``conflict_keys``), lifecycle ``state``, a
+    ``ready`` flag (was it in the pass's ready set), the ``claim_holder`` worker
+    id (or ``None`` when unheld), and the ``resolved_prerequisites`` ids.
+
+    Used both as the input the loop assembles and passes to
+    :meth:`ClaimStore.record_graph_snapshot` and as the read-back row, so a
+    recorded item round-trips to an equal value. The three set fields are stored
+    canonically (sorted JSON) on the durable backends -- the same
+    encode/decode parity ``conflict_keys_json`` already uses -- so they read
+    back as equal sets regardless of insertion order.
+    """
+
+    task_id: str
+    source_kind: str | None = None
+    source_ref: str | None = None
+    source_url: str | None = None
+    source_version: str | None = None
+    priority: int = 0
+    required_capabilities: frozenset[str] = frozenset()
+    conflict_keys: frozenset[str] = frozenset()
+    state: str
+    ready: bool
+    claim_holder: str | None = None
+    resolved_prerequisites: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, kw_only=True)
+class GraphSnapshotRecord:
+    """One ``graph_snapshots`` header row -- a recorded WorkGraph snapshot.
+
+    Append-only (spec 00055, D-3): a header and all its item rows commit in one
+    store transaction, never updated or deleted. ``id`` is the monotonic,
+    backend-assigned snapshot id (so the stream reads back in insertion order).
+    ``captured_at`` is the injected capture timestamp -- never a wall clock, so
+    the record is deterministic and testable. ``item_count`` is the number of
+    captured items (equal to the number of item rows read back, criterion #3).
+    ``last_event_id`` is the maximum ``orchestrator_events`` id at the instant
+    of the write (0 on an empty ledger), computed by the store inside the
+    snapshot's own transaction (D-2), so the cursor cannot drift from the
+    ledger it points at.
+    """
+
+    id: int
+    captured_at: datetime
+    item_count: int
+    last_event_id: int
 
 
 @runtime_checkable
@@ -336,6 +401,67 @@ def _row_to_orchestrator_event_record(
     )
 
 
+def _row_to_graph_snapshot_record(row: sqlite3.Row) -> GraphSnapshotRecord:
+    return GraphSnapshotRecord(
+        id=int(row["id"]),
+        captured_at=_parse_iso(row["captured_at"]),
+        item_count=int(row["item_count"]),
+        last_event_id=int(row["last_event_id"]),
+    )
+
+
+def _row_to_graph_snapshot_item(row: sqlite3.Row) -> GraphSnapshotItem:
+    holder = row["claim_holder"]
+    return GraphSnapshotItem(
+        task_id=row["task_id"],
+        source_kind=row["source_kind"],
+        source_ref=row["source_ref"],
+        source_url=row["source_url"],
+        source_version=row["source_version"],
+        priority=int(row["priority"]),
+        required_capabilities=decode_str_set(
+            row["required_capabilities_json"]
+        ),
+        conflict_keys=decode_str_set(row["conflict_keys_json"]),
+        state=row["state"],
+        ready=bool(row["ready"]),
+        claim_holder=holder if holder is not None else None,
+        resolved_prerequisites=decode_str_set(
+            row["resolved_prerequisites_json"]
+        ),
+    )
+
+
+def _normalize_graph_snapshot_item(
+    item: GraphSnapshotItem,
+) -> GraphSnapshotItem:
+    """Round-trip an item's set fields through the durable encode/decode.
+
+    The in-memory store mirrors the durable backends bit-for-bit by storing
+    each item exactly as SQLite/Postgres would read it back -- canonical sets,
+    a coerced bool ``ready``. Keeps the in-memory substrate from masking a
+    parity bug.
+    """
+    return GraphSnapshotItem(
+        task_id=item.task_id,
+        source_kind=item.source_kind,
+        source_ref=item.source_ref,
+        source_url=item.source_url,
+        source_version=item.source_version,
+        priority=item.priority,
+        required_capabilities=decode_str_set(
+            encode_str_set(item.required_capabilities)
+        ),
+        conflict_keys=decode_str_set(encode_str_set(item.conflict_keys)),
+        state=item.state,
+        ready=bool(item.ready),
+        claim_holder=item.claim_holder,
+        resolved_prerequisites=decode_str_set(
+            encode_str_set(item.resolved_prerequisites)
+        ),
+    )
+
+
 class InMemoryClaimStore:
     """In-memory :class:`ClaimStore`. Not durable; the test substrate.
 
@@ -348,6 +474,8 @@ class InMemoryClaimStore:
         self._claims: dict[str, TaskClaim] = {}
         self._conflict_keys: dict[str, frozenset[str]] = {}
         self._events: list[OrchestratorEventRecord] = []
+        self._snapshots: list[GraphSnapshotRecord] = []
+        self._snapshot_items: dict[int, list[GraphSnapshotItem]] = {}
 
     def _append_event(
         self,
@@ -538,6 +666,49 @@ class InMemoryClaimStore:
         # Per-task timeline: one task's events in id order.
         return [event for event in self._events if event.task_id == task_id]
 
+    def record_graph_snapshot(
+        self,
+        items: Iterable[GraphSnapshotItem],
+        *,
+        captured_at: datetime,
+    ) -> GraphSnapshotRecord:
+        # Append-only (D-3): a fresh monotonic id (1-based) per recorded
+        # snapshot, never overwritten. The cursor is store-computed from the
+        # in-memory ledger -- the max event id, 0 when empty (D-2) -- mirroring
+        # the durable backends' MAX(id) read inside the write transaction.
+        materialized = list(items)
+        last_event_id = self._events[-1].id if self._events else 0
+        snapshot_id = len(self._snapshots) + 1
+        record = GraphSnapshotRecord(
+            id=snapshot_id,
+            captured_at=captured_at,
+            item_count=len(materialized),
+            last_event_id=last_event_id,
+        )
+        self._snapshots.append(record)
+        # Normalize each item through the same encode/decode the durable
+        # backends use (so set fields read back identically) and store in
+        # task_id order to mirror the SQLite ``ORDER BY task_id`` read-back.
+        self._snapshot_items[snapshot_id] = sorted(
+            (_normalize_graph_snapshot_item(item) for item in materialized),
+            key=lambda item: item.task_id,
+        )
+        return record
+
+    def list_graph_snapshots(self) -> list[GraphSnapshotRecord]:
+        # Snapshot stream: every recorded header in id (insertion) order.
+        return list(self._snapshots)
+
+    def list_graph_snapshot_items(
+        self, snapshot_id: int
+    ) -> list[GraphSnapshotItem]:
+        # One snapshot's item rows, in task_id order. Unknown id -> empty.
+        return list(self._snapshot_items.get(snapshot_id, []))
+
+    def latest_graph_snapshot(self) -> GraphSnapshotRecord | None:
+        # Most recently recorded snapshot; None on an empty store.
+        return self._snapshots[-1] if self._snapshots else None
+
     def close(self) -> None:  # parity with the durable stores
         pass
 
@@ -610,6 +781,33 @@ CREATE TABLE IF NOT EXISTS orchestrator_events (
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_events_task
   ON orchestrator_events (task_id, id);
+
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  captured_at   TEXT NOT NULL,
+  item_count    INTEGER NOT NULL,
+  last_event_id INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_snapshot_items (
+  snapshot_id                 INTEGER NOT NULL,
+  task_id                     TEXT NOT NULL,
+  source_kind                 TEXT,
+  source_ref                  TEXT,
+  source_url                  TEXT,
+  source_version              TEXT,
+  priority                    INTEGER NOT NULL DEFAULT 0,
+  required_capabilities_json  TEXT NOT NULL DEFAULT '[]',
+  conflict_keys_json          TEXT NOT NULL DEFAULT '[]',
+  state                       TEXT NOT NULL,
+  ready                       INTEGER NOT NULL,
+  claim_holder                TEXT,
+  resolved_prerequisites_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (snapshot_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_snapshot_items_snapshot
+  ON graph_snapshot_items (snapshot_id);
 """
 
 
@@ -666,11 +864,14 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1/v2 -> v3: the WorkGraph tables (v2) and
-        # the conflict-keys column (v3) were already materialized above, so a
-        # pre-existing store keeps its task_claims/work_items rows intact.
-        # Converge the sentinel forward rather than refusing the store; a
-        # newer-than-current version still trips the mismatch guard below.
+        # Additive forward migration v1/v2/v3/v4 -> v5: the WorkGraph tables
+        # (v2), the conflict-keys column (v3), the orchestrator_events ledger
+        # (v4), and the graph_snapshots/graph_snapshot_items tables (v5) were
+        # all materialized above via CREATE TABLE IF NOT EXISTS, so a
+        # pre-existing store keeps its task_claims/work_items/source_syncs/
+        # orchestrator_events rows intact and simply gains an empty snapshot
+        # stream. Converge the sentinel forward rather than refusing the store;
+        # a newer-than-current version still trips the mismatch guard below.
         if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
                 "UPDATE orchestrator_schema_version SET version = ? "
@@ -992,6 +1193,99 @@ class SqliteClaimStore:
         ).fetchall()
         return [_row_to_orchestrator_event_record(row) for row in rows]
 
+    # -- WorkGraph snapshots (schema v5) -----------------------------------
+
+    def record_graph_snapshot(
+        self,
+        items: Iterable[GraphSnapshotItem],
+        *,
+        captured_at: datetime,
+    ) -> GraphSnapshotRecord:
+        """Record one WorkGraph snapshot atomically (spec 00055, D-3).
+
+        The header row and every item row commit in a single transaction, so a
+        reader never sees a snapshot whose item rows are a subset of what it
+        captured (criterion #3). ``last_event_id`` is stamped by the store as
+        the live ``orchestrator_events`` max id read *inside* this transaction
+        (0 when the ledger is empty, D-2), never caller-supplied, so it cannot
+        drift from the ledger. An empty ``items`` still records a valid snapshot
+        with item count 0 (criterion #11). Append-only: a fresh snapshot id per
+        call, never overwriting an earlier one.
+        """
+        materialized = list(items)
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(id), 0) AS hwm FROM orchestrator_events"
+            ).fetchone()
+            last_event_id = int(row["hwm"])
+            cursor = self._connection.execute(
+                "INSERT INTO graph_snapshots "
+                "(captured_at, item_count, last_event_id) VALUES (?, ?, ?)",
+                (_iso(captured_at), len(materialized), last_event_id),
+            )
+            snapshot_id = cursor.lastrowid
+            assert snapshot_id is not None  # AUTOINCREMENT INSERT sets it
+            for item in materialized:
+                self._connection.execute(
+                    "INSERT INTO graph_snapshot_items ("
+                    "  snapshot_id, task_id, source_kind, source_ref, "
+                    "  source_url, source_version, priority, "
+                    "  required_capabilities_json, conflict_keys_json, "
+                    "  state, ready, claim_holder, resolved_prerequisites_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        snapshot_id,
+                        item.task_id,
+                        item.source_kind,
+                        item.source_ref,
+                        item.source_url,
+                        item.source_version,
+                        item.priority,
+                        encode_str_set(item.required_capabilities),
+                        encode_str_set(item.conflict_keys),
+                        item.state,
+                        1 if item.ready else 0,
+                        item.claim_holder,
+                        encode_str_set(item.resolved_prerequisites),
+                    ),
+                )
+        return GraphSnapshotRecord(
+            id=int(snapshot_id),
+            captured_at=captured_at,
+            item_count=len(materialized),
+            last_event_id=last_event_id,
+        )
+
+    def list_graph_snapshots(self) -> list[GraphSnapshotRecord]:
+        # Snapshot stream: every recorded header in id (insertion) order.
+        rows = self._connection.execute(
+            "SELECT id, captured_at, item_count, last_event_id "
+            "FROM graph_snapshots ORDER BY id"
+        ).fetchall()
+        return [_row_to_graph_snapshot_record(row) for row in rows]
+
+    def list_graph_snapshot_items(
+        self, snapshot_id: int
+    ) -> list[GraphSnapshotItem]:
+        # One snapshot's item rows in task_id order. Unknown id -> empty list.
+        rows = self._connection.execute(
+            "SELECT task_id, source_kind, source_ref, source_url, "
+            "source_version, priority, required_capabilities_json, "
+            "conflict_keys_json, state, ready, claim_holder, "
+            "resolved_prerequisites_json FROM graph_snapshot_items "
+            "WHERE snapshot_id = ? ORDER BY task_id",
+            (snapshot_id,),
+        ).fetchall()
+        return [_row_to_graph_snapshot_item(row) for row in rows]
+
+    def latest_graph_snapshot(self) -> GraphSnapshotRecord | None:
+        # Most recently recorded snapshot header; None on an empty store.
+        row = self._connection.execute(
+            "SELECT id, captured_at, item_count, last_event_id "
+            "FROM graph_snapshots ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return _row_to_graph_snapshot_record(row) if row is not None else None
+
     # -- WorkGraph persistence (schema v2) ---------------------------------
 
     def upsert_work_item(self, item: WorkItem, *, now: datetime) -> None:
@@ -1211,6 +1505,8 @@ __all__ = [
     "ORCHESTRATOR_EVENT_TYPES",
     "ClaimLostError",
     "ClaimStore",
+    "GraphSnapshotItem",
+    "GraphSnapshotRecord",
     "InMemoryClaimStore",
     "SqliteClaimStore",
     "OrchestratorEventRecord",

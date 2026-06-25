@@ -57,6 +57,7 @@ from flywheel_orchestrator._held_out_gate import (
 )
 from flywheel_orchestrator._github import GhRunner, GithubWorkSource
 from flywheel_orchestrator._github_ci import GithubCiWorkSource
+from flywheel_orchestrator._github_review import GithubReviewWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
     PolicyError,
@@ -158,6 +159,7 @@ __all__ = [
     "GateVerdict",
     "GhRunner",
     "GithubCiWorkSource",
+    "GithubReviewWorkSource",
     "GithubWorkSource",
     "GraderReceipt",
     "HeldOutGraderError",

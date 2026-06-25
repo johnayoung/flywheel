@@ -1,0 +1,47 @@
+{
+  "id": "pr-review-source",
+  "goal": "A new `github_review` work source lists a repo's UNRESOLVED PR review threads through the injected gh runner (GraphQL) and compiles each into a WorkItem carrying the operator's default graders, a stable per-thread id, provenance stamps, and the full thread in context -- skipping grader-less threads, raising WorkSourceError on malformed output, and reporting receipts as a PR comment that issues no thread-resolution mutation.",
+  "tags": ["orchestrator", "spec-00053", "github-review", "worksource"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00053-pr-review-thread-source.md -- acceptance criteria #1, #2, #3, #4, #6, #7, #10 and decisions D-1, D-2, D-3, D-5, D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_ci.py -- the CI adapter to MIRROR (not extend): GithubCiWorkSource kw-only repo/default_graders/runner/log seam, source_kind class attr, source_name property, the dedup-to-stable-id list_work, the grader-less SKIP+log in _compile_run, WorkSourceError on malformed gh output, source_ref/source_version/source_url provenance, and report() posting a commit comment via the injected runner. Build a SEPARATE adapter _github_review.py (D-1), reusing GhRunner and _format_report_body from _github.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- GhRunner type (~line 62), _default_runner, _format_report_body (~line 154-172) to reuse for receipts; the report() comment write-back shape to mirror.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkSource protocol (list_work -> Sequence[WorkItem]; report) ~line 129-152 and WorkItem (~line 52-92): task, source_ref, source_kind, source_version, source_url; reuse unchanged.",
+      "packages/flywheel-orchestrator/tests/test_github_ci_source.py -- the _FakeGh runner pattern (records argv, returns canned stdout) to MIRROR for review-thread tests; add the new adapter's tests here or in a sibling test_github_review_source.py and keep the orchestrator suite green.",
+      "packages/flywheel-core/src/flywheel_core/task.py -- Task/Grader/Context shape (graders come from the operator default_graders; thread text goes in context.notes/references); do not modify core."
+    ],
+    "constraints": [
+      "list_work lists the repo's open PRs' review threads via `gh api graphql` (isResolved is GraphQL-only, not REST -- D-2), filters to isResolved == false, and returns one WorkItem per UNRESOLVED thread whose graders are the operator's [defaults.graders] (criterion #1).",
+      "A thread that resolves to ZERO graders is SKIPPED and logged via the injected log, never returned runnable (criterion #2); do not synthesize a grader.",
+      "Item id is STABLE per thread, keyed on the thread's GraphQL node id as `prc-<sha256(thread_node_id)[:16]>` -- identical across polls and across appended replies; a different thread node id yields a different id (D-3, criterion #3).",
+      "source_version digests the thread's comment bodies + isResolved + isOutdated + latest comment timestamp, so a new reply changes source_version while the id is unchanged (criterion #4). source_kind = \"github_review\"; source_url = the thread URL; source_ref = `{repo}#{pr_number}#{thread_node_id}` so report() can recover both the PR and the thread (D-6).",
+      "Malformed gh output (invalid JSON, non-object payload, a thread missing its node id, or a non-zero gh exit) raises WorkSourceError, never a silent empty list read as 'all threads resolved' (criterion #6).",
+      "context.notes carries every comment body with its author login and context.references carries the thread URL, so the agent sees the reviewer's actual request (criterion #10).",
+      "report() posts the run's grader receipts as a PR comment (via `gh pr comment` on the PR parsed from source_ref) and issues NO resolve/reply mutation -- no `resolveReviewThread` in any runner call (D-5, criterion #7).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT extend GithubWorkSource (issues) or GithubCiWorkSource (CI) -- build a separate _github_review.py adapter (D-1); the issue, CI, and directory sources must behave identically.",
+      "Do NOT read or trust the thread's isResolved state as a GRADE -- isResolved is only the candidate filter (which threads are open), never the verdict (D-4); the grade is the operator's out-of-band default graders (the loop-integration task asserts this composition).",
+      "Do NOT resolve, reply-to, or otherwise mutate a review thread's state in report() -- post a PR comment only (D-5).",
+      "Do NOT compile the review comment text into a rubric/structured grader (D-4 rejected); the grade is the operator's default graders.",
+      "Do NOT key items per comment id or comment count (re-queues the thread on every reply) -- key per thread node id (D-3).",
+      "Do NOT derive priority / required_capabilities / conflict_keys from review metadata (leave at defaults).",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema).",
+      "Do NOT add full multi-page pagination (deferred issue-hardening thread); read one bounded page and LOG when it truncates rather than reading truncation as 'no work'.",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A repo with one unresolved and one resolved thread yields exactly one WorkItem, for the unresolved thread, id prefixed `prc-` (criterion #1).",
+      "The same thread re-listed after a new reply yields the SAME id but a DIFFERENT source_version; a different thread node id yields a different id (criteria #3, #4).",
+      "A thread with no operator default graders is skipped + logged, not returned (criterion #2).",
+      "Invalid/non-JSON gh output or a missing thread node id -> WorkSourceError, not an empty list (criterion #6).",
+      "report() makes a `gh pr comment` call carrying the receipts and the PR number from source_ref, and no runner call contains `resolveReviewThread` (criterion #7)."
+    ]
+  }
+}

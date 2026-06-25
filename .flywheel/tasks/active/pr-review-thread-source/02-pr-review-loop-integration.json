@@ -1,0 +1,41 @@
+{
+  "id": "pr-review-loop-integration",
+  "goal": "Selecting `kind = \"github_review\"` in flywheel.toml builds a GithubReviewWorkSource bound to the configured repo and the operator's default graders, and driven through the orchestrator an unresolved-thread item reaches DONE only when those graders pass out-of-band -- never because the thread was resolved, and with no resolve mutation ever issued.",
+  "prerequisites": ["pr-review-source"],
+  "tags": ["orchestrator", "spec-00053", "github-review", "policy", "landing"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00053-pr-review-thread-source.md -- acceptance criteria #5, #8, #9 and decisions D-4 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_review.py -- the adapter from the pr-review-source task; this task wires it into policy/registry and proves the out-of-band-grade composition end-to-end.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_source_registry.py -- SOURCES registry (~line 20-42); register a 'github_review' kind pointing at build_github_review_source, mirroring the 'github_ci' entry.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _SOURCE_KINDS (~line 122), load_policy [source] parsing + the github_ci branch (~line 495-510) and build_github_ci_source / build_work_source (~line 1190-1208); add 'github_review' to _SOURCE_KINDS, parse source.repo (required), add WorkPolicy.github_review_repo (~line 350-373), and a build_github_review_source builder. An existing flywheel.toml with kind=directory/github/github_ci must load unchanged.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/__init__.py -- export build_github_review_source alongside build_github_ci_source (~line 64, 204).",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- the [source] kind parsing tests to mirror for github_review (kind+repo loads; missing repo -> PolicyError); keep green.",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- the orchestrate drive harness to mirror for the out-of-band-grade composition (an unresolved thread driven to DONE by passing default graders, with no resolve call); keep green."
+    ],
+    "constraints": [
+      "load_policy on a `[source] kind=\"github_review\"` + source.repo file resolves source_kind == \"github_review\" and build_work_source returns a GithubReviewWorkSource bound to that repo and the operator's default graders (criterion #8).",
+      "`kind = \"github_review\"` without source.repo raises PolicyError naming the missing repo key (criterion #9).",
+      "Driven through the orchestrator, an unresolved-thread item reaches DONE only when the operator's graders pass when run OUT-OF-BAND by the harness; the compiled Task carries no grader derived from isResolved, and an unresolved thread whose default graders pass still reaches DONE with no resolve mutation issued (D-4, criterion #5).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT read or trust the thread's isResolved state as the grade (D-4) -- the grade is the harness's out-of-band default graders plus 00051's held-out gate when configured.",
+      "Do NOT resolve or mutate a review thread anywhere on the drive/landing path.",
+      "Do NOT add a review-specific store or reconcile path -- reuse the existing sync_work_source / reconcile_live_runs unchanged.",
+      "Do NOT change the issue, CI, or directory source behavior.",
+      "Do NOT modify flywheel-core.",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A flywheel.toml with kind=github_review + repo loads and builds a GithubReviewWorkSource; missing repo -> PolicyError (criteria #8, #9).",
+      "An existing directory/github/github_ci policy file still loads unchanged (no regression).",
+      "agent reports DONE while the out-of-band graders fail -> NOT DONE (the grade is the graders, not the agent or thread resolution).",
+      "An unresolved thread with passing default graders is driven to DONE and the harness issues no resolve mutation (criterion #5, the headline anti-hack)."
+    ]
+  }
+}

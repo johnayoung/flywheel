@@ -81,6 +81,31 @@ def test_render_binds_default_paths() -> None:
     assert ".flywheel/specs/" in verify
 
 
+def test_fw_verify_instructs_held_out_registration_and_keeps_fence() -> None:
+    """Criterion #8 / D-4: the rendered fw-verify skill must BOTH instruct
+    writing the admitted oracle's registration to the configured held-out
+    root keyed by task id AND retain the fence forbidding committing the
+    oracle into the tracked repo / wiring it as an in-repo command grader.
+    The two are distinct channels and must coexist without contradiction."""
+    text = render_skill("fw-verify", SkillRenderSettings())
+
+    # (a) instructs registration at the held-out root keyed by task id.
+    assert "[held_out] root" in text
+    assert "<held-out-root>/<task_id>.json" in text
+    # keyed by the owning task id, referencing the oracle by absolute path.
+    assert "KEYED BY the owning task id" in text
+    assert "ABSOLUTE OPERATOR PATH" in text
+
+    # (b) retains the no-commit-into-repo / no-in-repo-grader fence.
+    assert "wire it as an in-repo `command` grader" in text
+    assert "never a commit into the tracked tree" in text
+    # The fence and the registration are presented as DISTINCT moves.
+    assert "DIFFERENT, sanctioned" in text
+
+    # No leftover placeholder survives rendering.
+    assert "__FW_" not in text
+
+
 def test_render_binds_custom_tasks_dir() -> None:
     settings = SkillRenderSettings(tasks_dir=Path("work/tasks"))
     text = render_skill("fw-plan", settings)

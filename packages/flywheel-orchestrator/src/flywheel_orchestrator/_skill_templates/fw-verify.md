@@ -41,7 +41,7 @@ Accepted forms:
 - A phase directory name or one or more task ids -> read those planned task JSONs under `__FW_TASKS_DIR__/active/`, matched back to the spec each was compiled from in `__FW_SPECS_DIR__/`.
 - (empty) -> the most recently planned phase under `__FW_TASKS_DIR__/active/`, matched back to its spec in `__FW_SPECS_DIR__/`. Never author for everything by reflex; confirm scope before fanning out.
 
-You READ specs and tasks; you never edit them. The spec is immutable, and the task definition `/fw-plan` produced is immutable. You WRITE the held-out oracle only into the git-ignored verification scratch location (named in STEP 5), RECORD its discrimination proof under `__FW_AUDITS_DIR__`, and you PRESENT the one task-side edit (a `non_goals` fence) for the operator to apply. Clarifications you discover route upstream (CONTRACT-PINNING FEEDBACK), never into the spec or the task JSON.
+You READ specs and tasks; you never edit them. The spec is immutable, and the task definition `/fw-plan` produced is immutable. You WRITE the held-out oracle only into the git-ignored verification scratch location (named in STEP 5), RECORD its discrimination proof under `__FW_AUDITS_DIR__`, WRITE the admitted oracle's `<held-out-root>/<task_id>.json` registration to the configured out-of-worktree held-out root when `[held_out] root` is set (STEP 5), and you PRESENT the one task-side edit (a `non_goals` fence) for the operator to apply. Clarifications you discover route upstream (CONTRACT-PINNING FEEDBACK), never into the spec or the task JSON.
 
 ## WHAT THIS STAGE IS AND IS NOT
 
@@ -164,7 +164,7 @@ For each held-out criterion you author, you bind three things together:
 
 **Record the discrimination proof:** which wrong reference died, on which input, and that the correct reference passed. That evidence is the durable artifact of this stage. Discard the synthesized references themselves as throwaway scratch the moment the gate is recorded, they MUST NOT ship into the repo or the agent's view; a reference solution in the worktree is exactly the leak the fence forbids.
 
-## STEP 5: SCREEN FOR EXECUTABILITY AND FLAKINESS, THEN RECORD AND FENCE
+## STEP 5: SCREEN FOR EXECUTABILITY AND FLAKINESS, THEN RECORD, REGISTER, AND FENCE
 
 A generated holdout is measurably flakier and more often non-executable than a human one, and a non-deterministic verdict destroys the authoritativeness the whole stage exists for. Screen every gate-passing holdout BEFORE you trust it to grade, against the synthesized correct reference from STEP 4, never the candidate:
 
@@ -173,11 +173,12 @@ A generated holdout is measurably flakier and more often non-executable than a h
 
 Write each passing, discriminating, non-flaky holdout to the GIT-IGNORED verification scratch location `.flywheel/verification/<spec-or-phase>/`, separated from the agent's visible tests and NEVER committed: the directory is git-ignored, so the oracle does not land in the tree, never appears in a freshly provisioned worker worktree, and never reaches the implementing agent's view. One holdout per criterion, named for the criterion, not the implementation. The holdout adds NO requirement beyond the declared criterion: a hidden oracle that demands behavior the contract does not state is itself a defect.
 
-Because this stage runs BEFORE execute, the holdout grades the SYNTHESIZED references from STEP 4 (the discrimination gate), not a real implementation that does not exist yet. Its job here is to PROVE blind that a discriminating oracle exists for the criterion and to RECORD that proof — not to gate the real agent run. The execute-time gate on the agent's actual work stays where `/fw-plan` put it: the task's own `command` graders plus the tests the implementing agent must write into the repo's normal suite (the durable, CI-run regression guard). Do NOT wire this throwaway oracle in as a landed grader — a git-ignored path is absent from the worker's worktree, and committing it to make the grader resolve would re-open the in-repo gameability this relocation exists to close.
+Because this stage runs BEFORE execute, the holdout grades the SYNTHESIZED references from STEP 4 (the discrimination gate), not a real implementation that does not exist yet. Its job here is to PROVE blind that a discriminating oracle exists for the criterion and to RECORD that proof — not to gate the real agent run. The execute-time gate on the agent's actual work stays where `/fw-plan` put it: the task's own `command` graders plus the tests the implementing agent must write into the repo's normal suite (the durable, CI-run regression guard). Do NOT wire this throwaway oracle in as an in-repo grader — a git-ignored path is absent from the worker's worktree, and committing it to make the grader resolve would re-open the in-repo gameability this relocation exists to close. That prohibition targets the in-repo / in-worktree path (a committed oracle is in the agent's view, gameable). It does NOT forbid the DIFFERENT, sanctioned channel below: writing a registration to the configured out-of-worktree held-out root, which the orchestrator reads from OUTSIDE the worktree and never materializes into the agent's view. Registration is a write to a git-ignored root, never a commit into the tracked tree.
 
 Then RECORD the durable artifact and PRESENT the one task-side edit (you READ tasks; the operator OWNS the task edit, present it, do not write the task JSON yourself):
 
 - **Record the discrimination proof** for each admitted holdout under `__FW_AUDITS_DIR__`: which synthesized wrong reference died, on which input, that the correct reference passed, and the flake-screen result. This recorded evidence — not a committed test file — is the artifact this stage keeps.
+- **Register the admitted oracle at the held-out root (the sanctioned out-of-worktree channel).** When the repo configures a held-out root — the `[held_out] root` key in `flywheel.toml`, conventionally a git-ignored directory under `.flywheel/verification/` — write a registration to `<held-out-root>/<task_id>.json`, KEYED BY the owning task id: a held-out `command` grader that invokes THIS admitted oracle BY ITS ABSOLUTE OPERATOR PATH, run with the agent's committed tree as its working directory. This is the channel that lets the discrimination you proved blind gate the agent's REAL run out-of-band: the orchestrator reads `<held-out-root>/<task_id>.json` from OUTSIDE the worktree, so neither the registration nor the oracle it references ever appears in the agent's view. Reference the oracle by absolute path — a relative path would resolve against the worktree, where the oracle does not exist. This registration is a write to the git-ignored, out-of-worktree root ONLY; it is NOT a commit into the tracked repo and NOT an in-repo `command` grader (the fence below still holds — the two are distinct moves). If no `[held_out] root` is configured there is nowhere to register: record the proof and present the fence as before, and note the registration cannot land until a held-out root is set.
 - **A `non_goals` line** forbidding the implementing agent from reading or writing the verification scratch dir ("do not read or write under `.flywheel/verification/`"), so a future blind oracle for the same criterion is not leaked into the agent's view. Add the path to the task's protected paths if the work source carries one.
 
 ```
@@ -188,6 +189,7 @@ Then RECORD the durable artifact and PRESENT the one task-side edit (you READ ta
    discrimination proof: killed <wrong-ref> on <input>; passed the correct reference
    screened: executable [pass], discriminates [pass], flake-screen run-twice [stable]
    recorded: __FW_AUDITS_DIR__/<record>      (durable artifact)
+   registered: <held-out-root>/<task_id>.json   (when [held_out] root is set; oracle by absolute path, cwd = committed tree; git-ignored, out-of-worktree — NOT committed)
    fence to add to task <id> (operator applies):
      non_goals: "Do not read or write under .flywheel/verification/"
 ```
@@ -221,20 +223,24 @@ Per criterion authored:
     located: .flywheel/verification/<spec>/<file>   (git-ignored, uncommitted)
     discriminates: killed <wrong-ref> on <input>, passed the correct reference
     recorded: __FW_AUDITS_DIR__/<record> (durable proof); fence to add to <task-id>.non_goals (operator applies)
+    registered: <held-out-root>/<task-id>.json when [held_out] root is set (oracle by absolute path; out-of-worktree, git-ignored — never committed)
 
 Skipped (already un-gameable): <s>          (structural/state/filesystem/schema)
 Routed to manual: <m>                       (subjective, or no discriminating oracle authorable)
 Returned upstream as under-specified: <u>   (criterion + the unstated contract detail)
 
-This stage proves blind that a discriminating oracle EXISTS and records that proof; it
-does not itself gate the agent's real run. The execute-time gate is the task's own command
-graders and tests (the durable, CI-run guard). An execute-time HELD-OUT gate — the agent
-graded by a test it never saw — additionally needs out-of-worktree grading owned by the
-orchestrator, out of scope here. A held-out suite is a filter, not a correctness guarantee.
+This stage proves blind that a discriminating oracle EXISTS and records that proof. The
+execute-time gate is always the task's own command graders and tests (the durable, CI-run
+guard). When a `[held_out] root` is configured, the registration written above ALSO routes
+the admitted oracle to the orchestrator's out-of-worktree HELD-OUT gate — the agent graded
+by a test it never saw — which the orchestrator runs from outside the worktree; absent that
+config, no held-out gate runs. fw-verify only emits the registration; activating and running
+the gate is orchestrator-owned. A held-out suite is a filter, not a correctness guarantee.
 
-Next: the operator adds the non_goals fence to each task, then runs the tasks with
-`flywheel worker` (graded by the task's own command graders and tests). Return the <u>
-under-specified criteria to /fw-spec before executing.
+Next: the operator adds the non_goals fence to each task, ensures `[held_out] root` is set if
+the registration should gate the run, then runs the tasks with `flywheel worker` (graded by
+the task's own command graders and tests, plus the held-out gate when configured). Return the
+<u> under-specified criteria to /fw-spec before executing.
 ```
 
 ## ANTI-PATTERNS
@@ -251,7 +257,7 @@ under-specified criteria to /fw-spec before executing.
 - **DO NOT** ship a generated holdout without an executability and run-twice flake screen, a non-deterministic verdict destroys authoritativeness.
 - **DO NOT** fan out N authors by default; escalate adaptively only on a failed strength gate or genuine disagreement, and diversify models/prompts when you do.
 - **DO NOT** ship the synthesized reference implementations into the repo or the agent's view, a reference in the worktree is a leaked answer.
-- **DO NOT** edit the spec or a handed-off task's goal or graders; write the oracle only into the git-ignored `.flywheel/verification/` scratch dir, record its discrimination proof under `__FW_AUDITS_DIR__`, and PRESENT only the `non_goals` fence for the operator to apply.
-- **DO NOT** land the throwaway oracle into the committed repo or wire it as a `command` grader — a git-ignored path is absent from the worker's worktree, and committing it to make a grader resolve re-opens the in-repo gameability this relocation closes. The execute-time gate is the task's own graders and tests.
+- **DO NOT** edit the spec or a handed-off task's goal or graders; write the oracle only into the git-ignored `.flywheel/verification/` scratch dir, record its discrimination proof under `__FW_AUDITS_DIR__`, write the `<held-out-root>/<task_id>.json` registration to the configured held-out root when `[held_out] root` is set, and PRESENT the `non_goals` fence for the operator to apply.
+- **DO NOT** land the throwaway oracle into the committed repo or wire it as an in-repo `command` grader — a git-ignored path is absent from the worker's worktree, and committing it to make a grader resolve re-opens the in-repo gameability this relocation closes. Writing the registration to the out-of-worktree, git-ignored held-out root is a DIFFERENT, sanctioned move (the orchestrator reads it from outside the worktree); it is never a commit into the tracked tree. The in-repo execute-time gate stays the task's own graders and tests.
 - **DO NOT** claim this stage gates the agent's real run or that the held-out flag is tamper-proof: it proves blind that a discriminating oracle exists and records that proof; an execute-time held-out gate additionally needs out-of-worktree grading owned by the orchestrator. Say so plainly.
 - **DO NOT** use emojis.

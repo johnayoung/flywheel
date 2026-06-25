@@ -1,0 +1,42 @@
+{
+  "id": "github-ci-source",
+  "goal": "A new `kind = \"github_ci\"` work source lists a repo's FAILED CI runs through the injected gh runner and compiles each into a WorkItem carrying the operator's default graders, a stable per-(workflow, branch) id, and provenance stamps -- skipping grader-less items and raising WorkSourceError on malformed output.",
+  "tags": ["orchestrator", "spec-00052", "github-ci", "worksource"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00052-github-ci-failure-source.md -- acceptance criteria #1, #2, #5, #7, #9 and decisions D-1, D-3, D-4 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- the shipped issue adapter to MIRROR (not extend): GithubWorkSource constructor with the kw-only repo/label/default_graders/done_action/runner seam; the GhRunner type (~line 62) and _default_runner; the readiness gate that SKIPS + logs an item with zero graders; WorkSourceError on malformed gh output; source_kind/source_version(sha)/source_url provenance stamps. Build a SEPARATE adapter (e.g. _github_ci.py) for the CI source (D-1), reusing GhRunner.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkSource protocol (list_work -> Sequence[WorkItem]; report) ~line 129-152 and WorkItem (~line 52-92): task, source_ref, source_kind, source_version, source_url, prerequisites; reuse these unchanged.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_source_registry.py -- SOURCES registry (~line 20-35); register a 'github_ci' kind pointing at a builder, mirroring the 'github' entry.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- load_policy [source] parsing + build_github_source / build_work_source (~line 457-525, 1131-1156); add github_ci parsing (repo required; optional failure filter) and a build_github_ci_source builder. An existing flywheel.toml with kind=directory/github must load unchanged.",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- the _FakeGh runner pattern (records argv, returns canned stdout) to MIRROR for CI tests; keep this suite green.",
+      "packages/flywheel-core/src/flywheel_core/task.py -- Task/Grader shape (graders come from the operator default_graders); do not modify core."
+    ],
+    "constraints": [
+      "list_work queries the repo's FAILED CI runs (not issues, not passing runs) via the injected GhRunner and returns one WorkItem per failed run (criterion #1).",
+      "Each CI WorkItem's graders are the operator's [defaults.graders]; a CI item that resolves to ZERO graders is SKIPPED and logged, never returned runnable (D-4, criterion #2). Do not synthesize a grader.",
+      "Item id is STABLE per (workflow, branch) across list passes so a persistent failure is one item, not a new id per poll (D-3, criterion #5). source_version tracks the failing head sha / conclusion so a moved failure is detected (criterion #7).",
+      "Stamp provenance: a source_kind identifying the CI source, source_url locating the run, source_version from head sha / conclusion (criterion #7).",
+      "Malformed gh output raises WorkSourceError, never a silent empty list (criterion #9).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT extend GithubWorkSource (issues) to list runs -- build a separate github_ci adapter (D-1); the issue source and directory source must behave identically (criterion #10).",
+      "Do NOT read or trust the GitHub check/run status as a grade, and do NOT trigger a re-run -- this task only LISTS and COMPILES; the grade is the harness's out-of-band default graders (the loop-integration task asserts that).",
+      "Do NOT derive priority / required_capabilities / conflict_keys from CI metadata (00049 D-7 stays deferred; leave at defaults).",
+      "Do NOT key items per run databaseId (unbounded duplicates as the head advances) -- key per (workflow, branch) (D-3).",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema) (criterion #11).",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "A persistent failure re-listed across two polls yields the SAME item id (criterion #5).",
+      "A failed run with no operator default graders is skipped + logged, not returned (criterion #2).",
+      "Malformed / non-JSON gh output -> WorkSourceError, not an empty list read as 'CI is green' (criterion #9).",
+      "Changing the failing head sha changes source_version (criterion #7)."
+    ]
+  }
+}

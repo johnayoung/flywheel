@@ -1,0 +1,42 @@
+{
+  "id": "github-ci-loop-integration",
+  "goal": "Driven through the orchestrator, a CI-failure item reaches DONE only when the operator's graders pass out-of-band (never the GitHub check status, and not when a fix merely disables the failing check), disappears cleanly when the failure is gone while a failed listing marks nothing disappeared, and reports grader receipts back to the run's commit/PR on a terminal outcome.",
+  "prerequisites": ["github-ci-source"],
+  "tags": ["orchestrator", "spec-00052", "github-ci", "landing", "reconcile"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00052-github-ci-failure-source.md -- acceptance criteria #3, #4, #6, #8 and decisions D-2, D-5, D-6 this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_ci.py -- the CI adapter from the github-ci-source task; add its report() write-back here and the no-trust-CI-status grade property.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- the issue source report() (~line 318-344) shows the gh comment/close write-back to MIRROR; for CI, comment receipts on the run's COMMIT or PR, never an issue close (D-5).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- reconcile_live_runs / _source_reconcile_loop / sync_work_source (~line 172-336): a SUCCESSFUL list pass that omits a now-fixed item marks it disappeared and interrupts an in-flight run; a FAILED list_work marks NOTHING disappeared (00048 posture, criterion #6). Reuse this path unchanged (D-6).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkReport / GraderReceipt (~line 94-127): report() receives the terminal status + grader receipts; the CI source writes them back.",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- the _FakeGh runner + report-formatting tests to mirror for CI write-back; keep green.",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- the orchestrate drive + reconcile harness to mirror for the out-of-band-grade and disappearance assertions; keep green."
+    ],
+    "constraints": [
+      "A CI item reaches DONE only when the operator's graders pass when run OUT-OF-BAND by the harness; the source's grade path issues no gh call that reads check/run status as the verdict (D-2, criterion #3).",
+      "If the committed fix makes CI green by disabling/editing the failing CI step without fixing the code, the out-of-band graders still fail and the item is NOT DONE (criterion #4) -- the operator's graders (e.g. the test suite) are independent of the workflow file.",
+      "On a SUCCESSFUL list pass the now-fixed item is omitted (storage marks it disappeared, an in-flight run is interrupted); a FAILED list_work raises WorkSourceError and marks nothing disappeared, via the existing sync_work_source path (D-6, criterion #6).",
+      "report() on a terminal outcome posts a grader-receipt comment to the run's commit or PR via the injected runner, and never closes or mutates an unrelated issue (D-5, criterion #8).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT read or trust the GitHub check status, and do NOT trigger a CI re-run, as the grade (D-2) -- the grade is the harness's out-of-band default graders plus 00051's held-out gate when configured.",
+      "Do NOT close or comment on a GitHub issue for a CI item (wrong object); write back to the run's commit/PR (D-5).",
+      "Do NOT add a CI-specific store or reconcile path -- reuse sync_work_source / reconcile_live_runs unchanged (D-6).",
+      "Do NOT change the issue or directory source behavior (criterion #10).",
+      "Do NOT modify flywheel-core (criterion #11).",
+      "Do NOT modify files under tests/ to weaken or delete assertions."
+    ],
+    "edge_cases": [
+      "agent reports DONE while the out-of-band graders fail -> NOT DONE (the grade is the graders, not the agent or CI).",
+      "fix disables the failing CI step but the default graders still fail -> NOT DONE (criterion #4, the headline anti-hack).",
+      "a now-passing job: successful list omits the item -> marked disappeared + in-flight run interrupted; a gh listing error -> WorkSourceError, nothing disappeared (criterion #6).",
+      "report() write-back targets the run's commit/PR and issues no issue-close (criterion #8)."
+    ]
+  }
+}

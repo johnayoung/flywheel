@@ -13,9 +13,16 @@ shell (``flywheel``), and module-level plumbing remains runnable as
 from typing import TYPE_CHECKING
 
 from flywheel_orchestrator._claims import (
+    EVENT_ACQUIRED,
+    EVENT_EXPIRED,
+    EVENT_RELEASED,
+    EVENT_RENEWED,
+    EVENT_STOLEN,
+    ORCHESTRATOR_EVENT_TYPES,
     ClaimLostError,
     ClaimStore,
     InMemoryClaimStore,
+    OrchestratorEventRecord,
     SourceSyncRecord,
     SqliteClaimStore,
     TaskClaim,
@@ -145,8 +152,15 @@ def __getattr__(name: str) -> object:
 
 __all__ = [
     "AttemptSummary",
+    "EVENT_ACQUIRED",
+    "EVENT_EXPIRED",
+    "EVENT_RELEASED",
+    "EVENT_RENEWED",
+    "EVENT_STOLEN",
+    "ORCHESTRATOR_EVENT_TYPES",
     "ClaimLostError",
     "ClaimStore",
+    "OrchestratorEventRecord",
     "HistoryRow",
     "HistoryRun",
     "RunDetail",

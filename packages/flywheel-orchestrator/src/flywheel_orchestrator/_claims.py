@@ -45,7 +45,36 @@ if TYPE_CHECKING:
 # pre-existing v1/v2 stores gain the column via ``ALTER TABLE ADD COLUMN`` (the
 # column defaults to ``'[]'``, so every surviving claim row keeps its data) and
 # converge their sentinel forward; no drop-and-recreate, no hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 3
+#
+# v4 adds the additive append-only ``orchestrator_events`` ledger (spec 00054,
+# D-1/D-2/D-5): one immutable row per committed claim-lease transition
+# (``acquired``/``stolen``/``renewed``/``released``/``expired``), written in the
+# same transaction as the ``task_claims`` mutation it describes. The bump is
+# additive -- ``CREATE TABLE IF NOT EXISTS`` materializes the table on open, so a
+# pre-existing v1/v2/v3 store keeps every ``task_claims``/``work_items`` row and
+# simply gains an empty ledger; the sentinel converges forward, no
+# drop-and-recreate, no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 4
+
+# The five event types the ledger records, one per committed ``task_claims``
+# insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
+# ``acquired`` so a reclaim over a different worker's lapsed lease is observable;
+# there is no ``lost`` type because a rejected renew commits no state change.
+EVENT_ACQUIRED: str = "acquired"
+EVENT_STOLEN: str = "stolen"
+EVENT_RENEWED: str = "renewed"
+EVENT_RELEASED: str = "released"
+EVENT_EXPIRED: str = "expired"
+
+ORCHESTRATOR_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        EVENT_ACQUIRED,
+        EVENT_STOLEN,
+        EVENT_RENEWED,
+        EVENT_RELEASED,
+        EVENT_EXPIRED,
+    }
+)
 
 
 class ClaimLostError(Exception):
@@ -135,6 +164,32 @@ class SourceSyncRecord:
     observed_count: int
     error: str | None
     metadata_json: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class OrchestratorEventRecord:
+    """One immutable ``orchestrator_events`` row -- a committed claim-lease
+    transition (spec 00054).
+
+    Append-only: a row is written in the same store transaction as the
+    ``task_claims`` insert/update/delete it describes, never updated or deleted.
+    ``id`` is the monotonic insertion id (backend-assigned), so the global
+    stream and a per-task timeline both read back in ``id`` order.
+    ``event_type`` is one of :data:`ORCHESTRATOR_EVENT_TYPES`; ``worker_id`` is
+    the worker the event pertains to (for ``expired`` it is the reaped holder);
+    ``version`` is the claim version after the transition; ``lease_expires_at``
+    is the lease the transition left in place (or, for a deletion, the lease of
+    the row removed); ``occurred_at`` is the injected ``now`` -- never a wall
+    clock, so the ledger is deterministic and testable.
+    """
+
+    id: int
+    task_id: str
+    worker_id: str
+    event_type: str
+    version: int
+    lease_expires_at: datetime
+    occurred_at: datetime
 
 
 @runtime_checkable
@@ -267,12 +322,57 @@ def _row_to_source_sync_record(row: sqlite3.Row) -> SourceSyncRecord:
     )
 
 
+def _row_to_orchestrator_event_record(
+    row: sqlite3.Row,
+) -> OrchestratorEventRecord:
+    return OrchestratorEventRecord(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        worker_id=row["worker_id"],
+        event_type=row["event_type"],
+        version=int(row["version"]),
+        lease_expires_at=_parse_iso(row["lease_expires_at"]),
+        occurred_at=_parse_iso(row["occurred_at"]),
+    )
+
+
 class InMemoryClaimStore:
-    """In-memory :class:`ClaimStore`. Not durable; the test substrate."""
+    """In-memory :class:`ClaimStore`. Not durable; the test substrate.
+
+    Records the same append-only ``orchestrator_events`` ledger as the durable
+    backends (spec 00054): one immutable event per committed claim-lease
+    transition, readable as a global stream and a per-task timeline.
+    """
 
     def __init__(self) -> None:
         self._claims: dict[str, TaskClaim] = {}
         self._conflict_keys: dict[str, frozenset[str]] = {}
+        self._events: list[OrchestratorEventRecord] = []
+
+    def _append_event(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        event_type: str,
+        version: int,
+        lease_expires_at: datetime,
+        occurred_at: datetime,
+    ) -> None:
+        # Append-only: a fresh monotonic id (1-based) per committed transition,
+        # never deduped or overwritten. Stored in insertion order, so both read
+        # accessors return events in id order without sorting.
+        self._events.append(
+            OrchestratorEventRecord(
+                id=len(self._events) + 1,
+                task_id=task_id,
+                worker_id=worker_id,
+                event_type=event_type,
+                version=version,
+                lease_expires_at=lease_expires_at,
+                occurred_at=occurred_at,
+            )
+        )
 
     def acquire_claim(
         self,
@@ -297,6 +397,13 @@ class InMemoryClaimStore:
         ):
             return None
         version = existing.version + 1 if existing is not None else 1
+        # A fresh insert or a same-worker re-acquire is ``acquired``; taking a
+        # *different* worker's lapsed lease is ``stolen`` (D-2) -- the "free"
+        # guard above means a different-worker existing row can only be lapsed.
+        if existing is not None and existing.worker_id != worker_id:
+            event_type = EVENT_STOLEN
+        else:
+            event_type = EVENT_ACQUIRED
         claim = TaskClaim(
             task_id=task_id,
             worker_id=worker_id,
@@ -306,6 +413,14 @@ class InMemoryClaimStore:
         )
         self._claims[task_id] = claim
         self._conflict_keys[task_id] = incoming
+        self._append_event(
+            task_id=task_id,
+            worker_id=worker_id,
+            event_type=event_type,
+            version=version,
+            lease_expires_at=claim.lease_expires_at,
+            occurred_at=now,
+        )
         return claim
 
     def _has_conflicting_live_claim(
@@ -348,9 +463,19 @@ class InMemoryClaimStore:
             version=existing.version + 1,
         )
         self._claims[claim.task_id] = renewed
+        self._append_event(
+            task_id=renewed.task_id,
+            worker_id=renewed.worker_id,
+            event_type=EVENT_RENEWED,
+            version=renewed.version,
+            lease_expires_at=renewed.lease_expires_at,
+            occurred_at=now,
+        )
         return renewed
 
-    def release_claim(self, claim: TaskClaim) -> None:
+    def release_claim(
+        self, claim: TaskClaim, *, now: datetime | None = None
+    ) -> None:
         existing = self._claims.get(claim.task_id)
         if (
             existing is not None
@@ -359,6 +484,16 @@ class InMemoryClaimStore:
         ):
             del self._claims[claim.task_id]
             self._conflict_keys.pop(claim.task_id, None)
+            # Only an actual row deletion records ``released`` (D-1/D-2); a
+            # stale/no-op release falls through the guard and writes nothing.
+            self._append_event(
+                task_id=claim.task_id,
+                worker_id=claim.worker_id,
+                event_type=EVENT_RELEASED,
+                version=claim.version,
+                lease_expires_at=claim.lease_expires_at,
+                occurred_at=now if now is not None else claim.lease_expires_at,
+            )
 
     def load_claim(self, task_id: str) -> TaskClaim | None:
         return self._claims.get(task_id)
@@ -374,15 +509,34 @@ class InMemoryClaimStore:
         # set (so they vanish from list_claims and become acquirable), while
         # claims still valid at now are untouched. Materialize the doomed ids
         # before mutating so the iteration is not over a changing dict.
-        released = [
-            task_id
-            for task_id, claim in self._claims.items()
+        doomed = [
+            claim
+            for claim in self._claims.values()
             if claim.lease_expires_at <= now
         ]
-        for task_id in released:
-            del self._claims[task_id]
-            self._conflict_keys.pop(task_id, None)
-        return released
+        for claim in doomed:
+            del self._claims[claim.task_id]
+            self._conflict_keys.pop(claim.task_id, None)
+            # One ``expired`` event per reaped claim, carrying the reaped
+            # holder's worker id (D-2); a still-valid claim is left untouched
+            # and writes nothing.
+            self._append_event(
+                task_id=claim.task_id,
+                worker_id=claim.worker_id,
+                event_type=EVENT_EXPIRED,
+                version=claim.version,
+                lease_expires_at=claim.lease_expires_at,
+                occurred_at=now,
+            )
+        return [claim.task_id for claim in doomed]
+
+    def list_events(self) -> list[OrchestratorEventRecord]:
+        # Global stream: every recorded event in id (insertion) order.
+        return list(self._events)
+
+    def list_task_events(self, task_id: str) -> list[OrchestratorEventRecord]:
+        # Per-task timeline: one task's events in id order.
+        return [event for event in self._events if event.task_id == task_id]
 
     def close(self) -> None:  # parity with the durable stores
         pass
@@ -443,6 +597,19 @@ CREATE TABLE IF NOT EXISTS source_syncs (
   error          TEXT,
   metadata_json  TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS orchestrator_events (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id          TEXT NOT NULL,
+  worker_id        TEXT NOT NULL,
+  event_type       TEXT NOT NULL,
+  version          INTEGER NOT NULL,
+  lease_expires_at TEXT NOT NULL,
+  occurred_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_events_task
+  ON orchestrator_events (task_id, id);
 """
 
 
@@ -527,6 +694,32 @@ class SqliteClaimStore:
         else:
             self._connection.execute("COMMIT")
 
+    def _append_event(
+        self,
+        *,
+        task_id: str,
+        worker_id: str,
+        event_type: str,
+        version: int,
+        lease_expires_at: datetime,
+        occurred_at: datetime,
+    ) -> None:
+        # Append one ledger row. MUST be called inside an open ``_transaction``
+        # so the event commits atomically with the ``task_claims`` mutation it
+        # describes (D-1): a rolled-back transition takes its event with it.
+        self._connection.execute(
+            "INSERT INTO orchestrator_events (task_id, worker_id, event_type, "
+            "version, lease_expires_at, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                worker_id,
+                event_type,
+                version,
+                _iso(lease_expires_at),
+                _iso(occurred_at),
+            ),
+        )
+
     def acquire_claim(
         self,
         task_id: str,
@@ -572,6 +765,14 @@ class SqliteClaimStore:
                         keys_json,
                     ),
                 )
+                self._append_event(
+                    task_id=task_id,
+                    worker_id=worker_id,
+                    event_type=EVENT_ACQUIRED,
+                    version=1,
+                    lease_expires_at=lease_expires,
+                    occurred_at=now,
+                )
                 return TaskClaim(
                     task_id=task_id,
                     worker_id=worker_id,
@@ -580,6 +781,15 @@ class SqliteClaimStore:
                     version=1,
                 )
             new_version = int(row["version"]) + 1
+            # A same-worker re-acquire is ``acquired``; taking over a *different*
+            # worker's row is ``stolen`` (D-2). The live-different-worker case
+            # already returned None above, so a surviving different-worker row
+            # here is necessarily a lapsed lease being reclaimed.
+            event_type = (
+                EVENT_ACQUIRED
+                if row["worker_id"] == worker_id
+                else EVENT_STOLEN
+            )
             self._connection.execute(
                 "UPDATE task_claims SET worker_id = ?, claimed_at = ?, "
                 "lease_expires_at = ?, version = ?, conflict_keys_json = ? "
@@ -592,6 +802,14 @@ class SqliteClaimStore:
                     keys_json,
                     task_id,
                 ),
+            )
+            self._append_event(
+                task_id=task_id,
+                worker_id=worker_id,
+                event_type=event_type,
+                version=new_version,
+                lease_expires_at=lease_expires,
+                occurred_at=now,
             )
             return TaskClaim(
                 task_id=task_id,
@@ -629,19 +847,31 @@ class SqliteClaimStore:
     ) -> TaskClaim:
         lease_expires = now + timedelta(seconds=lease_seconds)
         new_version = claim.version + 1
-        cursor = self._connection.execute(
-            "UPDATE task_claims SET lease_expires_at = ?, version = ? "
-            "WHERE task_id = ? AND version = ? AND worker_id = ?",
-            (
-                _iso(lease_expires),
-                new_version,
-                claim.task_id,
-                claim.version,
-                claim.worker_id,
-            ),
-        )
-        if cursor.rowcount != 1:
-            raise ClaimLostError(claim.task_id)
+        # The UPDATE and its ``renewed`` event commit together: a stale token
+        # updates no row, so the raise rolls the transaction back and no event
+        # is written (criterion #5).
+        with self._transaction():
+            cursor = self._connection.execute(
+                "UPDATE task_claims SET lease_expires_at = ?, version = ? "
+                "WHERE task_id = ? AND version = ? AND worker_id = ?",
+                (
+                    _iso(lease_expires),
+                    new_version,
+                    claim.task_id,
+                    claim.version,
+                    claim.worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ClaimLostError(claim.task_id)
+            self._append_event(
+                task_id=claim.task_id,
+                worker_id=claim.worker_id,
+                event_type=EVENT_RENEWED,
+                version=new_version,
+                lease_expires_at=lease_expires,
+                occurred_at=now,
+            )
         return TaskClaim(
             task_id=claim.task_id,
             worker_id=claim.worker_id,
@@ -650,12 +880,30 @@ class SqliteClaimStore:
             version=new_version,
         )
 
-    def release_claim(self, claim: TaskClaim) -> None:
-        self._connection.execute(
-            "DELETE FROM task_claims "
-            "WHERE task_id = ? AND version = ? AND worker_id = ?",
-            (claim.task_id, claim.version, claim.worker_id),
-        )
+    def release_claim(
+        self, claim: TaskClaim, *, now: datetime | None = None
+    ) -> None:
+        # The DELETE and its ``released`` event commit together. A stale/
+        # already-stolen token deletes no row (rowcount 0), so no event is
+        # written (criterion #7). ``now`` is the injected occurred-at; absent a
+        # caller-supplied clock it falls back to the released lease's expiry.
+        with self._transaction():
+            cursor = self._connection.execute(
+                "DELETE FROM task_claims "
+                "WHERE task_id = ? AND version = ? AND worker_id = ?",
+                (claim.task_id, claim.version, claim.worker_id),
+            )
+            if cursor.rowcount == 1:
+                self._append_event(
+                    task_id=claim.task_id,
+                    worker_id=claim.worker_id,
+                    event_type=EVENT_RELEASED,
+                    version=claim.version,
+                    lease_expires_at=claim.lease_expires_at,
+                    occurred_at=(
+                        now if now is not None else claim.lease_expires_at
+                    ),
+                )
 
     def load_claim(self, task_id: str) -> TaskClaim | None:
         row = self._connection.execute(
@@ -702,7 +950,8 @@ class SqliteClaimStore:
         now_iso = _iso(now)
         with self._transaction():
             rows = self._connection.execute(
-                "SELECT task_id FROM task_claims WHERE lease_expires_at <= ?",
+                "SELECT task_id, worker_id, version, lease_expires_at "
+                "FROM task_claims WHERE lease_expires_at <= ? ORDER BY task_id",
                 (now_iso,),
             ).fetchall()
             released = [row["task_id"] for row in rows]
@@ -711,7 +960,37 @@ class SqliteClaimStore:
                     "DELETE FROM task_claims WHERE lease_expires_at <= ?",
                     (now_iso,),
                 )
+                # One ``expired`` event per reaped claim, carrying that claim's
+                # holder/version (D-2); still-valid rows were never selected.
+                for row in rows:
+                    self._append_event(
+                        task_id=row["task_id"],
+                        worker_id=row["worker_id"],
+                        event_type=EVENT_EXPIRED,
+                        version=int(row["version"]),
+                        lease_expires_at=_parse_iso(row["lease_expires_at"]),
+                        occurred_at=now,
+                    )
         return released
+
+    def list_events(self) -> list[OrchestratorEventRecord]:
+        # Global stream: every recorded event in id (insertion) order.
+        rows = self._connection.execute(
+            "SELECT id, task_id, worker_id, event_type, version, "
+            "lease_expires_at, occurred_at FROM orchestrator_events "
+            "ORDER BY id"
+        ).fetchall()
+        return [_row_to_orchestrator_event_record(row) for row in rows]
+
+    def list_task_events(self, task_id: str) -> list[OrchestratorEventRecord]:
+        # Per-task timeline: one task's events in id order.
+        rows = self._connection.execute(
+            "SELECT id, task_id, worker_id, event_type, version, "
+            "lease_expires_at, occurred_at FROM orchestrator_events "
+            "WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        return [_row_to_orchestrator_event_record(row) for row in rows]
 
     # -- WorkGraph persistence (schema v2) ---------------------------------
 
@@ -924,10 +1203,17 @@ class SqliteClaimStore:
 
 __all__ = [
     "CURRENT_ORCH_SCHEMA_VERSION",
+    "EVENT_ACQUIRED",
+    "EVENT_EXPIRED",
+    "EVENT_RELEASED",
+    "EVENT_RENEWED",
+    "EVENT_STOLEN",
+    "ORCHESTRATOR_EVENT_TYPES",
     "ClaimLostError",
     "ClaimStore",
     "InMemoryClaimStore",
     "SqliteClaimStore",
+    "OrchestratorEventRecord",
     "OrchestratorSchemaError",
     "SourceSyncRecord",
     "TaskClaim",

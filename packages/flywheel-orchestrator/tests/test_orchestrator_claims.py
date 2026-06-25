@@ -9,6 +9,7 @@ contract suite.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,11 @@ from uuid import uuid4
 import pytest
 
 from flywheel_orchestrator import (
+    EVENT_ACQUIRED,
+    EVENT_EXPIRED,
+    EVENT_RELEASED,
+    EVENT_RENEWED,
+    EVENT_STOLEN,
     ClaimLostError,
     ClaimStore,
     InMemoryClaimStore,
@@ -231,3 +237,384 @@ def test_list_claims_enumerates_held_and_drops_released(
     store.release_claim(a)
     remaining = {(c.task_id, c.worker_id) for c in store.list_claims()}
     assert remaining == {("task-b", "worker-2")}
+
+
+# -- orchestrator_events ledger (spec 00054) ------------------------------
+#
+# The ledger lives on the in-memory and SQLite backends this slice (Layer A);
+# Postgres is a dependent task, so these cases parametrize over memory + sqlite
+# only, mirroring the lease cases above.
+_EVENT_BACKENDS = ("memory", "sqlite")
+
+
+@pytest.fixture(params=_EVENT_BACKENDS, ids=_EVENT_BACKENDS)
+def event_store(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> Iterator[InMemoryClaimStore | SqliteClaimStore]:
+    if request.param == "memory":
+        instance: InMemoryClaimStore | SqliteClaimStore = InMemoryClaimStore()
+    else:
+        instance = SqliteClaimStore(tmp_path / "events.db")
+    try:
+        yield instance
+    finally:
+        instance.close()
+
+
+def _types(events: list) -> list[str]:
+    return [event.event_type for event in events]
+
+
+def test_acquire_records_one_acquired_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #1: a fresh acquire writes exactly one ``acquired`` event
+    # carrying the worker and the post-acquire version.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    timeline = event_store.list_task_events("task-a")
+    assert len(timeline) == 1
+    event = timeline[0]
+    assert event.event_type == EVENT_ACQUIRED
+    assert event.worker_id == "worker-1"
+    assert event.version == claim.version
+    assert event.lease_expires_at == claim.lease_expires_at
+    assert event.occurred_at == _t(0)
+
+
+def test_refused_acquire_live_other_worker_records_no_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #2: a refused acquire (live lease held by another worker)
+    # returns None and adds no event.
+    first = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert first is not None
+    refused = event_store.acquire_claim(
+        "task-a", "worker-2", now=_t(10), lease_seconds=30
+    )
+    assert refused is None
+    assert _types(event_store.list_task_events("task-a")) == [EVENT_ACQUIRED]
+
+
+def test_refused_acquire_conflict_key_records_no_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #2: a conflict-key refusal also adds no event.
+    held = event_store.acquire_claim(
+        "task-a",
+        "worker-1",
+        now=_t(0),
+        lease_seconds=30,
+        conflict_keys=frozenset({"resource-x"}),
+    )
+    assert held is not None
+    refused = event_store.acquire_claim(
+        "task-b",
+        "worker-2",
+        now=_t(5),
+        lease_seconds=30,
+        conflict_keys=frozenset({"resource-x"}),
+    )
+    assert refused is None
+    assert event_store.list_task_events("task-b") == []
+
+
+def test_steal_records_distinct_stolen_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #3: stealing a different worker's lapsed lease writes a
+    # ``stolen`` event distinct from ``acquired``, carrying the new holder.
+    a = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert a is not None
+    b = event_store.acquire_claim(
+        "task-a", "worker-2", now=_t(31), lease_seconds=30
+    )
+    assert b is not None
+    timeline = event_store.list_task_events("task-a")
+    assert _types(timeline) == [EVENT_ACQUIRED, EVENT_STOLEN]
+    steal = timeline[1]
+    assert steal.event_type != EVENT_ACQUIRED
+    assert steal.worker_id == "worker-2"
+    assert steal.version == b.version
+
+
+def test_same_worker_reacquire_records_acquired_not_stolen(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # D-2: a same-worker re-acquire is ``acquired``, never ``stolen``.
+    first = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert first is not None
+    again = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(5), lease_seconds=30
+    )
+    assert again is not None
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_ACQUIRED,
+    ]
+
+
+def test_renew_records_renewed_event_with_version_and_expiry(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #4: a renew writes a ``renewed`` event carrying the post-renew
+    # version and lease expiry.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    renewed = event_store.renew_claim(claim, now=_t(20), lease_seconds=30)
+    timeline = event_store.list_task_events("task-a")
+    assert _types(timeline) == [EVENT_ACQUIRED, EVENT_RENEWED]
+    event = timeline[1]
+    assert event.version == renewed.version
+    assert event.lease_expires_at == renewed.lease_expires_at
+
+
+def test_failed_renew_records_no_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #5: a renew that raises ClaimLostError commits no state change
+    # and writes no event.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    stolen = event_store.acquire_claim(
+        "task-a", "worker-2", now=_t(31), lease_seconds=30
+    )
+    assert stolen is not None
+    with pytest.raises(ClaimLostError):
+        event_store.renew_claim(claim, now=_t(35), lease_seconds=30)
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_STOLEN,
+    ]
+
+
+def test_release_records_released_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #6: releasing the matching live claim writes a ``released``
+    # event for that worker.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    event_store.release_claim(claim, now=_t(10))
+    timeline = event_store.list_task_events("task-a")
+    assert _types(timeline) == [EVENT_ACQUIRED, EVENT_RELEASED]
+    assert timeline[-1].worker_id == "worker-1"
+    assert timeline[-1].occurred_at == _t(10)
+
+
+def test_noop_release_records_no_event(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #7: a release with a stale/already-stolen token deletes no row
+    # and writes no ``released`` event.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    stolen = event_store.acquire_claim(
+        "task-a", "worker-2", now=_t(31), lease_seconds=30
+    )
+    assert stolen is not None
+    event_store.release_claim(claim, now=_t(35))
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_STOLEN,
+    ]
+
+
+def test_sweep_records_one_expired_per_reaped_claim(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #8: a sweep writes exactly one ``expired`` event per reaped
+    # claim (carrying its holder) and none for a still-valid claim.
+    a = event_store.acquire_claim(
+        "task-1", "worker-a", now=_t(0), lease_seconds=30
+    )
+    b = event_store.acquire_claim(
+        "task-2", "worker-b", now=_t(0), lease_seconds=30
+    )
+    c = event_store.acquire_claim(
+        "task-3", "worker-c", now=_t(0), lease_seconds=120
+    )
+    assert a is not None and b is not None and c is not None
+    reaped = event_store.sweep_expired_claims(now=_t(45))
+    assert set(reaped) == {"task-1", "task-2"}
+    expired = [
+        event
+        for event in event_store.list_events()
+        if event.event_type == EVENT_EXPIRED
+    ]
+    assert {(e.task_id, e.worker_id) for e in expired} == {
+        ("task-1", "worker-a"),
+        ("task-2", "worker-b"),
+    }
+    assert event_store.list_task_events("task-3") == [
+        event
+        for event in event_store.list_events()
+        if event.task_id == "task-3"
+    ]
+    assert _types(event_store.list_task_events("task-3")) == [EVENT_ACQUIRED]
+
+
+def test_ledger_is_append_only_in_id_order(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #9: a committed sequence on one task yields one event per
+    # change in id order, never collapsed; re-acquiring after release appends.
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    claim = event_store.renew_claim(claim, now=_t(10), lease_seconds=30)
+    claim = event_store.renew_claim(claim, now=_t(20), lease_seconds=30)
+    event_store.release_claim(claim, now=_t(25))
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_RENEWED,
+        EVENT_RENEWED,
+        EVENT_RELEASED,
+    ]
+    reacquired = event_store.acquire_claim(
+        "task-a", "worker-2", now=_t(30), lease_seconds=30
+    )
+    assert reacquired is not None
+    timeline = event_store.list_task_events("task-a")
+    assert _types(timeline) == [
+        EVENT_ACQUIRED,
+        EVENT_RENEWED,
+        EVENT_RENEWED,
+        EVENT_RELEASED,
+        EVENT_ACQUIRED,
+    ]
+    # Strictly increasing insertion ids, never deduped or overwritten.
+    ids = [event.id for event in timeline]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == len(ids)
+
+
+def test_read_api_global_stream_and_per_task_timeline(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # Criterion #12: the global stream returns every event in id order; the
+    # per-task accessor returns only that task's events in id order; the store
+    # exposes no event-mutating/deleting method.
+    a = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    b = event_store.acquire_claim(
+        "task-b", "worker-2", now=_t(1), lease_seconds=30
+    )
+    assert a is not None and b is not None
+    event_store.renew_claim(a, now=_t(5), lease_seconds=30)
+    global_stream = event_store.list_events()
+    assert [(e.task_id, e.event_type) for e in global_stream] == [
+        ("task-a", EVENT_ACQUIRED),
+        ("task-b", EVENT_ACQUIRED),
+        ("task-a", EVENT_RENEWED),
+    ]
+    assert [e.id for e in global_stream] == sorted(e.id for e in global_stream)
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_RENEWED,
+    ]
+    # No event-mutating or event-deleting surface on the store.
+    for forbidden in (
+        "update_event",
+        "delete_event",
+        "edit_event",
+        "remove_event",
+        "clear_events",
+    ):
+        assert not hasattr(event_store, forbidden)
+
+
+def _build_v3_sqlite_store(path: Path) -> None:
+    """Materialize a schema-v3 orchestrator store (pre-ledger) with rows.
+
+    Mirrors the v3 DDL (task_claims + conflict_keys_json, work_items, the
+    sentinel) so the v4 build's additive migration can be exercised against a
+    real pre-existing store carrying claim and work-item rows.
+    """
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE task_claims (
+              task_id            TEXT PRIMARY KEY,
+              worker_id          TEXT NOT NULL,
+              claimed_at         DATETIME NOT NULL,
+              lease_expires_at   DATETIME NOT NULL,
+              version            INTEGER NOT NULL,
+              conflict_keys_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE orchestrator_schema_version (
+              id      INTEGER PRIMARY KEY CHECK (id = 1),
+              version INTEGER NOT NULL
+            );
+            CREATE TABLE work_items (
+              task_id                    TEXT PRIMARY KEY,
+              source_kind                TEXT,
+              source_ref                 TEXT,
+              source_url                 TEXT,
+              source_version             TEXT,
+              task_content_hash          TEXT,
+              priority                   INTEGER NOT NULL DEFAULT 0,
+              required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+              conflict_keys_json         TEXT NOT NULL DEFAULT '[]',
+              first_seen_at              TEXT NOT NULL,
+              last_seen_at               TEXT NOT NULL,
+              disappeared_at             TEXT,
+              metadata_json              TEXT NOT NULL DEFAULT '{}'
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_claims (task_id, worker_id, claimed_at, "
+            "lease_expires_at, version, conflict_keys_json) "
+            "VALUES ('task-a', 'worker-1', ?, ?, 1, '[]')",
+            (_t(0).isoformat(), _t(30).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO work_items (task_id, first_seen_at, last_seen_at) "
+            "VALUES ('task-a', ?, ?)",
+            (_t(0).isoformat(), _t(0).isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO orchestrator_schema_version (id, version) "
+            "VALUES (1, 3)"
+        )
+    finally:
+        conn.close()
+
+
+def test_v3_store_opens_under_v4_with_rows_and_empty_ledger(
+    tmp_path: Path,
+) -> None:
+    # Criterion #11: a pre-existing v3 store opens under the v4 build without
+    # error, keeps its task_claims and work_items rows, and exposes an empty
+    # ledger -- the additive, non-destructive bump.
+    path = tmp_path / "v3.db"
+    _build_v3_sqlite_store(path)
+    store = SqliteClaimStore(path)
+    try:
+        claim = store.load_claim("task-a")
+        assert claim is not None and claim.worker_id == "worker-1"
+        assert store.load_work_item("task-a") is not None
+        assert store.list_events() == []
+    finally:
+        store.close()

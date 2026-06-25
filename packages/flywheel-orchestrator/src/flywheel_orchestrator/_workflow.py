@@ -2738,10 +2738,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
             # set the DSN, then `flywheel init --provision` to verify and
             # create the schema without rewriting flywheel.toml.
             if getattr(args, "provision", False):
-                existing = load_policy(policy_path)
-                if existing is not None and existing.store_backend == "postgres":
+                existing_policy = load_policy(policy_path)
+                if existing_policy.store_backend == "postgres":
                     try:
-                        _postgres_preflight(args, existing.store_schema)
+                        _postgres_preflight(args, existing_policy.store_schema)
                     except _InitUsageError as exc:
                         print(f"error: {exc}", file=sys.stderr)
                         return 2

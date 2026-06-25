@@ -20,7 +20,6 @@ import shlex
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 from flywheel_core import (
     InvocationFailure,
@@ -218,7 +217,7 @@ class ContainerSubmitStrategy:
 
     def _make_invoke_wrapper(
         self, container_name: str
-    ) -> Callable[[InvokeFunc], InvokeFunc]:
+    ) -> Callable[[InvokeFunc | None], InvokeFunc]:
         agent = self._agent
         runtime = self._runtime
         workdir = self._workdir

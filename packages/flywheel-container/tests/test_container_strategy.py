@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable
 from pathlib import Path
 
 from flywheel_core import InvocationRequest, Intent, ValidEnvelope
@@ -23,7 +24,16 @@ from flywheel_container import (
     ContainerSubmitStrategy,
     ExecResult,
 )
+from flywheel_core import IterationResult
 from flywheel_core.envelope import OPENING_FENCE, CLOSING_FENCE
+
+
+async def _await_invoke(
+    awaitable: Awaitable[IterationResult],
+) -> IterationResult:
+    """Drive an ``InvokeFunc`` result (an ``Awaitable``) under ``asyncio.run``,
+    which requires a coroutine."""
+    return await awaitable
 
 
 def _request(task_id: str = "alpha") -> SandboxRequest:
@@ -207,7 +217,7 @@ def test_invoke_wrapper_runs_agent_and_parses_stream(tmp_path: Path) -> None:
         attempt_number=1,
         iteration_number=1,
     )
-    result = asyncio.run(invoke(request))
+    result = asyncio.run(_await_invoke(invoke(request)))
 
     # Agent ran in the container with the prompt piped on stdin.
     call = rec.exec_calls[0]
@@ -238,12 +248,14 @@ def test_invoke_nonzero_exit_sets_failure(tmp_path: Path) -> None:
 
     invoke = handle.invoke_wrapper(_base)
     result = asyncio.run(
-        invoke(
-            InvocationRequest(
-                prompt="p",
-                transcript_graders=(),
-                attempt_number=1,
-                iteration_number=1,
+        _await_invoke(
+            invoke(
+                InvocationRequest(
+                    prompt="p",
+                    transcript_graders=(),
+                    attempt_number=1,
+                    iteration_number=1,
+                )
             )
         )
     )

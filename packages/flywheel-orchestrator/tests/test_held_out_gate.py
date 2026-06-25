@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from flywheel_core.task import CommandGrader, RubricGrader, Task
+from flywheel_core.task import CommandGrader, Task
 from flywheel_orchestrator import (
     FilesystemHeldOutGraderSource,
     GateOutcome,

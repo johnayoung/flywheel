@@ -95,5 +95,5 @@ def test_hardened_composes_into_locked_down_options(tmp_path: Path) -> None:
     )
     assert tuple(opts.allowed_tools) == HARDENED_TOOLS
     assert opts.strict_mcp_config is True
-    assert list(opts.setting_sources) == ["project"]
-    assert opts.sandbox is not None and opts.sandbox["enabled"] is True
+    assert list(opts.setting_sources or ()) == ["project"]
+    assert opts.sandbox is not None and opts.sandbox.get("enabled") is True

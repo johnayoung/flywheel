@@ -28,8 +28,8 @@ def test_exec_enabled_sets_sandbox_settings() -> None:
         exec_auto_allow=True,
     )
     assert opts.sandbox is not None
-    assert opts.sandbox["enabled"] is True
-    assert opts.sandbox["autoAllowBashIfSandboxed"] is True
+    assert opts.sandbox.get("enabled") is True
+    assert opts.sandbox.get("autoAllowBashIfSandboxed") is True
 
 
 def test_exec_auto_allow_false_is_carried() -> None:
@@ -41,5 +41,5 @@ def test_exec_auto_allow_false_is_carried() -> None:
         exec_auto_allow=False,
     )
     assert opts.sandbox is not None
-    assert opts.sandbox["enabled"] is True
-    assert opts.sandbox["autoAllowBashIfSandboxed"] is False
+    assert opts.sandbox.get("enabled") is True
+    assert opts.sandbox.get("autoAllowBashIfSandboxed") is False

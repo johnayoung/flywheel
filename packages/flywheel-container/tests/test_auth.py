@@ -21,6 +21,7 @@ from flywheel_container import (
     ContainerRuntime,
     ContainerSubmitStrategy,
     DEFAULT_AGENT_HOME,
+    ExecResult,
     OAUTH_TOKEN_ENV,
 )
 from flywheel_orchestrator import SandboxRequest
@@ -90,7 +91,9 @@ class _Recorder:
     def runtime(self) -> ContainerRuntime:
         return ContainerRuntime(
             start=self.start,
-            exec_command=lambda *a, **k: None,
+            exec_command=lambda *a, **k: ExecResult(
+                stdout="", stderr="", exit_code=0
+            ),
             remove=lambda name: None,
             register_cleanup=lambda name: (lambda: None),
             ensure_internal_network=lambda name: None,

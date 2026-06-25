@@ -19,7 +19,6 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from flywheel_core.lifecycle import Status

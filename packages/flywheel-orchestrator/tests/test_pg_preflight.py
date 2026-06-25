@@ -208,6 +208,7 @@ def test_preflight_privileges_block_for_unprivileged_role(
     require_postgres: str,
 ) -> None:
     import psycopg
+    import psycopg.conninfo
 
     role = "fw_preflight_lowpriv"
     schema = "fw_preflight_lowpriv_schema"

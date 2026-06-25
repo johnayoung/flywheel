@@ -39,7 +39,9 @@ def _init_repo(path: Path) -> None:
     _git(path, "commit", "-m", "init")
 
 
-def _submitter(repo: Path, **retention: str) -> worker.GitWorktreeSubmitter:
+def _submitter(
+    repo: Path, *, on_done: str = "destroy", on_failure: str = "park"
+) -> worker.GitWorktreeSubmitter:
     worktrees = repo / ".flywheel" / "worktrees"
     worktrees.mkdir(parents=True, exist_ok=True)
     return worker.GitWorktreeSubmitter(
@@ -49,7 +51,8 @@ def _submitter(repo: Path, **retention: str) -> worker.GitWorktreeSubmitter:
         phase_base="main",
         lock_path=repo / ".flywheel" / ".merge.lock",
         log=lambda _m: None,
-        **retention,
+        on_done=on_done,
+        on_failure=on_failure,
     )
 
 

@@ -22,6 +22,7 @@ from flywheel_container import (
     ContainerRuntime,
     ContainerSubmitStrategy,
     DEFAULT_INTERNAL_NETWORK,
+    ExecResult,
     ResolvedNetwork,
     resolve_network,
 )
@@ -73,7 +74,9 @@ class _Recorder:
     def runtime(self) -> ContainerRuntime:
         return ContainerRuntime(
             start=self.start,
-            exec_command=lambda *a, **k: None,  # unused here
+            exec_command=lambda *a, **k: ExecResult(
+                stdout="", stderr="", exit_code=0
+            ),  # unused here
             remove=lambda name: None,
             register_cleanup=lambda name: (lambda: None),
             ensure_internal_network=self.internal_created.append,

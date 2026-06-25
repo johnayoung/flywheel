@@ -16,20 +16,35 @@ primitives in ``run_task_object`` and threaded down, exactly as ``model`` alread
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypedDict
 
 from flywheel_core._sdk import ClaudeAgentOptions
 from flywheel_core.workflow import build_agent_options
 
+
+class _FastPrimitives(TypedDict):
+    """The sandbox primitives ``build_agent_options`` accepts, typed per-key so
+    ``**FAST`` unpacks to the matching keyword parameters (not one widened union)."""
+
+    permission_mode: str
+    skills: str | tuple[str, ...]
+    allowed_tools: tuple[str, ...]
+    denied_tools: tuple[str, ...]
+    setting_sources: tuple[str, ...] | None
+    mcp_servers: tuple[str, ...]
+    mcp_strict: bool
+
+
 # The `fast` primitives == today's hardcoded construction (00037 baseline).
-FAST = dict(
-    permission_mode="bypassPermissions",
-    skills="all",
-    allowed_tools=(),
-    denied_tools=(),
-    setting_sources=None,
-    mcp_servers=(),
-    mcp_strict=False,
-)
+FAST: _FastPrimitives = {
+    "permission_mode": "bypassPermissions",
+    "skills": "all",
+    "allowed_tools": (),
+    "denied_tools": (),
+    "setting_sources": None,
+    "mcp_servers": (),
+    "mcp_strict": False,
+}
 
 
 def test_fast_primitives_reproduce_todays_options() -> None:
@@ -50,11 +65,13 @@ def test_fast_primitives_reproduce_todays_options() -> None:
 
 
 def test_changed_primitive_changes_options() -> None:
+    changed: _FastPrimitives = {
+        **FAST,
+        "permission_mode": "default",
+        "allowed_tools": ("Read",),
+    }
     opts = build_agent_options(
-        Path("/tmp/sbx"),
-        model=None,
-        max_turns=500,
-        **{**FAST, "permission_mode": "default", "allowed_tools": ("Read",)},
+        Path("/tmp/sbx"), model=None, max_turns=500, **changed
     )
     assert opts.permission_mode == "default"
     assert tuple(opts.allowed_tools) == ("Read",)

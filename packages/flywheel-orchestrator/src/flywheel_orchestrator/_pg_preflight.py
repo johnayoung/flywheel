@@ -102,6 +102,7 @@ def run_postgres_preflight(
 
     try:
         import psycopg
+        import psycopg.conninfo
     except ImportError:
         checks.append(
             PreflightCheck(
@@ -164,6 +165,7 @@ def run_postgres_preflight(
 def _dsn_port(dsn: str) -> int | None:
     try:
         import psycopg
+        import psycopg.conninfo
 
         raw = psycopg.conninfo.conninfo_to_dict(dsn).get("port")
     except Exception:

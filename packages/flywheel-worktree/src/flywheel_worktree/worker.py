@@ -1448,7 +1448,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # [held_out] root is configured, resolved against repo_root. When unset this
     # is None and landing is byte-identical to today.
     held_out_source = build_held_out_source(policy, repo_root)
-    if held_out_source is not None and policy is not None:
+    if (
+        held_out_source is not None
+        and policy is not None
+        and policy.held_out_root is not None
+    ):
         log(f"held-out gate active root={repo_root / policy.held_out_root}")
 
     log(f"started pid={os.getpid()} base={phase_base} db={db_path}")

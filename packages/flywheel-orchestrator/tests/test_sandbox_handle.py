@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from flywheel_core import InvocationRequest, IterationResult
 from flywheel_orchestrator import SandboxHandle
 from flywheel_orchestrator._orchestrate import (
     _apply_handle,
@@ -20,7 +21,7 @@ from flywheel_orchestrator._orchestrate import (
 from flywheel_orchestrator._strategy import _as_handle
 
 
-async def _invoke(request: object) -> object:  # a minimal InvokeFunc
+async def _invoke(request: InvocationRequest) -> IterationResult:  # a minimal InvokeFunc
     raise AssertionError("base invoke must not be called by the seam")
 
 

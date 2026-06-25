@@ -87,6 +87,29 @@ def _default_runner(argv: Sequence[str]) -> str:
     return proc.stdout
 
 
+def emit_truncation_warning(
+    log: Callable[[str], None] | None,
+    *,
+    source: str,
+    what: str,
+) -> None:
+    """Emit the uniform one-page truncation warning through ``log``.
+
+    The shared seam for every GitHub source: a bounded single-page listing
+    that fills its cap signals dropped items rather than silently truncating
+    (D-3). ``source`` names the source tag (e.g. ``github``), ``what`` names
+    the listed unit. The wording is uniform (``items``, not source-specific
+    nouns). A side channel only — a ``log=None`` caller is a no-op and the
+    returned work sequence is never affected.
+    """
+    if log is None:
+        return
+    log(
+        f"[{source}] {what} listing truncated at one page; "
+        f"some items were not read this pass"
+    )
+
+
 def _extract_spec_block(body: str, *, source: str) -> dict[str, Any] | None:
     """Parse the issue body's ```` ```flywheel ```` fenced block, if any.
 
@@ -241,6 +264,8 @@ class GithubWorkSource:
                 f"gh issue list returned {type(issues).__name__}, "
                 f"expected a list"
             )
+        if len(issues) == int(_LIST_LIMIT):
+            emit_truncation_warning(self._log, source="github", what="issue")
         items: list[WorkItem] = []
         for issue in sorted(
             (i for i in issues if isinstance(i, dict)),
@@ -344,4 +369,4 @@ class GithubWorkSource:
         )
 
 
-__all__ = ["GhRunner", "GithubWorkSource"]
+__all__ = ["GhRunner", "GithubWorkSource", "emit_truncation_warning"]

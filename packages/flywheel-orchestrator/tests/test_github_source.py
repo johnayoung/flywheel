@@ -160,6 +160,75 @@ def test_invalid_list_payload_raises() -> None:
         _source(gh).list_work()
 
 
+def _full_page() -> str:
+    return json.dumps([_issue(n, body="Please.") for n in range(1, 201)])
+
+
+def test_full_page_emits_one_truncation_warning() -> None:
+    gh = _FakeGh(_full_page())
+    lines: list[str] = []
+    source = _source(
+        gh, default_graders=(CommandGrader(run="true"),), log=lines.append
+    )
+
+    items = source.list_work()
+
+    assert len(items) == 200
+    warnings = [ln for ln in lines if "truncated at one page" in ln]
+    assert len(warnings) == 1
+    assert "[github]" in warnings[0]
+    assert "some items were not read this pass" in warnings[0]
+
+
+def test_below_cap_emits_no_truncation_warning() -> None:
+    gh = _FakeGh(json.dumps([_issue(n, body="Please.") for n in range(1, 200)]))
+    lines: list[str] = []
+    source = _source(
+        gh, default_graders=(CommandGrader(run="true"),), log=lines.append
+    )
+
+    source.list_work()
+
+    assert [ln for ln in lines if "truncated" in ln] == []
+
+
+def test_truncation_warning_is_a_side_channel() -> None:
+    page = _full_page()
+    with_log_source = _source(
+        _FakeGh(page),
+        default_graders=(CommandGrader(run="true"),),
+        log=[].append,
+    )
+    without_log_source = _source(
+        _FakeGh(page), default_graders=(CommandGrader(run="true"),)
+    )
+
+    with_log = with_log_source.list_work()
+    without_log = without_log_source.list_work()
+
+    assert [i.task.id for i in with_log] == [i.task.id for i in without_log]
+
+
+def test_full_page_with_log_none_does_not_crash() -> None:
+    gh = _FakeGh(_full_page())
+    source = _source(gh, default_graders=(CommandGrader(run="true"),))
+
+    items = source.list_work()
+
+    assert len(items) == 200
+
+
+def test_failed_listing_raises_and_never_returns_empty() -> None:
+    def _failing(argv) -> str:
+        raise WorkSourceError("gh issue list failed (exit 1): boom")
+
+    source = GithubWorkSource(
+        repo="octo/widgets", label="flywheel", runner=_failing
+    )
+    with pytest.raises(WorkSourceError, match="failed"):
+        source.list_work()
+
+
 # --- outbound: report -------------------------------------------------------
 
 

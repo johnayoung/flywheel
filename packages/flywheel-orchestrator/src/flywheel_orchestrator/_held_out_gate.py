@@ -47,7 +47,7 @@ from typing import Any, Protocol, runtime_checkable
 from flywheel_core.grader_command import run_command_graders
 from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.store_protocols import GraderResultRecord
-from flywheel_core.task import CommandGrader, Task
+from flywheel_core.task import CommandGrader, Grader, Task
 
 
 class HeldOutGraderError(Exception):
@@ -119,9 +119,20 @@ class HeldOutGraderSource(Protocol):
     Implementations MUST NOT expose held-out graders through the agent-facing
     ``Task`` or write them into the agent's worktree; the source is a side
     channel the orchestrator reads at gate time.
+
+    ``standing_graders_for`` returns the *standing-invariant* oracles that apply
+    to ``task`` by a predicate (its tags), as opposed to ``graders_for``'s
+    per-task-id registration. A standing oracle re-asserts an invariant across
+    *every* task that matches it -- the missing piece for autopilot, whose
+    auto-generated task ids cannot be pre-registered one by one. The gate ANDs
+    the standing graders into the per-task verdict. An implementation that has
+    no concept of standing oracles may return ``[]`` (the gate guards the call),
+    so the method is effectively optional for minimal sources.
     """
 
     def graders_for(self, task_id: str) -> list[CommandGrader] | None: ...
+
+    def standing_graders_for(self, task: Task) -> list[CommandGrader]: ...
 
 
 @dataclass(frozen=True)
@@ -201,6 +212,148 @@ class FilesystemHeldOutGraderSource:
         if root != candidate and root not in candidate.parents:
             return None
         return candidate
+
+    def standing_graders_for(self, task: Task) -> list[CommandGrader]:
+        """Return the standing-invariant oracles that apply to ``task``.
+
+        Standing oracles live under ``<root>/_standing/*.json``, each an object
+        ``{"match": {...}, "graders": [...]}``. A standing oracle applies to a
+        task when its ``match`` predicate matches: ``match.tags`` (a list)
+        applies to any task whose ``tags`` intersect it, while an absent/empty
+        ``match`` applies to *every* task (a global landing oracle). The graders
+        are the same command-only, out-of-band checks as a per-task
+        registration, and are ANDed into the gate verdict.
+
+        Fail-closed (D-3), mirroring :meth:`graders_for`: a standing file that is
+        unreadable, invalid JSON, declares a non-command or empty grader set, or
+        carries a malformed ``match`` predicate raises :class:`HeldOutGraderError`
+        -- a broken standing oracle blocks every land rather than silently
+        opening the gate. A task that matches no standing oracle yields ``[]``.
+        """
+        standing_dir = self.root / STANDING_SUBDIR
+        if not standing_dir.is_dir():
+            return []
+        out: list[CommandGrader] = []
+        for path in sorted(standing_dir.glob("*.json")):
+            if not path.is_file():
+                continue
+            out.extend(self._load_standing_file(path, task))
+        return out
+
+    def _load_standing_file(
+        self, path: Path, task: Task
+    ) -> list[CommandGrader]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HeldOutGraderError(
+                f"{path}: standing oracle cannot be read: {exc}"
+            ) from exc
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise HeldOutGraderError(
+                f"{path}: standing oracle is invalid JSON: {exc}"
+            ) from exc
+        if not isinstance(data, Mapping):
+            raise HeldOutGraderError(
+                f"{path}: standing oracle must be an object with 'match' and "
+                f"'graders'"
+            )
+        if not _standing_matches(data.get("match"), task, source=str(path)):
+            return []
+        try:
+            graders = load_graders(data.get("graders"), source=str(path))
+        except TaskLoadError as exc:
+            raise HeldOutGraderError(
+                f"standing oracle could not be parsed: {exc}"
+            ) from exc
+        command = [g for g in graders if isinstance(g, CommandGrader)]
+        if len(command) != len(graders):
+            raise HeldOutGraderError(
+                f"{path}: standing oracle graders must be command graders only "
+                f"(D-5); found a non-command grader"
+            )
+        if not command:
+            raise HeldOutGraderError(
+                f"{path}: standing oracle declares no command graders; refusing "
+                f"to certify an empty gate as passing"
+            )
+        return command
+
+
+#: Subdirectory under the held-out root holding standing-invariant oracles.
+STANDING_SUBDIR = "_standing"
+
+
+def _standing_matches(match: object, task: Task, *, source: str) -> bool:
+    """Whether a standing oracle's ``match`` predicate applies to ``task``.
+
+    Absent / empty ``match`` -> applies to every task (a global landing oracle).
+    ``match.tags`` (a list of strings) -> applies when ``task.tags`` intersects
+    it. A non-object ``match``, or a non-empty ``match`` without a valid ``tags``
+    list, raises :class:`HeldOutGraderError` (fail closed) so a typo'd predicate
+    never silently becomes global or never-matching.
+    """
+    if match is None:
+        return True
+    if not isinstance(match, Mapping):
+        raise HeldOutGraderError(
+            f"{source}: standing oracle 'match' must be an object"
+        )
+    if not match:
+        return True
+    tags = match.get("tags")
+    if not isinstance(tags, list) or not all(
+        isinstance(t, str) for t in tags
+    ):
+        raise HeldOutGraderError(
+            f"{source}: standing oracle 'match' must declare a 'tags' list of "
+            f"strings (the only supported predicate)"
+        )
+    return bool(set(tags) & set(task.tags))
+
+
+def write_standing_oracle_registration(
+    root: str | os.PathLike[str],
+    name: str,
+    oracle_path: str | os.PathLike[str],
+    *,
+    tags: tuple[str, ...] = (),
+    interpreter: str | None = None,
+) -> Path:
+    """Write a standing-invariant oracle to ``<root>/_standing/<name>.json``.
+
+    The standing companion of :func:`write_oracle_registration`: instead of
+    keying the oracle to one task id, it carries a ``match`` predicate so the
+    gate applies it to *every* task that matches. ``tags`` scopes it to tasks
+    carrying any of those tags; an empty ``tags`` writes a GLOBAL oracle that
+    gates every landing. The grader shape reuses :func:`build_oracle_registration`
+    (absolute oracle path, command-only, D-5), so the file always round-trips
+    through :meth:`FilesystemHeldOutGraderSource.standing_graders_for`.
+
+    Raises :class:`ValueError` for a ``name`` that would escape ``_standing/``
+    (separators or ``..``), mirroring the task-id traversal refusal.
+    """
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(
+            f"standing oracle name {name!r} must be a bare filename stem"
+        )
+    base = build_oracle_registration(
+        oracle_path, name=f"standing-oracle:{name}", interpreter=interpreter
+    )
+    registration: dict[str, Any] = {"graders": base["graders"]}
+    if tags:
+        registration["match"] = {"tags": list(tags)}
+
+    standing_dir = Path(root) / STANDING_SUBDIR
+    standing_dir.mkdir(parents=True, exist_ok=True)
+    target = standing_dir / f"{name}.json"
+    target.write_text(
+        json.dumps(registration, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return target
 
 
 def build_oracle_registration(
@@ -335,13 +488,20 @@ def evaluate_held_out_gate(
     """
     try:
         held_out = source.graders_for(task.id)
+        # Standing-invariant oracles applying to this task by predicate (tags),
+        # ANDed into the verdict. Guarded for minimal sources lacking the method.
+        standing_fn = getattr(source, "standing_graders_for", None)
+        standing = list(standing_fn(task)) if standing_fn is not None else []
     except HeldOutGraderError as exc:
         return GateVerdict(
             GateOutcome.FAIL,
             f"held-out gate failed closed: {exc}",
         )
 
-    if not held_out:
+    combined: list[Grader] = []
+    combined.extend(held_out or [])
+    combined.extend(standing)
+    if not combined:
         return GateVerdict(
             GateOutcome.NO_GATE,
             "no held-out graders registered for this task",
@@ -349,7 +509,7 @@ def evaluate_held_out_gate(
 
     gate_task = Task(
         goal=f"held-out landing gate for {task.id}",
-        graders=list(held_out),
+        graders=combined,
         id=task.id,
     )
 
@@ -377,7 +537,7 @@ def evaluate_held_out_gate(
             f"({type(exc).__name__}: {exc})",
         )
 
-    expected = len(held_out)
+    expected = len(combined)
     ran_all = len(records) == expected
     all_passed = all(record.passed for record in records)
 
@@ -455,6 +615,7 @@ class _GateGraderRecorder:
 
 
 __all__ = [
+    "STANDING_SUBDIR",
     "FilesystemHeldOutGraderSource",
     "GateOutcome",
     "GateVerdict",
@@ -463,4 +624,5 @@ __all__ = [
     "build_oracle_registration",
     "evaluate_held_out_gate",
     "write_oracle_registration",
+    "write_standing_oracle_registration",
 ]

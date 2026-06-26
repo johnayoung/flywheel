@@ -102,6 +102,7 @@ from flywheel_orchestrator._held_out_gate import (
     build_oracle_registration,
     evaluate_held_out_gate,
     write_oracle_registration,
+    write_standing_oracle_registration,
 )
 from flywheel_orchestrator._github import GhRunner, GithubWorkSource
 from flywheel_orchestrator._github_ci import GithubCiWorkSource
@@ -333,4 +334,5 @@ __all__ = [
     "task_state",
     "write_oracle_registration",
     "write_phase_base_if_missing",
+    "write_standing_oracle_registration",
 ]

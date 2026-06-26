@@ -25,26 +25,33 @@ uv sync
 
 Each package keeps its own `tests/` under `packages/<pkg>/tests/`.
 
+Run the full suite through `scripts/run_silent.sh`, a context-efficient
+backpressure wrapper: it suppresses output on success (one `ok` line) and dumps
+the full output only on failure, so a green run stays quiet.
+
 ```bash
-uv run pytest                                             # full suite
-uv run pytest packages/flywheel-core/tests/test_task.py   # one file
-uv run pytest -k transcript                                # one keyword
-uv run pytest -x -vv                                       # stop on first failure, verbose
+scripts/run_silent.sh "tests" uv run pytest               # full suite, quiet on success
+uv run pytest packages/flywheel-core/tests/test_task.py   # one file (iterating)
+uv run pytest -k transcript                                # one keyword (iterating)
+uv run pytest -x -vv                                       # stop on first failure, verbose (iterating)
 ```
+
+Use the bare `uv run pytest -k ...` forms while iterating on a single test; set
+`RUN_SILENT_VERBOSE=1` to stream output live.
 
 ## Lint and types
 
-CI gates every change on ruff and pyright in addition to the test suite, so
-run all three before opening a PR:
+CI gates every change on ruff and pyright in addition to the test suite. Run
+all three before opening a PR with `scripts/check.sh`, which runs them in CI
+order (ruff -> pyright -> pytest), each through the backpressure wrapper:
 
 ```bash
-uv run ruff check .
-uv run pyright
-uv run pytest
+scripts/check.sh
 ```
 
-Treat pyright errors as build failures; `uv run pytest` does not surface type
-errors.
+A clean tree prints three `ok` lines; the first failing gate dumps only its own
+output and stops. Treat pyright errors as build failures; the test suite does
+not surface type errors.
 
 ## Commit style
 

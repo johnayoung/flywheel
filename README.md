@@ -12,7 +12,7 @@ uv run flywheel init           # scaffold .flywheel/, a work policy, and the SDD
 export ANTHROPIC_API_KEY=...   # or run `claude login` — authenticate the agent first
 uv run flywheel worker --once  # claim one task, run it, exit
 uv run flywheel                # operator console (alias: fw)
-uv run pytest                  # full test suite
+scripts/check.sh               # full CI gate: ruff, pyright, pytest (quiet on success)
 ```
 
 The worker drives the Claude agent, so authenticate it before the first run: set `ANTHROPIC_API_KEY` or run `claude login`. Without it the first worker run fails when the agent SDK cannot authenticate.

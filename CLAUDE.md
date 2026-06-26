@@ -32,13 +32,15 @@ New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.
 
 ```bash
 uv sync                                                   # install all workspace packages
-uv run pytest                                             # full suite (all packages)
-uv run pytest packages/flywheel-core/tests/test_task.py   # one file
-uv run pytest -k transcript                                # one keyword
-uv run pytest -x -vv                                       # stop on first failure, verbose
+scripts/check.sh                                          # full gate: ruff -> pyright -> pytest, quiet on success
+uv run pytest packages/flywheel-core/tests/test_task.py   # one file (iterating)
+uv run pytest -k transcript                                # one keyword (iterating)
+uv run pytest -x -vv                                       # stop on first failure, verbose (iterating)
 ```
 
 Python 3.13 required. `uv` is the package manager and task runner — do not invoke `pip` or call `python` directly. Each package keeps its own `tests/` under `packages/<pkg>/tests/`; a root `conftest.py` hosts shared fixtures (e.g. the Postgres test container).
+
+**Run the full suite through `scripts/check.sh`, not bare `uv run pytest`.** It wraps each gate in `scripts/run_silent.sh` (context-efficient backpressure): output is suppressed on success — one `ok` line per gate — and dumped in full only on the first failure, so passing runs do not flood the transcript. Use the bare `uv run pytest -k ...` forms above only while iterating on a single test; set `RUN_SILENT_VERBOSE=1` to stream output live. Run any other verification command the same way: `scripts/run_silent.sh "<desc>" <command>`.
 
 ## Non-negotiable invariants
 
@@ -56,4 +58,4 @@ Python 3.13 required. `uv` is the package manager and task runner — do not inv
 
 ## After editing Python
 
-Call `mcp__ide__getDiagnostics` on every `.py` file you touch before reporting the task done. Treat Pylance errors as build failures; fix them in the same turn rather than handing back red squiggles. `uv run pytest` is necessary but not sufficient — the test suite does not surface type errors.
+Call `mcp__ide__getDiagnostics` on every `.py` file you touch before reporting the task done. Treat Pylance errors as build failures; fix them in the same turn rather than handing back red squiggles. Per-file diagnostics are necessary but not sufficient — they do not surface project-wide type errors or test failures. Before reporting the task done, run the full gate with `scripts/check.sh` (ruff -> pyright -> pytest, the same checks CI runs) and confirm it is green.

@@ -34,6 +34,7 @@ SLASH_HISTORY = "history"
 SLASH_WORKER = "worker"
 SLASH_AUTOPILOT = "autopilot"
 SLASH_QUIT = "quit"
+SLASH_EXIT = "exit"
 
 SLASH_COMMANDS: tuple[str, ...] = (
     SLASH_HELP,
@@ -46,6 +47,7 @@ SLASH_COMMANDS: tuple[str, ...] = (
     SLASH_WORKER,
     SLASH_AUTOPILOT,
     SLASH_QUIT,
+    SLASH_EXIT,
 )
 
 
@@ -60,7 +62,8 @@ HELP_LINES: tuple[str, ...] = (
     "  /history            list finished runs (enter opens a run's session)",
     "  /worker start|stop  spawn or gracefully stop the supervised worker",
     "  /autopilot start|stop  spawn or stop the supervised autopilot daemon",
-    "  /quit               exit the console",
+    "  /quit               exit (prompts to detach or stop running daemons)",
+    "  /exit               stop ALL supervised daemons and exit immediately",
 )
 
 HELP_TEXT: str = "\n".join(HELP_LINES)
@@ -126,6 +129,7 @@ __all__ = [
     "SLASH_ARCHIVE",
     "SLASH_AUTOPILOT",
     "SLASH_COMMANDS",
+    "SLASH_EXIT",
     "SLASH_HELP",
     "SLASH_HISTORY",
     "SLASH_INTERRUPT",

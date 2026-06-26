@@ -34,7 +34,6 @@ from flywheel_core.invoker_client import (
 from flywheel_core.lifecycle import Status
 
 from flywheel._quit_prompt import (
-    QUIT_CANCEL,
     QUIT_DETACH,
     QUIT_STOP,
     QuitPromptScreen,
@@ -46,6 +45,7 @@ from flywheel._slash import (
     SLASH_APPROVE,
     SLASH_ARCHIVE,
     SLASH_AUTOPILOT,
+    SLASH_EXIT,
     SLASH_HELP,
     SLASH_HISTORY,
     SLASH_INTERRUPT,
@@ -623,56 +623,77 @@ class DashboardApp(App[int]):
 
         if self._quit_prompt_active:
             return
-        status_fn = self._worker_status
-        if status_fn is None:
+        worker_live = self._worker_is_supervised()
+        autopilot_live = self._autopilot_is_supervised()
+        if not worker_live and not autopilot_live:
+            # No supervised children (or status unreadable) -> exit silently;
+            # never block quit on a status hiccup, never kill what we do not own.
             self.exit()
             return
-        try:
-            status = status_fn()
-        except Exception:  # noqa: BLE001 - boundary against supervisor errors
-            # If we cannot read the worker status, default to detach
-            # behaviour: never silently kill the child (spec).
-            self.exit()
-            return
-        if status.state != WorkerState.SUPERVISED:
-            self.exit()
-            return
+        label = _running_daemons_label(worker_live, autopilot_live)
         self._quit_prompt_active = True
-        self.push_screen(QuitPromptScreen(), self._handle_quit_choice)
+        self.push_screen(QuitPromptScreen(label), self._handle_quit_choice)
+
+    def _worker_is_supervised(self) -> bool:
+        if self._worker_status is None:
+            return False
+        try:
+            return self._worker_status().state == WorkerState.SUPERVISED
+        except Exception:  # noqa: BLE001 - boundary; treat as not-live
+            return False
+
+    def _autopilot_is_supervised(self) -> bool:
+        if self._autopilot_status is None:
+            return False
+        try:
+            return self._autopilot_status().state == AutopilotState.SUPERVISED
+        except Exception:  # noqa: BLE001 - boundary; treat as not-live
+            return False
 
     def _handle_quit_choice(self, result: str | None) -> None:
-        """Apply the operator's quit-prompt choice.
+        """Apply the operator's quit-prompt choice across BOTH daemons.
 
-        ``Enter`` -> detach (worker keeps running, console exits).
-        ``s``     -> stop the supervised child (SIGTERM + wait), exit.
-        ``Esc``   -> cancel; no exit, supervision state untouched.
-        ``None``  -> Textual delivered a dismissal without a value
-                     (modal popped without a binding firing); treat as
-                     a cancel so we never silently kill the child.
+        ``Enter`` -> detach every supervised child (they keep running, console
+                     exits). ``s`` -> stop every supervised child (SIGTERM +
+                     wait), exit. ``Esc`` / ``None`` -> cancel; no exit, no
+                     supervisor touched (never silently kill a child).
         """
 
         self._quit_prompt_active = False
         if result == QUIT_DETACH:
-            if self._worker_detach is not None:
-                try:
-                    self._worker_detach()
-                except Exception:  # noqa: BLE001 - boundary
-                    pass
+            self._for_each_supervisor(self._worker_detach, self._autopilot_detach)
             self.exit()
             return
         if result == QUIT_STOP:
-            if self._worker_stop is not None:
-                try:
-                    self._worker_stop()
-                except Exception:  # noqa: BLE001 - boundary
-                    pass
+            self._for_each_supervisor(self._worker_stop, self._autopilot_stop)
             self.exit()
             return
         # QUIT_CANCEL (or unknown) -- stay on the dashboard.
-        if result not in (QUIT_CANCEL, None):
-            # Defensive: an unrecognised dismiss value is treated as a
-            # cancel so we never silently kill the child.
-            pass
+
+    @staticmethod
+    def _for_each_supervisor(*actions: Callable[[], object] | None) -> None:
+        """Invoke each non-None supervisor action, containing any error.
+
+        Used by the quit handoff and ``/exit`` to stop (or detach) every
+        supervised child; a failure on one never blocks the others or the exit.
+        """
+        for action in actions:
+            if action is None:
+                continue
+            try:
+                action()
+            except Exception:  # noqa: BLE001 - boundary against supervisor errors
+                pass
+
+    def handle_exit_slash(self) -> None:
+        """``/exit``: stop every supervised daemon and exit immediately.
+
+        The decisive "I'm done -- take everything down" verb, distinct from
+        ``/quit`` (which prompts detach/stop/cancel). Stops the worker and the
+        autopilot daemon (whichever are supervised) and exits with no prompt.
+        """
+        self._for_each_supervisor(self._worker_stop, self._autopilot_stop)
+        self.exit()
 
     def action_toggle_help(self) -> None:
         widget = self.query_one("#help_footer", Static)
@@ -882,6 +903,10 @@ class DashboardApp(App[int]):
         if verb == SLASH_QUIT:
             input_widget.value = ""
             self.request_quit()
+            return
+        if verb == SLASH_EXIT:
+            input_widget.value = ""
+            self.handle_exit_slash()
             return
         # Unknown verb: keep the typed line so the operator can fix
         # the typo without re-entering the rest.
@@ -1174,6 +1199,15 @@ def _format_worker_status(status: WorkerStatus) -> Text:
             style="bold red",
         )
     return Text(f"worker: {state.value}")
+
+
+def _running_daemons_label(worker_live: bool, autopilot_live: bool) -> str:
+    """The quit prompt's first line, naming the supervised daemons at risk."""
+    if worker_live and autopilot_live:
+        return "supervised worker and autopilot are running"
+    if autopilot_live:
+        return "supervised autopilot is running"
+    return "supervised worker is running"
 
 
 def _format_autopilot_status(status: AutopilotStatus) -> Text:

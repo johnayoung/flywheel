@@ -30,12 +30,17 @@ QUIT_STOP = "stop"
 QUIT_CANCEL = "cancel"
 
 
-_PROMPT_LINES: tuple[str, ...] = (
-    "supervised worker is running",
-    "  enter  detach (worker keeps running, console exits)",
-    "  s      stop gracefully (SIGTERM; in-flight run finalizes to interrupted)",
-    "  esc    cancel quit",
-)
+#: The default running-daemons label (back-compat: a worker-only console).
+DEFAULT_RUNNING_LABEL = "supervised worker is running"
+
+
+def _prompt_lines(running_label: str) -> tuple[str, ...]:
+    return (
+        running_label,
+        "  enter  detach (daemons keep running, console exits)",
+        "  s      stop all gracefully (SIGTERM; in-flight run finalizes to interrupted)",
+        "  esc    cancel quit",
+    )
 
 
 class QuitPromptScreen(ModalScreen[str]):
@@ -43,10 +48,12 @@ class QuitPromptScreen(ModalScreen[str]):
 
     Returns the chosen action via :meth:`Screen.dismiss`. The
     dashboard pushes this screen with a callback that interprets the
-    result: ``"detach"`` invokes :meth:`WorkerSupervisor.detach`
-    before exit, ``"stop"`` invokes :meth:`WorkerSupervisor.stop`,
-    ``"cancel"`` pops back to the dashboard without touching the
-    supervisor.
+    result: ``"detach"`` detaches every supervised child before exit,
+    ``"stop"`` stops every supervised child (SIGTERM), ``"cancel"``
+    pops back to the dashboard without touching any supervisor.
+
+    ``running_label`` names which daemons are live (worker, autopilot,
+    or both) so the operator sees exactly what ``stop`` will terminate.
 
     ``priority=True`` on each binding so the modal's keys win over
     any parent screen bindings while it is on top of the screen
@@ -73,8 +80,14 @@ class QuitPromptScreen(ModalScreen[str]):
         Binding("escape", "cancel", "Cancel", priority=True, show=True),
     ]
 
+    def __init__(self, running_label: str = DEFAULT_RUNNING_LABEL) -> None:
+        super().__init__()
+        self._running_label = running_label
+
     def compose(self) -> ComposeResult:
-        yield Static("\n".join(_PROMPT_LINES), id="quit_prompt")
+        yield Static(
+            "\n".join(_prompt_lines(self._running_label)), id="quit_prompt"
+        )
 
     def action_detach(self) -> None:
         self.dismiss(QUIT_DETACH)
@@ -87,6 +100,7 @@ class QuitPromptScreen(ModalScreen[str]):
 
 
 __all__ = [
+    "DEFAULT_RUNNING_LABEL",
     "QUIT_CANCEL",
     "QUIT_DETACH",
     "QUIT_STOP",

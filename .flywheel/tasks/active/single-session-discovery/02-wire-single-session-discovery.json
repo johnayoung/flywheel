@@ -1,0 +1,36 @@
+{
+  "id": "wire-single-session-discovery",
+  "goal": "Production autopilot discovery drives the single-session subagent path (one claude session, not eleven) while the scripted per-tier invoker path stays intact for tests, and run_refill_pass still receives 11 tier verdicts.",
+  "prerequisites": ["subagent-discovery-core"],
+  "tags": ["orchestrator", "spec-00059", "autopilot", "discovery"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate-seam" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00059-FEATURE-single-session-discovery.md -- success criteria 3 and 6 (production runs one session; scripted seam intact) this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- run_discovery and run_refill_pass; swap the production (invoker=None) path to the single-session subagent discovery from subagent-discovery-core, keeping the scripted per-tier invoker path for tests",
+      "packages/flywheel-orchestrator/tests/test_autopilot_discovery.py -- keep green: the scripted-invoker discovery contract must be unchanged",
+      "packages/flywheel-orchestrator/tests/test_autopilot_daemon.py -- keep green",
+      "packages/flywheel-orchestrator/tests/test_autopilot_e2e.py -- keep green: the end-to-end refill pass still gets 11 verdicts and emits tasks"
+    ],
+    "constraints": [
+      "When no scripted invoker is injected (production), run_discovery uses the single-session subagent discovery; when a scripted AutopilotInvoker is injected (tests), the existing per-tier path is used unchanged. run_refill_pass keeps receiving exactly 11 TierVerdicts either way.",
+      "Add a test proving the production path runs ONE session (a fake client/session factory invoked exactly once for discovery, not once per tier) and returns 11 verdicts.",
+      "scripts/check.sh (ruff -> pyright -> pytest across all packages) must be green.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT alter the TierVerdict contract or the scoring/authoring stages.",
+      "Do NOT remove or weaken the scripted-invoker seam -- tests must keep driving discovery deterministically with no SDK.",
+      "Do NOT modify files under tests/ other than adding this task's new test; do not weaken or delete existing assertions.",
+      "Do NOT add the P2 relevance cache or tier pre-prune here -- that is a separate spec."
+    ],
+    "edge_cases": [
+      "The scripted per-tier discovery tests pass unchanged (success criterion 6).",
+      "Production discovery constructs the session exactly once per cycle -- a regression that builds one session per tier must fail the new test (success criteria 1-3).",
+      "A live-path test with a fake client returns 11 verdicts through the single-session route."
+    ]
+  }
+}

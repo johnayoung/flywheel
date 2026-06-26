@@ -1,0 +1,40 @@
+{
+  "id": "subagent-discovery-core",
+  "goal": "Autopilot discovery runs as a single SDK session that dispatches the 11 tiers as subagents and returns exactly one TierVerdict per tier parsed from the subagents' Agent/Task tool-result blocks, with a not-relevant fallback for any tier whose result is missing or malformed.",
+  "tags": ["orchestrator", "spec-00059", "autopilot", "discovery"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00059-FEATURE-single-session-discovery.md -- the outcome, success criteria, and decisions D-1..D-4 this task implements",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- run_discovery/discover_tier (the current 11-session asyncio.gather near line 633), the Tier enum, TierVerdict and Finding shapes, tier_prompt; reuse them, do not redefine",
+      "packages/flywheel-core/src/flywheel_core/_sdk.py -- the lazy SDK boundary; ClaudeAgentOptions, AgentDefinition, ClaudeSDKClient, AssistantMessage and the tool_use/tool_result content-block classes resolve through here",
+      "packages/flywheel-core/src/flywheel_core/invoker_client.py -- invoke_iteration_with_client opens the persistent ClaudeSDKClient session and drains its message stream; the authority on which content blocks reach a consumer",
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- the message-draining/parse pattern to mirror for reading tool-result blocks",
+      "packages/flywheel-orchestrator/tests/test_autopilot_discovery.py -- keep this suite green; mirror its scripted-fixture style"
+    ],
+    "constraints": [
+      "Build ONE ClaudeAgentOptions whose `agents` dict holds all 11 tiers as AgentDefinition subagents, keyed so each result maps back to its tier; each tier AgentDefinition sets mcpServers=[] and a bounded budget (low maxTurns/effort) with read-only repo tools. The orchestrator carries the Agent (a.k.a. Task) tool in allowed_tools plus a deterministic instruction to evaluate every tier.",
+      "Parse each tier's TierVerdict from the subagent's Agent/Task tool-RESULT block in the streamed messages (accept both the 'Task' and 'Agent' names, renamed in Claude Code v2.1.63), NOT from the orchestrator's final prose -- the parent may summarize and must not be trusted for the structured verdict.",
+      "Return exactly 11 verdicts in tier order. A tier whose tool-result is missing, errors, or fails to parse yields a (not relevant, error-reason) verdict -- never fewer than 11, mirroring the current best-effort posture.",
+      "Drive the session through an injectable client/seam so the test substitutes a fake client emitting canned subagent tool-result messages; no test may require a live model or network. SDK access stays behind flywheel_core._sdk.",
+      "AgentDefinition fields are camelCase (disallowedTools, maxTurns, mcpServers, permissionMode).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change run_refill_pass or run_discovery's production wiring here -- that is wire-single-session-discovery. This task delivers the single-session discovery function + collector and its tests.",
+      "Do NOT change the Tier, TierVerdict, or Finding shapes -- import them.",
+      "Do NOT score, sequence, select, or author findings here.",
+      "Do NOT add a top-level import of claude_agent_sdk to any module flywheel_core/__init__ imports; all SDK access stays behind flywheel_core._sdk.",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "Each tier subagent's AgentDefinition has mcpServers == [] -- a tier that would inherit/boot an MCP server must fail the test (structural proxy for one-session/one-MCP-boot, success criteria 1-2).",
+      "Verdicts are read from tool-result blocks: a fixture where the orchestrator's FINAL message omits or contradicts the per-tier JSON must still yield the correct 11 verdicts (success criterion 5).",
+      "A tier whose subagent result is malformed or absent yields (not relevant, reason); all 11 tiers present exactly once (success criteria 3-4).",
+      "Both 'Task' and 'Agent' tool-result names parse identically.",
+      "If the SDK stream cannot key a subagent result to its tier, fall back to the orchestrator emitting one aggregated JSON of all 11 verdicts as its final message and parse that once (spec D-2 supersession) -- this fallback is authorized; record which path was used."
+    ]
+  }
+}

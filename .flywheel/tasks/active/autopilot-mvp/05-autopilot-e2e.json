@@ -1,0 +1,37 @@
+{
+  "id": "autopilot-e2e",
+  "goal": "Driving `flywheel autopilot` and then the real orchestrate loop against a fixture git repo that contains a genuinely failing check produces a task whose grader is that repo's out-of-band check, drives it from red to green via a scripted executing invoker, and FF-merges the resulting branch into the base.",
+  "prerequisites": ["autopilot-loop"],
+  "tags": ["orchestrator", "spec-00058", "autopilot", "in-loop-verification"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #7 (the in-loop end-to-end proof) and decision D-3 this task satisfies; this is the phase's archive-gate in-loop-verification task",
+      "docs/workflow.md -- the in-loop-verification gate: this phase adds a new control path driving orchestrate, so it cannot archive without a DONE task that drives the real loop with a scripted invoker (this task is that proof)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the real orchestrate loop the test must drive end to end (not a unit of it); the executing agent is a scripted invoker that applies the fix",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- the autopilot entry from autopilot-loop that authors the task into the work source this test then drives",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter performs the FF-merge landing the test asserts (branch merged into base); reuse it, do not stub the landing",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- precedent for an in-loop test that seeds a temp git repo, drives the real loop with a scripted invoker, and asserts the landing effect; mirror its harness",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep this suite green"
+    ],
+    "constraints": [
+      "The test seeds a throwaway git repo whose verification check (e.g. a pytest target) is RED before the run; autopilot authors the task; the real orchestrate loop runs with a scripted executing invoker that makes the change; the test asserts the check goes RED -> GREEN and the task's branch FF-merged into the base (criterion #7).",
+      "The authored task's authoritative grader must be the fixture repo's pre-existing check (the red one), proving autopilot's authoring spined the task on an out-of-band grade the executing agent did not author (ties criterion #7 to #8).",
+      "Drive the REAL loop -- the same orchestrate/submit path production uses -- so this counts as in-loop verification; a unit test of generation in isolation does not satisfy this task.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT call a live model or network -- the executing agent is a scripted invoker, like the existing in-loop landing tests.",
+      "Do NOT weaken the FF-merge assertion to 'a branch exists' -- the proof is that verified work LANDED on the base, not that it was attempted.",
+      "Do NOT re-implement scoring, discovery, authoring, or the loop here -- this task only proves the assembled pipeline lands work through the real loop.",
+      "Do NOT modify files under tests/ other than adding this task's new test; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "If the scripted executing invoker does NOT fix the defect, the held-out/repo check stays red and the work must NOT FF-merge -- the negative case proves the grade gates the landing, not just the happy path.",
+      "The fixture's base branch must end with the merged fix (FF-merge, not a dangling branch) -- assert the base ref advanced to include the change.",
+      "The authored task's grader command resolves to the fixture's own committed check, not a check written during the run."
+    ]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "id": "autopilot-discovery",
+  "goal": "Running the autopilot tier fan-out against a codebase returns exactly one relevance verdict per tier (1-11) plus zero or more findings, where a tier judged not-relevant to that codebase contributes zero findings and records its not-relevant reason, driven through an injectable agent invoker so the result is deterministic under a scripted invoker.",
+  "prerequisites": ["autopilot-scoring"],
+  "tags": ["orchestrator", "spec-00058", "autopilot", "discovery"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #2 and decision D-1 this task satisfies",
+      "docs/autopilot.md -- the 11 tiers and their descriptions; the fan-out runs one relevance-and-findings agent per tier with that tier's description as its remit",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- the Tier enum and Finding shape from autopilot-scoring live here (or the module that task created); import them, do not redefine",
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- invoke_iteration is flywheel's existing agent-driving boundary; the tier fan-out must drive agents through an INJECTABLE seam of this kind so a test can substitute a scripted invoker (the agent call is a parameter/dependency, never a hard import of the live SDK)",
+      "packages/flywheel-core/src/flywheel_core/_sdk.py -- the only lazy boundary to the agent SDK; any real agent call resolves through here so `import flywheel_core` still works without the [claude] extra",
+      "packages/flywheel-core/tests/test_invoker.py -- the existing scripted/fake-invoker pattern to mirror when writing this task's deterministic test",
+      "packages/flywheel-orchestrator/tests/test_work_sources.py -- keep this suite green"
+    ],
+    "constraints": [
+      "Each of the 11 tiers gets its own agent invocation (the per-tier fan-out), each returning a structured result: a relevant/not-relevant verdict with a reason, plus a list of findings (each finding carries the fields autopilot-scoring's Finding requires). A not-relevant tier returns zero findings AND a recorded reason -- both are asserted.",
+      "Agent invocation MUST go through an injectable seam so the test drives the fan-out with a scripted invoker that returns canned per-tier results; no test in this phase may require a live model or network. Relevance and findings are STRUCTURED output the test asserts on, not free text the test greps.",
+      "The agent decides relevance per codebase (D-1): the test fixture is a library-shaped repo whose scripted invoker marks the production/deploy tiers not-relevant; the assertion is that those tiers yield zero findings and a recorded reason -- the relevance gate is real, not cosmetic.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT score, sequence, or select findings here -- emit the per-tier verdicts and findings; ordering/selection is autopilot-scoring's engine, invoked by autopilot-loop.",
+      "Do NOT compile findings into tasks or author graders here -- that is autopilot-authoring.",
+      "Do NOT add a top-level `import claude_agent_sdk` to any module flywheel_core/__init__ imports; all SDK access stays behind flywheel_core._sdk.",
+      "Do NOT change the Tier or Finding shapes introduced by autopilot-scoring -- import them; adding a field here is a planning error.",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "A tier whose scripted result is not-relevant must contribute zero findings; a test that lets a not-relevant tier emit a finding must fail.",
+      "Every one of the 11 tiers produces exactly one verdict per run -- a missing or duplicated tier verdict must fail.",
+      "A tier marked relevant but yielding no concrete findings is valid (relevant, empty findings) and distinct from not-relevant.",
+      "An agent invocation that raises for one tier must not abort the whole fan-out -- the other tiers' verdicts still return (best-effort, mirroring the orchestrator's report posture)."
+    ]
+  }
+}

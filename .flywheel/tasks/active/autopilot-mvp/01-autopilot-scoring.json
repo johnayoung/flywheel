@@ -1,0 +1,36 @@
+{
+  "id": "autopilot-scoring",
+  "goal": "A pure scoring engine sequences a set of findings so every ready Tier 1-3 finding precedes all Tier 4-11 findings, orders Tier 4-11 findings by the docs/autopilot.md weighted score, and attaches to each a ScoreBreakdown whose recorded components recompute to its final score.",
+  "tags": ["orchestrator", "spec-00058", "autopilot", "scoring"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criteria #3, #4, #5 and decisions D-1, D-4 this task satisfies; this task owns the shared data model the rest of the phase imports",
+      "docs/autopilot.md -- the authoritative tier table (1-11), the preemptive (<=3) vs scheduled (>=4) split, and the exact weighted-score formula (TierWeight*w_tier + Urgency*w_urg + Importance*w_imp + BlocksCount*w_unblock - Effort*w_effort) plus INTERRUPT_BASE+Urgency for preemptive items -- implement this formula verbatim",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- WorkItem already carries an int `priority` (spec 00049) the scheduler reads; the engine's selection must be expressible as a priority/order the orchestrator already understands, so do not invent a parallel scheduling channel",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep this suite green",
+      "packages/flywheel-orchestrator/tests/test_work_sources.py -- keep this suite green; it pins WorkItem/WorkSource shape"
+    ],
+    "constraints": [
+      "This task introduces the phase's shared invariants: a Tier enum (members for tiers 1-11 with the preemptive<=3 boundary), a Finding value (at minimum: a tier, urgency, importance, blocks-count, effort, and an identity), and a ScoreBreakdown value (tier-weight, urgency, importance, blocks, effort, final). Tasks autopilot-discovery / autopilot-authoring / autopilot-loop import these -- name and shape them so a downstream task adds NO field to them.",
+      "The engine is PURE: no file I/O, no agent calls, no subprocess, no clock/random in the scored output. Default weights are module constants (config override lands in autopilot-loop, not here).",
+      "Preemptive override is absolute: any ready Tier 1-3 finding outranks every Tier 4-11 finding regardless of the 4-11 weighted scores. Among Tier 4-11, order strictly by the weighted score, NOT by tier number -- a higher-scoring Tier 8 must be able to precede a lower-scoring Tier 5.",
+      "The final score on each emitted ScoreBreakdown must equal the documented formula applied to its own recorded components -- a test recomputes the formula from the components and asserts equality, so the final cannot be a free-floating agent-supplied number.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT make any agent call, read any repo, or perform discovery here -- this task only scores and sequences findings it is handed (discovery is autopilot-discovery).",
+      "Do NOT read flywheel.toml or add config plumbing here -- weights are constants this task ships; the [autopilot] override is autopilot-loop's job.",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema).",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "Two ready Tier-3 findings present: both precede all Tier 4-11; ties among preemptive break deterministically (stable order), never randomly.",
+      "A Tier-8 finding whose computed score exceeds a Tier-5 finding's must be sequenced before the Tier-5 -- strict tier order is a wrong implementation and must fail a test.",
+      "Empty finding set yields an empty sequence and does not raise.",
+      "Flipping a single component (e.g. effort) must change the recomputed final score -- a ScoreBreakdown whose final ignores a component must fail."
+    ]
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "id": "autopilot-authoring",
+  "goal": "Compiling a selected finding through the headless authoring agent emits one or more flywheel tasks that each load as a valid core Task with at least one grader whose authoritative check is a pre-existing repo command or a registered held-out oracle (never a check the same emitted task's own diff would create), while a finding that cannot be compiled to a grader-bearing task is dropped with a recorded reason instead of written.",
+  "prerequisites": ["autopilot-discovery"],
+  "tags": ["orchestrator", "spec-00058", "autopilot", "authoring", "integrity"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criteria #1, #8, the verification-surface DoD, and decision D-2 this task satisfies; this is the integrity crux of the phase",
+      "docs/task-schema.md -- the Task/Grader shape every emitted task must satisfy; a grader needs a real runnable check",
+      "packages/flywheel-core/src/flywheel_core/loaders.py -- load_task_file is the authoritative validator; every emitted task file must load through it without error (this is criterion #1's grader)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- import the Finding shape from autopilot-discovery; the authoring step consumes a selected finding",
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- drive the authoring agent through the same injectable invoker seam autopilot-discovery established, so the test scripts authoring deterministically",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-spec.md -- the authoring contract the agent follows headlessly: ungameable end-state criteria; ambiguity a human would be asked is resolved as a RECORDED ASSUMPTION, never by emitting a vaguer task",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan.md -- the grader-ladder contract: prefer an out-of-band command grader that points at a committed repo check; the executing agent must not author its own authoritative grade",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate.py -- precedent for held-out oracles registered out of the agent's reach; a held-out check is an acceptable authoritative grader source"
+    ],
+    "constraints": [
+      "The authoritative grader on an emitted task MUST be either (a) a command that invokes a check already committed in the target repo, or (b) a registered held-out oracle -- never a grader whose target file is created by the same emitted task's own diff. The test asserts this grader-source property directly (criterion #8); a self-authored grader emission must fail.",
+      "Every emitted task file MUST load via flywheel_core.loaders.load_task_file and have a non-empty graders array (criterion #1). A finding that cannot be lowered to such a task is DROPPED with a recorded reason and NOT written -- a goal-only or grader-less file is never emitted.",
+      "Ambiguity resolution is fully headless (D-2): the authoring agent records assumptions rather than asking, and never narrows a task to a vaguer one to dodge an unresolved question. Resolved assumptions are recorded with the emitted task, not edited into the spec.",
+      "Authoring drives agents only through the injectable invoker seam; the test uses a scripted invoker, no live model.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT write tasks into the live work source or run the worker here -- emit task objects/files the test inspects; wiring emission into the refill loop and the run source is autopilot-loop.",
+      "Do NOT introduce a new Grader type or any flywheel-core schema change -- compose existing grader types only.",
+      "Do NOT let the authoring path emit a task whose only grader is a brand-new test the executing agent would write to pass itself -- that is the exact self-attestation #8 forbids.",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "A finding with no expressible out-of-band grader is dropped with a recorded reason -- a test that lets it be written as a grader-less task must fail.",
+      "An emitted task whose grader command names a file that the same task's diff creates must be rejected by the authoring path (self-attestation guard).",
+      "A single finding may legitimately compile to more than one task (chained via prerequisites); each emitted task still independently satisfies criteria #1 and #8.",
+      "Every emitted file round-trips through load_task_file; a file that parses as JSON but fails Task validation must fail the grader."
+    ]
+  }
+}

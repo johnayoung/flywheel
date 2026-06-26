@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -100,7 +101,11 @@ from flywheel_orchestrator._held_out_gate import (
     HeldOutGraderSource,
     evaluate_held_out_gate,
 )
-from flywheel_orchestrator._policy import SandboxPolicy, WorkPolicy
+from flywheel_orchestrator._policy import (
+    SandboxPolicy,
+    WorkPolicy,
+    resolve_grader_env,
+)
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
     GraderReceipt,
@@ -589,6 +594,11 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
         exec_enabled=sandbox.exec.enabled,
         exec_auto_allow=sandbox.exec.auto_allow,
         agent_env=agent_env,
+        # The grader-side companion of agent_env: command graders run with this
+        # FULL env (subprocess env replaces, not merges) so an agent build and
+        # the command grader verifying it share [sandbox.env] (build-cache
+        # parity). None when nothing is configured -> graders inherit as before.
+        grader_env=resolve_grader_env(env),
     )
 
 
@@ -1191,6 +1201,7 @@ def _evaluate_landing_gate(
     sandbox: Path,
     run_id: str,
     task_id: str,
+    grader_env: Mapping[str, str] | None,
     stream: TextIO | None,
 ) -> GateVerdict | None:
     """Compute the held-out landing verdict for a finalized run, or ``None``.
@@ -1211,6 +1222,7 @@ def _evaluate_landing_gate(
         held_out_source,
         committed_tree=sandbox,
         run_id=run_id,
+        env=grader_env,
     )
     if stream is not None and verdict.outcome is not GateOutcome.NO_GATE:
         marker = "BLOCKED" if verdict.blocks_landing else "passed"
@@ -1253,6 +1265,7 @@ async def _drive_under_lease(
     exec_enabled: bool,
     exec_auto_allow: bool,
     agent_env: dict[str, str],
+    grader_env: Mapping[str, str] | None,
     max_cost_usd: float,
     max_tokens: int,
     wall_clock_seconds: int,
@@ -1313,6 +1326,7 @@ async def _drive_under_lease(
             exec_enabled=exec_enabled,
             exec_auto_allow=exec_auto_allow,
             agent_env=agent_env,
+            grader_env=grader_env,
             max_cost_usd=max_cost_usd,
             max_tokens=max_tokens,
             wall_clock_seconds=wall_clock_seconds,
@@ -1354,6 +1368,7 @@ async def _drive_under_lease(
             sandbox=sandbox,
             run_id=outcome.lifecycle.run_id,
             task_id=task_id,
+            grader_env=grader_env,
             stream=stream,
         )
         gate_blocked = gate is not None and gate.blocks_landing

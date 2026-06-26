@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from flywheel_core import Status
 from flywheel_orchestrator import GhRunner, SubmitRequest, WorkPolicy
@@ -121,13 +121,15 @@ def build_pr_submitter(
     on_done: str = "destroy",
     on_failure: str = "park",
     store: LandingLedger | None = None,
+    grader_env: Mapping[str, str] | None = None,
 ) -> GitPullRequestSubmitter:
     """Build the PR backend (the registry's ``pr`` target).
 
     Reads the remote and PR base from ``policy`` and logs the resolved
     landing target, matching the shared builder signature the submit-strategy
     registry dispatches on. ``policy`` is non-``None`` here: the worker only
-    selects ``pr`` from a policy that set it.
+    selects ``pr`` from a policy that set it. ``grader_env`` flows to the
+    inherited submit-time re-verification, matching the merge strategy.
     """
     assert policy is not None  # selection of "pr" requires a policy
     submitter = GitPullRequestSubmitter(
@@ -144,6 +146,7 @@ def build_pr_submitter(
         remote=policy.submit_remote,
         pr_base=policy.submit_pr_base,
         store=store,
+        grader_env=grader_env,
     )
     log(
         f"landing strategy: pr (remote={policy.submit_remote} "
@@ -172,6 +175,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         pr_base: str | None = None,
         gh: GhRunner | None = None,
         store: LandingLedger | None = None,
+        grader_env: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(
             repo_root=repo_root,
@@ -185,6 +189,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             on_done=on_done,
             on_failure=on_failure,
             store=store,
+            grader_env=grader_env,
         )
         self.remote = remote
         self.pr_base = pr_base or phase_base

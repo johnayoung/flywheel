@@ -108,7 +108,9 @@ default policy is not runnable and never reaches the scheduler.
 
 from __future__ import annotations
 
+import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -210,13 +212,47 @@ class SandboxEnv:
     the inline ``set`` literals. The ``fast`` baseline inherits the operator's
     full ambient environment (``inherit_home`` true, no explicit scoping).
     Resolved into the host SDK ``agent_env`` (``pass`` names from the operator
-    environment, ``set`` literals winning). The container backend bypasses the
-    host SDK options, so these do not reach the in-container agent.
+    environment, ``set`` literals winning) and into the command-grader
+    environment by :func:`resolve_grader_env`, so the agent and the command
+    graders that verify its work share the same environment (e.g. a build
+    cache). The container backend bypasses the host SDK options, so these do
+    not reach the in-container agent.
     """
 
     passthrough: tuple[str, ...] = ()
     set_values: dict[str, str] = field(default_factory=dict)
     inherit_home: bool = True
+
+
+def resolve_grader_env(
+    env: SandboxEnv, base_environ: Mapping[str, str] | None = None
+) -> dict[str, str] | None:
+    """Resolve ``[sandbox.env]`` into the full environment graders run with.
+
+    The agent path resolves ``[sandbox.env]`` into *overrides* the SDK merges
+    over the inherited environment. Command graders, by contrast, run via a
+    subprocess whose ``env`` argument REPLACES the inherited environment, so
+    this returns the FULL env (not just the overrides): the declared ``pass``
+    names forwarded from ``base_environ`` (present-only) plus the inline ``set``
+    literals (which win on collision), laid over the ambient environment when
+    ``inherit_home`` is true, or scoped to only those values when it is false.
+
+    Returns ``None`` when there is nothing to change (no overrides AND
+    ``inherit_home``), so callers pass ``env=None`` and graders inherit exactly
+    as before -- byte-identical to the behavior before ``[sandbox.env]`` was
+    wired to graders. This is the grader-side companion of the agent-side
+    resolution in ``_orchestrate._sandbox_agent_primitives``: both must see the
+    same env so an agent build and the command grader that verifies it share,
+    e.g., a Rust ``CARGO_TARGET_DIR`` / ``RUSTC_WRAPPER`` (build-cache parity).
+    """
+    environ = os.environ if base_environ is None else base_environ
+    overrides = {n: environ[n] for n in env.passthrough if n in environ}
+    overrides.update(env.set_values)
+    if env.inherit_home:
+        if not overrides:
+            return None
+        return {**environ, **overrides}
+    return dict(overrides)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1397,4 +1433,5 @@ __all__ = [
     "build_github_source",
     "build_work_source",
     "load_policy",
+    "resolve_grader_env",
 ]

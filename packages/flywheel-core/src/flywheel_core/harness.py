@@ -370,6 +370,15 @@ class HarnessConfig:
     sandbox, so that path stays correct). Workflow CLIs populate this with
     their sandbox path.
 
+    ``grader_env`` is the full environment ``command`` graders run with —
+    the subprocess ``env`` REPLACES the inherited environment, so this is the
+    complete mapping (ambient env plus any ``[sandbox.env]`` overrides),
+    resolved by the orchestrator. ``None`` (the default) makes graders inherit
+    the harness process environment exactly as before, so a run with no
+    ``[sandbox.env]`` configured is byte-identical. Set, it lets a command
+    grader see the same environment the agent built under (e.g. a shared Rust
+    ``CARGO_TARGET_DIR`` / ``RUSTC_WRAPPER``).
+
     ``rubric_judge_model`` is the default model for rubric judges when
     the per-grader ``RubricGrader.judge_model`` is unset; ``None`` falls
     through to the SDK's own default. ``rubric_judge_max_turns`` caps
@@ -422,6 +431,7 @@ class HarnessConfig:
     artifacts_root: str | os.PathLike[str] | None = None
     agent_context: Mapping[str, str] = field(default_factory=dict)
     worktree: str | os.PathLike[str] | None = None
+    grader_env: Mapping[str, str] | None = None
     rubric_judge_model: str | None = None
     rubric_judge_max_turns: int = 8
     rubric_judge_invoke: JudgeInvoke | None = None
@@ -3398,6 +3408,7 @@ async def _validate(
         run_id=lifecycle.run_id,
         attempt_number=attempt.number,
         cwd=config.worktree,
+        env=config.grader_env,
         artifacts_dir=attempt_dir,
         now=clock,
     )

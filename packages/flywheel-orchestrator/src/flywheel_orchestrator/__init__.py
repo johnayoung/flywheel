@@ -114,6 +114,7 @@ from flywheel_orchestrator._policy import (
     build_github_review_source,
     build_work_source,
     load_policy,
+    resolve_grader_env,
 )
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
@@ -324,6 +325,7 @@ __all__ = [
     "read_phase_base",
     "reconcile_live_runs",
     "resolve_db_path",
+    "resolve_grader_env",
     "resolve_postgres_dsn",
     "select_next_task",
     "status_rows_for_items",

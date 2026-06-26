@@ -73,6 +73,7 @@ from flywheel_orchestrator import (
     load_effective_policy,
     open_sqlite_bound_store,
     orchestrate,
+    resolve_grader_env,
 )
 from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
@@ -241,6 +242,7 @@ class GitWorktreeSubmitter:
         on_done: str = "destroy",
         on_failure: str = "park",
         store: LandingLedger | None = None,
+        grader_env: Mapping[str, str] | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -250,6 +252,11 @@ class GitWorktreeSubmitter:
         self.log = log
         self.protected_paths = tuple(protected_paths)
         self.setup_command = setup_command
+        # The full environment submit-time re-verification runs command graders
+        # with (resolved [sandbox.env]); None inherits the worker's environment,
+        # byte-identical to before. Shares the in-run grader env so a post-rebase
+        # re-verify builds against the same cache as the run it re-checks.
+        self.grader_env = grader_env
         # Submit-time retention ([sandbox.retention], spec 00041). Defaults
         # reproduce today's hardcoded behavior: a DONE branch's worktree is
         # destroyed after the merge, a non-DONE worktree is parked for
@@ -647,6 +654,7 @@ class GitWorktreeSubmitter:
             # numbering; receipts are logged, not persisted.
             attempt_number=0,
             cwd=worktree,
+            env=self.grader_env,
         )
         for record in records:
             label = record.grader_name or str(record.grader_spec.get("run", ""))
@@ -1274,6 +1282,7 @@ def build_merge_submitter(
     on_done: str = "destroy",
     on_failure: str = "park",
     store: LandingLedger | None = None,
+    grader_env: Mapping[str, str] | None = None,
 ) -> GitWorktreeSubmitter:
     """Build the merge backend (the registry's ``merge`` target).
 
@@ -1283,7 +1292,8 @@ def build_merge_submitter(
     ``on_done``/``on_failure`` are the submit-time ``[sandbox.retention]``
     knobs (defaults reproduce today's destroy/park behavior). ``store`` is the
     run ledger the submitter records a queryable ``LANDING_PARKED`` event on
-    when it parks a DONE branch.
+    when it parks a DONE branch. ``grader_env`` is the resolved ``[sandbox.env]``
+    the submit-time re-verification runs command graders with.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -1297,6 +1307,7 @@ def build_merge_submitter(
         on_done=on_done,
         on_failure=on_failure,
         store=store,
+        grader_env=grader_env,
     )
 
 
@@ -1416,6 +1427,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # reproduce today's destroy-on-done / park-on-failure behavior.
     on_done = policy.sandbox.retention.on_done if policy else "destroy"
     on_failure = policy.sandbox.retention.on_failure if policy else "park"
+    # Resolved [sandbox.env] for submit-time re-verification, matching the env
+    # the in-run command graders (and the agent) saw. None when unconfigured.
+    grader_env = resolve_grader_env(policy.sandbox.env) if policy else None
     # The submitter's own store handle: it records a queryable LANDING_PARKED
     # event on the run ledger when it parks a DONE branch. Same backing store
     # (policy-selected) as the run's lifecycle, opened on db_path.
@@ -1437,6 +1451,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         on_done=on_done,
         on_failure=on_failure,
         store=submit_store,
+        grader_env=grader_env,
     )
     # Select the run's submit strategy from [sandbox] backend: worktree
     # (submitter unchanged) or container (wrap it) — spec 00045.

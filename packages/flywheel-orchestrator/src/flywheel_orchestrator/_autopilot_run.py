@@ -27,6 +27,14 @@ from flywheel_orchestrator._autopilot import (
     ScoreWeights,
     run_refill_pass,
 )
+from flywheel_orchestrator._autopilot_activity import (
+    PHASE_IDLE,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+    AutopilotActivity,
+    EmittedSummary,
+    write_activity,
+)
 from flywheel_orchestrator._policy import PolicyError, WorkPolicy
 from flywheel_orchestrator._workflow import (
     DEFAULT_TASKS_DIR,
@@ -80,6 +88,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="Run a single refill pass and exit (no daemon loop).",
+    )
+    parser.add_argument(
+        "--activity-file",
+        default=None,
+        help=(
+            "Path to write the live activity snapshot the console reads "
+            "(defaults to <repo>/.flywheel/logs/autopilot/activity.json)."
+        ),
     )
     return parser
 
@@ -206,6 +222,80 @@ def _log_result(log: Callable[[str], None], result: AutopilotPassResult) -> None
         log(f"dropped {drop.finding.id}: {drop.reason}")
 
 
+class _ActivityRecorder:
+    """Writes the daemon's per-cycle activity snapshots for the console.
+
+    Extracted from :func:`main` so the snapshot sequence is testable by driving
+    :func:`run_daemon_loop` with a scripted ``run_cycle`` and no live model:
+    ``starting`` before the first cycle, ``running`` at each cycle start
+    (carrying the *previous* cycle's summary so the console keeps showing "last:
+    N emitted" while the next cycle runs), and ``idle`` with ``next_cycle_at``
+    after each cycle. ``clock`` is injected so ``next_cycle_at`` is deterministic
+    in tests. Snapshot I/O is best-effort -- a write failure never crashes a
+    cycle.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        interval_seconds: float,
+        pid: int | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._path = path
+        self._interval = interval_seconds
+        self._pid = pid if pid is not None else os.getpid()
+        self._clock = clock
+        self._cycle_index = 0
+        self._last_result: AutopilotPassResult | None = None
+
+    def _write(
+        self, phase: str, *, now: float, next_cycle_at: float | None = None
+    ) -> None:
+        result = self._last_result
+        activity = AutopilotActivity(
+            pid=self._pid,
+            phase=phase,
+            cycle_index=self._cycle_index,
+            updated_at=now,
+            interval_seconds=self._interval,
+            next_cycle_at=next_cycle_at,
+            last_emitted=0 if result is None else result.emitted_count,
+            last_dropped=0 if result is None else len(result.dropped),
+            last_reason="" if result is None else result.reason,
+            last_relevant_tiers=(
+                ()
+                if result is None
+                else tuple(int(t) for t in result.relevant_tiers)
+            ),
+            last_emitted_tasks=(
+                ()
+                if result is None
+                else tuple(
+                    EmittedSummary(task_id=e.task.id, tier=int(e.finding.tier))
+                    for e in result.emitted
+                )
+            ),
+        )
+        try:
+            write_activity(self._path, activity)
+        except OSError:
+            pass
+
+    def starting(self) -> None:
+        self._write(PHASE_STARTING, now=self._clock())
+
+    def before_cycle(self) -> None:
+        self._cycle_index += 1
+        self._write(PHASE_RUNNING, now=self._clock())
+
+    def on_cycle(self, result: AutopilotPassResult) -> None:
+        self._last_result = result
+        now = self._clock()
+        self._write(PHASE_IDLE, now=now, next_cycle_at=now + self._interval)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run ``flywheel autopilot``: a neverending daemon, or one pass.
 
@@ -261,6 +351,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"pid={os.getpid()}"
     )
 
+    activity_path = (
+        Path(args.activity_file)
+        if args.activity_file
+        else repo_root / ".flywheel" / "logs" / "autopilot" / "activity.json"
+    )
+    recorder = _ActivityRecorder(path=activity_path, interval_seconds=interval)
+    recorder.starting()
+
     shutdown = {"requested": False}
 
     def _flag(signum: int, _frame: object) -> None:
@@ -272,10 +370,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def before_cycle() -> None:
         _arm_signals(_flag)
+        recorder.before_cycle()
 
     def on_cycle(result: AutopilotPassResult) -> None:
         _log_result(log, result)
-        before_cycle()
+        recorder.on_cycle(result)
+        _arm_signals(_flag)
 
     cycles = run_daemon_loop(
         run_cycle=run_cycle,

@@ -59,6 +59,12 @@ from flywheel._slash import (
 )
 from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
 from flywheel._autopilot_supervisor import AutopilotState, AutopilotStatus
+from flywheel_orchestrator._autopilot_activity import (
+    PHASE_IDLE,
+    PHASE_RUNNING,
+    PHASE_STARTING,
+    AutopilotActivity,
+)
 from flywheel._worker_supervisor import WorkerState, WorkerStatus
 
 # How long a row that just left the active set stays dimmed on screen.
@@ -1210,17 +1216,62 @@ def _running_daemons_label(worker_live: bool, autopilot_live: bool) -> str:
     return "supervised worker is running"
 
 
-def _format_autopilot_status(status: AutopilotStatus) -> Text:
+def _format_autopilot_activity(activity: AutopilotActivity, now: float) -> str:
+    """Summarize one activity snapshot for the supervised status line.
+
+    Reads as ``<phase> | last: E emitted, D dropped``. The countdown
+    (``next in Xm Ys``) is derived from ``next_cycle_at`` against ``now`` so it
+    ticks down each render. The last-cycle summary appears only once a cycle has
+    actually completed (idle, or running a cycle past the first).
+    """
+    parts: list[str] = []
+    if activity.phase == PHASE_RUNNING:
+        parts.append(f"cycle {activity.cycle_index} running")
+    elif activity.phase == PHASE_IDLE:
+        if activity.next_cycle_at is not None:
+            remaining = _format_duration(int(round(activity.next_cycle_at - now)))
+            parts.append(f"idle, next in {remaining}")
+        else:
+            parts.append("idle")
+    elif activity.phase == PHASE_STARTING:
+        parts.append("starting")
+    else:
+        parts.append(activity.phase)
+
+    completed = activity.phase == PHASE_IDLE or (
+        activity.phase == PHASE_RUNNING and activity.cycle_index > 1
+    )
+    if completed:
+        parts.append(
+            f"last: {activity.last_emitted} emitted, "
+            f"{activity.last_dropped} dropped"
+        )
+    return " | ".join(parts)
+
+
+def _format_autopilot_status(
+    status: AutopilotStatus, now: float | None = None
+) -> Text:
     """Render one ``autopilot:`` line for the status bar.
 
     Mirrors :func:`_format_worker_status`'s vocabulary against the autopilot
     supervisor's states (``supervised`` / ``none`` / ``dead`` / ``error``);
-    autopilot has no ``detached`` state (it writes no lease).
+    autopilot has no ``detached`` state (it writes no lease). When the
+    supervised daemon has recorded live activity, its per-cycle summary
+    (current cycle, last emitted/dropped, time-to-next-cycle) is appended.
     """
     state = status.state
     if state == AutopilotState.SUPERVISED:
         pid = f" pid={status.pid}" if status.pid is not None else ""
-        return Text(f"autopilot: supervised{pid}", style="green")
+        text = f"autopilot: supervised{pid}"
+        if status.activity is not None:
+            clock = (
+                now
+                if now is not None
+                else datetime.now(timezone.utc).timestamp()
+            )
+            text += f" -- {_format_autopilot_activity(status.activity, clock)}"
+        return Text(text, style="green")
     if state == AutopilotState.NONE:
         return Text(
             "autopilot: none -- type '/autopilot start' to spawn one",

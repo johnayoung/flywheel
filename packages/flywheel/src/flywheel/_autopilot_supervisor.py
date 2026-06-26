@@ -32,6 +32,10 @@ from flywheel._worker_supervisor import (
     format_dead_message,
     read_supervised_death_reason,
 )
+from flywheel_orchestrator._autopilot_activity import (
+    AutopilotActivity,
+    read_activity,
+)
 
 # Same SIGTERM wait window as the worker supervisor: the autopilot daemon's
 # graceful-shutdown path exits promptly on signal (it idles between cycles), so
@@ -61,15 +65,25 @@ class AutopilotState(str, enum.Enum):
 
 @dataclass(frozen=True, kw_only=True)
 class AutopilotStatus:
-    """Snapshot of supervisor state for the console's status surface."""
+    """Snapshot of supervisor state for the console's status surface.
+
+    ``activity`` is the live per-cycle snapshot the daemon writes (which cycle,
+    last cycle's emitted/dropped counts, time-to-next-cycle). It is populated
+    only while ``state == SUPERVISED`` and the snapshot's pid matches the owned
+    child -- a stale file from a previous daemon is ignored.
+    """
 
     state: AutopilotState
     pid: int | None = None
     message: str | None = None
+    activity: AutopilotActivity | None = None
 
 
 def build_autopilot_spawn_argv(
-    *, tasks_dir: Path | None = None, model: str | None = None
+    *,
+    tasks_dir: Path | None = None,
+    model: str | None = None,
+    activity_file: Path | None = None,
 ) -> list[str]:
     """Compose the ``python -m flywheel_orchestrator._autopilot_run ...`` argv.
 
@@ -88,6 +102,8 @@ def build_autopilot_spawn_argv(
         argv.extend(["--tasks-dir", str(tasks_dir)])
     if model is not None:
         argv.extend(["--model", model])
+    if activity_file is not None:
+        argv.extend(["--activity-file", str(activity_file)])
     return argv
 
 
@@ -107,15 +123,26 @@ class AutopilotSupervisor:
         spawn_argv: Sequence[str] | None = None,
         tasks_dir: Path | None = None,
         model: str | None = None,
+        activity_path: Path | None = None,
     ) -> None:
         self._log_dir = (
             log_dir if log_dir is not None else Path(".flywheel/logs/autopilot")
+        )
+        # The activity snapshot the daemon writes and ``status()`` reads. The
+        # supervisor owns the path and hands it to the child via ``--activity-
+        # file`` so both ends agree without the daemon guessing.
+        self._activity_path = (
+            activity_path
+            if activity_path is not None
+            else self._log_dir / "activity.json"
         )
         if spawn_argv is not None:
             self._spawn_argv: list[str] = list(spawn_argv)
         else:
             self._spawn_argv = build_autopilot_spawn_argv(
-                tasks_dir=tasks_dir, model=model
+                tasks_dir=tasks_dir,
+                model=model,
+                activity_file=self._activity_path,
             )
         self._child: subprocess.Popen[bytes] | None = None
         self._log_handle: IO[bytes] | None = None
@@ -138,7 +165,9 @@ class AutopilotSupervisor:
             rc = self._child.poll()
             if rc is None:
                 return AutopilotStatus(
-                    state=AutopilotState.SUPERVISED, pid=self._child.pid
+                    state=AutopilotState.SUPERVISED,
+                    pid=self._child.pid,
+                    activity=self._read_owned_activity(self._child.pid),
                 )
             self._dead_pid = self._child.pid
             self._dead_exit = rc
@@ -257,6 +286,19 @@ class AutopilotSupervisor:
         self.detach()
 
     # ----- Internal helpers ------------------------------------------------
+
+    def _read_owned_activity(self, child_pid: int) -> AutopilotActivity | None:
+        """Read the activity snapshot iff it belongs to the owned child.
+
+        Guards against a stale ``activity.json`` left by a previous daemon: a
+        snapshot whose ``pid`` does not match the child this supervisor spawned
+        is treated as absent, so the status surface shows plain liveness until
+        the live daemon records its first cycle.
+        """
+        activity = read_activity(self._activity_path)
+        if activity is None or activity.pid != child_pid:
+            return None
+        return activity
 
     def _open_log(self) -> IO[bytes]:
         self._log_dir.mkdir(parents=True, exist_ok=True)

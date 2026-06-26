@@ -163,7 +163,8 @@ class PolicyError(ValueError):
 class SandboxExec:
     """``[sandbox.exec]`` — bash command isolation (SDK ``sandbox`` option).
 
-    Parsed-but-inert in this increment; the ``fast`` baseline disables it.
+    Wired into the host SDK agent options; ``fast``/``balanced`` disable it and
+    ``hardened`` enables it.
     """
 
     enabled: bool = False
@@ -192,8 +193,8 @@ class SandboxCapabilities:
 class SandboxNetwork:
     """``[sandbox.network]`` — network policy.
 
-    Carried on the policy but enforces nothing under the worktree backend
-    (advisory until the container backend lands in increment G).
+    Advisory under the worktree backend (enforces nothing); has real teeth
+    only under ``[sandbox] backend = "container"``.
     """
 
     policy: str = "allow"
@@ -208,7 +209,9 @@ class SandboxEnv:
     ``passthrough`` mirrors the ``pass`` name allowlist; ``set_values`` mirrors
     the inline ``set`` literals. The ``fast`` baseline inherits the operator's
     full ambient environment (``inherit_home`` true, no explicit scoping).
-    Inert until increment C wires the resolver.
+    Resolved into the host SDK ``agent_env`` (``pass`` names from the operator
+    environment, ``set`` literals winning). The container backend bypasses the
+    host SDK options, so these do not reach the in-container agent.
     """
 
     passthrough: tuple[str, ...] = ()
@@ -220,8 +223,10 @@ class SandboxEnv:
 class SandboxLimits:
     """``[sandbox.limits]`` — resource/budget ceilings.
 
-    The ``fast`` baseline carries today's turns/retries/lease with every
-    ceiling unenforced (``0``). Inert until increment D hooks the harness loop.
+    ``max_cost_usd``/``max_tokens``/``wall_clock_seconds`` are enforced per-run
+    cumulatively via ``HarnessConfig`` (``0`` = unenforced). ``max_turns``/
+    ``max_retries``/``lease_seconds`` mirror today's hardcoded values and keep
+    their existing CLI/default path (not lifted into ceiling enforcement).
     """
 
     max_turns: int = 500
@@ -236,8 +241,9 @@ class SandboxLimits:
 class SandboxRetention:
     """``[sandbox.retention]`` — teardown/disposal policy.
 
-    Mirrors today's hardcoded worker behavior (done destroy, fail park, 7d
-    sweep). Inert until increment E wires the ``teardown()`` seam.
+    ``on_done``/``on_failure`` are threaded through the worktree submitter
+    (done destroy, fail park by default). ``sweep_days`` stays on the CLI
+    (``--worktree-retention-days``), not policy-threaded.
     """
 
     on_done: str = "destroy"

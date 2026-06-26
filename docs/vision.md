@@ -114,8 +114,8 @@ The loop drives a task through its [lifecycle](task-lifecycle.md): a state machi
 ```text
 pending -> ready -> running -> validating -> done
                       |           |
-                      |           +-> validation_failed -> ready
-                      |           +-> validation_failed -> failed
+                      |           +-> failed_validation -> ready
+                      |           +-> failed_validation -> failed
                       |
                       +-> blocked -> ready
                       +-> interrupted -> ready
@@ -124,7 +124,7 @@ pending -> ready -> running -> validating -> done
 
 The brain executes. The loop controls execution, records the lifecycle, and verifies claims.
 
-A task typically begins in `pending`, becomes `ready` when it can be executed, moves to `running` when the agent is invoked, and transitions to `validating` only after the agent claims completion. If verification succeeds, the task reaches `done`. If verification fails, the loop enters `validation_failed`, which is a factual outcome — verification disproved the completion claim — not a retry decision. The controller then applies policy to decide whether the task returns to `ready` for another attempt or terminates as `failed`. Agent-declared inability to proceed can move the task into `blocked`. External pause or stop signals move it into `interrupted`. Terminal states produce structured outcome records. 
+A task typically begins in `pending`, becomes `ready` when it can be executed, moves to `running` when the agent is invoked, and transitions to `validating` only after the agent claims completion. If verification succeeds, the task reaches `done`. If verification fails, the loop enters `failed_validation`, recording the `validation_failed` outcome — verification disproved the completion claim — not a retry decision. The controller then applies policy to decide whether the task returns to `ready` for another attempt or terminates as `failed`. Agent-declared inability to proceed can move the task into `blocked`. External pause or stop signals move it into `interrupted`. Terminal states produce structured outcome records. 
 
 Every attempt is recorded with timing, outcome, agent output, and associated error context. Sequential failures are tracked explicitly so that higher-level systems can decide whether to continue, pause, or terminate. The data model must clearly distinguish iteration-level, attempt-level, and run-level counters to avoid ambiguity in implementation and telemetry. 
 
@@ -221,7 +221,7 @@ The single-task loop is flywheel's foundation, shipped as the embeddable `flywhe
 
 Its first agent backend targets the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python), wired in as an optional extra (`flywheel-core[claude]`) behind a single lazy boundary, so the data and lifecycle surface need no SDK at all.
 
-The building blocks that depend on a correct, trustworthy loop are built on top of it: multi-task orchestration over a prerequisite DAG (`flywheel-orchestrator`), the git-worktree landing strategies and worker daemon (`flywheel-worktree`), the `flywheel`/`fw` operator shell, and the spec-driven authoring skills installed by `flywheel init --skills`. Task decomposition and richer intervention policy continue to build on the same foundation. 
+The building blocks that depend on a correct, trustworthy loop are built on top of it, one workspace package per layer: multi-task orchestration over a prerequisite DAG plus the autopilot intake daemon that authors fresh `Task`s into the backlog (`flywheel_orchestrator.run_refill_pass`) live in `flywheel-orchestrator`; the git-worktree landing strategies and worker daemon that drain that backlog live in `flywheel-worktree`; the Docker sandbox execution backend — a third `SubmitStrategy` (`flywheel_container.ContainerSubmitStrategy`) — lives in `flywheel-container`; and the `flywheel`/`fw` product shell sits at the top, owning the operator console and the spec-driven `fw-*` authoring skills installed by `flywheel init --skills`. Task decomposition and richer intervention policy continue to build on the same foundation. 
 
 ## Glossary
 

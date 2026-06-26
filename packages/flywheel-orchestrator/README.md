@@ -35,14 +35,25 @@ plumbing remains available as `python -m flywheel_orchestrator._workflow`:
 ```bash
 flywheel init                   # scaffold .flywheel/ + work policy
 flywheel status                 # state of every active task
+flywheel status --rollup        # phase-grouped, evidence-derived (not self-reported) rollup
 flywheel live                   # one line per in-flight run
+flywheel history                # finished runs, newest first
+flywheel show ID                # one run in full (run_id or task id)
+flywheel validate               # statically lint active tasks' graders
 flywheel archive                # move fully-DONE phases to archive/
 flywheel recover                # finalize stranded lifecycles
 flywheel recheck-blocked        # re-evaluate blocked lifecycles' requires
 ```
 
-`next` and bare `orchestrate` remain `python -m flywheel_orchestrator._workflow`
-plumbing; the blessed headless drain is `flywheel worker [--once]`.
+`history`, `show`, and `validate` are product-shell verbs routed here
+in-process (`flywheel/_cli.py:46-58`), as is `status --rollup`. The autopilot
+intake daemon (`flywheel autopilot [--once]`, keeps the queue full) lives on the
+product shell too, delegating to `flywheel_orchestrator._autopilot_run`. `next`
+and bare `orchestrate` remain `python -m flywheel_orchestrator._workflow`
+plumbing; the blessed headless drain is `flywheel worker [--once]`. See
+[../../docs/cli.md](../../docs/cli.md) for the full verb reference and
+[../../docs/orchestration.md](../../docs/orchestration.md) for scheduling,
+claims, and the orchestrator store.
 
 ## Work sources
 
@@ -58,11 +69,21 @@ await orchestrate(source=GithubWorkSource(repo="owner/name", label="flywheel"),
 
 - `DirectoryWorkSource` — the `.flywheel/tasks/active/<phase>/*.json` layout
   (what `tasks_dir=` wraps; the historical default).
-- `GithubWorkSource` — labeled open issues via the `gh` CLI. An optional
-  fenced ` ```flywheel ` JSON block in the issue body supplies
+- `GithubWorkSource` (`kind = "github"`) — labeled open issues via the `gh`
+  CLI. An optional fenced ` ```flywheel ` JSON block in the issue body supplies
   goal/graders/context/prerequisites; issues without graders use the policy's
   default graders or are skipped. Outcomes post back as comments (or close
   the issue).
+- `GithubCiWorkSource` (`kind = "github_ci"`) — failed GitHub CI runs via the
+  `gh` CLI; each red `(workflow, branch)` becomes one graded task, verified by
+  the policy's `[defaults.graders]` run out-of-band (never the check status).
+- `GithubReviewWorkSource` (`kind = "github_review"`) — unresolved PR review
+  threads via `gh api graphql`; resolution is only a candidate filter, the grade
+  is `[defaults.graders]` out-of-band.
+
+See [../../docs/work-sources.md](../../docs/work-sources.md) for the full
+per-kind reference (config keys, item ids, write-back, and the entry-point
+plugin path for custom sources).
 
 A repo-root `flywheel.toml` selects the source per project and declares
 default graders; the CLI auto-detects it (`--policy` overrides, an explicit

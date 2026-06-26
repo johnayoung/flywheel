@@ -6,25 +6,33 @@ Flywheel is a Python orchestration loop for AI coding agents — it owns the exe
 
 ## Workspace layout (the hard line)
 
-A uv workspace of four packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
+A uv workspace of five packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
 
 - **`flywheel-core`** (import `flywheel_core`) — the lifecycle of a **single task**. Knows nothing about who calls it. No console script; invoke via `python -m flywheel_core.workflow`. This is the only package most contributors touch.
-- **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, claims/leases, multi-worker, phases). Owns its own store (`task_claims`). Library only; no console script.
+- **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only; no console script.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
-- **`flywheel`** (import `flywheel`) — top of stack: the unified product shell. Console scripts `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
+- **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree). SDK-free, a sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `[sandbox] backend = "container"`.
+- **`flywheel`** (import `flywheel`) — top of stack: the unified product shell. Console scripts `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console. Bundles the Claude agent SDK and the container backend.
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
 
-Authoritative specs in `docs/` override any inferred behavior:
+Authoritative specs in `docs/` override any inferred behavior. Full index: `docs/README.md`.
 
 - `docs/vision.md` — what the loop is and is not
 - `docs/task-schema.md` — `Task`/`Grader`/`Context` shape and validation rules
 - `docs/task-lifecycle.md` — `Lifecycle`/`Attempt`/`Status`/`Outcome` and transition rules
 - `docs/loop.md` — iteration envelope (`<!-- LOOP_STATUS -->`) and harness behavior
-- `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql` — SQLite store (WAL, foreign keys on, optimistic concurrency on `version`); Postgres mirror lives alongside it
-- `docs/strategy.md` — the `SubmitStrategy` landing seam and shipped strategies (merge, PR)
-- `docs/workflow.md` — how flywheel develops itself: the define/task/execute/audit pipeline and the runtime loop
+- `docs/persistence-tables.md` — the core store catalog; canonical DDL is `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql` (SQLite, WAL, foreign keys on, optimistic concurrency on `version`; Postgres mirror alongside)
 - `docs/data-taxonomy.md` — authoritative state vs. telemetry split
+- `docs/orchestration.md` — multi-task scheduling, claims/leases, the orchestrator store and ledgers
+- `docs/work-sources.md` — the `WorkSource` seam and shipped sources (directory, github, github_ci, github_review)
+- `docs/strategy.md` — the `SubmitStrategy`/`SandboxHandle` landing seam and shipped strategies (merge, PR, container)
+- `docs/sandbox.md` + `docs/container-backend.md` — the sandbox-as-deploy model, the `[sandbox.*]` reference, and the Docker backend
+- `docs/held-out-gate.md` — the execute-time held-out landing gate
+- `docs/configuration.md` — the complete `flywheel.toml` reference
+- `docs/cli.md` — the `flywheel`/`fw` verbs and operator console
+- `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
+- `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop
 
 New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.md`).
 

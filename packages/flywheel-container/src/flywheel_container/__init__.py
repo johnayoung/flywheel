@@ -4,8 +4,10 @@ Runs the task agent inside a Docker container against a bind-mounted worktree
 (spec 00044). SDK-free: the agent runs as its own CLI inside the image, so this
 package shells out to ``docker`` and never imports ``claude_agent_sdk``.
 
-G3 surface (lifecycle primitives); the ``ContainerSubmitStrategy``, the
-stream-json adapter, and ``[sandbox.network]`` enforcement land in G4–G6.
+Public surface: the Docker lifecycle primitives, the ``ClaudeAuth`` auth-mode
+passthrough, ``ContainerSubmitStrategy`` (which composes an inner landing
+strategy), the ``[sandbox.network]`` policy resolver, and the stream-json ->
+``IterationResult`` adapter. Activated via ``[sandbox] backend = "container"``.
 """
 
 from __future__ import annotations

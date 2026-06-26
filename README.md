@@ -41,26 +41,23 @@ Either way the work itself is never trusted blind: agent claims feed verificatio
 
 ## Packages
 
-A uv workspace of four packages under `packages/`. Dependencies point one way only — core imports nothing downstream.
+A uv workspace of five packages under `packages/`. Dependencies point one way only — core imports nothing downstream.
 
 | Package | Role |
 | --- | --- |
 | `flywheel-core` | Lifecycle of a single task: invoke, validate envelopes, verify via graders, record attempts, retry. The agent SDK is an optional extra (`flywheel-core[claude]`); the data and lifecycle surface need no SDK. |
-| `flywheel-orchestrator` | Drives many tasks on top of core: prerequisite DAG, claims/leases, multi-worker, phases, the `SubmitStrategy` landing seam. |
+| `flywheel-orchestrator` | Drives many tasks on top of core: prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon, and the `SubmitStrategy` landing seam. |
 | `flywheel-worktree` | Git-worktree landing strategies — FF-merge (default) or pull request — plus the worker daemon. |
-| `flywheel` | The `flywheel` / `fw` shell: verb router and operator console. Bundles the Claude agent SDK. |
+| `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. SDK-free; activated via `[sandbox] backend = "container"`. |
+| `flywheel` | The `flywheel` / `fw` shell: verb router and operator console. Bundles the Claude agent SDK and the container backend. |
 
 ## Docs
 
-Authoritative specs in `docs/` override any inferred behavior:
+Full index: **[docs/README.md](docs/README.md)**. The `docs/` specs are authoritative — they override any inferred behavior. Start with [vision.md](docs/vision.md), then read down your layer:
 
-- [vision.md](docs/vision.md) — what the loop is and is not
-- [task-schema.md](docs/task-schema.md) — `Task`/`Grader`/`Context` shape and validation
-- [task-lifecycle.md](docs/task-lifecycle.md) — lifecycle states, attempts, transition rules
-- [loop.md](docs/loop.md) — iteration envelope and harness behavior
-- [strategy.md](docs/strategy.md) — the `SubmitStrategy` landing seam and shipped strategies
-- [workflow.md](docs/workflow.md) — end-to-end run flow
-- [data-taxonomy.md](docs/data-taxonomy.md) — state vs. telemetry split
+- **Core (a single task):** [loop.md](docs/loop.md) · [task-schema.md](docs/task-schema.md) · [task-lifecycle.md](docs/task-lifecycle.md) · [persistence-tables.md](docs/persistence-tables.md) · [data-taxonomy.md](docs/data-taxonomy.md)
+- **Orchestration (many tasks):** [orchestration.md](docs/orchestration.md) · [work-sources.md](docs/work-sources.md) · [strategy.md](docs/strategy.md) · [held-out-gate.md](docs/held-out-gate.md) · [sandbox.md](docs/sandbox.md) · [container-backend.md](docs/container-backend.md)
+- **Operating flywheel:** [cli.md](docs/cli.md) · [configuration.md](docs/configuration.md) · [autopilot.md](docs/autopilot.md) · [workflow.md](docs/workflow.md)
 
 ## License
 

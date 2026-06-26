@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from flywheel_core.invoker import invoke_iteration
+from flywheel_core.loaders import TaskLoadError, load_task_data
+from flywheel_core.task import CommandGrader, Task
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
 
@@ -634,11 +636,319 @@ async def run_discovery(
     return list(verdicts)
 
 
+# --- Authoring: compile a finding into grader-bearing tasks (autopilot-authoring)
+#
+# The integrity crux of the phase. Each selected finding is compiled -- entirely
+# by an agent following the fw-spec / fw-plan contracts headlessly -- into one or
+# more validated flywheel tasks. The authoritative grader on every emitted task
+# must be either a pre-existing committed repo check or a registered held-out
+# oracle, never a check the same task's own diff creates (criterion #8: the
+# "entirely by agents" path must not emit self-attestation wearing a grader's
+# clothes). A finding that cannot be lowered to such a task is DROPPED with a
+# recorded reason, never written as a goal-only or grader-less stub (criterion #1).
+
+#: The authoritative grader points at a check already committed in the repo.
+GRADER_SOURCE_REPO_COMMAND: str = "repo_command"
+#: The authoritative grader is a registered held-out oracle (out of the agent's
+#: reach), declared by an absolute path outside the agent's worktree.
+GRADER_SOURCE_HELD_OUT: str = "held_out_oracle"
+_GRADER_SOURCES: frozenset[str] = frozenset(
+    {GRADER_SOURCE_REPO_COMMAND, GRADER_SOURCE_HELD_OUT}
+)
+
+#: Default turn budget for the real SDK-backed authoring invoker.
+DEFAULT_AUTHORING_MAX_TURNS: int = 120
+
+
+@dataclass(frozen=True, kw_only=True)
+class EmittedTask:
+    """One validated, grader-bearing task autopilot authored from a finding.
+
+    ``task`` is the compiled core :class:`~flywheel_core.task.Task` (it loaded
+    through the authoritative validator and carries at least one grader).
+    ``authoritative_grader`` is the run string of the out-of-band command grader
+    the work lands on; ``grader_source`` records whether it is a pre-existing
+    repo check or a held-out oracle; ``grader_target`` is the pre-existing check
+    it resolves to. ``creates_files`` are the files the task's own diff is
+    expected to create -- recorded so the self-attestation guard can prove the
+    authoritative grader does not target any of them. ``assumptions`` are the
+    ambiguities the authoring agent resolved itself (D-2), recorded with the
+    emitted task rather than edited into a spec.
+    """
+
+    finding: Finding
+    task: Task
+    authoritative_grader: str
+    grader_source: str
+    grader_target: str
+    creates_files: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = ()
+    held_out_oracle_path: str | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class DroppedFinding:
+    """A finding autopilot could not compile to a grader-bearing task.
+
+    Recorded with a ``reason`` instead of emitting a vaguer or grader-less task
+    (criterion #1 / D-2). The loop persists the reason so a clean repo or an
+    ungradeable finding is auditable rather than silently filler-filled.
+    """
+
+    finding: Finding
+    reason: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuthoringResult:
+    """The outcome of compiling one or more findings: emitted tasks + drops."""
+
+    emitted: tuple[EmittedTask, ...] = ()
+    dropped: tuple[DroppedFinding, ...] = ()
+
+
+def authoring_prompt(finding: Finding, repo_root: Path) -> str:
+    """Build the headless authoring prompt for one selected finding.
+
+    Carries the load-bearing integrity rule: the authoritative grader must be a
+    pre-existing committed check (or a held-out oracle), never a check this
+    task's own diff creates. Ambiguity is resolved as a recorded assumption, not
+    by emitting a vaguer task (D-2).
+    """
+    tier_name = TIER_DESCRIPTIONS[finding.tier][0]
+    evidence = "\n".join(f"  - {e}" for e in finding.evidence) or "  (none)"
+    return (
+        f"You are autopilot's headless authoring agent. Compile the finding "
+        f"below into one or more flywheel tasks following the fw-spec and "
+        f"fw-plan contracts -- a one-sentence goal and the strongest "
+        f"out-of-band grader you can express.\n\n"
+        f"Repository: {repo_root}\n"
+        f"Finding (Tier {finding.tier.value}, {tier_name}): {finding.title}\n"
+        f"Detail: {finding.detail}\n"
+        f"Evidence:\n{evidence}\n\n"
+        f"HARD INTEGRITY RULES:\n"
+        f"- Every emitted task must carry at least one grader.\n"
+        f"- The authoritative grader MUST be either (a) a command that invokes "
+        f"a check already committed in this repo (a test/lint/build command "
+        f"that exists BEFORE this task runs), or (b) a registered held-out "
+        f"oracle by absolute path. It must NEVER be a brand-new check this "
+        f"task's own diff creates -- that is self-attestation.\n"
+        f"- Resolve any ambiguity a human would be asked about as a recorded "
+        f"assumption; never emit a vaguer task to dodge a question.\n"
+        f"- If you cannot express an out-of-band grader for this finding, do "
+        f"not invent one: set \"dropped\" to a one-sentence reason and emit no "
+        f"task.\n\n"
+        f"Respond with exactly one fenced JSON block:\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "tasks": [\n'
+        f"    {{\n"
+        f'      "task": {{"id": "kebab-id", "goal": "one sentence", '
+        f'"graders": [{{"type": "command", "run": "<existing repo check>"}}], '
+        f'"tags": [], "context": {{}}}},\n'
+        f'      "authoritative_grader": "<run string matching a command grader '
+        f'above>",\n'
+        f'      "grader_source": "{GRADER_SOURCE_REPO_COMMAND}",\n'
+        f'      "grader_target": "<repo-relative path to the pre-existing check '
+        f'the grader runs>",\n'
+        f'      "creates_files": ["<paths this task\'s diff will create>"],\n'
+        f'      "assumptions": ["<ambiguity you resolved yourself>"]\n'
+        f"    }}\n"
+        f"  ],\n"
+        f'  "dropped": ""\n'
+        f"}}\n"
+        f"```"
+    )
+
+
+def _validate_task_entry(
+    finding: Finding, entry: Any, repo_root: Path
+) -> tuple[EmittedTask | None, str | None]:
+    """Validate one authored-task entry; return ``(emitted, drop_reason)``.
+
+    Exactly one of the two is non-``None``. The checks are the deterministic
+    enforcement of criteria #1 and #8 -- a self-authored or grader-less entry
+    is dropped, never emitted.
+    """
+    if not isinstance(entry, dict):
+        return None, "authored entry is not an object"
+    task_data = entry.get("task")
+    if not isinstance(task_data, dict):
+        return None, "authored entry has no task object"
+    try:
+        task = load_task_data(task_data, source=f"autopilot:{finding.id}")
+    except TaskLoadError as exc:
+        return None, f"authored task failed validation: {exc}"
+    if not task.graders:
+        return None, "authored task carries no grader (criterion #1)"
+
+    authoritative = entry.get("authoritative_grader")
+    if not isinstance(authoritative, str) or not authoritative.strip():
+        return None, "authored task names no authoritative grader"
+    command_runs = {
+        g.run for g in task.graders if isinstance(g, CommandGrader)
+    }
+    if authoritative not in command_runs:
+        return (
+            None,
+            "authoritative grader is not a command grader on the emitted task",
+        )
+
+    source = entry.get("grader_source")
+    if source not in _GRADER_SOURCES:
+        return None, f"unknown grader_source {source!r}"
+    target = entry.get("grader_target")
+    if not isinstance(target, str) or not target.strip():
+        return None, "authoritative grader names no pre-existing target"
+
+    raw_creates = entry.get("creates_files")
+    creates = (
+        tuple(str(c) for c in raw_creates if isinstance(c, str))
+        if isinstance(raw_creates, list)
+        else ()
+    )
+
+    # Self-attestation guard (criterion #8): the authoritative grader must not
+    # name -- nor resolve to -- a file this task's own diff creates.
+    for created in creates:
+        if created and created in authoritative:
+            return (
+                None,
+                "authoritative grader names a file this task's own diff "
+                "creates (self-attestation)",
+            )
+        if created and created == target:
+            return (
+                None,
+                "authoritative grader target is a file this task's own diff "
+                "creates (self-attestation)",
+            )
+
+    held_out_oracle_path: str | None = None
+    if source == GRADER_SOURCE_REPO_COMMAND:
+        # The grader must point at a check that pre-exists in the repo -- proof
+        # it is out-of-band, not created by the run it grades.
+        if not (repo_root / target).exists():
+            return (
+                None,
+                "authoritative grader target does not pre-exist in the repo "
+                "(not an out-of-band check)",
+            )
+    else:  # GRADER_SOURCE_HELD_OUT
+        oracle = Path(target)
+        if not oracle.is_absolute() or not oracle.exists():
+            return (
+                None,
+                "held-out oracle target is not an existing absolute path",
+            )
+        held_out_oracle_path = str(oracle)
+
+    raw_assumptions = entry.get("assumptions")
+    assumptions = (
+        tuple(str(a) for a in raw_assumptions if isinstance(a, str))
+        if isinstance(raw_assumptions, list)
+        else ()
+    )
+
+    return (
+        EmittedTask(
+            finding=finding,
+            task=task,
+            authoritative_grader=authoritative,
+            grader_source=source,
+            grader_target=target,
+            creates_files=creates,
+            assumptions=assumptions,
+            held_out_oracle_path=held_out_oracle_path,
+        ),
+        None,
+    )
+
+
+async def author_finding(
+    finding: Finding, *, repo_root: Path, invoker: AutopilotInvoker
+) -> AuthoringResult:
+    """Compile one finding into emitted tasks (or a recorded drop).
+
+    Drives the authoring agent through the injectable seam, parses its
+    structured output, and validates every authored task against criteria #1
+    and #8. A finding whose agent call raises, whose response is unparseable, or
+    that yields no valid grader-bearing task is dropped with a recorded reason
+    rather than written.
+    """
+    try:
+        text = await invoker(authoring_prompt(finding, repo_root))
+    except Exception as exc:  # noqa: BLE001 - best-effort per finding.
+        return AuthoringResult(
+            dropped=(
+                DroppedFinding(
+                    finding=finding,
+                    reason=f"authoring agent error: {type(exc).__name__}: {exc}",
+                ),
+            )
+        )
+    try:
+        data = _extract_json_object(text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return AuthoringResult(
+            dropped=(
+                DroppedFinding(
+                    finding=finding,
+                    reason=f"unparseable authoring response: {exc}",
+                ),
+            )
+        )
+
+    raw_tasks = data.get("tasks")
+    entries = raw_tasks if isinstance(raw_tasks, list) else []
+    emitted: list[EmittedTask] = []
+    drop_reasons: list[str] = []
+    for entry in entries:
+        task, reason = _validate_task_entry(finding, entry, repo_root)
+        if task is not None:
+            emitted.append(task)
+        elif reason is not None:
+            drop_reasons.append(reason)
+
+    if emitted:
+        return AuthoringResult(emitted=tuple(emitted))
+
+    # No valid task: prefer the agent's own drop reason, else the first
+    # validation failure, else a generic note.
+    agent_drop = data.get("dropped")
+    reason = (
+        agent_drop.strip()
+        if isinstance(agent_drop, str) and agent_drop.strip()
+        else (drop_reasons[0] if drop_reasons else "no grader-bearing task authored")
+    )
+    return AuthoringResult(
+        dropped=(DroppedFinding(finding=finding, reason=reason),)
+    )
+
+
+async def author_findings(
+    findings: list[Finding], *, repo_root: Path, invoker: AutopilotInvoker
+) -> AuthoringResult:
+    """Author every finding in order; aggregate emitted tasks and drops."""
+    emitted: list[EmittedTask] = []
+    dropped: list[DroppedFinding] = []
+    for finding in findings:
+        result = await author_finding(
+            finding, repo_root=repo_root, invoker=invoker
+        )
+        emitted.extend(result.emitted)
+        dropped.extend(result.dropped)
+    return AuthoringResult(emitted=tuple(emitted), dropped=tuple(dropped))
+
+
 __all__ = [
+    "DEFAULT_AUTHORING_MAX_TURNS",
     "DEFAULT_DISCOVERY_MAX_TURNS",
     "DEFAULT_WEIGHTS",
     "INTERRUPT_BASE",
     "PREEMPTIVE_MAX_TIER",
+    "GRADER_SOURCE_HELD_OUT",
+    "GRADER_SOURCE_REPO_COMMAND",
     "TIER_DESCRIPTIONS",
     "TIER_WEIGHTS",
     "W_EFFORT",
@@ -646,13 +956,19 @@ __all__ = [
     "W_TIER",
     "W_UNBLOCK",
     "W_URGENCY",
+    "AuthoringResult",
     "AutopilotInvoker",
+    "DroppedFinding",
+    "EmittedTask",
     "Finding",
     "ScoreBreakdown",
     "ScoreWeights",
     "ScoredFinding",
     "Tier",
     "TierVerdict",
+    "author_finding",
+    "author_findings",
+    "authoring_prompt",
     "build_repo_invoker",
     "discover_tier",
     "parse_tier_verdict",

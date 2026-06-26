@@ -237,10 +237,19 @@ class AutopilotSupervisor:
         return AutopilotStatus(state=AutopilotState.SUPERVISED, pid=child.pid)
 
     def stop(self, *, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS) -> bool:
-        """Send SIGTERM to the supervised child and wait for it to exit.
+        """Stop the supervised daemon and everything it spawned.
 
-        Returns ``True`` when the child exited within ``timeout``; ``False``
-        when there is no supervised child or the wait timed out. Idempotent.
+        Signals the child's whole process *group*, not just its pid: the daemon
+        is its own session leader (``start_new_session=True``), so the agent
+        subprocesses it spawns (and their MCP children) share its group and must
+        come down with it -- signaling only the daemon pid leaves those agents
+        orphaned and still editing the repo. A graceful SIGTERM goes first; if
+        the group is still alive after ``timeout`` -- a daemon blocked mid-cycle
+        cannot honor the stop flag until its in-flight agent call returns -- it
+        is escalated to SIGKILL so the console never exits leaving an orphan.
+
+        Returns ``True`` when a running daemon was stopped (gracefully or
+        force-killed); ``False`` when there was no supervised child. Idempotent.
         """
         if self._child is None:
             return False
@@ -251,18 +260,25 @@ class AutopilotSupervisor:
             self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
-        try:
-            self._child.send_signal(signal.SIGTERM)
-        except ProcessLookupError:
+
+        if not self._signal_group(signal.SIGTERM):
+            # The child vanished between the poll and the signal; nothing to do.
             self._dead_pid = self._child.pid
             self._dead_exit = self._child.poll() or 0
             self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
-            return False
+            return True
+
         try:
             exit_code = self._child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return False
+            # Blocked mid-cycle: force the whole group down rather than orphan
+            # it, then reap so no zombie is left behind.
+            self._signal_group(signal.SIGKILL)
+            try:
+                exit_code = self._child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                exit_code = None
         self._dead_pid = self._child.pid
         self._dead_exit = exit_code
         self._reap_child()
@@ -286,6 +302,27 @@ class AutopilotSupervisor:
         self.detach()
 
     # ----- Internal helpers ------------------------------------------------
+
+    def _signal_group(self, sig: int) -> bool:
+        """Signal the child's process group; ``False`` if it no longer exists.
+
+        The daemon is a session leader, so its pgid equals its pid and the
+        signal reaches every descendant it spawned. Returns ``False`` when the
+        process (or its group) is already gone, so the caller can treat a
+        vanished child as already-stopped.
+        """
+        child = self._child
+        if child is None:
+            return False
+        try:
+            pgid = os.getpgid(child.pid)
+        except ProcessLookupError:
+            return False
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return False
+        return True
 
     def _read_owned_activity(self, child_pid: int) -> AutopilotActivity | None:
         """Read the activity snapshot iff it belongs to the owned child.

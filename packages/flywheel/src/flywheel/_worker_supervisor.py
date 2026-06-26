@@ -431,16 +431,21 @@ class WorkerSupervisor:
     def stop(
         self, *, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS
     ) -> bool:
-        """Send SIGTERM to the supervised child and wait for it to exit.
+        """Stop the supervised worker and everything it spawned.
 
-        Returns ``True`` when the child exited within ``timeout``,
-        ``False`` when there is no supervised child to stop or the
-        wait timed out. The worker's existing graceful-shutdown path
-        is what finalizes the in-flight lifecycle to ``interrupted``;
-        the supervisor only signals + reaps.
+        Signals the child's whole process *group*, not just its pid: the worker
+        is its own session leader (``start_new_session=True``), so the agent
+        subprocesses it spawns share its group and must come down with it --
+        signaling only the worker pid leaves those agents orphaned. A graceful
+        SIGTERM goes first (giving the worker's shutdown path its ``timeout``
+        window to finalize the in-flight lifecycle to ``interrupted``); if the
+        group is still alive after ``timeout`` -- a worker blocked mid-agent-
+        call cannot honor the signal until that call returns -- it is escalated
+        to SIGKILL so the console never exits leaving an orphan. A force-killed
+        worker's lease simply lapses and another worker reclaims the task.
 
-        Idempotent: a second call after the child has exited returns
-        ``False`` without raising.
+        Returns ``True`` when a running worker was stopped (gracefully or
+        force-killed); ``False`` when there is no supervised child. Idempotent.
         """
 
         if self._child is None:
@@ -454,20 +459,26 @@ class WorkerSupervisor:
             self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
-        try:
-            self._child.send_signal(signal.SIGTERM)
-        except ProcessLookupError:
-            # Child died between the poll and the signal; reap and
-            # report not-stopped-by-us so the caller can decide.
+
+        if not self._signal_group(signal.SIGTERM):
+            # Child died between the poll and the signal; reap and report it
+            # stopped (there is nothing left running).
             self._dead_pid = self._child.pid
             self._dead_exit = self._child.poll() or 0
             self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
-            return False
+            return True
+
         try:
             exit_code = self._child.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return False
+            # Blocked mid-agent-call: force the whole group down rather than
+            # orphan it, then reap so no zombie is left behind.
+            self._signal_group(signal.SIGKILL)
+            try:
+                exit_code = self._child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                exit_code = None
         self._dead_pid = self._child.pid
         self._dead_exit = exit_code
         self._reap_child()
@@ -503,6 +514,27 @@ class WorkerSupervisor:
         self.detach()
 
     # ----- Internal helpers ------------------------------------------------
+
+    def _signal_group(self, sig: int) -> bool:
+        """Signal the child's process group; ``False`` if it no longer exists.
+
+        The worker is a session leader, so its pgid equals its pid and the
+        signal reaches every descendant it spawned. Returns ``False`` when the
+        process (or its group) is already gone, so the caller can treat a
+        vanished child as already-stopped.
+        """
+        child = self._child
+        if child is None:
+            return False
+        try:
+            pgid = os.getpgid(child.pid)
+        except ProcessLookupError:
+            return False
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return False
+        return True
 
     def _open_log(self) -> IO[bytes]:
         """Open the per-spawn supervisor log file in append mode.

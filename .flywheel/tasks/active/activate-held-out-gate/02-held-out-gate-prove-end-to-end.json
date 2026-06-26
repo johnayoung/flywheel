@@ -1,0 +1,44 @@
+{
+  "id": "held-out-gate-prove-end-to-end",
+  "goal": "A held-out source built from the parsed policy via `build_held_out_source` blocks and parks a task whose `<root>/<task_id>.json` registration's command grader fails against the committed tree and lands a task whose registration passes (identically to a no-held-out baseline), with neither the registration file nor its oracle present anywhere under the agent's worktree.",
+  "tags": ["orchestrator", "worktree", "spec-00057", "held-out", "gate-proof"],
+  "prerequisites": ["held-out-gate-activate-config"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/", "name": "worktree-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00057-activate-held-out-gate.md -- acceptance criteria #3, #5, #6 and decisions D-1, D-2 this task satisfies.",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- the existing land/block harness: drives a real lifecycle through `orchestrate` with a stubbed agent and asserts the LANDING consequences (passing/absent gate -> `submit` invoked / lands; failing gate -> `submit` never invoked, run parked). Mirror this harness for #3, but build the source via `build_held_out_source` from a parsed/constructed policy (the D-2 differentiator), not a hand-built `FilesystemHeldOutGraderSource`. Keep this suite green.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- `build_held_out_source(policy, repo_root)` (~line 1358): the construction entry the proof must drive so the assertion fails if config->source wiring regresses (D-2).",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- `write_oracle_registration(root, task_id, oracle_path, ...)` / `build_oracle_registration` (~line 206-310): produce the `<root>/<task_id>.json` registration (a command grader invoking the oracle by absolute path, cwd = committed tree) used in #3. `evaluate_held_out_gate` and `FilesystemHeldOutGraderSource` are the gate; reuse unchanged.",
+      "packages/flywheel-orchestrator/tests/test_held_out_registration.py -- existing round-trip tests for `write_oracle_registration`/`graders_for`; mirror its construction so the #3 registration is produced by the shipped writer, not hand-rolled JSON. Keep green.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the landing path that consults the held-out gate before `submit` (~line 1187-1351); reuse unchanged."
+    ],
+    "constraints": [
+      "Build the held-out source via `build_held_out_source` from a parsed/constructed policy with `[held_out] root` set (D-2), then drive one task whose registration (written by the shipped `write_oracle_registration`) passes against the committed tree and one whose registration fails.",
+      "Pass-task: reaches the same landed end-state as a no-held-out baseline (`submit` invoked) -- criterion #3.",
+      "Fail-task: does not land (`submit` never invoked), the worktree is parked, and the gate-failed end-state is distinguishable on the recorded run -- criterion #3.",
+      "The registration's discrimination is reproduced THROUGH the gate: PASS on a correct committed tree, FAIL on a plausible-wrong committed tree (the oracle grades the committed content, not the agent's self-report).",
+      "While the gate is active with a registration and its oracle file on disk at the configured root, neither file is present anywhere under the agent's worktree during the run -- criterion #5 (committed-pointer / git-ignored-payload).",
+      "No file under packages/flywheel-core/src/flywheel_core/ is modified -- criterion #6.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT modify the 00050 gate engine or the 00051 activation/registration code (`evaluate_held_out_gate`, `FilesystemHeldOutGraderSource`, `build_held_out_source`, `build_oracle_registration`, `write_oracle_registration`) -- this task proves the existing machinery, it does not re-decide it (D-5/00051).",
+      "Do NOT drive a full `flywheel worker` subprocess; assert the landed/blocked end-state through `orchestrate` with the source built via `build_held_out_source` (D-2 -- the subprocess exit status is a weaker end-state and is flaky).",
+      "Do NOT add a default/catch-all held-out grader; the per-task contract is unchanged (D-3).",
+      "Do NOT commit any registration or oracle file into the tracked tree -- the payload stays git-ignored, written only to the out-of-worktree held-out root (D-1).",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema).",
+      "Do NOT modify files under tests/ to weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "Registration's command grader fails (nonzero exit) against the committed tree -> blocked + parked, `submit` never invoked -- #3.",
+      "Registration's command grader passes -> lands identically to baseline, `submit` invoked -- #3.",
+      "Oracle referenced by an absolute path outside the committed tree, run with cwd = committed tree -> it observes the committed changes while its own file is never in the worktree -- #5/#3.",
+      "A plausible-wrong committed tree must FAIL the gate (a green-on-everything registration that grades nothing is a defect) -- #3."
+    ]
+  }
+}

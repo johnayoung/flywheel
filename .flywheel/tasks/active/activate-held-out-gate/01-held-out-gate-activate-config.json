@@ -1,0 +1,44 @@
+{
+  "id": "held-out-gate-activate-config",
+  "goal": "flywheel's own flywheel.toml commits a `[held_out] root` pointing at a git-ignored directory under `.flywheel/verification/`, so the worker's source-construction (`build_held_out_source`) resolves registrations under `<repo_root>/<root>` and an unregistered task lands byte-identically to the no-held-out baseline.",
+  "tags": ["orchestrator", "worktree", "spec-00057", "held-out", "activation"],
+  "graders": [
+    { "type": "command", "run": "uv run python -c \"from flywheel_orchestrator import load_policy; from pathlib import Path; assert load_policy(Path('flywheel.toml')).held_out_root is not None, 'flywheel.toml must declare [held_out] root'\"", "name": "activation-pointer" },
+    { "type": "command", "run": "uv run python -c \"from flywheel_orchestrator import load_policy; from pathlib import Path; import subprocess, sys; r = load_policy(Path('flywheel.toml')).held_out_root; assert r is not None; sys.exit(subprocess.run(['git', 'check-ignore', '-q', str(r)]).returncode)\"", "name": "payload-gitignored" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/", "name": "worktree-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/", "name": "core-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00057-activate-held-out-gate.md -- acceptance criteria #1, #2, #4, #6 and decisions D-1, D-2, D-3 this task satisfies.",
+      "flywheel.toml -- the edit target: add a `[held_out]` table with `root = \".flywheel/verification/held-out\"` (a git-ignored subdir of the already-ignored `.flywheel/verification/`, per `.flywheel/.gitignore`). This is the committed activation pointer (D-1); the payload it names stays untracked.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- `WorkPolicy.held_out_root` (~line 386) and its parser `_optional_held_out_root` (~line 830). Already shipped (00051); reuse unchanged -- this task only sets the key in flywheel.toml, it does not change the parser.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- `build_held_out_source(policy, repo_root)` (~line 1358) resolves a relative `[held_out] root` against `repo_root` and builds a `FilesystemHeldOutGraderSource`; `main` calls it (~line 1450) and threads it through every `run_once`. Already shipped (00051); reuse unchanged.",
+      "packages/flywheel-worktree/tests/test_worker.py -- the existing `build_held_out_source` tests (~line 860-885, incl. `test_build_held_out_source_resolves_relative_against_repo_root`). Extend here for #2: a registration written at `<repo_root>/<root>/<task_id>.json` is consulted while an identically named file under the worker cwd or a sandbox path is NOT. Keep this suite green.",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- the existing land/block harness that drives a real lifecycle through `orchestrate` with a `FilesystemHeldOutGraderSource`. Extend here for #4: with the gate active but NO registration for the driven task, the task lands exactly as a no-held-out baseline (the NO_GATE path). Keep this suite green.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- `FilesystemHeldOutGraderSource` (`<root>/<task_id>.json`, fail-closed, NO_GATE when no file). Reuse unchanged."
+    ],
+    "constraints": [
+      "Add `[held_out] root` to flywheel.toml pointing at `.flywheel/verification/held-out` (or another subdir of the already-ignored `.flywheel/verification/`); the configured directory must be git-ignored so the `payload-gitignored` grader passes (`git check-ignore -q <root>` exits 0) -- criterion #1, D-1.",
+      "The repo's flywheel.toml must parse via `load_policy` to a non-None `held_out_root` -- criterion #1, the `activation-pointer` grader.",
+      "Prove resolution through the REAL construction entry `build_held_out_source` from a parsed/constructed policy (NOT a hand-built FilesystemHeldOutGraderSource): a registration at `<repo_root>/<root>/<task_id>.json` is consulted, an identically named file under the worker's cwd or a sandbox path is not -- criterion #2, D-2.",
+      "With `[held_out] root` configured but no `<task_id>.json` for the driven task, the task reaches the same landed end-state as a no-held-out baseline (NO_GATE, no block, no park) -- criterion #4 (must-not-regress).",
+      "No file under packages/flywheel-core/src/flywheel_core/ is modified -- criterion #6.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT modify the 00050 gate engine or the 00051 activation/registration code (`evaluate_held_out_gate`, `FilesystemHeldOutGraderSource`, `build_held_out_source`, `build_oracle_registration`, `write_oracle_registration`, the `_optional_held_out_root` parser) -- this task only sets the config key and adds tests (out of scope, D-5/00051).",
+      "Do NOT add a default/catch-all held-out grader; the per-task `<root>/<task_id>.json` contract is unchanged (D-3).",
+      "Do NOT author or register a held-out oracle for any task, and do NOT gate this task's own execution -- activation and proof only.",
+      "Do NOT commit any registration or oracle file into the tracked tree -- only the pointer is committed; the payload stays git-ignored (D-1).",
+      "Do NOT modify flywheel-core (Task/Grader/lifecycle/schema).",
+      "Do NOT modify files under tests/ to weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "A registration at `<repo_root>/<root>/<id>.json` is honored; an identically named file under cwd or a sandbox path is ignored (resolution is repo-root-anchored, not cwd-anchored) -- #2.",
+      "Gate active, no registration for the driven task -> lands identically to baseline (NO_GATE) -- #4.",
+      "`held_out_root` resolves but the configured directory does not exist yet -> the source returns NO_GATE (no file), never an error -- the missing-dir default."
+    ]
+  }
+}

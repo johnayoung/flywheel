@@ -635,21 +635,35 @@ async def run_discovery(
     *,
     repo_root: Path,
     invoker: AutopilotInvoker | None = None,
+    session_runner: DiscoverySessionRunner | None = None,
     model: str | None = None,
 ) -> list[TierVerdict]:
-    """Fan out one relevance agent per tier and return all 11 verdicts.
+    """Run discovery and return all 11 verdicts, in tier order.
 
-    Returns exactly one verdict per tier (1-11) in tier order. ``invoker``
-    defaults to the production SDK-backed seam rooted at ``repo_root``; tests
-    pass a scripted coroutine. The fan-out is concurrent and best-effort: a
-    tier whose agent raises still yields a (not-relevant, error-reason)
-    verdict, so the run always returns 11 verdicts.
+    Two paths, one observable contract (exactly one verdict per tier, 1-11):
+
+    * **Production (no scripted ``invoker``)** runs the single-session
+      tier-subagent discovery (:func:`run_single_session_discovery`) -- ONE
+      ``claude`` session whose ``options.agents`` registers all 11 tiers,
+      collapsing the old 11-session fan-out into one process and one MCP boot
+      (spec 00059). ``session_runner`` defaults to the SDK-backed runner; a test
+      injects a scripted one to exercise the production route with no SDK.
+    * **Tests (a scripted ``invoker`` is injected)** keep the per-tier fan-out
+      unchanged: one ``discover_tier`` call per tier through the scripted seam,
+      concurrent and best-effort.
+
+    Both paths are best-effort: a tier whose agent raises or returns malformed
+    output still yields a (not-relevant, error-reason) verdict, so the run
+    always returns 11.
     """
-    seam = invoker if invoker is not None else build_repo_invoker(
-        repo_root, model=model
-    )
+    if invoker is None:
+        return await run_single_session_discovery(
+            repo_root=repo_root,
+            session_runner=session_runner,
+            model=model,
+        )
     verdicts = await asyncio.gather(
-        *(discover_tier(tier, repo_root=repo_root, invoker=seam) for tier in Tier)
+        *(discover_tier(tier, repo_root=repo_root, invoker=invoker) for tier in Tier)
     )
     return list(verdicts)
 
@@ -1479,11 +1493,6 @@ async def run_refill_pass(
             ),
         )
 
-    discover = (
-        discovery_invoker
-        if discovery_invoker is not None
-        else build_repo_invoker(repo_root, model=model)
-    )
     author = (
         authoring_invoker
         if authoring_invoker is not None
@@ -1492,7 +1501,13 @@ async def run_refill_pass(
         )
     )
 
-    verdicts = await run_discovery(repo_root=repo_root, invoker=discover)
+    # Discovery routes itself: a scripted ``discovery_invoker`` (tests) drives
+    # the per-tier fan-out; ``None`` (production) drives the single-session
+    # tier-subagent path. Either way ``run_discovery`` returns exactly 11
+    # verdicts.
+    verdicts = await run_discovery(
+        repo_root=repo_root, invoker=discovery_invoker, model=model
+    )
     relevant_tiers = tuple(v.tier for v in verdicts if v.relevant)
     not_relevant_tiers = tuple(v.tier for v in verdicts if not v.relevant)
     findings = [f for v in verdicts if v.relevant for f in v.findings]

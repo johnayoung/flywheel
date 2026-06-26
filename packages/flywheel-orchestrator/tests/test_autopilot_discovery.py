@@ -14,11 +14,20 @@ import json
 import re
 from pathlib import Path
 
+from flywheel_core.envelope import parse_envelope
+from flywheel_core.invoker import (
+    InvocationSignals,
+    IterationResult,
+    ToolInteraction,
+    ToolResultObservation,
+)
+
 from flywheel_orchestrator._autopilot import (
     Finding,
     Tier,
     parse_tier_verdict,
     run_discovery,
+    tier_agent_key,
 )
 
 # A library-shaped fixture repo: the production/deploy tiers do not apply.
@@ -162,6 +171,72 @@ def test_unparseable_response_yields_not_relevant_error_verdict() -> None:
     assert verdict.relevant is False
     assert verdict.findings == ()
     assert "unparseable" in verdict.reason
+
+
+def _subagent_interaction(tier_value: int) -> ToolInteraction:
+    """One ``Agent`` dispatch + its tool-result block for a tier subagent."""
+    body = {
+        "relevant": True,
+        "reason": f"tier {tier_value} applies",
+        "findings": [],
+    }
+    tool_use_id = f"tu-{tier_value}"
+    return ToolInteraction(
+        tool_use_id=tool_use_id,
+        tool_name="Agent",
+        tool_input={"subagent_type": tier_agent_key(Tier(tier_value))},
+        result=ToolResultObservation(
+            tool_use_id=tool_use_id,
+            is_error=None,
+            content=f"```json\n{json.dumps(body)}\n```",
+        ),
+    )
+
+
+def _single_session_result() -> IterationResult:
+    """A drained discovery session carrying all 11 tier subagent tool-results."""
+    signals = InvocationSignals(
+        stop_reason=None,
+        num_turns=None,
+        total_cost_usd=None,
+        result_is_error=None,
+        result_subtype=None,
+        api_error_status=None,
+        session_id=None,
+        tool_interactions=tuple(_subagent_interaction(t.value) for t in Tier),
+    )
+    return IterationResult(
+        transcript="",
+        messages=(),
+        envelope=parse_envelope(""),
+        signals=signals,
+    )
+
+
+def test_production_path_runs_one_session_and_returns_eleven() -> None:
+    # Production = no scripted invoker. run_discovery must drive the
+    # single-session subagent path: ONE session for all 11 tiers, not one
+    # session per tier. A regression that builds a session per tier would call
+    # the runner 11 times and fail this assertion.
+    sessions: list[str] = []
+
+    async def _session_runner(prompt: str) -> IterationResult:
+        sessions.append(prompt)
+        return _single_session_result()
+
+    verdicts = asyncio.run(
+        run_discovery(
+            repo_root=Path("/repo"),
+            invoker=None,
+            session_runner=_session_runner,
+        )
+    )
+
+    # Exactly one session was constructed for the whole discovery cycle.
+    assert len(sessions) == 1
+    # ...and it still yields exactly 11 verdicts, one per tier, in tier order.
+    assert [v.tier for v in verdicts] == list(Tier)
+    assert len(verdicts) == 11
 
 
 def test_findings_carry_the_full_score_axes() -> None:

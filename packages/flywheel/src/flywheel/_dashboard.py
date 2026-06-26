@@ -45,6 +45,7 @@ from flywheel._slash import (
     HELP_TEXT,
     SLASH_APPROVE,
     SLASH_ARCHIVE,
+    SLASH_AUTOPILOT,
     SLASH_HELP,
     SLASH_HISTORY,
     SLASH_INTERRUPT,
@@ -57,6 +58,7 @@ from flywheel._slash import (
     unknown_command_notice,
 )
 from flywheel._snapshot import DashboardSnapshot, RowSnapshot, SummaryData
+from flywheel._autopilot_supervisor import AutopilotState, AutopilotStatus
 from flywheel._worker_supervisor import WorkerState, WorkerStatus
 
 # How long a row that just left the active set stays dimmed on screen.
@@ -124,6 +126,19 @@ WorkerStopFn = Callable[[], bool]
 """``() -> bool`` -- ``/worker stop`` and quit-prompt 's' branch."""
 WorkerDetachFn = Callable[[], None]
 """``() -> None`` -- quit-prompt Enter branch (idempotent forget)."""
+
+# The autopilot supervisor's seams, mirroring the worker's. Autopilot is an
+# independent supervised child (decision D-6); the console shows its status and
+# drives ``/autopilot start|stop`` through these callables, bound to an
+# ``AutopilotSupervisor`` in production and stubbed in tests.
+AutopilotStatusFn = Callable[[], AutopilotStatus]
+"""``() -> AutopilotStatus`` -- read-only status poll for the status surface."""
+AutopilotStartFn = Callable[[], AutopilotStatus]
+"""``() -> AutopilotStatus`` -- ``/autopilot start``."""
+AutopilotStopFn = Callable[[], bool]
+"""``() -> bool`` -- ``/autopilot stop``."""
+AutopilotDetachFn = Callable[[], None]
+"""``() -> None`` -- console-exit detach (idempotent forget)."""
 
 
 # Statuses against which the in-process watcher will apply ``interrupt``.
@@ -276,6 +291,10 @@ class DashboardApp(App[int]):
         worker_start: WorkerStartFn | None = None,
         worker_stop: WorkerStopFn | None = None,
         worker_detach: WorkerDetachFn | None = None,
+        autopilot_status: AutopilotStatusFn | None = None,
+        autopilot_start: AutopilotStartFn | None = None,
+        autopilot_stop: AutopilotStopFn | None = None,
+        autopilot_detach: AutopilotDetachFn | None = None,
     ) -> None:
         super().__init__()
         self._poll = poll
@@ -302,9 +321,17 @@ class DashboardApp(App[int]):
         self._worker_start = worker_start
         self._worker_stop = worker_stop
         self._worker_detach = worker_detach
+        # Autopilot supervision seams, the independent second supervised child
+        # (decision D-6). Same optional shape as the worker seams: ``None``
+        # degrades ``/autopilot`` to a "not wired" notice.
+        self._autopilot_status = autopilot_status
+        self._autopilot_start = autopilot_start
+        self._autopilot_stop = autopilot_stop
+        self._autopilot_detach = autopilot_detach
         # Latest worker status snapshot; cached so the status bar can
         # re-render between polls without re-querying the supervisor.
         self._last_worker_status: WorkerStatus | None = None
+        self._last_autopilot_status: AutopilotStatus | None = None
         self._memo: dict[str, _RowMemo] = {}
         self._last_snapshot: DashboardSnapshot | None = None
         self._last_error: str | None = None
@@ -431,6 +458,7 @@ class DashboardApp(App[int]):
         # within one tick. ``None`` (no supervisor wired) hides the bar
         # entirely so snapshot-only tests are unaffected.
         worker_bar = self.query_one("#worker_bar", Static)
+        worker_text: Text | None = None
         if self._worker_status is not None:
             try:
                 status = self._worker_status()
@@ -439,14 +467,33 @@ class DashboardApp(App[int]):
                 self._last_error = f"worker status read failed: {exc}"
             if status is not None:
                 self._last_worker_status = status
-                worker_bar.update(_format_worker_status(status))
-                worker_bar.remove_class("hidden")
-            elif self._last_worker_status is not None:
-                worker_bar.update(_format_worker_status(self._last_worker_status))
-                worker_bar.remove_class("hidden")
-            else:
-                worker_bar.update("")
-                worker_bar.add_class("hidden")
+            if self._last_worker_status is not None:
+                worker_text = _format_worker_status(self._last_worker_status)
+
+        # Autopilot is an independent supervised child shown on the same bar
+        # (decision D-6): the console surfaces its live/none status the way it
+        # shows the worker's.
+        autopilot_text: Text | None = None
+        if self._autopilot_status is not None:
+            try:
+                ap_status = self._autopilot_status()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                ap_status = None
+                self._last_error = f"autopilot status read failed: {exc}"
+            if ap_status is not None:
+                self._last_autopilot_status = ap_status
+            if self._last_autopilot_status is not None:
+                autopilot_text = _format_autopilot_status(
+                    self._last_autopilot_status
+                )
+
+        parts = [t for t in (worker_text, autopilot_text) if t is not None]
+        if parts:
+            combined = parts[0]
+            for extra in parts[1:]:
+                combined = combined + Text("   ") + extra
+            worker_bar.update(combined)
+            worker_bar.remove_class("hidden")
         else:
             worker_bar.update("")
             worker_bar.add_class("hidden")
@@ -826,6 +873,12 @@ class DashboardApp(App[int]):
                 self._set_notice(notice)
             input_widget.value = ""
             return
+        if verb == SLASH_AUTOPILOT:
+            notice = self.handle_autopilot_slash(command.argument)
+            if notice:
+                self._set_notice(notice)
+            input_widget.value = ""
+            return
         if verb == SLASH_QUIT:
             input_widget.value = ""
             self.request_quit()
@@ -966,6 +1019,70 @@ class DashboardApp(App[int]):
             f"/worker: unknown sub-verb {sub!r}; try 'start' or 'stop'"
         )
 
+    def handle_autopilot_slash(self, argument: str) -> str:
+        """Dispatch ``/autopilot start`` and ``/autopilot stop``.
+
+        Mirrors :meth:`handle_worker_slash` against the independent autopilot
+        supervisor (decision D-6): ``start`` spawns the neverending autopilot
+        daemon as a detached supervised child when none is owned (idempotent
+        otherwise), ``stop`` SIGTERMs the supervised child. Returns the inline
+        notice the caller surfaces. Public so the session screen can reach it
+        the way it reaches ``handle_worker_slash``.
+        """
+        sub = argument.strip().lower()
+        if sub == "start":
+            if self._autopilot_start is None:
+                return "/autopilot start is not wired on this screen"
+            try:
+                status = self._autopilot_start()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                return f"/autopilot start failed: {exc}"
+            self._last_autopilot_status = status
+            if status.state == AutopilotState.SUPERVISED:
+                return f"/autopilot start: supervised (pid={status.pid})"
+            if status.state == AutopilotState.ERROR:
+                return (
+                    f"/autopilot start failed: {status.message or 'unknown'}"
+                )
+            return f"/autopilot start: state={status.state.value}"
+        if sub == "stop":
+            if self._autopilot_stop is None:
+                return "/autopilot stop is not wired on this screen"
+            current = (
+                self._autopilot_status()
+                if self._autopilot_status is not None
+                else None
+            )
+            if current is None or current.state != AutopilotState.SUPERVISED:
+                state_name = (
+                    current.state.value if current is not None else "unknown"
+                )
+                return (
+                    f"/autopilot stop: no supervised autopilot to stop "
+                    f"(state={state_name})"
+                )
+            try:
+                stopped = self._autopilot_stop()
+            except Exception as exc:  # noqa: BLE001 - boundary against supervisor errors
+                return f"/autopilot stop failed: {exc}"
+            if self._autopilot_status is not None:
+                try:
+                    self._last_autopilot_status = self._autopilot_status()
+                except Exception:  # noqa: BLE001 - re-read is opportunistic
+                    pass
+            if stopped:
+                return "/autopilot stop: autopilot terminated gracefully"
+            return (
+                "/autopilot stop: autopilot did not exit within the wait window"
+            )
+        return (
+            f"/autopilot: unknown sub-verb {sub!r}; try 'start' or 'stop'"
+        )
+
+    def autopilot_status(self) -> AutopilotStatus | None:
+        """The most recent autopilot status snapshot, for the status surface."""
+        return self._last_autopilot_status
+
     def _status_text(self) -> str:
         """Render the selected run's status for ``/status``.
 
@@ -1057,6 +1174,36 @@ def _format_worker_status(status: WorkerStatus) -> Text:
             style="bold red",
         )
     return Text(f"worker: {state.value}")
+
+
+def _format_autopilot_status(status: AutopilotStatus) -> Text:
+    """Render one ``autopilot:`` line for the status bar.
+
+    Mirrors :func:`_format_worker_status`'s vocabulary against the autopilot
+    supervisor's states (``supervised`` / ``none`` / ``dead`` / ``error``);
+    autopilot has no ``detached`` state (it writes no lease).
+    """
+    state = status.state
+    if state == AutopilotState.SUPERVISED:
+        pid = f" pid={status.pid}" if status.pid is not None else ""
+        return Text(f"autopilot: supervised{pid}", style="green")
+    if state == AutopilotState.NONE:
+        return Text(
+            "autopilot: none -- type '/autopilot start' to spawn one",
+            style="dim",
+        )
+    if state == AutopilotState.DEAD:
+        detail = f" ({status.message})" if status.message else ""
+        return Text(
+            f"autopilot: dead -- type '/autopilot start' to respawn{detail}",
+            style="bold red",
+        )
+    if state == AutopilotState.ERROR:
+        return Text(
+            f"autopilot: error: {status.message or 'unknown'}",
+            style="bold red",
+        )
+    return Text(f"autopilot: {state.value}")
 
 
 def _format_summary(summary: SummaryData) -> Text:

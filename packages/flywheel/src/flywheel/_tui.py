@@ -68,6 +68,7 @@ from flywheel._snapshot import (
     build_snapshot,
     snapshot_to_dict,
 )
+from flywheel._autopilot_supervisor import AutopilotSupervisor
 from flywheel._worker_supervisor import WorkerSupervisor
 
 
@@ -393,6 +394,12 @@ def _run_dashboard(
     )
     if not no_worker:
         supervisor.start()
+    # Autopilot is an independent supervised child (decision D-6): the operator
+    # starts it on demand via ``/autopilot start`` -- it is never auto-spawned
+    # on console launch (it writes to the base branch unattended). The
+    # supervisor is constructed unconditionally so the status surface and the
+    # console action exist; it is detached (never killed) on console exit.
+    autopilot_supervisor = AutopilotSupervisor(tasks_dir=tasks_dir, model=model)
 
     def poll() -> DashboardSnapshot:
         return build_snapshot(
@@ -517,6 +524,10 @@ def _run_dashboard(
         worker_start=supervisor.start,
         worker_stop=supervisor.stop,
         worker_detach=supervisor.detach,
+        autopilot_status=autopilot_supervisor.status,
+        autopilot_start=autopilot_supervisor.start,
+        autopilot_stop=autopilot_supervisor.stop,
+        autopilot_detach=autopilot_supervisor.detach,
     )
     try:
         rc = app.run()
@@ -525,8 +536,10 @@ def _run_dashboard(
         # child (if any) keeps running so a SIGINT-on-the-console exit
         # never silently kills the worker (spec FR-3 / Edge Cases).
         # The operator's explicit ``stop`` choice has already signaled
-        # the child by the time we get here.
+        # the child by the time we get here. Autopilot detaches the same
+        # way -- a started autopilot daemon survives console exit.
         supervisor.close()
+        autopilot_supervisor.close()
         store.close()
     return rc if isinstance(rc, int) else 0
 

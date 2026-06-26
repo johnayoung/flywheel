@@ -12,6 +12,13 @@ sandbox_root = ".flywheel/worktrees"
 [agent]
 model = "claude-opus-4-8"
 
+# Execute-time held-out landing gate (specs 00050/00051/00057). The committed
+# pointer activates the gate for the orchestrator; the payload it names
+# (per-task registrations + oracles) lives under the already git-ignored
+# .flywheel/verification/ tree, so it never materializes into an agent worktree.
+[held_out]
+root = ".flywheel/verification/held-out"
+
 # Default graders for work items that declare none (tracker sources only;
 # directory task files always declare their own).
 # [[defaults.graders]]

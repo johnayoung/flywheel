@@ -900,6 +900,74 @@ def test_build_held_out_source_honors_absolute_root(tmp_path: Path) -> None:
     assert source.root == abs_root
 
 
+def test_build_held_out_source_reads_repo_root_not_cwd_or_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registration at <repo_root>/<root>/<id>.json is consulted; an
+    identically named file under the worker's cwd or a sandbox path is not
+    (spec 00057 criterion #2, D-2).
+
+    Proven through the REAL construction entry: the source is built by
+    ``build_held_out_source`` from a parsed-shape policy whose ``[held_out]
+    root`` is RELATIVE, and the resulting source's reads are repo-root-anchored,
+    not cwd-anchored. A config that resolved the root against the worker's cwd or
+    a sandbox path would silently miss every registration -- active but gating
+    nothing -- and this test fails it.
+    """
+    repo_root = tmp_path / "repo"
+    rel_root = Path(".flywheel/verification/held-out")
+
+    # The only authoritative registration: under <repo_root>/<root>. Its grader
+    # is distinguishable ("true") from the decoys' ("exit 1").
+    repo_reg_dir = repo_root / rel_root
+    repo_reg_dir.mkdir(parents=True)
+    (repo_reg_dir / "alpha.json").write_text(
+        json.dumps([{"type": "command", "run": "true", "name": "repo-root"}]),
+        encoding="utf-8",
+    )
+
+    # Decoys at identical relative paths under the worker's cwd and a sandbox
+    # path. They carry an "alpha.json" that must lose to the repo-root file, and
+    # a "decoy-only.json" that has NO repo-root counterpart -- so consulting it
+    # at all would prove cwd/sandbox resolution.
+    cwd = tmp_path / "worker-cwd"
+    sandbox = tmp_path / "sandbox"
+    for decoy_base in (cwd, sandbox):
+        decoy_dir = decoy_base / rel_root
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "alpha.json").write_text(
+            json.dumps(
+                [{"type": "command", "run": "exit 1", "name": "decoy"}]
+            ),
+            encoding="utf-8",
+        )
+        (decoy_dir / "decoy-only.json").write_text(
+            json.dumps(
+                [{"type": "command", "run": "exit 1", "name": "decoy-only"}]
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.chdir(cwd)
+
+    policy = WorkPolicy(
+        source_kind="directory",
+        tasks_dir=repo_root,
+        held_out_root=rel_root,
+    )
+    source = worker.build_held_out_source(policy, repo_root)
+    assert isinstance(source, FilesystemHeldOutGraderSource)
+
+    # The repo-root registration wins over identically named decoys under cwd
+    # and the sandbox path.
+    graders = source.graders_for("alpha")
+    assert graders is not None
+    assert [g.run for g in graders] == ["true"]
+
+    # A task registered ONLY under cwd/sandbox is not consulted at all: the
+    # source reads <repo_root>/<root> and no other directory.
+    assert source.graders_for("decoy-only") is None
+
+
 # --- submit: protected-path merge gate -----------------------------------------
 
 

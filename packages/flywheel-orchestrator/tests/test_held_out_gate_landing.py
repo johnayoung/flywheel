@@ -184,6 +184,60 @@ def test_no_source_lands_unchanged(tmp_path: Path) -> None:
     assert [c.status for c in submit_calls] == [Status.DONE]
 
 
+# --- #4: gate active + no registration == no-held-out baseline --------------
+
+
+def test_unregistered_task_lands_identically_to_no_held_out_baseline(
+    tmp_path: Path,
+) -> None:
+    """Spec 00057 criterion #4 (must-not-regress): activating ``[held_out]
+    root`` must not change landing for the un-registered majority of tasks.
+
+    Two identical drives of the same task -- one with NO held-out source (the
+    no-held-out baseline), one with the gate ACTIVE at a configured root that
+    holds no ``<task_id>.json`` for the driven task -- must reach the same
+    landed end-state. Concretely: both land DONE via submit, with no block and
+    no park. The only permitted difference is the NO_GATE marker the active
+    source records (the gate ran and found nothing to gate), versus the absent
+    marker on the baseline where no gate ran at all -- neither is a landing
+    consequence.
+    """
+    # Baseline: no held-out source wired at all.
+    baseline_root = tmp_path / "baseline"
+    phase = baseline_root / "tasks" / "active" / "01-phase"
+    _write_task(phase, "alpha")
+    baseline_submits: list[SubmitRequest] = []
+    baseline = _drive(
+        baseline_root, held_out_root=None, submit_calls=baseline_submits
+    )
+
+    # Gate active: a configured (existing) root with no registration for alpha.
+    active_root = tmp_path / "active"
+    phase = active_root / "tasks" / "active" / "01-phase"
+    _write_task(phase, "alpha")
+    held_out = active_root / "held_out"
+    held_out.mkdir()
+    active_submits: list[SubmitRequest] = []
+    active = _drive(
+        active_root, held_out_root=held_out, submit_calls=active_submits
+    )
+
+    # Same landed end-state: DONE, landed via submit, nothing withheld/parked.
+    assert [r.status for r in baseline.runs] == [Status.DONE]
+    assert [r.status for r in active.runs] == [Status.DONE]
+    assert [c.task_id for c in baseline_submits] == ["alpha"]
+    assert [c.task_id for c in active_submits] == ["alpha"]
+    assert [c.status for c in baseline_submits] == [Status.DONE]
+    assert [c.status for c in active_submits] == [Status.DONE]
+    assert (
+        baseline_submits[0].status == active_submits[0].status == Status.DONE
+    )
+    # The active gate ran and explicitly found nothing to gate (NO_GATE); the
+    # baseline never ran a gate. Neither blocks the land.
+    assert baseline.runs[0].gate is None
+    assert active.runs[0].gate is GateOutcome.NO_GATE
+
+
 # --- #2 / #8: a failing gate blocks the land, submit never invoked ----------
 
 

@@ -27,8 +27,15 @@ a :class:`ScoreWeights` into these functions — this module never reads config.
 
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
+from typing import Any
+
+from flywheel_core.invoker import invoke_iteration
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
 
@@ -310,24 +317,349 @@ class TierVerdict:
     findings: tuple[Finding, ...] = ()
 
 
+# --- Discovery: per-tier relevance fan-out (autopilot-discovery) -------------
+#
+# One agent invocation per tier. Each agent reads the repo, decides whether its
+# tier is even relevant to *this* codebase (D-1: relevance is judged per-repo by
+# an agent, never by coded detectors), and surfaces zero or more concrete
+# findings with evidence. Agent access goes through an injectable seam built on
+# ``flywheel_core.invoker.invoke_iteration`` so a test scripts the fan-out
+# offline; the real driver resolves the SDK lazily through ``flywheel_core._sdk``.
+
+
+#: The tier's remit handed to its relevance agent: the class name and the
+#: one-line description from ``docs/autopilot.md``. The agent judges relevance
+#: and surfaces findings against exactly this remit.
+TIER_DESCRIPTIONS: dict[Tier, tuple[str, str]] = {
+    Tier.PRODUCTION_DOWN: (
+        "Production down / active harm",
+        "Outages, in-progress data loss, active breach, payments failing. "
+        "Nothing below advances while open.",
+    ),
+    Tier.IMMINENT_SEVERE_RISK: (
+        "Imminent severe risk",
+        "Actively/trivially exploitable vuln, spreading corruption, "
+        "hard-deadline compliance violation, dependency about to break prod.",
+    ),
+    Tier.BROKEN_BUILD: (
+        "Broken build / blocked pipeline",
+        "CI red, main can't deploy, team blocked from shipping. Blocks "
+        "everyone's forward motion.",
+    ),
+    Tier.COMMITTED_DELIVERABLES: (
+        "Committed deliverables at risk",
+        "Work with external commitments (customer deadlines, contracts, "
+        "dependent teams) about to slip.",
+    ),
+    Tier.CORE_FEATURE_WORK: (
+        "Core feature work",
+        "The roadmap -- new functionality delivering primary value. Default "
+        "steady state.",
+    ),
+    Tier.TEST_COVERAGE: (
+        "Test coverage (shipped/in-flight)",
+        "Tests for code that exists or is being written. Untested code "
+        "becomes tomorrow's Tier 1.",
+    ),
+    Tier.NON_CRITICAL_BUGS: (
+        "Non-critical bugs",
+        "Known defects, not blocking or severe. System functions.",
+    ),
+    Tier.TECH_DEBT: (
+        "Tech debt / refactoring",
+        "Cleanup that improves velocity and reduces risk.",
+    ),
+    Tier.OBSERVABILITY_TOOLING: (
+        "Observability & tooling",
+        "Logging, metrics, dashboards, dev ergonomics. Compounding "
+        "dividends, rarely urgent.",
+    ),
+    Tier.DOCUMENTATION: (
+        "Documentation",
+        "READMEs, API docs, runbooks, onboarding. Valuable, almost never "
+        "time-critical.",
+    ),
+    Tier.POLISH: (
+        "Polish / nice-to-have",
+        "Cosmetic tweaks, minor optimizations, \"wouldn't it be nice.\"",
+    ),
+}
+
+
+#: The injectable agent seam: a coroutine that takes a prompt and returns the
+#: agent's response text. The default driver wraps
+#: ``flywheel_core.invoker.invoke_iteration`` (SDK behind the lazy
+#: ``flywheel_core._sdk`` boundary); tests inject a scripted coroutine returning
+#: canned per-tier JSON so the fan-out is deterministic and offline.
+AutopilotInvoker = Callable[[str], Awaitable[str]]
+
+#: Default per-tier turn budget for the real SDK-backed invoker.
+DEFAULT_DISCOVERY_MAX_TURNS: int = 60
+
+
+def build_repo_invoker(
+    repo_root: Path,
+    *,
+    model: str | None = None,
+    max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
+) -> AutopilotInvoker:
+    """Build the production agent seam: a Claude session rooted in ``repo_root``.
+
+    The agent gets read access to the repo so it can judge tier relevance and
+    surface findings. The SDK is resolved lazily inside the returned coroutine,
+    so importing this module never requires the ``claude`` extra (the seam is
+    only exercised when an unscripted autopilot run actually drives an agent).
+    """
+
+    async def _invoke(prompt: str) -> str:
+        from flywheel_core._sdk import ClaudeAgentOptions
+
+        options = ClaudeAgentOptions(
+            cwd=str(repo_root),
+            add_dirs=[str(repo_root)],
+            permission_mode="bypassPermissions",
+            max_turns=max_turns,
+            model=model,
+        )
+        result = await invoke_iteration(prompt=prompt, options=options)
+        return result.transcript
+
+    return _invoke
+
+
+def tier_prompt(tier: Tier, repo_root: Path) -> str:
+    """Build the relevance-and-findings prompt for one tier.
+
+    The prompt names the tier (so a scripted invoker can route on ``TIER: N``),
+    states its remit, and pins the structured-JSON output contract the fan-out
+    parses. It explicitly authorizes a *not relevant* verdict so a tier that
+    does not apply to this repo contributes nothing rather than inventing work.
+    """
+    name, description = TIER_DESCRIPTIONS[tier]
+    return (
+        f"You are the relevance agent for autopilot TIER: {tier.value} "
+        f"({name}).\n\n"
+        f"Tier remit: {description}\n\n"
+        f"Read the repository at {repo_root} and decide whether THIS tier is "
+        f"relevant to THIS codebase. Relevance is per-codebase: e.g. "
+        f"\"production down\" is meaningless for a pure library. If the tier "
+        f"does not apply, say so -- do not invent work to fill it.\n\n"
+        f"If the tier is relevant, surface zero or more concrete findings, "
+        f"each backed by evidence you actually observed in the repo. For each "
+        f"finding estimate, on a 0-10 scale: urgency (how fast cost grows if "
+        f"untouched), importance (value/risk-reduction if done), blocks (how "
+        f"many other efforts it unblocks), effort (cost to do). Set ready=true "
+        f"when the work can start now.\n\n"
+        f"Respond with exactly one fenced JSON block:\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "relevant": true,\n'
+        f'  "reason": "one sentence on why this tier does or does not apply",\n'
+        f'  "findings": [\n'
+        f'    {{"id": "short-slug", "title": "...", "detail": "...", '
+        f'"evidence": ["path:line or observation"], "urgency": 0, '
+        f'"importance": 0, "blocks": 0, "effort": 0, "ready": true}}\n'
+        f"  ]\n"
+        f"}}\n"
+        f"```\n"
+        f"A not-relevant verdict carries relevant=false, a reason, and an "
+        f"empty findings list."
+    )
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Extract the structured JSON object from an agent response.
+
+    Prefers a ```` ```json ```` fenced block (the contract in
+    :func:`tier_prompt`); falls back to the outermost ``{...}`` span so a model
+    that omitted the fence still parses. Raises :class:`ValueError` when no
+    JSON object is present so the caller records a parse failure rather than a
+    silent empty verdict.
+    """
+    fence = "```json"
+    start = text.find(fence)
+    if start != -1:
+        body_start = start + len(fence)
+        end = text.find("```", body_start)
+        if end != -1:
+            candidate = text[body_start:end].strip()
+            data = json.loads(candidate)
+            if not isinstance(data, dict):
+                raise ValueError("fenced JSON is not an object")
+            return data
+    # Fallback: the outermost brace span.
+    first = text.find("{")
+    last = text.rfind("}")
+    if first == -1 or last == -1 or last <= first:
+        raise ValueError("no JSON object found in agent response")
+    data = json.loads(text[first : last + 1])
+    if not isinstance(data, dict):
+        raise ValueError("response JSON is not an object")
+    return data
+
+
+def _coerce_int(value: Any) -> int:
+    """Coerce an agent-supplied score axis to a non-negative int, default 0."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
+    return 0
+
+
+def _parse_findings(tier: Tier, raw: Any) -> tuple[Finding, ...]:
+    """Build :class:`Finding` values for one tier from the agent's list.
+
+    Each finding is stamped with ``tier`` here -- the agent never assigns its
+    own tier, so a finding cannot land in a tier its relevance agent was not
+    asked about. A malformed entry (not an object, or missing a title) is
+    skipped rather than aborting the tier.
+    """
+    if not isinstance(raw, list):
+        return ()
+    findings: list[Finding] = []
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        raw_id = entry.get("id")
+        slug = raw_id if isinstance(raw_id, str) and raw_id.strip() else str(idx)
+        evidence = entry.get("evidence")
+        evidence_tuple = (
+            tuple(str(e) for e in evidence)
+            if isinstance(evidence, list)
+            else ()
+        )
+        detail = entry.get("detail")
+        ready = entry.get("ready")
+        findings.append(
+            Finding(
+                id=f"t{tier.value}-{slug}",
+                tier=tier,
+                title=title.strip(),
+                detail=detail if isinstance(detail, str) else "",
+                evidence=evidence_tuple,
+                urgency=_coerce_int(entry.get("urgency")),
+                importance=_coerce_int(entry.get("importance")),
+                blocks=_coerce_int(entry.get("blocks")),
+                effort=_coerce_int(entry.get("effort")),
+                ready=ready if isinstance(ready, bool) else True,
+            )
+        )
+    return tuple(findings)
+
+
+def parse_tier_verdict(tier: Tier, text: str) -> TierVerdict:
+    """Parse one tier agent's response into a :class:`TierVerdict`.
+
+    A not-relevant verdict always carries zero findings: even if the agent
+    contradicts itself and lists findings under ``relevant=false``, they are
+    dropped here so a not-relevant tier can never contribute work (criterion
+    #2). A response with no parseable JSON yields a not-relevant verdict with
+    the parse error as its reason -- the fan-out records the failure rather
+    than crashing.
+    """
+    try:
+        data = _extract_json_object(text)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return TierVerdict(
+            tier=tier,
+            relevant=False,
+            reason=f"unparseable discovery response: {exc}",
+            findings=(),
+        )
+    relevant = bool(data.get("relevant"))
+    reason_raw = data.get("reason")
+    reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
+    if not relevant:
+        return TierVerdict(
+            tier=tier,
+            relevant=False,
+            reason=reason or "tier judged not relevant to this codebase",
+            findings=(),
+        )
+    return TierVerdict(
+        tier=tier,
+        relevant=True,
+        reason=reason or "tier judged relevant to this codebase",
+        findings=_parse_findings(tier, data.get("findings")),
+    )
+
+
+async def discover_tier(
+    tier: Tier, *, repo_root: Path, invoker: AutopilotInvoker
+) -> TierVerdict:
+    """Run one tier's relevance agent and parse its verdict.
+
+    Any exception from the agent is contained and returned as a not-relevant
+    verdict carrying the error reason, so one failing tier never aborts the
+    fan-out (best-effort, mirroring the orchestrator's report posture).
+    """
+    try:
+        text = await invoker(tier_prompt(tier, repo_root))
+    except Exception as exc:  # noqa: BLE001 - best-effort fan-out per tier.
+        return TierVerdict(
+            tier=tier,
+            relevant=False,
+            reason=f"discovery agent error: {type(exc).__name__}: {exc}",
+            findings=(),
+        )
+    return parse_tier_verdict(tier, text)
+
+
+async def run_discovery(
+    *,
+    repo_root: Path,
+    invoker: AutopilotInvoker | None = None,
+    model: str | None = None,
+) -> list[TierVerdict]:
+    """Fan out one relevance agent per tier and return all 11 verdicts.
+
+    Returns exactly one verdict per tier (1-11) in tier order. ``invoker``
+    defaults to the production SDK-backed seam rooted at ``repo_root``; tests
+    pass a scripted coroutine. The fan-out is concurrent and best-effort: a
+    tier whose agent raises still yields a (not-relevant, error-reason)
+    verdict, so the run always returns 11 verdicts.
+    """
+    seam = invoker if invoker is not None else build_repo_invoker(
+        repo_root, model=model
+    )
+    verdicts = await asyncio.gather(
+        *(discover_tier(tier, repo_root=repo_root, invoker=seam) for tier in Tier)
+    )
+    return list(verdicts)
+
+
 __all__ = [
+    "DEFAULT_DISCOVERY_MAX_TURNS",
     "DEFAULT_WEIGHTS",
     "INTERRUPT_BASE",
     "PREEMPTIVE_MAX_TIER",
+    "TIER_DESCRIPTIONS",
     "TIER_WEIGHTS",
     "W_EFFORT",
     "W_IMPORTANCE",
     "W_TIER",
     "W_UNBLOCK",
     "W_URGENCY",
+    "AutopilotInvoker",
     "Finding",
     "ScoreBreakdown",
     "ScoreWeights",
     "ScoredFinding",
     "Tier",
     "TierVerdict",
+    "build_repo_invoker",
+    "discover_tier",
+    "parse_tier_verdict",
     "recompute_final",
+    "run_discovery",
     "score_finding",
     "select_findings",
     "sequence_findings",
+    "tier_prompt",
 ]

@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import os
+import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
-
-from collections.abc import Callable
 
 from flywheel_orchestrator._autopilot import (
     DEFAULT_WEIGHTS,
@@ -128,11 +130,90 @@ def run_single_pass(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run ``flywheel autopilot`` -- a single pass under ``--once``.
+# --- The neverending daemon loop (autopilot-daemon) -------------------------
 
-    The neverending daemon form (bare ``flywheel autopilot``) is added by
-    autopilot-daemon; this task wires the single pass and the verb.
+
+def run_daemon_loop(
+    *,
+    run_cycle: Callable[[], AutopilotPassResult],
+    interval_seconds: float,
+    should_stop: Callable[[], bool],
+    sleep: Callable[[float, Callable[[], bool]], None],
+    on_cycle: Callable[[AutopilotPassResult], None] | None = None,
+    before_cycle: Callable[[], None] | None = None,
+    max_cycles: int | None = None,
+) -> int:
+    """Run refill passes on an interval until an explicit stop signal.
+
+    The testable core of ``flywheel autopilot`` (no ``--once``): each cycle
+    runs one ``run_cycle`` pass, then waits ``interval_seconds`` before the
+    next. It MUST NOT terminate on an idle (nothing-actionable) cycle -- an
+    empty pass writes nothing and the loop continues (D-5). The loop exits only
+    when ``should_stop()`` is true (an injected stop event in tests; a
+    SIGTERM/SIGINT flag in production), and at no other time.
+
+    Every collaborator is injected so the loop runs with no real wall-clock
+    waits and no live model: ``run_cycle`` is the (scripted) pass, ``sleep``
+    the interruptible wait, ``should_stop`` the stop signal. ``before_cycle``
+    re-arms signal handlers each iteration (``asyncio.run`` inside a real pass
+    reclaims them). ``max_cycles`` is a test-only safety bound; production
+    leaves it ``None`` (truly neverending).
+
+    Returns the number of cycles run.
+    """
+    cycles = 0
+    while not should_stop():
+        if before_cycle is not None:
+            before_cycle()
+        result = run_cycle()
+        cycles += 1
+        if on_cycle is not None:
+            on_cycle(result)
+        if max_cycles is not None and cycles >= max_cycles:
+            break
+        if should_stop():
+            break
+        sleep(interval_seconds, should_stop)
+    return cycles
+
+
+def _arm_signals(handler: Callable[[int, object], None]) -> None:
+    """Install the shutdown-flag handler for SIGTERM/SIGINT.
+
+    Re-armed each cycle because ``asyncio.run`` (inside a pass) takes these
+    signals over for the run and restores their default disposition afterward
+    -- mirroring the worker daemon.
+    """
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(ValueError):
+            signal.signal(sig, handler)
+
+
+def _interruptible_sleep(seconds: float, should_stop: Callable[[], bool]) -> None:
+    """Sleep up to ``seconds``, waking immediately when ``should_stop`` flips."""
+    whole = int(max(seconds, 0))
+    for _ in range(whole):
+        if should_stop():
+            return
+        time.sleep(1)
+
+
+def _log_result(log: Callable[[str], None], result: AutopilotPassResult) -> None:
+    log(result.reason)
+    for path in result.emitted_paths:
+        log(f"emitted {path}")
+    for drop in result.dropped:
+        log(f"dropped {drop.finding.id}: {drop.reason}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run ``flywheel autopilot``: a neverending daemon, or one pass.
+
+    Bare ``flywheel autopilot`` runs the neverending refill loop on the
+    configured interval (idling, not exiting, on an empty cycle, D-5),
+    stopping only on SIGTERM/SIGINT. ``--once`` runs exactly one refill pass
+    and exits 0 (the testable unit and a manual escape hatch). Mirrors
+    ``flywheel worker`` (daemon by default, ``--once`` for a single drain).
     """
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
@@ -147,23 +228,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     tasks_dir, target_depth, landing, weights = _resolve_runtime(args, policy)
     model = args.model or (policy.model if policy is not None else None)
 
+    def run_cycle() -> AutopilotPassResult:
+        return run_single_pass(
+            repo_root=repo_root,
+            tasks_dir=tasks_dir,
+            target_depth=target_depth,
+            landing=landing,
+            weights=weights,
+            model=model,
+        )
+
+    if args.once:
+        log(
+            f"single pass repo={repo_root} tasks={tasks_dir} "
+            f"target_depth={target_depth} landing={landing}"
+        )
+        _log_result(log, run_cycle())
+        return 0
+
+    interval = (
+        args.interval
+        if args.interval is not None
+        else (
+            policy.autopilot_interval_seconds
+            if policy is not None
+            else 300.0
+        )
+    )
     log(
-        f"started repo={repo_root} tasks={tasks_dir} target_depth={target_depth} "
-        f"landing={landing}"
+        f"daemon started repo={repo_root} tasks={tasks_dir} "
+        f"target_depth={target_depth} landing={landing} interval={interval}s "
+        f"pid={os.getpid()}"
     )
-    result = run_single_pass(
-        repo_root=repo_root,
-        tasks_dir=tasks_dir,
-        target_depth=target_depth,
-        landing=landing,
-        weights=weights,
-        model=model,
+
+    shutdown = {"requested": False}
+
+    def _flag(signum: int, _frame: object) -> None:
+        shutdown["requested"] = True
+        log(f"stop signal {signum}; exiting after the current cycle")
+
+    def should_stop() -> bool:
+        return shutdown["requested"]
+
+    def before_cycle() -> None:
+        _arm_signals(_flag)
+
+    def on_cycle(result: AutopilotPassResult) -> None:
+        _log_result(log, result)
+        before_cycle()
+
+    cycles = run_daemon_loop(
+        run_cycle=run_cycle,
+        interval_seconds=interval,
+        should_stop=should_stop,
+        sleep=_interruptible_sleep,
+        on_cycle=on_cycle,
+        before_cycle=before_cycle,
     )
-    log(result.reason)
-    for path in result.emitted_paths:
-        log(f"emitted {path}")
-    for drop in result.dropped:
-        log(f"dropped {drop.finding.id}: {drop.reason}")
+    log(f"daemon stopped after {cycles} cycle(s)")
     return 0
 
 

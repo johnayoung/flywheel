@@ -51,3 +51,14 @@ def test_autopilot_verb_routes_to_the_orchestrator_entry(
 
     assert main(["autopilot", "--once"]) == 0
     assert captured["argv"] == ["--once"]
+
+
+def test_autopilot_help_advertises_the_daemon_interval(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The daemon exposes an --interval knob (the between-cycle wait)."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(["autopilot", "--help"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "--interval" in out

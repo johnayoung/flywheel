@@ -12,6 +12,22 @@ shell (``flywheel``), and module-level plumbing remains runnable as
 
 from typing import TYPE_CHECKING
 
+from flywheel_orchestrator._autopilot import (
+    DEFAULT_WEIGHTS,
+    INTERRUPT_BASE,
+    PREEMPTIVE_MAX_TIER,
+    TIER_WEIGHTS,
+    Finding,
+    ScoreBreakdown,
+    ScoredFinding,
+    ScoreWeights,
+    Tier,
+    TierVerdict,
+    recompute_final,
+    score_finding,
+    select_findings,
+    sequence_findings,
+)
 from flywheel_orchestrator._claims import (
     EVENT_ACQUIRED,
     EVENT_EXPIRED,
@@ -153,6 +169,20 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "DEFAULT_WEIGHTS",
+    "INTERRUPT_BASE",
+    "PREEMPTIVE_MAX_TIER",
+    "TIER_WEIGHTS",
+    "Finding",
+    "ScoreBreakdown",
+    "ScoredFinding",
+    "ScoreWeights",
+    "Tier",
+    "TierVerdict",
+    "recompute_final",
+    "score_finding",
+    "select_findings",
+    "sequence_findings",
     "AttemptSummary",
     "EVENT_ACQUIRED",
     "EVENT_EXPIRED",

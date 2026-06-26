@@ -115,6 +115,11 @@ from pathlib import Path
 from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.task import Grader
 
+from flywheel_orchestrator._autopilot import (
+    DEFAULT_LANDING,
+    DEFAULT_TARGET_DEPTH,
+    ScoreWeights,
+)
 from flywheel_orchestrator._github import GithubWorkSource
 from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._github_review import GithubReviewWorkSource
@@ -134,6 +139,12 @@ _SOURCE_KINDS: tuple[str, ...] = (
 )
 
 _DONE_ACTIONS: tuple[str, ...] = ("comment", "close")
+
+#: Default autopilot cycle interval (seconds) when [autopilot] omits one.
+DEFAULT_AUTOPILOT_INTERVAL_SECONDS: float = 300.0
+
+#: Landing postures autopilot work can take; FF-merge is the shipped default.
+_AUTOPILOT_LANDINGS: tuple[str, ...] = ("merge", "pr")
 
 _STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
@@ -385,6 +396,10 @@ class WorkPolicy:
     phase_verify: str | None = None
     held_out_root: Path | None = None
     sandbox: SandboxPolicy = field(default_factory=SandboxPolicy)
+    autopilot_target_depth: int = DEFAULT_TARGET_DEPTH
+    autopilot_landing: str = DEFAULT_LANDING
+    autopilot_interval_seconds: float = DEFAULT_AUTOPILOT_INTERVAL_SECONDS
+    autopilot_weights: ScoreWeights | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -476,6 +491,16 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [held_out] must be a table")
     held_out_root = _optional_held_out_root(held_out, policy_file=path)
 
+    autopilot = data.get("autopilot") or {}
+    if not isinstance(autopilot, dict):
+        raise PolicyError(f"{path}: [autopilot] must be a table")
+    (
+        autopilot_target_depth,
+        autopilot_landing,
+        autopilot_interval_seconds,
+        autopilot_weights,
+    ) = _optional_autopilot(autopilot, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -504,6 +529,10 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            autopilot_target_depth=autopilot_target_depth,
+            autopilot_landing=autopilot_landing,
+            autopilot_interval_seconds=autopilot_interval_seconds,
+            autopilot_weights=autopilot_weights,
         )
 
     if kind == "github_ci":
@@ -538,6 +567,10 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            autopilot_target_depth=autopilot_target_depth,
+            autopilot_landing=autopilot_landing,
+            autopilot_interval_seconds=autopilot_interval_seconds,
+            autopilot_weights=autopilot_weights,
         )
 
     if kind == "github_review":
@@ -566,6 +599,10 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            autopilot_target_depth=autopilot_target_depth,
+            autopilot_landing=autopilot_landing,
+            autopilot_interval_seconds=autopilot_interval_seconds,
+            autopilot_weights=autopilot_weights,
         )
 
     repo = source.get("repo")
@@ -606,6 +643,10 @@ def load_policy(path: Path) -> WorkPolicy:
         phase_verify=phase_verify,
         held_out_root=held_out_root,
         sandbox=sandbox_policy,
+        autopilot_target_depth=autopilot_target_depth,
+        autopilot_landing=autopilot_landing,
+        autopilot_interval_seconds=autopilot_interval_seconds,
+        autopilot_weights=autopilot_weights,
     )
 
 
@@ -849,6 +890,75 @@ def _optional_held_out_root(
             f"{policy_file}: held_out.root must be a non-empty string"
         )
     return Path(value)
+
+
+def _optional_autopilot(
+    table: dict, *, policy_file: Path
+) -> tuple[int, str, float, ScoreWeights | None]:
+    """Validate the optional ``[autopilot]`` table.
+
+    Returns ``(target_depth, landing, interval_seconds, weights)``. Absent keys
+    take code defaults (a sane target depth, FF-merge landing, the default
+    interval, and ``None`` weights -- the scoring engine's constant defaults).
+    The optional ``[autopilot.weights]`` sub-table overrides individual score
+    weights; an unset weight keeps the engine default. A malformed value raises
+    :class:`PolicyError` so a typo never silently degrades autopilot's behavior.
+    """
+    target_depth = _override_int(
+        table, "target_depth", DEFAULT_TARGET_DEPTH,
+        path="autopilot.target_depth", policy_file=policy_file,
+    )
+    if target_depth <= 0:
+        raise PolicyError(
+            f"{policy_file}: autopilot.target_depth must be a positive integer"
+        )
+    landing = _override_str(
+        table, "landing", DEFAULT_LANDING,
+        path="autopilot.landing", policy_file=policy_file,
+        choices=_AUTOPILOT_LANDINGS,
+    )
+    interval = _override_float(
+        table, "interval_seconds", DEFAULT_AUTOPILOT_INTERVAL_SECONDS,
+        path="autopilot.interval_seconds", policy_file=policy_file,
+    )
+    if interval <= 0:
+        raise PolicyError(
+            f"{policy_file}: autopilot.interval_seconds must be positive"
+        )
+
+    weights_tbl = table.get("weights")
+    if weights_tbl is None:
+        return target_depth, landing, interval, None
+    if not isinstance(weights_tbl, dict):
+        raise PolicyError(f"{policy_file}: [autopilot.weights] must be a table")
+    base = ScoreWeights()
+    weights = ScoreWeights(
+        tier=_override_float(
+            weights_tbl, "tier", base.tier,
+            path="autopilot.weights.tier", policy_file=policy_file,
+        ),
+        urgency=_override_float(
+            weights_tbl, "urgency", base.urgency,
+            path="autopilot.weights.urgency", policy_file=policy_file,
+        ),
+        importance=_override_float(
+            weights_tbl, "importance", base.importance,
+            path="autopilot.weights.importance", policy_file=policy_file,
+        ),
+        unblock=_override_float(
+            weights_tbl, "unblock", base.unblock,
+            path="autopilot.weights.unblock", policy_file=policy_file,
+        ),
+        effort=_override_float(
+            weights_tbl, "effort", base.effort,
+            path="autopilot.weights.effort", policy_file=policy_file,
+        ),
+        interrupt_base=_override_float(
+            weights_tbl, "interrupt_base", base.interrupt_base,
+            path="autopilot.weights.interrupt_base", policy_file=policy_file,
+        ),
+    )
+    return target_depth, landing, interval, weights
 
 
 def _sandbox_subtable(

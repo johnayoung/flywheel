@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from flywheel_core.invoker import invoke_iteration
-from flywheel_core.loaders import TaskLoadError, load_task_data
+from flywheel_core.loaders import TaskLoadError, load_task_data, serialize_task
 from flywheel_core.task import CommandGrader, Task
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
@@ -684,6 +684,7 @@ class EmittedTask:
     creates_files: tuple[str, ...] = ()
     assumptions: tuple[str, ...] = ()
     held_out_oracle_path: str | None = None
+    prerequisites: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -850,6 +851,16 @@ def _validate_task_entry(
         else ()
     )
 
+    # ``prerequisites`` is an orchestration-layer edge core drops on load, so
+    # read it straight from the authored task source (mirroring the directory
+    # work source) and carry it on the emitted task for emission to preserve.
+    raw_prereqs = task_data.get("prerequisites")
+    prerequisites = (
+        tuple(str(p) for p in raw_prereqs if isinstance(p, str))
+        if isinstance(raw_prereqs, list)
+        else ()
+    )
+
     return (
         EmittedTask(
             finding=finding,
@@ -860,6 +871,7 @@ def _validate_task_entry(
             creates_files=creates,
             assumptions=assumptions,
             held_out_oracle_path=held_out_oracle_path,
+            prerequisites=prerequisites,
         ),
         None,
     )
@@ -941,9 +953,230 @@ async def author_findings(
     return AuthoringResult(emitted=tuple(emitted), dropped=tuple(dropped))
 
 
+# --- The single refill pass: compose discovery -> score -> author -> emit ----
+#
+# autopilot-loop's orchestration: one pass that fills the work source up to the
+# target queue depth from actionable findings. Structured as a callable the
+# daemon (autopilot-daemon) invokes in a loop -- no infinite loop here. On a
+# clean repo (no actionable finding) it writes zero tasks and returns cleanly
+# (D-5): the single pass under `--once` exits 0.
+
+#: Default target queue depth when the [autopilot] table omits one.
+DEFAULT_TARGET_DEPTH: int = 5
+#: Default landing posture (FF-merge autonomy is the shipped default, D-3).
+DEFAULT_LANDING: str = "merge"
+#: The phase directory autopilot emits authored tasks into.
+AUTOPILOT_PHASE: str = "autopilot"
+
+
+@dataclass(frozen=True, kw_only=True)
+class AutopilotPassResult:
+    """The recorded outcome of one refill pass, for logs and the daemon.
+
+    ``emitted_paths`` are the task files written into the work source this pass;
+    ``emitted`` the corresponding authored tasks; ``dropped`` the findings that
+    could not be compiled. ``relevant_tiers`` / ``not_relevant_tiers`` record
+    the per-tier relevance verdicts so a clean repo is auditable. ``reason``
+    summarizes why the pass emitted what it did.
+    """
+
+    emitted_paths: tuple[Path, ...] = ()
+    emitted: tuple[EmittedTask, ...] = ()
+    dropped: tuple[DroppedFinding, ...] = ()
+    queue_depth_before: int = 0
+    target_depth: int = 0
+    relevant_tiers: tuple[Tier, ...] = ()
+    not_relevant_tiers: tuple[Tier, ...] = ()
+    landing: str = DEFAULT_LANDING
+    reason: str = ""
+
+    @property
+    def emitted_count(self) -> int:
+        return len(self.emitted_paths)
+
+
+def _emitted_task_file(
+    emitted: EmittedTask, breakdown: ScoreBreakdown
+) -> dict[str, Any]:
+    """Serialize an emitted task to the directory work source's file shape.
+
+    The body is the core task (``serialize_task``) plus the orchestration-layer
+    keys the directory source reads from top-level JSON: ``priority`` (derived
+    from the recorded final score so the scheduler orders autopilot work) and
+    ``prerequisites``. The full :class:`ScoreBreakdown` is recorded under an
+    ``autopilot`` key (ignored by the core loader) so the recommendation stays
+    inspectable after the run -- the legible-score requirement (#3) persisted.
+    """
+    body = serialize_task(emitted.task)
+    body["priority"] = int(round(breakdown.final))
+    if emitted.prerequisites:
+        body["prerequisites"] = list(emitted.prerequisites)
+    body["autopilot"] = {
+        "finding_id": emitted.finding.id,
+        "tier": breakdown.tier.value,
+        "tier_weight": breakdown.tier_weight,
+        "urgency": breakdown.urgency,
+        "importance": breakdown.importance,
+        "blocks": breakdown.blocks,
+        "effort": breakdown.effort,
+        "final": breakdown.final,
+        "preemptive": breakdown.preemptive,
+        "authoritative_grader": emitted.authoritative_grader,
+        "grader_source": emitted.grader_source,
+        "grader_target": emitted.grader_target,
+        "assumptions": list(emitted.assumptions),
+    }
+    return body
+
+
+def emit_emitted_task(
+    emitted: EmittedTask,
+    breakdown: ScoreBreakdown,
+    *,
+    tasks_dir: Path,
+    phase: str = AUTOPILOT_PHASE,
+) -> Path | None:
+    """Write one emitted task into the directory work source; return its path.
+
+    Lands the file under ``<tasks_dir>/active/<phase>/<task_id>.json`` so the
+    existing worker drains it (the directory adapter lists it on its next
+    pass). Returns ``None`` without overwriting when a file for that task id
+    already exists, so re-running autopilot does not duplicate or clobber
+    in-flight work.
+    """
+    phase_dir = tasks_dir / "active" / phase
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    target = phase_dir / f"{emitted.task.id}.json"
+    if target.exists():
+        return None
+    target.write_text(
+        json.dumps(_emitted_task_file(emitted, breakdown), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+async def run_refill_pass(
+    *,
+    tasks_dir: Path,
+    repo_root: Path,
+    target_depth: int = DEFAULT_TARGET_DEPTH,
+    discovery_invoker: AutopilotInvoker | None = None,
+    authoring_invoker: AutopilotInvoker | None = None,
+    weights: ScoreWeights = DEFAULT_WEIGHTS,
+    landing: str = DEFAULT_LANDING,
+    model: str | None = None,
+    queue_depth: Callable[[Path], int] | None = None,
+) -> AutopilotPassResult:
+    """Run one refill pass: discovery -> score/select -> author -> emit.
+
+    While the live queue depth is below ``target_depth`` and actionable
+    findings remain, emits authored tasks until the target is met or the
+    actionable findings are exhausted. When discovery yields nothing actionable
+    the pass writes ZERO tasks and returns cleanly -- never raising, never
+    emitting filler (D-5). It does not loop on an interval; the daemon
+    (autopilot-daemon) calls this once per cycle.
+
+    ``queue_depth`` measures the current work-source depth; it defaults to the
+    directory adapter's listing count. The agent seams default to the real
+    SDK-backed invokers rooted at ``repo_root``; tests inject scripted ones.
+    """
+    depth_fn = queue_depth if queue_depth is not None else _directory_queue_depth
+    current = depth_fn(tasks_dir)
+    slots = target_depth - current
+    if slots <= 0:
+        return AutopilotPassResult(
+            queue_depth_before=current,
+            target_depth=target_depth,
+            landing=landing,
+            reason=(
+                f"queue depth {current} already at or above target "
+                f"{target_depth}; nothing emitted"
+            ),
+        )
+
+    discover = (
+        discovery_invoker
+        if discovery_invoker is not None
+        else build_repo_invoker(repo_root, model=model)
+    )
+    author = (
+        authoring_invoker
+        if authoring_invoker is not None
+        else build_repo_invoker(
+            repo_root, model=model, max_turns=DEFAULT_AUTHORING_MAX_TURNS
+        )
+    )
+
+    verdicts = await run_discovery(repo_root=repo_root, invoker=discover)
+    relevant_tiers = tuple(v.tier for v in verdicts if v.relevant)
+    not_relevant_tiers = tuple(v.tier for v in verdicts if not v.relevant)
+    findings = [f for v in verdicts if v.relevant for f in v.findings]
+
+    sequenced = sequence_findings(findings, weights)
+    if not sequenced:
+        return AutopilotPassResult(
+            queue_depth_before=current,
+            target_depth=target_depth,
+            relevant_tiers=relevant_tiers,
+            not_relevant_tiers=not_relevant_tiers,
+            landing=landing,
+            reason="no actionable findings this cycle; idling without emitting",
+        )
+
+    emitted: list[EmittedTask] = []
+    emitted_paths: list[Path] = []
+    dropped: list[DroppedFinding] = []
+    breakdown_by_finding = {s.finding.id: s.breakdown for s in sequenced}
+
+    # Author the top-sequenced findings until the queue reaches the target or
+    # the actionable findings run out; only enough to fill the depth-to-target.
+    for scored in sequenced:
+        if len(emitted_paths) >= slots:
+            break
+        result = await author_finding(
+            scored.finding, repo_root=repo_root, invoker=author
+        )
+        dropped.extend(result.dropped)
+        for et in result.emitted:
+            breakdown = breakdown_by_finding[et.finding.id]
+            path = emit_emitted_task(et, breakdown, tasks_dir=tasks_dir)
+            if path is not None:
+                emitted.append(et)
+                emitted_paths.append(path)
+
+    reason = (
+        f"emitted {len(emitted_paths)} task(s) to fill queue from {current} "
+        f"toward target {target_depth}"
+        if emitted_paths
+        else "no grader-bearing task could be authored this cycle"
+    )
+    return AutopilotPassResult(
+        emitted_paths=tuple(emitted_paths),
+        emitted=tuple(emitted),
+        dropped=tuple(dropped),
+        queue_depth_before=current,
+        target_depth=target_depth,
+        relevant_tiers=relevant_tiers,
+        not_relevant_tiers=not_relevant_tiers,
+        landing=landing,
+        reason=reason,
+    )
+
+
+def _directory_queue_depth(tasks_dir: Path) -> int:
+    """Current work-source depth: the directory adapter's active-item count."""
+    from flywheel_orchestrator._sources import DirectoryWorkSource
+
+    return len(DirectoryWorkSource(tasks_dir).list_work())
+
+
 __all__ = [
+    "AUTOPILOT_PHASE",
     "DEFAULT_AUTHORING_MAX_TURNS",
     "DEFAULT_DISCOVERY_MAX_TURNS",
+    "DEFAULT_LANDING",
+    "DEFAULT_TARGET_DEPTH",
     "DEFAULT_WEIGHTS",
     "INTERRUPT_BASE",
     "PREEMPTIVE_MAX_TIER",
@@ -958,6 +1191,7 @@ __all__ = [
     "W_URGENCY",
     "AuthoringResult",
     "AutopilotInvoker",
+    "AutopilotPassResult",
     "DroppedFinding",
     "EmittedTask",
     "Finding",
@@ -971,9 +1205,11 @@ __all__ = [
     "authoring_prompt",
     "build_repo_invoker",
     "discover_tier",
+    "emit_emitted_task",
     "parse_tier_verdict",
     "recompute_final",
     "run_discovery",
+    "run_refill_pass",
     "score_finding",
     "select_findings",
     "sequence_findings",

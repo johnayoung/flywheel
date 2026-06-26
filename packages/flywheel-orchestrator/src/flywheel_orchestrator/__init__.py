@@ -13,8 +13,11 @@ shell (``flywheel``), and module-level plumbing remains runnable as
 from typing import TYPE_CHECKING
 
 from flywheel_orchestrator._autopilot import (
+    AUTOPILOT_PHASE,
     DEFAULT_AUTHORING_MAX_TURNS,
     DEFAULT_DISCOVERY_MAX_TURNS,
+    DEFAULT_LANDING,
+    DEFAULT_TARGET_DEPTH,
     DEFAULT_WEIGHTS,
     GRADER_SOURCE_HELD_OUT,
     GRADER_SOURCE_REPO_COMMAND,
@@ -24,6 +27,7 @@ from flywheel_orchestrator._autopilot import (
     TIER_WEIGHTS,
     AuthoringResult,
     AutopilotInvoker,
+    AutopilotPassResult,
     DroppedFinding,
     EmittedTask,
     Finding,
@@ -37,9 +41,11 @@ from flywheel_orchestrator._autopilot import (
     authoring_prompt,
     build_repo_invoker,
     discover_tier,
+    emit_emitted_task,
     parse_tier_verdict,
     recompute_final,
     run_discovery,
+    run_refill_pass,
     score_finding,
     select_findings,
     sequence_findings,
@@ -186,8 +192,11 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "AUTOPILOT_PHASE",
     "DEFAULT_AUTHORING_MAX_TURNS",
     "DEFAULT_DISCOVERY_MAX_TURNS",
+    "DEFAULT_LANDING",
+    "DEFAULT_TARGET_DEPTH",
     "DEFAULT_WEIGHTS",
     "GRADER_SOURCE_HELD_OUT",
     "GRADER_SOURCE_REPO_COMMAND",
@@ -197,6 +206,7 @@ __all__ = [
     "TIER_WEIGHTS",
     "AuthoringResult",
     "AutopilotInvoker",
+    "AutopilotPassResult",
     "DroppedFinding",
     "EmittedTask",
     "Finding",
@@ -210,9 +220,11 @@ __all__ = [
     "authoring_prompt",
     "build_repo_invoker",
     "discover_tier",
+    "emit_emitted_task",
     "parse_tier_verdict",
     "recompute_final",
     "run_discovery",
+    "run_refill_pass",
     "score_finding",
     "select_findings",
     "sequence_findings",

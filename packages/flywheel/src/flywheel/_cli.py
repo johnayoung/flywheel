@@ -30,6 +30,7 @@ from collections.abc import Sequence
 
 from flywheel_core.audit._cli import main as _audit_main
 from flywheel_core.workflow import main as _core_main
+from flywheel_orchestrator._autopilot_run import main as _autopilot_main
 from flywheel_orchestrator._workflow import main as _orchestrator_main
 from flywheel_worktree.worker import main as _worker_main
 
@@ -65,6 +66,7 @@ _SAY_VERB = "say"
 _CORE_STEER_VERB = "steer"
 
 _WORKER_VERB = "worker"
+_AUTOPILOT_VERB = "autopilot"
 _AUDIT_VERB = "audit"
 
 _USAGE = """\
@@ -79,6 +81,7 @@ exits 0.
 Verbs:
   init             scaffold .flywheel/ and a flywheel.toml work policy
   worker [--once]  run the git-worktree daemon loop (or a single drain)
+  autopilot        keep the queue full (neverending; --once for one pass)
   status [--json]  print every active task's state
   live [--watch N] print one line per in-flight run (optionally tailing)
   history [--json] list finished runs, one line per task, newest first
@@ -139,6 +142,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # In-process delegation to the git-worktree daemon loop in
         # :mod:`flywheel_worktree.worker` (spec constraint: no shell-out).
         return _worker_main(rest)
+    if verb == _AUTOPILOT_VERB:
+        # The autopilot intake daemon: keeps the work queue full with
+        # verifiable, tier-prioritized tasks. Neverending by default;
+        # --once runs a single refill pass.
+        return _autopilot_main(rest)
     if verb == _AUDIT_VERB:
         return _audit_main(rest)
 

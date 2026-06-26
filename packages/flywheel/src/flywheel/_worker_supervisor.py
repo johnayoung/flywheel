@@ -188,6 +188,49 @@ def build_default_spawn_argv(
     return argv
 
 
+_DEATH_REASON_MAX_LEN = 240
+
+
+def read_supervised_death_reason(log_path: Path | None) -> str | None:
+    """Extract a human-readable death reason from a dead child's log file.
+
+    A supervised child's stdout+stderr are redirected to ``log_path``; on an
+    unexpected exit the most informative line is typically the last non-blank
+    line — e.g. ``flywheel worker: policy error: ...`` (a config problem the
+    operator can fix) or the final ``SomeError: ...`` of a traceback. Returns
+    that line (capped), skipping the ``RuntimeWarning`` the ``python -m``
+    launcher emits, or ``None`` when the log is empty/unreadable. Best-effort:
+    never raises — a missing reason simply degrades to the bare exit code.
+    """
+    if log_path is None:
+        return None
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    meaningful = [
+        ln
+        for ln in lines
+        if "RuntimeWarning" not in ln and "found in sys.modules" not in ln
+    ]
+    candidates = meaningful or lines
+    if not candidates:
+        return None
+    reason = candidates[-1]
+    if len(reason) > _DEATH_REASON_MAX_LEN:
+        reason = reason[: _DEATH_REASON_MAX_LEN - 1] + "…"
+    return reason
+
+
+def format_dead_message(exit_code: int | None, reason: str | None) -> str:
+    """Compose the ``DEAD`` status message: the exit code plus, when known,
+    the captured failure reason so the console explains *why* the child died
+    instead of only that it did."""
+    base = f"exit={exit_code}"
+    return f"{base}: {reason}" if reason else base
+
+
 class WorkerSupervisor:
     """Spawn, detach from, and stop one git-worktree worker child.
 
@@ -242,15 +285,20 @@ class WorkerSupervisor:
             )
         self._child: subprocess.Popen[bytes] | None = None
         self._log_handle: IO[bytes] | None = None
+        # Path of the current child's redirected log; kept after the handle is
+        # closed so a death can be explained by reading the log's tail.
+        self._log_path: Path | None = None
         self._last_error: str | None = None
         # Marks whether the most recent supervised child exited
         # unexpectedly mid-session. Cleared on the next successful
         # ``start()``; flips on when ``status()`` first observes a
         # non-running child it owned. The dashboard reads this through
         # ``status().state == DEAD`` so the death is visible until the
-        # operator respawns.
+        # operator respawns. ``_dead_reason`` is the captured "why" (the log's
+        # last meaningful line) surfaced alongside the exit code.
         self._dead_pid: int | None = None
         self._dead_exit: int | None = None
+        self._dead_reason: str | None = None
 
     # ----- Public seams -----------------------------------------------------
 
@@ -269,18 +317,19 @@ class WorkerSupervisor:
                 return WorkerStatus(
                     state=WorkerState.SUPERVISED, pid=self._child.pid
                 )
-            # Child died on its own; reap the resource handles and
-            # remember the death so subsequent ticks keep reporting
-            # DEAD until the operator respawns.
+            # Child died on its own; capture *why* (the log tail) before
+            # reaping, then remember the death so subsequent ticks keep
+            # reporting DEAD until the operator respawns.
             self._dead_pid = self._child.pid
             self._dead_exit = rc
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
 
         if self._dead_pid is not None:
             return WorkerStatus(
                 state=WorkerState.DEAD,
                 pid=self._dead_pid,
-                message=f"exit={self._dead_exit}",
+                message=format_dead_message(self._dead_exit, self._dead_reason),
             )
         if self._last_error is not None:
             return WorkerStatus(
@@ -335,6 +384,7 @@ class WorkerSupervisor:
         # the supervisor's snapshot matches reality post-spawn.
         self._dead_pid = None
         self._dead_exit = None
+        self._dead_reason = None
         self._last_error = None
 
         # A DEAD / ERROR status short-circuits status() *before* its
@@ -397,8 +447,11 @@ class WorkerSupervisor:
             return False
         rc = self._child.poll()
         if rc is not None:
+            # Already exited before we signaled it (an unexpected death):
+            # capture why so the DEAD status can explain it.
             self._dead_pid = self._child.pid
             self._dead_exit = rc
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
         try:
@@ -408,6 +461,7 @@ class WorkerSupervisor:
             # report not-stopped-by-us so the caller can decide.
             self._dead_pid = self._child.pid
             self._dead_exit = self._child.poll() or 0
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
         try:
@@ -433,6 +487,7 @@ class WorkerSupervisor:
         self._child = None
         self._dead_pid = None
         self._dead_exit = None
+        self._dead_reason = None
         self._close_log()
 
     def close(self) -> None:
@@ -464,6 +519,7 @@ class WorkerSupervisor:
         path = self._log_dir / f"supervisor-{ts}.log"
         handle = open(path, "ab", buffering=0)
         self._log_handle = handle
+        self._log_path = path
         return handle
 
     def _close_log(self) -> None:
@@ -493,5 +549,7 @@ __all__ = [
     "WorkerStatus",
     "WorkerSupervisor",
     "build_default_spawn_argv",
+    "format_dead_message",
     "has_live_lease",
+    "read_supervised_death_reason",
 ]

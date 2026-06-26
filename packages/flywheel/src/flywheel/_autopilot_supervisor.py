@@ -28,6 +28,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Sequence
 
+from flywheel._worker_supervisor import (
+    format_dead_message,
+    read_supervised_death_reason,
+)
+
 # Same SIGTERM wait window as the worker supervisor: the autopilot daemon's
 # graceful-shutdown path exits promptly on signal (it idles between cycles), so
 # a few seconds of headroom is ample. Tests override to stay snappy.
@@ -114,9 +119,11 @@ class AutopilotSupervisor:
             )
         self._child: subprocess.Popen[bytes] | None = None
         self._log_handle: IO[bytes] | None = None
+        self._log_path: Path | None = None
         self._last_error: str | None = None
         self._dead_pid: int | None = None
         self._dead_exit: int | None = None
+        self._dead_reason: str | None = None
 
     # ----- Public seams -----------------------------------------------------
 
@@ -135,13 +142,14 @@ class AutopilotSupervisor:
                 )
             self._dead_pid = self._child.pid
             self._dead_exit = rc
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
 
         if self._dead_pid is not None:
             return AutopilotStatus(
                 state=AutopilotState.DEAD,
                 pid=self._dead_pid,
-                message=f"exit={self._dead_exit}",
+                message=format_dead_message(self._dead_exit, self._dead_reason),
             )
         if self._last_error is not None:
             return AutopilotStatus(
@@ -168,6 +176,7 @@ class AutopilotSupervisor:
 
         self._dead_pid = None
         self._dead_exit = None
+        self._dead_reason = None
         self._last_error = None
 
         try:
@@ -210,6 +219,7 @@ class AutopilotSupervisor:
         if rc is not None:
             self._dead_pid = self._child.pid
             self._dead_exit = rc
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
         try:
@@ -217,6 +227,7 @@ class AutopilotSupervisor:
         except ProcessLookupError:
             self._dead_pid = self._child.pid
             self._dead_exit = self._child.poll() or 0
+            self._dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
             return False
         try:
@@ -238,6 +249,7 @@ class AutopilotSupervisor:
         self._child = None
         self._dead_pid = None
         self._dead_exit = None
+        self._dead_reason = None
         self._close_log()
 
     def close(self) -> None:
@@ -252,6 +264,7 @@ class AutopilotSupervisor:
         path = self._log_dir / f"autopilot-supervisor-{ts}.log"
         handle = open(path, "ab", buffering=0)
         self._log_handle = handle
+        self._log_path = path
         return handle
 
     def _close_log(self) -> None:

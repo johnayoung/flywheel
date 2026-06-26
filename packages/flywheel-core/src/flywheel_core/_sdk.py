@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     # flywheel_core._sdk import X`` guarded by the importer's own
     # TYPE_CHECKING block. Never executed at runtime.
     from claude_agent_sdk import (
+        AgentDefinition as AgentDefinition,
+    )
+    from claude_agent_sdk import (
         AssistantMessage as AssistantMessage,
     )
     from claude_agent_sdk import (
@@ -105,6 +108,7 @@ class MissingAgentSDKError(MissingExtraError):
 # never masks a real "no such attribute" as a missing-SDK error.
 _SDK_EXPORTS: frozenset[str] = frozenset(
     {
+        "AgentDefinition",
         "AssistantMessage",
         "ClaudeAgentOptions",
         "ClaudeSDKClient",

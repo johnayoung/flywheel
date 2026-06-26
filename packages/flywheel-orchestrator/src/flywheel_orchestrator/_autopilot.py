@@ -33,11 +33,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
-from flywheel_core.invoker import invoke_iteration
+from flywheel_core.invoker import (
+    IterationResult,
+    ToolResultObservation,
+    invoke_iteration,
+)
 from flywheel_core.loaders import TaskLoadError, load_task_data, serialize_task
 from flywheel_core.task import CommandGrader, Task
+
+if TYPE_CHECKING:
+    from flywheel_core._sdk import AgentDefinition, ClaudeAgentOptions
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
 
@@ -574,6 +581,17 @@ def parse_tier_verdict(tier: Tier, text: str) -> TierVerdict:
             reason=f"unparseable discovery response: {exc}",
             findings=(),
         )
+    return _verdict_from_data(tier, data)
+
+
+def _verdict_from_data(tier: Tier, data: dict[str, Any]) -> TierVerdict:
+    """Build a :class:`TierVerdict` from an already-parsed verdict object.
+
+    Shared by :func:`parse_tier_verdict` (one tier's own JSON) and the
+    aggregated-final-message fallback (:func:`_parse_aggregated_verdicts`), so
+    the relevance/reason/findings rules -- a not-relevant verdict always drops
+    any findings the agent listed -- live in exactly one place.
+    """
     relevant = bool(data.get("relevant"))
     reason_raw = data.get("reason")
     reason = reason_raw.strip() if isinstance(reason_raw, str) else ""
@@ -634,6 +652,372 @@ async def run_discovery(
         *(discover_tier(tier, repo_root=repo_root, invoker=seam) for tier in Tier)
     )
     return list(verdicts)
+
+
+# --- Single-session discovery: tier subagents in one session (spec 00059) -----
+#
+# The per-tier session fan-out above opens one ``claude`` process (and one MCP
+# boot) per tier. Single-session discovery collapses that to ONE session whose
+# ``ClaudeAgentOptions.agents`` registers all 11 tiers as subagents; the parent
+# dispatches each via the built-in ``Agent`` (a.k.a. ``Task``) tool, and every
+# verdict is read back from the subagent's tool-RESULT block in the streamed
+# messages -- never from the parent's prose, which the SDK lets it re-summarize
+# (D-2). A tier whose result is missing, errors, or fails to parse still yields
+# a (not relevant, error-reason) verdict, so the run always returns 11.
+
+#: The built-in subagent-dispatch tool. ``Task`` was renamed ``Agent`` in
+#: Claude Code v2.1.63; both names appear in the stream, so both are accepted on
+#: read and both are carried in ``allowed_tools`` on dispatch.
+SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({"Agent", "Task"})
+
+#: Read-only repo tools handed to each tier subagent: enough to judge relevance
+#: by reading the repo, nothing that can mutate it or drive a browser.
+SUBAGENT_READONLY_TOOLS: tuple[str, ...] = ("Read", "Grep", "Glob")
+
+#: The ``AgentDefinition.effort`` levels the SDK accepts (camelCase enum).
+DiscoveryEffort = Literal["low", "medium", "high", "xhigh", "max"]
+
+#: A tier subagent is a relevance triage, not a deep task: a low effort and a
+#: tight turn budget cap its per-tier cost (D-3).
+DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS: int = 8
+DEFAULT_DISCOVERY_SUBAGENT_EFFORT: DiscoveryEffort = "low"
+
+
+#: The single-session seam: drive one discovery session for ``prompt`` and
+#: return its drained :class:`IterationResult`. The default builds one
+#: ``ClaudeSDKClient``-backed session (SDK behind ``flywheel_core._sdk``); tests
+#: inject a coroutine returning a canned result with per-subagent tool-result
+#: blocks, so the collector is exercised with no SDK and no live model.
+DiscoverySessionRunner = Callable[[str], Awaitable[IterationResult]]
+
+
+def tier_agent_key(tier: Tier) -> str:
+    """The ``options.agents`` key (and ``subagent_type``) for one tier."""
+    return f"tier-{tier.value}"
+
+
+def _tier_from_agent_key(key: Any) -> Tier | None:
+    """Map a dispatched ``subagent_type`` back to its :class:`Tier`.
+
+    Returns ``None`` for any value that is not one of the 11 ``tier-N`` keys, so
+    a stray tool call the parent makes (or a malformed dispatch) is ignored
+    rather than mis-attributed to a tier.
+    """
+    if not isinstance(key, str) or not key.startswith("tier-"):
+        return None
+    try:
+        value = int(key[len("tier-") :])
+    except ValueError:
+        return None
+    try:
+        return Tier(value)
+    except ValueError:
+        return None
+
+
+def build_tier_agents(
+    repo_root: Path,
+    *,
+    model: str | None = None,
+    max_turns: int = DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
+    effort: DiscoveryEffort = DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
+) -> dict[str, AgentDefinition]:
+    """Build the 11 tier-relevance subagent definitions, keyed by tier.
+
+    Each subagent carries the tier's relevance-and-findings remit as its system
+    prompt, read-only repo tools, ``mcpServers=[]`` (no redundant
+    ``playwright``/``proto`` boots, D-3), and a cheap budget. The SDK is
+    resolved lazily so importing this module never requires the ``claude``
+    extra.
+    """
+    from flywheel_core._sdk import AgentDefinition
+
+    agents: dict[str, AgentDefinition] = {}
+    for tier in Tier:
+        name = TIER_DESCRIPTIONS[tier][0]
+        agents[tier_agent_key(tier)] = AgentDefinition(
+            description=f"Autopilot relevance triage for tier {tier.value} ({name}).",
+            prompt=tier_prompt(tier, repo_root),
+            tools=list(SUBAGENT_READONLY_TOOLS),
+            mcpServers=[],
+            model=model,
+            maxTurns=max_turns,
+            effort=effort,
+            permissionMode="bypassPermissions",
+        )
+    return agents
+
+
+def orchestrator_prompt(repo_root: Path) -> str:
+    """Build the deterministic dispatcher prompt for the parent session.
+
+    The parent is a dispatcher, not a judge: it must fan out every one of the 11
+    tier subagents exactly once via the ``Agent`` tool and must NOT pre-judge,
+    skip, or merge any tier. It also emits an aggregated final JSON purely as the
+    fallback the collector reads only when it cannot key a tool-result to a tier
+    (spec 00059 D-2 supersession); the per-tier tool-results remain the trusted
+    source.
+    """
+    keys = ", ".join(tier_agent_key(tier) for tier in Tier)
+    return (
+        "You are autopilot's discovery dispatcher for the repository at "
+        f"{repo_root}.\n\n"
+        f"Eleven tier-relevance subagents are registered: {keys}.\n\n"
+        "Use the Agent tool (a.k.a. Task) to dispatch EVERY one of these 11 "
+        "subagents exactly once, each with subagent_type set to its key. Tell "
+        "each subagent to read the repository, judge whether its tier is "
+        "relevant to THIS codebase, and return its verdict as the fenced JSON "
+        "block its own instructions define. Dispatch all 11 regardless of your "
+        "own opinion -- do not skip, merge, or pre-judge any tier. The per-tier "
+        "tool-results are read directly, so you need not restate them.\n\n"
+        "After all 11 subagents return, emit exactly one final fenced JSON block "
+        "aggregating every verdict as a safety net:\n"
+        "```json\n"
+        '{"verdicts": [{"tier": 1, "relevant": false, "reason": "...", '
+        '"findings": []}]}\n'
+        "```"
+    )
+
+
+def build_single_session_options(
+    repo_root: Path,
+    *,
+    model: str | None = None,
+    max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
+    subagent_max_turns: int = DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
+    subagent_effort: DiscoveryEffort = DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
+) -> ClaudeAgentOptions:
+    """Build the ONE session's options with all 11 tiers as subagents.
+
+    The parent carries the ``Agent``/``Task`` dispatch tool plus the read-only
+    repo tools in ``allowed_tools``; the 11 tier subagents are registered under
+    ``agents``. The SDK is resolved lazily through ``flywheel_core._sdk``.
+    """
+    from flywheel_core._sdk import ClaudeAgentOptions
+
+    return ClaudeAgentOptions(
+        cwd=str(repo_root),
+        add_dirs=[str(repo_root)],
+        permission_mode="bypassPermissions",
+        max_turns=max_turns,
+        model=model,
+        allowed_tools=[*sorted(SUBAGENT_TOOL_NAMES), *SUBAGENT_READONLY_TOOLS],
+        agents=build_tier_agents(
+            repo_root,
+            model=model,
+            max_turns=subagent_max_turns,
+            effort=subagent_effort,
+        ),
+    )
+
+
+def build_single_session_runner(
+    repo_root: Path,
+    *,
+    model: str | None = None,
+    max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
+    subagent_max_turns: int = DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
+    subagent_effort: DiscoveryEffort = DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
+) -> DiscoverySessionRunner:
+    """Build the production single-session runner rooted at ``repo_root``.
+
+    The returned coroutine drives one agent session (one ``claude`` process,
+    one MCP boot) whose options register the 11 tier subagents, and returns the
+    drained :class:`IterationResult` so the collector can read each verdict from
+    its subagent tool-result block. The SDK is resolved lazily inside the
+    coroutine.
+    """
+
+    async def _run(prompt: str) -> IterationResult:
+        options = build_single_session_options(
+            repo_root,
+            model=model,
+            max_turns=max_turns,
+            subagent_max_turns=subagent_max_turns,
+            subagent_effort=subagent_effort,
+        )
+        return await invoke_iteration(prompt=prompt, options=options)
+
+    return _run
+
+
+def _tool_result_text(observation: ToolResultObservation | None) -> str | None:
+    """Extract the subagent's response text from its tool-result block.
+
+    A subagent returns its final message as the ``Agent`` tool result, which the
+    stream surfaces either as a plain string or as a list of content-block dicts
+    (``{"type": "text", "text": ...}``). Returns ``None`` when the observation is
+    absent, errored, or carries no text, so the caller records a missing-result
+    verdict rather than parsing an empty string.
+    """
+    if observation is None or observation.is_error:
+        return None
+    content = observation.content
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content or None
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts) if parts else None
+
+
+def _parse_aggregated_verdicts(text: str) -> dict[Tier, TierVerdict]:
+    """Parse the orchestrator's aggregated final JSON into per-tier verdicts.
+
+    The D-2 fallback: when a subagent tool-result cannot be keyed to its tier,
+    the parent's final ``{"verdicts": [...]}`` block is parsed once. Returns the
+    verdicts it could read, keyed by tier; an absent or malformed block yields an
+    empty mapping so the caller falls through to the error verdict.
+    """
+    try:
+        data = _extract_json_object(text)
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    raw = data.get("verdicts")
+    if not isinstance(raw, list):
+        return {}
+    out: dict[Tier, TierVerdict] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        tier_value = entry.get("tier")
+        if isinstance(tier_value, bool) or not isinstance(tier_value, int):
+            continue
+        try:
+            tier = Tier(tier_value)
+        except ValueError:
+            continue
+        out[tier] = _verdict_from_data(tier, entry)
+    return out
+
+
+#: The collector source: which path produced the 11 verdicts. ``tool_result``
+#: when every filled tier came from its subagent tool-result; ``aggregated``
+#: when the final-JSON fallback supplied them; ``mixed`` when both contributed;
+#: ``error_fallback`` when nothing keyed and no aggregate parsed.
+COLLECT_SOURCE_TOOL_RESULT: str = "tool_result"
+COLLECT_SOURCE_AGGREGATED: str = "aggregated"
+COLLECT_SOURCE_MIXED: str = "mixed"
+COLLECT_SOURCE_ERROR: str = "error_fallback"
+
+
+@dataclass(frozen=True, kw_only=True)
+class DiscoveryCollection:
+    """The 11 collected verdicts plus a record of which path produced them.
+
+    ``verdicts`` is exactly one :class:`TierVerdict` per tier in tier order.
+    ``source`` records whether the trusted per-subagent tool-results, the
+    aggregated-final-JSON fallback, or a mix produced them (spec 00059: "record
+    which path was used").
+    """
+
+    verdicts: tuple[TierVerdict, ...]
+    source: str
+
+
+def collect_tier_verdicts(result: IterationResult) -> DiscoveryCollection:
+    """Collect 11 tier verdicts from one discovery session's drained result.
+
+    Reads each verdict from its subagent ``Agent``/``Task`` tool-RESULT block
+    (keyed to its tier by ``subagent_type``), never from the parent's prose
+    (D-2). A tier with a present-but-unparseable/errored result yields a
+    (not relevant, error-reason) verdict; a tier with NO keyed tool-result is
+    filled from the parent's aggregated final JSON, and if that too is absent it
+    yields a (not relevant) error verdict. Always returns exactly 11 verdicts in
+    tier order.
+    """
+    from_tool: dict[Tier, TierVerdict] = {}
+    for interaction in result.signals.tool_interactions:
+        if interaction.tool_name not in SUBAGENT_TOOL_NAMES:
+            continue
+        tier = _tier_from_agent_key(interaction.tool_input.get("subagent_type"))
+        if tier is None:
+            continue
+        text = _tool_result_text(interaction.result)
+        if text is None:
+            from_tool[tier] = TierVerdict(
+                tier=tier,
+                relevant=False,
+                reason="subagent tool-result missing, errored, or empty",
+                findings=(),
+            )
+            continue
+        from_tool[tier] = parse_tier_verdict(tier, text)
+
+    missing = [tier for tier in Tier if tier not in from_tool]
+    aggregated = (
+        _parse_aggregated_verdicts(result.transcript) if missing else {}
+    )
+
+    verdicts: list[TierVerdict] = []
+    used_tool = used_aggregated = used_error = False
+    for tier in Tier:
+        if tier in from_tool:
+            verdicts.append(from_tool[tier])
+            used_tool = True
+        elif tier in aggregated:
+            verdicts.append(aggregated[tier])
+            used_aggregated = True
+        else:
+            verdicts.append(
+                TierVerdict(
+                    tier=tier,
+                    relevant=False,
+                    reason=(
+                        "no discovery result for this tier: subagent was not "
+                        "dispatched and no aggregated verdict was emitted"
+                    ),
+                    findings=(),
+                )
+            )
+            used_error = True
+
+    return DiscoveryCollection(
+        verdicts=tuple(verdicts),
+        source=_collect_source(used_tool, used_aggregated, used_error),
+    )
+
+
+def _collect_source(
+    used_tool: bool, used_aggregated: bool, used_error: bool
+) -> str:
+    """Summarize which path(s) produced the collected verdicts."""
+    if used_tool and not used_aggregated and not used_error:
+        return COLLECT_SOURCE_TOOL_RESULT
+    if used_aggregated and not used_tool and not used_error:
+        return COLLECT_SOURCE_AGGREGATED
+    if not used_tool and not used_aggregated:
+        return COLLECT_SOURCE_ERROR
+    return COLLECT_SOURCE_MIXED
+
+
+async def run_single_session_discovery(
+    *,
+    repo_root: Path,
+    session_runner: DiscoverySessionRunner | None = None,
+    model: str | None = None,
+) -> list[TierVerdict]:
+    """Run discovery as ONE session of tier subagents; return all 11 verdicts.
+
+    Drives a single session (default: the production ``ClaudeSDKClient``-backed
+    runner rooted at ``repo_root``; tests inject a scripted runner) whose
+    ``options.agents`` registers the 11 tiers, then collects each verdict from
+    its subagent tool-result block. Returns exactly one verdict per tier (1-11)
+    in tier order -- a tier whose result is missing or malformed still yields a
+    (not relevant, error-reason) verdict, mirroring :func:`run_discovery`.
+    """
+    runner = (
+        session_runner
+        if session_runner is not None
+        else build_single_session_runner(repo_root, model=model)
+    )
+    result = await runner(orchestrator_prompt(repo_root))
+    return list(collect_tier_verdicts(result).verdicts)
 
 
 # --- Authoring: compile a finding into grader-bearing tasks (autopilot-authoring)
@@ -1173,8 +1557,14 @@ def _directory_queue_depth(tasks_dir: Path) -> int:
 
 __all__ = [
     "AUTOPILOT_PHASE",
+    "COLLECT_SOURCE_AGGREGATED",
+    "COLLECT_SOURCE_ERROR",
+    "COLLECT_SOURCE_MIXED",
+    "COLLECT_SOURCE_TOOL_RESULT",
     "DEFAULT_AUTHORING_MAX_TURNS",
     "DEFAULT_DISCOVERY_MAX_TURNS",
+    "DEFAULT_DISCOVERY_SUBAGENT_EFFORT",
+    "DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS",
     "DEFAULT_LANDING",
     "DEFAULT_TARGET_DEPTH",
     "DEFAULT_WEIGHTS",
@@ -1182,6 +1572,8 @@ __all__ = [
     "PREEMPTIVE_MAX_TIER",
     "GRADER_SOURCE_HELD_OUT",
     "GRADER_SOURCE_REPO_COMMAND",
+    "SUBAGENT_READONLY_TOOLS",
+    "SUBAGENT_TOOL_NAMES",
     "TIER_DESCRIPTIONS",
     "TIER_WEIGHTS",
     "W_EFFORT",
@@ -1192,6 +1584,8 @@ __all__ = [
     "AuthoringResult",
     "AutopilotInvoker",
     "AutopilotPassResult",
+    "DiscoveryCollection",
+    "DiscoverySessionRunner",
     "DroppedFinding",
     "EmittedTask",
     "Finding",
@@ -1204,12 +1598,19 @@ __all__ = [
     "author_findings",
     "authoring_prompt",
     "build_repo_invoker",
+    "build_single_session_options",
+    "build_single_session_runner",
+    "build_tier_agents",
+    "collect_tier_verdicts",
     "discover_tier",
     "emit_emitted_task",
+    "orchestrator_prompt",
     "parse_tier_verdict",
     "recompute_final",
     "run_discovery",
     "run_refill_pass",
+    "run_single_session_discovery",
+    "tier_agent_key",
     "score_finding",
     "select_findings",
     "sequence_findings",

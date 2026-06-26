@@ -1910,17 +1910,6 @@ sandbox_root = ".flywheel/sandboxes"
 # model = "claude-sonnet-4-5"
 """
 
-# The commented placeholder used when init could not detect a branch to
-# pin (e.g. no git, detached HEAD -- which the git preflight already
-# rejects, so this is just a defensive fallback).
-_INIT_SUBMIT_BLOCK_COMMENTED = """\
-# Landing policy. base pins the branch finished work lands on and the
-# worker resolves its phase base from; unset falls back to the
-# checked-out branch (back-compat).
-# [submit]
-# base = "main"
-"""
-
 _INIT_POLICY_TAIL_FOOT = """\
 # Sandbox provisioning. setup runs (shell) inside every newly created
 # sandbox before the agent enters, so tasks never pay discovery cost for
@@ -1939,21 +1928,30 @@ _INIT_POLICY_TAIL_FOOT = """\
 def _render_submit_block(submit_base: str | None) -> str:
     """Render the ``[submit]`` section.
 
-    When init detected the repo's current branch it is pinned as an
-    active ``base`` (a developer-facing tool should record the landing
-    target, not leave it implicit). With no branch detected the original
-    commented placeholder is kept. ``json.dumps`` quoting is valid for a
-    TOML basic string, so an unusual branch name cannot break the file.
+    The detected current branch is recorded as a COMMENTED ``base`` suggestion,
+    never an active key. An active ``base`` equal to the checked-out branch is
+    refused by the landing guard (:func:`resolve_landing_base`) — so pinning the
+    just-detected branch (the universal single-branch case right after init)
+    would make the worker exit on startup. Left unset, the worker falls back to
+    the checked-out branch and FF-merges in-tree, the working default. The
+    operator uncomments and edits ``base`` only to land onto a SEPARATE
+    integration branch they do not have checked out. ``json.dumps`` quoting is
+    valid for a TOML basic string, so an unusual branch name cannot break the
+    file.
     """
-    if not submit_base:
-        return _INIT_SUBMIT_BLOCK_COMMENTED
+    suggestion = json.dumps(submit_base) if submit_base else '"main"'
+    detected_note = (
+        f" (detected current branch: {submit_base})" if submit_base else ""
+    )
     return (
-        "# Landing policy. base pins the branch finished work lands on and\n"
-        "# the worker resolves its phase base from. Auto-detected from the\n"
-        "# current branch at init; change it to your integration branch if\n"
-        "# different.\n"
+        "# Landing policy. base pins the branch finished work lands on and the\n"
+        "# worker resolves its phase base from. Leave it UNSET to FF-merge work\n"
+        f"# in-tree onto your checked-out branch{detected_note} — the working\n"
+        "# default. Set base ONLY to a separate integration branch you do NOT\n"
+        "# have checked out; setting base to the checked-out branch is refused\n"
+        "# and the worker exits on startup.\n"
         "[submit]\n"
-        f"base = {json.dumps(submit_base)}\n"
+        f"# base = {suggestion}\n"
     )
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
@@ -1995,9 +1993,11 @@ class _InitAnswers:
     github_repo: str | None = None
     github_label: str | None = None
     github_done_action: str = "comment"
-    # The branch finished work lands on, recorded as [submit] base. Auto-
-    # detected from the repo's current branch at init; None falls back to
-    # the commented placeholder (worker then uses the checked-out branch).
+    # The repo's current branch, detected at init and surfaced as a COMMENTED
+    # [submit] base suggestion (never an active key — an active base equal to
+    # the checked-out branch is refused by the landing guard). None when no
+    # branch was detected; either way base stays unset so the worker FF-merges
+    # in-tree onto the checked-out branch.
     submit_base: str | None = None
     # Whether to install the Claude Code skills (fw-spec / fw-plan /
     # fw-retro / fw-improve) into .claude/skills/. Interactive default

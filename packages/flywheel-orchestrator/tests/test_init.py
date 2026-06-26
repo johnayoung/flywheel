@@ -159,20 +159,27 @@ def test_init_policy_is_loadable_and_points_into_flywheel_dir(
     # The default scaffold pins the store backend explicitly.
     assert policy.store_backend == "sqlite"
     assert policy.store_schema is None
-    # init auto-detects the current branch and pins it as the landing base
-    # (the `repo` fixture inits on `main`).
-    assert policy.submit_base == "main"
+    # init leaves the landing base UNSET so the worker FF-merges in-tree onto
+    # the checked-out branch; an active base equal to the checkout would be
+    # refused by the landing guard and exit the worker on startup.
+    assert policy.submit_base is None
 
 
-def test_init_pins_submit_base_to_current_branch(repo: Path) -> None:
+def test_init_suggests_current_branch_as_commented_base(repo: Path) -> None:
     subprocess.run(
         ["git", "switch", "-c", "integration"], cwd=repo, check=True,
         capture_output=True,
     )
     main(["init"])
     text = (repo / "flywheel.toml").read_text()
-    assert "[submit]\nbase = \"integration\"" in text
-    assert load_policy(repo / "flywheel.toml").submit_base == "integration"
+    # The detected branch is surfaced as a COMMENTED suggestion (with the
+    # branch name in the explanatory comment), never an active key.
+    assert "# base = \"integration\"" in text
+    assert "\nbase = \"integration\"" not in text  # not active
+    assert "integration" in text  # named in the guidance comment
+    # Unset -> the worker falls back to the checked-out branch (the default
+    # that actually works right after init).
+    assert load_policy(repo / "flywheel.toml").submit_base is None
 
 
 def test_init_reports_agent_auth_present(repo: Path, monkeypatch, capsys) -> None:

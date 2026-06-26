@@ -2675,6 +2675,57 @@ def _current_branch() -> str | None:
     return name
 
 
+def _cmd_init_agent(policy_path: Path) -> int:
+    """Drive the agent-driven init path and report the proposal (FR ``--agent``).
+
+    Imported lazily so the agent seam (and its lazy SDK boundary) is only
+    pulled in when ``--agent`` is actually used -- the default init path never
+    touches it. The model resolution mirrors the autopilot daemon's default
+    (the production SDK-backed invoker rooted at the cwd). The proposal is
+    printed BEFORE the policy is written so the operator sees what was chosen;
+    an unparseable response or an invalid render raises and writes nothing.
+    """
+    from flywheel_orchestrator._init_agent import (
+        InitAgentError,
+        run_agent_init,
+    )
+
+    repo_root = Path.cwd()
+    submit_base = _current_branch()
+    try:
+        result = run_agent_init(
+            repo_root=repo_root,
+            submit_base=submit_base,
+            policy_path=policy_path,
+        )
+    except InitAgentError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    proposal = result.proposal
+    print("Agent proposal:")
+    if proposal.notes:
+        print(f"  notes: {proposal.notes}")
+    if proposal.default_graders:
+        print("  default graders:")
+        for run in proposal.default_graders:
+            print(f"    - {run}")
+    else:
+        print("  default graders: (none)")
+    print(f"  sandbox setup: {proposal.sandbox_setup or '(none)'}")
+    if proposal.target_depth is not None:
+        print(f"  autopilot target_depth: {proposal.target_depth}")
+    if proposal.interval_seconds is not None:
+        print(f"  autopilot interval_seconds: {proposal.interval_seconds}")
+    print(f"created: {result.policy_path}")
+    for line in result.gitignore_added:
+        print(f"gitignore: +{line}")
+    _report_agent_auth()
+    print()
+    _print_init_next_steps(result.policy.store_backend)
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Scaffold ``.flywheel/`` and a ``flywheel.toml`` in the working dir.
 
@@ -2756,6 +2807,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
             )
             return 0
         return _reconfigure_policy(args, policy_path)
+
+    if getattr(args, "agent", False):
+        return _cmd_init_agent(policy_path)
 
     try:
         answers = _collect_init_answers(args, interactive=interactive)
@@ -2913,6 +2967,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Accept every default without prompting (a non-TTY stdin "
             "implies this)."
+        ),
+    )
+    p_init.add_argument(
+        "--agent",
+        action="store_true",
+        help=(
+            "Drive an agent to inspect the repo and PROPOSE the flywheel.toml "
+            "policy (detected toolchain -> default graders, sandbox setup, "
+            "autopilot cadence, .gitignore additions) instead of prompting. "
+            "The proposal is printed before the policy is written and is "
+            "re-validated; an unparseable response writes nothing."
         ),
     )
     p_init.set_defaults(func=_cmd_init)

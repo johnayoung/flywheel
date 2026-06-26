@@ -1,15 +1,19 @@
 # Feature: Autopilot (MVP)
 
 ## Outcome
-Running `flywheel autopilot` against any codebase keeps the work queue non-empty
-with verifiable, tier-prioritized tasks: a fan-out of one agent per tier judges
+An operator starts autopilot once — from the interactive console (`/autopilot
+start`) or the shell (`flywheel autopilot`) — and it runs as a neverending
+process that keeps the work queue non-empty with verifiable, tier-prioritized
+tasks until explicitly stopped. Each cycle: a fan-out of one agent per tier judges
 which tiers are even relevant to *this* repo and surfaces concrete findings, a
 synthesis agent sequences them by the tier model (preemptive 1-3 above weighted-
 scored 4-11), and each selected finding is compiled — entirely by agents, with no
 human interview — through the authoring pipeline into a flywheel task that carries
 a real grader. The existing worker drains and FF-merges that work, and autopilot
-refills as the queue drains, so flywheel never sits idle on a repo that still has
-work, and never invents work on one that does not.
+refills on its interval, so flywheel never sits idle on a repo that still has work;
+on a cycle that finds nothing actionable autopilot idles (writes nothing) and keeps
+watching rather than inventing work or terminating. The process only ends when the
+operator stops it.
 
 ## Background
 flywheel already executes graded tasks autonomously (worker + worktree + submit)
@@ -30,7 +34,11 @@ only on an out-of-band grade.
 ## Scope
 ### In scope
 - A `flywheel autopilot` entry that runs the discover -> sequence -> author -> refill
-  loop against the repo's configured work source and store.
+  loop against the repo's configured work source and store, as a neverending daemon
+  by default and a single pass under `--once`.
+- An operator activation path from the interactive console (`/autopilot start` /
+  `/autopilot stop`) that spawns and stops the autopilot daemon as a detached
+  supervised child, mirroring `/worker start` / `/worker stop`.
 - One relevance-and-discovery agent invocation per tier (the 11 tiers in
   `docs/autopilot.md`), fanned out, each returning a structured "relevant to this
   repo?" verdict plus zero or more findings with evidence.
@@ -120,15 +128,16 @@ live-model nondeterminism; one end-to-end criterion drives the real loop.
    defends against: reverting to strict top-down priority, which starves docs/debt/
    tests forever — the exact failure `docs/autopilot.md` exists to prevent.
 
-6. While the queue depth is below the configured target and at least one actionable
-   finding exists, autopilot emits tasks until the target is met or actionable
-   findings are exhausted; when no finding is actionable it emits zero tasks and exits
-   0 without error. [command | held-out]
+6. A single refill pass (the `--once` unit): while the queue depth is below the
+   configured target and at least one actionable finding exists, the pass emits tasks
+   until the target is met or actionable findings are exhausted; when no finding is
+   actionable the pass emits zero tasks and returns without error (and `--once` exits
+   0). [command | held-out]
    verify: (a) with a scripted invoker over a fixture that yields known findings and
-   an empty queue, assert autopilot raises the queue to the target depth (or to the
+   an empty queue, assert one pass raises the queue to the target depth (or to the
    number of available findings, whichever is smaller); (b) with a fixture whose tier
-   agents all return not-relevant / no findings, assert zero tasks written and exit
-   code 0.
+   agents all return not-relevant / no findings, assert zero tasks written and a clean
+   return / exit code 0.
    defends against: spinning or erroring (or inventing filler work) on a clean repo;
    and never refilling a drained queue.
 
@@ -143,6 +152,29 @@ live-model nondeterminism; one end-to-end criterion drives the real loop.
    branch FF-merged into the base.
    defends against: unit tests that prove generation in isolation while the live loop
    never executed the new path (the documented reason the archive gate exists).
+
+9. When autopilot runs without `--once`, it executes repeated refill passes on its
+   configured interval and does not terminate on an idle (nothing-actionable) pass —
+   it keeps surveying across cycles and only stops on an explicit stop signal.
+   [command | held-out]
+   verify: drive the autopilot loop with a scripted invoker and a controllable clock/
+   stop signal over a fixture whose findings are empty on cycle 1 and non-empty on a
+   later cycle; assert the process runs more than one cycle, writes zero tasks on the
+   idle cycle without exiting, authors work on the later cycle, and terminates only
+   after the stop signal is delivered.
+   defends against: a one-shot that exits after the first pass (defeating "autopilot"),
+   and a busy-loop that exits or errors when a cycle finds nothing.
+
+10. When the operator issues the autopilot start action from the interactive console,
+    a neverending autopilot process is launched as a detached supervised child, and the
+    stop action terminates it. [command | held-out]
+    verify: with the worker-supervisor test harness as precedent, assert the console
+    start action spawns an autopilot child the supervisor reports as live, that the
+    child is detached (survives console exit), and that the stop action signals it to
+    exit; assert the start dispatch targets the autopilot daemon entry, not a single
+    pass.
+    defends against: wiring `/autopilot` to a one-shot pass or to the worker, so the
+    console appears to "start autopilot" while no continuous process is running.
 
 8. The authoritative grader on an emitted task is a check the *executing* run did not
    author against its own known inputs — it is the repo's existing verification
@@ -180,12 +212,18 @@ their dependents.
   `fw-spec`/`fw-plan` contracts into validated grader-bearing tasks, resolving
   ambiguity as recorded assumptions. Satisfies #1, #8. Depends on discovery's Finding
   shape.
-- Layer loop+surface (orchestrator/worker + product shell): the `flywheel autopilot`
-  entry, queue-depth target + refill + idle-safe exit, config (`[autopilot]` in
+- Layer pass+surface (orchestrator + product shell): the single refill pass, the
+  `flywheel autopilot --once` verb, queue-depth target, config (`[autopilot]` in
   `flywheel.toml`, FF-merge default), emission into the work source. Satisfies #6.
   Depends on scoring + authoring.
-- Layer end-to-end (in-loop-verification): drive autopilot -> real orchestrate loop ->
-  FF-merge on a fixture defect. Satisfies #7. Depends on every layer above.
+- Layer daemon (orchestrator + product shell): wrap the pass in a neverending loop on
+  an interval with a stop signal; `flywheel autopilot` (no `--once`) runs it; idles on
+  empty cycles, resumes on later ones. Satisfies #9. Depends on the pass layer.
+- Layer activation (product shell console): `/autopilot start` / `/autopilot stop`
+  spawn/stop the daemon as a detached supervised child, mirroring `/worker`. Satisfies
+  #10. Depends on the daemon layer.
+- Layer end-to-end (in-loop-verification): drive autopilot (a pass) -> real orchestrate
+  loop -> FF-merge on a fixture defect. Satisfies #7. Depends on the pass layer.
 
 Shared invariants multiple layers assert against — land them in the layer that owns
 them and have dependents import, never redefine:
@@ -228,7 +266,7 @@ them and have dependents import, never redefine:
   Consequences: unattended writes to the base branch from the first run; the integrity
   burden falls entirely on the out-of-band grade (#7, #8) and protected_paths.
 
-### D-4: "Never stops" means never blocked, not always busy  (Status: Accepted)
+### D-4: "Never stops" means never blocked, not always busy  (Status: Superseded by D-5)
 - Context: on a clean repo with no actionable work, forcing the queue full would invent
   low-value work. Decision: autopilot fills to a target depth only from actionable
   findings; when none clear the bar it emits nothing and exits 0, re-surveying on the
@@ -236,6 +274,33 @@ them and have dependents import, never redefine:
 - Rejected: always-keep-N-queued (invents filler on clean repos); escalate-to-operator
   on empty (adds a human gate to an unattended loop). Consequences: a genuinely clean
   repo produces an empty, exit-0 run — graded explicitly by #6(b).
+- Superseded: the "exits 0 on empty" framing made autopilot a one-shot. D-5 keeps the
+  no-busywork rule but makes the *process* continuous — an empty cycle idles, it does
+  not terminate. The single-pass exit-0 behavior survives only under `--once`.
+
+### D-5: Autopilot is a neverending daemon; idle, do not exit, on an empty cycle  (Status: Accepted)
+- Context: "the whole point is autopilot" — a one-shot refill is not autopilot. The
+  operator must start it once and have it run continuously. Decision: `flywheel
+  autopilot` runs a neverending loop of refill passes on an interval; a cycle that
+  finds nothing actionable writes nothing and continues to the next cycle; the process
+  ends only on an explicit stop signal. `--once` runs exactly one pass and exits
+  (the testable unit and a manual escape hatch).
+- Rejected: one-shot verb the operator must re-run / cron (pushes the core loop onto
+  the operator, contradicts "autopilot"); always-busy continuous loop (reintroduces the
+  busywork D-4 rejected). Consequences: the daemon mirrors `flywheel worker` (daemon by
+  default, `--once` for one pass); #9 grades the continuous behavior, #6 grades the
+  single pass.
+
+### D-6: Activation is operator-started from the console, mirroring `/worker`  (Status: Accepted)
+- Context: the operator wants to start autopilot from the interactive console the way
+  they already start the worker. Decision: `/autopilot start` / `/autopilot stop` in
+  the console spawn and stop the autopilot daemon as a detached supervised child, reusing
+  the `WorkerSupervisor` spawn/detach/stop pattern; the shell `flywheel autopilot` verb
+  is the same daemon, runnable without the console.
+- Rejected: shell-only activation (the operator explicitly wants the console action);
+  a bespoke supervision mechanism (the worker supervisor is the proven precedent).
+  Consequences: a second supervised daemon runs alongside the worker; the console gains
+  an autopilot status the same way it shows worker status.
 
 ## Open Questions (accepted gaps)
 - Whether an agent-authored grader is *provably* ungameable in the general case is an

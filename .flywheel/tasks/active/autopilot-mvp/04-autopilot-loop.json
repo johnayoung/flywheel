@@ -1,6 +1,6 @@
 {
   "id": "autopilot-loop",
-  "goal": "Invoking `flywheel autopilot` fills the configured work source up to the [autopilot] target queue depth from actionable findings (running discovery, scoring, and authoring), and when no finding is actionable it writes zero tasks and exits 0, with FF-merge as the shipped default landing posture.",
+  "goal": "Invoking `flywheel autopilot --once` runs a single refill pass that fills the configured work source up to the [autopilot] target queue depth from actionable findings (running discovery, scoring, and authoring), and when no finding is actionable writes zero tasks and exits 0, with FF-merge as the shipped default landing posture.",
   "prerequisites": ["autopilot-scoring", "autopilot-discovery", "autopilot-authoring"],
   "tags": ["orchestrator", "flywheel", "spec-00058", "autopilot", "loop", "cli"],
   "graders": [
@@ -9,17 +9,17 @@
   ],
   "context": {
     "relevant": [
-      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #6 and decisions D-3 (FF-merge default), D-4 (never-blocked, not always-busy) this task satisfies",
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #6 (the single --once pass) and decisions D-3 (FF-merge default), D-5 (this task builds the pass; the neverending daemon wrapping it is autopilot-daemon) this task satisfies",
       "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- composes this phase's three layers: discovery -> scoring/selection -> authoring -> emit into the work source; this task is the orchestration that wires them together (the seam holdout over the shared Tier/Finding/ScoreBreakdown invariants)",
       "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- emit authored tasks so the existing worker drains them; reuse the WorkSource/WorkItem seam and the priority field, do not bypass it",
       "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- flywheel.toml parsing; add an [autopilot] table (target queue depth, optional weight overrides, landing posture defaulting to FF-merge) read here",
-      "packages/flywheel/src/flywheel/_cli.py -- verb dispatch (see _WORKER_VERB / _ORCHESTRATOR_VERBS and main()'s routing ~line 102-142); register an `autopilot` verb that delegates to the orchestrator entry, mirroring how `worker` is wired",
+      "packages/flywheel/src/flywheel/_cli.py -- verb dispatch (see _WORKER_VERB / _ORCHESTRATOR_VERBS and main()'s routing ~line 102-142); register an `autopilot` verb that delegates to the orchestrator entry, mirroring how `worker` is wired; this task wires `--once` (the single pass), the bare-daemon form is autopilot-daemon",
       "packages/flywheel-orchestrator/tests/test_policy.py -- keep green; it pins flywheel.toml parsing",
       "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green; it pins the orchestrator entry surface"
     ],
     "constraints": [
       "Queue-depth target and landing posture come from an [autopilot] table in flywheel.toml via _policy.py, with code defaults (FF-merge landing, a sane target depth) when the table is absent. Weight overrides, if provided, feed autopilot-scoring's engine; absent overrides use that engine's constant defaults.",
-      "Refill semantics (criterion #6): while the live queue depth is below the target AND actionable findings remain, emit authored tasks until the target is met or actionable findings are exhausted. When discovery yields no actionable finding, write ZERO tasks and exit 0 -- never raise, never emit filler (D-4).",
+      "Refill semantics (criterion #6): a single pass, while the live queue depth is below the target AND actionable findings remain, emits authored tasks until the target is met or actionable findings are exhausted. When discovery yields no actionable finding, the pass writes ZERO tasks and `--once` exits 0 -- never raise, never emit filler (D-5). Structure the pass as a callable the daemon (autopilot-daemon) can invoke in a loop; do NOT bake an infinite loop into this task.",
       "Each emitted task records its ScoreBreakdown (tier + components + final) so the recommendation is inspectable after the run -- the breakdown is persisted with the emitted task, not discarded.",
       "All agent calls flow through the injectable invoker seam; the tests script discovery and authoring so the loop tests are deterministic and offline.",
       "Commit the change with a clear message before reporting done."
@@ -27,7 +27,8 @@
     "non_goals": [
       "Do NOT re-implement task selection or grader authoring here -- call autopilot-scoring and autopilot-authoring; this task is wiring + CLI + config + refill control flow only.",
       "Do NOT drive the real execution/landing loop in THIS task's tests -- the live orchestrate+FF-merge proof is autopilot-e2e; here the worker side may be a scripted/stubbed drain so the refill and idle behavior are graded in isolation.",
-      "Do NOT add an always-keep-N-queued behavior that invents work on a clean repo (rejected in D-4).",
+      "Do NOT add an always-keep-N-queued behavior that invents work on a clean repo (rejected in D-4/D-5).",
+      "Do NOT implement the neverending loop, interval, or stop signal here -- this task is the single pass + --once verb; the daemon is autopilot-daemon.",
       "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
     ],
     "edge_cases": [

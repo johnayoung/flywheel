@@ -1,0 +1,37 @@
+{
+  "id": "autopilot-activation",
+  "goal": "Issuing the autopilot start action from the interactive console spawns the neverending autopilot daemon as a detached supervised child the console reports as live, and the stop action signals that child to exit.",
+  "prerequisites": ["autopilot-daemon"],
+  "tags": ["flywheel", "spec-00058", "autopilot", "console", "activation"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel/tests/", "name": "shell-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #10 and decision D-6 (operator-started from the console, mirroring /worker) this task satisfies",
+      "packages/flywheel/src/flywheel/_worker_supervisor.py -- WorkerSupervisor (spawn/detach/stop a daemon child, WorkerState, build_default_spawn_argv); reuse this exact spawn/detach/stop pattern for an autopilot supervisor rather than inventing a new mechanism",
+      "packages/flywheel/src/flywheel/_tui.py -- the interactive console: it already dispatches slash commands (/worker start, /worker stop, /archive) and shows worker status; add /autopilot start and /autopilot stop alongside them and surface autopilot's live/none status the same way",
+      "packages/flywheel/src/flywheel/_cli.py -- the `flywheel autopilot` daemon verb (from autopilot-daemon) is the child the supervisor spawns; the start action must spawn the DAEMON (no --once), not a single pass",
+      "packages/flywheel/tests/ -- the worker-supervisor / console tests are the precedent harness for asserting spawn/detach/stop; mirror them for autopilot",
+      "packages/flywheel/tests/test_worker_supervisor.py -- keep green; pattern to follow for the autopilot supervisor test (if this exact filename differs, the supervisor's existing test is the model)"
+    ],
+    "constraints": [
+      "The console start action spawns a `flywheel autopilot` daemon child (NOT --once, NOT the worker) and the supervisor reports it live; the child is detached so the console can exit while autopilot keeps running; the stop action sends the termination signal and the child exits (criterion #10, mirroring /worker).",
+      "Autopilot and worker are independent supervised children: starting/stopping one does not start/stop the other, and the console shows each one's status separately.",
+      "The test asserts the start dispatch targets the autopilot daemon entry (the long-running form), detaches, and that stop signals it -- using the worker-supervisor test harness as precedent, with no live model and no real daemon left running after the test.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change the daemon loop/interval/stop semantics from autopilot-daemon -- this task only adds the console spawn/detach/stop wiring and status surface.",
+      "Do NOT couple autopilot's lifecycle to the worker's -- they are separate supervised children.",
+      "Do NOT have the start action run a single --once pass -- it must launch the neverending daemon (the defends-against for criterion #10).",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "Console exits after /autopilot start: the daemon survives (detached) and keeps running.",
+      "/autopilot start when an autopilot daemon is already live: it does not spawn a second one (idempotent start, mirroring the worker supervisor).",
+      "/autopilot stop with no live autopilot child: a clean no-op notice, not an error.",
+      "Worker and autopilot both running: /worker stop stops only the worker; the autopilot daemon keeps running, and vice versa."
+    ]
+  }
+}

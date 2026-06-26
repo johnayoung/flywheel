@@ -1,0 +1,40 @@
+{
+  "id": "autopilot-daemon",
+  "goal": "Running `flywheel autopilot` without `--once` executes repeated refill passes on its configured interval and does not terminate on an idle (nothing-actionable) cycle, continuing to survey across cycles and stopping only on an explicit stop signal.",
+  "prerequisites": ["autopilot-loop"],
+  "tags": ["orchestrator", "flywheel", "spec-00058", "autopilot", "daemon"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/", "name": "orchestrator-suite" },
+    { "type": "command", "run": "uv run pytest packages/flywheel/tests/", "name": "shell-suite" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00058-FEATURE-autopilot-mvp.md -- acceptance criterion #9 and decision D-5 (neverending daemon; idle, do not exit, on an empty cycle) this task satisfies",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- the single refill pass from autopilot-loop; this task wraps it in the neverending loop, calling the pass once per cycle",
+      "packages/flywheel/src/flywheel/_cli.py -- the `autopilot` verb from autopilot-loop; the bare form (no --once) runs the daemon loop, --once still runs exactly one pass (mirror how `worker` is a daemon by default with --once for a single drain)",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the existing daemon-loop precedent (interval, SIGTERM-driven shutdown); mirror its loop/stop posture so autopilot shuts down cleanly on signal",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- read the [autopilot] interval from flywheel.toml here (alongside the target depth autopilot-loop added), with a code default when absent",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green",
+      "packages/flywheel/tests/ -- keep the shell suite green"
+    ],
+    "constraints": [
+      "The daemon is the single refill pass invoked in a loop: each cycle runs one pass (discovery -> score -> author -> emit), then waits the configured interval before the next cycle. It MUST NOT terminate on an idle cycle -- an empty pass writes nothing and the loop continues (D-5).",
+      "Shutdown is via an explicit stop signal only (SIGTERM/SIGINT or an injected stop event), mirroring the worker daemon; the loop exits promptly and cleanly on that signal and at no other time.",
+      "The loop MUST be testable without real wall-clock waits or a live model: inject the clock/interval and the stop signal, and drive passes with the scripted invoker from the prior tasks. A test runs >1 cycle (empty cycle then a cycle with findings) and asserts the daemon idled without exiting on the empty cycle, authored work on the later cycle, and exited only after the stop signal.",
+      "`--once` behavior from autopilot-loop is unchanged: exactly one pass, then exit 0.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT change the single-pass refill/idle semantics built in autopilot-loop -- this task only adds the surrounding loop, interval, and stop handling.",
+      "Do NOT add console spawn/detach/stop wiring here -- that is autopilot-activation; this task makes `flywheel autopilot` itself a long-running process.",
+      "Do NOT busy-spin: between cycles the daemon waits the interval; it does not re-survey with no delay.",
+      "Do NOT modify files under tests/ other than adding this task's new tests; do not weaken or delete existing assertions."
+    ],
+    "edge_cases": [
+      "Empty cycle followed by a productive cycle: the daemon must still be running for the second cycle -- a daemon that exited after the first empty pass must fail the test.",
+      "Stop signal delivered mid-wait: the daemon exits promptly without running another pass.",
+      "Stop signal delivered mid-pass: the in-flight pass completes or aborts cleanly, and no new cycle starts.",
+      "Interval absent from [autopilot]: a code-default interval applies and the daemon still loops."
+    ]
+  }
+}

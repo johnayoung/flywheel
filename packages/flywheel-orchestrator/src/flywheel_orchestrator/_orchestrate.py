@@ -129,6 +129,7 @@ from flywheel_orchestrator._workflow import (
     TaskStatusRow,
     _latest_lifecycle_row,
     status_rows_for_items,
+    task_state,
 )
 
 # Default lease window and how often the heartbeat renews it. The window is
@@ -1087,6 +1088,32 @@ async def orchestrate(
                 )
                 if claim is None:
                     held.add(pick.task.id)
+                    continue
+                # Post-claim terminal-state recheck (closes the stale-snapshot
+                # TOCTOU). ``states`` was read at the top of this pass; a peer
+                # worker may have driven this task to DONE and released its
+                # claim in the window before we acquired ours. ``release_claim``
+                # deletes the claim row, so the claim layer alone cannot report
+                # that the task already finished -- only re-reading its
+                # lifecycle can. Refresh just the picked task's state under our
+                # now-held claim (a DONE prerequisite is monotonic, so the rest
+                # of the snapshot stays valid) and re-test readiness with the
+                # exact predicate the scheduler used. If a peer finished it, the
+                # task is no longer in the ready set: drop the claim and exclude
+                # it rather than minting a second run. The resume paths
+                # (sections 1/1b) already recheck after claiming; this gives the
+                # fresh path the same exactly-once guarantee.
+                states[pick.task.id] = task_state(control, pick.task).state
+                if not any(
+                    item.task.id == pick.task.id
+                    for item in graph.ready_set(
+                        states,
+                        excluded=exclude,
+                        worker_capabilities=worker_capabilities,
+                    )
+                ):
+                    claims.release_claim(claim)
+                    attempted_fresh.add(pick.task.id)
                     continue
                 attempted_fresh.add(pick.task.id)
                 # A bare-interrupted lifecycle (operator SIGINT or in-band

@@ -26,7 +26,11 @@ from flywheel_core import (
     Status,
     ValidEnvelope,
 )
-from flywheel_orchestrator import SqliteClaimStore, orchestrate
+from flywheel_orchestrator import (
+    DirectoryWorkSource,
+    SqliteClaimStore,
+    orchestrate,
+)
 from flywheel_core.store_sqlite import SqliteStore
 
 
@@ -493,6 +497,118 @@ def test_two_workers_run_each_task_exactly_once(tmp_path: Path) -> None:
     all_runs = list(report_a.runs) + list(report_b.runs)  # type: ignore[attr-defined]
     assert len(all_runs) == len(task_ids)
     assert all(r.status is Status.DONE for r in all_runs)
+
+
+def test_fresh_selection_rechecks_terminal_state_under_claim(
+    tmp_path: Path,
+) -> None:
+    """A peer that completes a task between this worker's snapshot read and
+    its claim acquisition must NOT cause a re-run.
+
+    Deterministic regression for the stale-snapshot TOCTOU in the
+    fresh-selection path (the load-only flake of
+    ``test_two_workers_run_each_task_exactly_once``): ``states`` is read once
+    per scheduling pass, and ``release_claim`` deletes the claim row, so the
+    claim layer keeps no memory that a task already finished. Worker B selects
+    t1 off a snapshot that still shows it READY, then -- after worker A drives
+    t1 to DONE and releases -- freely re-acquires the deleted claim. The fresh
+    path must re-check the picked task's terminal state under the claim and
+    decline, exactly as the resume paths already do.
+
+    The interleaving is forced (not raced): B parks between building its
+    snapshot and acquiring its claim until A has finished and released.
+    """
+    import threading
+
+    tasks_dir = tmp_path / "tasks"
+    phase = tasks_dir / "active" / "01-phase"
+    _write_task(phase, "t1")
+    db_path = tmp_path / "flywheel.sqlite"
+
+    b_snapshot_taken = threading.Event()
+    a_released = threading.Event()
+
+    class _SignalOnSecondListSource:
+        """Worker A's source: its second ``list_work`` (pass 2, after A has
+        driven t1 to DONE and released the claim) signals that the claim is
+        free and t1 is committed DONE."""
+
+        def __init__(self) -> None:
+            self._inner = DirectoryWorkSource(tasks_dir)
+            self._calls = 0
+
+        def list_work(self):
+            items = self._inner.list_work()
+            self._calls += 1
+            if self._calls == 2:
+                a_released.set()
+            return items
+
+        def report(self, report) -> None:  # type: ignore[no-untyped-def]
+            self._inner.report(report)
+
+    async def _invoke_a(request: InvocationRequest) -> IterationResult:
+        # Do not finalize t1 until B has taken its (t1-is-READY) snapshot, so
+        # B is guaranteed to select t1 off the stale view.
+        b_snapshot_taken.wait(5)
+        return _verify_result()
+
+    async def _invoke_b(request: InvocationRequest) -> IterationResult:
+        return _verify_result()
+
+    # Worker B's clock parks it between snapshot and claim. The first call is
+    # the per-pass graph snapshot, fired right AFTER B's states snapshot is
+    # built -> signal and proceed. Every later call (the next is acquire_claim)
+    # waits until A has released, so B acquires the freed (deleted) claim on a
+    # stale snapshot.
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def _clock_b() -> datetime:
+        if not b_snapshot_taken.is_set():
+            b_snapshot_taken.set()
+            return t0
+        a_released.wait(5)
+        return t0
+
+    results: dict[str, object] = {}
+
+    def _run(worker_id: str, source, invoke, clock=None) -> None:  # type: ignore[no-untyped-def]
+        kwargs: dict[str, object] = dict(
+            source=source,
+            db_path=db_path,
+            sandbox_root=tmp_path / "sb" / worker_id,
+            invoke=invoke,
+            worker_id=worker_id,
+            max_retries=0,
+            max_turns=4,
+            lease_seconds=60,
+            stream=io.StringIO(),
+        )
+        if clock is not None:
+            kwargs["now"] = clock
+        results[worker_id] = asyncio.run(orchestrate(**kwargs))  # type: ignore[arg-type]
+
+    ta = threading.Thread(
+        target=_run,
+        args=("worker-a", _SignalOnSecondListSource(), _invoke_a),
+    )
+    tb = threading.Thread(
+        target=_run,
+        args=("worker-b", DirectoryWorkSource(tasks_dir), _invoke_b),
+        kwargs={"clock": _clock_b},
+    )
+    tb.start()
+    ta.start()
+    ta.join(30)
+    tb.join(30)
+    assert not ta.is_alive() and not tb.is_alive()
+
+    ran_a = {r.task_id for r in results["worker-a"].runs}  # type: ignore[attr-defined]
+    ran_b = {r.task_id for r in results["worker-b"].runs}  # type: ignore[attr-defined]
+    # t1 runs exactly once: A completes it; B observes the committed DONE under
+    # its claim and declines to re-run it.
+    assert ran_a == {"t1"}
+    assert ran_b == set()
 
 
 def test_claim_lost_mid_run_relinquishes_without_killing_worker(

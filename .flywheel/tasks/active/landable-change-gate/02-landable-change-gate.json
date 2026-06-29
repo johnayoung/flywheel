@@ -1,0 +1,38 @@
+{
+  "id": "landable-change-gate",
+  "goal": "A task that finishes verify with an empty or uncommitted change under a git landing strategy is not recorded as a landed success but is re-driven by bounded retry, while a committed change lands through the unchanged submit path.",
+  "prerequisites": ["landable-change-predicate"],
+  "tags": ["orchestrator", "spec-00061", "landing-gate"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "gate" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00061-FEATURE-landable-change-gate.md -- criteria #1, #2, #3, #4, #5, #6 and decisions D-1, D-2, D-3",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the Status.DONE post-run / pre-submit site (~line 1245) where the held-out gate already runs; invoke the landability predicate here and route a non-landable DONE to a retryable non-terminal outcome before submit",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- the held-out gate is the model for a git-aware decision fed in at the DONE site without core knowing git exists; mirror its placement, not its content",
+      "packages/flywheel-core -- the lease/claim and max-retries machinery the re-drive reuses; do NOT add git awareness here",
+      "packages/flywheel-orchestrator/tests/ -- mirror test_held_out_gate*/test_orchestrator* for the gate's held-out proofs; keep existing suites green"
+    ],
+    "constraints": [
+      "Invoke the strategy-supplied landability predicate at the existing Status.DONE site, before the held-out gate/submit. On a non-landable verdict, do NOT land as DONE: route to a retryable non-terminal outcome so the existing retry/lease/work-source path re-drives the task against the same base (D-2).",
+      "Retry is bounded by the existing max-retries budget; a task that never commits ends FAILED (not DONE) with a recorded reason naming the non-landable change -- never an infinite loop.",
+      "When the predicate reports landable (or the no-op default), the post-run path is byte-for-byte unchanged: the held-out gate and submit run exactly as today.",
+      "flywheel-core and the orchestrator gain no git/commit awareness -- the predicate is the only place git is touched (criterion #6, D-1).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT implement the cross-task coherence oracle or autopilot conflict_keys (Gap 3, out of scope).",
+      "Do NOT alter the merge-flock, rebase/re-verify, or protected-paths logic.",
+      "Do not weaken or delete existing test assertions; add new tests only."
+    ],
+    "edge_cases": [
+      "Agent reaches verify with an uncommitted tree on attempt 1, commits on attempt 2 -> attempt 1 is not a landed success, the task is re-driven, attempt 2 lands the committed change (criterion #1).",
+      "Branch has zero commits beyond base -> not recorded as a landed success, base unchanged (criterion #2).",
+      "A non-git/non-code task with the no-op predicate -> reaches DONE on the first attempt with no spurious retry (criterion #3).",
+      "Concurrency/exactly-once: a re-driven non-landable DONE must not mint a double-run -- respects post-4dc477b claim/lease semantics (criterion #4).",
+      "Never-commits task -> exhausts max-retries and surfaces FAILED with a recorded reason, no infinite loop (criterion #4 bound).",
+      "Committed change -> lands via the unchanged submit path; existing held-out-gate ordering preserved (criterion #5)."
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "landable-change-predicate",
+  "goal": "The landing strategy exposes a landability predicate that reports whether a finished run produced a committed, non-empty change against its base, which non-git strategies answer affirmatively by default.",
+  "tags": ["worktree", "orchestrator", "spec-00061", "landing-gate"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "gate" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00061-FEATURE-landable-change-gate.md -- criteria #2, #3, #6 and decisions D-1, D-3; the predicate-seam layer",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_strategy.py -- the SubmitStrategy structural protocol; add the optional landability predicate as a new hook with a default that reports landable",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter; lift the existing porcelain (git status --porcelain, ~line 518) and commit-count (_commit_count, git rev-list --count base..branch, ~line 534/685) checks into a non-mutating inspection the predicate calls",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- GitPullRequestSubmitter inherits the same predicate",
+      "packages/flywheel-worktree/tests/ and packages/flywheel-orchestrator/tests/ -- add predicate unit tests here; keep existing suites green"
+    ],
+    "constraints": [
+      "The predicate is read-only: it inspects the worktree/branch and returns a verdict; it must NOT mutate, merge, park, rebase, or clean up. The existing submit() landing logic is unchanged.",
+      "A non-git strategy (no diff notion) inherits a default predicate that reports landable, so non-code task classes are unaffected.",
+      "Keep flywheel-core pure and the orchestrator git-free: the predicate's git inspection lives only in the worktree strategy module (D-1).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT wire the predicate into the orchestrator run loop yet -- that is landable-change-gate.",
+      "Do NOT change submit()'s park/merge/rebase behavior.",
+      "Do not modify existing test assertions; add new tests only."
+    ],
+    "edge_cases": [
+      "Committed, non-empty diff vs base -> predicate reports landable.",
+      "Clean tree but zero commits beyond base (empty diff) -> not landable.",
+      "Dirty tree (uncommitted modifications or untracked files) -> not landable.",
+      "A SubmitStrategy with no git/diff notion -> default predicate reports landable (no-op), proving non-code classes opt out (criterion #3)."
+    ]
+  }
+}

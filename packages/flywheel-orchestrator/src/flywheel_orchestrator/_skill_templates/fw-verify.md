@@ -1,7 +1,7 @@
 ---
 name: fw-verify
 description: Blind-author the discriminating held-out test ORACLE for fw-plan's tasks before execute, so the agent being graded never writes the test that grades it
-argument-hint: [NNNNN-FEATURE-name, a phase dir, one or more task ids, or empty for the latest plan]
+argument-hint: '[NNNNN-FEATURE-name, a phase dir, one or more task ids, or empty for the latest plan]'
 ---
 <!-- managed-by: flywheel init -->
 

@@ -1,7 +1,7 @@
 ---
 name: fw-improve
 description: Turn cited loop-retro findings into ranked, scoped improvement proposals, each ending in a handoff to /fw-spec, /fw-plan, or accept -- do not fix
-argument-hint: [retro name, path, "all", or empty for the most recent]
+argument-hint: '[retro name, path, "all", or empty for the most recent]'
 ---
 <!-- managed-by: flywheel init -->
 

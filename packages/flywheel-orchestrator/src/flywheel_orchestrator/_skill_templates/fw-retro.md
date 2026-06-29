@@ -1,7 +1,7 @@
 ---
 name: fw-retro
 description: Forensic audit of how the loop executed a phase; every finding carries a re-runnable CLI pointer and stops at diagnosis
-argument-hint: [phase-dir-name, task id, or empty for the most recent]
+argument-hint: '[phase-dir-name, task id, or empty for the most recent]'
 ---
 <!-- managed-by: flywheel init -->
 

@@ -1,0 +1,33 @@
+{
+  "id": "worker-concurrency-config",
+  "goal": "flywheel worker resolves its pool size from a [worker] concurrency setting and a --concurrency flag (the flag overriding the config, default 1), and rejects any resolved value below 1 by exiting non-zero with an error naming the setting before any task is claimed.",
+  "tags": ["worktree", "orchestrator", "spec-00060", "concurrency", "config"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "gate" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00060-FEATURE-worker-concurrency-pool.md -- criteria #1, #5, #6 and decisions D-1, D-4 this task implements",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy (around line 367) and the section-parsing pattern for [autopilot]/[execution]; add a [worker] table with a `concurrency` field, default 1, mirroring these",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the argparse block (around line 1191) and main(); add --concurrency and resolve flag-over-config",
+      "docs/configuration.md -- the flywheel.toml reference; document [worker] concurrency",
+      "packages/flywheel-orchestrator/tests/ and packages/flywheel-worktree/tests/ -- keep green; add the resolver and validation tests here"
+    ],
+    "constraints": [
+      "[worker] concurrency defaults to 1 (an absent section means 1); --concurrency overrides the config value; the resolved value is what the worker uses.",
+      "A resolved concurrency < 1 (0, negative, or non-integer) exits non-zero with a message naming the concurrency setting and claims no task (no lifecycle or claim row created).",
+      "Add the [worker] field to WorkPolicy and update every caller that constructs or validates WorkPolicy in this same change.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT build the worker pool or spawn multiple workers here -- that is worker-concurrency-pool. This task only resolves and validates the value; resolving N>1 may still run a single worker for now.",
+      "Do not modify existing test assertions; add new tests only.",
+      "Do not change lease, claim, or landing behavior."
+    ],
+    "edge_cases": [
+      "concurrency unset resolves to 1 (back-compat, criterion #1).",
+      "config concurrency=3 with --concurrency 1 resolves to 1, and config=1 with --concurrency 3 resolves to 3 (flag wins, criterion #5 precedence).",
+      "--concurrency 0 / -2 / non-integer exits non-zero, names the setting, and creates zero claims (criterion #6); a silent clamp to 1 must fail the test."
+    ]
+  }
+}

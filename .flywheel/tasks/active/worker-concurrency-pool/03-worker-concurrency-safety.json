@@ -1,0 +1,33 @@
+{
+  "id": "worker-concurrency-safety",
+  "goal": "Under the worker pool, every task executes and lands exactly once and only after re-verifying against the exact base it lands on, and a pool of size 1 behaves identically to today's single serial worker.",
+  "prerequisites": ["worker-concurrency-pool"],
+  "tags": ["worktree", "orchestrator", "spec-00060", "concurrency", "safety"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "gate" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00060-FEATURE-worker-concurrency-pool.md -- criteria #1, #4, #10 (the held-out safety spine)",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- test_fresh_selection_rechecks_terminal_state_under_claim (commit 4dc477b): the deterministic interleaving harness to model the exactly-once stress proof",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the submit-time rebase / merge-flock landing path that serializes base merges and re-runs command graders",
+      "packages/flywheel-worktree/tests/ and packages/flywheel-orchestrator/tests/ -- add the exactly-once, concurrent-landing, and N=1 back-compat tests here; keep the rest green"
+    ],
+    "constraints": [
+      "Add a deterministic (not load-dependent) stress test: M independent tasks through a pool of N with induced overlap; assert each task has exactly one DONE run and the union covers all M, none twice (criterion #4).",
+      "Add a concurrent-landing test: pool N=2, two tasks each committing a distinct graded change; assert both land, the post-drain base contains both changes, and the full suite is green on the landed base (criterion #10).",
+      "Add a back-compat test: a pool of size 1 keeps at most one task in_progress at any instant over a multi-task drain (criterion #1).",
+      "If a proof reveals the pool violates exactly-once or serialized landing, fix the pool to satisfy the invariant -- never weaken the test.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not weaken or delete any assertion to make a test pass; exactly-once and serialized landing are out-of-band truth (the spec's must-not-regress).",
+      "Do not parallelize landing or change D-3."
+    ],
+    "edge_cases": [
+      "The #4 test must induce real overlap (a slow or barriered invoke), not rely on machine load; tasks too fast to overlap must not count as a pass.",
+      "#10: a lost-update or partial/interleaved merge under concurrent completion must fail the test.",
+      "#1: a size-1 pool that runs two tasks at once must fail the test."
+    ]
+  }
+}

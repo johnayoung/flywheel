@@ -1,0 +1,38 @@
+{
+  "id": "worker-concurrency-pool",
+  "goal": "A single flywheel worker invocation runs up to N tasks simultaneously and never more than N, idles surplus workers cleanly when fewer tasks are ready, restarts a crashed pool member so its task is reclaimed and completes exactly once, and on stop leaves no orphaned worker or agent/MCP child process.",
+  "prerequisites": ["worker-concurrency-config"],
+  "tags": ["worktree", "orchestrator", "spec-00060", "concurrency"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "gate" }
+  ],
+  "context": {
+    "relevant": [
+      ".flywheel/specs/00060-FEATURE-worker-concurrency-pool.md -- criteria #2, #3, #5, #7, #8, #9 and decisions D-2, D-5",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- run loop and main() (around line 1392); the existing per-process worker and the group-kill supervisor model; build the pool supervisor here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- orchestrate(): each pool member calls it with a distinct worker_id; the lease/claim and sweep_expired_claims reclaim path used for crash recovery",
+      "packages/flywheel-orchestrator/tests/test_supervisor_group_shutdown.py -- mirror this SIGTERM-ignoring child+grandchild pattern for the pool no-orphan proof (#9)",
+      "packages/flywheel-worktree/tests/ -- keep green; add the pool concurrency, surplus, crash-restart, and shutdown tests here"
+    ],
+    "constraints": [
+      "From one invocation, supervise up to N concurrent single-task workers, each with a distinct worker-id and its own worktree, against the one shared store. N is the resolved concurrency from worker-concurrency-config.",
+      "At most N tasks are in_progress at any instant; with fewer than N ready tasks the surplus workers idle without error and without double-claiming.",
+      "A pool member that dies mid-task is respawned to restore the pool to N; the dead task's lease expires and is reclaimed by a live worker and reaches exactly one DONE run.",
+      "Stopping the pool (SIGTERM, --once completion, or console quit) terminates every worker subprocess and its agent/MCP children with no orphan, reusing the group-kill supervisor model (commit 36a0622).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT parallelize landing -- base merges stay serialized through the existing repo merge-flock (D-3).",
+      "Do NOT weaken the exactly-once or lease/claim logic to fit the pool; the safety proofs land in worker-concurrency-safety.",
+      "Do not modify existing test assertions; add new tests only."
+    ],
+    "edge_cases": [
+      "N=3 with 3 prereq-free tasks: a barrier-style test where each invoke blocks until 3 are concurrently in_progress proves real overlap (criterion #2); N processes that serialize must fail it.",
+      "N=2 with 5 ready tasks: the maximum simultaneous in_progress count is exactly 2, never 3 (criterion #3).",
+      "N=4 with 1 ready task: it completes once, the worker exits 0 in --once mode, and there is no crash or busy-spin (criterion #7).",
+      "Inject a hard exit in one member mid-task: the pool returns to N and the task reaches exactly one DONE run (criterion #8); zero or two runs must fail.",
+      "Pool of N members each with a SIGTERM-ignoring child+grandchild: after stop, zero descendant processes survive (criterion #9).",
+      "The resolved --concurrency value flows through to the actual pool size (criterion #5 behavioral effect)."
+    ]
+  }
+}

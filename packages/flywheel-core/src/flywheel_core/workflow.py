@@ -411,6 +411,18 @@ def _compose_message_observers(
     return _combined
 
 
+#: The highest-priority ``--settings`` layer injected onto every
+#: flywheel-driven agent (spec 00063): it disables Claude Code's default
+#: ``Co-Authored-By: Claude`` / ``Generated with Claude Code`` git trailer.
+#: flywheel commits are authored by the worker identity, so the AI-attribution
+#: trailer is unwanted noise that also violates operators' commit-hygiene
+#: rules; suppressing it at the source is preventive (the agent never writes
+#: it) rather than rewriting committed history at land time. The SDK consumes
+#: this JSON string as an inline settings layer (``--settings``), which
+#: overrides the user/project ``includeCoAuthoredBy`` default.
+_NO_COAUTHOR_SETTINGS = json.dumps({"includeCoAuthoredBy": False})
+
+
 def build_agent_options(
     sandbox: Path,
     *,
@@ -439,7 +451,10 @@ def build_agent_options(
     reproduce today's construction byte-for-byte (SC-1): an empty tool/MCP
     tuple, ``setting_sources=None`` (the SDK derives ``["user", "project"]``
     from ``skills="all"``), and ``mcp_strict=False`` leave those fields at
-    their SDK defaults rather than setting them explicitly.
+    their SDK defaults rather than setting them explicitly. The one always-on
+    exception is ``settings`` (:data:`_NO_COAUTHOR_SETTINGS`, spec 00063): the
+    inline ``--settings`` layer that suppresses the AI co-author git trailer on
+    every agent commit.
 
     ``exec_enabled`` maps onto the SDK ``sandbox`` bash-isolation setting
     (``SandboxSettings``): when enabled, ``sandbox`` becomes
@@ -463,6 +478,10 @@ def build_agent_options(
         skills=list(skills) if isinstance(skills, tuple) else skills,
         max_turns=max_turns,
         model=model,
+        # Always-on: suppress the AI co-author git trailer (spec 00063). This
+        # is the one field deliberately NOT omit-on-unset -- flywheel's standing
+        # policy is that agent commits carry no Co-Authored-By attribution.
+        settings=_NO_COAUTHOR_SETTINGS,
     )
     if allowed_tools:
         kwargs["allowed_tools"] = list(allowed_tools)

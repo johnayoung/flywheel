@@ -15,6 +15,7 @@ primitives in ``run_task_object`` and threaded down, exactly as ``model`` alread
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TypedDict
 
@@ -83,3 +84,12 @@ def test_max_turns_and_model_thread() -> None:
     )
     assert opts.max_turns == 7
     assert opts.model == "claude-opus-4-8"
+
+
+def test_agent_options_suppress_coauthor_trailer() -> None:
+    # Spec 00063: every flywheel-driven agent carries an inline --settings layer
+    # disabling Claude Code's Co-Authored-By git trailer, so agent commits never
+    # add AI attribution to the operator's history.
+    opts = build_agent_options(Path("/tmp/sbx"), model=None, max_turns=500, **FAST)
+    assert opts.settings is not None
+    assert json.loads(opts.settings)["includeCoAuthoredBy"] is False

@@ -47,10 +47,12 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from collections.abc import Mapping
-from typing import Callable, Iterator, Protocol, Sequence, TextIO
+from typing import IO, Callable, Iterator, Protocol, Sequence, TextIO
+from uuid import uuid4
 
 from flywheel_core import (
     CommandGrader,
@@ -99,6 +101,20 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 # cross-cycle backstop that replaces the bash SPAWN_FAILURES circuit breaker.
 MAX_CONSECUTIVE_CYCLE_FAILURES = 5
 CYCLE_FAILURE_BACKOFF_SECONDS = 10
+
+# Worker-pool supervision (spec 00060). How long the pool's group shutdown
+# gives each member's SIGTERM window before escalating to SIGKILL, and how
+# often the supervise loop polls members for exit. The stop timeout mirrors the
+# console worker supervisor (commit 36a0622); the poll interval is short so a
+# stop signal or a member crash is noticed promptly without busy-spinning.
+DEFAULT_POOL_STOP_TIMEOUT_SECONDS = 10.0
+POOL_SUPERVISE_POLL_SECONDS = 0.2
+# Per-slot restart budget: a member that keeps crashing (e.g. a misconfigured
+# environment, not a flaky task) is respawned at most this many times before
+# the pool gives up and exits non-zero for operator inspection. The per-task
+# retry ceiling lives in the lease/lifecycle machinery (D-2); this is the
+# cross-restart backstop that keeps a crash-loop from spinning forever.
+MAX_POOL_RESTARTS_PER_SLOT = 5
 
 
 Logger = Callable[[str], None]
@@ -1083,6 +1099,376 @@ def run_once(
     return report
 
 
+# --- worker pool supervisor (spec 00060) ------------------------------------
+
+
+@dataclass
+class _PoolMember:
+    """One supervised pool member: a single-task worker subprocess.
+
+    ``proc`` is its own session leader (``start_new_session=True``), so its
+    agent/MCP children share its process group and a group signal reaches the
+    whole subtree (the orphan-free-shutdown guarantee, commit 36a0622).
+    ``log_handle`` is the redirected stdout/stderr sink (``None`` when output is
+    inherited); ``log_path`` is kept for forensics after the handle closes.
+    """
+
+    slot: int
+    worker_id: str
+    proc: subprocess.Popen[bytes]
+    log_handle: IO[bytes] | None
+    log_path: Path | None
+
+
+class WorkerPool:
+    """Supervise up to ``size`` single-task worker subprocesses from one
+    ``flywheel worker`` invocation (spec 00060, decision D-5).
+
+    Each pool member is its own OS process in its own session, running
+    ``flywheel worker --concurrency 1`` with a distinct ``--worker-id`` against
+    the one shared store. Per-task leases keep members off the same task and the
+    repo merge-flock serializes their landings, so ``size`` members give up to
+    ``size`` tasks executing at once and never more (criteria #2/#3). Surplus
+    members find nothing claimable and idle -- or, in ``--once`` mode, drain and
+    exit 0 -- without double-claiming (#7).
+
+    Crash policy is restart-and-reclaim (D-2): a member that exits non-zero is
+    respawned so the live pool returns to ``size``, and its in-flight task's
+    lease lapses (or, on a same-worker-id respawn, is reclaimed immediately) so
+    a live member finishes it exactly once (#8). Per-slot restarts are bounded
+    so a member that crashes instantly cannot spin forever.
+
+    Shutdown reuses the group-kill supervisor model: each member is a session
+    leader whose agent/MCP children share its process group, so :meth:`stop`
+    signals every member's whole group (SIGTERM, then SIGKILL on the survivors
+    after the stop window) and returns with nothing left alive (#9).
+
+    ``spawn_member`` maps a member's worker id to the argv that launches it,
+    keeping the production worker entrypoint and the test substitute (a trivial
+    child) on the same supervision path. Construction spawns nothing; call
+    :meth:`run_supervised` to drive the pool, or drive :meth:`start` /
+    :meth:`_supervise_tick` / :meth:`stop` directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        spawn_member: Callable[[str], Sequence[str]],
+        log: Logger,
+        once: bool,
+        prefix: str = "pool",
+        log_dir: Path | None = None,
+        env: Mapping[str, str] | None = None,
+        stop_timeout: float = DEFAULT_POOL_STOP_TIMEOUT_SECONDS,
+        poll_interval: float = POOL_SUPERVISE_POLL_SECONDS,
+        max_restarts_per_slot: int = MAX_POOL_RESTARTS_PER_SLOT,
+    ) -> None:
+        if size < 1:
+            raise ValueError(f"worker pool size must be >= 1, got {size}")
+        self._size = size
+        self._spawn_member = spawn_member
+        self._log = log
+        self._once = once
+        self._prefix = prefix
+        self._log_dir = log_dir
+        self._env = dict(env) if env is not None else None
+        self._stop_timeout = stop_timeout
+        self._poll_interval = poll_interval
+        self._max_restarts = max(max_restarts_per_slot, 0)
+        self._members: dict[int, _PoolMember] = {}
+        self._retired: set[int] = set()
+        self._restarts: dict[int, int] = {}
+        self._stop_requested = False
+        self._stopped = False
+        self._exit_code = 0
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def run_supervised(self) -> int:
+        """Spawn the pool, supervise it, and return the process exit code.
+
+        Installs the SIGTERM/SIGINT shutdown handler, spawns ``size`` members,
+        then loops: in ``--once`` mode it returns 0 once every member has
+        drained and exited cleanly; as a daemon it runs until a stop signal.
+        Either way the ``finally`` group-kills every surviving member so the
+        invocation never leaves an orphan behind.
+        """
+        self._arm_signals()
+        try:
+            self.start()
+            while not self._stop_requested:
+                if self._once and self.is_done():
+                    break
+                time.sleep(self._poll_interval)
+                self._supervise_tick()
+            return self._exit_code
+        finally:
+            self.stop()
+
+    def start(self) -> None:
+        """Spawn one member into every not-yet-filled, not-retired slot."""
+        for slot in range(self._size):
+            if slot not in self._members and slot not in self._retired:
+                self._spawn_slot(slot)
+
+    def is_done(self) -> bool:
+        """``--once`` only: every slot has drained and exited cleanly."""
+        return self._once and len(self._retired) >= self._size
+
+    def live_member_pids(self) -> list[int]:
+        """PIDs of members currently alive (a running ``poll()``)."""
+        return [
+            m.proc.pid
+            for m in self._members.values()
+            if m.proc.poll() is None
+        ]
+
+    def _supervise_tick(self) -> None:
+        """One supervision pass: reap exited members, retire cleanly drained
+        ``--once`` members, and respawn crashed ones (bounded per slot)."""
+        for slot in range(self._size):
+            if slot in self._retired:
+                continue
+            member = self._members.get(slot)
+            if member is None:
+                continue
+            code = member.proc.poll()
+            if code is None:
+                continue  # still running
+            self._reap(member)
+            if code == 0 and self._once:
+                # Clean drain: this slot is done, do not respawn (else the pool
+                # would never terminate in --once mode).
+                self._retired.add(slot)
+                self._members.pop(slot, None)
+                self._log(
+                    f"pool member {member.worker_id} drained (exit 0)"
+                )
+                continue
+            # Non-zero exit, or an unexpected daemon-mode exit: restart-and-
+            # reclaim to restore the pool to size (D-2). The dead member's task
+            # is reclaimed by a live worker via the existing lease machinery.
+            if self._restarts.get(slot, 0) >= self._max_restarts:
+                self._log(
+                    f"pool member {member.worker_id} exceeded "
+                    f"{self._max_restarts} restarts (last exit {code}); "
+                    f"giving up"
+                )
+                self._members.pop(slot, None)
+                self._exit_code = 1
+                self._stop_requested = True
+                return
+            self._restarts[slot] = self._restarts.get(slot, 0) + 1
+            self._log(
+                f"pool member {member.worker_id} exited {code}; respawning "
+                f"(restart {self._restarts[slot]}/{self._max_restarts})"
+            )
+            self._spawn_slot(slot)
+
+    def stop(self, *, timeout: float | None = None) -> None:
+        """Group-kill every surviving member; idempotent.
+
+        Sends SIGTERM to each live member's process group first (a shared
+        graceful window so the pool does not pay ``timeout`` per member), waits
+        out the window, then escalates the survivors to SIGKILL so the pool
+        always returns with nothing left alive -- no member, no agent, no MCP
+        child (#9). A force-killed member's lease simply lapses and another
+        worker reclaims its task.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        window = self._stop_timeout if timeout is None else timeout
+        live = [
+            m for m in self._members.values() if m.proc.poll() is None
+        ]
+        for member in live:
+            self._signal_group(member, signal.SIGTERM)
+        deadline = time.monotonic() + window
+        for member in live:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                member.proc.wait(timeout=remaining)
+        for member in live:
+            if member.proc.poll() is None:
+                self._signal_group(member, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    member.proc.wait(timeout=window)
+        for member in list(self._members.values()):
+            self._reap(member)
+        self._members.clear()
+
+    # ----- internals --------------------------------------------------------
+
+    def _arm_signals(self) -> None:
+        """Install the SIGTERM/SIGINT shutdown handler. The pool parent runs no
+        asyncio event loop, so (unlike the single-worker loop) the handler is
+        installed once and stays armed for the whole invocation."""
+
+        def _handler(signum: int, _frame: object) -> None:
+            self._stop_requested = True
+            self._log(
+                f"pool shutdown requested (signal {signum}); stopping members."
+            )
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ValueError):
+                signal.signal(sig, _handler)
+
+    def _spawn_slot(self, slot: int) -> None:
+        worker_id = f"{self._prefix}-{slot}"
+        argv = list(self._spawn_member(worker_id))
+        log_handle, log_path = self._open_member_log(worker_id)
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=log_handle if log_handle is not None else None,
+                stderr=(
+                    subprocess.STDOUT if log_handle is not None else None
+                ),
+                env=(
+                    self._env if self._env is not None else os.environ.copy()
+                ),
+                # Own session so each member's agent/MCP children share its
+                # process group and a group signal takes the whole subtree
+                # down; also so a Ctrl+C on the console terminal does not reach
+                # members behind the pool's back.
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError):
+            if log_handle is not None:
+                with contextlib.suppress(OSError):
+                    log_handle.close()
+            raise
+        self._members[slot] = _PoolMember(
+            slot=slot,
+            worker_id=worker_id,
+            proc=proc,
+            log_handle=log_handle,
+            log_path=log_path,
+        )
+        self._log(f"pool member {worker_id} spawned pid={proc.pid}")
+
+    def _open_member_log(
+        self, worker_id: str
+    ) -> tuple[IO[bytes] | None, Path | None]:
+        if self._log_dir is None:
+            return None, None
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        path = self._log_dir / f"pool-{worker_id}-{ts}.log"
+        return open(path, "ab", buffering=0), path
+
+    def _signal_group(self, member: _PoolMember, sig: int) -> bool:
+        """Signal a member's whole process group; ``False`` if it is gone.
+
+        The member is a session leader, so its pgid equals its pid and the
+        signal reaches every descendant it spawned.
+        """
+        try:
+            pgid = os.getpgid(member.proc.pid)
+        except ProcessLookupError:
+            return False
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def _reap(self, member: _PoolMember) -> None:
+        if member.log_handle is not None:
+            with contextlib.suppress(OSError):
+                member.log_handle.close()
+            member.log_handle = None
+
+
+def _pool_member_argv(
+    args: argparse.Namespace, worker_id: str, *, model: str | None
+) -> list[str]:
+    """Compose the argv for one pool member: this same worker, re-invoked at
+    ``--concurrency 1`` with a distinct ``--worker-id`` (spec 00060).
+
+    Every other run knob the operator passed is forwarded verbatim so a pool
+    member behaves exactly like a hand-launched single worker against the same
+    store; ``--concurrency 1`` is pinned explicitly so the member runs one task
+    at a time and never recurses into another pool, regardless of config.
+    """
+    argv = [
+        sys.executable,
+        "-m",
+        "flywheel_worktree.worker",
+        "--concurrency",
+        "1",
+        "--worker-id",
+        worker_id,
+        "--max-turns",
+        str(args.max_turns),
+        "--max-retries",
+        str(args.max_retries),
+        "--worktree-retention-days",
+        str(args.worktree_retention_days),
+        "--heartbeat",
+        str(args.heartbeat),
+        "--poll-interval",
+        str(args.poll_interval),
+        "--lease-seconds",
+        str(args.lease_seconds),
+        "--reconcile-seconds",
+        str(args.reconcile_seconds),
+    ]
+    if args.tasks_dir is not None:
+        argv.extend(["--tasks-dir", str(args.tasks_dir)])
+    if args.db is not None:
+        argv.extend(["--db", str(args.db)])
+    if model is not None:
+        argv.extend(["--model", str(model)])
+    if args.once:
+        argv.append("--once")
+    return argv
+
+
+def _run_pool(
+    args: argparse.Namespace,
+    *,
+    concurrency: int,
+    model: str | None,
+    db_path: Path,
+    worker_id: str | None,
+    log: Logger,
+) -> int:
+    """Drive a :class:`WorkerPool` of ``concurrency`` single-task members.
+
+    The members share the one store at ``db_path`` and land through the same
+    merge-flock as a hand-launched fleet would; this only supervises them from
+    one invocation. The pool's worker-id prefix is the operator's
+    ``--worker-id`` when given (so members read ``<id>-0``, ``<id>-1``, ...),
+    else a fresh per-invocation prefix, keeping every member's id distinct so
+    claims attribute to the right worker.
+    """
+    prefix = worker_id or f"pool-{uuid4().hex[:8]}"
+
+    def spawn_member(member_id: str) -> list[str]:
+        return _pool_member_argv(args, member_id, model=model)
+
+    pool = WorkerPool(
+        size=concurrency,
+        spawn_member=spawn_member,
+        log=log,
+        once=bool(args.once),
+        prefix=prefix,
+        log_dir=db_path.parent / "logs" / "worker",
+    )
+    log(
+        f"started worker pool size={concurrency} prefix={prefix} "
+        f"once={bool(args.once)} pid={os.getpid()}"
+    )
+    return pool.run_supervised()
+
+
 # --- CLI / daemon -----------------------------------------------------------
 
 
@@ -1471,6 +1857,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Spec 00060 (D-5): a resolved concurrency > 1 means this invocation is the
+    # pool supervisor, not a worker -- it spawns N single-task members (each
+    # re-invoking this module at --concurrency 1) against the one shared store
+    # and supervises them. The concurrency == 1 path below is the unchanged
+    # single-worker daemon a pool member itself runs.
+    if concurrency > 1:
+        return _run_pool(
+            args,
+            concurrency=concurrency,
+            model=model,
+            db_path=db_path,
+            worker_id=args.worker_id,
+            log=log,
+        )
 
     protected_paths = policy.protected_paths if policy else ()
     setup_command = policy.sandbox_setup if policy else None

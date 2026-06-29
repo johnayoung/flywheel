@@ -722,6 +722,7 @@ async def run_task_object(
     events: str = EVENTS_NONE,
     source: str | None = None,
     sink: TelemetrySink | None = None,
+    landability_gate: Callable[[], str | None] | None = None,
 ) -> HarnessOutcome:
     """Persist a lifecycle for ``task`` and drive it via ``run_task``.
 
@@ -753,6 +754,12 @@ async def run_task_object(
     the database (``<db dir>/logs`` — the spec 00025 default of
     ``.flywheel/logs`` for the default db path), writing one JSONL file
     per run under ``logs/runs/``.
+
+    ``landability_gate`` is forwarded verbatim onto
+    :attr:`HarnessConfig.landability_gate` (spec 00061): a git-free opaque
+    callback the orchestrator supplies so a non-landable finished change is
+    re-driven by bounded retry instead of landing as ``DONE``. ``None`` (the
+    default) disables the gate, byte-identical to today.
     """
     out = stream if stream is not None else sys.stderr
     # ``source`` rides the lifecycle into the LifecycleInitialized seed so
@@ -889,6 +896,7 @@ async def run_task_object(
                     agent_context=agent_context,
                     worktree=sandbox,
                     grader_env=grader_env,
+                    landability_gate=landability_gate,
                 ),
                 invoke=invoker,
                 sink=run_sink,

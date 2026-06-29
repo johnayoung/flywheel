@@ -123,6 +123,7 @@ from flywheel_orchestrator._strategy import (
     SubmitStrategy,
     Submitter,
     _as_handle,
+    probe_landability,
 )
 from flywheel_orchestrator._workflow import (
     TaskState,
@@ -758,6 +759,12 @@ async def orchestrate(
             )
         prepare_sandbox = strategy.prepare_sandbox
         submit = strategy.submit
+    # The landability probe (spec 00061) is the strategy itself: a git-aware
+    # strategy implements the optional ``is_landable`` predicate, a non-git
+    # strategy does not and is treated as always-landable by
+    # ``probe_landability``. ``None`` when the caller wired the bare
+    # prepare/submit callables (no bundled strategy), which keeps the gate off.
+    landability_probe = strategy if strategy is not None else None
     clock = now or _utcnow
     wid = worker_id or f"worker-{uuid4().hex[:8]}"
     # This worker's advertised capability set (spec 00049, decision D-2):
@@ -947,6 +954,7 @@ async def orchestrate(
                         db_path=db_path,
                         sandbox=sandbox,
                         submit=submit,
+                        landability_probe=landability_probe,
                         teardown=handle.teardown,
                         work_source=source,
                         held_out_source=held_out_source,
@@ -1156,6 +1164,7 @@ async def orchestrate(
                     db_path=db_path,
                     sandbox=sandbox,
                     submit=submit,
+                    landability_probe=landability_probe,
                     teardown=handle.teardown,
                     work_source=source,
                     held_out_source=held_out_source,
@@ -1271,6 +1280,7 @@ async def _drive_under_lease(
     db_path: Path,
     sandbox: Path,
     submit: Submitter | None,
+    landability_probe: object | None,
     teardown: Callable[[], None] | None,
     work_source: WorkSource,
     held_out_source: HeldOutGraderSource | None,
@@ -1328,6 +1338,42 @@ async def _drive_under_lease(
     the schedule.
     """
     task_id = row.task.id
+    # Landable-change gate (spec 00061, D-1/D-2): the orchestrator owns the
+    # gate but stays git-unaware. It hands the harness a git-free closure
+    # consulted at the verify-passed VALIDATING -> DONE boundary; the closure
+    # asks the bundled strategy's read-only landability predicate whether the
+    # finished change is landable. A non-empty reason re-drives the run via the
+    # harness's own max_retries machinery (FAILED_VALIDATION, against the same
+    # base) instead of landing it as DONE; the unchanged submit path runs only
+    # for a landable (or no-op default) verdict. A strategy with no diff notion
+    # (non-git) is always-landable, so the closure returns None and DONE lands
+    # byte-identically. Probe errors fail open (return None): a buggy predicate
+    # must never block landing -- submit's existing park logic is the fallback.
+    def _landability_gate() -> str | None:
+        request = SubmitRequest(
+            task_id=task_id,
+            task_file=row.task_file,
+            task=row.task,
+            run_id=run_id or "",
+            status=Status.DONE,
+            sandbox=sandbox,
+            source_ref=row.source_ref,
+        )
+        try:
+            verdict = probe_landability(landability_probe, request)
+        except Exception as exc:  # noqa: BLE001 - probe is consumer code
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: landability probe failed "
+                    f"({type(exc).__name__}: {exc}); treating as landable",
+                    file=stream,
+                    flush=True,
+                )
+            return None
+        if verdict.landable:
+            return None
+        return verdict.reason or "no landable change"
+
     heartbeat = _ClaimHeartbeat(
         claims=claims,
         claim=claim,
@@ -1361,6 +1407,9 @@ async def _drive_under_lease(
             stream=stream,
             run_id=run_id,
             source=row.source_ref or None,
+            landability_gate=(
+                _landability_gate if landability_probe is not None else None
+            ),
         )
         # Projected once, shared by the consumer submit step and the
         # work-source report. Best-effort: a store hiccup costs the

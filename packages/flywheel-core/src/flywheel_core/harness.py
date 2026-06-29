@@ -421,6 +421,22 @@ class HarnessConfig:
     recovery summarizer instead of the runner's default fresh
     ``claude_agent_sdk.query`` invoker. Production callers leave it
     ``None``.
+
+    ``landability_gate`` is a git-free opaque consumer hook (spec 00061)
+    consulted exactly at the verify-passed ``VALIDATING -> DONE`` boundary,
+    after graders pass and before the run lands as a success. It is a
+    zero-argument callable returning ``None`` when the finished change is
+    landable (the run proceeds to ``DONE`` byte-identically to today) or a
+    non-empty *reason* string when it is not (an empty or uncommitted change
+    under a git landing strategy). On a reason, the harness does NOT land the
+    run as ``DONE``: it finalizes the attempt ``VALIDATION_FAILED`` and
+    transitions ``FAILED_VALIDATION`` so the existing ``max_retries`` machinery
+    re-drives the task against the same base, ending terminal ``FAILED`` (never
+    ``DONE``) with the reason recorded once the budget is exhausted. ``None``
+    (the default) disables the gate, byte-identical to today. Core stays
+    git-unaware: the orchestrator supplies the closure that calls the
+    strategy's landability predicate, the harness only consults the opaque
+    callback.
     """
 
     max_retries: int = 0
@@ -440,6 +456,7 @@ class HarnessConfig:
     context_recovery_trigger_ratio: float = 0.9
     max_context_recoveries: int = 1
     recovery_summarizer_invoke: SummarizerInvoke | None = None
+    landability_gate: Callable[[], str | None] | None = None
 
     def __post_init__(self) -> None:
         # Reject out-of-range ratio: must be in (0, 1]. Spec 00018
@@ -3521,6 +3538,43 @@ async def _validate(
                 gate=first_gate,
                 attempt_dir=attempt_dir,
                 clock=clock,
+            )
+            return
+        # Landable-change gate (spec 00061): the run has passed every
+        # automated grader and would land as DONE. Consult the optional
+        # git-free consumer hook FIRST. A non-empty reason means the change
+        # is not landable (empty/uncommitted under a git landing strategy);
+        # do not land it as a success — finalize VALIDATION_FAILED and route
+        # to FAILED_VALIDATION so the existing max_retries machinery re-drives
+        # the task against the same base, ending terminal FAILED (never DONE)
+        # once the budget is exhausted. ``None``/unset is byte-identical to
+        # the historical direct ``-> DONE`` path below.
+        landability_reason = (
+            config.landability_gate() if config.landability_gate else None
+        )
+        if landability_reason:
+            error = f"change not landable: {landability_reason}"
+            telemetry.emit(
+                kind="harness.landability_gate_blocked",
+                payload={"reason": landability_reason, "message": error},
+                attempt_number=attempt.number,
+            )
+            _finalize_attempt(
+                store=store,
+                telemetry=telemetry,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.VALIDATION_FAILED,
+                error=error,
+                agent_output=agent_output,
+                clock=clock,
+            )
+            _transition(
+                lifecycle,
+                Status.FAILED_VALIDATION,
+                store=store,
+                error=error,
+                now=clock,
             )
             return
         _finalize_attempt(

@@ -260,11 +260,22 @@ existing max-retries, never invents an unbounded loop).
   layers of defense — likelier-correct authoring plus a hard gate.
 
 ## Open Questions (accepted gaps)
-- The exact retry-routing mechanism (which non-terminal status/outcome the
-  orchestrator uses to re-drive a non-landable DONE without minting a double-run)
-  must be lowered against the post-4dc477b claim/lease semantics during `/fw-plan`;
-  criteria #1 and #4 are the held-out/visible proofs that pin it. Not a design gap —
-  a lowering detail.
+- ~~The exact retry-routing mechanism (which non-terminal status/outcome the
+  orchestrator uses to re-drive a non-landable DONE without minting a double-run)~~
+  **Resolved during implementation.** `run_task_object` runs the full retry loop
+  internally and persists a terminal DONE *before* the orchestrator's
+  `_drive_under_lease` observes the outcome; DONE is terminal-and-permanent
+  (`_has_done_lifecycle`), so routing *after* the orchestrator sees DONE could not
+  satisfy criterion #4 (terminal FAILED). The gate therefore runs one level lower,
+  at the harness's own verify-passed `VALIDATING -> DONE` boundary, via a git-free
+  opaque `HarnessConfig.landability_gate: Callable[[], str | None]`: the
+  orchestrator (which owns the gate and calls the strategy's `probe_landability`)
+  supplies the closure; a non-empty reason finalizes the attempt
+  `VALIDATION_FAILED` and transitions `FAILED_VALIDATION`, reusing the existing
+  `max_retries` machinery to re-drive against the same base and ending terminal
+  `FAILED` (reason recorded) on exhaustion. No double-run is minted because the
+  decision happens before DONE is ever written. Core and the orchestrator stay
+  git-unaware (criterion #6) — only the strategy predicate touches git.
 
 ## Future directions (not this spec)
 - **Cross-task coherence oracle (Gap 3).** A standing-invariant, repo-level

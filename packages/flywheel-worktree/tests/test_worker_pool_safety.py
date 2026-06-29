@@ -449,14 +449,31 @@ def test_single_worker_keeps_at_most_one_task_in_progress(
     for tid in task_ids:
         _task_file(repo, "01-phase", tid)
     db_path = repo / ".flywheel" / "flywheel.sqlite"
+    worktrees = repo / ".flywheel" / "worktrees"
 
     probe = _ConcurrencyProbe()
 
-    async def _invoke(_request: InvocationRequest) -> IterationResult:
+    def _task_of(prompt: str) -> str:
+        for tid in task_ids:
+            if f"Goal for {tid}." in prompt:
+                return tid
+        raise AssertionError(f"no known task id in prompt: {prompt[:80]!r}")
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
         probe.enter()
         try:
             # Dwell so any concurrent entry would overlap here and lift the peak.
             await asyncio.sleep(0.02)
+            # Commit a per-task file so the change is landable under the
+            # landable-change gate (spec 00061); this test is about concurrency,
+            # not landability, so it must produce a real commit to reach DONE.
+            task_id = _task_of(request.prompt)
+            _commit(
+                worktrees / task_id,
+                f"{task_id}.txt",
+                f"{task_id} body\n",
+                f"add {task_id}.txt",
+            )
         finally:
             probe.leave()
         return _verify_result()

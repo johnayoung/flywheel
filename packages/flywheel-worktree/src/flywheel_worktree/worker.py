@@ -67,6 +67,7 @@ from flywheel_orchestrator import (
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
     HeldOutGraderSource,
+    LandabilityVerdict,
     OrchestratorReport,
     PolicyError,
     SandboxRequest,
@@ -500,6 +501,46 @@ class GitWorktreeSubmitter:
                 f"submit error for {req.task_id} ({type(exc).__name__}: "
                 f"{exc}); worktree left parked at {self._worktree(req.task_id)}"
             )
+
+    def is_landable(self, req: SubmitRequest) -> LandabilityVerdict:
+        """Report whether the run produced a committed, non-empty change.
+
+        The :data:`~flywheel_orchestrator.LandabilityProbe` hook (spec 00061,
+        decision D-3): a change is landable iff the worktree is clean (no
+        uncommitted modifications or untracked files) and there is at least one
+        commit with a non-empty diff against the branch's base. It reuses the
+        exact ``git status --porcelain`` + ``git rev-list --count base..branch``
+        inspections :meth:`_submit` lands on.
+
+        Strictly read-only: it inspects the worktree/branch and returns a
+        verdict; it never mutates, merges, parks, rebases, or cleans up — the
+        landing decisions stay in :meth:`submit`. The orchestrator calls this at
+        the post-run ``Status.DONE`` site, before ``submit``.
+        """
+        phase = phase_of_task_file(req.task_file, self.tasks_dir)
+        worktree = self._worktree(req.task_id)
+        branch = self._branch(req.task_id, phase)
+
+        porcelain = _git(worktree, "status", "--porcelain").stdout
+        if porcelain.strip():
+            return LandabilityVerdict(
+                landable=False,
+                reason=(
+                    f"uncommitted changes in the worktree on {branch}: the "
+                    f"agent finished without committing its edits"
+                ),
+            )
+
+        if self._commit_count(branch) == 0:
+            return LandabilityVerdict(
+                landable=False,
+                reason=(
+                    f"no commits beyond {self.phase_base} on {branch}: the "
+                    f"run produced an empty diff against its base"
+                ),
+            )
+
+        return LandabilityVerdict(landable=True)
 
     def _submit(self, req: SubmitRequest) -> None:
         task_id = req.task_id

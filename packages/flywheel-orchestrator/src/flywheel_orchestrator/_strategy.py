@@ -155,6 +155,65 @@ SandboxProvider = Callable[[SandboxRequest], "Path | SandboxHandle"]
 Submitter = Callable[[SubmitRequest], None]
 
 
+@dataclass(frozen=True, kw_only=True)
+class LandabilityVerdict:
+    """A landing strategy's read-only verdict on a finished run's change.
+
+    Supplied by the optional :data:`LandabilityProbe.is_landable` hook so a
+    git-aware strategy can report whether the run produced a committed,
+    non-empty, landable change against its branch's base *before* the
+    orchestrator treats it as a landed success. The check is structural
+    (decision D-3 of spec 00061): ``landable`` is ``True`` iff the worktree is
+    clean (no uncommitted modifications or untracked files) and there is at
+    least one commit with a non-empty diff against the base.
+
+    ``reason`` names *why* a change is not landable (uncommitted tree, zero
+    commits) so the orchestrator can record it when it re-drives the run; it is
+    empty for a landable verdict. The probe is read-only — producing this
+    verdict must not mutate, merge, park, rebase, or clean up anything.
+    """
+
+    landable: bool
+    reason: str = ""
+
+
+#: The verdict a strategy with no diff notion (research/config, non-git)
+#: yields for everything it finishes: always landable, so non-code task
+#: classes opt out of the landable-change gate entirely (spec 00061 #3).
+LANDABLE = LandabilityVerdict(landable=True)
+
+
+@runtime_checkable
+class LandabilityProbe(Protocol):
+    """The optional landability hook a :class:`SubmitStrategy` may expose.
+
+    Structural and optional: a strategy that implements ``is_landable``
+    participates in the landable-change gate; one that does not (any strategy
+    with no notion of a diff) is treated as always-landable via
+    :func:`probe_landability`. Implementations MUST be read-only — they inspect
+    the sandbox/branch and return a verdict without mutating, merging, parking,
+    rebasing, or cleaning up. The ``request`` carries the same terminal-run
+    context as :meth:`SubmitStrategy.submit`.
+    """
+
+    def is_landable(self, request: SubmitRequest, /) -> LandabilityVerdict: ...
+
+
+def probe_landability(
+    strategy: object, request: SubmitRequest
+) -> LandabilityVerdict:
+    """Ask ``strategy`` whether ``request``'s finished run is landable.
+
+    The default-bearing seam: a strategy that implements
+    :data:`LandabilityProbe.is_landable` answers for itself; one that does not
+    (a non-git strategy, with no diff notion) inherits the :data:`LANDABLE`
+    default, so non-code task classes are unaffected by the gate.
+    """
+    if isinstance(strategy, LandabilityProbe):
+        return strategy.is_landable(request)
+    return LANDABLE
+
+
 @runtime_checkable
 class SubmitStrategy(Protocol):
     """One landing policy, bundled: provision the sandbox, land the outcome.
@@ -167,6 +226,11 @@ class SubmitStrategy(Protocol):
     worktree backend) or a :class:`SandboxHandle` (a container backend); the
     orchestrator adapts a ``Path`` to a handle. Pass one to
     ``orchestrate(strategy=...)`` instead of wiring the callables individually.
+
+    A strategy MAY additionally implement the optional
+    :data:`LandabilityProbe.is_landable` hook to report whether a finished run
+    produced a landable change; strategies that do not are treated as
+    always-landable by :func:`probe_landability`.
     """
 
     def prepare_sandbox(

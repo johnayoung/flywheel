@@ -88,12 +88,16 @@ from flywheel_orchestrator._orchestrate import (
     sync_work_source,
 )
 from flywheel_orchestrator._strategy import (
+    LANDABLE,
+    LandabilityProbe,
+    LandabilityVerdict,
     SandboxHandle,
     SandboxProvider,
     SandboxRequest,
     SubmitRequest,
     SubmitStrategy,
     Submitter,
+    probe_landability,
 )
 
 if TYPE_CHECKING:
@@ -297,6 +301,9 @@ __all__ = [
     "LiveRunRow",
     "LoopPathOptOut",
     "LoopPathOptOutError",
+    "LANDABLE",
+    "LandabilityProbe",
+    "LandabilityVerdict",
     "OrchestratorReport",
     "PG_DSN_ENV",
     "PG_DSN_FALLBACK_ENV",
@@ -342,6 +349,7 @@ __all__ = [
     "loop_base_ref",
     "open_sqlite_bound_store",
     "orchestrate",
+    "probe_landability",
     "phase_diff_vs_base",
     "read_phase_base",
     "reconcile_live_runs",

@@ -1057,6 +1057,15 @@ _GRADER_SOURCES: frozenset[str] = frozenset(
 #: Default turn budget for the real SDK-backed authoring invoker.
 DEFAULT_AUTHORING_MAX_TURNS: int = 120
 
+#: Commit-before-done discipline that ``/fw-plan`` bakes into hand-authored
+#: tasks (fw-plan template). The autopilot authoring prompt does not, so every
+#: emitted task gets it injected deterministically -- a task that finishes with
+#: uncommitted work is verified green against a dirty tree yet silently fails to
+#: land (the worker parks it). Phrasing mirrors the fw-plan example constraint.
+COMMIT_BEFORE_DONE_CONSTRAINT: str = (
+    "Commit the change with a clear message before reporting done"
+)
+
 
 @dataclass(frozen=True, kw_only=True)
 class EmittedTask:
@@ -1160,6 +1169,20 @@ def authoring_prompt(finding: Finding, repo_root: Path) -> str:
     )
 
 
+def _ensure_commit_before_done(task: Task) -> None:
+    """Inject the commit-before-done constraint on an authored task (in place).
+
+    Idempotent: a no-op when the task already carries a constraint mentioning a
+    commit, so an agent that authored its own commit discipline is not
+    duplicated. Constraints are advisory prompt text (the agent sees them under
+    ``## Constraints``); the hard enforcement is the landable-change gate.
+    """
+    constraints = task.context.constraints
+    if any("commit" in c.lower() for c in constraints):
+        return
+    constraints.append(COMMIT_BEFORE_DONE_CONSTRAINT)
+
+
 def _validate_task_entry(
     finding: Finding, entry: Any, repo_root: Path
 ) -> tuple[EmittedTask | None, str | None]:
@@ -1180,6 +1203,7 @@ def _validate_task_entry(
         return None, f"authored task failed validation: {exc}"
     if not task.graders:
         return None, "authored task carries no grader (criterion #1)"
+    _ensure_commit_before_done(task)
 
     authoritative = entry.get("authoritative_grader")
     if not isinstance(authoritative, str) or not authoritative.strip():

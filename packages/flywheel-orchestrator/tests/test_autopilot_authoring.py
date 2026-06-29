@@ -15,6 +15,7 @@ from pathlib import Path
 
 from flywheel_core.loaders import load_task_file, serialize_task
 from flywheel_orchestrator._autopilot import (
+    COMMIT_BEFORE_DONE_CONSTRAINT,
     GRADER_SOURCE_HELD_OUT,
     GRADER_SOURCE_REPO_COMMAND,
     Finding,
@@ -97,6 +98,85 @@ def test_emitted_task_loads_and_carries_grader(tmp_path: Path) -> None:
     out.write_text(json.dumps(serialize_task(emitted.task)))
     reloaded = load_task_file(out)
     assert reloaded.graders
+
+
+# --- Commit-before-done constraint parity (fw-plan) -------------------------
+
+
+def test_emitted_task_carries_commit_before_done_constraint(tmp_path: Path) -> None:
+    """An autopilot-emitted task gets the commit-before-done constraint injected.
+
+    The authoring prompt emits ``context: {}``; without injection the agent
+    finishes against an uncommitted tree and the worker silently parks the work.
+    The constraint must survive the serialize round-trip into the task file.
+    """
+    repo = _seed_repo(tmp_path)
+    response = _fenced(
+        {
+            "tasks": [
+                {
+                    "task": {
+                        "id": "test-parser",
+                        "goal": "The parser module is covered by tests.",
+                        "graders": [
+                            {"type": "command", "run": "pytest tests/test_existing.py"}
+                        ],
+                        "context": {},
+                    },
+                    "authoritative_grader": "pytest tests/test_existing.py",
+                    "grader_source": GRADER_SOURCE_REPO_COMMAND,
+                    "grader_target": "tests/test_existing.py",
+                }
+            ],
+            "dropped": "",
+        }
+    )
+    result = asyncio.run(
+        author_finding(_finding(), repo_root=repo, invoker=_scripted(response))
+    )
+    assert len(result.emitted) == 1
+    constraints = result.emitted[0].task.context.constraints
+    assert COMMIT_BEFORE_DONE_CONSTRAINT in constraints
+
+    # Survives serialization into the on-disk task file.
+    out = tmp_path / "emitted.json"
+    out.write_text(json.dumps(serialize_task(result.emitted[0].task)))
+    reloaded = load_task_file(out)
+    assert COMMIT_BEFORE_DONE_CONSTRAINT in reloaded.context.constraints
+
+
+def test_existing_commit_constraint_is_not_duplicated(tmp_path: Path) -> None:
+    """Injection is idempotent: an agent that authored its own commit discipline
+    keeps exactly its constraint, with no canonical line appended."""
+    repo = _seed_repo(tmp_path)
+    agent_constraint = "Commit each change atomically before reporting done"
+    response = _fenced(
+        {
+            "tasks": [
+                {
+                    "task": {
+                        "id": "test-parser",
+                        "goal": "The parser module is covered by tests.",
+                        "graders": [
+                            {"type": "command", "run": "pytest tests/test_existing.py"}
+                        ],
+                        "context": {"constraints": [agent_constraint]},
+                    },
+                    "authoritative_grader": "pytest tests/test_existing.py",
+                    "grader_source": GRADER_SOURCE_REPO_COMMAND,
+                    "grader_target": "tests/test_existing.py",
+                }
+            ],
+            "dropped": "",
+        }
+    )
+    result = asyncio.run(
+        author_finding(_finding(), repo_root=repo, invoker=_scripted(response))
+    )
+    assert len(result.emitted) == 1
+    constraints = result.emitted[0].task.context.constraints
+    assert constraints == [agent_constraint]
+    assert COMMIT_BEFORE_DONE_CONSTRAINT not in constraints
 
 
 # --- Criterion #8: authoritative grader is out-of-band, not self-authored ---

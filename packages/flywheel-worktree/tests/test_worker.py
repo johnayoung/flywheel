@@ -36,6 +36,7 @@ from flywheel_core import (
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
     FilesystemHeldOutGraderSource,
+    PolicyError,
     SandboxRequest,
     StoreConfigError,
     SubmitRequest,
@@ -787,6 +788,94 @@ def test_resolve_model_returns_none_when_policy_omits_agent(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "flywheel.toml").write_text('[source]\nkind = "directory"\n')
     assert worker._resolve_model(_args(model=None), load_effective_policy()) is None
+
+
+# --- concurrency resolution (spec 00060, criteria #5/#6) --------------------
+
+
+def _conc_args(concurrency: str | None = None) -> argparse.Namespace:
+    """An ``argparse.Namespace`` trimmed to the field
+    :func:`_resolve_concurrency` reads."""
+
+    return argparse.Namespace(concurrency=concurrency)
+
+
+def test_resolve_concurrency_defaults_to_one_without_policy_or_flag() -> None:
+    """No policy and no --concurrency: back-compat single worker (criterion
+    #1)."""
+    assert worker._resolve_concurrency(_conc_args(None), None) == 1
+
+
+def test_resolve_concurrency_uses_config_when_flag_absent() -> None:
+    policy = WorkPolicy(source_kind="directory", worker_concurrency=4)
+    assert worker._resolve_concurrency(_conc_args(None), policy) == 4
+
+
+def test_resolve_concurrency_flag_overrides_higher_config() -> None:
+    """config=3, --concurrency 1 resolves to 1 (flag wins; criterion #5)."""
+    policy = WorkPolicy(source_kind="directory", worker_concurrency=3)
+    assert worker._resolve_concurrency(_conc_args("1"), policy) == 1
+
+
+def test_resolve_concurrency_flag_overrides_lower_config() -> None:
+    """config=1, --concurrency 3 resolves to 3 (flag wins; criterion #5)."""
+    policy = WorkPolicy(source_kind="directory", worker_concurrency=1)
+    assert worker._resolve_concurrency(_conc_args("3"), policy) == 3
+
+
+def test_resolve_concurrency_flag_overrides_subone_config() -> None:
+    """A sub-1 config is rescued by a valid flag: config=0, --concurrency 3
+    resolves to 3 (the config value is never the resolved size here)."""
+    policy = WorkPolicy(source_kind="directory", worker_concurrency=0)
+    assert worker._resolve_concurrency(_conc_args("3"), policy) == 3
+
+
+def test_resolve_concurrency_rejects_zero_flag() -> None:
+    """--concurrency 0 is a hard error naming the setting; no silent clamp to
+    1 (criterion #6, D-4)."""
+    with pytest.raises(PolicyError, match="concurrency"):
+        worker._resolve_concurrency(_conc_args("0"), None)
+
+
+def test_resolve_concurrency_rejects_negative_flag() -> None:
+    with pytest.raises(PolicyError, match="concurrency"):
+        worker._resolve_concurrency(_conc_args("-2"), None)
+
+
+def test_resolve_concurrency_rejects_non_integer_flag() -> None:
+    with pytest.raises(PolicyError, match="concurrency"):
+        worker._resolve_concurrency(_conc_args("two"), None)
+
+
+def test_resolve_concurrency_rejects_subone_config_without_flag() -> None:
+    """A sub-1 config with no overriding flag IS the resolved size, so it is
+    rejected (the config alone is the pool size here)."""
+    policy = WorkPolicy(source_kind="directory", worker_concurrency=0)
+    with pytest.raises(PolicyError, match="concurrency"):
+        worker._resolve_concurrency(_conc_args(None), policy)
+
+
+def test_main_subone_concurrency_exits_nonzero_and_claims_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``flywheel worker --concurrency 0`` exits non-zero, the stderr message
+    names the concurrency setting, and no store is opened — so no lifecycle or
+    claim row is created (criterion #6). The proof that nothing was claimed is
+    that the sqlite store file is never written: concurrency is validated
+    before any store is constructed."""
+
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "flywheel.toml").write_text('[source]\nkind = "directory"\n')
+    _task_file(repo, "01-phase", "t1", grader="true")
+    monkeypatch.chdir(repo)
+
+    rc = worker.main(["--concurrency", "0", "--once"])
+
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "concurrency" in err
+    assert not (repo / ".flywheel" / "flywheel.sqlite").exists()
 
 
 # --- store-factory routing ---------------------------------------------------

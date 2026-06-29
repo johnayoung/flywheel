@@ -118,6 +118,7 @@ from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._github_review import GithubReviewWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
+    DEFAULT_WORKER_CONCURRENCY,
     PolicyError,
     WorkPolicy,
     build_github_ci_source,
@@ -266,6 +267,7 @@ __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
+    "DEFAULT_WORKER_CONCURRENCY",
     "DirectoryWorkSource",
     "FilesystemHeldOutGraderSource",
     "GateOutcome",

@@ -62,6 +62,7 @@ from flywheel_core import (
 )
 from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_orchestrator import (
+    DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
     HeldOutGraderSource,
     OrchestratorReport,
@@ -1209,6 +1210,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait between drain cycles when idle.",
     )
     parser.add_argument("--worker-id", default=None)
+    parser.add_argument(
+        "--concurrency",
+        default=None,
+        help=(
+            "Worker pool size: how many tasks this invocation drives "
+            "concurrently. Overrides [worker] concurrency in flywheel.toml "
+            "(default 1). Must resolve to an integer >= 1."
+        ),
+    )
     parser.add_argument("--lease-seconds", type=float, default=300.0)
     parser.add_argument(
         "--reconcile-seconds",
@@ -1266,6 +1276,42 @@ def _resolve_model(
     if policy is None:
         return None
     return policy.model
+
+
+def _resolve_concurrency(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> int:
+    """Resolve the worker pool size from ``--concurrency`` over config.
+
+    Precedence (spec 00060, D-1): an explicit ``--concurrency`` flag wins; else
+    the ``[worker] concurrency`` config value (``policy.worker_concurrency``,
+    default ``1``); else ``1`` when no policy is loaded. The resolved value is
+    what the worker drains the queue with.
+
+    A resolved value below ``1`` -- or a ``--concurrency`` that is not an
+    integer -- is a hard error (D-4): raised as :class:`PolicyError` so
+    :func:`main` exits non-zero with a message naming the concurrency setting
+    BEFORE any task is claimed. A silent clamp to ``1`` would hide the operator
+    mistake and is deliberately not done.
+    """
+    setting = "--concurrency / [worker] concurrency"
+    if args.concurrency is not None:
+        try:
+            value = int(args.concurrency)
+        except (TypeError, ValueError):
+            raise PolicyError(
+                f"{setting} must be an integer >= 1, got "
+                f"{args.concurrency!r}"
+            ) from None
+    elif policy is not None:
+        value = policy.worker_concurrency
+    else:
+        value = DEFAULT_WORKER_CONCURRENCY
+    if value < 1:
+        raise PolicyError(
+            f"{setting} must resolve to an integer >= 1, got {value}"
+        )
+    return value
 
 
 def build_merge_submitter(
@@ -1402,6 +1448,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # checked-out-base / detached-HEAD config errors surface as PolicyError.
         policy = load_effective_policy()
         phase_base = resolve_landing_base(repo_root, policy, log=log)
+        # Resolve the worker pool size BEFORE any store is opened or task is
+        # claimed (spec 00060, D-4): a resolved concurrency < 1 (or a
+        # non-integer flag) must fail fast and loud, naming the setting, with
+        # no lifecycle or claim row created.
+        concurrency = _resolve_concurrency(args, policy)
     except PolicyError as exc:
         print(f"flywheel worker: policy error: {exc}", file=sys.stderr)
         return 2
@@ -1470,7 +1521,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         log(f"held-out gate active root={repo_root / policy.held_out_root}")
 
-    log(f"started pid={os.getpid()} base={phase_base} db={db_path}")
+    log(
+        f"started pid={os.getpid()} base={phase_base} db={db_path} "
+        f"concurrency={concurrency}"
+    )
     log(
         f"tasks={tasks_dir} worktrees={worktrees_dir} "
         f"logs={db_path.parent / 'logs' / 'runs'}"

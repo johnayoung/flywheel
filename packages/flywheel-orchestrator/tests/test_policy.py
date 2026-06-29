@@ -1013,3 +1013,102 @@ def test_held_out_root_carries_on_github_policy(tmp_path: Path) -> None:
     )
     assert policy.source_kind == "github"
     assert policy.held_out_root == Path("ops/held-out")
+
+
+# --- [worker] concurrency (spec 00060) --------------------------------------
+
+
+def test_worker_concurrency_defaults_to_one_when_table_absent(
+    tmp_path: Path,
+) -> None:
+    """No [worker] table yields concurrency=1 (single serial worker,
+    today's behavior byte-for-byte; criterion #1)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.worker_concurrency == 1
+
+
+def test_worker_concurrency_defaults_to_one_when_key_absent(
+    tmp_path: Path,
+) -> None:
+    """A [worker] table present but no concurrency key yields 1."""
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\n[worker]\n')
+    )
+    assert policy.worker_concurrency == 1
+
+
+def test_worker_concurrency_parses_positive_integer(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[worker]\nconcurrency = 4\n',
+        )
+    )
+    assert policy.worker_concurrency == 4
+
+
+def test_worker_concurrency_allows_zero_at_load_time(tmp_path: Path) -> None:
+    """A sub-1 config is NOT rejected at load time: --concurrency overrides
+    the config, so a config of 0 with --concurrency 3 is valid. The < 1
+    range check is the worker's resolve-time job (D-4), not load_policy's."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[worker]\nconcurrency = 0\n',
+        )
+    )
+    assert policy.worker_concurrency == 0
+
+
+def test_worker_concurrency_rejects_non_integer(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="worker.concurrency"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[worker]\nconcurrency = 1.5\n",
+            )
+        )
+
+
+def test_worker_concurrency_rejects_boolean(tmp_path: Path) -> None:
+    """A TOML boolean is rejected (bool is an int subclass; ``= true`` is a
+    typo, never 1)."""
+    with pytest.raises(PolicyError, match="worker.concurrency"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[worker]\nconcurrency = true\n",
+            )
+        )
+
+
+def test_worker_table_rejects_non_table(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match=r"\[worker\] must be a table"):
+        load_policy(
+            _write(
+                tmp_path,
+                'worker = "nope"\n[source]\nkind = "directory"\n',
+            )
+        )
+
+
+def test_worker_concurrency_carries_on_github_policy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[worker]",
+                    "concurrency = 3",
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.worker_concurrency == 3

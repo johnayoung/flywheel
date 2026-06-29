@@ -21,6 +21,7 @@ One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (
 | `[[defaults.graders]]` | no | default graders for tracker work items | [task-schema.md](task-schema.md) |
 | `[store]` | no | persistence backend (sqlite/postgres) | this doc |
 | `[execution]` | no | mode (local/distributed) + advertised capabilities | [orchestration.md](orchestration.md) |
+| `[worker]` | no | worker pool size (concurrency) | this doc |
 | `[submit]` | no | how DONE work lands (strategy, protected paths) | [strategy.md](strategy.md) |
 | `[phase]` | no | phase-exit verify gate | this doc |
 | `[held_out]` | no | execute-time held-out landing gate | [held-out-gate.md](held-out-gate.md) |
@@ -94,6 +95,16 @@ Distribution and capability matching. See [orchestration.md](orchestration.md).
 | `capabilities` | list of str | `[]` | this worker's advertised capability set |
 
 **`mode = "distributed"` requires `store.backend = "postgres"` or `load_policy` raises** (`_policy.py:460`). That postgres requirement is `mode`'s *only* runtime effect: `execution_mode` is a pure load-time validation assertion (`_policy.py:348`) — it is never read by any scheduler/claim/lease code path, so it does not itself change how work is scheduled, claimed, or leased. `capabilities` is the *worker's* advertised set: the scheduler offers this worker only items whose `required_capabilities` is a subset of it. This is distinct from `[sandbox.capabilities]`, which is the *agent's* tool/skill/MCP surface inside the sandbox.
+
+## `[worker]` (optional)
+
+Worker pool size for a single `flywheel worker` invocation.
+
+| Key | Type | Default | Controls |
+|-----|------|---------|----------|
+| `concurrency` | int (>=1 once resolved) | `1` | how many tasks one `flywheel worker` invocation drives concurrently |
+
+`--concurrency` overrides this value per-run (flag wins). An absent `[worker]` table means `concurrency = 1` — single serial worker, today's behavior byte-for-byte. A resolved value below `1` (e.g. `--concurrency 0`, a negative, or a non-integer flag) is a hard error: the worker exits non-zero naming the setting and claims no task (`_resolve_concurrency`, `worker.py`). The `< 1` range is *not* checked at load time because the flag can override the config, so a config of `0` with `--concurrency 3` is valid.
 
 ## `[submit]` (optional)
 
@@ -186,6 +197,6 @@ Rendered:
 - `[submit]` — `base = "<current branch>"` when a branch is detected, else a commented placeholder.
 - Commented placeholders for `[[defaults.graders]]`, `[agent] model`, `[sandbox] setup`, and `[phase] verify`.
 
-**Not rendered by init — must be hand-written:** `[execution]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
+**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
 
 The commented `[agent] model` placeholder shows one example model id; do not treat any printed id as canonical — the value is opaque and projects vary.

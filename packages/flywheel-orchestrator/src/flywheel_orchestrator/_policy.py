@@ -152,6 +152,10 @@ _STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
 _EXECUTION_MODES: tuple[str, ...] = ("local", "distributed")
 
+#: Default worker pool size when [worker] omits ``concurrency`` (single
+#: serial worker — today's behavior byte-for-byte; spec 00060, D-1).
+DEFAULT_WORKER_CONCURRENCY: int = 1
+
 
 class PolicyError(ValueError):
     """Raised when a policy file is missing, unparseable, or invalid.
@@ -397,6 +401,15 @@ class WorkPolicy:
     items whose ``required_capabilities`` is a subset of it; empty (the
     default, an absent key) preserves today's behavior -- every existing
     zero-requirement item is selectable.
+    ``worker_concurrency`` mirrors the optional ``[worker] concurrency``
+    key -- the worker pool size a single ``flywheel worker`` invocation
+    drains the queue with (spec 00060, D-1). It defaults to ``1`` (an
+    absent ``[worker]`` table means single serial worker, byte-for-byte
+    today's behavior) and is overridden per-run by ``--concurrency``. The
+    ``< 1`` range check is deliberately NOT enforced at load time: because
+    the flag overrides the config, a sub-1 value is only an error once it
+    is the *resolved* pool size (D-4), so the worker validates the resolved
+    value, not this field.
     ``submit_base`` is the explicit
     landing/phase-base branch; ``None`` falls back to the checked-out
     branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
@@ -429,6 +442,7 @@ class WorkPolicy:
     store_schema: str | None = None
     execution_mode: str = "local"
     execution_capabilities: frozenset[str] = frozenset()
+    worker_concurrency: int = DEFAULT_WORKER_CONCURRENCY
     protected_paths: tuple[str, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
@@ -543,6 +557,11 @@ def load_policy(path: Path) -> WorkPolicy:
         autopilot_weights,
     ) = _optional_autopilot(autopilot, policy_file=path)
 
+    worker = data.get("worker") or {}
+    if not isinstance(worker, dict):
+        raise PolicyError(f"{path}: [worker] must be a table")
+    worker_concurrency = _optional_worker(worker, policy_file=path)
+
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
         if raw_dir is not None and not isinstance(raw_dir, str):
@@ -562,6 +581,7 @@ def load_policy(path: Path) -> WorkPolicy:
             store_schema=store_schema,
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
+            worker_concurrency=worker_concurrency,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -600,6 +620,7 @@ def load_policy(path: Path) -> WorkPolicy:
             store_schema=store_schema,
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
+            worker_concurrency=worker_concurrency,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -632,6 +653,7 @@ def load_policy(path: Path) -> WorkPolicy:
             store_schema=store_schema,
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
+            worker_concurrency=worker_concurrency,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -676,6 +698,7 @@ def load_policy(path: Path) -> WorkPolicy:
         store_schema=store_schema,
         execution_mode=execution_mode,
         execution_capabilities=execution_capabilities,
+        worker_concurrency=worker_concurrency,
         protected_paths=protected_paths,
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
@@ -801,6 +824,30 @@ def _optional_execution_capabilities(
             f"non-empty strings"
         )
     return frozenset(value)
+
+
+def _optional_worker(table: dict, *, policy_file: Path) -> int:
+    """Validate and return the optional ``[worker] concurrency`` value.
+
+    Returns ``1`` (the :data:`DEFAULT_WORKER_CONCURRENCY` single-serial-worker
+    default) when the section (or the ``concurrency`` key) is absent so every
+    pre-existing policy file keeps today's behavior byte-for-byte. A non-integer
+    value (including a TOML boolean) raises :class:`PolicyError` naming
+    ``worker.concurrency`` so a typo never silently degrades the pool size.
+
+    The ``< 1`` range check is deliberately NOT enforced here: ``--concurrency``
+    overrides this config value (spec 00060, D-1), so a sub-1 config is only an
+    error once it is the *resolved* pool size (decision D-4, validated by the
+    worker). A config of ``0`` with ``--concurrency 3`` is valid, so rejecting
+    ``0`` at load time would be wrong.
+    """
+    return _override_int(
+        table,
+        "concurrency",
+        DEFAULT_WORKER_CONCURRENCY,
+        path="worker.concurrency",
+        policy_file=policy_file,
+    )
 
 
 def _optional_protected_paths(
@@ -1418,6 +1465,7 @@ def build_work_source(policy: WorkPolicy) -> WorkSource:
 
 __all__ = [
     "DEFAULT_POLICY_FILENAME",
+    "DEFAULT_WORKER_CONCURRENCY",
     "PolicyError",
     "SandboxCapabilities",
     "SandboxEnv",

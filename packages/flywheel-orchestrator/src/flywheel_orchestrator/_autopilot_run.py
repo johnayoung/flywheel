@@ -25,8 +25,10 @@ from flywheel_orchestrator._autopilot import (
     DEFAULT_WEIGHTS,
     AutopilotPassResult,
     ScoreWeights,
+    actionable_queue_depth,
     run_refill_pass,
 )
+from flywheel_orchestrator._store_factory import build_store
 from flywheel_orchestrator._autopilot_activity import (
     PHASE_IDLE,
     PHASE_RUNNING,
@@ -132,8 +134,15 @@ def run_single_pass(
     landing: str,
     weights: ScoreWeights,
     model: str | None,
+    queue_depth: Callable[[Path], int] | None = None,
 ) -> AutopilotPassResult:
-    """Drive exactly one refill pass with the real SDK-backed invokers."""
+    """Drive exactly one refill pass with the real SDK-backed invokers.
+
+    ``queue_depth`` measures actionable work for the fill-to-target decision;
+    ``None`` falls back to the directory adapter's raw active-file count (spec
+    00062: the daemon passes a store-backed counter that excludes terminal
+    tasks so a finished-but-unarchived task file never suppresses refill).
+    """
     return asyncio.run(
         run_refill_pass(
             tasks_dir=tasks_dir,
@@ -142,8 +151,39 @@ def run_single_pass(
             weights=weights,
             landing=landing,
             model=model,
+            queue_depth=queue_depth,
         )
     )
+
+
+def _build_queue_depth(
+    policy: WorkPolicy | None,
+    repo_root: Path,
+    log: Callable[[str], None],
+) -> Callable[[Path], int] | None:
+    """Open a store-backed actionable-depth counter, or ``None`` on failure.
+
+    Spec 00062: resolves the policy db path (default
+    ``.flywheel/flywheel.sqlite`` under the repo, matching the worker), opens
+    the store once, and returns a counter that excludes terminal tasks. A build
+    failure (missing/locked db, missing backend extra) degrades to the raw
+    active-file count -- today's behavior -- rather than crashing the daemon.
+    """
+    raw_db = (
+        policy.db_path
+        if policy is not None and policy.db_path is not None
+        else Path(".flywheel") / "flywheel.sqlite"
+    )
+    db_path = raw_db if raw_db.is_absolute() else repo_root / raw_db
+    try:
+        store = build_store(policy, db_path=db_path, environ=os.environ)
+    except Exception as exc:  # noqa: BLE001 - depth backing is best-effort
+        log(
+            f"queue-depth store unavailable ({type(exc).__name__}: {exc}); "
+            "falling back to raw active-file count"
+        )
+        return None
+    return lambda tasks_dir: actionable_queue_depth(tasks_dir, store)
 
 
 # --- The neverending daemon loop (autopilot-daemon) -------------------------
@@ -317,6 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     tasks_dir, target_depth, landing, weights = _resolve_runtime(args, policy)
     model = args.model or (policy.model if policy is not None else None)
+    queue_depth = _build_queue_depth(policy, repo_root, log)
 
     def run_cycle() -> AutopilotPassResult:
         return run_single_pass(
@@ -326,6 +367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             landing=landing,
             weights=weights,
             model=model,
+            queue_depth=queue_depth,
         )
 
     if args.once:

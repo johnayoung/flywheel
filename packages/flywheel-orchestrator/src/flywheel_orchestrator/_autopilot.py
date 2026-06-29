@@ -40,11 +40,14 @@ from flywheel_core.invoker import (
     ToolResultObservation,
     invoke_iteration,
 )
+from flywheel_core.lifecycle import Status
 from flywheel_core.loaders import TaskLoadError, load_task_data, serialize_task
 from flywheel_core.task import CommandGrader, Task
 
 if TYPE_CHECKING:
     from flywheel_core._sdk import AgentDefinition, ClaudeAgentOptions
+    from flywheel_core.store_postgres import PostgresStore
+    from flywheel_core.store_sqlite import SqliteStore
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
 
@@ -1594,6 +1597,45 @@ def _directory_queue_depth(tasks_dir: Path) -> int:
     return len(DirectoryWorkSource(tasks_dir).list_work())
 
 
+#: The lifecycle statuses that mean a task is finished work, not queued work
+#: (the two states with no outgoing transition in ``_VALID_EDGES``).
+_TERMINAL_STATUSES: tuple[Status, ...] = (Status.DONE, Status.FAILED)
+
+
+def actionable_queue_depth(
+    tasks_dir: Path, store: SqliteStore | PostgresStore
+) -> int:
+    """Active task files whose task has no terminal lifecycle (spec 00062).
+
+    The refill decision needs *actionable* depth -- work the worker can still
+    drive -- not the raw active-file count :func:`_directory_queue_depth`
+    returns. A finished task's JSON lingers under ``active/<phase>/`` until its
+    WHOLE phase archives (archival is all-or-nothing per phase, gated on every
+    task reaching ``DONE``), so counting terminal tasks pins depth at target and
+    suppresses refill; worse, a single terminally-``FAILED`` task -- now
+    reachable via the spec-00061 landable-change gate -- never archives and
+    would wedge intake permanently. Excluding ``DONE``/``FAILED`` tasks
+    decouples "is the queue full?" from "is the phase fully archived?".
+
+    Resilient by construction: a per-task store read that fails counts the task
+    as actionable (conservative -- never under-reports depth) so a transient
+    store hiccup can never crash a daemon cycle or spuriously over-emit.
+    """
+    from flywheel_orchestrator._sources import load_active_tasks
+
+    depth = 0
+    for _path, task in load_active_tasks(tasks_dir):
+        try:
+            terminal = store.list_lifecycles(
+                statuses=_TERMINAL_STATUSES, task_id=task.id
+            )
+        except Exception:  # noqa: BLE001 - depth must never crash a cycle
+            terminal = []
+        if not terminal:
+            depth += 1
+    return depth
+
+
 __all__ = [
     "AUTOPILOT_PHASE",
     "COLLECT_SOURCE_AGGREGATED",
@@ -1640,6 +1682,7 @@ __all__ = [
     "build_single_session_options",
     "build_single_session_runner",
     "build_tier_agents",
+    "actionable_queue_depth",
     "collect_tier_verdicts",
     "discover_tier",
     "emit_emitted_task",

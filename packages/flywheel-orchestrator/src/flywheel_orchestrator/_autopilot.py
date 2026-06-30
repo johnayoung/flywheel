@@ -35,6 +35,12 @@ from enum import IntEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
+from flywheel_core.deadline import run_with_deadline
+from flywheel_core.deadline_config import (
+    DEFAULT_AUTOPILOT_AGENT_SECONDS,
+    DeadlineClass,
+    DeadlineConfig,
+)
 from flywheel_core.invoker import (
     IterationResult,
     ToolResultObservation,
@@ -405,8 +411,39 @@ TIER_DESCRIPTIONS: dict[Tier, tuple[str, str]] = {
 #: canned per-tier JSON so the fan-out is deterministic and offline.
 AutopilotInvoker = Callable[[str], Awaitable[str]]
 
+#: The injectable invoke-iteration seam the production builders drive. The
+#: default is the real :func:`flywheel_core.invoker.invoke_iteration` (SDK behind
+#: the lazy ``flywheel_core._sdk`` boundary); tests inject a never-terminating
+#: stub to prove the wall-clock deadline fires even while the stream produces.
+InvokeIterationFn = Callable[..., Awaitable[IterationResult]]
+
 #: Default per-tier turn budget for the real SDK-backed invoker.
 DEFAULT_DISCOVERY_MAX_TURNS: int = 60
+
+
+async def _drive_agent_iteration(
+    *,
+    prompt: str,
+    options: ClaudeAgentOptions,
+    deadline_seconds: float | None,
+    invoke: InvokeIterationFn,
+) -> IterationResult:
+    """Drive one autopilot agent iteration under the wall-clock deadline.
+
+    Bounds the agent call -- the ``async for`` over the SDK stream inside
+    :func:`flywheel_core.invoker.invoke_iteration` -- with the shared deadline
+    primitive (spec 00066 criterion #6, D-2/D-3). ``max_turns`` is a turn budget,
+    not a time budget: a stream that streams forever without ever spending a turn
+    would otherwise run unbounded. The bound is total wall-clock elapsed; on
+    timeout the call is cancelled and
+    :class:`~flywheel_core.deadline.DeadlineExceeded` propagates so the cycle
+    surfaces a distinguishable timeout outcome rather than parking the daemon.
+    ``None`` (the operator per-class opt-out) restores the unbounded await.
+    """
+    call = invoke(prompt=prompt, options=options)
+    if deadline_seconds is None:
+        return await call
+    return await run_with_deadline(call, deadline_seconds)
 
 
 def build_repo_invoker(
@@ -414,6 +451,8 @@ def build_repo_invoker(
     *,
     model: str | None = None,
     max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
+    deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
+    invoke: InvokeIterationFn = invoke_iteration,
 ) -> AutopilotInvoker:
     """Build the production agent seam: a Claude session rooted in ``repo_root``.
 
@@ -421,6 +460,11 @@ def build_repo_invoker(
     surface findings. The SDK is resolved lazily inside the returned coroutine,
     so importing this module never requires the ``claude`` extra (the seam is
     only exercised when an unscripted autopilot run actually drives an agent).
+
+    ``deadline_seconds`` is the wall-clock ceiling the agent call runs under
+    (spec 00066 criterion #6); it defaults to the resolved-config autopilot
+    ceiling so the call is bounded by default. ``invoke`` is the injectable
+    invoke-iteration seam (tests substitute a never-terminating stub).
     """
 
     async def _invoke(prompt: str) -> str:
@@ -433,7 +477,12 @@ def build_repo_invoker(
             max_turns=max_turns,
             model=model,
         )
-        result = await invoke_iteration(prompt=prompt, options=options)
+        result = await _drive_agent_iteration(
+            prompt=prompt,
+            options=options,
+            deadline_seconds=deadline_seconds,
+            invoke=invoke,
+        )
         return result.transcript
 
     return _invoke
@@ -640,6 +689,7 @@ async def run_discovery(
     invoker: AutopilotInvoker | None = None,
     session_runner: DiscoverySessionRunner | None = None,
     model: str | None = None,
+    deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
 ) -> list[TierVerdict]:
     """Run discovery and return all 11 verdicts, in tier order.
 
@@ -664,6 +714,7 @@ async def run_discovery(
             repo_root=repo_root,
             session_runner=session_runner,
             model=model,
+            deadline_seconds=deadline_seconds,
         )
     verdicts = await asyncio.gather(
         *(discover_tier(tier, repo_root=repo_root, invoker=invoker) for tier in Tier)
@@ -835,6 +886,8 @@ def build_single_session_runner(
     max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
     subagent_max_turns: int = DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
     subagent_effort: DiscoveryEffort = DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
+    deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
+    invoke: InvokeIterationFn = invoke_iteration,
 ) -> DiscoverySessionRunner:
     """Build the production single-session runner rooted at ``repo_root``.
 
@@ -843,6 +896,12 @@ def build_single_session_runner(
     drained :class:`IterationResult` so the collector can read each verdict from
     its subagent tool-result block. The SDK is resolved lazily inside the
     coroutine.
+
+    ``deadline_seconds`` is the wall-clock ceiling the discovery session runs
+    under (spec 00066 criterion #6); it defaults to the resolved-config
+    autopilot ceiling so the session is bounded by default. ``invoke`` is the
+    injectable invoke-iteration seam (tests substitute a never-terminating
+    stub).
     """
 
     async def _run(prompt: str) -> IterationResult:
@@ -853,7 +912,12 @@ def build_single_session_runner(
             subagent_max_turns=subagent_max_turns,
             subagent_effort=subagent_effort,
         )
-        return await invoke_iteration(prompt=prompt, options=options)
+        return await _drive_agent_iteration(
+            prompt=prompt,
+            options=options,
+            deadline_seconds=deadline_seconds,
+            invoke=invoke,
+        )
 
     return _run
 
@@ -1018,6 +1082,7 @@ async def run_single_session_discovery(
     repo_root: Path,
     session_runner: DiscoverySessionRunner | None = None,
     model: str | None = None,
+    deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
 ) -> list[TierVerdict]:
     """Run discovery as ONE session of tier subagents; return all 11 verdicts.
 
@@ -1031,7 +1096,9 @@ async def run_single_session_discovery(
     runner = (
         session_runner
         if session_runner is not None
-        else build_single_session_runner(repo_root, model=model)
+        else build_single_session_runner(
+            repo_root, model=model, deadline_seconds=deadline_seconds
+        )
     )
     result = await runner(orchestrator_prompt(repo_root))
     return list(collect_tier_verdicts(result).verdicts)
@@ -1569,6 +1636,7 @@ async def run_refill_pass(
     landing: str = DEFAULT_LANDING,
     model: str | None = None,
     queue_depth: Callable[[Path], int] | None = None,
+    deadlines: DeadlineConfig | None = None,
 ) -> AutopilotPassResult:
     """Run one refill pass: discovery -> score/select -> author -> emit.
 
@@ -1583,6 +1651,13 @@ async def run_refill_pass(
     directory adapter's listing count. The agent seams default to the real
     SDK-backed invokers rooted at ``repo_root``; tests inject scripted ones.
     """
+    # Default-on, operator-overridable wall-clock ceiling for the discovery and
+    # authoring agent calls (spec 00066 criterion #6, D-1/D-3): resolve it once
+    # and feed it to both the authoring invoker and the discovery session so a
+    # stalled SDK stream is cancelled rather than parking the daemon.
+    resolved_deadlines = deadlines if deadlines is not None else DeadlineConfig()
+    autopilot_ceiling = resolved_deadlines.for_class(DeadlineClass.AUTOPILOT_AGENT)
+
     depth_fn = queue_depth if queue_depth is not None else _directory_queue_depth
     current = depth_fn(tasks_dir)
     slots = target_depth - current
@@ -1601,7 +1676,10 @@ async def run_refill_pass(
         authoring_invoker
         if authoring_invoker is not None
         else build_repo_invoker(
-            repo_root, model=model, max_turns=DEFAULT_AUTHORING_MAX_TURNS
+            repo_root,
+            model=model,
+            max_turns=DEFAULT_AUTHORING_MAX_TURNS,
+            deadline_seconds=autopilot_ceiling,
         )
     )
 
@@ -1610,7 +1688,10 @@ async def run_refill_pass(
     # tier-subagent path. Either way ``run_discovery`` returns exactly 11
     # verdicts.
     verdicts = await run_discovery(
-        repo_root=repo_root, invoker=discovery_invoker, model=model
+        repo_root=repo_root,
+        invoker=discovery_invoker,
+        model=model,
+        deadline_seconds=autopilot_ceiling,
     )
     relevant_tiers = tuple(v.tier for v in verdicts if v.relevant)
     not_relevant_tiers = tuple(v.tier for v in verdicts if not v.relevant)

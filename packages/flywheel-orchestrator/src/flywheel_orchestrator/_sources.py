@@ -29,13 +29,13 @@ directory-specific flow — see ``archive_completed_phases``).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from flywheel_core.lifecycle import Status
-from flywheel_core.loaders import load_task_file, task_digest
+from flywheel_core.loaders import TaskLoadError, load_task_file, task_digest
 from flywheel_core.task import Task
 
 
@@ -257,14 +257,34 @@ class DirectoryWorkSource:
     ``report`` is intentionally a no-op: for local files the store is
     already the durable record and phase archiving (with its loop-path
     gate) is a separate directory-shaped flow driven by the worker.
+
+    One unloadable task file (malformed JSON, a definition that fails
+    validation) is **skipped, not fatal**: ``list_work`` counts it in
+    :attr:`last_skipped_count` and emits one ``log`` line naming the file,
+    then returns every other valid item in deterministic walk order. The
+    record is what lets a downstream reconciler tell a skip ("one item was
+    dropped, investigate it") from an empty source ("there is simply no
+    work") -- the two must never look alike. ``log`` (when provided)
+    receives one line per skipped file, mirroring the tracker sources.
     """
 
     #: Provenance ``source_kind`` stamped on every emitted item and on the
     #: ``source_syncs`` row recording a sync over this source.
     source_kind = "directory"
 
-    def __init__(self, tasks_dir: Path) -> None:
+    def __init__(
+        self,
+        tasks_dir: Path,
+        *,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
         self.tasks_dir = tasks_dir
+        self._log = log
+        #: Number of task files the most recent :meth:`list_work` skipped
+        #: because they could not be loaded. A reconciler reads this to
+        #: distinguish "dropped a bad item" from "no work" -- both can
+        #: yield a short or empty item list, but only a skip is non-zero.
+        self.last_skipped_count = 0
 
     @property
     def source_name(self) -> str:
@@ -273,7 +293,18 @@ class DirectoryWorkSource:
 
     def list_work(self) -> list[WorkItem]:
         items: list[WorkItem] = []
-        for path, task in load_active_tasks(self.tasks_dir):
+        skipped = 0
+        for path in iter_active_task_files(self.tasks_dir):
+            try:
+                task = load_task_file(path)
+            except TaskLoadError as exc:
+                skipped += 1
+                if self._log is not None:
+                    self._log(
+                        f"[directory] skipping {path}: cannot load task "
+                        f"-- {exc}"
+                    )
+                continue
             priority, required_capabilities, conflict_keys = (
                 _read_scheduling_metadata(path)
             )
@@ -291,6 +322,7 @@ class DirectoryWorkSource:
                     conflict_keys=conflict_keys,
                 )
             )
+        self.last_skipped_count = skipped
         return items
 
     def report(self, report: WorkReport) -> None:

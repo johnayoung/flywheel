@@ -1944,8 +1944,13 @@ verification/
 """
 
 _INIT_POLICY_HEADER = """\
-# Flywheel work policy: where work comes from and where runtime state lives.
-# Committed with the repo; CLI flags always override.
+# Flywheel work policy: where work comes from, where runtime state lives, and
+# how finished work lands. Committed with the repo; CLI flags always override.
+#
+# This file is self-documenting. The ACTIVE keys below are what `flywheel init`
+# chose for this repo; every other knob is shown COMMENTED with its default so
+# you can see the full feature surface and turn things on by uncommenting.
+# Only [source] and [store] are required. Full reference: docs/configuration.md.
 """
 
 _INIT_POLICY_TAIL_HEAD = """\
@@ -1953,30 +1958,88 @@ _INIT_POLICY_TAIL_HEAD = """\
 db = ".flywheel/flywheel.sqlite"
 sandbox_root = ".flywheel/sandboxes"
 
-# Default graders for work items that declare none (tracker sources only;
-# directory task files always declare their own).
+# --- Default graders -------------------------------------------------------
+# Verification commands for work items that declare none. Tracker sources
+# (github) lean on these; directory task files always carry their own. One
+# array-of-tables entry per grader, run in order; pass is exit code 0.
 # [[defaults.graders]]
 # type = "command"
 # run = "uv run pytest"
 
-# Agent runtime settings. Pin the model id the worker passes to the SDK
-# verbatim (no allowlist enforced). CLI flags still override.
+# --- Agent -----------------------------------------------------------------
+# The model id the worker passes to the agent SDK verbatim (no allowlist).
+# CLI --model overrides. Unset uses the SDK default.
 # [agent]
-# model = "claude-sonnet-4-5"
+# model = "claude-opus-4-8"
+
+# --- Sandbox ---------------------------------------------------------------
+# Where the agent runs and how the sandbox is provisioned. `setup` runs (shell)
+# inside every newly created sandbox before the agent enters (dependency
+# install, codegen) so tasks never pay discovery cost for a bare worktree.
+# `backend` selects the execution surface: "worktree" (default) or "container"
+# (Docker; needs the flywheel-container extra + a [sandbox.container] block).
+# `preset` is a code-owned baseline that subtable keys override.
+# [sandbox]
+# setup = "uv sync"
+# backend = "worktree"               # worktree | container
+# preset = "fast"                    # fast | balanced | hardened
+# permission_mode = "default"        # default | acceptEdits | bypassPermissions
+#
+# Optional [sandbox.*] subtables (full reference: docs/sandbox.md):
+#   [sandbox.env]          explicit env handed to the agent AND graders
+#   [sandbox.capabilities] the agent's tool/skill/MCP surface inside the sandbox
+#   [sandbox.network]      network policy (e.g. policy = "offline")
+#   [sandbox.exec]         exec-time knobs
+#   [sandbox.limits]       cpu / memory / pids / wall-time ceilings
+#   [sandbox.retention]    on_done / on_failure = "destroy" | "park"
+#   [sandbox.container]    image / model / auth for the container backend
 """
 
 _INIT_POLICY_TAIL_FOOT = """\
-# Sandbox provisioning. setup runs (shell) inside every newly created
-# sandbox before the agent enters, so tasks never pay discovery cost for
-# a bare worktree. Unset means new sandboxes are used bare.
-# [sandbox]
-# setup = "uv sync"
-
-# Phase-exit gate. verify runs (shell) against the merged phase base once
-# every task in a phase has landed; a non-zero exit leaves the phase active
-# instead of archiving it. Unset means today's archival (no gate).
+# --- Phase-exit gate -------------------------------------------------------
+# `verify` runs (shell) against the merged phase base once every task in a
+# phase has landed; a non-zero exit leaves the phase active instead of
+# archiving it. Unset = today's archival (no gate). Distinct from
+# [submit] verify, which gates each individual land.
 # [phase]
 # verify = "uv run pytest"
+
+# --- Held-out landing gate -------------------------------------------------
+# `root` is a directory of operator-authored held-out grader registrations the
+# execute-time gate runs against the committed sandbox before landing — the
+# agent never sees them, so it cannot game them. Unset = no gate.
+# See docs/held-out-gate.md.
+# [held_out]
+# root = ".flywheel/verification"
+
+# --- Autopilot intake ------------------------------------------------------
+# The intake daemon (`flywheel autopilot`) keeps the queue filled. `target_depth`
+# is the queue target, `interval_seconds` the refill cadence, `landing` how
+# authored work lands. The optional [autopilot.weights] sub-table tunes the
+# scoring axes (unset weights keep the engine defaults). See docs/autopilot.md.
+# [autopilot]
+# target_depth = 5
+# interval_seconds = 300
+# landing = "merge"
+# [autopilot.weights]
+# urgency = 1.0
+# importance = 1.0
+
+# --- Worker ----------------------------------------------------------------
+# `concurrency` is how many tasks one worker process drives in parallel
+# (default 1). >1 relies on each task's conflict_keys to keep concurrent work
+# off shared files; --concurrency overrides per run.
+# [worker]
+# concurrency = 1
+
+# --- Execution -------------------------------------------------------------
+# `mode` is "local" (default) or "distributed" (the latter requires
+# store.backend = "postgres"). `capabilities` is THIS worker's advertised set;
+# the scheduler offers it only tasks whose required_capabilities is a subset.
+# (Distinct from [sandbox.capabilities], the agent's in-sandbox tool surface.)
+# [execution]
+# mode = "local"
+# capabilities = ["gpu", "cuda"]
 """
 
 
@@ -1999,14 +2062,36 @@ def _render_submit_block(submit_base: str | None) -> str:
         f" (detected current branch: {submit_base})" if submit_base else ""
     )
     return (
-        "# Landing policy. base pins the branch finished work lands on and the\n"
-        "# worker resolves its phase base from. Leave it UNSET to FF-merge work\n"
-        f"# in-tree onto your checked-out branch{detected_note} — the working\n"
-        "# default. Set base ONLY to a separate integration branch you do NOT\n"
-        "# have checked out; setting base to the checked-out branch is refused\n"
-        "# and the worker exits on startup.\n"
+        "# --- Landing --------------------------------------------------------"
+        "------\n"
+        "# How finished work reaches your branch. `strategy` is \"merge\" (FF-merge"
+        "\n# in-tree, default) or \"pr\" (push + open a pull request; uses `remote`"
+        "\n# and optional `pr_base`).\n"
+        "#\n"
+        "# `base` pins the branch finished work lands on and the worker resolves\n"
+        "# its phase base from. Leave it UNSET to FF-merge onto your checked-out\n"
+        f"# branch{detected_note} — the working default. Set base ONLY to a\n"
+        "# separate integration branch you do NOT have checked out; setting it to\n"
+        "# the checked-out branch is refused and the worker exits on startup.\n"
+        "#\n"
+        "# `verify` is the standing build gate (spec 00064): a repo-wide command\n"
+        "# re-run under the merge lock against the exact tree about to land, on\n"
+        "# every land path, independent of each task's own graders. A non-zero\n"
+        "# exit refuses the land and parks the work — this is what stops a\n"
+        "# semantic merge skew (two independently-valid changes whose union does\n"
+        "# not build) from reaching your branch. Unset = no gate. It serializes\n"
+        "# landings, so a slow command bottlenecks throughput.\n"
+        "#\n"
+        "# `protected_paths` are globs a finished branch may not touch; a match\n"
+        "# refuses the land. Use it to stop authored work from rewriting the\n"
+        "# verification surface (policy, CI, .flywheel state).\n"
         "[submit]\n"
         f"# base = {suggestion}\n"
+        '# verify = "uv run pytest"\n'
+        '# protected_paths = ["flywheel.toml", ".flywheel/**"]\n'
+        '# strategy = "merge"          # merge | pr\n'
+        '# remote = "origin"           # pr strategy push target\n'
+        '# pr_base = "main"            # pr strategy base branch\n'
     )
 
 _INIT_STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")

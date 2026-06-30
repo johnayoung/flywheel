@@ -209,15 +209,38 @@ def test_init_policy_agent_example_documented(repo: Path) -> None:
     main(["init"])
     text = (repo / "flywheel.toml").read_text()
     assert "# [agent]" in text
-    assert '# model = "claude-sonnet-4-5"' in text
+    assert '# model = "claude-opus-4-8"' in text
 
     uncommented = text.replace(
-        '# [agent]\n# model = "claude-sonnet-4-5"',
-        '[agent]\nmodel = "claude-sonnet-4-5"',
+        '# [agent]\n# model = "claude-opus-4-8"',
+        '[agent]\nmodel = "claude-opus-4-8"',
     )
     (repo / "flywheel.toml").write_text(uncommented)
     policy = load_policy(repo / "flywheel.toml")
-    assert policy.model == "claude-sonnet-4-5"
+    assert policy.model == "claude-opus-4-8"
+
+
+def test_init_policy_documents_submit_verify_gate(repo: Path) -> None:
+    """The scaffold must surface the standing build gate (spec 00064) as a
+    commented, round-trippable example so adopters discover it.
+
+    Uncommenting it (verbatim) must yield a loadable policy whose
+    ``submit_verify`` matches the scaffolded example.
+    """
+    main(["init"])
+    text = (repo / "flywheel.toml").read_text()
+    assert '# verify = "uv run pytest"' in text
+    # The scaffold also names the full feature surface, so the file doubles as
+    # living documentation of what flywheel supports.
+    for section in ("[sandbox]", "[phase]", "[held_out]", "[autopilot]", "[worker]"):
+        assert section in text, f"{section} missing from scaffold docs"
+
+    uncommented = text.replace(
+        "[submit]\n# base", '[submit]\nverify = "uv run pytest"\n# base'
+    )
+    (repo / "flywheel.toml").write_text(uncommented)
+    policy = load_policy(repo / "flywheel.toml")
+    assert policy.submit_verify == "uv run pytest"
 
 
 def test_init_is_idempotent_and_never_clobbers(repo: Path, capsys) -> None:

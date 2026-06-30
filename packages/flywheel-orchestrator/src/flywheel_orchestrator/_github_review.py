@@ -31,10 +31,15 @@ Thread -> Task compilation:
   provenance; ``source_ref`` encodes ``{repo}#{pr}#{thread_id}`` so the report
   path can recover both the PR (to post on) and the thread (to reference) — D-6.
 
-Malformed ``gh`` output (invalid JSON, a non-object payload, a thread missing
-its node id, or a non-zero ``gh`` exit) raises :class:`WorkSourceError` rather
-than returning an empty list — a parse break or auth failure must never
-masquerade as "every thread is resolved" (criterion #6).
+Malformed ``gh`` output is read at two grains. A broken top-level envelope
+(invalid JSON, a non-object payload, a thread missing its node id so it cannot
+even be named, or a non-zero ``gh`` exit) raises :class:`WorkSourceError`
+rather than returning an empty list — a parse break or auth failure must never
+masquerade as "every thread is resolved" (criterion #6). But a single
+*identifiable* thread node (its node id is in hand) that fails to compile —
+malformed comments substructure, an invalid compiled task — is dropped one at a
+time: it is counted and logged by node id, and the surviving valid threads on
+the page still return, so one bad node never blanks the whole listing.
 
 Outbound: :meth:`GithubReviewWorkSource.report` posts the run's grader receipts
 as a PR comment via ``gh pr comment`` (the PR parsed back out of
@@ -152,6 +157,18 @@ def _truncated(connection: dict[str, Any]) -> bool:
     return isinstance(page, dict) and bool(page.get("hasNextPage"))
 
 
+class _BadThreadNode(WorkSourceError):
+    """One identifiable review-thread node that cannot be compiled.
+
+    A subclass of :class:`WorkSourceError` raised only AFTER a thread's stable
+    node id is in hand, so the offending node can be named. The per-thread loop
+    catches THIS specific type to skip and log the single bad node and keep the
+    surviving valid threads, while a bare :class:`WorkSourceError` — an
+    envelope or identity break that leaves a node unnameable — still aborts the
+    whole listing rather than masquerading as "no unresolved threads".
+    """
+
+
 class GithubReviewWorkSource:
     """Unresolved PR review threads in one GitHub repo, compiled to tasks.
 
@@ -223,6 +240,7 @@ class GithubReviewWorkSource:
             )
 
         items: list[WorkItem] = []
+        skipped = 0
         for pr in pr_nodes:
             pr_obj = _require_object(pr, "pullRequest")
             number = pr_obj.get("number")
@@ -244,9 +262,26 @@ class GithubReviewWorkSource:
             for thread in _nodes(
                 review_threads, f"pullRequest(#{number}).reviewThreads"
             ):
-                item = self._compile_thread(thread, pr_number=number)
+                try:
+                    item = self._compile_thread(thread, pr_number=number)
+                except _BadThreadNode as exc:
+                    # One identifiable-but-uncompilable node is dropped, not
+                    # the whole page: count it and name it, then keep going so
+                    # the surviving valid threads still return.
+                    skipped += 1
+                    if self._log is not None:
+                        self._log(
+                            f"[github_review] skipping malformed review "
+                            f"thread node: {exc}"
+                        )
+                    continue
                 if item is not None:
                     items.append(item)
+        if skipped and self._log is not None:
+            self._log(
+                f"[github_review] skipped {skipped} malformed review thread "
+                f"node(s) this pass on {self.repo}"
+            )
         return items
 
     def _compile_thread(
@@ -255,11 +290,29 @@ class GithubReviewWorkSource:
         thread_obj = _require_object(thread, "reviewThread")
         node_id = thread_obj.get("id")
         if not isinstance(node_id, str) or not node_id:
+            # No stable id means the node cannot be named or keyed: this is an
+            # identity break, not a skippable node — abort the whole listing.
             raise WorkSourceError(
                 f"gh api graphql review thread missing string 'id': "
                 f"{thread_obj!r}"
             )
+        # Past this point the node is identifiable, so any compile failure is
+        # demoted to a per-node skip naming the offending thread (the loop
+        # catches _BadThreadNode), leaving the surviving valid threads intact.
+        try:
+            return self._compile_identified_thread(
+                thread_obj, node_id=node_id, pr_number=pr_number
+            )
+        except _BadThreadNode:
+            raise
+        except WorkSourceError as exc:
+            raise _BadThreadNode(
+                f"review thread node {node_id!r} on PR #{pr_number}: {exc}"
+            ) from exc
 
+    def _compile_identified_thread(
+        self, thread_obj: dict[str, Any], *, node_id: str, pr_number: int
+    ) -> WorkItem | None:
         # Resolution state is the candidate FILTER only, never the verdict
         # (D-4): skip resolved threads, but do not derive a grade from it.
         if bool(thread_obj.get("isResolved")):

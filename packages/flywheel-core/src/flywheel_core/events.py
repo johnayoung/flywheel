@@ -230,8 +230,10 @@ class LandingParked(_DomainEventBase):
 
     ``park_kind`` discriminates the cause on one shared surface:
     ``"uncommitted-work"`` (the agent reached DONE with an uncommitted tree,
-    spec 00027) or ``"divergent-base"`` (the configured base could not
-    fast-forward even after rebase + re-verify, spec 00026). ``detail`` is a
+    spec 00027), ``"divergent-base"`` (the configured base could not
+    fast-forward even after rebase + re-verify, spec 00026), or
+    ``"standing-verify"`` (the ``[submit] verify`` standing build invariant
+    failed against the tree about to land, spec 00064). ``detail`` is a
     human-readable reason, queryable via ``list_domain_events(run_id)``.
     """
 

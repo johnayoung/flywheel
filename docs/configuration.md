@@ -117,8 +117,11 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 | `remote` | str | `origin` | `pr` strategy push target |
 | `pr_base` | str | unset (worker base branch) | `pr` strategy PR base branch |
 | `base` | str | unset (checked-out branch) | explicit landing/phase-base branch |
+| `verify` | str (shell) | unset (no gate) | standing build invariant re-run under the merge lock against the exact tree about to become the base, on every land path; a non-zero exit refuses landing and parks the work (`park_kind="standing-verify"`) |
 
 `protected_paths` is honored by both strategies (`worker.py:598`); it protects the verification surface — grader configs, CI, harness state — from being rewritten by the work it judges.
+
+`verify` is the "trunk must always build" gate (spec 00064): repo-wide and independent of the task's own (often crate-scoped) command graders, it catches a *semantic merge skew* where two independently-valid changes union into a tree that does not build. It runs serialized under the merge lock — a slow command bottlenecks landings — and inherits the resolved `[sandbox.env]`. Example: `verify = "cargo build --workspace --tests"` or `verify = "uv run pytest"`.
 
 ## `[phase]` (optional)
 

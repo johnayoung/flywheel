@@ -261,6 +261,7 @@ class GitWorktreeSubmitter:
         on_failure: str = "park",
         store: LandingLedger | None = None,
         grader_env: Mapping[str, str] | None = None,
+        verify_command: str | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -275,6 +276,12 @@ class GitWorktreeSubmitter:
         # byte-identical to before. Shares the in-run grader env so a post-rebase
         # re-verify builds against the same cache as the run it re-checks.
         self.grader_env = grader_env
+        # Standing build invariant ([submit] verify, spec 00064): a repo-wide
+        # command re-run under the merge lock against the exact tree about to
+        # become the base, on every land path, independent of the task's own
+        # graders. None => no gate (back-compat). Runs with grader_env so the
+        # build shares the same cache/toolchain as the in-run graders.
+        self.verify_command = verify_command
         # Submit-time retention ([sandbox.retention], spec 00041). Defaults
         # reproduce today's hardcoded behavior: a DONE branch's worktree is
         # destroyed after the merge, a non-DONE worktree is parked for
@@ -593,13 +600,34 @@ class GitWorktreeSubmitter:
                 )
                 return
 
-            if self._ff_merge(branch):
-                self.log(
-                    f"Merged {branch} into {self.phase_base} "
-                    f"({commit_count} commit(s))"
-                )
-                self._teardown_on_done(worktree, branch)
-                return
+            # Clean-FF path: when the branch already contains the current base
+            # its tree IS the tree that will become the base, so the standing
+            # build invariant ([submit] verify) gates it here, before the FF.
+            # Under the merge lock the base cannot move, so this ancestry check
+            # predicts the FF outcome exactly.
+            if self._is_ancestor(self.phase_base, branch):
+                if not self._standing_verify(req, worktree):
+                    self.log(
+                        f"standing verify failed for {branch}; refusing to "
+                        f"merge, parking worktree at {worktree}"
+                    )
+                    self._record_landing_park(
+                        req.run_id,
+                        park_kind="standing-verify",
+                        detail=(
+                            f"{branch} failed the standing build invariant "
+                            f"([submit] verify) against the tree it would land; "
+                            f"worktree preserved at {worktree}"
+                        ),
+                    )
+                    return
+                if self._ff_merge(branch):
+                    self.log(
+                        f"Merged {branch} into {self.phase_base} "
+                        f"({commit_count} commit(s))"
+                    )
+                    self._teardown_on_done(worktree, branch)
+                    return
 
             # FF failed (base advanced): rebase once, re-verify, retry FF,
             # else park.
@@ -624,6 +652,23 @@ class GitWorktreeSubmitter:
                 self.log(
                     f"post-rebase re-verification failed for {branch}; "
                     f"parking worktree at {worktree}"
+                )
+                return
+            # The rebased worktree is now the exact post-merge tree: gate it on
+            # the standing build invariant before the FF, same as the clean path.
+            if not self._standing_verify(req, worktree):
+                self.log(
+                    f"post-rebase standing verify failed for {branch}; "
+                    f"parking worktree at {worktree}"
+                )
+                self._record_landing_park(
+                    req.run_id,
+                    park_kind="standing-verify",
+                    detail=(
+                        f"{branch} failed the standing build invariant "
+                        f"([submit] verify) against the rebased tree it would "
+                        f"land; worktree preserved at {worktree}"
+                    ),
                 )
                 return
             if self._ff_merge(branch):
@@ -722,6 +767,55 @@ class GitWorktreeSubmitter:
                 f"({record.duration_ms}ms)"
             )
         return len(records) == command_count and all(r.passed for r in records)
+
+    def _is_ancestor(self, ancestor: str, rev: str) -> bool:
+        """True when ``ancestor`` is reachable from ``rev`` -- i.e. a
+        fast-forward of the base to ``rev`` is possible because ``rev`` already
+        contains ``ancestor``. ``git merge-base --is-ancestor`` exits 0 for
+        ancestor, 1 for not; evaluated in the shared object DB so it holds for
+        both the in-tree and out-of-tree FF paths. Under ``merge_lock`` the base
+        cannot move, so this predicts the FF outcome exactly."""
+        return (
+            _git(
+                self.repo_root, "merge-base", "--is-ancestor", ancestor, rev
+            ).returncode
+            == 0
+        )
+
+    def _standing_verify(self, req: SubmitRequest, worktree: Path) -> bool:
+        """Run the policy's standing build invariant (``[submit] verify``,
+        spec 00064) against the exact tree about to become the base.
+
+        This is the repo-wide "the trunk must build" gate, run under the merge
+        lock immediately before the fast-forward and independent of the task's
+        own (possibly crate-scoped) command graders. It catches a semantic merge
+        skew -- two independently-valid changes whose union does not build -- that
+        per-task graders run in isolation cannot. Unset (``None``) => no gate.
+        Runs with ``grader_env`` exactly as :meth:`_reverify` runs graders so the
+        build shares the same cache/toolchain. A non-zero exit returns ``False``
+        (the caller parks); the command never raises into :meth:`submit`."""
+        if self.verify_command is None:
+            return True
+        self.log(
+            f"standing verify for {req.task_id}: {self.verify_command!r} in "
+            f"{worktree}"
+        )
+        proc = subprocess.run(
+            self.verify_command,
+            shell=True,
+            cwd=worktree,
+            env=dict(self.grader_env) if self.grader_env is not None else None,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout).strip()[-2000:]
+            self.log(
+                f"standing verify FAILED (exit {proc.returncode}) for "
+                f"{req.task_id}: {tail}"
+            )
+        return proc.returncode == 0
 
     def _commit_count(self, branch: str) -> int:
         res = _git(
@@ -1759,14 +1853,16 @@ def build_merge_submitter(
 ) -> GitWorktreeSubmitter:
     """Build the merge backend (the registry's ``merge`` target).
 
-    The fast-forward-merge landing reads nothing extra from ``policy``; the
-    argument is part of the shared builder signature the submit-strategy
-    registry dispatches on (see :mod:`flywheel_worktree._submit_registry`).
-    ``on_done``/``on_failure`` are the submit-time ``[sandbox.retention]``
-    knobs (defaults reproduce today's destroy/park behavior). ``store`` is the
-    run ledger the submitter records a queryable ``LANDING_PARKED`` event on
-    when it parks a DONE branch. ``grader_env`` is the resolved ``[sandbox.env]``
-    the submit-time re-verification runs command graders with.
+    Reads ``[submit] verify`` from ``policy`` (spec 00064) -- the standing build
+    invariant the submitter re-runs under the merge lock against the exact tree
+    about to land -- and otherwise takes the shared builder arguments the
+    submit-strategy registry dispatches on (see
+    :mod:`flywheel_worktree._submit_registry`). ``on_done``/``on_failure`` are the
+    submit-time ``[sandbox.retention]`` knobs (defaults reproduce today's
+    destroy/park behavior). ``store`` is the run ledger the submitter records a
+    queryable ``LANDING_PARKED`` event on when it parks a DONE branch.
+    ``grader_env`` is the resolved ``[sandbox.env]`` the submit-time
+    re-verification (and the standing verify) run with.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -1781,6 +1877,7 @@ def build_merge_submitter(
         on_failure=on_failure,
         store=store,
         grader_env=grader_env,
+        verify_command=policy.submit_verify if policy is not None else None,
     )
 
 

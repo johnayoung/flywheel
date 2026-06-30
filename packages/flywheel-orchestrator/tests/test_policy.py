@@ -846,6 +846,56 @@ def test_submit_base_carries_on_github_policy(tmp_path: Path) -> None:
     assert policy.submit_base == "release"
 
 
+# --- [submit] verify (spec 00064) --------------------------------------------
+
+
+def test_submit_verify_default_none_when_table_absent(tmp_path: Path) -> None:
+    """No [submit] table yields submit_verify=None (no standing gate)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.submit_verify is None
+
+
+def test_submit_verify_default_none_when_key_absent(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\nstrategy = "merge"\n',
+        )
+    )
+    assert policy.submit_verify is None
+
+
+def test_submit_verify_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\n'
+            'verify = "cargo build --workspace --tests"\n',
+        )
+    )
+    assert policy.submit_verify == "cargo build --workspace --tests"
+
+
+def test_submit_verify_rejects_empty_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.verify"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\nverify = ""\n',
+            )
+        )
+
+
+def test_submit_verify_rejects_non_string(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.verify"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\nverify = 42\n',
+            )
+        )
+
+
 # --- [phase] verify -----------------------------------------------------------
 
 

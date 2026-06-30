@@ -448,6 +448,7 @@ class WorkPolicy:
     submit_remote: str = "origin"
     submit_pr_base: str | None = None
     submit_base: str | None = None
+    submit_verify: str | None = None
     sandbox_setup: str | None = None
     phase_verify: str | None = None
     held_out_root: Path | None = None
@@ -530,6 +531,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_pr_base,
         submit_base,
     ) = _optional_submit_strategy(submit, policy_file=path)
+    submit_verify = _optional_submit_verify(submit, policy_file=path)
 
     sandbox = data.get("sandbox") or {}
     if not isinstance(sandbox, dict):
@@ -587,6 +589,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
+            submit_verify=submit_verify,
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -626,6 +629,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
+            submit_verify=submit_verify,
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -659,6 +663,7 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
+            submit_verify=submit_verify,
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -704,6 +709,7 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_remote=submit_remote,
         submit_pr_base=submit_pr_base,
         submit_base=submit_base,
+        submit_verify=submit_verify,
         sandbox_setup=sandbox_setup,
         phase_verify=phase_verify,
         held_out_root=held_out_root,
@@ -915,6 +921,27 @@ def _optional_submit_strategy(
             f"{policy_file}: submit.base must be a non-empty string"
         )
     return strategy, remote, pr_base, base
+
+
+def _optional_submit_verify(
+    table: dict, *, policy_file: Path
+) -> str | None:
+    """Validate and return the optional ``submit.verify`` command (spec 00064).
+
+    The standing build invariant re-run under the merge lock against the exact
+    tree about to become the base. Returns ``None`` when absent so an
+    unconfigured policy lands as before (no extra gate). A non-string or
+    empty/whitespace-only value raises :class:`PolicyError` so a typo never
+    silently degrades into "no gate."
+    """
+    value = table.get("verify")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: submit.verify must be a non-empty string"
+        )
+    return value
 
 
 def _optional_sandbox_setup(

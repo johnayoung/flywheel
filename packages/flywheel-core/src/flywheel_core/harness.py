@@ -71,6 +71,8 @@ if TYPE_CHECKING:
         Message,
     )
 
+from flywheel_core.deadline import DeadlineExceeded, run_with_deadline
+from flywheel_core.deadline_config import DeadlineClass, DeadlineConfig
 from flywheel_core.envelope import (
     BlockedRequirement,
     CommandGraderRequirement,
@@ -397,6 +399,19 @@ class HarnessConfig:
     threshold disables independently via ``None`` / ``0``; default values
     keep the detectors on without tripping the existing harness suite.
 
+    ``deadlines`` carries the default-on, operator-overridable wall-clock
+    ceilings for the external-call classes (spec 00066). The harness reads
+    ``deadlines.for_class(DeadlineClass.AGENT_ITERATION)`` to bound every
+    working-agent iteration: when it resolves to a positive float the
+    invocation is wrapped in :func:`flywheel_core.deadline.run_with_deadline`
+    so an invoker that never returns (even one still streaming) is cancelled
+    once the ceiling passes and routed to the timeout-classified
+    ``INTERNAL_ERROR`` path; the default is finite and non-null (default-on).
+    The bound is total wall-clock elapsed, additive to and independent of the
+    inter-message silence watchdog (``loop_guard.hang_timeout_seconds``) — both
+    run. An operator opts the class out (unbounded) with a ``0`` override,
+    which resolves to ``None`` and restores the bare await path.
+
     ``context_window_tokens`` is the operator-supplied agent context-window
     capacity used by the context-recovery policy (spec 00018). When
     ``None`` (the default) the recovery policy is disabled and the harness
@@ -452,6 +467,7 @@ class HarnessConfig:
     rubric_judge_max_turns: int = 8
     rubric_judge_invoke: JudgeInvoke | None = None
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
+    deadlines: DeadlineConfig = field(default_factory=DeadlineConfig)
     context_window_tokens: int | None = None
     context_recovery_trigger_ratio: float = 0.9
     max_context_recoveries: int = 1
@@ -705,6 +721,45 @@ class _HangDetected(Exception):
         self.iteration_number = iteration_number
         self.timeout_seconds = timeout_seconds
         self.silence_seconds = silence_seconds
+
+
+class _IterationDeadlineExceeded(Exception):
+    """Sentinel raised when the wall-clock deadline cancels an iteration.
+
+    The wall-clock agent-iteration deadline (spec 00066 criterion #2, D-2)
+    is additive to the inter-message silence watchdog: it fires on total
+    elapsed time since the invocation started, even while the invoker is
+    still streaming, so a steadily-producing-but-never-terminating agent is
+    cut off where the silence watchdog would not catch it. The
+    :class:`flywheel_core.deadline.DeadlineExceeded` raised by
+    :func:`flywheel_core.deadline.run_with_deadline` is translated into this
+    harness-local sentinel so the :func:`_run_attempt` boundary can route it
+    to the timeout-classified containment path (``Outcome.INTERNAL_ERROR`` /
+    ``running -> internal_error``) — the same retryable infrastructure class
+    the hang watchdog uses — distinct from an operator-driven cancellation.
+    The ``harness.deadline_exceeded`` audit event is emitted inside
+    :func:`_drive_iterations` before this is raised.
+    """
+
+    def __init__(
+        self,
+        *,
+        attempt_number: int,
+        iteration_number: int,
+        ceiling_seconds: float,
+        elapsed_seconds: float | None,
+    ) -> None:
+        elapsed_detail = (
+            "" if elapsed_seconds is None else f" after {elapsed_seconds:.3f}s"
+        )
+        super().__init__(
+            f"agent-iteration deadline: invocation exceeded wall-clock "
+            f"ceiling of {ceiling_seconds:.3f}s{elapsed_detail}"
+        )
+        self.attempt_number = attempt_number
+        self.iteration_number = iteration_number
+        self.ceiling_seconds = ceiling_seconds
+        self.elapsed_seconds = elapsed_seconds
 
 
 # Marker kind appended (best-effort) to the sink itself when its first
@@ -1037,6 +1092,48 @@ def _handle_hang_detected(
 
     The ``harness.hang_detected`` audit event was emitted inside
     :func:`_invoke_with_watchdog` before the cancel — this helper does not
+    re-emit it. Idempotent against ``attempt.ended_at is not None`` so a
+    near-simultaneous normal completion that already finalized the attempt
+    cannot be double-written.
+    """
+    error = str(exc)
+    if attempt.ended_at is None:
+        _finalize_attempt(
+            store=store,
+            telemetry=telemetry,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.INTERNAL_ERROR,
+            error=error,
+            clock=clock,
+        )
+    if lifecycle.status != Status.INTERNAL_ERROR:
+        _transition(
+            lifecycle,
+            Status.INTERNAL_ERROR,
+            store=store,
+            error=error,
+            now=clock,
+        )
+
+
+def _handle_iteration_deadline(
+    exc: _IterationDeadlineExceeded,
+    *,
+    store: HarnessStore,
+    telemetry: _RunTelemetry,
+    lifecycle: Lifecycle,
+    attempt: Attempt,
+    clock: Callable[[], datetime],
+) -> None:
+    """Finalize an attempt whose invocation the wall-clock deadline cancelled.
+
+    Mirrors :func:`_handle_hang_detected`: closes the open attempt as
+    :attr:`Outcome.INTERNAL_ERROR` and transitions the lifecycle to
+    :attr:`Status.INTERNAL_ERROR` — the retryable infrastructure class, the
+    timeout-classified containment outcome (spec 00066 criterion #2, D-4).
+    The ``harness.deadline_exceeded`` audit event was emitted inside
+    :func:`_drive_iterations` before the cancel — this helper does not
     re-emit it. Idempotent against ``attempt.ended_at is not None`` so a
     near-simultaneous normal completion that already finalized the attempt
     cannot be double-written.
@@ -1929,6 +2026,24 @@ async def _run_attempt(
         # below. The harness.hang_detected audit event was already emitted
         # inside _invoke_with_watchdog before the cancel.
         _handle_hang_detected(
+            exc,
+            store=store,
+            telemetry=telemetry,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            clock=clock,
+        )
+    except _IterationDeadlineExceeded as exc:
+        # Wall-clock agent-iteration deadline fired (spec 00066 criterion
+        # #2): the invocation exceeded its finite ceiling -- even while it
+        # was still streaming -- so run_with_deadline cancelled it. Route to
+        # the same timeout-classified internal_error containment path the
+        # hang watchdog uses; distinct from the operator-interrupt path
+        # because run_with_deadline translated the DeadlineExceeded into this
+        # harness-local sentinel rather than letting a bare CancelledError
+        # propagate. The harness.deadline_exceeded audit event was already
+        # emitted inside _drive_iterations before the cancel.
+        _handle_iteration_deadline(
             exc,
             store=store,
             telemetry=telemetry,
@@ -3240,19 +3355,65 @@ async def _drive_iterations(
         # cancel routes through _HangDetected to the FR-3 internal_error
         # path rather than _handle_interrupt (FR-4).
         hang_timeout = config.loop_guard.hang_timeout_seconds
-        try:
+
+        async def _run_invocation() -> IterationResult:
             if hang_timeout is None or hang_timeout <= 0:
-                iteration_result = await invoker(request)
+                return await invoker(request)
+            return await _invoke_with_watchdog(
+                invoker=invoker,
+                request=request,
+                hang_timeout=hang_timeout,
+                mclock=mclock,
+                telemetry=telemetry,
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+            )
+
+        # Wall-clock agent-iteration deadline (spec 00066 criterion #2, D-2):
+        # the resolved ceiling is finite and non-null by default (default-on),
+        # so the bare unbounded ``await invoker(request)`` path is NOT
+        # reachable under the default config. The bound is total elapsed wall
+        # time since the invocation started -- additive to, not a replacement
+        # for, the inter-message silence watchdog above (both run): an invoker
+        # that never returns, even one steadily streaming output the silence
+        # watchdog would never trip on, is cancelled once the ceiling passes.
+        # ``run_with_deadline`` raises ``DeadlineExceeded`` on timeout; we
+        # translate it into the harness-local ``_IterationDeadlineExceeded``
+        # sentinel so the ``_run_attempt`` boundary routes it to the
+        # timeout-classified internal_error containment path (mirroring the
+        # hang watchdog), distinct from an operator-driven cancellation. An
+        # operator opts out per class with a ``0`` override (resolves to
+        # ``None``), restoring the unbounded await.
+        agent_ceiling = config.deadlines.for_class(
+            DeadlineClass.AGENT_ITERATION
+        )
+        try:
+            if agent_ceiling is None:
+                iteration_result = await _run_invocation()
             else:
-                iteration_result = await _invoke_with_watchdog(
-                    invoker=invoker,
-                    request=request,
-                    hang_timeout=hang_timeout,
-                    mclock=mclock,
-                    telemetry=telemetry,
-                    attempt_number=attempt_number,
-                    iteration_number=iteration_number,
-                )
+                try:
+                    iteration_result = await run_with_deadline(
+                        _run_invocation(), agent_ceiling
+                    )
+                except DeadlineExceeded as exc:
+                    telemetry.emit(
+                        kind="harness.deadline_exceeded",
+                        payload={
+                            "iteration": iteration_number,
+                            "deadline_class": (
+                                DeadlineClass.AGENT_ITERATION.value
+                            ),
+                            "ceiling_seconds": agent_ceiling,
+                            "elapsed_seconds": exc.elapsed_seconds,
+                        },
+                        attempt_number=attempt_number,
+                    )
+                    raise _IterationDeadlineExceeded(
+                        attempt_number=attempt_number,
+                        iteration_number=iteration_number,
+                        ceiling_seconds=agent_ceiling,
+                        elapsed_seconds=exc.elapsed_seconds,
+                    ) from exc
         except HarnessRecoveryRequested:
             # Spec 00019 FR-4 / FR-7: the live-client invoker raised
             # the distinguishable mid-turn recovery signal in response

@@ -63,6 +63,7 @@ from flywheel_core.harness import (
     _RunTelemetry,
     finalize_stranded_lifecycle,
 )
+from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.invoker import ToolInteraction, ToolResultObservation
 from flywheel_core.store_protocols import TelemetryRecord
 from flywheel_core.loop_guard import LoopGuardConfig
@@ -5325,6 +5326,177 @@ class TestHangWatchdog:
         assert len(hang) == 1
         assert hang[0].payload["iteration"] == 1
         assert hang[0].payload["hang_timeout_seconds"] == hang_timeout
+
+
+# --- Wall-clock agent-iteration deadline (spec 00066, criterion #2) --------
+
+
+class TestHarnessAgentDeadline:
+    """Spec 00066 criterion #2: the working-agent iteration runs under a
+    finite, default-on wall-clock ceiling.
+
+    An invoker that never returns is cancelled and routed to the
+    timeout-classified ``INTERNAL_ERROR`` containment path, distinct from a
+    hang (inter-message silence) and from an operator interrupt. The bound is
+    total elapsed wall time, additive to the silence watchdog (D-2): it fires
+    even while the invoker is still producing output. The default-resolved
+    ceiling is non-null (default-on), so the bare unbounded
+    ``await invoker(request)`` path is unreachable without an explicit
+    opt-out override.
+    """
+
+    def test_harness_agent_deadline_default_ceiling_is_non_null(self) -> None:
+        # Default-on: a default-constructed HarnessConfig resolves a finite,
+        # non-null agent-iteration ceiling -- the guard against wiring the
+        # bound but defaulting it off so it only fires under an override.
+        config = HarnessConfig()
+        ceiling = config.deadlines.agent_iteration_seconds
+        assert ceiling is not None
+        assert ceiling > 0
+        from math import isfinite
+
+        assert isfinite(ceiling)
+
+    def test_harness_agent_deadline_cancels_never_returning_invoker(
+        self,
+    ) -> None:
+        # An invoker that never returns is cancelled by the wall-clock
+        # deadline in bounded wall time and surfaces a timeout-classified
+        # INTERNAL_ERROR outcome (max_retries=0 -> lifecycle FAILED). A small
+        # ceiling keeps the real wall cost tiny; the bound is real elapsed
+        # time, not a fake-clock comparison, because run_with_deadline reads
+        # the event-loop clock.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-agent-deadline")
+        # Explicit small override on the agent-iteration class only; the
+        # other four classes keep their finite defaults.
+        config = HarnessConfig(
+            max_retries=0,
+            deadlines=DeadlineConfig(agent_iteration_seconds=0.05),
+        )
+
+        async def never_returning_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            await asyncio.Future()
+            raise RuntimeError("unreachable")  # pragma: no cover
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=never_returning_invoker,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(outcome.attempts) == 1
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "deadline" in attempt.error
+
+        events = sink.events(lifecycle.run_id)
+        deadline_events = [
+            e for e in events if e.kind == "harness.deadline_exceeded"
+        ]
+        assert len(deadline_events) == 1
+        payload = deadline_events[0].payload
+        assert payload["deadline_class"] == "agent_iteration"
+        assert payload["ceiling_seconds"] == 0.05
+        assert payload["iteration"] == 1
+        assert deadline_events[0].attempt_number == 1
+
+        # A wall-clock deadline cancel must NOT reach the operator-interrupt
+        # path nor be mistaken for an inter-message silence hang.
+        assert all(e.kind != "harness.interrupted" for e in events)
+        assert all(e.kind != "harness.hang_detected" for e in events)
+
+    def test_harness_agent_deadline_streaming_invoker_is_cut_off(
+        self,
+    ) -> None:
+        # D-2: the bound is wall-clock, not silence. An invoker that keeps
+        # calling on_message forever (so an idle/silence watchdog would never
+        # trip) is still cancelled once the ceiling passes.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-agent-deadline-stream")
+        config = HarnessConfig(
+            max_retries=0,
+            deadlines=DeadlineConfig(agent_iteration_seconds=0.05),
+        )
+
+        async def streaming_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            # Steadily produce output -- never idle, never terminate.
+            while True:
+                if request.on_message is not None:
+                    request.on_message(_assistant(text="still working"))
+                await asyncio.sleep(0.005)
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=streaming_invoker,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "deadline" in attempt.error
+        events = sink.events(lifecycle.run_id)
+        assert any(
+            e.kind == "harness.deadline_exceeded" for e in events
+        )
+
+    def test_harness_agent_deadline_normal_completion_not_tripped(
+        self,
+    ) -> None:
+        # No false positive: under the DEFAULT config (finite, non-null
+        # ceiling) a normally-completing iteration still reaches DONE -- the
+        # deadline wrapping is transparent when the invoker returns in time.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-agent-deadline-ok")
+        config = HarnessConfig()
+        assert config.deadlines.agent_iteration_seconds is not None
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        events = sink.events(lifecycle.run_id)
+        assert all(
+            e.kind != "harness.deadline_exceeded" for e in events
+        )
 
 
 # --- Context-recovery policy (spec 00018) ---------------------------------

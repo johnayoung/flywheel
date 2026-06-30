@@ -160,6 +160,31 @@ def test_envelope_contract_is_explained_with_fences_and_closed_intent_enum() -> 
     assert "required" in prompt.lower()
 
 
+def test_blocked_intent_documents_requires_contract() -> None:
+    # Regression for the prompt->contract drift that produced 122 malformed
+    # blocked envelopes overnight: the prompt must teach that `blocked` needs a
+    # `requires` array (with the predicate shapes) and steer a moot/unsatisfiable
+    # task to `abort` instead.
+    task = _minimal_task()
+    lifecycle = Lifecycle(task_id=task.id, run_id="run-1")
+
+    prompt = build_iteration_prompt(
+        task, lifecycle, IterationInputs(max_retries=1)
+    )
+
+    assert "requires" in prompt
+    # The three (and only three) recognized predicate shapes are named.
+    assert "command_grader" in prompt
+    assert "file_exists" in prompt
+    assert "env_var_set" in prompt
+    # The blocked example actually carries a requires array.
+    assert '"requires"' in prompt
+    # The moot/unsatisfiable steer points at abort, not blocked.
+    assert "abort" in prompt
+    lowered = prompt.lower()
+    assert "premise is false" in lowered or "already satisfied" in lowered
+
+
 def test_graders_section_surfaces_every_grader_type() -> None:
     task = _briefed_task()
     lifecycle = Lifecycle(task_id=task.id, run_id="run-1")

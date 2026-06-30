@@ -18,9 +18,11 @@ The prompt surfaces:
 - The lifecycle's current status, retry budget, last error, and full
   attempts history so the agent does not re-attempt already-failed
   approaches blindly.
-- The iteration envelope contract from ``docs/loop.md`` verbatim — the
-  closed-enum ``intent`` (``verify``/``blocked``/``continue``/``abort``)
-  and the ``<!-- LOOP_STATUS -->`` fencing.
+- The iteration envelope contract from ``docs/loop.md`` — the closed-enum
+  ``intent`` (``verify``/``blocked``/``continue``/``abort``), the
+  ``<!-- LOOP_STATUS -->`` fencing, and the mandatory ``requires`` predicate
+  array that an ``intent=blocked`` envelope must carry (with the steer to use
+  ``abort`` for an unsatisfiable/moot task that has nothing to re-check).
 
 Pure module: no IO, no SDK imports, no logging, no template-file reads.
 """
@@ -377,6 +379,28 @@ def _section_envelope_contract() -> str:
         f"{CLOSING_FENCE}\n\n"
         "`intent` is a closed enum — only these four values are accepted:\n\n"
         f"{intent_bullets}\n\n"
+        "## `blocked` requires a `requires` array\n\n"
+        "An `intent=blocked` envelope MUST additionally carry a non-empty "
+        "`requires` array naming the machine-checkable predicate(s) that would "
+        "unblock it; the harness persists them and auto-resumes the lifecycle "
+        "once they all hold. Use `blocked` ONLY when such a predicate exists. "
+        "The three recognized shapes (and only these) are:\n\n"
+        '- `{"type": "command_grader", "name": "<a command grader on this '
+        'task>"}`\n'
+        '- `{"type": "file_exists", "path": "<repo-relative path>", '
+        '"present": true}`\n'
+        '- `{"type": "env_var_set", "name": "<ENV_VAR>"}`\n\n'
+        "Example:\n\n"
+        f"{OPENING_FENCE}\n"
+        '{"intent": "blocked", "reason": "needs the integration database up", '
+        '"requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}\n'
+        f"{CLOSING_FENCE}\n\n"
+        "If you cannot proceed and there is NOTHING for the harness to "
+        "re-check — the task's premise is false or already satisfied, the work "
+        "is already on the base, or no correct change is possible — emit "
+        "`abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` "
+        "envelope with no `requires` array is a protocol failure that discards "
+        "your reasoning.\n\n"
         "Missing, malformed, duplicated, or truncated envelopes are protocol "
         "failures and may end the run."
     )
@@ -384,15 +408,25 @@ def _section_envelope_contract() -> str:
 
 _INTENT_DESCRIPTIONS: dict[str, str] = {
     Intent.VERIFY.value: (
-        "work claims to be complete; harness runs graders."
+        "work claims to be complete; the harness runs the graders above. "
+        "Emit only when you believe every grader will pass."
     ),
     Intent.BLOCKED.value: (
-        "external input is needed; pauses the loop until intervention."
+        "you cannot proceed until a concrete, RE-CHECKABLE external "
+        "prerequisite is met (a named command grader passing, a file "
+        "appearing, an env var being set). This intent REQUIRES a non-empty "
+        "`requires` array (see below) and pauses the lifecycle until the "
+        "harness re-checks those predicates. Do NOT use `blocked` for a task "
+        "you simply cannot complete — use `abort`."
     ),
     Intent.CONTINUE.value: (
         "more iterations needed; carry context forward."
     ),
     Intent.ABORT.value: (
-        "give up; harness records the failure and stops."
+        "you cannot complete the task and there is nothing for the harness to "
+        "re-check — e.g. the task's premise is false or already satisfied, the "
+        "work is already on the base, or no correct change is possible without "
+        "fabricating one. The harness records your `reason` and stops (no "
+        "retry). Put your full diagnosis in `reason`."
     ),
 }

@@ -96,11 +96,14 @@ invariant evaluated against the exact landing tree on both paths.
 - `command`: `scripts/check.sh` — full gate (ruff -> pyright -> pytest) green.
 
 ## Subsequent phases (same outcome family — closes the rest of the overnight retro)
-- **P2 — Autopilot populates `conflict_keys`.** Intake authoring derives
-  `conflict_keys` from each task's grader targets / files-it-creates so overlapping
-  tasks serialize at claim time (enforcement already exists in `_claims.py`; only
-  population is missing). Collapses the ~25-branch dedupe swarm into one in-flight
-  task. Explicitly deferred by spec 00061 (Gap 3).
+- **P2 — Autopilot populates `conflict_keys`. (LANDED)** `_emitted_task_file`
+  derives `conflict_keys` from each task's `grader_target` + `creates_files`,
+  keeping only specific source files (build manifests and directories are dropped
+  so unrelated work is not over-serialized), and stamps them on the emitted task
+  JSON. The directory source reads them into `WorkItem.conflict_keys` and the
+  existing claim-time `_conflicts` check serializes overlapping tasks. Collapses
+  the dedupe swarm (13 tasks all targeting `tycho.rs`) into one in-flight task.
+  Closes spec 00061 Gap 3.
 - **P3 — Surface stranded landings.** `fw status` grows a "stranded landings"
   section listing parked/unlanded autopilot branches with their `LandingParked`
   `park_kind` + detail, so a divergent-base / standing-verify park is visible

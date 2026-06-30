@@ -32,7 +32,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import IntEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
 
 from flywheel_core.invoker import (
@@ -1420,6 +1420,78 @@ class AutopilotPassResult:
         return len(self.emitted_paths)
 
 
+#: Build-manifest / lockfile basenames that make poor conflict keys: many
+#: legitimately-distinct tasks land against the same manifest, so serializing on
+#: it would collapse unrelated work into one lane. Conflict keys want the
+#: specific source file a task contends for, not the shared package manifest.
+_MANIFEST_BASENAMES: frozenset[str] = frozenset(
+    {
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "go.mod",
+        "go.sum",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    }
+)
+
+
+def _conflict_key_for_path(raw: str) -> str | None:
+    """Normalize a repo-relative path into a stable conflict-key token, or
+    ``None`` when it is too coarse to be a useful claim-time conflict resource.
+
+    Returns ``None`` for a path that is empty, absolute, parent-escaping,
+    directory-like (no file suffix -- e.g. ``crates/``), or a shared build
+    manifest / lockfile (see :data:`_MANIFEST_BASENAMES`). A specific source
+    file (``crates/infrared-feed/src/tycho.rs``) returns its normalized posix
+    form so two tasks scoped to it serialize.
+    """
+    s = raw.strip()
+    if not s:
+        return None
+    p = PurePosixPath(s)
+    if p.is_absolute() or any(part == ".." for part in p.parts):
+        return None
+    if p.suffix == "":  # directory-like (or extensionless): too coarse
+        return None
+    if p.name in _MANIFEST_BASENAMES:
+        return None
+    return p.as_posix()
+
+
+def _conflict_keys_for(emitted: EmittedTask) -> list[str]:
+    """Claim-time conflict keys for an emitted task: the repo source files it
+    contends for, so two autopilot tasks scoped to the same file serialize at
+    claim time instead of racing -- the dedupe-swarm failure mode (spec 00061
+    Gap 3, spec 00064 P2).
+
+    Derived deterministically from ``grader_target`` (the file the task's
+    authoritative check resolves to -- the signal that collapsed the 13-task
+    ``tycho.rs`` swarm) and ``creates_files``, never from an agent-reported
+    value. Coarse targets (build manifests, directories) are dropped so
+    unrelated work that merely shares a manifest is not over-serialized. Empty
+    when neither yields a specific source file.
+    """
+    keys: set[str] = set()
+    target = _conflict_key_for_path(emitted.grader_target)
+    if target is not None:
+        keys.add(target)
+    for created in emitted.creates_files:
+        norm = _conflict_key_for_path(created)
+        if norm is not None:
+            keys.add(norm)
+    return sorted(keys)
+
+
 def _emitted_task_file(
     emitted: EmittedTask, breakdown: ScoreBreakdown
 ) -> dict[str, Any]:
@@ -1427,8 +1499,10 @@ def _emitted_task_file(
 
     The body is the core task (``serialize_task``) plus the orchestration-layer
     keys the directory source reads from top-level JSON: ``priority`` (derived
-    from the recorded final score so the scheduler orders autopilot work) and
-    ``prerequisites``. The full :class:`ScoreBreakdown` is recorded under an
+    from the recorded final score so the scheduler orders autopilot work),
+    ``prerequisites``, and ``conflict_keys`` (the source files the task contends
+    for, so overlapping tasks serialize at claim time -- omitted when empty).
+    The full :class:`ScoreBreakdown` is recorded under an
     ``autopilot`` key (ignored by the core loader) so the recommendation stays
     inspectable after the run -- the legible-score requirement (#3) persisted.
     """
@@ -1436,6 +1510,9 @@ def _emitted_task_file(
     body["priority"] = int(round(breakdown.final))
     if emitted.prerequisites:
         body["prerequisites"] = list(emitted.prerequisites)
+    conflict_keys = _conflict_keys_for(emitted)
+    if conflict_keys:
+        body["conflict_keys"] = conflict_keys
     body["autopilot"] = {
         "finding_id": emitted.finding.id,
         "tier": breakdown.tier.value,

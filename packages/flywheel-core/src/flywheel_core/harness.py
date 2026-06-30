@@ -3605,6 +3605,15 @@ async def _validate(
       via a ``harness.crash`` event whose ``classification`` is
       ``rubric_judge_error``.
     """
+    # Wall-clock per-grader deadline (spec 00066 criterion #4): resolve the
+    # default-on COMMAND_GRADER ceiling from config and pass it through so a
+    # grader command that hangs is SIGKILLed and recorded with
+    # ``payload['termination'] == 'timeout'`` instead of blocking validation
+    # forever. ``for_class`` returns ``None`` only when an operator opts the
+    # class out (``0``/unbounded override), which restores the unbounded wait.
+    command_grader_ceiling = config.deadlines.for_class(
+        DeadlineClass.COMMAND_GRADER
+    )
     command_results = run_command_graders(
         task,
         store,
@@ -3612,6 +3621,7 @@ async def _validate(
         attempt_number=attempt.number,
         cwd=config.worktree,
         env=config.grader_env,
+        per_grader_timeout_seconds=command_grader_ceiling,
         artifacts_dir=attempt_dir,
         now=clock,
     )

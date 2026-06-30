@@ -12,8 +12,12 @@ Contract surface (see ``docs/task-schema.md`` and ``flywheel/_schema/persistence
   still preserved so audits can reconstruct the original list from
   ``grader_results.ordinal`` alone.
 * Pass is strictly ``exit_code == 0``. Non-zero exit, signal termination,
-  and timeout are all failures and are distinguishable in ``payload`` via a
-  ``termination`` discriminator (``exited`` | ``signal`` | ``timeout``).
+  timeout, and a subprocess that never started are all failures and are
+  distinguishable in ``payload`` via a ``termination`` discriminator
+  (``exited`` | ``signal`` | ``timeout`` | ``spawn_failure``). A
+  ``spawn_failure`` (the ``Popen`` raised ``OSError``) is an infra failure,
+  not the code under test asserting false; the harness routes it to the
+  retryable internal-error class.
 * ``grader_spec`` snapshots the input grader verbatim at run time so later
   edits to the task definition do not rewrite historical truth.
 * stdout/stderr capture is bounded (tail-only) with a deterministic byte
@@ -140,15 +144,51 @@ def run_command_graders(
         ts_start = clock()
         start_ns = time.monotonic_ns()
 
-        proc = subprocess.Popen(
-            grader.run,
-            shell=True,
-            cwd=cwd,
-            env=dict(env) if env is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                grader.run,
+                shell=True,
+                cwd=cwd,
+                env=dict(env) if env is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            # The subprocess never started (bad cwd, exec failure, resource
+            # exhaustion). This is an infra failure, not the code under test
+            # asserting false, so it is recorded with a distinct
+            # ``termination`` discriminator. The harness reads this to
+            # classify a spawn failure as a retryable internal error rather
+            # than a validation failure (a grader that ran and exited
+            # non-zero). Mirrors the recheck path's ``except OSError`` guard.
+            end_ns = time.monotonic_ns()
+            duration_ms = (end_ns - start_ns) // 1_000_000
+            spawn_payload: dict[str, Any] = {
+                "run": grader.run,
+                "exit_code": None,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "termination": "spawn_failure",
+                "spawn_error": str(exc),
+            }
+            record = GraderResultRecord(
+                run_id=run_id,
+                attempt_number=attempt_number,
+                ordinal=ordinal,
+                grader_type="command",
+                grader_spec=spec,
+                grader_name=grader.name,
+                passed=False,
+                duration_ms=int(duration_ms),
+                payload=spawn_payload,
+                ts=ts_start,
+            )
+            persisted.append(store.append_grader_result(record))
+            aborted = True
+            continue
 
         timed_out = False
         try:

@@ -1355,6 +1355,27 @@ def _signal_killed_grader(
     return None
 
 
+def _spawn_failed_grader(
+    results: Sequence[GraderResultRecord],
+) -> GraderResultRecord | None:
+    """Return the first failing command grader whose subprocess never
+    started.
+
+    A ``spawn_failure`` termination (the ``Popen`` raised ``OSError``) is an
+    infrastructure failure, not the code under test asserting false. It must
+    route to the retryable ``INTERNAL_ERROR`` class — distinct from a grader
+    that ran and exited non-zero (``VALIDATION_FAILED``).
+    """
+    for result in results:
+        if result.passed:
+            continue
+        if result.grader_type != "command":
+            continue
+        if result.payload.get("termination") == "spawn_failure":
+            return result
+    return None
+
+
 def _serialize_requires(
     requires: Sequence[BlockedRequirement],
 ) -> list[dict[str, Any]]:
@@ -3412,6 +3433,10 @@ async def _validate(
     - All pass -> ``DONE``.
     - Command/transcript fail -> ``FAILED_VALIDATION``.
     - Operator-signal-killed command grader -> ``INTERRUPTED``.
+    - Command grader whose subprocess failed to start ->
+      ``INTERNAL_ERROR`` outcome + ``INTERNAL_ERROR`` lifecycle status
+      (the retryable infra class) via a ``harness.crash`` event whose
+      ``classification`` is ``grader_spawn_failure``.
     - Rubric fail with ``retry_on_fail=True`` -> ``FAILED_VALIDATION``.
     - Rubric fail with ``retry_on_fail=False`` -> ``INTERRUPTED``.
     - Judge infra failure (``RubricJudgeError``) ->
@@ -3624,6 +3649,42 @@ async def _validate(
                 lifecycle,
                 Status.INTERRUPTED,
                 store=store,
+                now=clock,
+            )
+            return
+        spawn_failed = _spawn_failed_grader(command_results)
+        if spawn_failed is not None:
+            grader_label = spawn_failed.grader_name or spawn_failed.grader_type
+            spawn_error = str(spawn_failed.payload.get("spawn_error", ""))
+            error = (
+                f"command grader {grader_label!r} failed to start: "
+                f"{spawn_error}"
+            )
+            telemetry.emit(
+                kind="harness.crash",
+                payload={
+                    "classification": "grader_spawn_failure",
+                    "grader_name": spawn_failed.grader_name,
+                    "grader_ordinal": spawn_failed.ordinal,
+                    "message": error,
+                },
+                attempt_number=attempt.number,
+            )
+            _finalize_attempt(
+                store=store,
+                telemetry=telemetry,
+                lifecycle=lifecycle,
+                attempt=attempt,
+                outcome=Outcome.INTERNAL_ERROR,
+                error=error,
+                agent_output=agent_output,
+                clock=clock,
+            )
+            _transition(
+                lifecycle,
+                Status.INTERNAL_ERROR,
+                store=store,
+                error=error,
                 now=clock,
             )
             return

@@ -727,12 +727,13 @@ async def orchestrate(
     sqlite-on-``db_path`` behavior byte-for-byte.
 
     ``repo_root`` enables the schedule-time static-validation gate (spec
-    00034): a picked task whose graders fail :func:`validate_task` (an
-    unparseable command, or a repo-relative path that does not exist) is
-    skipped-and-reported instead of dispatched, mirroring the
-    unprovisionable-task skip so one bad task never starves eligible peers.
-    ``None`` (the default for library callers) disables the gate, preserving
-    prior behavior.
+    00034): a picked task whose graders fail :func:`validate_task` (an empty
+    or unparseable command) is skipped-and-reported instead of dispatched,
+    mirroring the unprovisionable-task skip so one bad task never starves
+    eligible peers. (The missing-path check is tabled — see
+    :mod:`flywheel_core.validation` — so a grader that references a not-yet-
+    created path no longer blocks.) ``None`` (the default for library callers)
+    disables the gate, preserving prior behavior.
 
     ``held_out_source`` enables the execute-time held-out landing gate (spec
     00050): after a task's run finalizes with the landing status (``DONE``) and

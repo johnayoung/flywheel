@@ -167,18 +167,18 @@ def test_task_with_dangling_prerequisite_never_runs(tmp_path: Path) -> None:
 def test_statically_invalid_task_is_skipped_not_dispatched(
     tmp_path: Path,
 ) -> None:
-    # Schedule-time validation gate (spec 00034): a task whose grader
-    # references a repo-relative path that does not exist is statically
-    # invalid -- the orchestrator must skip it (never dispatch its agent),
-    # while a valid peer in the same phase still runs. The invalid task is
-    # absent from report.runs entirely (skipped), not present-but-FAILED
-    # (dispatched then failed) -- that discriminates the gate from a no-op.
+    # Schedule-time validation gate (spec 00034): a task whose grader is an
+    # unparseable shell command is statically invalid -- the orchestrator must
+    # skip it (never dispatch its agent), while a valid peer in the same phase
+    # still runs. The invalid task is absent from report.runs entirely
+    # (skipped), not present-but-FAILED (dispatched then failed) -- that
+    # discriminates the gate from a no-op. (The missing-path check is tabled.)
     phase = tmp_path / "tasks" / "active" / "01-phase"
     _write_task(phase, "ok", grader_run="true")
     _write_task(
         phase,
         "broken",
-        grader_run="uv run pytest .flywheel/holdout/does-not-exist/ -q",
+        grader_run="uv run pytest 'unterminated",
     )
 
     report = asyncio.run(
@@ -211,7 +211,7 @@ def test_invalid_task_does_not_starve_a_valid_peer_repo_root_default(
     _write_task(
         phase,
         "broken",
-        grader_run="uv run pytest .flywheel/holdout/does-not-exist/ -q",
+        grader_run="uv run pytest 'unterminated",
     )
 
     report = _orchestrate(tmp_path, _always_verify())

@@ -43,21 +43,17 @@ def test_validate_mixed_corpus_exits_nonzero_and_names_invalid(
     monkeypatch.chdir(tmp_path)
     tasks_dir = _tasks_dir(tmp_path)
     phase = tasks_dir / "active" / "01-phase"
-    # An existing path the valid task can reference (rooted at repo_root).
-    (tmp_path / "pkg").mkdir()
     _write_task(phase, "valid-one", "uv run pytest pkg/ -q")
-    _write_task(
-        phase, "broken-one", "uv run pytest .flywheel/holdout/missing/ -q"
-    )
+    # An unparseable command (unterminated quote) is still statically invalid;
+    # the missing-path check is tabled, so a missing path no longer counts.
+    _write_task(phase, "broken-one", "uv run pytest 'unterminated")
 
     rc = main(["validate", "--tasks-dir", str(tasks_dir)])
 
     out = capsys.readouterr().out
     assert rc != 0, "a statically-invalid task must make the verb exit non-zero"
     assert "broken-one" in out, "the invalid task must be named in the output"
-    assert ".flywheel/holdout/missing" in out, (
-        "the missing path must be reported"
-    )
+    assert "does not parse" in out, "the unparseable command must be reported"
     # The valid task is not reported as invalid.
     assert "valid-one: invalid" not in out
 

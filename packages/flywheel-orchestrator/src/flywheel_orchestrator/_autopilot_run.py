@@ -188,6 +188,17 @@ def _build_queue_depth(
 
 # --- The neverending daemon loop (autopilot-daemon) -------------------------
 
+# Consecutive whole-cycle failures (a refill pass raising unexpectedly) before
+# the daemon gives up so an operator can inspect, rather than hot-looping.
+# Mirrors the worker daemon's cross-cycle backstop
+# (``flywheel_worktree.worker.MAX_CONSECUTIVE_CYCLE_FAILURES`` /
+# ``CYCLE_FAILURE_BACKOFF_SECONDS``): a single raising cycle is counted and
+# backed off so the loop runs further cycles; a subsequent success resets the
+# count; on the bounded count the loop stops by surfacing a give-up signal the
+# caller turns into a non-zero exit (never a silent exit).
+MAX_CONSECUTIVE_CYCLE_FAILURES = 5
+CYCLE_FAILURE_BACKOFF_SECONDS = 10
+
 
 def run_daemon_loop(
     *,
@@ -197,6 +208,8 @@ def run_daemon_loop(
     sleep: Callable[[float, Callable[[], bool]], None],
     on_cycle: Callable[[AutopilotPassResult], None] | None = None,
     before_cycle: Callable[[], None] | None = None,
+    on_cycle_failure: Callable[[BaseException, int], None] | None = None,
+    on_give_up: Callable[[int], None] | None = None,
     max_cycles: int | None = None,
 ) -> int:
     """Run refill passes on an interval until an explicit stop signal.
@@ -206,7 +219,18 @@ def run_daemon_loop(
     next. It MUST NOT terminate on an idle (nothing-actionable) cycle -- an
     empty pass writes nothing and the loop continues (D-5). The loop exits only
     when ``should_stop()`` is true (an injected stop event in tests; a
-    SIGTERM/SIGINT flag in production), and at no other time.
+    SIGTERM/SIGINT flag in production), or when the circuit breaker gives up
+    (below), and at no other time.
+
+    Circuit breaker (mirrors the worker daemon): a ``run_cycle`` that raises is
+    contained -- the exception is counted, ``on_cycle_failure`` is notified, and
+    the loop backs off ``CYCLE_FAILURE_BACKOFF_SECONDS`` (via the injected,
+    interruptible ``sleep``) before running a further cycle. A subsequent
+    successful cycle resets the consecutive-failure count. After
+    ``MAX_CONSECUTIVE_CYCLE_FAILURES`` consecutive failures the loop stops and
+    calls ``on_give_up`` so the caller can surface a visible non-zero signal --
+    never a silent exit. ``KeyboardInterrupt``/``asyncio.CancelledError`` are
+    not counted: they stop the loop immediately.
 
     Every collaborator is injected so the loop runs with no real wall-clock
     waits and no live model: ``run_cycle`` is the (scripted) pass, ``sleep``
@@ -215,13 +239,33 @@ def run_daemon_loop(
     reclaims them). ``max_cycles`` is a test-only safety bound; production
     leaves it ``None`` (truly neverending).
 
-    Returns the number of cycles run.
+    Returns the number of cycles attempted (successful and failed).
     """
     cycles = 0
+    consecutive_failures = 0
     while not should_stop():
         if before_cycle is not None:
             before_cycle()
-        result = run_cycle()
+        try:
+            result = run_cycle()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            break
+        except Exception as exc:  # noqa: BLE001 - one bad cycle must not crash the daemon
+            consecutive_failures += 1
+            cycles += 1
+            if on_cycle_failure is not None:
+                on_cycle_failure(exc, consecutive_failures)
+            if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES:
+                if on_give_up is not None:
+                    on_give_up(consecutive_failures)
+                break
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            if should_stop():
+                break
+            sleep(CYCLE_FAILURE_BACKOFF_SECONDS, should_stop)
+            continue
+        consecutive_failures = 0
         cycles += 1
         if on_cycle is not None:
             on_cycle(result)
@@ -419,6 +463,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         recorder.on_cycle(result)
         _arm_signals(_flag)
 
+    gave_up = {"requested": False}
+
+    def on_cycle_failure(exc: BaseException, consecutive: int) -> None:
+        log(
+            f"cycle failed ({type(exc).__name__}: {exc}) "
+            f"[{consecutive}/{MAX_CONSECUTIVE_CYCLE_FAILURES}]"
+        )
+        _arm_signals(_flag)
+
+    def on_give_up(consecutive: int) -> None:
+        gave_up["requested"] = True
+        log(
+            f"too many consecutive cycle failures ({consecutive}); "
+            "exiting non-zero for operator inspection."
+        )
+
     cycles = run_daemon_loop(
         run_cycle=run_cycle,
         interval_seconds=interval,
@@ -426,9 +486,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         sleep=_interruptible_sleep,
         on_cycle=on_cycle,
         before_cycle=before_cycle,
+        on_cycle_failure=on_cycle_failure,
+        on_give_up=on_give_up,
     )
     log(f"daemon stopped after {cycles} cycle(s)")
-    return 0
+    return 1 if gave_up["requested"] else 0
 
 
 if __name__ == "__main__":  # pragma: no cover - module entry stub

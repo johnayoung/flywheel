@@ -146,6 +146,17 @@ def _extract_spec_block(body: str, *, source: str) -> dict[str, Any] | None:
     )
 
 
+def _issue_sort_key(issue: dict[str, Any]) -> int:
+    """Sort key by issue number, tolerant of malformed payloads.
+
+    Sorting runs before per-item compilation, so a payload with a missing
+    or non-integer ``number`` (which :meth:`_compile_issue` will reject and
+    skip) must not crash the ordering. Such items sort as ``0``.
+    """
+    number = issue.get("number")
+    return number if isinstance(number, int) else 0
+
+
 def _context_from_spec(spec: dict[str, Any], *, source: str) -> Context:
     raw = spec.get("context") or {}
     if not isinstance(raw, dict):
@@ -267,13 +278,28 @@ class GithubWorkSource:
         if len(issues) == int(_LIST_LIMIT):
             emit_truncation_warning(self._log, source="github", what="issue")
         items: list[WorkItem] = []
+        skipped: list[WorkSourceError] = []
         for issue in sorted(
             (i for i in issues if isinstance(i, dict)),
-            key=lambda i: int(i.get("number", 0)),
+            key=_issue_sort_key,
         ):
-            item = self._compile_issue(issue)
+            try:
+                item = self._compile_issue(issue)
+            except WorkSourceError as exc:
+                # One uncompilable payload must not abort the whole board:
+                # count + log the bad ticket (the message carries its
+                # source_ref / payload so it is recoverable) and keep going.
+                skipped.append(exc)
+                if self._log is not None:
+                    self._log(f"[github] skipping malformed issue: {exc}")
+                continue
             if item is not None:
                 items.append(item)
+        # A listing that produced no compilable item yet hit malformed
+        # payloads is a hard error, not "no work" -- preserve the loud abort
+        # so a fully broken board never silently reads as empty.
+        if not items and skipped:
+            raise skipped[0]
         return items
 
     def _compile_issue(self, issue: dict[str, Any]) -> WorkItem | None:

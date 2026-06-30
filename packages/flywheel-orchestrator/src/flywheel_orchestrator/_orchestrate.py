@@ -847,7 +847,25 @@ async def orchestrate(
         attempted_approve: set[str] = set()
 
         while True:
-            items = list(source.list_work())
+            # Source-listing containment (mirrors _source_reconcile_loop and
+            # sync_work_source): a raising list_work() must degrade this pass,
+            # never crash the driver. A generic-Exception guard matches the
+            # reconciler/sync posture -- a tracker hiccup or adapter/transport
+            # failure is contained, the in-flight state (claims, runs already
+            # recorded) is left untouched, and the worker quiesces gracefully
+            # (returns its report) rather than unwinding the whole session.
+            try:
+                items = list(source.list_work())
+            except Exception as exc:  # noqa: BLE001 - adapter/transport failure
+                if stream is not None:
+                    print(
+                        f"[orchestrate] work-source listing failed "
+                        f"({type(exc).__name__}: {exc}); no work this pass, "
+                        f"ending the session without touching in-flight state",
+                        file=stream,
+                        flush=True,
+                    )
+                break
             rows = status_rows_for_items(items, control)
             # Build (and structurally validate) the WorkGraph from the same
             # items the rows derive from -- one list_work() pass feeds both.
@@ -1438,18 +1456,40 @@ async def _drive_under_lease(
         # (D-3). A blocked gate suppresses the submit landing effect: submit is
         # not invoked, so the worktree backend leaves the sandbox parked for
         # forensics and no merge/PR happens.
-        gate = _evaluate_landing_gate(
-            held_out_source,
-            row.task,
-            status=outcome.lifecycle.status,
-            sandbox=sandbox,
-            run_id=outcome.lifecycle.run_id,
-            task_id=task_id,
-            grader_env=grader_env,
-            stream=stream,
-        )
+        # Call-site containment, fail closed: gate evaluation must never unwind
+        # the worker, and an evaluation that ERRORED must suppress landing
+        # rather than fall through to a merge/PR off an unevaluated gate. The
+        # engine already fails closed on a registration/runner error (returns a
+        # FAIL verdict); this guard covers the orthogonal case where the
+        # evaluation itself raised an unexpected exception (e.g. a buggy custom
+        # source). Mirrors the gate engine's discipline and the program
+        # decision that intentional gates are never auto-bypassed: an errored
+        # gate blocks the land just like a FAIL verdict.
+        gate_errored = False
+        try:
+            gate = _evaluate_landing_gate(
+                held_out_source,
+                row.task,
+                status=outcome.lifecycle.status,
+                sandbox=sandbox,
+                run_id=outcome.lifecycle.run_id,
+                task_id=task_id,
+                grader_env=grader_env,
+                stream=stream,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed, suppress landing
+            gate = None
+            gate_errored = True
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: held-out landing gate "
+                    f"evaluation errored ({type(exc).__name__}: {exc}); "
+                    f"landing suppressed (failing closed)",
+                    file=stream,
+                    flush=True,
+                )
         gate_blocked = gate is not None and gate.blocks_landing
-        if submit is not None and not gate_blocked:
+        if submit is not None and not gate_blocked and not gate_errored:
             submit(
                 SubmitRequest(
                     task_id=task_id,

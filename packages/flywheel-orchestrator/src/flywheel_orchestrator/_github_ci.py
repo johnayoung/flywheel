@@ -25,8 +25,14 @@ Run -> Task compilation:
   that moves to a new commit is detected even though the item id is stable.
 * ``source_url`` locates the run; ``source_kind`` marks the CI provenance.
 
-Malformed ``gh`` output raises :class:`WorkSourceError` rather than returning
-an empty list — a parse break must never masquerade as "CI is green."
+A single malformed run row (a non-object entry, a missing identity string, a
+definition that fails validation) is **skipped, counted, and logged** rather
+than aborting the whole listing: one uncompilable run must not hide every
+other failing run. The skip is recorded in :attr:`last_skipped_count` and one
+``log`` line names the offending run. But a parse break must never masquerade
+as "CI is green": if the page held rows yet *nothing* compiled because rows
+were dropped, ``list_work`` re-raises :class:`WorkSourceError` instead of
+returning an empty list.
 
 Outbound: :meth:`GithubCiWorkSource.report` posts the run's grader receipts
 back as a comment on the failing commit (never an issue mutation, never a
@@ -107,6 +113,14 @@ class GithubCiWorkSource:
     ``gh run list --status`` value (default ``"failure"``); an operator may
     widen it to capture other failing conclusions. ``log`` (when provided)
     receives one line per skipped run so non-runnable failures are visible.
+
+    A run row that cannot be compiled into a valid :class:`WorkItem` (a
+    non-object entry, a missing identity string, a definition that fails
+    validation) is skipped rather than aborting the listing: it is counted in
+    :attr:`last_skipped_count` and named in one ``log`` line, mirroring
+    :class:`~flywheel_orchestrator._sources.DirectoryWorkSource`. The count is
+    what lets a reconciler tell a dropped item ("investigate it") from an empty
+    source ("no work") -- the two must never look alike.
     """
 
     #: Provenance ``source_kind`` for emitted items and ``source_syncs`` rows.
@@ -130,6 +144,14 @@ class GithubCiWorkSource:
         self.failure_filter = failure_filter
         self._run = runner if runner is not None else _default_runner
         self._log = log
+        #: Number of run rows the most recent :meth:`list_work` skipped
+        #: because they could not be compiled into a valid item (malformed
+        #: output, missing identity field, failed validation). A reconciler
+        #: reads this to distinguish "dropped a bad row" from "no work" --
+        #: both can yield a short or empty item list, but only a skip is
+        #: non-zero. The no-grader readiness gate (D-4) is a policy decision,
+        #: not a parse break, so it is logged but not counted here.
+        self.last_skipped_count = 0
 
     @property
     def source_name(self) -> str:
@@ -173,19 +195,43 @@ class GithubCiWorkSource:
                 self._log, source="github_ci", what="run"
             )
 
+        # One uncompilable run row is skipped (counted + logged), not fatal:
+        # it must not hide every other failing run. ``skipped`` feeds
+        # ``last_skipped_count``; ``first_skip_error`` is held so an
+        # all-dropped page re-raises rather than reading as "CI is green".
+        skipped = 0
+        first_skip_error: WorkSourceError | None = None
+
+        def _skip(error: WorkSourceError) -> None:
+            nonlocal skipped, first_skip_error
+            skipped += 1
+            if first_skip_error is None:
+                first_skip_error = error
+            if self._log is not None:
+                self._log(
+                    f"[github_ci] skipping malformed run -- {error}"
+                )
+
         # Dedup to one item per (workflow, branch), keeping the most recent
         # run (D-3): multiple failed runs of the same workflow on the same
         # branch are one persistent failure, not several work items.
         latest: dict[tuple[str, str], dict[str, Any]] = {}
         for run in runs:
             if not isinstance(run, dict):
-                raise WorkSourceError(
-                    f"gh run list entry is {type(run).__name__}, "
-                    f"expected an object: {run!r}"
+                _skip(
+                    WorkSourceError(
+                        f"gh run list entry is {type(run).__name__}, "
+                        f"expected an object: {run!r}"
+                    )
                 )
-            workflow = _required_str(run, "workflowName")
-            branch = _required_str(run, "headBranch")
-            _required_str(run, "headSha")
+                continue
+            try:
+                workflow = _required_str(run, "workflowName")
+                branch = _required_str(run, "headBranch")
+                _required_str(run, "headSha")
+            except WorkSourceError as exc:
+                _skip(exc)
+                continue
             key = (workflow, branch)
             prior = latest.get(key)
             if prior is None or str(run.get("createdAt") or "") >= str(
@@ -195,9 +241,21 @@ class GithubCiWorkSource:
 
         items: list[WorkItem] = []
         for (workflow, branch), run in sorted(latest.items()):
-            item = self._compile_run(run, workflow=workflow, branch=branch)
+            try:
+                item = self._compile_run(run, workflow=workflow, branch=branch)
+            except WorkSourceError as exc:
+                _skip(exc)
+                continue
             if item is not None:
                 items.append(item)
+
+        self.last_skipped_count = skipped
+
+        # A parse break must never masquerade as "CI is green": if the page
+        # held rows yet nothing compiled because rows were dropped, surface
+        # the first skip's error rather than returning an empty list.
+        if not items and first_skip_error is not None:
+            raise first_skip_error
         return items
 
     def _compile_run(

@@ -19,21 +19,32 @@ The lifecycle tracks a task's execution state from creation to terminal outcome.
 
 ## State machine
 
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> ready : prerequisites met
+    ready --> running : worker claims and dispatches
+    running --> validating : agent emits intent=verify
+    running --> failed : intent=abort
+    running --> interrupted : operator interrupt / stuck guard
+    running --> internal_error : hang / crash
+    validating --> done : all graders pass, no manual gate
+    validating --> awaiting_approval : graders pass, manual gate pending
+    validating --> failed_validation : a grader fails / protocol failure
+    validating --> interrupted
+    validating --> internal_error : rubric-judge infra failure
+    awaiting_approval --> done : approve
+    awaiting_approval --> failed_validation : reject
+    failed_validation --> ready : retry when budget remains
+    failed_validation --> failed : retries exhausted
+    internal_error --> ready : retry when budget remains
+    internal_error --> failed : retries exhausted
+    interrupted --> ready : resume, no retry budget consumed
+    done --> [*]
+    failed --> [*]
 ```
-pending -> ready -> running -> validating -> done
-                      |           |
-                      |           +-> awaiting_approval -> done (approve)
-                      |           |                    -> failed_validation (reject) -> ready (retry) or failed
-                      |           |
-                      |      failed_validation -> ready (retry) or failed
-                      |           |
-                      |           +-> interrupted -> ready
-                      |           +-> internal_error -> ready (retry) or failed
-                      |
-                      +-> internal_error -> ready (retry) or failed
-                      +-> failed
-                      +-> interrupted -> ready
-```
+
+This diagram is the exact set of legal edges the harness enforces (`_VALID_EDGES` in `flywheel_core.lifecycle`); any other transition raises `LifecycleTransitionError`.
 
 `validating -> internal_error` covers rubric-judge infrastructure failures (SDK crash, parse failure, missing/duplicate/truncated verdict envelope); the existing retry budget applies just as it does for `running -> internal_error`.
 

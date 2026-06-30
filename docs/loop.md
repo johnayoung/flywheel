@@ -13,18 +13,29 @@ It does not queue, plan, or decompose work. It runs one task: invoke the agent, 
 - Preserve attempt history and failure context
 - Emit structured events for telemetry
 
-## State machine
+## The iteration loop
 
-```
-pending -> ready -> running -> validating -> done
-                      |           |
-                      |      failed_validation -> ready (retry) or failed
-                      |
-                      +-> failed
-                      +-> interrupted -> ready
-```
+One iteration: build the prompt, invoke the agent, then route on the loop guards and the agent's intent envelope. `continue` loops; every other outcome drives a [lifecycle](task-lifecycle.md) transition. `intent=verify` starts `validating`, **not** `done` — verification outcome and retry policy are separate decisions.
 
-`completed` from the agent starts `validating`, not `done`. Verification outcome and retry policy are separate decisions.
+```mermaid
+flowchart TD
+    P["Build iteration prompt (goal, context, graders, prior attempts)"] --> A["Invoke agent for one iteration"]
+    A --> G{"loop guard tripped?"}
+    G -->|hang| IE["internal_error, then retry"]
+    G -->|thrash| FV["failed_validation, then retry"]
+    G -->|"stuck / repeated tool failure"| INT["interrupted (operator-recoverable)"]
+    G -->|no| E["Parse the LOOP_STATUS envelope"]
+    E --> K{"envelope intent"}
+    K -->|continue| P
+    K -->|verify| VAL["validating: run graders in cost order"]
+    VAL --> VP{"all graders pass?"}
+    VP -->|"yes, no manual gate"| DONE["done (SubmitStrategy then lands it)"]
+    VP -->|"yes, manual gate"| AA["awaiting_approval (approve / reject)"]
+    VP -->|no| FV
+    K -->|"blocked (+ requires)"| INT2["interrupted; persist requires; recheck-blocked promotes to ready when every predicate holds"]
+    K -->|abort| FAIL["failed (reason recorded)"]
+    K -->|"malformed / missing / duplicate / truncated"| FV2["protocol failure, then failed_validation, then retry or failed"]
+```
 
 ## State detection
 

@@ -38,6 +38,42 @@ One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb 
 
 The `merge`/`pr` strategies both honor `[submit] protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
 
+## How a finished task lands
+
+The decision `submit` makes for a DONE run, under the merge lock (which serializes all base mutations so two workers never land concurrently). Every leaf is either a land or a park-with-reason — nothing lands that was not verified against the exact base it lands on.
+
+```mermaid
+flowchart TD
+    A["Run reaches a terminal status (submit, under the task lease)"] --> B{"status == DONE?"}
+    B -->|"no (failed / interrupted)"| P0["Park or destroy the sandbox per [sandbox.retention] on_failure"]
+    B -->|yes| S{"[submit] strategy"}
+
+    S -->|pr| PR["Push branch to [submit] remote, open/refresh a PR onto pr_base with grader receipts in the body. Review and CI own the merge."]
+
+    S -->|"merge (default)"| L["Acquire the merge lock"]
+    L --> U{"worktree clean?"}
+    U -->|"no, uncommitted edits"| K1["Park, park_kind=uncommitted-work"]
+    U -->|yes| C{"commits beyond base?"}
+    C -->|"no, empty diff"| CL["Clean up branch (legitimate no-op, nothing to land)"]
+    C -->|yes| PP{"touches [submit] protected_paths?"}
+    PP -->|yes| K2["Park, refuse to land"]
+    PP -->|no| FF{"branch already contains base? (fast-forward possible)"}
+
+    FF -->|"yes, clean FF"| V1{"[submit] verify passes? (standing build gate)"}
+    V1 -->|no| K3["Park, park_kind=standing-verify"]
+    V1 -->|yes| M1["FF-merge into base. LANDED. (in-tree merge --ff-only when base is the checked-out branch; out-of-tree fetch when base is a separate branch)"]
+
+    FF -->|"no, base advanced"| RB{"rebase onto base clean?"}
+    RB -->|no| K4["Park, park_kind=divergent-base"]
+    RB -->|yes| RV{"task command graders re-pass on the rebased tree?"}
+    RV -->|no| K5["Park, post-rebase re-verify failed"]
+    RV -->|yes| V2{"[submit] verify passes?"}
+    V2 -->|no| K6["Park, park_kind=standing-verify"]
+    V2 -->|yes| M2["FF-merge into base. LANDED."]
+```
+
+`[submit] base` unset (the default) lands onto the branch you have checked out (in-tree FF); set it to a *separate* branch you do not have checked out to land out-of-tree. `[submit] verify` (spec 00064) is the repo-wide standing build gate; `park_kind` values are queryable on the run's ledger and surfaced by `flywheel status` (see [configuration.md](configuration.md)).
+
 ## Future strategies
 
 Container-based isolation is shipped — see `ContainerSubmitStrategy` above. The remaining futures all fit the same two hooks: emit a patch artifact (touch no refs), auto-merge on green, non-git submission flows. flywheel does not need to know they exist.

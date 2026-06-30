@@ -21,6 +21,18 @@ Autopilot emits plain core `Task`s (`docs/task-schema.md`), each carrying at lea
 
 One refill pass (`run_refill_pass`, `_autopilot.py:1059`) composes four stages and fills the queue **only up to the target depth, from actionable findings only** — never always-busy filler. It is headless and logs to stderr with an `[autopilot]` prefix (`make_logger`, `_autopilot_run.py:37`).
 
+```mermaid
+flowchart TD
+    START["Daemon cycle (every interval_seconds)"] --> D{"actionable queue depth below target_depth?"}
+    D -->|no| WAIT["Emit nothing; return cleanly; wait for the next cycle"]
+    D -->|yes| DISC["Discovery: one relevance agent per tier (11 concurrent) produces findings with evidence and estimates"]
+    DISC --> SCORE["Score and sequence: server-side final score, ready/preemptive band ahead of the scheduled band"]
+    SCORE --> AUTH["Author: compile top findings into Tasks, each with an out-of-band grader and conflict_keys derived from grader_target and creates_files; un-lowerable findings dropped with a reason"]
+    AUTH --> EMIT["Emit task JSON to .flywheel/tasks/active/autopilot/ (idempotent by task id)"]
+    EMIT --> START
+    EMIT -.->|"independent daemon"| WORKER["Worker drains the queue: claim (conflict_keys serialize overlapping tasks), run the agent, land via the SubmitStrategy"]
+```
+
 1. **Discovery** (`run_discovery`, `_autopilot.py:616`) — fans out **one relevance agent per tier**, 11 concurrent invocations. Each agent reads the repo, judges whether its tier is relevant to this codebase, and returns a `TierVerdict` with zero or more findings carrying evidence plus 0–10 estimates for urgency, importance, blocks, and effort, and a `ready` flag. Relevance is agent-judged per repo, never coded detectors. The fan-out is best-effort: it always returns exactly 11 verdicts, even if every agent errors, and a not-relevant verdict always carries zero findings. Findings are stamped with their tier server-side, not by the agent.
 2. **Score** (`sequence_findings`, `_autopilot.py:262`) — applies [the scoring model](#the-scoring-model) to every finding from relevant tiers, partitioning the ready preemptive band ahead of the scheduled band, each ordered by descending score. The final score is computed here, never agent-reported; the agent only supplies the input estimates.
 3. **Author** (`author_finding`, `_autopilot.py:880`) — each selected finding is compiled by an agent into one or more validated core `Task`s, each with at least one grader. **The authoritative grader must be out-of-band** — a pre-existing committed repo check (`repo_command`) or a registered held-out oracle (`held_out_oracle`), never a check the same task's own diff creates. A self-attestation guard (`_validate_task_entry`, `_autopilot.py:765`) drops any task whose authoritative grader names or equals a file the task creates. A finding that cannot be lowered to such a task is **dropped with a recorded reason**, never written as a stub. Ambiguities a human would be asked about are recorded as `assumptions` on the emitted task.

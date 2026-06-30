@@ -28,6 +28,31 @@ One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (
 | `[autopilot]` | no | intake-daemon cadence + scoring weights | [autopilot.md](autopilot.md) |
 | `[sandbox.*]` | no | provisioning + the agent's execution environment | [sandbox.md](sandbox.md) |
 
+The main axes and what each selects — the "how config changes the path" view:
+
+```mermaid
+flowchart LR
+    CFG["flywheel.toml"] --> SRC["[source] kind"]
+    SRC --> SRCd["directory: task JSON files"]
+    SRC --> SRCg["github / github_ci / github_review: tracker issues and PRs"]
+    CFG --> ST["[store] backend"]
+    ST --> STs["sqlite (default)"]
+    ST --> STp["postgres (required for execution.mode = distributed)"]
+    CFG --> SBX["[sandbox] backend"]
+    SBX --> SBw["worktree (default): a git worktree per task"]
+    SBX --> SBc["container: Docker via the flywheel-container extra"]
+    CFG --> SUB["[submit]"]
+    SUB --> STR{"strategy"}
+    STR --> SM["merge (default): FF-merge in-tree, full autonomy"]
+    STR --> SP["pr: push and open a PR, review owns the merge"]
+    SUB --> BASE{"base set?"}
+    BASE -->|unset| BU["land onto the checked-out branch"]
+    BASE -->|set| BS["land out-of-tree onto a separate integration branch"]
+    SUB --> VER["verify: standing build gate (land only if it passes)"]
+```
+
+See [strategy.md](strategy.md) for the full landing decision tree these `[submit]` keys drive.
+
 ## `[source]` (required)
 
 Where work comes from. `kind` selects the `WorkSource` backend; the remaining keys are per-kind. See [work-sources.md](work-sources.md) for each kind's listing/grading behavior.

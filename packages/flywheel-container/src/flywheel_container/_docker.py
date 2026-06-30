@@ -23,6 +23,8 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from flywheel_core.deadline_config import DeadlineClass, resolve_deadlines
+
 DEFAULT_AGENT_HOME = "/home/agent"
 DEFAULT_WORKDIR = f"{DEFAULT_AGENT_HOME}/workspace"
 # Cap the retained stdout/stderr tail (64 KiB/stream) so a long agent run cannot
@@ -30,9 +32,33 @@ DEFAULT_WORKDIR = f"{DEFAULT_AGENT_HOME}/workspace"
 # ``on_line`` as they arrive.
 DEFAULT_MAX_TAIL_CHARS = 64 * 1024
 
+# Default-on wall-clock ceiling (seconds) for every docker *management* call
+# (image/network inspect, network create, container stop/rm, the atexit
+# force-remove). Resolved from the shared deadline config (spec 00066, D-1) so
+# the magnitude lives in one place and an operator override flows through the
+# same surface as the other call classes. ``None`` would be the unbounded
+# opt-out; the default is finite so a hung ``dockerd`` cannot wedge the caller
+# while it holds the lease.
+DEFAULT_MANAGEMENT_TIMEOUT: float | None = resolve_deadlines().for_class(
+    DeadlineClass.DOCKER_MANAGEMENT
+)
+
 
 class DockerError(RuntimeError):
     """A ``docker`` invocation failed (non-zero exit or spawn error)."""
+
+
+class DockerTimeoutError(DockerError):
+    """A ``docker`` invocation exceeded its wall-clock timeout.
+
+    A distinguishable subclass of :class:`DockerError` so a hung ``dockerd``
+    surfaces as a recognizable *timeout* rather than being conflated with an
+    ordinary non-zero exit or a benign "not found". The best-effort callers
+    (``image_exists`` / ``network_exists`` / ``remove_container`` /
+    ``force_remove_container_sync``) swallow ordinary failures but re-raise this
+    one: a timeout means the daemon is wedged, which the caller must learn about
+    rather than silently treat as "absent" or "already gone".
+    """
 
 
 @dataclass(frozen=True)
@@ -159,6 +185,10 @@ def _run_docker(argv: Sequence[str], *, timeout: float | None = None) -> str:
             text=True,
             timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise DockerTimeoutError(
+            f"docker {argv[1] if len(argv) > 1 else ''} timed out after {timeout}s"
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise DockerError(f"docker {argv[1] if len(argv) > 1 else ''} failed: {exc}") from exc
     if proc.returncode != 0:
@@ -169,16 +199,28 @@ def _run_docker(argv: Sequence[str], *, timeout: float | None = None) -> str:
     return proc.stdout
 
 
-def image_exists(image: str) -> bool:
+def image_exists(
+    image: str, *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> bool:
     """Whether ``image`` is present locally."""
     try:
-        _run_docker(["docker", "image", "inspect", image, "--format", "{{.Id}}"])
+        _run_docker(
+            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+            timeout=timeout,
+        )
         return True
+    except DockerTimeoutError:
+        raise
     except DockerError:
         return False
 
 
-def check_image_uid(image: str, expected_uid: int) -> None:
+def check_image_uid(
+    image: str,
+    expected_uid: int,
+    *,
+    timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT,
+) -> None:
     """Pre-flight: the image must exist and its baked ``USER`` UID (when
     numeric) must equal ``expected_uid``.
 
@@ -188,8 +230,11 @@ def check_image_uid(image: str, expected_uid: int) -> None:
     """
     try:
         out = _run_docker(
-            ["docker", "image", "inspect", image, "--format", "{{.Config.User}}"]
+            ["docker", "image", "inspect", image, "--format", "{{.Config.User}}"],
+            timeout=timeout,
         )
+    except DockerTimeoutError:
+        raise
     except DockerError as exc:
         raise DockerError(
             f"image {image!r} not found locally; build it first"
@@ -341,16 +386,25 @@ def exec_in_container(
     )
 
 
-def network_exists(name: str) -> bool:
+def network_exists(
+    name: str, *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> bool:
     """Whether a Docker network named ``name`` exists."""
     try:
-        _run_docker(["docker", "network", "inspect", name, "--format", "{{.Id}}"])
+        _run_docker(
+            ["docker", "network", "inspect", name, "--format", "{{.Id}}"],
+            timeout=timeout,
+        )
         return True
+    except DockerTimeoutError:
+        raise
     except DockerError:
         return False
 
 
-def ensure_internal_network(name: str) -> None:
+def ensure_internal_network(
+    name: str, *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> None:
     """Create ``name`` as a Docker ``--internal`` network if absent (idempotent).
 
     Internal networks have no external connectivity — Docker provisions no
@@ -359,28 +413,54 @@ def ensure_internal_network(name: str) -> None:
     (spec 00044 G6); fine-grained ``allow_hosts`` is delegated to an
     operator-provisioned egress-proxy network instead.
     """
-    if network_exists(name):
+    if network_exists(name, timeout=timeout):
         return
-    _run_docker(["docker", "network", "create", "--internal", name])
+    _run_docker(
+        ["docker", "network", "create", "--internal", name], timeout=timeout
+    )
 
 
-def remove_container(name: str) -> None:
-    """Stop and remove a container, best-effort (ignores 'not found')."""
+def remove_container(
+    name: str, *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> None:
+    """Stop and remove a container, best-effort (ignores 'not found').
+
+    A wall-clock ``timeout`` bounds each stop/rm so a hung ``dockerd`` cannot
+    wedge teardown while the worker holds its lease; an ordinary failure (e.g.
+    'not found') is still swallowed, but a :class:`DockerTimeoutError` re-raises
+    so the timeout is not silently mistaken for a clean removal.
+    """
     for sub in (["docker", "stop", name], ["docker", "rm", name]):
         try:
-            _run_docker(sub)
+            _run_docker(sub, timeout=timeout)
+        except DockerTimeoutError:
+            raise
         except DockerError:
             pass
 
 
-def force_remove_container_sync(name: str) -> None:
-    """``docker rm -f`` a container, swallowing all errors (crash cleanup)."""
+def force_remove_container_sync(
+    name: str, *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> None:
+    """``docker rm -f`` a container, swallowing spawn/exit errors (crash cleanup).
+
+    A wall-clock ``timeout`` bounds the call so the ``atexit`` backstop cannot
+    wedge interpreter shutdown against a hung ``dockerd``. Ordinary errors stay
+    swallowed (best-effort cleanup), but a timeout re-raises as a
+    :class:`DockerTimeoutError` so the wedge is distinguishable;
+    :func:`_flush_cleanup_registry` catches it so atexit still exits cleanly.
+    """
     try:
         subprocess.run(
             ["docker", "rm", "-f", name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise DockerTimeoutError(
+            f"docker rm -f timed out after {timeout}s"
+        ) from exc
     except (OSError, subprocess.SubprocessError):
         pass
 

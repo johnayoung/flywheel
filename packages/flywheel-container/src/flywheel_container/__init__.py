@@ -14,9 +14,11 @@ from __future__ import annotations
 
 from flywheel_container._docker import (
     DEFAULT_AGENT_HOME,
+    DEFAULT_MANAGEMENT_TIMEOUT,
     DEFAULT_MAX_TAIL_CHARS,
     DEFAULT_WORKDIR,
     DockerError,
+    DockerTimeoutError,
     ExecResult,
     VolumeMount,
     build_exec_argv,
@@ -62,9 +64,11 @@ __all__ = [
     "DEFAULT_AGENT_HOME",
     "DEFAULT_INTERNAL_NETWORK",
     "OAUTH_TOKEN_ENV",
+    "DEFAULT_MANAGEMENT_TIMEOUT",
     "DEFAULT_MAX_TAIL_CHARS",
     "DEFAULT_WORKDIR",
     "DockerError",
+    "DockerTimeoutError",
     "ExecResult",
     "ResolvedNetwork",
     "StreamOutcome",

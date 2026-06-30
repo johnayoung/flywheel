@@ -8,20 +8,27 @@ loudly, *before* any scheduling pass — instead of silently producing a graph
 that deadlocks or schedules a task that can never satisfy its own
 precondition.
 
-The four defect classes are deliberately split (spec 00047, decision D-1):
+Every defect is *contained, never fatal* — the containment floor (spec
+00065) extends the missing-prerequisite posture (spec 00047, decision D-1)
+to structural corruption so one corrupt definition never poisons the
+unrelated tasks sharing its scheduling pass:
 
 * **Structural corruption** — a duplicate task id, a self-dependency, or a
-  cycle — hard-fails. No safe schedule exists, so building a graph at all
-  would be a lie. Construction raises :class:`WorkGraphValidationError` and
-  the message names the offending id(s); for a cycle it names *every*
-  participating member.
+  cycle — isolates the offending task(s). Construction does NOT raise; it
+  records an :class:`ExcludedTask` whose ``reason`` names the offending
+  id(s) — for a cycle, every participating member — and builds the graph
+  from the survivors. The isolated ids never reach :attr:`WorkGraph.items`,
+  so they stay out of :meth:`WorkGraph.ready_set` while every valid,
+  independent task in the same pass remains schedulable. The reason is
+  recoverable on :attr:`WorkGraph.excluded`, never silently dropped.
 * **A missing prerequisite** — an edge that resolves to no node in the
-  graph — is a different class. Under multi-source aggregation the referenced
-  work may simply not be loaded by a sibling source on this pass, so aborting
-  the build would regress the "dangling prerequisite never runs" contract.
-  Construction does NOT raise; it records a :class:`GraphValidationIssue`
-  naming the referencing and missing ids, and the referencing task stays out
-  of :meth:`WorkGraph.ready_set`.
+  graph. Under multi-source aggregation the referenced work may simply not
+  be loaded by a sibling source on this pass, so aborting the build would
+  regress the "dangling prerequisite never runs" contract. Construction
+  records a :class:`GraphValidationIssue` naming the referencing and missing
+  ids, and the referencing task stays out of :meth:`WorkGraph.ready_set`. A
+  survivor whose prerequisite was *isolated* above keeps a dangling edge of
+  exactly this class.
 
 ``ready_set(states, excluded)`` answers the same eligibility question
 ``flywheel_orchestrator._workflow.select_next_task`` does — a task is runnable
@@ -61,15 +68,21 @@ def _state_value(state: Any) -> Any:
     return getattr(state, "value", state)
 
 
-class WorkGraphValidationError(ValueError):
-    """Structural corruption in a :class:`WorkGraph`'s prerequisite edges.
+@dataclass(frozen=True, kw_only=True)
+class ExcludedTask:
+    """A task isolated from a :class:`WorkGraph` for structural corruption.
 
-    Raised on construction for a duplicate task id, a self-dependency, or a
-    cycle. The message always names the offending id(s) — and for a cycle,
-    every participating member — so an operator can find and fix the corrupt
-    definition. A *missing* prerequisite is NOT this error: it is recorded as
-    a :class:`GraphValidationIssue` (decision D-1).
+    Recorded (never raised) when construction encounters a duplicate task id,
+    a self-dependency, or a cycle: ``task_id`` is the isolated task and
+    ``reason`` is a human-readable explanation that always names the offending
+    id(s) — for a cycle, every participating member. The isolated task is
+    absent from :attr:`WorkGraph.items` and the ready set, while every valid,
+    independent task in the same pass stays schedulable. The reason keeps the
+    exclusion recoverable rather than a silent drop (spec 00065).
     """
+
+    task_id: str
+    reason: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -98,60 +111,140 @@ class GraphValidationIssue:
 
 @dataclass(frozen=True, kw_only=True)
 class GraphValidationResult:
-    """A built :class:`WorkGraph` together with its non-fatal issues.
+    """A built :class:`WorkGraph` together with its recorded defects.
 
     Returned by :meth:`WorkGraph.build`. ``graph`` is the validated graph
-    (its construction already raised on any structural corruption);
-    ``issues`` holds the recorded missing-prerequisite findings (empty when
-    every edge resolved).
+    built from the survivors; ``issues`` holds the recorded
+    missing-prerequisite findings (empty when every edge resolved);
+    ``excluded`` holds the tasks isolated for structural corruption (a
+    duplicate id, a self-dependency, or a cycle), each with a reason naming
+    the offender (empty when the set was structurally sound).
     """
 
     graph: "WorkGraph"
     issues: tuple[GraphValidationIssue, ...] = ()
+    excluded: tuple[ExcludedTask, ...] = ()
 
 
 class WorkGraph:
     """A validated prerequisite DAG built from a sequence of ``WorkItem``.
 
-    Construction validates structure eagerly: a duplicate task id, a
-    self-dependency, or a cycle raises :class:`WorkGraphValidationError`
-    (message naming the offender(s)). Missing prerequisites are recorded as
-    :class:`GraphValidationIssue`\\ s on :attr:`issues` rather than raising.
+    Construction validates structure eagerly but *contains* every defect
+    rather than raising (spec 00065). A duplicate task id, a self-dependency,
+    or a cycle isolates the offending task(s): the graph is built from the
+    survivors and each exclusion is recorded as an :class:`ExcludedTask` on
+    :attr:`excluded` with a reason naming the offender(s). Missing
+    prerequisites are recorded as :class:`GraphValidationIssue`\\ s on
+    :attr:`issues`. Either way, every valid, independent task in the same
+    pass stays schedulable.
     """
 
     def __init__(self, items: Iterable[WorkItem] = ()) -> None:
         materialized = tuple(items)
 
+        # Structural corruption is contained, not fatal: an offending task is
+        # isolated with a recorded reason and the graph is built from the
+        # survivors, so one corrupt definition never poisons the unrelated
+        # tasks sharing its scheduling pass. ``excluded`` keeps the reasons
+        # (recoverable, never silently dropped); an isolated id never reaches
+        # ``_by_id`` and so stays out of every structure query and the ready
+        # set.
+        excluded: list[ExcludedTask] = []
+        excluded_ids: set[str] = set()
+
         # -- duplicate task id (structural corruption) ---------------------
-        by_id: dict[str, WorkItem] = {}
-        duplicates: list[str] = []
+        # An id defined more than once is ambiguous -- nothing can say which
+        # definition is authoritative -- so every copy is isolated and the id
+        # is named once. First-seen order keeps the record deterministic.
+        counts: dict[str, int] = {}
+        first_seen: list[str] = []
         for item in materialized:
             task_id = item.task.id
-            if task_id in by_id:
-                duplicates.append(task_id)
-            by_id[task_id] = item
-        if duplicates:
-            named = ", ".join(sorted(set(duplicates)))
-            raise WorkGraphValidationError(
-                f"duplicate task id(s): {named}"
-            )
+            if task_id not in counts:
+                first_seen.append(task_id)
+            counts[task_id] = counts.get(task_id, 0) + 1
+        for task_id in first_seen:
+            if counts[task_id] > 1:
+                excluded_ids.add(task_id)
+                excluded.append(
+                    ExcludedTask(
+                        task_id=task_id,
+                        reason=(
+                            f"duplicate task id: {task_id!r} is defined "
+                            f"{counts[task_id]} times in the same scheduling "
+                            f"pass"
+                        ),
+                    )
+                )
 
-        # -- self-dependency + edge classification -------------------------
+        # -- self-dependency (structural corruption) -----------------------
+        # A task that lists itself as a prerequisite can never satisfy its own
+        # precondition; isolate it. A copy already isolated as a duplicate is
+        # not recorded twice.
+        for item in materialized:
+            task_id = item.task.id
+            if task_id in excluded_ids:
+                continue
+            if task_id in tuple(item.prerequisites):
+                excluded_ids.add(task_id)
+                excluded.append(
+                    ExcludedTask(
+                        task_id=task_id,
+                        reason=(
+                            f"self-dependency: task {task_id!r} lists itself "
+                            f"as a prerequisite"
+                        ),
+                    )
+                )
+
+        # -- cycle detection (structural corruption) -----------------------
+        # Detect cycles over the survivors' resolved edges, then isolate every
+        # participating member -- naming the whole cycle in each member's
+        # reason so the corrupt loop is recoverable from any of its ids.
+        survivor_ids = {
+            item.task.id
+            for item in materialized
+            if item.task.id not in excluded_ids
+        }
+        resolved_for_cycle = {
+            item.task.id: tuple(
+                p for p in item.prerequisites if p in survivor_ids
+            )
+            for item in materialized
+            if item.task.id not in excluded_ids
+        }
+        cycle_members = _cycle_members(resolved_for_cycle)
+        if cycle_members:
+            named = ", ".join(sorted(cycle_members))
+            for member in sorted(cycle_members):
+                excluded_ids.add(member)
+                excluded.append(
+                    ExcludedTask(
+                        task_id=member,
+                        reason=f"dependency cycle among task id(s): {named}",
+                    )
+                )
+
+        # -- build the graph from the survivors ----------------------------
         # ``_declared`` keeps every prerequisite as authored (used to keep a
         # task with a dangling edge ineligible); ``_resolved`` keeps only
-        # edges that point at a real node (used for cycle detection,
-        # topological order, and the resolved-prerequisite query).
+        # edges that point at a surviving node (used for cycle detection,
+        # topological order, and the resolved-prerequisite query). A survivor
+        # whose prerequisite was isolated above keeps a dangling edge --
+        # recorded as a GraphValidationIssue exactly like an unresolved
+        # cross-source reference -- so it stays out of the ready set.
+        survivors = tuple(
+            item for item in materialized if item.task.id not in excluded_ids
+        )
+        by_id: dict[str, WorkItem] = {
+            item.task.id: item for item in survivors
+        }
         declared: dict[str, tuple[str, ...]] = {}
         resolved: dict[str, tuple[str, ...]] = {}
         issues: list[GraphValidationIssue] = []
-        for item in materialized:
+        for item in survivors:
             task_id = item.task.id
             prereqs = tuple(item.prerequisites)
-            if task_id in prereqs:
-                raise WorkGraphValidationError(
-                    f"self-dependency: task {task_id!r} lists itself as a "
-                    f"prerequisite"
-                )
             declared[task_id] = prereqs
             resolved[task_id] = tuple(p for p in prereqs if p in by_id)
             for prereq_id in prereqs:
@@ -162,30 +255,24 @@ class WorkGraph:
                         )
                     )
 
-        # -- cycle detection (structural corruption) -----------------------
-        cycle_members = _cycle_members(resolved)
-        if cycle_members:
-            named = ", ".join(sorted(cycle_members))
-            raise WorkGraphValidationError(
-                f"dependency cycle among task id(s): {named}"
-            )
-
-        self._items: tuple[WorkItem, ...] = materialized
+        self._items: tuple[WorkItem, ...] = survivors
         self._by_id = by_id
         self._declared = declared
         self._resolved = resolved
         self._issues: tuple[GraphValidationIssue, ...] = tuple(issues)
+        self._excluded: tuple[ExcludedTask, ...] = tuple(excluded)
 
     # -- builder --------------------------------------------------------------
 
     @classmethod
     def build(cls, items: Iterable[WorkItem] = ()) -> GraphValidationResult:
-        """Construct the graph and return it with its recorded issues.
+        """Construct the graph and return it with its recorded defects.
 
-        Raises :class:`WorkGraphValidationError` on structural corruption
-        (the construction itself raises); otherwise returns a
-        :class:`GraphValidationResult` carrying the graph and any
-        missing-prerequisite issues.
+        Never raises: structural corruption (a duplicate id, a
+        self-dependency, a cycle) isolates the offending task(s) and missing
+        prerequisites are recorded. Returns a :class:`GraphValidationResult`
+        carrying the survivor graph, any missing-prerequisite ``issues``, and
+        any ``excluded`` tasks (each with a reason naming the offender).
         """
         graph = cls(items)
         return graph.validation
@@ -203,9 +290,22 @@ class WorkGraph:
         return self._issues
 
     @property
+    def excluded(self) -> tuple[ExcludedTask, ...]:
+        """Tasks isolated for structural corruption, each with a reason.
+
+        One :class:`ExcludedTask` per task isolated for a duplicate id, a
+        self-dependency, or a cycle; its ``reason`` names the offender(s).
+        Empty when the input set was structurally sound. The excluded ids are
+        absent from :attr:`items` and the ready set.
+        """
+        return self._excluded
+
+    @property
     def validation(self) -> GraphValidationResult:
-        """This graph paired with its recorded issues."""
-        return GraphValidationResult(graph=self, issues=self._issues)
+        """This graph paired with its recorded issues and exclusions."""
+        return GraphValidationResult(
+            graph=self, issues=self._issues, excluded=self._excluded
+        )
 
     def resolved_prerequisites(self, task_id: str) -> frozenset[str]:
         """Prerequisite ids of ``task_id`` that resolve to a real node.
@@ -324,9 +424,9 @@ class WorkGraphBuilder:
     reference unresolved in *every* source becomes a non-fatal
     :class:`GraphValidationIssue` rather than aborting the build. Structural
     corruption in the combined set (a duplicate id whose two members come from
-    different sources, a self-dependency, a cycle) still raises
-    :class:`WorkGraphValidationError`, exactly as constructing the model
-    directly would.
+    different sources, a self-dependency, a cycle) isolates the offending
+    task(s) as :class:`ExcludedTask` records, exactly as constructing the
+    model directly would -- the surviving items still build a graph.
 
     The builder depends only on the ``list_work()`` protocol, so it is
     source-kind agnostic: a :class:`DirectoryWorkSource`, a
@@ -348,9 +448,9 @@ class WorkGraphBuilder:
         sequence. Each source's :meth:`WorkSource.list_work` is called once,
         in argument order, and the items are concatenated preserving that
         order so selection ties still break deterministically. The combined
-        set is constructed through :meth:`WorkGraph.build`, which raises
-        :class:`WorkGraphValidationError` on structural corruption and records
-        missing-prerequisite :class:`GraphValidationIssue`\\ s otherwise.
+        set is constructed through :meth:`WorkGraph.build`, which isolates
+        structurally-corrupt tasks as :class:`ExcludedTask` records and
+        records missing-prerequisite :class:`GraphValidationIssue`\\ s.
         """
         items: list[WorkItem] = []
         for source in _flatten_sources(sources):
@@ -444,9 +544,9 @@ def _cycle_members(resolved: Mapping[str, tuple[str, ...]]) -> frozenset[str]:
 
 
 __all__ = [
+    "ExcludedTask",
     "GraphValidationIssue",
     "GraphValidationResult",
     "WorkGraph",
     "WorkGraphBuilder",
-    "WorkGraphValidationError",
 ]

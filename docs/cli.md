@@ -47,7 +47,7 @@ Delegated to `flywheel_orchestrator._workflow.main`. On a load/policy/work-sourc
 
 | Verb | What it does | Key flags |
 |---|---|---|
-| `status` | One line per active task: `phase/task_id state [-- error]`. INTERRUPTED rows show `blocked_on:`; AWAITING_APPROVAL rows show `awaiting_on: <instruction>`. `--json` emits a per-task array. | `--json`, `--rollup`, `--tasks-dir`, `--policy`, `--db` |
+| `status` | One line per active task: `phase/task_id state [-- error]`. INTERRUPTED rows show `blocked_on:`; AWAITING_APPROVAL rows show `awaiting_on: <instruction>`; a DONE run that never landed shows `stranded: <park_kind> -- <detail>` (the work finished but the strategy parked it -- uncommitted tree, divergent base, or a failed `[submit] verify`). `--json` emits a per-task array, each entry carrying `stranded: {park_kind, detail}` when parked (omitted otherwise). | `--json`, `--rollup`, `--tasks-dir`, `--policy`, `--db` |
 | `status --rollup` | Phase-grouped, **evidence-derived** rollup: each task's status is computed from grader receipts (verified vs accepted vs blocked/failed/not-started), never self-reported. | `--rollup`, `--json` |
 | `live` | One line per in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL): status, `attempt=N iter=K`, `tokens=/cost=/turns=`, `age=` / `idle=` (marked `STALE` past 90s idle), last action. `--watch N` clears and refreshes every N seconds (Ctrl-C exits). | `--watch SECONDS`, `--policy`, `--db` (no `--tasks-dir`) |
 | `history` | Finished runs (done / failed / failed_validation), one line per task, newest first; retries fold to one row `runs=N`. | `--status S` (repeatable), `--phase`, `--limit N`, `--json`, `--tasks-dir`, `--policy`, `--db` |

@@ -40,6 +40,7 @@ from flywheel_core.harness import (
     RecheckOutcome,
     recheck_blocked_lifecycle,
 )
+from flywheel_core.events import LandingParked
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
@@ -1331,6 +1332,24 @@ def _cmd_status_rollup(args: argparse.Namespace) -> int:
     return 0
 
 
+def _landing_park_for_run(
+    store: SqliteStore | PostgresStore, run_id: str
+) -> LandingParked | None:
+    """The most recent :class:`LandingParked` event on ``run_id``, or ``None``.
+
+    A parked DONE run is *stranded*: its work finished and graded green, but the
+    strategy could not land it (uncommitted tree, divergent base, or a failed
+    ``[submit] verify`` standing build invariant), so it sits on an unmerged
+    branch/worktree. This is the marker the ``stranded:`` status annotation
+    keys on so a strand is visible instead of accumulating silently."""
+    parks = [
+        e
+        for e in store.list_domain_events(run_id)
+        if isinstance(e, LandingParked)
+    ]
+    return parks[-1] if parks else None
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     if getattr(args, "rollup", False):
         return _cmd_status_rollup(args)
@@ -1348,6 +1367,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
         live_worker_ids = {
             live.run_id: live.worker_id for live in collect_live_rows(store)
         }
+        # A parked DONE run is stranded -- finished but never landed. Collect
+        # the park reason per run while the store is open (the rows render
+        # after it closes), bounded to DONE rows since a park only attaches at
+        # the DONE landing site.
+        parked_landings: dict[str, LandingParked] = {}
+        for row in rows:
+            if (
+                row.latest_run_id is not None
+                and row.latest_status == Status.DONE
+            ):
+                park = _landing_park_for_run(store, row.latest_run_id)
+                if park is not None:
+                    parked_landings[row.latest_run_id] = park
     finally:
         store.close()
     if args.json:
@@ -1390,6 +1422,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     "ordinal": row.awaiting_manual_ordinal,
                     "instruction": instruction,
                 }
+            park = (
+                parked_landings.get(row.latest_run_id)
+                if row.latest_run_id is not None
+                else None
+            )
+            if park is not None:
+                # A landed-but-parked (stranded) DONE run: surface the park
+                # reason on the same omit-when-absent convention as awaiting_on.
+                entry["stranded"] = {
+                    "park_kind": park.park_kind,
+                    "detail": park.detail,
+                }
             out.append(entry)
         print(json.dumps(out, indent=2))
         return 0
@@ -1422,6 +1466,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
             # ``flywheel status`` see the gate's instruction without
             # cross-referencing the task file or the audit stream.
             print(f"    awaiting_on: {instruction}")
+        park = (
+            parked_landings.get(row.latest_run_id)
+            if row.latest_run_id is not None
+            else None
+        )
+        if park is not None:
+            # A DONE run whose work never landed: surface the strand and its
+            # cause as a follow-up line so it is visible at a glance instead of
+            # accumulating as a silent unmerged branch.
+            detail = f" -- {park.detail}" if park.detail else ""
+            print(f"    stranded: {park.park_kind}{detail}")
     return 0
 
 def _list_blocked_lifecycles(store: SqliteStore | PostgresStore) -> list[tuple[str, str]]:

@@ -19,6 +19,7 @@ import pytest
 from claude_agent_sdk import Message
 
 from flywheel_core.envelope import Intent, ValidEnvelope
+from flywheel_core.events import LandingParked
 from flywheel_core.harness import HarnessOutcome, InvocationRequest
 from flywheel_core.invoker import InvocationSignals, IterationResult
 from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
@@ -1476,6 +1477,101 @@ def test_main_status_json_emits_machine_readable(
     assert len(payload) == 1
     assert payload[0]["task_id"] == "a"
     assert payload[0]["state"] == "fresh"
+
+
+# ---------- Stranded-landing surfacing (spec 00064 P3) ----------
+
+
+def _park_landing(
+    store: SqliteStore, lc: Lifecycle, *, park_kind: str, detail: str
+) -> None:
+    """Record a LandingParked event on ``lc``'s run, as the submitter does for a
+    DONE run whose branch could not land."""
+    loaded = store.load_lifecycle(lc.run_id)
+    assert loaded is not None
+    store.append_domain_event(
+        LandingParked(
+            run_id=lc.run_id,
+            ts=datetime.now(timezone.utc),
+            park_kind=park_kind,
+            detail=detail,
+        ),
+        expected_version=loaded.version,
+    )
+
+
+def test_status_text_marks_a_stranded_parked_landing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        lc = _seed_done(store, "a")
+        _park_landing(
+            store,
+            lc,
+            park_kind="standing-verify",
+            detail="a failed the standing build invariant",
+        )
+    finally:
+        store.close()
+
+    rc = orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "stranded:" in ln)
+    assert "standing-verify" in line
+    assert "failed the standing build invariant" in line
+
+
+def test_status_json_surfaces_stranded_for_parked_landing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        lc = _seed_done(store, "a")
+        _park_landing(
+            store, lc, park_kind="divergent-base", detail="cannot fast-forward"
+        )
+    finally:
+        store.close()
+
+    rc = orch_main(
+        ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["stranded"] == {
+        "park_kind": "divergent-base",
+        "detail": "cannot fast-forward",
+    }
+
+
+def test_status_omits_stranded_for_cleanly_done_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "a")  # DONE, landed cleanly: no LandingParked event
+    finally:
+        store.close()
+
+    rc = orch_main(
+        ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "stranded" not in payload[0]
+    out_text_rc = orch_main(
+        ["status", "--tasks-dir", str(tmp_path), "--db", str(db)]
+    )
+    assert out_text_rc == 0
+    assert "stranded:" not in capsys.readouterr().out
 
 
 # ---------- Stranded-lifecycle recovery ----------

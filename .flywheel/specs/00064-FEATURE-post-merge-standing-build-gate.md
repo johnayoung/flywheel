@@ -104,10 +104,13 @@ invariant evaluated against the exact landing tree on both paths.
   existing claim-time `_conflicts` check serializes overlapping tasks. Collapses
   the dedupe swarm (13 tasks all targeting `tycho.rs`) into one in-flight task.
   Closes spec 00061 Gap 3.
-- **P3 — Surface stranded landings.** `fw status` grows a "stranded landings"
-  section listing parked/unlanded autopilot branches with their `LandingParked`
-  `park_kind` + detail, so a divergent-base / standing-verify park is visible
-  instead of accumulating as silent `flywheel/autopilot/*` branches.
+- **P3 — Surface stranded landings. (LANDED)** `fw status` annotates a DONE run
+  that never landed with a `stranded: <park_kind> -- <detail>` follow-up line
+  (and `stranded: {park_kind, detail}` in `--json`, omitted when absent), keyed on
+  its `LandingParked` event -- mirroring the `blocked_on:`/`awaiting_on:` idiom.
+  A divergent-base / standing-verify / uncommitted-work park is now visible at a
+  glance instead of accumulating as a silent `flywheel/autopilot/*` branch. The
+  per-task `--json` array contract is preserved (entries are only enriched).
 - **P-future — Speculative batch landing.** Combine N queued branches, verify the
   union once, bisect on failure (the merge-queue throughput pattern) to recover the
   serialization cost D-6 introduces.

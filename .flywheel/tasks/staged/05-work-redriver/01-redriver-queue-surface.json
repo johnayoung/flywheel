@@ -1,0 +1,34 @@
+{
+  "id": "redriver-queue-surface",
+  "goal": "A single durable, queryable human-review queue lists every unit that could not be auto-recovered, each carrying its task/run identity and a machine-readable reason, built by extending the existing orchestrator/domain event ledger and status read rather than a new silo.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_queue.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_claims.py packages/flywheel-core/tests/test_events.py", "name": "ledger-seam-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "queue", "foundation"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- orchestrator event ledger (acquired/stolen/renewed/released/expired), record_graph_snapshot, the existing queryable surface to extend",
+      "packages/flywheel-core/src/flywheel_core/events.py -- DomainEvent / LandingParked (park_kind, detail), list_domain_events(run_id): the existing durable stop-record surface the queue reads",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep green; the orchestrator-event ledger regression oracle"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criterion #12; the queue is the shared invariant every routing layer writes to"
+    ],
+    "constraints": [
+      "Extend the existing orchestrator-event / domain-event ledger and status read; do NOT introduce a new persistence silo table for the queue (criterion #12 grades that no new silo is added)",
+      "Each queue entry exposes a machine-readable `reason` field plus the task/run identity; later routing layers (escalation, landing, prereq, no-progress, human-gate) all write this same shape",
+      "Provide one read that returns the full queue across all routed kinds",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not auto-clear or transition any stop here -- this layer only defines the surface and the read"
+    ],
+    "edge_cases": [
+      "An empty queue returns an empty list, not an error",
+      "A reason must be machine-readable (a stable token), not only a free-text detail string"
+    ]
+  }
+}

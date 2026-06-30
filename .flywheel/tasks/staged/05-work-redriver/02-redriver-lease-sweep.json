@@ -1,0 +1,35 @@
+{
+  "id": "redriver-lease-sweep",
+  "goal": "While the orchestrate loop runs, an in-loop sweep on a bounded cadence releases lapsed claims and finalizes their stranded lifecycles so the task returns to an eligible state without any worker re-selecting that exact task, and never touches a still-live claim.",
+  "prerequisites": ["redriver-queue-surface"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_lease_sweep.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_claims.py packages/flywheel-orchestrator/tests/test_orchestrator.py", "name": "claims-loop-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "claims", "sweep"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- sweep_expired_claims (line ~1144, batch-release lapsed rows, no production caller today); acquire/load/list claims",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the `while True` loop (line ~849), the _source_reconcile_loop wiring (~833-843) to mirror cadence, _recover_claimable_stranded (~460-502) and its entry call (~825) to reuse the live-claim safety + finalize_stranded_lifecycle",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep green; the claims regression oracle"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #1, #2"
+    ],
+    "constraints": [
+      "Wire the sweep into the steady-state loop on a bounded periodic cadence (mirror _source_reconcile_loop); the existing orchestrate-ENTRY recovery must keep working -- the in-loop sweep is additive, not a replacement",
+      "Reuse the live-claim safety of _recover_claimable_stranded: a claim with a future lease, or a task a live peer is actively running, is NEVER swept or reclaimed (criterion #2)",
+      "Finalize stranded lifecycles only through finalize_stranded_lifecycle / sanctioned store + claim APIs -- never write a status directly",
+      "Drive tests with an injected clock so lease lapse is deterministic; commit before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not make the orchestrator git-aware; do not alter exactly-once execution or serialized landing (00060 invariants)"
+    ],
+    "edge_cases": [
+      "Eligibility after sweep must arise from the sweep itself, NOT from a coincidental re-selection of the same task id (criterion #1 grades the no-re-pick path)",
+      "A live (non-lapsed) claim and its lifecycle are byte-identical before and after a sweep cycle (criterion #2)"
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "deadline-config-defaults",
+  "goal": "Resolve a finite, non-null, operator-overridable default wall-clock ceiling for each of the five external-call classes (agent iteration, rubric judge, command grader, docker management, autopilot agent) so the default config yields non-null ceilings and an explicit override changes the resolved value.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k deadline_config_defaults packages/flywheel-core/tests/", "name": "behavior" }
+  ],
+  "prerequisites": ["deadline-primitive"],
+  "tags": ["deadlines", "core", "config", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/loop_guard.py -- LoopGuardConfig.hang_timeout_seconds currently defaults None; the agent-iteration default ceiling resolves here or alongside",
+      "packages/flywheel/src/flywheel/_session.py:1026 -- where hang_timeout_seconds is read from the toml payload; the override path must flow through here",
+      "packages/flywheel-container/src/flywheel_container/_config.py -- exec_timeout config pattern to mirror for the docker-management default ceiling"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #7 and D-1 (default-on, generous, overridable)"
+    ],
+    "constraints": [
+      "Each of the five ceilings must default to a finite, non-null value with NO operator override required (default-on).",
+      "An explicit operator override per class must change the resolved ceiling, and an unbounded/0 opt-out must remain expressible per class.",
+      "Keep flywheel_core.task and flywheel_core.lifecycle pure; resolution logic lives in a non-pure module.",
+      "Add the pytest target so `uv run pytest -k deadline_config_defaults` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not apply the resolved ceilings at any call site in this task -- only resolution + defaults. Application is the dependent tasks.",
+      "Do not weaken or delete existing config tests.",
+      "Do not choose a 'correct' magnitude -- the requirement is finite + default-on + overridable, not a specific number."
+    ],
+    "edge_cases": [
+      "Default config (no overrides) -> every one of the five ceilings is non-null and finite.",
+      "Override-of-0 / unbounded for a class resolves to the opt-out, not back to the default.",
+      "An explicit override magnitude is reflected exactly in the resolved value."
+    ]
+  }
+}

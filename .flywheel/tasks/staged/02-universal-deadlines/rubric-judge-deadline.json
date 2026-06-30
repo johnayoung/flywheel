@@ -1,0 +1,37 @@
+{
+  "id": "rubric-judge-deadline",
+  "goal": "Bound the rubric judge invocation with the default wall-clock deadline so a judge stream that never terminates is cancelled and surfaces a judge-infra timeout outcome under the default config, rather than stalling VALIDATING forever.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k rubric_judge_deadline packages/flywheel-core/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_grader_rubric.py", "name": "rubric-suite-holdout" }
+  ],
+  "prerequisites": ["deadline-primitive", "deadline-config-defaults"],
+  "tags": ["deadlines", "core", "rubric", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/grader_rubric.py -- around line 377 the `async for msg in _sdk_query(...)` judge stream is unbounded and sits outside the harness watchdog",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- the _validate -> run_rubric_graders path does not wrap the judge in the working-agent watchdog",
+      "packages/flywheel-core/tests/test_grader_rubric.py -- keep this suite green; mirror its judge-invoke substitution for the new test"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #3, the RubricJudgeError judge-infra failure path described in harness.py docstring (~line 3417)"
+    ],
+    "constraints": [
+      "Use the deadline primitive and resolved-config rubric ceiling from the prerequisite tasks.",
+      "Under default config the judge stream runs under a finite ceiling; a never-ending judge async-for must be cancelled.",
+      "A timeout surfaces as a judge-infra timeout outcome (the existing RubricJudgeError / judge-infra classification), distinguishable from a normal verdict.",
+      "Do not require the SDK extra at module top -- the judge path already lazy-imports via flywheel_core._sdk; keep it that way.",
+      "Add the pytest target so `uv run pytest -k rubric_judge_deadline` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken assertions in test_grader_rubric.py.",
+      "Do not touch the working-agent, command-grader, docker, or autopilot paths here.",
+      "Do not make the rubric grader the authoritative grade -- this only bounds its invocation."
+    ],
+    "edge_cases": [
+      "A judge whose `async for` never ends is cancelled in bounded wall time under DEFAULT config -- a streaming judge must not slip a silence timer.",
+      "A normally-returning judge still produces its verdict (no false-positive timeout)."
+    ]
+  }
+}

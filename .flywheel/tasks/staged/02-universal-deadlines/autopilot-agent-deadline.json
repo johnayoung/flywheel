@@ -1,0 +1,38 @@
+{
+  "id": "autopilot-agent-deadline",
+  "goal": "Bound the autopilot discovery and authoring agent calls with the default wall-clock deadline so a stalled SDK stream is cancelled and surfaces a timeout outcome under the default config, rather than parking the daemon on a turn budget that never bounds wall time.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k autopilot_agent_deadline packages/flywheel-orchestrator/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_discovery.py packages/flywheel-orchestrator/tests/test_autopilot_authoring.py", "name": "autopilot-suite-holdout" }
+  ],
+  "prerequisites": ["deadline-primitive", "deadline-config-defaults"],
+  "tags": ["deadlines", "orchestrator", "autopilot", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- around line 213 the `async for msg in source` loop has no asyncio.wait_for, so only max_turns bounds it, not wall-clock",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- invoke_iteration call sites (~436 discovery, ~856 authoring); max_turns (60/8/120) is a turn budget, not a time budget; the cycle is a blocking asyncio.run",
+      "packages/flywheel-orchestrator/tests/test_autopilot_discovery.py -- keep this suite green; mirror its invoke-iteration injection"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #6, D-3 (one primitive, all sites)"
+    ],
+    "constraints": [
+      "Use the deadline primitive and resolved-config autopilot ceiling from the prerequisite tasks; do not invent a bespoke timeout.",
+      "Under default config the discovery/authoring agent call runs under a finite wall-clock ceiling; a stream that never yields a terminal message must be cancelled.",
+      "A timeout surfaces a distinguishable timeout outcome so the cycle does not park; the resolved default autopilot agent ceiling is non-null.",
+      "Do not require the SDK extra at import; the invoker already goes through the lazy SDK boundary -- keep it that way.",
+      "Add the pytest target so `uv run pytest -k autopilot_agent_deadline` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken assertions in the autopilot discovery/authoring tests.",
+      "Do not change the core harness, rubric, command-grader, or docker paths here.",
+      "Do not replace the max_turns turn budget -- the wall-clock bound is additive to it."
+    ],
+    "edge_cases": [
+      "An invoke-iteration whose underlying stream never yields a terminal message is cancelled with a timeout-classified outcome in bounded wall time, under DEFAULT config.",
+      "A stream that streams forever without spending a turn must still be bounded (turn budget alone is insufficient).",
+      "A normally-completing cycle still completes (no false-positive timeout)."
+    ]
+  }
+}

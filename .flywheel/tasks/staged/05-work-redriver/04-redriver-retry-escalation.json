@@ -1,0 +1,35 @@
+{
+  "id": "redriver-retry-escalation",
+  "goal": "On first retry-budget exhaustion the re-driver auto-escalates exactly once (a stronger-model / re-decompose attempt) instead of terminating the task, and on a second exhaustion routes it to the human-review queue with reason=retries-exhausted-after-escalation rather than a silent terminal FAILED.",
+  "prerequisites": ["redriver-queue-surface"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_escalation.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_lifecycle_module_purity.py packages/flywheel-core/tests/test_task_module_purity.py", "name": "core-purity-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "escalation", "bounded"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- the exhaustion walk to terminal FAILED (~1786-1810) and is_retry_eligible; the seam where exhaustion is observed",
+      "packages/flywheel-core/src/flywheel_core/lifecycle.py -- consecutive_failed_runs() (~257), computed but unused today; the signal escalation builds on",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the orchestrator seam that drives the escalated attempt and routes to the queue surface"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #5, #6, #13; Decision D-A; D-C (escalation under the budget)"
+    ],
+    "constraints": [
+      "Escalate exactly ONCE on first exhaustion (a stronger model OR a re-decompose attempt, reusing existing model/decompose configuration); on a SECOND exhaustion route to the queue with reason=retries-exhausted-after-escalation (criteria #5, #6)",
+      "The escalation must itself be bounded -- never re-escalate on every exhaustion (criterion #13); the escalated attempt runs under the existing per-run budget ceilings (D-C)",
+      "Re-eligibility is requested through sanctioned store/claim APIs; the harness owns transitions -- do NOT make core impure and do NOT forge a status or agent envelope",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not weaken the core purity tests; do not design a new escalation-policy engine -- only select stronger-model/re-decompose from existing config"
+    ],
+    "edge_cases": [
+      "After the first exhaustion the task is NOT in terminal FAILED -- an escalated attempt is observably dispatched",
+      "An exhausted-after-escalation task must be queryable in the queue; it must never be recorded as a bare silent terminal FAILED with no queue entry"
+    ]
+  }
+}

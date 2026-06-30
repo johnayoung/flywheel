@@ -1,0 +1,29 @@
+{
+  "id": "github-review-source-skip-bad-item",
+  "goal": "The github_review work source skips one review-thread node it cannot compile into a valid item, counting and logging it, and still returns every other valid item.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_review_source_skip_bad_item.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_review_source.py", "name": "existing-suite-green" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "work-source", "github-review"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_review.py -- list_work walks GraphQL thread nodes; _require_object / _nodes (~lines 130, 142) and the per-thread compile (~lines 230, 258, 336) raise WorkSourceError on a malformed node, aborting the whole listing. Change the per-thread loop so one uncompilable node is skipped (counted + logged) and the rest return",
+      "packages/flywheel-orchestrator/tests/test_github_review_source.py -- existing github_review coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_github_review_source_skip_bad_item.py; do not weaken or delete existing assertions",
+      "Do not change the other sources here (each has its own task)",
+      "Do not blank the whole unresolved-thread listing on one bad node -- the surviving valid threads must be returned"
+    ],
+    "constraints": [
+      "The skip must be recorded (a count and/or a log line naming the bad thread node), not silently swallowed",
+      "Distinguish a malformed individual thread NODE (skip-and-continue) from a structurally-broken top-level GraphQL envelope -- this task contains the per-node case",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Exactly one malformed thread node among several valid ones: the result is exactly the valid items -- an empty/aborted listing must fail the test"
+    ]
+  }
+}

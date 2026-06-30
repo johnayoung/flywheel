@@ -1,0 +1,48 @@
+{
+  "id": "autopilot-liveness-record",
+  "goal": "A running autopilot daemon publishes a liveness record (PID plus freshness) so a second supervisor reads it, finds the live daemon, and adopts it instead of spawning a duplicate, while a stale record reads as not-live exactly like a lapsed worker lease.",
+  "prerequisites": ["supervision-policy-core"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_supervised_run.py -k liveness_adoption",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_daemon.py packages/flywheel/tests/test_autopilot_supervisor.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["supervision", "reliability", "autopilot", "liveness"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- the daemon loop (run_daemon_loop, main) is where the liveness record is published/refreshed each cycle",
+      "packages/flywheel/src/flywheel/_worker_supervisor.py -- has_live_lease() reads task_claims with lease_expires_at > now and treats a past expiry as not-live; mirror this staleness rule exactly for the autopilot record",
+      "packages/flywheel/src/flywheel/_autopilot_supervisor.py -- today has NO cross-process liveness (the module docstring notes 'autopilot writes no task_claims lease'); this task gives it a record to read so adoption/DETACHED detection becomes possible"
+    ],
+    "constraints": [
+      "The liveness record's staleness rule MUST match the worker lease-expiry semantics: a record whose freshness is in the past reads as not-live (so a truly dead daemon is respawned, not adopted forever). This is the shared invariant with has_live_lease().",
+      "Liveness is read out-of-band from the record's freshness -- never from a status the daemon self-reports (daemon/agent claims are untrusted).",
+      "A second supervisor reading a live record must adopt (report DETACHED/adopted) and spawn zero new children; reading a stale record must NOT block respawn.",
+      "Prefer reusing an existing store/record surface over adding a new schema table; if a new file/record surface is unavoidable, keep it minimal and document the freshness field.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not add auto-respawn logic here -- that is the console-supervisor and headless-entrypoint tasks; this task ships the liveness record and its read/adopt path plus tests.",
+      "Do not modify or weaken existing autopilot-daemon or supervisor tests.",
+      "Do not change the worker's task_claims schema or protocol.",
+      "Do not touch flywheel_core purity boundaries."
+    ],
+    "edge_cases": [
+      "Stale record (freshness in the past) must read as not-live -- this is the case that prevents 'adopt a corpse forever'.",
+      "A record from a different daemon pid than the one a supervisor owns must not be mistaken for the owned child (mirror the existing activity-pid guard).",
+      "No record at all (fresh project, daemon never ran) reads as not-live, same as a missing lease."
+    ]
+  }
+}

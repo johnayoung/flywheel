@@ -1,0 +1,49 @@
+{
+  "id": "recurring-worktree-sweep",
+  "goal": "The worktree retention sweep recurs on a bounded cadence while the daemon runs, so a parked worktree that ages past the retention window is reclaimed mid-run without requiring a restart while a within-window worktree survives.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_recurring_sweep.py -k \"sweep_tick_reclaims_aged or within_window_survives\"",
+      "name": "behavior-tick"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_recurring_sweep.py -k cadence_recurs",
+      "name": "behavior-cadence"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_sandbox_retention.py packages/flywheel-worktree/tests/test_worker.py",
+      "name": "regression-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "worktree"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- retention_sweep() at lines 1019-1054 removes worktrees older than retention_days and their branches; the main loop calls it ONCE at boot (line 2072). Make the sweep recur on a bounded cadence inside the `while not shutdown[...]` loop (per-cycle or on an interval), preserving exactly what one sweep does.",
+      "packages/flywheel-worktree/tests/test_sandbox_retention.py -- existing retention behavior to keep green; the per-sweep removal semantics must not change, only the cadence."
+    ],
+    "constraints": [
+      "Preserve retention_sweep's existing semantics exactly: prune dangling entries first, remove worktrees older than the window AND their flywheel/<phase>/<task-id> branches, leave within-window worktrees untouched. This task changes the CADENCE, not what one sweep removes.",
+      "The sweep must run on a bounded recurring cadence while the loop runs (more than the single boot invocation across N cycles / an elapsed interval) -- a boot-only sweep is the leak this task removes.",
+      "The recurring tick must be drivable in a test without a real restart (so the test asserts mid-run reclaim, not reclaim-on-restart).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change retention_sweep's removal rules or what counts as 'older than the window'.",
+      "Do not modify or weaken existing retention/worker tests; do not weaken assertions.",
+      "Do not touch flywheel_core purity boundaries."
+    ],
+    "edge_cases": [
+      "A within-window worktree must survive every tick (the cadence must not over-reclaim).",
+      "Calling the sweep exactly once at boot must FAIL the cadence grader -- the cadence must recur across cycles.",
+      "Clock advance between ticks: a worktree that ages past the window mid-run is gone after the next tick, not only after restart."
+    ]
+  }
+}

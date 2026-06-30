@@ -1,0 +1,37 @@
+{
+  "id": "transient-classifier-backoff",
+  "goal": "A fault classifier buckets each in-scope fault as TRANSIENT or PERMANENT and a bounded backoff helper produces monotonic-non-decreasing, capped waits.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k 'backoff_bounded or transient_classification_matrix'", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "purity-invariant" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "transient", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- collects api_error_status and rate_limit_events; classifier+backoff live near or beside this seam",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- StoreSchemaError is the PERMANENT case for the store side",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- OrchestratorSchemaError is the other PERMANENT case",
+      "packages/flywheel-core/tests/test_invoker.py -- add backoff_bounded and transient_classification_matrix tests here"
+    ],
+    "constraints": [
+      "Define ONE shared TRANSIENT/PERMANENT classification (a typed/enum value) and ONE bounded-backoff helper that every downstream retry site reuses -- do not let later tasks fork their own buckets",
+      "The backoff helper must accept an injectable sleep/clock so waits are captured deterministically; growth is monotonic-non-decreasing and each wait <= a configured cap",
+      "The classification matrix in test_invoker.py must cover every in-scope fault (rate-limit/overload, SQLite locked-past-timeout, dropped PG connection, PG pool timeout -> TRANSIENT; schema mismatch -> PERMANENT) in one parametrized run",
+      "An optimistic-concurrency version conflict is NOT a TRANSIENT fault here (it is already loop-retried by the harness); do not classify it TRANSIENT",
+      "flywheel_core.task and flywheel_core.lifecycle stay pure (no json/pathlib/io/open); keep classifier/backoff out of those two modules",
+      "import flywheel_core must work without claude-agent-sdk; any SDK touch goes through the existing _sdk boundary only",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not wire the classifier into the API, store, pool, or worker sites yet -- downstream tasks consume it",
+      "Do not modify or weaken files under tests/ other than adding the two new tests named above; do not delete or relax existing assertions",
+      "Do not add a retry around version conflicts"
+    ],
+    "edge_cases": [
+      "A returned constant delay must FAIL the monotonic-growth assertion (sleep(0) is not backoff)",
+      "An uncapped exponential must FAIL the cap assertion",
+      "Schema mismatch bucketed TRANSIENT, or a dropped connection bucketed PERMANENT, must fail the matrix"
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "command-grader-default-timeout",
+  "goal": "Make the harness pass the default per-grader wall-clock timeout through to command graders so a grader command that hangs is killed and recorded with a timeout termination under the default config, instead of blocking validation forever.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k command_grader_default_timeout packages/flywheel-core/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_grader_command.py", "name": "grader-command-suite-holdout" }
+  ],
+  "prerequisites": ["deadline-config-defaults"],
+  "tags": ["deadlines", "core", "grader", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- around line 3422 run_command_graders is called WITHOUT per_grader_timeout_seconds; the default ceiling must be passed here",
+      "packages/flywheel-core/src/flywheel_core/grader_command.py -- run_command_graders already accepts per_grader_timeout_seconds (line ~101) and records payload['termination']='timeout' (line ~188); reuse it, do not re-implement",
+      "packages/flywheel-core/tests/test_grader_command.py -- keep this suite green"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #4"
+    ],
+    "constraints": [
+      "Resolve the default per-grader timeout from the prerequisite config and pass it into run_command_graders from the harness; do not re-implement the timeout in grader_command.py.",
+      "Under default config (no explicit per-grader timeout argument) a hanging grader command must be killed and recorded with payload['termination']=='timeout'.",
+      "An operator override (including unbounded/0 opt-out) must still be honored.",
+      "Add the pytest target so `uv run pytest -k command_grader_default_timeout` selects it; assert through the harness's default call path, not just the parameter in isolation.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken assertions in test_grader_command.py.",
+      "Do not change the agent, rubric, docker, or autopilot paths here.",
+      "Do not alter the existing termination discriminator semantics (exited|signal|timeout)."
+    ],
+    "edge_cases": [
+      "A command grader whose `run` blocks (sleep-style) under DEFAULT harness config fails with termination=='timeout' in bounded wall time.",
+      "A fast-passing command grader still passes (no false-positive timeout).",
+      "The override path still bounds (or opts out of) the per-grader timeout."
+    ]
+  }
+}

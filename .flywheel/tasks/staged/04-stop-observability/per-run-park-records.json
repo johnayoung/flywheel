@@ -1,0 +1,45 @@
+{
+  "id": "per-run-park-records",
+  "goal": "Every landing/submit path that suppresses a land -- held-out-gate FAIL, protected-paths refusal (merge and PR), push/gh failure, and the swallowed-exception catch -- appends a durable LandingParked record naming its reason to the parked DONE run's per-run domain-event stream, just like the three existing park paths.",
+  "tags": ["spec-00068", "stop-observability", "landing", "events"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py packages/flywheel-worktree/tests/test_pr_strategy.py packages/flywheel-orchestrator/tests/test_landability_gate_orchestrate.py", "name": "behavior" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-worktree/ packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-worktree/ packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- _submit() refuses on protected paths (~594-601) and submit() swallows any _submit exception (~500-510) without a record; reuse the existing _record_landing_park helper (~907-943) for both, plus a new park_kind for each",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- _open_pr() refuses on protected paths (~225-232) and logs-only on push/gh failure (~234-246); record a LandingParked for each via the same helper pattern the worker uses",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- around 1451 the held-out gate blocks the submit (gate_blocked) and emits no durable record though outcome.lifecycle.run_id and the control store are in scope; append a LandingParked on the blocked path",
+      "packages/flywheel-core/src/flywheel_core/events.py -- LandingParked.park_kind is the shared vocabulary (existing: uncommitted-work, divergent-base, standing-verify); extend its docstring to cover the new kinds; the dataclass shape itself need not change",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep green; pins submit/park behavior; add the protected-path-park and swallowed-error-park assertions here",
+      "packages/flywheel-worktree/tests/test_pr_strategy.py -- keep green; add the PR protected-path-park and push-failed-park assertions here",
+      "packages/flywheel-orchestrator/tests/test_landability_gate_orchestrate.py -- keep green; add the held-out-gate-park assertion (drive a DONE run under a FAILing held-out source; assert list_domain_events(run_id) carries the held-out-gate LandingParked and that nothing landed)"
+    ],
+    "references": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py:572 -- the canonical uncommitted-work park: _record_landing_park(run_id, park_kind=..., detail=...) loads the lifecycle, appends LandingParked at expected_version, and never raises. Mirror this exactly.",
+      "docs/held-out-gate.md -- the gate verdict lives on the in-process RunRecord only and is never persisted; the new held-out-gate park record IS that persisted verdict"
+    ],
+    "constraints": [
+      "Introduce the new park_kind values as ONE named, shared set: held-out-gate, protected-paths, push-failed, submit-error. Every new emit site uses a value from this set; pick stable kebab-case spellings and keep them identical across the worker, pr, and orchestrate sites so the fw status reader (built in a dependent task) can recognize all of them.",
+      "Each new record carries a non-empty detail: the offending protected path(s), the push/gh stderr, the swallowed exception text, or the held-out gate reason respectively -- so the operator can tell one strand from another.",
+      "Audit-witness only (D-2): do NOT change WHEN/WHETHER a land is suppressed. The protected-path refusal still refuses, the push failure still parks, the swallowed exception is still swallowed, the gate-blocked submit is still not called, and the run stays Status.DONE. The record's fold is the identity (advances version only).",
+      "submit() must still never raise into the orchestrate loop: the new recording call goes through the helper's own try/except (or equivalent) so a store error logs and returns rather than escaping (D-2).",
+      "The held-out-gate record attaches to outcome.lifecycle.run_id via the control store already in scope at the gate-block site; do not invent a new store handle.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add any retry, respawn, re-drive, or auto-land behavior -- visibility only; re-driving is a later phase.",
+      "Do NOT change the run's terminal status, the gate's blocking decision, the protected-path predicate, or the standing-verify/divergent-base/uncommitted-work paths that already record.",
+      "Do NOT weaken, delete, or relax any assertion under packages/*/tests/; do NOT modify the existing _record_landing_park guarantee that it never raises.",
+      "Do NOT touch the orchestrator-events ledger or the fw status renderer here (separate tasks).",
+      "Do NOT make flywheel_core.events impure (no json/pathlib/io) -- the dataclass stays pure."
+    ],
+    "edge_cases": [
+      "A held-out source that returns FAIL must produce a held-out-gate park AND no merge/PR -- a record with a landed branch must fail.",
+      "Both the merge strategy and the PR strategy protected-path refusals must each emit a record; recording one but not the other must fail (narrow-coverage cheat).",
+      "A forced _submit exception must be swallowed (submit returns None) AND leave a submit-error record; re-raising the exception OR emitting no record must both fail.",
+      "A returned-constant park_kind (always the same string regardless of cause) must fail: each site's record names its own cause."
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "workgraph-isolate-invalid-task",
+  "goal": "A scheduling pass built from a task set containing one structurally-invalid task (duplicate id, self-dependency, or cycle member) excludes that task with a recorded reason and still schedules the remaining valid, independent tasks.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workgraph_isolate_invalid_task.py", "name": "behavior" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "work-graph", "scheduling"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py -- WorkGraph.__init__ raises WorkGraphValidationError on a duplicate id (~line 135), self-dependency (~line 151), and cycle (~line 169), poisoning every unrelated task in the pass. Missing prerequisites are already recorded as non-raising GraphValidationIssue on .issues -- extend that contain-and-record posture to these three structural defects: isolate the offending task(s) with a recorded reason and build the graph from the survivors",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- existing scheduling-selection coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_workgraph_isolate_invalid_task.py; do not weaken or delete existing assertions",
+      "Do not silently drop an invalid task with no recorded reason -- the exclusion reason must name the offender",
+      "Do not change the orchestrate main-loop containment (that is its own task that consumes this one)",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "constraints": [
+      "The exclusion reason is recorded (e.g. as a GraphValidationIssue-style record or equivalent) and names the offending task id(s) -- recoverable, not lost",
+      "Valid, independent tasks in the same set remain schedulable (present in the ready/selectable set)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Duplicate id, self-dependency, and cycle-member are each isolated; a valid independent task in the same set stays selectable -- dropping the whole pass must fail the test",
+      "BOTH halves are asserted: valid tasks survive AND the exclusion is recorded with a reason naming the offender; a silent drop must fail"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "redriver-prereq-redriver",
+  "goal": "A task referencing a missing prerequisite becomes eligible and is driven once that prerequisite later appears in the work source, and if the prerequisite stays missing past a fixed bound the referencing task is routed to the human-review queue with a reason naming the missing prerequisite id, never dispatched against an unsatisfied prereq.",
+  "prerequisites": ["redriver-queue-surface"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_prereq.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py packages/flywheel-orchestrator/tests/test_orchestrator_claims.py", "name": "graph-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "prerequisites", "bounded"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py -- GraphValidationIssue recording for a dangling edge (~155-163, currently discarded by orchestrate) and the declared-vs-resolved prereq split that keeps a dangling task ineligible",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the loop that rebuilds the graph each pass (WorkGraph.build ~860) and where the dangling issue is consumed to re-drive or route",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep green; covers WorkGraph build / dangling-prereq handling, the graph regression oracle"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #7, #8, #13"
+    ],
+    "constraints": [
+      "When the missing prerequisite later appears, the previously-ineligible task becomes eligible and is driven (criterion #7) -- do not keep it permanently ineligible",
+      "If the prerequisite stays missing past a fixed bound (cycles or window), route the referencing task to the queue with a machine-readable reason naming the missing prerequisite id, and never dispatch it against an unsatisfied prereq (criteria #8, #13)",
+      "Preserve today's safety: a task with an unresolved prereq is never executed; commit before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not change cycle/self-dependency detection or the topological-sort contract"
+    ],
+    "edge_cases": [
+      "A once-dangling task must not stay permanently ineligible after its prerequisite materializes",
+      "The bound must be finite -- a prerequisite missing past the bound produces exactly one queue entry, not an infinite ineligible spin"
+    ]
+  }
+}

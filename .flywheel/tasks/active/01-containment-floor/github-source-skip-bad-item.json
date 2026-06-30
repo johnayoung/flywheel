@@ -1,0 +1,31 @@
+{
+  "id": "github-source-skip-bad-item",
+  "goal": "The github-issues work source skips one issue payload it cannot compile into a valid item, counting and logging it, and still returns every other valid item.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_source_skip_bad_item.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_source.py", "name": "existing-suite-green" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "work-source", "github"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- list_work compiles each issue via _compile_issue; raises WorkSourceError on the first bad payload (~lines 282, 296, 330) and on an invalid spec block (~line 134), aborting the whole listing. Change the per-item loop so one uncompilable issue is skipped (counted + logged via self._log) and the rest return",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- existing github-source coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_github_source_skip_bad_item.py; do not weaken or delete existing assertions",
+      "Do not change the directory / github_ci / github_review sources here (each has its own task)",
+      "Do not abort the whole listing on the first bad issue -- the surviving valid issues must be returned",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "constraints": [
+      "The skip must be recorded (a count and/or a self._log line naming the bad issue), not silently swallowed -- one bad ticket must not read as 'no work'",
+      "A returnable issue that is intentionally not-runnable (e.g. no graders) keeps its existing skip-and-log behavior; this change is about MALFORMED payloads that today raise",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Exactly one malformed issue (e.g. missing integer 'number', or invalid JSON spec block) among several valid ones: the result is exactly the valid items -- an empty/aborted listing must fail the test",
+      "The skip is logged with the offending source_ref so it is recoverable"
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "postgres-pool-bound",
+  "goal": "Postgres pool acquisition has a bounded wait and a pool-exhaustion timeout surfaces as a TRANSIENT-classified, retryable failure within that bound instead of an uncaught PoolTimeout.",
+  "prerequisites": ["transient-classifier-backoff"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_store_postgres.py -k pool_acquire_bounded", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k transient_classification_matrix", "name": "seam-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "transient", "store", "postgres", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py -- the pool is built with only min/max size (~line 201); add a bounded acquisition wait and classify the timeout",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- the claim-store pool (~line 201) needs the same bound applied in this same change",
+      "packages/flywheel-core/tests/test_store_postgres.py -- add pool_acquire_bounded; it must skip cleanly when no Postgres test container is available, matching the existing gating in this file"
+    ],
+    "constraints": [
+      "Reuse the TRANSIENT classification from transient-classifier-backoff; a pool-acquisition timeout classifies TRANSIENT and retryable",
+      "Both the core store pool (store_postgres.py) and the claim store pool (_claims_postgres.py) get the bounded wait in this same change -- they share the pool-construction shape",
+      "pool_acquire_bounded: with the pool exhausted (all connections held) a competing acquire must return/raise a TRANSIENT-classified failure within the configured timeout, asserted with a wall-time upper bound generous to CI",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under tests/ except adding the named test; do not weaken existing postgres-store tests",
+      "Do not set the timeout so high the test passes by never timing out -- the failure must occur within a finite bound",
+      "Do not leave the timeout unclassified (an unclassified PoolTimeout would still be treated as fatal by the breaker)"
+    ],
+    "edge_cases": [
+      "No Postgres container present -> the test skips, it does not fail",
+      "An unbounded acquire that blocks forever must fail the wall-time upper-bound assertion"
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "sqlite-store-retry",
+  "goal": "A SQLite database-is-locked error past busy-timeout is retried with bounded backoff and the operation's real result is returned; exhausting the budget raises a TRANSIENT-classified failure.",
+  "prerequisites": ["transient-classifier-backoff"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_store_sqlite.py -k 'locked_retry or locked_classified'", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k transient_classification_matrix", "name": "seam-holdout" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_store_contract.py packages/flywheel-core/tests/test_store_sqlite.py", "name": "store-contract" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "transient", "store", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py -- busy_timeout is set (line ~175); wrap store operations so a locked-past-timeout OperationalError retries with bounded backoff",
+      "packages/flywheel-core/tests/test_store_sqlite.py -- add locked_retry and locked_classified tests; hold a write lock on the same DB file from a competing connection to force the lock",
+      "packages/flywheel-core/tests/test_store_contract.py -- the shared store contract suite must stay green"
+    ],
+    "constraints": [
+      "Reuse the TRANSIENT classification and bounded-backoff helper from transient-classifier-backoff; classify the locked-past-budget case TRANSIENT",
+      "locked_retry: a lock held shorter than the total transient budget must let the competing call return its REAL expected value with no OperationalError propagated -- not a fabricated/empty success",
+      "locked_classified: a lock held longer than the budget must raise a TRANSIENT-classified failure",
+      "Widening busy_timeout alone is insufficient -- the fix is retry-with-backoff so it also covers dropped connections; keep busy_timeout as-is or document any change",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under tests/ except adding the two named tests; do not weaken the store-contract assertions",
+      "Do not blanket-classify every store error TRANSIENT -- schema mismatch must remain PERMANENT (graded by the matrix holdout)",
+      "Do not retry version conflicts"
+    ],
+    "edge_cases": [
+      "Returning an empty/fabricated value after catching the lock instead of completing the operation must fail locked_retry (assert on the operation's actual result)",
+      "A schema-mismatch error reaching this retry path must NOT be retried as TRANSIENT"
+    ]
+  }
+}

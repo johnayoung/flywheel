@@ -1,0 +1,30 @@
+{
+  "id": "directory-source-skip-bad-item",
+  "goal": "The directory work source skips one task file it cannot load, counting and logging it, and still returns every other valid item.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_directory_source_skip_bad_item.py", "name": "behavior" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "work-source", "directory"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py -- load_active_tasks (~line 237) raises TaskLoadError on the FIRST bad file, aborting the whole listing; DirectoryWorkSource.list_work consumes it. Change the listing so one bad file is skipped (counted + logged) and the rest return",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- existing directory-source coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_directory_source_skip_bad_item.py; do not weaken or delete existing assertions",
+      "Do not change the other shipped sources here (each has its own task)",
+      "Do not return an empty or partial list as 'handled' -- every valid file must still be present",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "constraints": [
+      "The skip must be recorded (a count and/or a log line naming the bad file), not silently swallowed -- a downstream reconciler must be able to tell a skip from 'no work'",
+      "Deterministic walk order is preserved for the surviving items",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Exactly one malformed file among several valid ones: the result is exactly the valid items (bad absent, every good present) -- an empty list must fail the test",
+      "A directory of only-bad files yields an empty list plus recorded skips, not a raise"
+    ]
+  }
+}

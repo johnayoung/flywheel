@@ -1,0 +1,42 @@
+{
+  "id": "redriver-discipline-and-aggregate",
+  "goal": "The re-driver never transitions a lifecycle by forging an agent claim or status (re-eligibility flows only through sanctioned store/claim APIs), every automatic re-drive/escalate/land path is bounded, and all routed kinds are listable from one queue read.",
+  "prerequisites": [
+    "redriver-lease-sweep",
+    "redriver-landing-redriver",
+    "redriver-retry-escalation",
+    "redriver-prereq-redriver",
+    "redriver-no-progress-backoff",
+    "redriver-human-gate-routing"
+  ],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_aggregate.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "core-purity-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "invariant", "aggregate"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _recover_claimable_stranded (~460-502): the sanctioned re-eligibility pattern (acquire claim -> finalize_stranded_lifecycle -> release) the re-driver paths must follow rather than writing a status",
+      "packages/flywheel-core/tests/test_task_module_purity.py -- keep green; the core-purity oracle",
+      "packages/flywheel-core/tests/test_lifecycle_module_purity.py -- keep green; the core-purity oracle"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #12 (single surface), #13 (boundedness across all paths), #14 (transition discipline)"
+    ],
+    "constraints": [
+      "Assert across the re-drive paths (#3, #5, #9 and the land loop): for a never-clearing cause the count of automatic attempts equals the configured bound and a queue entry is produced -- proving no path loops unbounded (criterion #13)",
+      "Assert a single queue read returns one unit of each routed kind (#4, #6, #8, #9, #10, #11), each with a distinct machine-readable reason, and that the surface is the existing event/status ledger -- no new silo table (criterion #12)",
+      "Assert (grep/AST + green purity tests) that the re-driver paths route through the existing claim/finalize/store APIs rather than writing a status or synthesizing an agent envelope (criterion #14)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not relax core purity to make a check pass; do not introduce a new queue silo"
+    ],
+    "edge_cases": [
+      "If any single re-drive path can exceed its bound, the boundedness assertion must fail -- this is the central anti-goal guard",
+      "If routed kinds are scattered across more than one surface, the single-read assertion must fail"
+    ]
+  }
+}

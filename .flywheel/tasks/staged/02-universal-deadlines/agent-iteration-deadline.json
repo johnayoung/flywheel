@@ -1,0 +1,38 @@
+{
+  "id": "agent-iteration-deadline",
+  "goal": "Bound the working-agent iteration with the default wall-clock deadline so an invoker that never returns is cancelled and surfaces a timeout-classified failure under the default config, with no operator override required.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k harness_agent_deadline packages/flywheel-core/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py", "name": "harness-suite-holdout" }
+  ],
+  "prerequisites": ["deadline-primitive", "deadline-config-defaults"],
+  "tags": ["deadlines", "core", "harness", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- around line 3221 the bare `await invoker(request)` path runs when hang_timeout is None/non-positive; this is the unbounded path to bound",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- _invoke_with_watchdog around line 2860 is the existing silence watchdog; the wall-clock deadline is additive to it",
+      "packages/flywheel-core/tests/test_harness.py -- keep this suite green"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #2, D-2 (wall-clock not silence), Open Questions (Phase 1 containment seam for the timeout classification)"
+    ],
+    "constraints": [
+      "Use the deadline primitive and resolved-config ceiling from the prerequisite tasks; do not invent a bespoke timeout here.",
+      "Under default config (no override) the agent iteration must run under a finite ceiling -- do NOT leave the bare unbounded await path reachable by default.",
+      "A timeout must surface a distinguishable timeout-classified outcome (route into Phase-1 containment if its seam is present), not a silent return or a generic crash.",
+      "Keep the existing silence watchdog behavior working; the new bound runs alongside it.",
+      "Add the pytest target so `uv run pytest -k harness_agent_deadline` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken assertions in test_harness.py or the silence-watchdog tests.",
+      "Do not change the rubric, command-grader, docker, or autopilot paths here.",
+      "Do not grade the downstream retry policy -- only that the deadline fires and a timeout outcome is surfaced."
+    ],
+    "edge_cases": [
+      "An invoker that never returns under DEFAULT config (no override) is cancelled in bounded wall time -- a test that only passes when an override is set is insufficient.",
+      "The resolved default agent-iteration ceiling is non-null.",
+      "A normally-completing iteration still completes (no false-positive timeout)."
+    ]
+  }
+}

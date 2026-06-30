@@ -1,0 +1,35 @@
+{
+  "id": "redriver-landing-redriver",
+  "goal": "A run parked unlanded (a LandingParked stop record) is automatically re-driven (re-claim, re-rebase, re-run command/standing graders, re-attempt land) up to a fixed bound; a parked run whose cause has cleared lands, and one whose cause never clears is routed to the human-review queue with a reason naming its park cause and no further land attempts.",
+  "prerequisites": ["redriver-queue-surface", "redriver-lease-sweep"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_landing.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/test_submit_standing_verify.py packages/flywheel-worktree/tests/test_worker.py", "name": "land-path-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "landing", "bounded"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the landing-park sites (standing-verify ~609/659, divergent-base ~635/685), _record_landing_park (~907), _reverify/_standing_verify/_ff_merge: the re-rebase + re-run graders + re-attempt-land path to re-drive",
+      "packages/flywheel-core/src/flywheel_core/events.py -- LandingParked (park_kind, detail) is the durable stop record consumed here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the loop where the bounded re-drive cycle runs and routes to the queue surface"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #3, #4, #13; D-C (re-drive under the budget)"
+    ],
+    "constraints": [
+      "Re-attempting a land MUST re-run the rebase + command/standing graders against the exact base it lands on (reuse the worker rebase/reverify/standing path); never re-land without re-verifying",
+      "Bound the land-retry: at most `bound` automatic land attempts; on the bound, route the run to the queue with a machine-readable reason carrying its park_kind, and make no (bound+1)th attempt (criteria #4, #13)",
+      "Re-drive runs under the existing per-run budget ceilings (D-C); a re-attempt that breaches a ceiling is a routed stop, not a free retry",
+      "Re-claim through sanctioned claim APIs; the harness still owns transitions; commit before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not change the merge-flock, rebase, protected-paths, or standing-verify mechanics (owned by 00061/00064)"
+    ],
+    "edge_cases": [
+      "An unbounded land-retry loop is a defect -- the count of automatic land attempts must equal the configured bound for a never-clearing cause",
+      "A re-driver that re-lands without re-running graders against the exact base must fail the behavior test"
+    ]
+  }
+}

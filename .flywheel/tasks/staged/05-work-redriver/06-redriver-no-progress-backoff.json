@@ -1,0 +1,34 @@
+{
+  "id": "redriver-no-progress-backoff",
+  "goal": "After a fixed bound of consecutive cycles that make no progress on a unit (a phase whose verify never passes, or an autopilot repo that never authors a task), the re-driver backs that unit off and routes it to the human-review queue with a no-progress reason instead of re-running it the next cycle.",
+  "prerequisites": ["redriver-queue-surface"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_no_progress.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_loop.py packages/flywheel-worktree/tests/test_worker.py", "name": "spin-source-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "backoff", "bounded"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the phase_verify path (~993) that keeps a fully-DONE phase active forever when verify never passes",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- the discovery loop that re-runs full discovery every cycle for an un-authorable repo",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the loop where per-unit no-progress cycles are counted and backed off / routed to the queue surface"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #9, #13; D-C (back-off respects the budget)"
+    ],
+    "constraints": [
+      "Count consecutive no-progress cycles per unit; after a fixed bound, back the unit off (do NOT re-attempt it the next cycle) and route it to the queue with a machine-readable no-progress reason (criteria #9, #13)",
+      "Progress definition is observable (a state change / a task authored / a verify passing); a backed-off unit must be absent from the active set on the cycle after the bound is crossed",
+      "The bound is finite so a never-progressing unit cannot burn agent cost forever; commit before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not change phase_verify or autopilot discovery semantics themselves -- only add the bounded no-progress back-off + routing around them"
+    ],
+    "edge_cases": [
+      "A unit that DOES make progress resets its no-progress counter and is never backed off",
+      "Back-off must produce exactly one queue entry per backed-off unit, not a re-queue every cycle"
+    ]
+  }
+}

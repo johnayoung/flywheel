@@ -1,0 +1,39 @@
+{
+  "id": "bound-supervisor-logs",
+  "goal": "Across repeated supervisor starts the supervisor log directory's footprint stays at or under a configured ceiling by reclaiming the oldest logs while the most-recent log content survives.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel/tests/test_supervisor_log_bound.py",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "autopilot", "logs"],
+  "context": {
+    "relevant": [
+      "packages/flywheel/src/flywheel/_autopilot_supervisor.py -- _open_log() (around lines 340-347) opens a NEW autopilot-supervisor-<ts>.log on every start with nothing reclaiming the old ones; bound the directory footprint here (rotation/cap/retention by age or count)",
+      "packages/flywheel/tests/test_autopilot_supervisor.py -- existing supervisor tests to keep green; the new bound must not break liveness/log-handle behavior"
+    ],
+    "constraints": [
+      "The bound reclaims the OLDEST supervisor logs while preserving at least the most-recent log content -- a 'rotation' that deletes/truncates everything (footprint zero, no logs survive) is a defect.",
+      "Footprint is held at or under a CONFIGURED ceiling (default-on); the magnitude is not load-bearing -- bounded + default-on is the requirement.",
+      "Keep this in the flywheel/supervisor layer; do not place log/disk logic in flywheel_core.task or flywheel_core.lifecycle (purity).",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken existing supervisor or autopilot tests; do not delete assertions.",
+      "Do not change the per-run telemetry JSONL retention (that is the bound-run-logs task).",
+      "Do not touch flywheel_core purity boundaries."
+    ],
+    "edge_cases": [
+      "Fewer logs than the ceiling -- nothing is reclaimed (no over-eager deletion).",
+      "Exactly at the ceiling after a start -- the most-recent log must still be readable.",
+      "A reclaim that empties the directory must fail the test (recent content must survive)."
+    ]
+  }
+}

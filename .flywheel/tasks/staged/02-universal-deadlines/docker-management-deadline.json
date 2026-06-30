@@ -1,0 +1,38 @@
+{
+  "id": "docker-management-deadline",
+  "goal": "Give every docker management call (image/network inspect, network create, container stop/rm, the atexit force-remove) a default wall-clock timeout so a hung dockerd surfaces a docker timeout error within ceiling+epsilon instead of wedging the caller while it holds the lease.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k docker_management_deadline packages/flywheel-container/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-container/tests/test_docker_primitives.py", "name": "docker-primitives-holdout" }
+  ],
+  "prerequisites": ["deadline-config-defaults"],
+  "tags": ["deadlines", "container", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-container/src/flywheel_container/_docker.py -- _run_docker (line ~152) defaults timeout=None; management callers pass nothing: image_exists (~172), check_image_uid (~181), network_exists (~344), ensure_internal_network (~353), remove_container (~367), force_remove_container_sync (~376)",
+      "packages/flywheel-container/src/flywheel_container/_config.py -- exec_timeout config pattern; resolve the docker-management default ceiling consistently",
+      "packages/flywheel-container/tests/test_docker_primitives.py -- keep this suite green; mirror its docker-invocation stubbing"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #5, D-1"
+    ],
+    "constraints": [
+      "Apply a finite default timeout to every management call listed above under default config (no override required).",
+      "Do NOT regress already-bounded paths: start_container (timeout=120.0, line ~227) and docker exec (governed by exec_timeout) keep their existing bounds.",
+      "A hung dockerd must raise a distinguishable docker timeout error (DockerError-style), not hang.",
+      "An operator override (including unbounded/0 opt-out) must still be honored per the resolved config.",
+      "Add the pytest target so `uv run pytest -k docker_management_deadline` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify or weaken assertions in test_docker_primitives.py or test_docker_live.py.",
+      "Do not change start_container's or exec's existing timeout bounds.",
+      "Do not touch the core agent/rubric/grader or autopilot paths here."
+    ],
+    "edge_cases": [
+      "Each management primitive (image_exists, check_image_uid, network_exists, ensure_internal_network, remove_container, force_remove_container_sync) raises a docker timeout error in bounded wall time when docker hangs, under DEFAULT config.",
+      "start_container and exec retain their bounds (assert unchanged) -- fixing one call site and leaving teardown callers unbounded must fail.",
+      "The atexit force_remove_container_sync path is bounded too (teardown must not wedge while holding the lease)."
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "id": "autopilot-daemon-circuit-breaker",
+  "goal": "The autopilot daemon loop wraps its per-cycle run_cycle in a circuit breaker mirroring the worker's: a raising cycle is counted and backed off so the daemon runs further cycles, and on a bounded consecutive-failure count it stops by surfacing a visible non-zero give-up signal rather than exiting silently.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_daemon_circuit_breaker.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_daemon.py", "name": "existing-daemon-suite-green" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "autopilot", "daemon"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- run_daemon_loop (~line 192) calls run_cycle() at ~line 224 with NO try/except, asymmetric with the worker daemon; wrap it in a consecutive-failure breaker (count + backoff + bounded give-up that surfaces). Every collaborator (run_cycle, sleep, should_stop) is already injected, so the breaker is testable with no wall-clock waits and no live model",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the reference breaker: MAX_CONSECUTIVE_CYCLE_FAILURES=5 / CYCLE_FAILURE_BACKOFF_SECONDS=10 (~lines 103-104), the count+backoff+give-up block (~lines 2117-2136); mirror this contract -- consecutive-failure reset on success, bounded give-up returns a non-zero signal for operator inspection",
+      "packages/flywheel-orchestrator/tests/test_autopilot_daemon.py -- existing run_daemon_loop coverage (idle-cycle-does-not-exit etc.); keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_autopilot_daemon_circuit_breaker.py; do not weaken or delete existing assertions",
+      "Do not invent a divergent breaker contract -- mirror the worker daemon's shape (count, backoff, bounded give-up that surfaces)",
+      "Do not give up by exiting 0 -- a supervisor must be able to tell a crash-loop give-up from a clean stop"
+    ],
+    "constraints": [
+      "A single raising cycle is contained and the loop runs a FURTHER cycle (the breaker resets consecutive count on a subsequent success); the must-not-exit-on-idle-cycle behavior (D-5) is preserved",
+      "On the bounded consecutive-failure count the loop stops by surfacing a visible non-zero / recorded give-up signal, never a silent process exit",
+      "Backoff between failed cycles remains interruptible by the stop signal (mirror _interruptible_sleep usage)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "run_cycle raises once then succeeds: a cycle is observed strictly AFTER the failing one and the loop returns normally -- catching-then-breaking must fail the test",
+      "run_cycle raises every cycle: the loop terminates having reached the bounded count and surfaces a non-success give-up signal -- an unbounded retry or a give-up that returns 0 must fail the test"
+    ]
+  }
+}

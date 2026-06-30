@@ -1,0 +1,47 @@
+{
+  "id": "reap-orphan-containers",
+  "goal": "When a worker starts and a flywheel-owned orphan container left by a prior killed worker is present, the worker's startup reap removes that orphan (the SIGKILL/OOM case the atexit backstop misses) while leaving non-flywheel containers untouched.",
+  "prerequisites": ["container-owner-marker"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_orphan_container_reap.py -k \"reaps_flywheel_orphan or leaves_unrelated_container\"",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-container/tests/test_owner_marker.py packages/flywheel-worktree/tests/test_orphan_container_reap.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "container"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-container/src/flywheel_container/_docker.py -- the owner marker + selector from container-owner-marker (the scan keys on it); force_remove_container_sync()/remove_container() (lines 367-427) are the removal primitives; the atexit _flush_cleanup_registry (402-427) is the backstop that does NOT run on SIGKILL/OOM, which this startup reap covers.",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the worker startup path (around line 2072, alongside the boot retention_sweep) is where the orphan reap runs once on start, before the main loop.",
+      "packages/flywheel-worktree/tests/test_orphan_container_reap.py -- new test; stub the docker layer to report a flywheel-owned container present and assert removal is issued, and a non-flywheel container present and assert it is NOT removed."
+    ],
+    "constraints": [
+      "Reap ONLY containers carrying the flywheel-owner marker from container-owner-marker (import the shared selector -- do not re-derive the match string); a broad match that removes unrelated containers is a defect.",
+      "The reap runs at worker startup (covering the killed-worker case where atexit never ran); it must issue the actual removal for a present orphan, not a no-op.",
+      "Must not remove a container a live worker still owns -- target only orphans (e.g. not in the current process's active set); do not change the normal teardown/atexit path.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not redefine the owner marker/selector here -- consume the one from container-owner-marker (the prerequisite).",
+      "Do not change git-lease/worktree reconciliation; containers are a separate seam.",
+      "Do not modify or weaken existing container or worker tests; do not weaken assertions.",
+      "Do not touch flywheel_core purity boundaries."
+    ],
+    "edge_cases": [
+      "A non-flywheel / unrelated container reported by the same stub must NOT be removed (no collateral damage).",
+      "No orphan present -- the reap is a clean no-op (no error).",
+      "The SIGKILL case: atexit never ran, so the orphan is the only signal -- the startup scan must find and remove it."
+    ]
+  }
+}

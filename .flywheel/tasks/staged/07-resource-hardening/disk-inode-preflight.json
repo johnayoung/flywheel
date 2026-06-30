@@ -1,0 +1,46 @@
+{
+  "id": "disk-inode-preflight",
+  "goal": "When a disk/inode preflight finds free space or inodes below the configured threshold, the worker records a queryable degraded-space state and skips the authoritative store write for that unit instead of letting that write hard-crash on ENOSPC; above threshold it proceeds normally and the store write is reached.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_disk_preflight.py -k \"below_threshold_degrades_and_skips_store or above_threshold_proceeds\"",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest -k \"module_purity or sdk_optional or import_without\"",
+      "name": "purity-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "disk"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the worker run path that drives a unit into the authoritative store write; add a guarded low-space preflight (a free-space/inode probe via shutil.disk_usage / os.statvfs) ahead of that write.",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- around line 814 telemetry writes are already crash-swallowed; the AUTHORITATIVE store write is what hard-fails on ENOSPC. The preflight surfaces a degraded record BEFORE that write rather than catching the crash after.",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- the degraded-space record should surface on the worker's status/telemetry surface so it is queryable; do not put the disk-probe logic in flywheel_core.task/lifecycle."
+    ],
+    "constraints": [
+      "Below threshold: produce a QUERYABLE degraded-space record (readable via the worker's status/telemetry surface) AND do NOT invoke the authoritative store write for that unit (the write that would crash on ENOSPC).",
+      "Above threshold: normal flow proceeds and the store write IS reached -- the preflight must not block healthy operation.",
+      "The probe/preflight logic lives in the worker layer (NOT flywheel_core.task/lifecycle -- purity); the threshold is configurable and default-on; magnitude is not load-bearing.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not catch the store-write OSError after the fact -- the preflight declines BEFORE the crashing write (state must not be half-written).",
+      "Do not recover or re-drive the declined unit (later phases own that); stop at 'degraded record exists and crashing write was skipped'.",
+      "Do not place disk/json/io logic in flywheel_core.task or flywheel_core.lifecycle (the purity-holdout grader pins this).",
+      "Do not modify or weaken existing purity/store tests; do not weaken assertions."
+    ],
+    "edge_cases": [
+      "Below threshold but a printed success string -- must fail: the grader reads the classified degraded record and the not-called store write, not stdout.",
+      "Above threshold -- the store write must be reached (no false degrade).",
+      "Inode exhaustion with bytes free (and vice versa) -- either below-threshold dimension triggers the degraded path."
+    ]
+  }
+}

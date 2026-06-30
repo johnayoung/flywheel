@@ -1,0 +1,34 @@
+{
+  "id": "redriver-human-gate-routing",
+  "goal": "An intentional human stop (AWAITING_APPROVAL, intent=abort, or a budget-ceiling breach) is surfaced into the human-review queue with a reason naming its cause and is never auto-retried, auto-approved, auto-rejected, or otherwise transitioned out of its stop state by the re-driver.",
+  "prerequisites": ["redriver-queue-surface"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_human_gates.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_budget_ceilings.py packages/flywheel-orchestrator/tests/test_orchestrator.py", "name": "gate-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["redriver", "human-gates", "routing"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- AWAITING_APPROVAL manual gate (~3521-3542), intent=abort -> FAILED (~2229-2249), budget-ceiling -> FAILED (_finalize_budget_breach ~3806-3851): the three intentional stop sites",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the approval-resolution sweep (_should_apply_approval ~457) and the loop where these stops are surfaced to the queue WITHOUT being transitioned"
+    ],
+    "references": [
+      ".flywheel/specs/00069-FEATURE-work-redriver.md -- criteria #10, #11; Decision D-E (human gates are routed, never bypassed)"
+    ],
+    "constraints": [
+      "ROUTE, NEVER BYPASS: while a lifecycle is AWAITING_APPROVAL its status must stay AWAITING_APPROVAL after re-drive/sweep cycles (no auto-approve, no auto-reject); abort- and budget-terminated runs must not be re-dispatched (criteria #10, #11)",
+      "Surface each stop into the queue with a machine-readable reason naming its cause (awaiting-approval / abort / budget-ceiling)",
+      "The re-driver must never transition a human/budget stop out of its stop state -- only a human resolves these (D-E)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/*/tests/; do not weaken or delete assertions",
+      "Do not auto-resolve any approval, clear any abort, or raise any budget ceiling"
+    ],
+    "edge_cases": [
+      "Auto-approving / auto-rejecting an approval gate is the most dangerous failure in this phase and must fail the behavior test",
+      "Treating an intentional abort or budget breach as a transient failure to re-drive must fail the behavior test"
+    ]
+  }
+}

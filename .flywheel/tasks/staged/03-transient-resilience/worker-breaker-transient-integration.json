@@ -1,0 +1,31 @@
+{
+  "id": "worker-breaker-transient-integration",
+  "goal": "A worker cycle that hits a transient store fault which then clears completes without incrementing the consecutive-cycle-failure breaker.",
+  "prerequisites": ["sqlite-store-retry", "schema-mismatch-permanent-stop"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py -k transient_not_breaker", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py -k 'schema_mismatch_permanent_stop'", "name": "seam-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "transient", "worker", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the consecutive_failures breaker and CYCLE_FAILURE_BACKOFF (~line 2117); the transient retry must absorb the fault BENEATH this breaker so a cleared transient costs no strike",
+      "packages/flywheel-worktree/tests/test_worker.py -- add transient_not_breaker here"
+    ],
+    "constraints": [
+      "transient_not_breaker: a cycle hitting a transient store fault that then clears must complete with the worker's consecutive_failures counter at 0 -- proving the retry happened at the fault site below the breaker, not at the breaker level",
+      "Do not 'handle' the fault by catching it at the breaker (which still spends a strike and backs off the whole cycle); the transient retry from sqlite-store-retry must do the work first",
+      "A permanent stop (from schema-mismatch-permanent-stop) must still short-circuit the breaker as a single distinctly-labelled exit",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under tests/ except adding the named test; do not weaken existing worker tests",
+      "Do not change the meaning of the breaker for genuine repeated cycle failures (a real non-transient cycle failure still counts a strike)"
+    ],
+    "edge_cases": [
+      "Catching the transient at the breaker level (counter increments to 1 then resets) must fail the counter-at-0 assertion",
+      "A genuine non-transient cycle failure must still increment the breaker"
+    ]
+  }
+}

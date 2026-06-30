@@ -1,0 +1,51 @@
+{
+  "id": "console-supervisor-respawn",
+  "goal": "The autopilot and worker console supervisors auto-respawn a dead daemon child while inside the shared crash-loop budget, and stop respawning with a distinct queryable DEAD-after-budget status once the budget is exhausted.",
+  "prerequisites": ["supervision-policy-core"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel/tests/test_process_supervision.py -k 'respawn_within_window or budget_exhausted or budget_zero_no_respawn'",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel/tests/test_worker_supervisor.py packages/flywheel/tests/test_autopilot_supervisor.py packages/flywheel/tests/test_supervisor_group_shutdown.py packages/flywheel/tests/test_dashboard.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["supervision", "reliability", "console"],
+  "context": {
+    "relevant": [
+      "packages/flywheel/src/flywheel/_worker_supervisor.py -- WorkerSupervisor.status()/start() and the WorkerState enum gain auto-respawn + the DEAD-after-budget member",
+      "packages/flywheel/src/flywheel/_autopilot_supervisor.py -- AutopilotSupervisor.status()/start() and the AutopilotState enum, mirroring the worker change",
+      "packages/flywheel/src/flywheel/_dashboard.py -- the status reader that renders supervisor state; it must handle the new status member",
+      "packages/flywheel/tests/test_worker_supervisor.py -- keep green (existing supervisor semantics)",
+      "packages/flywheel/tests/test_autopilot_supervisor.py -- keep green",
+      "packages/flywheel/tests/test_dashboard.py -- keep green; update any exhaustive status-member rendering in the same change"
+    ],
+    "constraints": [
+      "Consume the shared policy from supervision-policy-core; do not re-implement window/budget counting here. The two supervisors must enforce the SAME policy.",
+      "Adding the DEAD-after-budget member to WorkerState/AutopilotState is a shared invariant: every reader of those enums (dashboard, TUI, tests) must handle the new member in THIS change so no slice inherits a red suite.",
+      "Auto-respawn must launch a real new child process (a new pid) -- not relabel the DEAD status string. Respawn happens inside status()/the supervise tick without an operator start() call.",
+      "Preserve the existing orphan-free group-shutdown path (start_new_session, killpg) unchanged; respawn must not introduce a new base-branch write path.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change the worker pool here (separate task pool-slot-retirement) or the headless autopilot entrypoint (separate task).",
+      "Do not modify or weaken assertions in any existing tests/ file; the orphan-shutdown and DEAD/DETACHED-distinction assertions must stay intact.",
+      "Do not auto-START autopilot from a cold console -- the manual-start default is unchanged; this governs respawn of an ALREADY-running daemon only.",
+      "Do not add new persistent-store surfaces."
+    ],
+    "edge_cases": [
+      "A respawned child that immediately re-dies must count against the same window so the budget can be reached (criterion #2).",
+      "Budget 0 / disabled: the supervisor must reproduce today's plain DEAD behavior exactly (no respawn).",
+      "After exhaustion the supervisor must STOP spawning -- a later operator start() may still re-arm it, but no automatic spawn occurs."
+    ]
+  }
+}

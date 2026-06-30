@@ -1,0 +1,41 @@
+{
+  "id": "supervision-policy-core",
+  "goal": "A shared supervision policy decides respawn-vs-exhausted for a daemon death by counting deaths in a rolling window against a per-window budget, with the window decaying over injected time and a budget of 0 disabling respawn entirely.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel/tests/test_process_supervision.py -k 'window_decays or budget_zero_no_respawn'",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["supervision", "reliability", "policy-core"],
+  "context": {
+    "relevant": [
+      "packages/flywheel/src/flywheel/_worker_supervisor.py -- the existing DEAD-detection shape and _dead_pid/_dead_exit bookkeeping this policy will feed",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- lines ~118 and ~1364 hold today's lifetime MAX_POOL_RESTARTS_PER_SLOT counter and _supervise_tick; this policy replaces that counting logic"
+    ],
+    "constraints": [
+      "The budget MUST be windowed: a death after the window has elapsed since the earliest counted death is treated as a fresh budget, not counted against an old burst. A non-decaying lifetime counter is the wrong implementation and criterion #3 fails it.",
+      "The window/budget logic must take an injected clock (a now-callable or monotonic source) so tests drive time deterministically -- do not read wall-clock directly in the decision path.",
+      "Budget 0 (or an explicit disabled flag) means: never respawn, report the plain pre-respawn DEAD outcome. This is the operator's unattended-base-branch safety override.",
+      "Expose the budget and window as a parameter shape (the shared invariant) that the supervisors and the pool will both construct -- name the field shape so dependent tasks build against the same surface.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not wire this policy into the autopilot/worker supervisors or the pool yet -- those are separate dependent tasks; this task ships the policy object plus its own unit tests only.",
+      "Do not modify or weaken any existing test under packages/*/tests/; this task adds packages/flywheel/tests/test_process_supervision.py.",
+      "Do not add a process-manager dependency (systemd/supervisord); supervision stays stdlib in-tree.",
+      "Do not touch flywheel_core.task or flywheel_core.lifecycle (they stay pure)."
+    ],
+    "edge_cases": [
+      "Exactly N deaths in the window: the Nth is still respawned; the (N+1)th is the first to report exhausted (boundary must not be off-by-one -- a returned constant 'always respawn' or 'always exhausted' must fail).",
+      "Window boundary: a death exactly at the window edge -- define and test which side it falls on so the decay is deterministic.",
+      "Budget 0 must produce zero respawns even on the first death."
+    ]
+  }
+}

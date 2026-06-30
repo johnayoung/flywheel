@@ -1,0 +1,28 @@
+{
+  "id": "github-ci-source-skip-bad-item",
+  "goal": "The github_ci work source skips one run payload it cannot compile into a valid item, counting and logging it, and still returns every other valid item.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_ci_source_skip_bad_item.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_ci_source.py", "name": "existing-suite-green" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "work-source", "github-ci"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github_ci.py -- list_work compiles each gh run row; _required_str (~line 95) and the per-item compile (~line 247) raise WorkSourceError on a malformed row, aborting the whole listing. Change the per-item loop so one uncompilable run is skipped (counted + logged) and the rest return",
+      "packages/flywheel-orchestrator/tests/test_github_ci_source.py -- existing github_ci coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_github_ci_source_skip_bad_item.py; do not weaken or delete existing assertions",
+      "Do not change the other sources here (each has its own task)",
+      "Do not let one parse break read as a green repo -- the other failing runs must still surface"
+    ],
+    "constraints": [
+      "The skip must be recorded (a count and/or a log line naming the bad run), not silently swallowed",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Exactly one malformed run row (e.g. missing a required identity string) among several valid ones: the result is exactly the valid items -- an empty/aborted listing must fail the test"
+    ]
+  }
+}

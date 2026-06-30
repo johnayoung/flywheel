@@ -1,0 +1,29 @@
+{
+  "id": "stop-observability-holdout",
+  "goal": "The full stop-observability seam holds together: across the core, orchestrator, and worktree packages, every stop producer emits a record shape that the shared park_kind vocabulary, the orchestrator stop-event taxonomy, and the fw status reader all recognize, proven by the whole gate passing as one.",
+  "prerequisites": ["status-enumerates-stops"],
+  "tags": ["spec-00068", "stop-observability", "holdout", "verification-surface"],
+  "graders": [
+    { "type": "command", "run": "scripts/check.sh", "name": "seam-holdout" }
+  ],
+  "context": {
+    "relevant": [
+      "scripts/check.sh -- the full project gate (ruff -> pyright -> pytest across every package); running it as one exercises the per-run park producers, the per-task stop producers, the status reader, and the shared taxonomies against one another",
+      ".flywheel/specs/00068-FEATURE-stop-observability.md -- criterion #10 and the two shared-invariant taxonomies (park_kind vocabulary; orchestrator stop-event kinds) this holdout composes"
+    ],
+    "constraints": [
+      "This is the composition holdout over the shared-invariant change (the park_kind vocabulary and the orchestrator stop-event taxonomy that multiple producers and the fw status reader all assert against). It adds NO requirement beyond the spec -- it only composes what the per-package graders already check, run together so a producer whose record shape the reader or taxonomy does not recognize fails here even if its own package suite passed in isolation.",
+      "If scripts/check.sh is already green after the three prerequisite tasks, this task's work is to confirm the seam holds and add (only if a real seam gap surfaces) a cross-package assertion that exercises a producer's record through the status reader end to end -- not to re-implement any producer.",
+      "Commit any change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add a new stop kind, a new producer, a new ledger, or any re-drive behavior -- this task only proves the existing seam composes.",
+      "Do NOT weaken or delete any assertion under packages/*/tests/ to make the gate pass; a removed assertion with no equal-or-greater replacement is a blocking defect.",
+      "Do NOT modify the shared taxonomies established by the prerequisite tasks; if a divergence surfaces, fix the divergent producer, not the taxonomy contract."
+    ],
+    "edge_cases": [
+      "A producer emitting a park_kind or stop-event kind the fw status reader does not recognize must fail this gate even though its own package suite passed.",
+      "A taxonomy spelling that drifted between a producer and the reader (e.g. push_failed vs push-failed) must surface here."
+    ]
+  }
+}

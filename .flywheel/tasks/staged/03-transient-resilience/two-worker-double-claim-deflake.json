@@ -1,0 +1,28 @@
+{
+  "id": "two-worker-double-claim-deflake",
+  "goal": "The two-worker double-claim test asserts exactly-once execution deterministically under contention without weakening the existing assertion.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py -k 'two_workers_run_each_task_exactly_once or fresh_selection_rechecks_terminal_state_under_claim'", "name": "behavior" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "deflake", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- test_two_workers_run_each_task_exactly_once (~line 447) flakes under load; test_fresh_selection_rechecks_terminal_state_under_claim (~line 502) is the deterministic-interleave pattern to model on",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the post-claim terminal-state recheck (~lines 1101-1126) already closes the correctness hole; this is a test-determinism fix only"
+    ],
+    "constraints": [
+      "Make the test deterministic by CONTROLLING the interleave (force the contention, modelled on test_fresh_selection_rechecks_terminal_state_under_claim), not by loosening the check",
+      "The assertions ran_a.isdisjoint(ran_b), ran_a | ran_b == set(task_ids), and len(all_runs) == len(task_ids) must remain present and unchanged (byte-for-byte equivalent strength)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do NOT weaken the exactly-once assertion: no allowing a task in both sets, no '>=' for '==', no removing any of the three named assertions",
+      "Do not change the orchestrator's claim/recheck logic -- the correctness hole is already closed; this is a test-only deflake"
+    ],
+    "edge_cases": [
+      "Replacing '==' with '>=' or dropping isdisjoint must fail this criterion (the assertion must stay intact)",
+      "A still load-dependent sleep-based race that passes only sometimes is not acceptable -- the interleave must be forced"
+    ]
+  }
+}

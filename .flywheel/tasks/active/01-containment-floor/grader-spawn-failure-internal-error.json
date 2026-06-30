@@ -1,0 +1,32 @@
+{
+  "id": "grader-spawn-failure-internal-error",
+  "goal": "A command grader whose subprocess fails to start is classified as a retryable internal error, distinct from a grader that runs and exits non-zero (a validation failure).",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_grader_command_spawn_failure.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_grader_command.py", "name": "ran-and-failed-stays-validation-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["containment-floor", "core", "grader"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/grader_command.py -- run_command_graders spawns subprocess.Popen(shell=True) at ~line 143 with NO guard; this is the call site to harden",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- the recheck path (~lines 4040-4055) already guards the same Popen with `except OSError` and reports a not-satisfied result; mirror that posture and route a spawn failure to the INTERNAL_ERROR (retryable) class, not FAILED_VALIDATION",
+      "packages/flywheel-core/src/flywheel_core/lifecycle.py -- Outcome / Status enums define INTERNAL_ERROR vs FAILED_VALIDATION; the retryable internal-error class is the target classification",
+      "packages/flywheel-core/tests/test_grader_command.py -- existing command-grader suite; keep green (it pins ran-and-failed -> validation-failed)"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-core/tests/test_grader_command_spawn_failure.py; do not weaken or delete existing assertions",
+      "Do not change what a grader that successfully RUNS decides -- a grader that starts and exits non-zero must still be a validation failure",
+      "Do not add timeouts or transient-retry classification beyond the spawn-failure distinction (those are later phases)"
+    ],
+    "constraints": [
+      "flywheel_core.task and flywheel_core.lifecycle stay pure -- no json/pathlib/io added there; spawn-guard logic lives in grader_command/harness",
+      "The harness remains the authority on lifecycle transitions; this only adds a classification for an infra failure",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "Spawn failure must be the retryable INTERNAL_ERROR class; collapsing it into FAILED_VALIDATION (or leaving it a terminal crash) must fail the new test",
+      "A grader that DOES start and exits non-zero must still yield FAILED_VALIDATION -- the holdout suite pins this so the two classes cannot merge"
+    ]
+  }
+}

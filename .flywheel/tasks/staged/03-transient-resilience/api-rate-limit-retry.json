@@ -1,0 +1,35 @@
+{
+  "id": "api-rate-limit-retry",
+  "goal": "An iteration that returns a 429/overload/rate-limit status is retried after bounded backoff on a transient budget separate from validation max_retries, terminating after a bounded number of attempts.",
+  "prerequisites": ["transient-classifier-backoff"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py -k 'rate_limit_retry or rate_limit_exhausted'", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k transient_classification_matrix", "name": "seam-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "transient", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/harness.py -- the task driver / iteration loop that owns max_retries and currently turns a 429 into a MissingEnvelope/AGENT_ERROR; add the transient iteration-retry here",
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- api_error_status (line ~248) and rate_limit_events (~263) are already collected on InvocationSignals; consume them, do not re-derive",
+      "packages/flywheel-core/tests/test_harness.py -- add rate_limit_retry and rate_limit_exhausted tests here"
+    ],
+    "constraints": [
+      "Reuse the TRANSIENT classification and bounded-backoff helper from transient-classifier-backoff; do not introduce a second backoff or budget definition",
+      "The transient-retry budget MUST be tracked separately from the harness validation max_retries: criterion proof runs with max_retries=0 and still reaches DONE on [rate-limit, rate-limit, valid-pass]",
+      "rate_limit_exhausted: N+1 rate-limit results (N = transient budget) terminates in bounded time with a TRANSIENT-classified failure and attempt count N+1 -- never an unbounded loop",
+      "A genuine non-API MissingEnvelope (no api_error_status / no rate-limit event) must STILL consume the validation budget and reach AGENT_ERROR/FAILED_VALIDATION as before",
+      "import flywheel_core must work without claude-agent-sdk; touch the SDK only through _sdk",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under tests/ except adding the two named tests; do not weaken existing harness tests",
+      "Do not raise the default max_retries to absorb 429s -- that conflates infra faults with agent failures and is explicitly rejected (D-1)",
+      "Do not retry version conflicts"
+    ],
+    "edge_cases": [
+      "max_retries=0 must still let two rate-limited iterations precede a passing one and reach DONE -- proving the validation budget was untouched",
+      "The retry loop must be bounded by the transient budget, not by a value an agent could set to infinity"
+    ]
+  }
+}

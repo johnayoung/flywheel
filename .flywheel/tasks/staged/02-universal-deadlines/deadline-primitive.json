@@ -1,0 +1,37 @@
+{
+  "id": "deadline-primitive",
+  "goal": "Add a reusable wall-clock deadline primitive in flywheel-core that bounds an awaitable or async-for stream and raises a distinguishable timeout signal within ceiling+epsilon even while the stream is still yielding items.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest -k deadline_primitive packages/flywheel-core/tests/", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py", "name": "purity-holdout" }
+  ],
+  "tags": ["deadlines", "core", "phase2"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/loop_guard.py -- the existing hang watchdog keys on inter-message silence; the new primitive is a wall-clock bound, additive not a replacement",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- _invoke_with_watchdog around line 2860 shows the existing silence watchdog the new primitive must NOT duplicate",
+      "packages/flywheel-core/tests/test_loop_guard.py -- mirror this test style for the new primitive's tests"
+    ],
+    "references": [
+      "packages/flywheel-core/src/flywheel_core/invoker_client.py:528 -- existing asyncio.wait_for usage to mirror",
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- criterion #1 and Decomposition Hint shared invariant"
+    ],
+    "constraints": [
+      "Place the primitive in a non-pure core module (e.g. a new module or loop_guard); do NOT add it to flywheel_core.task or flywheel_core.lifecycle -- those stay pure (no file/json/io).",
+      "Do NOT add a top-level claude_agent_sdk import; the primitive must not require the SDK extra.",
+      "The bound is total wall-clock elapsed since the call started -- it must fire even while the wrapped stream is still producing items (not an idle/silence timer).",
+      "Add the new pytest target so `uv run pytest -k deadline_primitive` selects it.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not weaken, delete, or modify existing assertions in test_loop_guard.py or the harness silence-watchdog tests.",
+      "Do not wire any call site (harness/grader/docker/autopilot) to the primitive in this task -- that is the dependent tasks.",
+      "Do not introduce the config/default-ceiling resolution here."
+    ],
+    "edge_cases": [
+      "An async-for over a generator that yields forever without ever stopping must still raise the timeout signal -- a silence/idle timer that resets on each yield must fail this test.",
+      "A coroutine that sleeps past a tiny ceiling raises the same distinguishable timeout signal.",
+      "The timeout signal is distinguishable from a normal cancellation so callers can classify it."
+    ]
+  }
+}

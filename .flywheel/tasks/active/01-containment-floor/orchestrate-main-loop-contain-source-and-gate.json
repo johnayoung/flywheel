@@ -1,0 +1,34 @@
+{
+  "id": "orchestrate-main-loop-contain-source-and-gate",
+  "goal": "The orchestrate main driver contains a raising source list_work() so the pass degrades instead of crashing, and contains a raising held-out gate evaluation at its call site so an errored gate suppresses landing rather than unwinding the pass.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrate_main_loop_containment.py", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py", "name": "driver-and-gate-suites-green" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "prerequisites": ["workgraph-isolate-invalid-task"],
+  "tags": ["containment-floor", "orchestrate", "gate"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the main loop's list_work() (~line 850, inside the try at ~824 whose only handler is a finally at ~1198) is bare; the reconciler (~256) and sync (~320) already wrap list_work in try/except and continue -- mirror that posture on the main driver so a raising source degrades the pass instead of crashing it",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the held-out gate call site _evaluate_landing_gate (~line 1441) is unguarded; wrap it so an unexpected exception is contained AND landing is suppressed (submit not invoked) when gate evaluation itself errored -- fail closed at the call site",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- existing landing-gate coverage; keep green"
+    ],
+    "non_goals": [
+      "Do not modify files under any tests/ directory except to ADD the new packages/flywheel-orchestrator/tests/test_orchestrate_main_loop_containment.py; do not weaken or delete existing assertions",
+      "Do not change the gate engine's internal fail-closed verdict logic -- only the orchestrate CALL SITE is wrapped",
+      "Do not let a contained gate error fall through to a merge/PR submit -- an errored gate must suppress landing"
+    ],
+    "constraints": [
+      "Source-listing containment uses a generic Exception guard matching the reconciler/sync posture (a narrowed subtype that lets an unrelated raise escape must fail the test)",
+      "Gate-site containment fails closed: the submit/landing effect is NOT taken when gate evaluation raised (mirrors the gate engine's internal discipline and program decision: intentional gates are never auto-bypassed)",
+      "The worker remains the authority on lifecycle transitions; landing stays the SubmitStrategy's job",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "edge_cases": [
+      "A source whose list_work() raises a generic Exception: the driver continues without re-raising and in-flight state is untouched",
+      "A gate evaluator injected to raise: the pass settles AND no merge/PR submit happens off the unevaluated gate -- a contain-then-land implementation must fail the test",
+      "This depends on workgraph-isolate-invalid-task: the main loop's WorkGraph.build no longer raises on a structural defect, so source containment and graph-build containment compose without the graph step crashing the contained pass"
+    ]
+  }
+}

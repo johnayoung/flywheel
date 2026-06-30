@@ -1,0 +1,44 @@
+{
+  "id": "bound-run-logs",
+  "goal": "The worker's active run-log retention reduces the run-logs directory to at or under a configured bound, deleting the oldest run JSONL files while the most-recent runs survive.",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_run_log_retention.py",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest -k \"module_purity or sdk_optional or import_without\"",
+      "name": "purity-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "logs"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the comment at lines 1013-1016 explicitly leaves .flywheel/logs/runs/ operator-owned and never rotated; this task replaces that disclaimer with an active default-on retention behavior the worker runs",
+      "packages/flywheel-core/src/flywheel_core/telemetry_file.py -- FileTelemetrySink writes .flywheel/logs/runs/<run_id>.jsonl (runs_dir/path_for); the retention reads this directory, but the reclaim/cap logic must NOT go into flywheel_core.task/lifecycle"
+    ],
+    "constraints": [
+      "Reclaim the OLDEST run files (by mtime/count) and preserve the most-recent N -- deleting the newest/in-progress run is a defect; a no-op that leaves growth unbounded is the leak this task removes.",
+      "The directory is held at or under a CONFIGURED bound (count and/or total size), default-on; magnitude is not load-bearing.",
+      "The reclaim logic lives in the telemetry/loaders/worker layer (NOT flywheel_core.task/lifecycle); import flywheel_core must still work without the SDK extra.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not place file/disk/json reclaim logic in flywheel_core.task or flywheel_core.lifecycle (breaks purity -- the purity-holdout grader pins this).",
+      "Do not modify or weaken existing telemetry-sink or purity tests; do not weaken assertions.",
+      "Do not change the supervisor log bound (separate task)."
+    ],
+    "edge_cases": [
+      "Distinct mtimes -- the surviving set must be exactly the most-recent N (the test pins WHICH files survive, not just a count).",
+      "Fewer files than the bound -- nothing is reclaimed.",
+      "An in-progress/newest run must never be the one deleted."
+    ]
+  }
+}

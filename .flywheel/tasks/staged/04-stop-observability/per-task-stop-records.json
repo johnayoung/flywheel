@@ -1,0 +1,50 @@
+{
+  "id": "per-task-stop-records",
+  "goal": "Every pre-run dead-end with no run_id -- a dangling prerequisite, a no-op autopilot cycle, a recurring container prepare-preflight skip, and a source-listing truncation or zero-grader item drop -- appends a durable, append-only record of a new closed orchestrator stop-event taxonomy to the per-task orchestrator-events ledger, naming the stop and its cause, without changing the work that does (or does not) get scheduled.",
+  "tags": ["spec-00068", "stop-observability", "orchestrator", "events"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_work_sources.py packages/flywheel-orchestrator/tests/test_autopilot_loop.py packages/flywheel-orchestrator/tests/test_github_source.py packages/flywheel-orchestrator/tests/test_policy.py", "name": "behavior" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py -- the dangling-prerequisite GraphValidationIssue (~155-163) is computed into self._issues (~191) and then discarded by orchestrate; this is the surface to read so the issue becomes a durable per-task record",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the pass reads WorkGraph.build(items).graph (~860) and drops .issues; the sandbox prepare/preflight failure (~1143-1155) releases the claim and logs-only then continue; both have the control store in scope to emit a per-task stop record",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- autopilot_pass() returns AutopilotPassResult with a reason string when it emits zero tasks (~1619-1628 no actionable findings; ~1650-1656 nothing authorable); the control store is a parameter (~1586) so the no-op cycle can be recorded durably",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- emit_truncation_warning(log,...) (~90-110) and the page-200 truncation site (~71); the zero-grader drop emits a skip line; both go nowhere because production passes no log",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- the source builders (~1441-1479: build_directory_source/build_github_source/build_github_ci_source/build_github_review_source) construct each source without a log= sink; this is the production wiring that must route truncation/zero-grader signals into a durable record",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the orchestrator_events ledger lives here: the five-member claim-event taxonomy, OrchestratorEventRecord, the same-transaction append, and list_events/list_task_events read API are the contract this new stop-event taxonomy mirrors and extends",
+      "packages/flywheel-orchestrator/tests/test_work_sources.py -- keep green; add the source-truncation and zero-grader-drop record assertions, driven through the production source-construction path (not a hand-injected log)",
+      "packages/flywheel-orchestrator/tests/test_autopilot_loop.py -- keep green; add the no-op-cycle record assertion (a pass forced to emit zero tasks records exactly one no-op-cycle row carrying its reason and the queue depths)",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- keep green; pins the source builders; assert the builders now wire the truncation/zero-grader sink to the durable record"
+    ],
+    "references": [
+      ".flywheel/tasks/archive/orchestrator-events/event-ledger-store.json -- the established pattern for an append-only orchestrator_events row written in the same store transaction; mirror its taxonomy/record/read-API shape for the new stop-event kinds",
+      "docs/orchestration.md -- the orchestrator_events ledger contract (append-only, same-transaction, list_events/list_task_events, no update/delete)",
+      "docs/data-taxonomy.md -- Ledger/Event class: anything an operator must enumerate is durable queryable state, not a log line"
+    ],
+    "constraints": [
+      "Define the new stop-event kinds as ONE closed, named taxonomy on the orchestrator-events ledger: dangling-prerequisite, no-op-cycle, prepare-skip, source-truncation, zero-grader-drop. Use stable kebab-case spellings shared with the fw status reader (built in a dependent task). Mirror the existing five-member claim-event taxonomy's shape rather than inventing a parallel ledger.",
+      "Each record names its subject task/source and carries the cause in its payload: the missing prerequisite id; the no-op reason plus observed/target queue depth; the prepare failure text; the source name and the truncation/zero-grader detail.",
+      "Append-only and same-transaction where a committed state change exists (D-3): the prepare-skip record is written in the same store transaction as the claim release it accompanies; records that accompany no state change are still appended exactly once per occurrence. Provide NO update/delete for these rows.",
+      "Do NOT dedupe or coalesce recurring stops (D-3): a prepare-skip recurring every cycle, or a no-op cycle every pass, produces one record per occurrence -- the recurrence IS the signal. A ledger that collapses N occurrences into one must fail.",
+      "Audit-witness only (D-2): record the stop WITHOUT changing what gets scheduled. The dangling-prereq task stays out of the ready set; the prepare-skip still releases the claim and continues draining; the no-op cycle still emits zero tasks; the truncated/zero-grader work sequence returned to the caller is byte-for-byte unchanged (the record is a pure side channel).",
+      "Route the source truncation and zero-grader signals through the production _policy source builders (wire the log/sink to the durable record there), not only through a test-injected callable -- the gap today is that production passes nothing.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add any retry, respawn, re-author, re-drive, or auto-skip-forever behavior -- visibility only.",
+      "Do NOT alter the work sequence a source returns, the ready-set membership of a dangling-prereq task, the autopilot emit count, the claim-release/continue control flow on prepare failure, or the page/item limits themselves.",
+      "Do NOT create a synthetic lifecycle or run_id for these pre-run stops (D-1) -- they have no run; they belong on the per-task orchestrator-events ledger, not the per-run domain-event stream.",
+      "Do NOT add pruning, retention, rotation, or a growth cap to the ledger; do NOT change the existing five claim-event kinds.",
+      "Do NOT weaken or delete any assertion under packages/flywheel-orchestrator/tests/.",
+      "Do NOT modify flywheel-core, the persistence-schema*.sql files, or the per-run domain-event stream here (separate task)."
+    ],
+    "edge_cases": [
+      "Items where A declares a prerequisite on a non-existent id: one orchestrate pass records a dangling-prerequisite row for A naming the missing id, and A stays out of the ready set -- recording the row but making A runnable, or making A runnable without a row, must both fail.",
+      "A source backing returning 201 items at a 200 page limit records exactly one source-truncation row naming the source AND returns the same work sequence it returns today; an item carrying zero graders records one zero-grader-drop row AND is still dropped from the sequence as today.",
+      "A prepare-preflight failure recurring across three cycles records three prepare-skip rows (not one); a deduping ledger must fail.",
+      "An autopilot pass that DOES emit a grader-bearing task records NO no-op-cycle row -- a record on a productive cycle must fail."
+    ]
+  }
+}

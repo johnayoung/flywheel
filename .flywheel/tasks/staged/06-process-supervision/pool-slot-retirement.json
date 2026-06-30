@@ -1,0 +1,48 @@
+{
+  "id": "pool-slot-retirement",
+  "goal": "A worker-pool slot that exhausts its windowed crash-loop budget is retired in isolation while every other live member keeps running, instead of the budget being a lifetime counter that group-kills the whole pool on exhaustion.",
+  "prerequisites": ["supervision-policy-core"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker_pool_safety.py -k slot_retire_keeps_fleet",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-worktree/tests/test_worker_pool.py packages/flywheel-worktree/tests/test_worker_pool_safety.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["supervision", "reliability", "worker-pool"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- WorkerPool._supervise_tick (~line 1364) currently sets _stop_requested on exhaustion; the finally: stop() at run_supervised (~line 1343) then group-kills all members. The MAX_POOL_RESTARTS_PER_SLOT constant (~line 118) is the lifetime counter to replace.",
+      "packages/flywheel-worktree/tests/test_worker_pool.py -- keep green; test_pool_gives_up_after_restart_budget pins the old behavior and must be reconciled, not deleted, in the same change",
+      "packages/flywheel-worktree/tests/test_worker_pool_safety.py -- keep green (exactly-once, serialized-landing, clean-shutdown invariants)"
+    ],
+    "constraints": [
+      "Consume the shared windowed budget from supervision-policy-core; replace the lifetime per-slot counter (MAX_POOL_RESTARTS_PER_SLOT, never decays) with the windowed policy.",
+      "On a slot exhausting budget: retire/quarantine THAT slot only and continue supervising; do NOT set a pool-wide stop or trigger the group-kill of healthy members. Healthy members stay alive.",
+      "Preserve the orphan-free group shutdown on actual stop() (SIGTERM->SIGKILL, killpg) and the exactly-once / serialized-landing invariants -- those tests must stay green.",
+      "If an existing test asserted the old group-kill-on-exhaustion behavior, it must be updated to assert the new single-slot retirement (an equal-or-greater replacement), with its old intent re-expressed -- not silently dropped.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change the console supervisors (separate task) or autopilot.",
+      "Do not weaken the orphan-free-shutdown or exactly-once assertions; the pool must still leave nothing alive on stop().",
+      "Do not introduce parallel landing or change the lease/claim protocol.",
+      "Do not add a process-manager dependency."
+    ],
+    "edge_cases": [
+      "Pool of size >= 2: one slot crashing past budget must leave the other member's pid alive after retirement (the discriminating case).",
+      "All slots retired: the pool may now run below size N -- that is the intended trade; the pool must not crash or spin when fewer than N members are live.",
+      "Windowed budget: a slot that crashed long ago then crashes once more after the window must be respawned, not retired (no lifetime carryover)."
+    ]
+  }
+}

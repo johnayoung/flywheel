@@ -1,0 +1,35 @@
+{
+  "id": "schema-mismatch-permanent-stop",
+  "goal": "A store/orchestrator schema-version mismatch classifies PERMANENT and stops the worker loop after a single distinctly-labelled permanent-stop instead of accumulating identical breaker strikes.",
+  "prerequisites": ["transient-classifier-backoff"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py -k schema_mismatch_permanent_stop", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k transient_classification_matrix", "name": "seam-holdout" },
+    { "type": "command", "run": "scripts/check.sh", "name": "full-gate" }
+  ],
+  "tags": ["reliability", "permanent", "phase-03"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the cycle loop and the 5-strike breaker (~line 2117); add a permanent-stop exit path distinct from the transient-cycle-failure path",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the store is reopened every cycle (~line 816), which is why a mismatch raises identically on cycles 1..5",
+      "packages/flywheel-core/src/flywheel_core/store_sqlite.py -- StoreSchemaError raised on version mismatch (~line 196)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- OrchestratorSchemaError (~line 814/882)",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- add schema_mismatch_permanent_stop here"
+    ],
+    "constraints": [
+      "Classify StoreSchemaError and OrchestratorSchemaError PERMANENT using the classifier from transient-classifier-backoff",
+      "schema_mismatch_permanent_stop: a store whose schema_version row is wrong must stop the worker loop after exactly ONE cycle via a distinctly-labelled permanent-stop signal/return, NOT one strike per cycle -- assert the strike/cycle count is 1, not MAX_CONSECUTIVE_CYCLE_FAILURES",
+      "The permanent-stop path must be distinguishable from the transient-cycle-failure path (a distinct return/log/signal a grader can assert on)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under tests/ except adding the named test; do not weaken existing orchestrator tests",
+      "Do not retry a schema mismatch as TRANSIENT (it can never succeed)",
+      "Do not let a schema mismatch ride all 5 breaker strikes"
+    ],
+    "edge_cases": [
+      "A mismatch classified TRANSIENT and retried must fail (it would loop forever)",
+      "A mismatch counting 5 strikes before exiting must fail the count-is-1 assertion"
+    ]
+  }
+}

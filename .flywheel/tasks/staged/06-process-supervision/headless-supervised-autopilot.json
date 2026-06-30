@@ -1,0 +1,48 @@
+{
+  "id": "headless-supervised-autopilot",
+  "goal": "A headless supervised autopilot entrypoint runs the daemon outside the console under the shared crash-loop policy, restarting a daemon that dies once inside its window and adopting an already-live daemon via the liveness record so it never spawns a duplicate.",
+  "prerequisites": ["supervision-policy-core", "autopilot-liveness-record", "console-supervisor-respawn"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_supervised_run.py -k 'headless_respawn or headless_adopts_live'",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_daemon.py packages/flywheel/tests/test_autopilot_cli.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["supervision", "reliability", "autopilot", "headless"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- main()/run_daemon_loop is the headless daemon with NO supervisor today; the supervised entrypoint wraps the daemon under the shared policy",
+      "packages/flywheel/src/flywheel/_autopilot_supervisor.py -- the console supervision shape (spawn/respawn/budget) the headless path reuses so console and headless enforce ONE policy",
+      "packages/flywheel-orchestrator/tests/test_autopilot_supervised_run.py -- the new test surface (also used by autopilot-liveness-record); keep both files' suites green"
+    ],
+    "constraints": [
+      "Reuse the shared policy (supervision-policy-core) and the liveness record (autopilot-liveness-record) -- the headless path must enforce the SAME budget/window and the SAME adoption semantics as the console supervisor, not a parallel implementation.",
+      "On adoption: if a live liveness record exists, the headless entrypoint adopts it and spawns no second daemon (spawn count == 0). On a dead daemon inside budget: restart it and continue (a subsequent cycle runs).",
+      "Tests must inject the spawn and the clock so respawn and adoption are deterministic, not wall-clock or real-subprocess dependent.",
+      "Preserve the daemon's SIGTERM/SIGINT graceful-shutdown and orphan-free exit; the supervised wrapper must not leave an orphan on stop.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change the existing `flywheel autopilot` daemon's per-cycle behavior or the --once single-pass path.",
+      "Do not auto-start autopilot where it was previously manual-start-only; this adds a supervised RUN path, it does not change the cold-start default.",
+      "Do not modify or weaken existing autopilot/CLI tests.",
+      "Do not introduce a process-manager dependency or a new persistent schema table."
+    ],
+    "edge_cases": [
+      "Daemon dies once then succeeds: must be restarted and run a further cycle (proves restart, not just 'entrypoint exists').",
+      "An already-live daemon (fresh liveness record) present at startup: the headless entrypoint adopts it and spawns nothing.",
+      "Budget exhausted headless: the entrypoint stops respawning and exits/reports the DEAD-after-budget terminal state rather than looping forever."
+    ]
+  }
+}

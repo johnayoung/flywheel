@@ -1,0 +1,40 @@
+{
+  "id": "status-enumerates-stops",
+  "goal": "fw status enumerates every newly-recorded stopped or stranded unit with its stop reason -- the new per-run park kinds (held-out-gate, protected-paths, push-failed, submit-error) and the new per-task stop-event kinds (dangling-prerequisite, no-op-cycle, prepare-skip, source-truncation, zero-grader-drop) -- in both the text and the --json rendering, extending the existing stranded: surface rather than adding a separate view.",
+  "prerequisites": ["per-run-park-records", "per-task-stop-records"],
+  "tags": ["spec-00068", "stop-observability", "status", "cli"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-orchestrator/tests/ -k status", "name": "behavior" },
+    { "type": "command", "run": "uv run ruff check packages/flywheel-orchestrator/ && uv run pyright packages/flywheel-orchestrator/", "name": "lint-typecheck" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_status (~1353-1480) already renders the stranded: line from the per-run LandingParked via _landing_park_for_run (~1335-1350); extend it to (a) recognize the new per-run park_kind values and (b) also read the new per-task stop-event records from the orchestrator-events ledger and enumerate those stopped units, in both the text path and the --json path (the entry['stranded'] / follow-up-line conventions)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py -- the per-task stop-event read API (list_task_events / equivalent) added by the prerequisite task is the source the status reader queries for pre-run stops",
+      "packages/flywheel-core/src/flywheel_core/events.py -- the LandingParked.park_kind vocabulary the reader must recognize",
+      "packages/flywheel-orchestrator/tests/ -- the status tests selected by -k status; keep them green and add assertions that each new stop kind appears (text and --json) with its reason"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py:1474 -- the existing stranded: follow-up line is the rendering convention to mirror for the new kinds (omit-when-absent, reason after a dash)"
+    ],
+    "constraints": [
+      "Read both record surfaces (the per-run domain-event LandingParked AND the per-task orchestrator-events stop kinds) and union them into the status output; a unit stopped by ANY of the nine kinds must appear with its reason in both text and --json.",
+      "Extend the existing stranded: surface and its omit-when-absent convention rather than inventing a new top-level view or CLI verb.",
+      "Per-unit reason, not just a count: each enumerated unit carries its stop kind and detail so the operator can act without cross-referencing logs.",
+      "Do NOT change which units are stopped or how -- the status command is read-only over the records the prerequisite tasks emit (D-2).",
+      "This task depends on the exact park_kind and stop-event-kind spellings fixed by the two prerequisite tasks; use those shared spellings verbatim.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do NOT add a re-drive, retry, or queue-drain action to status -- enumeration only (re-driving is a later phase).",
+      "Do NOT emit any new records here -- the producers are the prerequisite tasks; status only reads.",
+      "Do NOT change the existing stranded:/awaiting_on:/blocked_on: rendering for cases already covered.",
+      "Do NOT weaken or delete any assertion under packages/flywheel-orchestrator/tests/."
+    ],
+    "edge_cases": [
+      "A store holding one of each new record kind: status text and --json each list every stopped/stranded unit with its reason; a kind that renders in text but is missing from --json (or vice versa) must fail.",
+      "A unit with NO stop record renders exactly as today (no stranded line) -- a spurious stranded line on a healthy unit must fail.",
+      "A recurring per-task stop (e.g. three prepare-skips) surfaces the unit as stopped with its reason -- status must not crash on multiple records for one task."
+    ]
+  }
+}

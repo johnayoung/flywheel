@@ -1,0 +1,43 @@
+{
+  "id": "container-owner-marker",
+  "goal": "Every flywheel container is created carrying a stable flywheel-owner marker, and a single shared selector matches exactly the containers that carry it (round-trip: a container built with the marker is selected, one without it is not).",
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-container/tests/test_owner_marker.py",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-container/tests/test_docker_primitives.py",
+      "name": "regression-holdout"
+    },
+    {
+      "type": "command",
+      "run": "scripts/check.sh",
+      "name": "full-gate"
+    }
+  ],
+  "tags": ["resource-hardening", "reliability", "container"],
+  "context": {
+    "relevant": [
+      "packages/flywheel-container/src/flywheel_container/_docker.py -- build_run_argv() (around lines 89-128) emits `docker run -d --name <name> ...` with NO label; add a stable flywheel-owner marker (a --label / owner identifier) to the created argv, and expose ONE selector (the same identifier) the orphan scan will use.",
+      "packages/flywheel-container/src/flywheel_container/_submit.py -- container names are `flywheel-{task_id}-{uuid}` (line 167); the owner marker must be the durable identifier the reap scan keys on, independent of the per-task name."
+    ],
+    "constraints": [
+      "The marker emitted at creation and the selector the scan uses MUST be the SAME identifier (this is the shared invariant the dependent reap task consumes). Expose the selector so the consumer imports the one source of truth -- do not hardcode the string twice.",
+      "The marker must distinguish flywheel-owned containers from unrelated containers so the reaper never matches non-flywheel containers.",
+      "build_run_argv stays pure (no subprocess); only the argv gains the marker.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not implement the orphan reap here -- that is reap-orphan-containers, which depends on this marker.",
+      "Do not modify or weaken existing docker-primitive tests; do not weaken assertions.",
+      "Do not touch flywheel_core purity boundaries."
+    ],
+    "edge_cases": [
+      "A container built WITHOUT the marker must NOT be selected by the scan selector (round-trip negative case).",
+      "The marker must survive in a form `docker ps`/inspect can filter on (a label or an owner field), not just the local name."
+    ]
+  }
+}

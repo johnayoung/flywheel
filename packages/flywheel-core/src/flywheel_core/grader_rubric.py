@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from flywheel_core.deadline import DeadlineExceeded, run_with_deadline
 from flywheel_core.store_protocols import GraderResultRecord, GraderResultStore
 from flywheel_core.task import RubricGrader, Task
 
@@ -422,6 +423,7 @@ async def run_rubric_graders(
     judge_invoke: JudgeInvoke | None = None,
     judge_model: str | None = None,
     judge_max_turns: int = 8,
+    judge_ceiling_seconds: float | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> list[GraderResultRecord]:
     """Run every ``RubricGrader`` on ``task.graders`` in list order.
@@ -432,7 +434,12 @@ async def run_rubric_graders(
        assertions, the working-agent ``transcript``, and the verdict
        envelope contract.
     2. Invoke ``judge_invoke`` (defaults to a fresh
-       ``claude_agent_sdk.query`` against ``worktree``).
+       ``claude_agent_sdk.query`` against ``worktree``). When
+       ``judge_ceiling_seconds`` is a positive float, the invocation is
+       bound by :func:`flywheel_core.deadline.run_with_deadline` so a judge
+       whose stream never terminates is cancelled in bounded wall time and
+       surfaced as a :class:`RubricJudgeError` (judge-infra timeout, spec
+       00066 criterion #3); ``None`` leaves the call unbounded.
     3. Parse the response with :func:`parse_verdict`. Any non-``valid``
        variant raises :class:`RubricJudgeError` without persisting a row
        (judge-infrastructure failure — routed through ``INTERNAL_ERROR``
@@ -488,9 +495,33 @@ async def run_rubric_graders(
 
         prompt = _build_judge_prompt(task, grader, transcript)
         try:
-            response = await invoker(prompt, grader, worktree)
+            # Wall-clock judge deadline (spec 00066 criterion #3, D-2): a
+            # never-terminating judge stream -- even one steadily yielding
+            # output -- is cancelled once the ceiling passes. The bound wraps
+            # the whole invocation (not the SDK stream inside the default
+            # invoker) so an injected ``judge_invoke`` is bounded too. A
+            # ``None`` ceiling is the operator's unbounded opt-out.
+            if judge_ceiling_seconds is None:
+                response = await invoker(prompt, grader, worktree)
+            else:
+                response = await run_with_deadline(
+                    invoker(prompt, grader, worktree),
+                    judge_ceiling_seconds,
+                )
         except RubricJudgeError:
             raise
+        except DeadlineExceeded as exc:
+            # A deadline timeout is a judge-infrastructure failure,
+            # distinguishable from a normal verdict: route it through the
+            # same RubricJudgeError path the harness classifies as
+            # ``rubric_judge_error``.
+            raise RubricJudgeError(
+                grader_name=grader.name or "<unnamed>",
+                reason=(
+                    "judge invocation exceeded wall-clock deadline of "
+                    f"{exc.ceiling_seconds}s"
+                ),
+            ) from exc
         except Exception as exc:
             raise RubricJudgeError(
                 grader_name=grader.name or "<unnamed>",

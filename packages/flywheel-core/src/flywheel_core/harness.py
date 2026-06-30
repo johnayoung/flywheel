@@ -3662,6 +3662,9 @@ async def _validate(
                 judge_invoke=config.rubric_judge_invoke,
                 judge_model=config.rubric_judge_model,
                 judge_max_turns=config.rubric_judge_max_turns,
+                judge_ceiling_seconds=config.deadlines.for_class(
+                    DeadlineClass.RUBRIC_JUDGE
+                ),
                 now=clock,
             )
         except RubricJudgeError as exc:

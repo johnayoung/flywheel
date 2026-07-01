@@ -88,9 +88,12 @@ if TYPE_CHECKING:
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
+    REASON_NO_PROGRESS,
     REASON_PREREQUISITE_MISSING,
     REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
     STOP_DANGLING_PREREQUISITE,
+    STOP_NO_PROGRESS,
+    STOP_NO_PROGRESS_RESET,
     STOP_RETRIES_ESCALATED,
     ClaimLostError,
     GraphSnapshotItem,
@@ -215,6 +218,20 @@ DEFAULT_ESCALATION_BOUND: int = 1
 # pass or two late, yet finite so a genuinely absent prerequisite reaches a human
 # promptly rather than spinning ineligible forever.
 DEFAULT_PREREQ_REDRIVE_BOUND: int = 3
+
+# How many consecutive cycles a "unit" may make NO observable progress before the
+# no-progress back-off re-driver backs it off and routes it to the human-review
+# queue (spec 00069, criteria #9/#13; D-C). A unit is a phase whose verify never
+# passes or an autopilot repo that never authors a task -- something the loop
+# keeps re-attempting with nothing to show for it. Each fruitless cycle records
+# one ``no-progress-cycle`` witness on the unit's append-only ledger; on the cycle
+# the consecutive count reaches this bound the unit is backed off (absent from the
+# active set the next cycle) and routed ONCE with ``no-progress``. Observable
+# progress (a state change, a task authored, a verify passing) appends a
+# ``no-progress-reset`` marker so the streak restarts -- a unit that ever makes
+# progress is never backed off. Three tolerates a couple of genuinely-slow cycles
+# yet is finite, so a never-progressing unit cannot burn agent cost forever.
+DEFAULT_NO_PROGRESS_BOUND: int = 3
 
 
 def _utcnow() -> datetime:
@@ -1379,6 +1396,207 @@ def redrive_missing_prerequisites(
                 result="waiting",
                 cycles=cycles,
             )
+        )
+    return tuple(outcomes)
+
+
+@dataclass(frozen=True, kw_only=True)
+class NoProgressObservation:
+    """One unit's observed progress for a single scheduling cycle.
+
+    A "unit" is anything the loop keeps re-attempting that can make no headway --
+    a phase whose verify never passes, an autopilot repo that never authors a
+    task. ``unit_id`` is the stable key the re-driver counts witnesses under (the
+    subject on the stop ledger); ``progressed`` is whether the unit made an
+    observable state change this cycle (a task authored, a verify passing, a
+    lifecycle advanced). ``detail`` is optional human-readable context folded into
+    the witness / queue rows. ``task_id`` is the identifier the queue entry
+    carries when the unit is backed off; it defaults to ``unit_id`` (a phase or
+    repo IS its own review subject), but a unit whose review subject differs from
+    its ledger key can name it explicitly.
+    """
+
+    unit_id: str
+    progressed: bool
+    detail: str = ""
+    task_id: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class NoProgressOutcome:
+    """What the no-progress back-off re-driver did with one unit in a pass.
+
+    ``unit_id`` is the observed unit. ``cycles`` is the length of the unit's
+    current consecutive no-progress streak (the count of ``no-progress-cycle``
+    witnesses since its last ``no-progress-reset`` marker, including this pass's
+    when it was fruitless). ``result`` is the disposition:
+
+    * ``"progressed"`` -- the unit made observable progress this cycle; its streak
+      was reset (``cycles`` is 0) and it is never backed off.
+    * ``"waiting"`` -- the unit made no progress but the bound is not yet reached;
+      a witness was recorded and the unit stays active for another attempt.
+    * ``"queued"`` -- the unit's fruitless streak reached the bound, so it was
+      backed off (it will be absent from the active set next cycle) and routed to
+      the single human-review queue ONCE with :data:`REASON_NO_PROGRESS` (or was
+      already routed on a prior pass, the terminal no-further-routing state).
+    """
+
+    unit_id: str
+    result: Literal["progressed", "waiting", "queued"]
+    cycles: int
+
+
+def _no_progress_streak(claims: SqliteClaimStore, unit_id: str) -> int:
+    """Length of ``unit_id``'s current consecutive no-progress streak.
+
+    Walks the unit's append-only stop ledger and counts ``no-progress-cycle``
+    witnesses that fall AFTER its most recent ``no-progress-reset`` marker -- so a
+    unit that made progress (which appended a reset marker) starts a fresh streak
+    even though no witness is ever deleted. This trailing count is how the
+    re-driver enforces its bound and how progress resets the counter.
+    """
+    streak = 0
+    for event in claims.list_subject_stop_events(unit_id):
+        if event.kind == STOP_NO_PROGRESS_RESET:
+            streak = 0
+        elif event.kind == STOP_NO_PROGRESS:
+            streak += 1
+    return streak
+
+
+def _no_progress_already_queued(
+    claims: SqliteClaimStore, unit_id: str
+) -> bool:
+    """True once ``unit_id`` has been backed off to the human-review queue.
+
+    The terminal guard behind criterion #9's "exactly one queue entry, not a
+    re-queue every cycle": a backed-off unit carries a :data:`REASON_NO_PROGRESS`
+    stop row keyed to its id. Its presence stops the re-driver from ever
+    re-witnessing or re-routing the same unit, so a never-progressing unit costs
+    exactly ``bound`` witnesses and one queue entry.
+    """
+    return any(
+        event.kind == REASON_NO_PROGRESS
+        for event in claims.list_subject_stop_events(unit_id)
+    )
+
+
+def redrive_no_progress(
+    claims: SqliteClaimStore,
+    *,
+    observations: Iterable[NoProgressObservation],
+    bound: int = DEFAULT_NO_PROGRESS_BOUND,
+    now: Callable[[], datetime],
+    stream: TextIO | None = None,
+) -> tuple[NoProgressOutcome, ...]:
+    """Bounded no-progress back-off of units the loop cannot advance (spec 00069,
+    criteria #9/#13; D-C).
+
+    A "unit" -- a phase whose verify never passes, an autopilot repo that never
+    authors a task -- is otherwise re-attempted every cycle forever. This
+    re-driver bounds that: it counts a unit's consecutive fruitless cycles and,
+    after ``bound`` of them, backs the unit off (it must be absent from the active
+    set the next cycle) and routes it to the single human-review queue with the
+    machine-readable :data:`REASON_NO_PROGRESS` reason instead of re-running it.
+    For each ``observation`` this pass it:
+
+    1. Short-circuits a unit already backed off to the queue (the terminal,
+       no-further-routing state -- criterion #9), recording nothing further so a
+       never-progressing unit produces exactly one queue entry.
+    2. On observable progress, appends one ``no-progress-reset`` marker (only when
+       a streak is outstanding) so the unit's streak restarts -- a unit that ever
+       makes progress is never backed off (the reset edge case).
+    3. Otherwise appends one ``no-progress-cycle`` witness -- the durable,
+       recurrence-preserving record of a fruitless cycle -- and, on the cycle the
+       consecutive streak reaches ``bound``, routes the unit to the queue ONCE
+       with :data:`REASON_NO_PROGRESS`. Below the bound it merely waits.
+
+    The re-driver never re-attempts the backed-off unit and never fabricates a
+    lifecycle state: it only reads observed progress and appends ledger rows
+    (criterion #14). Backing a unit off is the caller's cue to drop it from the
+    active set (the queue row is authoritative -- ``_no_progress_already_queued``
+    keeps it out of every later pass). Returns one :class:`NoProgressOutcome` per
+    observation, in input order.
+    """
+    outcomes: list[NoProgressOutcome] = []
+    for observation in observations:
+        unit_id = observation.unit_id
+        # Terminal guard (criterion #9): a unit already backed off is never
+        # re-witnessed and never re-queued -- exactly one queue entry, no
+        # re-queue every cycle.
+        if _no_progress_already_queued(claims, unit_id):
+            outcomes.append(
+                NoProgressOutcome(
+                    unit_id=unit_id,
+                    result="queued",
+                    cycles=_no_progress_streak(claims, unit_id),
+                )
+            )
+            continue
+        # Observable progress resets the streak (the reset edge case): append a
+        # delimiter so the trailing count restarts, but only when there is a live
+        # streak to reset -- a perpetually-progressing unit never grows the
+        # ledger.
+        if observation.progressed:
+            if _no_progress_streak(claims, unit_id) > 0:
+                claims.record_stop_event(
+                    kind=STOP_NO_PROGRESS_RESET,
+                    subject=unit_id,
+                    detail=(
+                        observation.detail
+                        or f"unit {unit_id!r} made progress; streak reset"
+                    ),
+                    occurred_at=now(),
+                )
+            outcomes.append(
+                NoProgressOutcome(
+                    unit_id=unit_id, result="progressed", cycles=0
+                )
+            )
+            continue
+        # Witness this fruitless cycle (spec 00068): one row per cycle the unit
+        # makes no headway, never deduped -- the recurrence is the signal and the
+        # streak length is the bound.
+        claims.record_stop_event(
+            kind=STOP_NO_PROGRESS,
+            subject=unit_id,
+            detail=(
+                observation.detail
+                or f"unit {unit_id!r} made no observable progress this cycle"
+            ),
+            occurred_at=now(),
+        )
+        cycles = _no_progress_streak(claims, unit_id)
+        if cycles >= bound:
+            detail = (
+                f"unit {unit_id!r} made no observable progress for {cycles} "
+                f"consecutive cycle(s) (bound {bound}); backed off and routed to "
+                f"the human-review queue"
+            )
+            if observation.detail:
+                detail = f"{detail}: {observation.detail}"
+            claims.record_human_review(
+                reason=REASON_NO_PROGRESS,
+                task_id=observation.task_id or unit_id,
+                detail=detail,
+                occurred_at=now(),
+            )
+            if stream is not None:
+                print(
+                    f"[orchestrate] {unit_id}: no progress for {bound} "
+                    f"consecutive cycle(s); backed off and routed to the "
+                    f"human-review queue (reason {REASON_NO_PROGRESS!r})",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                NoProgressOutcome(
+                    unit_id=unit_id, result="queued", cycles=cycles
+                )
+            )
+            continue
+        outcomes.append(
+            NoProgressOutcome(unit_id=unit_id, result="waiting", cycles=cycles)
         )
     return tuple(outcomes)
 

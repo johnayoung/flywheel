@@ -120,6 +120,10 @@ ORCHESTRATOR_EVENT_TYPES: frozenset[str] = frozenset(
 # * ``dangling-prerequisite`` -- a task whose declared prerequisite resolves to
 #   no work item this pass; the task stays out of the ready set.
 # * ``no-op-cycle`` -- an autopilot refill cycle that emitted zero tasks.
+# * ``no-progress`` (witness) -- a cycle in which a unit (a never-passing phase,
+#   an autopilot repo that never authors) made no observable progress; one row
+#   per fruitless cycle, counted by the no-progress back-off re-driver to enforce
+#   its bound.
 # * ``prepare-skip`` -- a sandbox prepare/preflight failure that releases the
 #   claim and continues without minting a run.
 # * ``source-truncation`` -- a work-source listing that filled its one-page cap,
@@ -128,6 +132,7 @@ ORCHESTRATOR_EVENT_TYPES: frozenset[str] = frozenset(
 #   because it resolved to no graders.
 STOP_DANGLING_PREREQUISITE: str = "dangling-prerequisite"
 STOP_NO_OP_CYCLE: str = "no-op-cycle"
+STOP_NO_PROGRESS: str = "no-progress-cycle"
 STOP_PREPARE_SKIP: str = "prepare-skip"
 STOP_SOURCE_TRUNCATION: str = "source-truncation"
 STOP_ZERO_GRADER_DROP: str = "zero-grader-drop"
@@ -136,11 +141,24 @@ ORCHESTRATOR_STOP_EVENT_KINDS: frozenset[str] = frozenset(
     {
         STOP_DANGLING_PREREQUISITE,
         STOP_NO_OP_CYCLE,
+        STOP_NO_PROGRESS,
         STOP_PREPARE_SKIP,
         STOP_SOURCE_TRUNCATION,
         STOP_ZERO_GRADER_DROP,
     }
 )
+
+# The no-progress back-off re-driver's streak delimiter (spec 00069, criteria
+# #9/#13). The re-driver counts consecutive ``no-progress-cycle`` witnesses on a
+# unit's ledger to enforce its bound; when the unit instead makes observable
+# progress the re-driver appends one ``no-progress-reset`` marker, and the streak
+# is counted only from AFTER the last such marker -- so progress genuinely resets
+# the counter even though the append-only ledger never deletes a witness. Like
+# ``retries-escalated`` this marker is DELIBERATELY neither a pre-run stop
+# (:data:`ORCHESTRATOR_STOP_EVENT_KINDS`) nor a queue reason
+# (:data:`HUMAN_REVIEW_QUEUE_REASONS`) -- it is internal bookkeeping and never
+# leaks into the human-review queue read.
+STOP_NO_PROGRESS_RESET: str = "no-progress-reset"
 
 # The retry-escalation re-driver's boundedness marker (spec 00069, criteria
 # #5/#6; D-A). When a task exhausts its retry budget the re-driver escalates
@@ -2037,6 +2055,8 @@ __all__ = [
     "REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION",
     "STOP_DANGLING_PREREQUISITE",
     "STOP_NO_OP_CYCLE",
+    "STOP_NO_PROGRESS",
+    "STOP_NO_PROGRESS_RESET",
     "STOP_PREPARE_SKIP",
     "STOP_RETRIES_ESCALATED",
     "STOP_SOURCE_TRUNCATION",

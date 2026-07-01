@@ -19,7 +19,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TextIO
 
 from flywheel_core.faults import FaultClass, classify_fault
 from flywheel_orchestrator._autopilot import (
@@ -28,6 +30,13 @@ from flywheel_orchestrator._autopilot import (
     ScoreWeights,
     actionable_queue_depth,
     run_refill_pass,
+)
+from flywheel_orchestrator._claims import SqliteClaimStore
+from flywheel_orchestrator._orchestrate import (
+    DEFAULT_NO_PROGRESS_BOUND,
+    NoProgressObservation,
+    NoProgressOutcome,
+    redrive_no_progress,
 )
 from flywheel_orchestrator._store_factory import build_store
 from flywheel_orchestrator._autopilot_activity import (
@@ -185,6 +194,87 @@ def _build_queue_depth(
         )
         return None
     return lambda tasks_dir: actionable_queue_depth(tasks_dir, store)
+
+
+# --- No-progress back-off around the refill pass (spec 00069, #9/#13) --------
+
+
+def _cycle_made_progress(result: AutopilotPassResult) -> bool:
+    """Did this refill cycle make observable progress on the repo unit?
+
+    Progress is a task authored this cycle (``emitted_count > 0``) OR a queue
+    already at/above target -- healthy backpressure, not a dead-end, exactly as
+    the existing no-op ledger treats it. Only a below-target cycle that did
+    discovery work yet authored nothing is a genuine no-progress cycle. This
+    observes the pass result; it never changes discovery or authoring semantics.
+    """
+    if result.emitted_count > 0:
+        return True
+    return result.queue_depth_before >= result.target_depth
+
+
+def apply_no_progress_backoff(
+    result: AutopilotPassResult,
+    *,
+    claims: SqliteClaimStore,
+    unit_id: str,
+    bound: int = DEFAULT_NO_PROGRESS_BOUND,
+    now: Callable[[], datetime] | None = None,
+    stream: TextIO | None = None,
+) -> NoProgressOutcome:
+    """Feed one autopilot cycle to the bounded no-progress back-off re-driver.
+
+    The autopilot repo IS the "unit": a cycle that authored nothing while below
+    target made no headway. After ``bound`` such consecutive cycles the re-driver
+    backs the repo off -- routing it to the single human-review queue with the
+    machine-readable ``no-progress`` reason -- and the daemon stops re-attempting
+    it. A cycle that makes progress resets the streak, so a repo that ever
+    authors is never backed off. Returns the re-driver's outcome; a ``"queued"``
+    result is the daemon's cue to stop.
+    """
+    clock = now if now is not None else (lambda: datetime.now(timezone.utc))
+    (outcome,) = redrive_no_progress(
+        claims,
+        observations=[
+            NoProgressObservation(
+                unit_id=unit_id,
+                progressed=_cycle_made_progress(result),
+                detail=result.reason,
+            )
+        ],
+        bound=bound,
+        now=clock,
+        stream=stream,
+    )
+    return outcome
+
+
+def _open_backoff_claims(
+    policy: WorkPolicy | None,
+    repo_root: Path,
+    log: Callable[[str], None],
+) -> SqliteClaimStore | None:
+    """Open the claim store the no-progress back-off records witnesses on.
+
+    Resolves the same db path the worker/queue-depth counter use (default
+    ``.flywheel/flywheel.sqlite`` under the repo). A build failure (missing
+    backend, locked db) degrades to no back-off rather than crashing the daemon
+    -- the loop simply keeps running, as it does today.
+    """
+    raw_db = (
+        policy.db_path
+        if policy is not None and policy.db_path is not None
+        else Path(".flywheel") / "flywheel.sqlite"
+    )
+    db_path = raw_db if raw_db.is_absolute() else repo_root / raw_db
+    try:
+        return SqliteClaimStore(db_path)
+    except Exception as exc:  # noqa: BLE001 - back-off is best-effort
+        log(
+            f"no-progress back-off store unavailable "
+            f"({type(exc).__name__}: {exc}); back-off disabled"
+        )
+        return None
 
 
 # --- The neverending daemon loop (autopilot-daemon) -------------------------
@@ -479,9 +569,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         _arm_signals(_flag)
         recorder.before_cycle()
 
+    # Bounded no-progress back-off (spec 00069, #9/#13): a repo that keeps
+    # authoring nothing while below target is backed off after a finite number of
+    # fruitless cycles -- routed to the human-review queue and no longer
+    # re-attempted -- so a never-progressing repo cannot burn agent cost forever.
+    backoff_claims = _open_backoff_claims(policy, repo_root, log)
+    backoff_unit = str(tasks_dir)
+
     def on_cycle(result: AutopilotPassResult) -> None:
         _log_result(log, result)
         recorder.on_cycle(result)
+        if backoff_claims is not None:
+            outcome = apply_no_progress_backoff(
+                result, claims=backoff_claims, unit_id=backoff_unit
+            )
+            if outcome.result == "queued":
+                shutdown["requested"] = True
+                log(
+                    f"no progress for {outcome.cycles} consecutive cycle(s); "
+                    "backed off and routed to the human-review queue "
+                    "(reason 'no-progress'); stopping."
+                )
         _arm_signals(_flag)
 
     gave_up = {"requested": False}
@@ -500,16 +608,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "exiting non-zero for operator inspection."
         )
 
-    cycles = run_daemon_loop(
-        run_cycle=run_cycle,
-        interval_seconds=interval,
-        should_stop=should_stop,
-        sleep=_interruptible_sleep,
-        on_cycle=on_cycle,
-        before_cycle=before_cycle,
-        on_cycle_failure=on_cycle_failure,
-        on_give_up=on_give_up,
-    )
+    try:
+        cycles = run_daemon_loop(
+            run_cycle=run_cycle,
+            interval_seconds=interval,
+            should_stop=should_stop,
+            sleep=_interruptible_sleep,
+            on_cycle=on_cycle,
+            before_cycle=before_cycle,
+            on_cycle_failure=on_cycle_failure,
+            on_give_up=on_give_up,
+        )
+    finally:
+        if backoff_claims is not None:
+            backoff_claims.close()
     log(f"daemon stopped after {cycles} cycle(s)")
     return 1 if gave_up["requested"] else 0
 

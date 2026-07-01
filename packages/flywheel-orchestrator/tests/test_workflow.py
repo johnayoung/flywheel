@@ -19,7 +19,13 @@ import pytest
 from claude_agent_sdk import Message
 
 from flywheel_core.envelope import Intent, ValidEnvelope
-from flywheel_core.events import LandingParked
+from flywheel_core.events import (
+    PARK_KIND_HELD_OUT_GATE,
+    PARK_KIND_PROTECTED_PATHS,
+    PARK_KIND_PUSH_FAILED,
+    PARK_KIND_SUBMIT_ERROR,
+    LandingParked,
+)
 from flywheel_core.harness import HarnessOutcome, InvocationRequest
 from flywheel_core.invoker import InvocationSignals, IterationResult
 from flywheel_core.lifecycle import Attempt, Lifecycle, Outcome, Status
@@ -45,6 +51,14 @@ from flywheel_orchestrator._workflow import (
     read_phase_base,
     select_next_task,
     write_phase_base_if_missing,
+)
+from flywheel_orchestrator._claims import (
+    STOP_DANGLING_PREREQUISITE,
+    STOP_NO_OP_CYCLE,
+    STOP_PREPARE_SKIP,
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
+    SqliteClaimStore,
 )
 from flywheel_orchestrator._sources import (
     iter_active_phase_dirs,
@@ -1572,6 +1586,225 @@ def test_status_omits_stranded_for_cleanly_done_run(
     )
     assert out_text_rc == 0
     assert "stranded:" not in capsys.readouterr().out
+
+
+# ---------- New stop/park kinds enumerated on the stranded surface ----------
+
+
+def _record_stop(db: Path, *, kind: str, subject: str, detail: str) -> None:
+    """Append one orchestrator stop-event row on the same file the core store
+    uses, as a scheduling pass does for a pre-run dead-end."""
+    claims = SqliteClaimStore(db)
+    try:
+        claims.record_stop_event(
+            kind=kind,
+            subject=subject,
+            detail=detail,
+            occurred_at=datetime.now(timezone.utc),
+        )
+    finally:
+        claims.close()
+
+
+@pytest.mark.parametrize(
+    "park_kind",
+    [
+        PARK_KIND_HELD_OUT_GATE,
+        PARK_KIND_PROTECTED_PATHS,
+        PARK_KIND_PUSH_FAILED,
+        PARK_KIND_SUBMIT_ERROR,
+    ],
+)
+def test_status_surfaces_new_park_kinds(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], park_kind: str
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        lc = _seed_done(store, "a")
+        _park_landing(store, lc, park_kind=park_kind, detail="blocked here")
+    finally:
+        store.close()
+
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    line = next(
+        ln for ln in capsys.readouterr().out.splitlines() if "stranded:" in ln
+    )
+    assert park_kind in line
+    assert "blocked here" in line
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["stranded"] == {
+        "park_kind": park_kind,
+        "detail": "blocked here",
+    }
+
+
+@pytest.mark.parametrize(
+    "kind", [STOP_DANGLING_PREREQUISITE, STOP_PREPARE_SKIP]
+)
+def test_status_surfaces_per_task_stop_on_its_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    _record_stop(db, kind=kind, subject="a", detail="stop cause")
+
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    line = next(
+        ln for ln in capsys.readouterr().out.splitlines() if "stopped:" in ln
+    )
+    assert kind in line
+    assert "stop cause" in line
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    entry = next(e for e in payload if e.get("task_id") == "a")
+    assert entry["stopped"] == {"kind": kind, "detail": "stop cause"}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [STOP_NO_OP_CYCLE, STOP_SOURCE_TRUNCATION, STOP_ZERO_GRADER_DROP],
+)
+def test_status_surfaces_source_level_stop_as_its_own_unit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: str
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    _record_stop(db, kind=kind, subject="my-source", detail="source cause")
+
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    text = capsys.readouterr().out
+    line = next(ln for ln in text.splitlines() if "my-source" in ln)
+    assert kind in line
+    assert "source cause" in line
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    orphan = next(e for e in payload if e.get("subject") == "my-source")
+    assert orphan["stopped"] == {"kind": kind, "detail": "source cause"}
+    # The healthy task row carries no stop marker.
+    task_a = next(e for e in payload if e.get("task_id") == "a")
+    assert "stopped" not in task_a
+
+
+def test_status_surfaces_recurring_stop_once_without_crashing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    for _ in range(3):
+        _record_stop(
+            db, kind=STOP_PREPARE_SKIP, subject="a", detail="skip cause"
+        )
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    entry = next(e for e in payload if e.get("task_id") == "a")
+    assert entry["stopped"] == {"kind": STOP_PREPARE_SKIP, "detail": "skip cause"}
+
+
+def test_status_omits_stopped_for_unit_without_stop_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    SqliteStore(db).close()
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert "stopped" not in payload[0]
+    assert all("subject" not in e for e in payload)
+
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    assert "stopped:" not in capsys.readouterr().out
+
+
+def test_status_enumerates_one_of_each_new_stop_kind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        lc = _seed_done(store, "a")
+        _park_landing(
+            store, lc, park_kind=PARK_KIND_HELD_OUT_GATE, detail="gate"
+        )
+    finally:
+        store.close()
+    _record_stop(db, kind=STOP_DANGLING_PREREQUISITE, subject="b", detail="d1")
+    _record_stop(db, kind=STOP_PREPARE_SKIP, subject="c", detail="d2")
+    _record_stop(db, kind=STOP_NO_OP_CYCLE, subject="src1", detail="d3")
+    _record_stop(db, kind=STOP_SOURCE_TRUNCATION, subject="src2", detail="d4")
+    _record_stop(db, kind=STOP_ZERO_GRADER_DROP, subject="src3", detail="d5")
+
+    every_kind = [
+        PARK_KIND_HELD_OUT_GATE,
+        STOP_DANGLING_PREREQUISITE,
+        STOP_PREPARE_SKIP,
+        STOP_NO_OP_CYCLE,
+        STOP_SOURCE_TRUNCATION,
+        STOP_ZERO_GRADER_DROP,
+    ]
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    json_blob = json.dumps(json.loads(capsys.readouterr().out))
+    for kind in every_kind:
+        assert kind in json_blob
+
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    text = capsys.readouterr().out
+    for kind in every_kind:
+        assert kind in text
 
 
 # ---------- Stranded-lifecycle recovery ----------

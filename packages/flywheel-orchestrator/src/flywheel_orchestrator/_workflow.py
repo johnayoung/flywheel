@@ -63,6 +63,10 @@ from flywheel_core.workflow import (
     _short,
     recover_stranded_lifecycles,
 )
+from flywheel_orchestrator._claims import (
+    OrchestratorStopEventRecord,
+    SqliteClaimStore,
+)
 from flywheel_orchestrator._history import (
     TERMINAL_STATUSES,
     HistoryRow,
@@ -1350,6 +1354,38 @@ def _landing_park_for_run(
     return parks[-1] if parks else None
 
 
+def _stop_events_by_subject(
+    db_path: Path,
+) -> dict[str, OrchestratorStopEventRecord]:
+    """The most recent pre-run stop event per subject, keyed by subject.
+
+    A pre-run dead-end -- a dangling prerequisite, a no-op refill cycle, a
+    prepare/preflight skip, a source-listing truncation, or a zero-grader item
+    drop -- never mints a run, so it lands in the orchestrator claim store's
+    append-only ``orchestrator_stop_events`` ledger (its own tables on the same
+    sqlite file the core store uses) rather than on any run's domain-event
+    stream. This is the second record surface the ``stranded:`` status view
+    unions in alongside the per-run :class:`LandingParked` parks: a unit
+    stopped before a run existed is just as invisible as a DONE-but-unlanded
+    strand unless status enumerates it.
+
+    Recurrence is the ledger's signal (it never dedupes), so a subject stopped
+    on several passes surfaces once here with its latest reason -- ``list_stop_events``
+    returns id (insertion) order, so the last row for a subject wins. An empty
+    ledger yields an empty map, keeping the omit-when-absent convention intact
+    for a healthy store. The claim store is opened read-only-in-intent on the
+    resolved ``db_path`` and closed before returning.
+    """
+    claims = SqliteClaimStore(db_path)
+    try:
+        latest: dict[str, OrchestratorStopEventRecord] = {}
+        for event in claims.list_stop_events():
+            latest[event.subject] = event
+        return latest
+    finally:
+        claims.close()
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     if getattr(args, "rollup", False):
         return _cmd_status_rollup(args)
@@ -1382,6 +1418,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     parked_landings[row.latest_run_id] = park
     finally:
         store.close()
+    # The second stranded record surface: pre-run stops (dangling prerequisite,
+    # no-op cycle, prepare skip, source truncation, zero-grader drop) that
+    # dead-ended a scheduling pass before any run existed. Read from the
+    # orchestrator claim store's stop-event ledger and unioned into the same
+    # stranded surface as the per-run parks above -- keyed by subject (a task id
+    # for the per-task kinds, a source name for the source-level kinds).
+    stops_by_subject = _stop_events_by_subject(db_path)
+    stopped_task_ids = {row.task.id for row in rows}
     if args.json:
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -1434,13 +1478,33 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     "park_kind": park.park_kind,
                     "detail": park.detail,
                 }
+            stop = stops_by_subject.get(row.task.id)
+            if stop is not None:
+                # A pre-run stop keyed to this task id (a dangling prerequisite
+                # or a prepare skip): surface its kind and detail on the same
+                # omit-when-absent convention as stranded.
+                entry["stopped"] = {"kind": stop.kind, "detail": stop.detail}
             out.append(entry)
+        # Source-level stops (no-op cycle, source truncation, zero-grader drop)
+        # are keyed to a source name, not a task in the work list, so they have
+        # no row above. Enumerate them as their own entries so no stopped unit
+        # is dropped from the surface.
+        for subject in sorted(stops_by_subject):
+            if subject in stopped_task_ids:
+                continue
+            stop = stops_by_subject[subject]
+            out.append(
+                {
+                    "subject": subject,
+                    "stopped": {"kind": stop.kind, "detail": stop.detail},
+                }
+            )
         print(json.dumps(out, indent=2))
         return 0
-    if not rows:
+    if not rows and not stops_by_subject:
         print("(no active tasks)")
         return 0
-    width = max(len(row.task.id) for row in rows)
+    width = max((len(row.task.id) for row in rows), default=0)
     for row in rows:
         # File-backed rows render their phase directory; external items
         # (empty task_file) render under their source ref instead.
@@ -1477,6 +1541,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
             # accumulating as a silent unmerged branch.
             detail = f" -- {park.detail}" if park.detail else ""
             print(f"    stranded: {park.park_kind}{detail}")
+        stop = stops_by_subject.get(row.task.id)
+        if stop is not None:
+            # A pre-run stop keyed to this task id: surface its kind and cause
+            # as a follow-up line, mirroring the stranded: convention.
+            detail = f" -- {stop.detail}" if stop.detail else ""
+            print(f"    stopped: {stop.kind}{detail}")
+    # Source-level stops have no task row above; enumerate each as its own line
+    # so every stopped unit is visible with its reason.
+    for subject in sorted(stops_by_subject):
+        if subject in stopped_task_ids:
+            continue
+        stop = stops_by_subject[subject]
+        detail = f" -- {stop.detail}" if stop.detail else ""
+        print(f"  {subject}  stopped: {stop.kind}{detail}")
     return 0
 
 def _list_blocked_lifecycles(store: SqliteStore | PostgresStore) -> list[tuple[str, str]]:

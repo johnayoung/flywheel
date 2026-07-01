@@ -110,6 +110,11 @@ from flywheel_core.grader_transcript import (
     total_tokens_from_usage,
 )
 from flywheel_core.event_serde import event_kind, event_payload
+from flywheel_core.faults import (
+    BackoffPolicy,
+    FaultClass,
+    classify_fault,
+)
 from flywheel_core.events import (
     AttemptFinalized,
     AttemptStarted,
@@ -121,6 +126,7 @@ from flywheel_core.events import (
     TransitionedTo,
 )
 from flywheel_core.invoker import (
+    InvocationSignals,
     IterationResult,
     _serialize_sdk_message,
     invoke_iteration,
@@ -345,6 +351,24 @@ class HarnessConfig:
     reached without a terminal envelope the Attempt finalizes as an
     agent error (no silent coercion to ``verify``).
 
+    ``max_transient_retries`` is the SEPARATE, bounded budget for
+    re-invoking a single iteration whose result is a transient
+    infrastructure fault — a 429 / overload (5xx) ``api_error_status`` or a
+    ``rejected`` ``RateLimitEvent`` — that yielded no usable completion. It
+    is tracked independently of ``max_retries`` (the validation retry
+    budget): a rate-limited iteration is re-invoked in place up to this many
+    times before the iteration is finalized, so a run with ``max_retries=0``
+    still rides out transient rate limits. The loop is bounded by this
+    operator-supplied budget, never by an agent-supplied value, so it can
+    never spin forever. ``transient_backoff`` is the shared
+    :class:`flywheel_core.faults.BackoffPolicy` schedule waited between those
+    re-invocations (the same capped-exponential helper every retry site
+    reuses); ``transient_sleep`` is the awaitable sleep seam (default
+    :func:`asyncio.sleep`) tests inject to capture the waits without
+    blocking. A genuine non-transient missing/malformed envelope (no
+    ``api_error_status``, no ``rejected`` rate-limit event) is unaffected and
+    still consumes the validation budget as before.
+
     ``artifacts_root``, when set, is the base directory under which the
     harness creates per-attempt subdirectories. Each Attempt gets a
     deterministic ``attempt-NNN`` subdir, surfaced to grader runners
@@ -459,6 +483,9 @@ class HarnessConfig:
     max_tokens: int = 0
     wall_clock_seconds: int = 0
     max_iterations_per_attempt: int = 1
+    max_transient_retries: int = 6
+    transient_backoff: BackoffPolicy = field(default_factory=BackoffPolicy)
+    transient_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     artifacts_root: str | os.PathLike[str] | None = None
     agent_context: Mapping[str, str] = field(default_factory=dict)
     worktree: str | os.PathLike[str] | None = None
@@ -1301,6 +1328,44 @@ def _all_passed(results: Sequence[GraderResultRecord]) -> bool:
     return all(r.passed for r in results)
 
 
+def _transient_rate_limit_reason(signals: InvocationSignals) -> str | None:
+    """Return a short reason when ``signals`` mark a transient rate limit.
+
+    Consumes the signals the invoker already collected — never re-derives
+    them from raw messages. A 429 / overload / transient-5xx
+    ``api_error_status`` is bucketed through the shared
+    :func:`flywheel_core.faults.classify_fault` classifier (the one TRANSIENT
+    taxonomy every retry site reuses); a ``rejected``
+    :class:`claude_agent_sdk.RateLimitEvent` is a hard rate-limit block in
+    its own right. Attributes are read via ``getattr`` so this module never
+    imports the optional SDK types. Returns ``None`` when no transient
+    rate-limit signal is present.
+    """
+    status = signals.api_error_status
+    if status is not None and classify_fault(status) is FaultClass.TRANSIENT:
+        return f"api_error_status={status}"
+    for event in signals.rate_limit_events:
+        info = getattr(event, "rate_limit_info", None)
+        if getattr(info, "status", None) == "rejected":
+            rl_type = getattr(info, "rate_limit_type", None)
+            return f"rate_limit_rejected:{rl_type}"
+    return None
+
+
+def _iteration_is_transient_rate_limit(result: IterationResult) -> str | None:
+    """Return the transient reason when ``result`` is a rate-limited iteration.
+
+    A rate limit yields no usable completion, so a valid envelope of any
+    intent is never treated as transient (the agent produced actionable
+    output — a mere ``allowed_warning`` rate-limit notice alongside a valid
+    ``verify`` must not trigger a re-invocation). Otherwise the presence of a
+    transient signal on the iteration's :class:`InvocationSignals` decides.
+    """
+    if isinstance(result.envelope, ValidEnvelope):
+        return None
+    return _transient_rate_limit_reason(result.signals)
+
+
 def _first_breach_across_graders(
     graders: Sequence[TranscriptGrader],
     observation: TranscriptObservation,
@@ -2131,6 +2196,7 @@ async def _run_attempt_body(
         wall_seconds,
         loop_guard_verdict,
         recovery_trigger,
+        transient_exhausted,
     ) = await _drive_iterations(
         task=task,
         lifecycle=lifecycle,
@@ -2195,6 +2261,38 @@ async def _run_attempt_body(
         return
 
     lifecycle.agent_output = iteration_result.transcript
+
+    # Transient rate-limit exhaustion: the iteration was re-invoked the full
+    # separate transient budget and still returned a rate-limit fault. This
+    # is an infrastructure fault, not an agent protocol error, so it routes
+    # to the retryable, TRANSIENT-classified INTERNAL_ERROR class (the same
+    # class the hang watchdog and store faults use) rather than the
+    # AGENT_ERROR / FAILED_VALIDATION path a genuine missing envelope takes.
+    # The per-retry / exhaustion telemetry already emitted inside
+    # _drive_iterations; this finalizes the attempt and transitions.
+    if transient_exhausted:
+        error = (
+            "transient rate-limit retries exhausted after "
+            f"{config.max_transient_retries + 1} invocations"
+        )
+        _finalize_attempt(
+            store=store,
+            telemetry=telemetry,
+            lifecycle=lifecycle,
+            attempt=attempt,
+            outcome=Outcome.INTERNAL_ERROR,
+            error=error,
+            agent_output=iteration_result.transcript,
+            clock=clock,
+        )
+        _transition(
+            lifecycle,
+            Status.INTERNAL_ERROR,
+            store=store,
+            error=error,
+            now=clock,
+        )
+        return
 
     # Crash takes priority and goes straight to FAILED — refined
     # classification is deferred (see _DEFERRED_LOOP_SUBSYSTEMS).
@@ -3070,6 +3168,7 @@ async def _drive_iterations(
     float,
     LoopGuardVerdict | None,
     _RecoveryTrigger | None,
+    bool,
 ]:
     """Run iterations until a non-``continue`` envelope, crash, or cap.
 
@@ -3088,6 +3187,13 @@ async def _drive_iterations(
     what feeds the :class:`TranscriptObservation` so transcript graders
     see the same elapsed time regardless of which iteration sets the
     envelope.
+
+    The final tuple element is ``transient_exhausted``: ``True`` when a
+    rate-limited iteration was re-invoked ``config.max_transient_retries``
+    times (on the separate transient budget, backing off between tries) and
+    still returned a transient fault, so the caller finalizes the attempt as
+    a TRANSIENT-classified ``INTERNAL_ERROR`` rather than an agent protocol
+    error. It is ``False`` on every other path.
     """
     iteration_result: IterationResult | None = None
     iteration_number = 0
@@ -3095,6 +3201,7 @@ async def _drive_iterations(
     wall_seconds = 0.0
     loop_guard_verdict: LoopGuardVerdict | None = None
     recovery_trigger: _RecoveryTrigger | None = None
+    transient_exhausted = False
     attempt_number = attempt.number
 
     def _record_steering(command: ControlCommandRecord) -> None:
@@ -3387,55 +3494,116 @@ async def _drive_iterations(
         agent_ceiling = config.deadlines.for_class(
             DeadlineClass.AGENT_ITERATION
         )
-        try:
-            if agent_ceiling is None:
-                iteration_result = await _run_invocation()
-            else:
-                try:
-                    iteration_result = await run_with_deadline(
-                        _run_invocation(), agent_ceiling
-                    )
-                except DeadlineExceeded as exc:
-                    telemetry.emit(
-                        kind="harness.deadline_exceeded",
-                        payload={
-                            "iteration": iteration_number,
-                            "deadline_class": (
-                                DeadlineClass.AGENT_ITERATION.value
-                            ),
-                            "ceiling_seconds": agent_ceiling,
-                            "elapsed_seconds": exc.elapsed_seconds,
-                        },
-                        attempt_number=attempt_number,
-                    )
-                    raise _IterationDeadlineExceeded(
-                        attempt_number=attempt_number,
-                        iteration_number=iteration_number,
-                        ceiling_seconds=agent_ceiling,
-                        elapsed_seconds=exc.elapsed_seconds,
-                    ) from exc
-        except HarnessRecoveryRequested:
-            # Spec 00019 FR-4 / FR-7: the live-client invoker raised
-            # the distinguishable mid-turn recovery signal in response
-            # to ``recovery_interrupt_event`` being set above. Capture
-            # the work-so-far transcript and the occupancy that armed
-            # the interrupt into a mid_turn ``_RecoveryTrigger`` and
-            # break the iteration loop -- _run_attempt_body routes
-            # this through :func:`_handle_context_recovery` which
-            # finalizes the attempt RECOVERED and emits
-            # ``harness.context_recovery`` with ``trigger="mid_turn"``.
-            recovery_trigger = _RecoveryTrigger(
-                occupancy_tokens=midturn_occupancy[0],
-                transcript_tail="".join(partial_transcript_chunks),
-                iteration_number=iteration_number,
-                trigger=_RECOVERY_TRIGGER_MID_TURN,
+        # Transient rate-limit retry: a 429 / overload / ``rejected``
+        # rate-limit iteration is an infrastructure fault that produced no
+        # usable completion. Rather than spend the validation retry budget on
+        # it, the harness re-invokes the SAME iteration on the SEPARATE,
+        # bounded ``config.max_transient_retries`` budget, backing off between
+        # tries with the shared BackoffPolicy schedule. The loop is bounded by
+        # that operator-supplied budget, never by an agent-supplied value, so
+        # it cannot spin forever. On exhaustion ``transient_exhausted`` is set
+        # and the last (still rate-limited) result falls through so the caller
+        # finalizes the attempt as a TRANSIENT-classified INTERNAL_ERROR.
+        transient_retries = 0
+        recovery_requested = False
+        while True:
+            try:
+                if agent_ceiling is None:
+                    iteration_result = await _run_invocation()
+                else:
+                    try:
+                        iteration_result = await run_with_deadline(
+                            _run_invocation(), agent_ceiling
+                        )
+                    except DeadlineExceeded as exc:
+                        telemetry.emit(
+                            kind="harness.deadline_exceeded",
+                            payload={
+                                "iteration": iteration_number,
+                                "deadline_class": (
+                                    DeadlineClass.AGENT_ITERATION.value
+                                ),
+                                "ceiling_seconds": agent_ceiling,
+                                "elapsed_seconds": exc.elapsed_seconds,
+                            },
+                            attempt_number=attempt_number,
+                        )
+                        raise _IterationDeadlineExceeded(
+                            attempt_number=attempt_number,
+                            iteration_number=iteration_number,
+                            ceiling_seconds=agent_ceiling,
+                            elapsed_seconds=exc.elapsed_seconds,
+                        ) from exc
+            except HarnessRecoveryRequested:
+                # Spec 00019 FR-4 / FR-7: the live-client invoker raised
+                # the distinguishable mid-turn recovery signal in response
+                # to ``recovery_interrupt_event`` being set above. Capture
+                # the work-so-far transcript and the occupancy that armed
+                # the interrupt into a mid_turn ``_RecoveryTrigger`` and
+                # break the iteration loop -- _run_attempt_body routes
+                # this through :func:`_handle_context_recovery` which
+                # finalizes the attempt RECOVERED and emits
+                # ``harness.context_recovery`` with ``trigger="mid_turn"``.
+                recovery_trigger = _RecoveryTrigger(
+                    occupancy_tokens=midturn_occupancy[0],
+                    transcript_tail="".join(partial_transcript_chunks),
+                    iteration_number=iteration_number,
+                    trigger=_RECOVERY_TRIGGER_MID_TURN,
+                )
+                iteration_result = None
+                # Update wall_seconds for parity with the normal-completion
+                # path even though the mid-turn route does not invoke
+                # transcript graders -- keeps the return shape uniform.
+                wall_seconds = mclock() - started_monotonic
+                recovery_requested = True
+                break
+
+            transient_reason = _iteration_is_transient_rate_limit(
+                iteration_result
             )
-            iteration_result = None
-            # Update wall_seconds for parity with the normal-completion
-            # path even though the mid-turn route does not invoke
-            # transcript graders -- keeps the return shape uniform.
-            wall_seconds = mclock() - started_monotonic
+            if transient_reason is None:
+                break
+            if transient_retries >= config.max_transient_retries:
+                # Budget exhausted: hand the rate-limited result back marked
+                # transient so the caller routes it to INTERNAL_ERROR, not the
+                # agent-protocol AGENT_ERROR path.
+                transient_exhausted = True
+                telemetry.emit(
+                    kind="harness.transient_exhausted",
+                    payload={
+                        "iteration": iteration_number,
+                        "reason": transient_reason,
+                        "invocations": transient_retries + 1,
+                        "max_transient_retries": config.max_transient_retries,
+                        "classification": FaultClass.TRANSIENT.value,
+                    },
+                    attempt_number=attempt_number,
+                    iteration_number=iteration_number,
+                )
+                break
+            delay = config.transient_backoff.delay_for(transient_retries)
+            transient_retries += 1
+            telemetry.emit(
+                kind="harness.transient_retry",
+                payload={
+                    "iteration": iteration_number,
+                    "reason": transient_reason,
+                    "retry": transient_retries,
+                    "max_transient_retries": config.max_transient_retries,
+                    "delay_seconds": delay,
+                    "classification": FaultClass.TRANSIENT.value,
+                },
+                attempt_number=attempt_number,
+                iteration_number=iteration_number,
+            )
+            await config.transient_sleep(delay)
+
+        if recovery_requested:
             break
+        # Only the recovery path leaves iteration_result None (and it broke
+        # the outer loop above); every other exit of the transient loop
+        # assigned an IterationResult.
+        assert iteration_result is not None
         wall_seconds = mclock() - started_monotonic
 
         # Context-pressure telemetry: token fields are per-iteration deltas
@@ -3572,6 +3740,7 @@ async def _drive_iterations(
         wall_seconds,
         loop_guard_verdict,
         recovery_trigger,
+        transient_exhausted,
     )
 
 

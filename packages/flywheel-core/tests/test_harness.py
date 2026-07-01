@@ -1157,6 +1157,159 @@ class TestRateLimitSurface:
         assert completed_events[0].payload["rate_limited"] is True
 
 
+# --- Transient rate-limit retry ------------------------------------------
+
+
+def _rejected_rate_limit_event() -> RateLimitEvent:
+    """A hard ``rejected`` rate-limit event (the limit was actually hit)."""
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="rejected",
+            resets_at=1_700_000_000,
+            rate_limit_type="five_hour",
+            utilization=1.0,
+        ),
+        uuid="evt-reject",
+        session_id="sess-1",
+    )
+
+
+def _rate_limited_iteration(
+    *, api_error_status: int | None = 429, rejected: bool = False
+) -> IterationResult:
+    """A rate-limited iteration: no usable completion (MissingEnvelope)
+    plus a transient signal — a 429/overload ``api_error_status`` and/or a
+    ``rejected`` RateLimitEvent."""
+    events = (_rejected_rate_limit_event(),) if rejected else ()
+    return _iteration(
+        envelope=MissingEnvelope(),
+        signals=_make_signals(
+            api_error_status=api_error_status,
+            rate_limit_events=events,
+        ),
+    )
+
+
+class TestTransientRateLimitRetry:
+    def test_rate_limit_retry(self) -> None:
+        """A 429/rate-limit iteration is re-invoked on the SEPARATE transient
+        budget and, once the fault clears, the run reaches DONE — even with
+        the validation budget (max_retries) at zero, proving the transient
+        budget is untouched by and independent of it."""
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rl-retry")
+        invoke = _scripted_invoker(
+            [
+                # [rate-limit, rate-limit, valid-pass] — the criterion proof.
+                _rate_limited_iteration(api_error_status=429),
+                _rate_limited_iteration(rejected=True, api_error_status=None),
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                ),
+            ]
+        )
+        delays: list[float] = []
+
+        async def _sleep(delay: float) -> None:
+            delays.append(delay)
+
+        config = HarnessConfig(
+            max_retries=0,
+            max_transient_retries=3,
+            transient_sleep=_sleep,
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        # Reached DONE despite max_retries=0: the transient budget carried
+        # the two rate-limited iterations, the validation budget was not
+        # consulted (no retry was scheduled).
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 1
+        # Three invocations happened within the single attempt: the two
+        # rate-limited tries plus the passing one.
+        assert len(invoke.calls) == 3  # type: ignore[attr-defined]
+        # One backoff wait per re-invocation, monotonic non-decreasing and
+        # bounded by the shared BackoffPolicy cap (proves reuse, not a
+        # second backoff).
+        assert len(delays) == 2
+        assert all(b >= a for a, b in zip(delays, delays[1:]))
+        assert all(d <= config.transient_backoff.cap_seconds for d in delays)
+        # The retries were audited as transient, not as validation retries.
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
+        assert kinds.count("harness.transient_retry") == 2
+        assert "harness.retry_scheduled" not in kinds
+
+    def test_rate_limit_exhausted(self) -> None:
+        """N+1 rate-limit results (N = transient budget) terminate in bounded
+        time with a TRANSIENT-classified failure and exactly N+1 invocations
+        — never an unbounded loop."""
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rl-exhausted")
+        transient_budget = 2
+        invoke = _scripted_invoker(
+            # N+1 = 3 rate-limited results; the loop must stop after these.
+            [_rate_limited_iteration() for _ in range(transient_budget + 1)]
+        )
+
+        async def _sleep(_delay: float) -> None:
+            return None
+
+        config = HarnessConfig(
+            max_retries=0,
+            max_transient_retries=transient_budget,
+            transient_sleep=_sleep,
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        # Bounded termination: exactly transient_budget + 1 invocations, then
+        # the run fails (max_retries=0 exhausts the validation budget the
+        # transient INTERNAL_ERROR falls back to).
+        assert outcome.lifecycle.status == Status.FAILED
+        assert len(invoke.calls) == transient_budget + 1  # type: ignore[attr-defined]
+        assert len(outcome.attempts) == 1
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        # The failure was classified transient in the audit stream.
+        exhausted = [
+            e
+            for e in sink.events(lifecycle.run_id)
+            if e.kind == "harness.transient_exhausted"
+        ]
+        assert len(exhausted) == 1
+        assert exhausted[0].payload["classification"] == "transient"
+        assert exhausted[0].payload["invocations"] == transient_budget + 1
+
+
 # --- Context-pressure telemetry ------------------------------------------
 
 

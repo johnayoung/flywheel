@@ -1966,6 +1966,97 @@ def build_held_out_source(
     return FilesystemHeldOutGraderSource(root=repo_root / policy.held_out_root)
 
 
+def run_daemon_loop(
+    *,
+    run_cycle: Callable[[], object],
+    once: bool,
+    poll_interval: float,
+    should_stop: Callable[[], bool],
+    sleep: Callable[[float, Callable[[], bool]], None],
+    before_cycle: Callable[[], None] | None = None,
+    on_cycle_failure: Callable[[BaseException, int], None] | None = None,
+    on_give_up: Callable[[int], None] | None = None,
+    on_permanent_stop: Callable[[BaseException], None] | None = None,
+    on_interrupt: Callable[[], None] | None = None,
+    max_cycles: int | None = None,
+) -> int:
+    """The worker daemon's cross-cycle circuit breaker, extracted so the
+    transient-vs-strike boundary is testable without a live model.
+
+    Each pass runs one ``run_cycle`` (a full ``run_once`` in production), then
+    waits ``poll_interval`` before the next; ``once`` stops after the first
+    successful pass. The loop exits only on ``should_stop`` (a SIGTERM/SIGINT
+    flag in production, an injected event in tests) or a breaker verdict.
+    ``before_cycle`` re-arms signal handlers each iteration (``asyncio.run``
+    inside a real pass reclaims them).
+
+    The breaker sits ABOVE the store's own bounded transient retry: a TRANSIENT
+    store fault that clears within the store's retry budget is absorbed BENEATH
+    this loop -- ``run_cycle`` returns normally and no strike is counted, so a
+    flake that self-heals costs nothing. Only a cycle that actually raises past
+    that retry counts a strike (``on_cycle_failure``); after
+    ``MAX_CONSECUTIVE_CYCLE_FAILURES`` consecutive strikes the loop gives up
+    (``on_give_up``, returns 1) so a non-zero exit is visible. A successful
+    cycle resets the count.
+
+    A PERMANENT-classified fault (e.g. a ``StoreSchemaError`` from reopening a
+    store whose ``schema_version`` row is wrong) can never succeed on retry, so
+    it is NOT counted as a transient strike -- otherwise it would burn all five
+    strikes with a backoff between each. Instead the loop signals the distinct
+    ``on_permanent_stop`` and returns ``PERMANENT_STOP_EXIT_CODE`` after exactly
+    one cycle. ``KeyboardInterrupt``/``asyncio.CancelledError`` are not counted
+    either: they signal ``on_interrupt`` and stop the loop.
+
+    ``max_cycles`` is a test-only safety bound; production leaves it ``None``.
+    Returns the process exit code (0 normal, 1 gave up, permanent-stop code).
+    """
+    consecutive_failures = 0
+    cycles = 0
+    while not should_stop():
+        if before_cycle is not None:
+            before_cycle()
+        try:
+            run_cycle()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            if on_interrupt is not None:
+                on_interrupt()
+            break
+        except Exception as exc:  # noqa: BLE001 - one bad cycle must not crash the daemon
+            # A permanent fault (a schema-version mismatch reopening the store
+            # every cycle) can never succeed on retry, so it must not ride all
+            # five breaker strikes: classify PERMANENT and stop the loop after
+            # this single cycle via a distinctly-labelled permanent-stop exit,
+            # separate from the transient give-up path.
+            if classify_fault(exc) is FaultClass.PERMANENT:
+                if on_permanent_stop is not None:
+                    on_permanent_stop(exc)
+                return PERMANENT_STOP_EXIT_CODE
+            consecutive_failures += 1
+            cycles += 1
+            if on_cycle_failure is not None:
+                on_cycle_failure(exc, consecutive_failures)
+            if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES:
+                if on_give_up is not None:
+                    on_give_up(consecutive_failures)
+                return 1
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            if should_stop():
+                break
+            sleep(CYCLE_FAILURE_BACKOFF_SECONDS, should_stop)
+            continue
+        consecutive_failures = 0
+        cycles += 1
+        if once:
+            break
+        if max_cycles is not None and cycles >= max_cycles:
+            break
+        if should_stop():
+            break
+        sleep(poll_interval, should_stop)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     repo_root = _repo_root()
@@ -2093,78 +2184,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"current cycle."
         )
 
-    consecutive_failures = 0
-    try:
-        while not shutdown["requested"]:
-            _arm_signals(_flag)
-            try:
-                run_once(
-                    submitter,
-                    tasks_dir=tasks_dir,
-                    db_path=db_path,
-                    worktrees_dir=worktrees_dir,
-                    model=model,
-                    max_turns=args.max_turns,
-                    max_retries=args.max_retries,
-                    worker_id=args.worker_id,
-                    lease_seconds=args.lease_seconds,
-                    reconcile_seconds=args.reconcile_seconds or None,
-                    stream=sys.stderr,
-                    log=log,
-                    policy=policy,
-                    strategy=run_strategy,
-                    held_out_source=held_out_source,
-                )
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                log(
-                    "Interrupted mid-run; in-flight task finalized to "
-                    "interrupted. Shutting down."
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 - one bad cycle must not crash the daemon
-                # A permanent fault (a schema-version mismatch reopening the
-                # store every cycle) can never succeed on retry, so it must not
-                # ride all five breaker strikes: classify PERMANENT and stop the
-                # loop after this single cycle via a distinctly-labelled
-                # permanent-stop exit, separate from the transient give-up path.
-                if classify_fault(exc) is FaultClass.PERMANENT:
-                    log(
-                        f"Cycle hit a permanent fault "
-                        f"({type(exc).__name__}: {exc}); stopping the worker "
-                        f"loop after one cycle for operator inspection "
-                        f"(retrying cannot reconcile it)."
-                    )
-                    return PERMANENT_STOP_EXIT_CODE
-                consecutive_failures += 1
-                log(
-                    f"Cycle failed ({type(exc).__name__}: {exc}) "
-                    f"[{consecutive_failures}/{MAX_CONSECUTIVE_CYCLE_FAILURES}]"
-                )
-                if consecutive_failures >= MAX_CONSECUTIVE_CYCLE_FAILURES:
-                    log(
-                        "Too many consecutive cycle failures; exiting for "
-                        "operator inspection."
-                    )
-                    return 1
-                _arm_signals(_flag)
-                _interruptible_sleep(
-                    CYCLE_FAILURE_BACKOFF_SECONDS,
-                    lambda: shutdown["requested"],
-                )
-                continue
-            else:
-                consecutive_failures = 0
+    def _run_cycle() -> None:
+        run_once(
+            submitter,
+            tasks_dir=tasks_dir,
+            db_path=db_path,
+            worktrees_dir=worktrees_dir,
+            model=model,
+            max_turns=args.max_turns,
+            max_retries=args.max_retries,
+            worker_id=args.worker_id,
+            lease_seconds=args.lease_seconds,
+            reconcile_seconds=args.reconcile_seconds or None,
+            stream=sys.stderr,
+            log=log,
+            policy=policy,
+            strategy=run_strategy,
+            held_out_source=held_out_source,
+        )
 
-            if args.once:
-                break
-            _arm_signals(_flag)
-            _interruptible_sleep(
-                args.poll_interval, lambda: shutdown["requested"]
-            )
+    def _should_stop() -> bool:
+        return shutdown["requested"]
+
+    def _sleep(seconds: float, stop: Callable[[], bool]) -> None:
+        # asyncio.run inside a cycle reclaims SIGTERM/SIGINT and restores their
+        # default disposition; re-arm before every wait so a shutdown signal
+        # during the backoff/poll still wakes us.
+        _arm_signals(_flag)
+        _interruptible_sleep(int(seconds), stop)
+
+    try:
+        return run_daemon_loop(
+            run_cycle=_run_cycle,
+            once=args.once,
+            poll_interval=args.poll_interval,
+            should_stop=_should_stop,
+            sleep=_sleep,
+            before_cycle=lambda: _arm_signals(_flag),
+            on_cycle_failure=lambda exc, n: log(
+                f"Cycle failed ({type(exc).__name__}: {exc}) "
+                f"[{n}/{MAX_CONSECUTIVE_CYCLE_FAILURES}]"
+            ),
+            on_give_up=lambda _n: log(
+                "Too many consecutive cycle failures; exiting for "
+                "operator inspection."
+            ),
+            on_permanent_stop=lambda exc: log(
+                f"Cycle hit a permanent fault "
+                f"({type(exc).__name__}: {exc}); stopping the worker "
+                f"loop after one cycle for operator inspection "
+                f"(retrying cannot reconcile it)."
+            ),
+            on_interrupt=lambda: log(
+                "Interrupted mid-run; in-flight task finalized to "
+                "interrupted. Shutting down."
+            ),
+        )
     finally:
         heartbeat.stop()
         log("Shutting down.")
-    return 0
 
 
 if __name__ == "__main__":

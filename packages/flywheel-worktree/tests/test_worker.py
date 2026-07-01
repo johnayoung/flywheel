@@ -920,6 +920,120 @@ def test_run_once_postgres_policy_without_dsn_fails_fast(
     assert "DATABASE_URL" in message
 
 
+# --- the cross-cycle circuit breaker vs. the store's transient retry --------
+
+
+def test_transient_not_breaker_absorbs_cleared_store_fault_beneath_breaker(
+    tmp_path: Path,
+) -> None:
+    """A cycle that hits a TRANSIENT store fault which then clears completes
+    without spending a breaker strike.
+
+    The store's own bounded transient retry sits BENEATH the daemon breaker: a
+    real write blocked past ``busy_timeout`` on a held write lock is retried
+    with backoff; the injected backoff releases the competing writer, so the
+    retry commits for real and ``run_cycle`` returns normally. Because the fault
+    was absorbed at the fault site -- not caught at the breaker -- the
+    consecutive-failure counter never leaves 0: ``on_cycle_failure`` is never
+    called and the loop exits 0. Catching the transient at the breaker level
+    (increment-then-reset) would record a strike here and fail the assertion.
+
+    The same driver still counts a strike for a genuine non-transient cycle
+    failure, proving the breaker is not simply disabled.
+    """
+    import sqlite3
+    from datetime import datetime, timezone
+
+    from flywheel_core.faults import BackoffPolicy
+    from flywheel_core.store_sqlite import SqliteStore
+
+    db = tmp_path / "transient.db"
+    holder: dict[str, sqlite3.Connection | None] = {}
+
+    def release_lock_on_backoff(_delay: float) -> None:
+        # Stands in for the store's real backoff sleep: the first retry's
+        # backoff releases the competing writer, so the next attempt acquires
+        # the write lock and the operation commits for real.
+        blocker = holder.get("conn")
+        if blocker is not None:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+            holder["conn"] = None
+
+    # Construct before the lock is taken so the schema bootstrap writes are
+    # uncontended; the tiny busy_timeout makes each locked attempt fail fast.
+    store = SqliteStore(
+        db,
+        busy_timeout_ms=50,
+        max_transient_retries=5,
+        transient_backoff=BackoffPolicy(
+            base_seconds=0.001, factor=1.0, cap_seconds=0.001
+        ),
+        transient_sleep=release_lock_on_backoff,
+    )
+    task = Task(
+        id="t-locked",
+        goal="survive a held write lock beneath the breaker",
+        graders=[CommandGrader(run="true")],
+    )
+    try:
+        blocker = sqlite3.connect(str(db), isolation_level=None)
+        blocker.execute("BEGIN IMMEDIATE")  # holds the write lock on the file
+        holder["conn"] = blocker
+
+        def transient_cycle() -> None:
+            # A real store write that must survive the held write lock: the
+            # store's transient retry backs off, the backoff releases the lock,
+            # and the retry commits for real. This never raises past the store.
+            store.save_task(task, now=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+        strikes: list[int] = []
+        gave_up: list[int] = []
+        permanent: list[BaseException] = []
+        code = worker.run_daemon_loop(
+            run_cycle=transient_cycle,
+            once=True,
+            poll_interval=0,
+            should_stop=lambda: False,
+            sleep=lambda _s, _stop: None,
+            on_cycle_failure=lambda _exc, n: strikes.append(n),
+            on_give_up=lambda n: gave_up.append(n),
+            on_permanent_stop=lambda exc: permanent.append(exc),
+        )
+
+        # The transient fault was absorbed beneath the breaker: no strike, the
+        # counter stayed at 0, and the write actually landed.
+        assert strikes == []
+        assert gave_up == []
+        assert permanent == []
+        assert code == 0
+        assert store.load_task("t-locked") is not None
+    finally:
+        leftover = holder.get("conn")
+        if leftover is not None:
+            leftover.close()
+        store.close()
+
+    # Control: a genuine non-transient cycle failure still counts a strike, so
+    # the breaker is not merely disabled for every fault.
+    real_strikes: list[int] = []
+
+    def failing_cycle() -> None:
+        raise RuntimeError("a real, non-transient cycle failure")
+
+    code = worker.run_daemon_loop(
+        run_cycle=failing_cycle,
+        once=True,
+        poll_interval=0,
+        should_stop=lambda: False,
+        sleep=lambda _s, _stop: None,
+        on_cycle_failure=lambda _exc, n: real_strikes.append(n),
+        max_cycles=1,
+    )
+    assert real_strikes == [1]
+    assert code == 0
+
+
 def test_archive_phases_accepts_repeated_factory_calls(
     tmp_path: Path,
 ) -> None:

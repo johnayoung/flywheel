@@ -110,8 +110,9 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flywheel_core.loaders import TaskLoadError, load_graders
@@ -122,11 +123,16 @@ from flywheel_orchestrator._autopilot import (
     DEFAULT_TARGET_DEPTH,
     ScoreWeights,
 )
+from flywheel_orchestrator._claims import StopEventStore
 from flywheel_orchestrator._github import GithubWorkSource
 from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._github_review import GithubReviewWorkSource
 from flywheel_orchestrator._source_registry import SOURCES
-from flywheel_orchestrator._sources import DirectoryWorkSource, WorkSource
+from flywheel_orchestrator._sources import (
+    DirectoryWorkSource,
+    StopEventSink,
+    WorkSource,
+)
 
 DEFAULT_POLICY_FILENAME = "flywheel.toml"
 
@@ -1438,13 +1444,53 @@ def _optional_sandbox_policy(
     )
 
 
-def build_directory_source(policy: WorkPolicy) -> WorkSource:
-    """Build the directory backend (the registry's ``directory`` target)."""
+def _make_stop_sink(
+    control: StopEventStore | None,
+    now: Callable[[], datetime] | None,
+) -> StopEventSink | None:
+    """Bind a source's stop-event sink to the durable stop-event ledger.
+
+    Returns ``None`` when no ``control`` store is supplied, so a source built
+    without one behaves byte-for-byte as before (the sink is an audit witness,
+    never a scheduling input). When bound, each ``sink(kind, subject, detail)``
+    call appends one append-only ``record_stop_event`` row stamped with the
+    injected ``now`` clock (falling back to wall-clock UTC).
+    """
+    if control is None:
+        return None
+    clock = now if now is not None else (lambda: datetime.now(timezone.utc))
+
+    def sink(kind: str, subject: str, detail: str) -> None:
+        control.record_stop_event(
+            kind=kind, subject=subject, detail=detail, occurred_at=clock()
+        )
+
+    return sink
+
+
+def build_directory_source(
+    policy: WorkPolicy,
+    *,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> WorkSource:
+    """Build the directory backend (the registry's ``directory`` target).
+
+    ``control`` / ``now`` are accepted for a uniform builder signature but
+    unused here: the directory source has no truncation or zero-grader gate --
+    an unloadable task file surfaces as a raised ``TaskLoadError`` (a loud
+    abort), so it has no pre-run dead-end to witness on the stop ledger.
+    """
     assert policy.tasks_dir is not None  # load_policy guarantees it
     return DirectoryWorkSource(policy.tasks_dir)
 
 
-def build_github_source(policy: WorkPolicy) -> WorkSource:
+def build_github_source(
+    policy: WorkPolicy,
+    *,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> WorkSource:
     """Build the GitHub-issues backend (the registry's ``github`` target)."""
     assert policy.github_repo is not None and policy.github_label is not None
     return GithubWorkSource(
@@ -1452,20 +1498,32 @@ def build_github_source(policy: WorkPolicy) -> WorkSource:
         label=policy.github_label,
         default_graders=policy.default_graders,
         done_action=policy.github_done_action,
+        stop_sink=_make_stop_sink(control, now),
     )
 
 
-def build_github_ci_source(policy: WorkPolicy) -> WorkSource:
+def build_github_ci_source(
+    policy: WorkPolicy,
+    *,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> WorkSource:
     """Build the GitHub-CI backend (the registry's ``github_ci`` target)."""
     assert policy.github_ci_repo is not None  # load_policy guarantees it
     return GithubCiWorkSource(
         repo=policy.github_ci_repo,
         default_graders=policy.default_graders,
         failure_filter=policy.github_ci_failure_filter,
+        stop_sink=_make_stop_sink(control, now),
     )
 
 
-def build_github_review_source(policy: WorkPolicy) -> WorkSource:
+def build_github_review_source(
+    policy: WorkPolicy,
+    *,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> WorkSource:
     """Build the PR-review backend (the registry's ``github_review`` target).
 
     Binds a :class:`GithubReviewWorkSource` to the policy's repo and the
@@ -1476,18 +1534,26 @@ def build_github_review_source(policy: WorkPolicy) -> WorkSource:
     return GithubReviewWorkSource(
         repo=policy.github_review_repo,
         default_graders=policy.default_graders,
+        stop_sink=_make_stop_sink(control, now),
     )
 
 
-def build_work_source(policy: WorkPolicy) -> WorkSource:
+def build_work_source(
+    policy: WorkPolicy,
+    *,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> WorkSource:
     """Construct the :class:`WorkSource` a policy describes.
 
     Routes ``policy.source_kind`` through the
     :data:`~flywheel_orchestrator._source_registry.SOURCES` registry; the
     per-kind construction lives in :func:`build_directory_source` /
-    :func:`build_github_source`.
+    :func:`build_github_source`. When ``control`` is supplied it is forwarded
+    to the resolved builder, which wires each source's ``source-truncation`` /
+    ``zero-grader-drop`` stop events to that durable ledger.
     """
-    return SOURCES.resolve(policy.source_kind)(policy)
+    return SOURCES.resolve(policy.source_kind)(policy, control=control, now=now)
 
 
 __all__ = [

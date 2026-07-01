@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flywheel_core.loaders import load_task_file
@@ -22,7 +23,13 @@ from flywheel_orchestrator._autopilot import (
     ScoreBreakdown,
     Tier,
 )
+from flywheel_orchestrator._claims import (
+    STOP_NO_OP_CYCLE,
+    InMemoryClaimStore,
+)
 from flywheel_orchestrator._sources import DirectoryWorkSource
+
+_FIXED_NOW = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _seed_repo(tmp_path: Path) -> Path:
@@ -210,6 +217,121 @@ def test_queue_at_target_emits_nothing(tmp_path: Path) -> None:
     )
     assert result.emitted_count == 0
     assert "at or above target" in result.reason
+
+
+# --- stop ledger: the no-op cycle is an audit witness -----------------------
+
+
+def test_no_op_cycle_records_one_stop_row_with_reason_and_depths(
+    tmp_path: Path,
+) -> None:
+    repo = _seed_repo(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    control = InMemoryClaimStore()
+    invoker = _make_invoker({})  # nothing actionable -> zero emit
+    result = asyncio.run(
+        run_refill_pass(
+            tasks_dir=tasks_dir,
+            repo_root=repo,
+            target_depth=5,
+            discovery_invoker=invoker,
+            authoring_invoker=invoker,
+            control=control,
+            now=lambda: _FIXED_NOW,
+        )
+    )
+    assert result.emitted_count == 0
+    # Exactly one no-op-cycle row, naming the queue and carrying the reason
+    # plus the observed and target queue depths.
+    rows = control.list_stop_events()
+    assert len(rows) == 1
+    (row,) = rows
+    assert row.kind == STOP_NO_OP_CYCLE
+    assert row.subject == str(tasks_dir)
+    assert "no actionable findings" in row.detail
+    assert "observed queue depth 0" in row.detail
+    assert "target 5" in row.detail
+    assert row.occurred_at == _FIXED_NOW
+
+
+def test_productive_cycle_records_no_no_op_row(tmp_path: Path) -> None:
+    repo = _seed_repo(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    control = InMemoryClaimStore()
+    invoker = _make_invoker({5: 2, 8: 2})  # 4 findings, target 3 -> emits 3
+    result = asyncio.run(
+        run_refill_pass(
+            tasks_dir=tasks_dir,
+            repo_root=repo,
+            target_depth=3,
+            discovery_invoker=invoker,
+            authoring_invoker=invoker,
+            control=control,
+            now=lambda: _FIXED_NOW,
+        )
+    )
+    # A productive cycle emits tasks and records NO no-op row.
+    assert result.emitted_count == 3
+    assert control.list_stop_events() == []
+
+
+def test_queue_at_target_short_circuit_records_no_no_op_row(
+    tmp_path: Path,
+) -> None:
+    repo = _seed_repo(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    phase = tasks_dir / "active" / "existing"
+    phase.mkdir(parents=True)
+    for i in range(3):
+        (phase / f"pre{i}.json").write_text(
+            json.dumps(
+                {
+                    "id": f"pre{i}",
+                    "goal": f"Pre-existing task {i}.",
+                    "graders": [{"type": "command", "run": "true"}],
+                }
+            )
+        )
+    control = InMemoryClaimStore()
+    invoker = _make_invoker({5: 5})
+    result = asyncio.run(
+        run_refill_pass(
+            tasks_dir=tasks_dir,
+            repo_root=repo,
+            target_depth=3,
+            discovery_invoker=invoker,
+            authoring_invoker=invoker,
+            control=control,
+            now=lambda: _FIXED_NOW,
+        )
+    )
+    # A full queue is healthy backpressure, not a dead-end -- no row.
+    assert result.emitted_count == 0
+    assert control.list_stop_events() == []
+
+
+def test_recurring_no_op_cycles_are_not_deduped(tmp_path: Path) -> None:
+    repo = _seed_repo(tmp_path)
+    tasks_dir = tmp_path / "tasks"
+    control = InMemoryClaimStore()
+    invoker = _make_invoker({})
+    # Three identical idle passes -> three rows: recurrence is the signal, so
+    # the ledger must NOT collapse them into one.
+    for _ in range(3):
+        asyncio.run(
+            run_refill_pass(
+                tasks_dir=tasks_dir,
+                repo_root=repo,
+                target_depth=5,
+                discovery_invoker=invoker,
+                authoring_invoker=invoker,
+                control=control,
+                now=lambda: _FIXED_NOW,
+            )
+        )
+    rows = control.list_stop_events()
+    assert len(rows) == 3
+    assert all(r.kind == STOP_NO_OP_CYCLE for r in rows)
 
 
 # --- Criterion #3 persisted: recorded breakdown recomputes ------------------

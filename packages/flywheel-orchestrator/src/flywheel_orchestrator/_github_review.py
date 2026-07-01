@@ -57,6 +57,10 @@ from typing import Any
 
 from flywheel_core.task import Context, Grader, Task, ValidationError
 
+from flywheel_orchestrator._claims import (
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
+)
 from flywheel_orchestrator._github import (
     GhRunner,
     _default_runner,
@@ -64,6 +68,7 @@ from flywheel_orchestrator._github import (
     emit_truncation_warning,
 )
 from flywheel_orchestrator._sources import (
+    StopEventSink,
     WorkItem,
     WorkReport,
     WorkSourceError,
@@ -189,6 +194,7 @@ class GithubReviewWorkSource:
         default_graders: Sequence[Grader] = (),
         runner: GhRunner | None = None,
         log: Callable[[str], None] | None = None,
+        stop_sink: StopEventSink | None = None,
     ) -> None:
         if not repo or "/" not in repo:
             raise ValueError(
@@ -198,11 +204,29 @@ class GithubReviewWorkSource:
         self.default_graders = tuple(default_graders)
         self._run = runner if runner is not None else _default_runner
         self._log = log
+        self._stop_sink = stop_sink
 
     @property
     def source_name(self) -> str:
         """The source's locus for ``source_syncs`` (D-6): the ``owner/repo``."""
         return self.repo
+
+    def _note_truncation(self, *, what: str) -> None:
+        """Log a one-page truncation and record one durable stop event.
+
+        The log line is the pre-existing side channel; the stop event is the
+        durable witness on the append-only ledger (``source-truncation``).
+        Both are pure side channels -- the returned work sequence is unchanged
+        whether or not a sink is wired.
+        """
+        emit_truncation_warning(self._log, source="github_review", what=what)
+        if self._stop_sink is not None:
+            self._stop_sink(
+                STOP_SOURCE_TRUNCATION,
+                self.source_name,
+                f"{what} listing truncated at one page; "
+                f"some items were not read this pass",
+            )
 
     # -- inbound --------------------------------------------------------
 
@@ -235,9 +259,7 @@ class GithubReviewWorkSource:
         )
         pr_nodes = _nodes(pull_requests, "pullRequests")
         if _truncated(pull_requests):
-            emit_truncation_warning(
-                self._log, source="github_review", what="open pull requests"
-            )
+            self._note_truncation(what="open pull requests")
 
         items: list[WorkItem] = []
         skipped = 0
@@ -254,11 +276,7 @@ class GithubReviewWorkSource:
                 f"pullRequest(#{number}).reviewThreads",
             )
             if _truncated(review_threads):
-                emit_truncation_warning(
-                    self._log,
-                    source="github_review",
-                    what=f"review threads on PR #{number}",
-                )
+                self._note_truncation(what=f"review threads on PR #{number}")
             for thread in _nodes(
                 review_threads, f"pullRequest(#{number}).reviewThreads"
             ):
@@ -323,10 +341,8 @@ class GithubReviewWorkSource:
             thread_obj.get("comments"), "reviewThread.comments"
         )
         if _truncated(comments_conn):
-            emit_truncation_warning(
-                self._log,
-                source="github_review",
-                what=f"comments on a review thread on PR #{pr_number}",
+            self._note_truncation(
+                what=f"comments on a review thread on PR #{pr_number}"
             )
         comments = _nodes(comments_conn, "reviewThread.comments")
 
@@ -357,6 +373,13 @@ class GithubReviewWorkSource:
                 self._log(
                     f"[github_review] skipping {item_id} (thread on PR "
                     f"#{pr_number}): no default grader policy -- not runnable"
+                )
+            if self._stop_sink is not None:
+                self._stop_sink(
+                    STOP_ZERO_GRADER_DROP,
+                    self.source_name,
+                    f"{item_id} (thread on PR #{pr_number}): no default "
+                    f"grader policy -- not runnable",
                 )
             return None
 

@@ -38,6 +38,16 @@ from flywheel_core.lifecycle import Status
 from flywheel_core.loaders import TaskLoadError, load_task_file, task_digest
 from flywheel_core.task import Task
 
+# A source's stop-event sink: ``sink(kind, subject, detail)`` appends one
+# durable stop record to the orchestrator's append-only ledger without changing
+# what the source lists. ``kind`` is a member of
+# ``ORCHESTRATOR_STOP_EVENT_KINDS`` (``source-truncation`` /
+# ``zero-grader-drop`` for a source), ``subject`` is the source name (its repo
+# or tasks_dir path), and ``detail`` names the cause. A source given no sink
+# behaves byte-for-byte as before -- the record is an audit witness, never a
+# scheduling input.
+StopEventSink = Callable[[str, str, str], None]
+
 
 class WorkSourceError(RuntimeError):
     """Raised when a work source cannot enumerate or compile its items.
@@ -332,6 +342,7 @@ class DirectoryWorkSource:
 __all__ = [
     "DirectoryWorkSource",
     "GraderReceipt",
+    "StopEventSink",
     "WorkItem",
     "WorkReport",
     "WorkSource",

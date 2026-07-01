@@ -84,6 +84,7 @@ if TYPE_CHECKING:
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
+    STOP_DANGLING_PREREQUISITE,
     ClaimLostError,
     GraphSnapshotItem,
     SourceSyncRecord,
@@ -876,7 +877,26 @@ async def orchestrate(
             # here, before any task dispatches; a missing prerequisite is a
             # recorded issue and keeps its task ineligible / out of the ready
             # set exactly as today (spec 00047, decision D-1).
-            graph = WorkGraph.build(items).graph
+            validation = WorkGraph.build(items)
+            graph = validation.graph
+            # Witness every dangling prerequisite this pass surfaced (D-2): a
+            # task whose declared prerequisite resolves to no work item stays
+            # out of the ready set exactly as before, but the dead-end is now
+            # recorded on the append-only stop ledger, naming the referencing
+            # task and the missing id. One row per issue per pass -- never
+            # deduped, since a prerequisite that stays dangling across passes
+            # is a recurring stop and the recurrence is the signal.
+            for issue in validation.issues:
+                claims.record_stop_event(
+                    kind=STOP_DANGLING_PREREQUISITE,
+                    subject=issue.referencing_id,
+                    detail=(
+                        f"prerequisite {issue.missing_id!r} resolves to no "
+                        f"work item; {issue.referencing_id!r} stays out of "
+                        f"the ready set"
+                    ),
+                    occurred_at=clock(),
+                )
             states: dict[str, TaskState] = {r.task.id: r.state for r in rows}
             task_by_id: dict[str, Task] = {r.task.id: r.task for r in rows}
             row_by_id: dict[str, TaskStatusRow] = {
@@ -947,6 +967,18 @@ async def orchestrate(
                                 file=stream,
                                 flush=True,
                             )
+                        # Release the claim AND witness the prepare-skip in one
+                        # transaction (D-3): the control flow is unchanged (we
+                        # still skip this task for the session and keep
+                        # draining peers), but the dead-end is now recorded on
+                        # the stop ledger. ``claim = None`` so the finally does
+                        # not double-release.
+                        claims.record_prepare_skip(
+                            claim,
+                            detail=f"{type(exc).__name__}: {exc}",
+                            now=clock(),
+                        )
+                        claim = None
                         continue
                     sandbox = handle.path
                     drive_primitives, drive_invoke = _apply_handle(
@@ -1162,8 +1194,15 @@ async def orchestrate(
                 except Exception as exc:  # noqa: BLE001 - consumer code
                     # A failing provider skips this task for the session
                     # (already in attempted_fresh) and keeps draining the
-                    # rest, rather than unwinding the whole worker.
-                    claims.release_claim(claim)
+                    # rest, rather than unwinding the whole worker. The claim
+                    # release and the prepare-skip witness commit in one
+                    # transaction (D-3): scheduling is unchanged, but the
+                    # dead-end is now recorded on the stop ledger.
+                    claims.record_prepare_skip(
+                        claim,
+                        detail=f"{type(exc).__name__}: {exc}",
+                        now=clock(),
+                    )
                     if stream is not None:
                         print(
                             f"[orchestrate] {pick.task.id}: prepare failed "

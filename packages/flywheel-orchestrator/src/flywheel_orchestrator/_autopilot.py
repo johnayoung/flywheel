@@ -31,6 +31,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal
@@ -50,10 +51,14 @@ from flywheel_core.lifecycle import Status
 from flywheel_core.loaders import TaskLoadError, load_task_data, serialize_task
 from flywheel_core.task import CommandGrader, Task
 
+from flywheel_orchestrator._claims import STOP_NO_OP_CYCLE
+
 if TYPE_CHECKING:
     from flywheel_core._sdk import AgentDefinition, ClaudeAgentOptions
     from flywheel_core.store_postgres import PostgresStore
     from flywheel_core.store_sqlite import SqliteStore
+
+    from flywheel_orchestrator._claims import StopEventStore
 
 # --- Tier model (docs/autopilot.md) -----------------------------------------
 
@@ -1637,6 +1642,8 @@ async def run_refill_pass(
     model: str | None = None,
     queue_depth: Callable[[Path], int] | None = None,
     deadlines: DeadlineConfig | None = None,
+    control: StopEventStore | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> AutopilotPassResult:
     """Run one refill pass: discovery -> score/select -> author -> emit.
 
@@ -1661,6 +1668,29 @@ async def run_refill_pass(
     depth_fn = queue_depth if queue_depth is not None else _directory_queue_depth
     current = depth_fn(tasks_dir)
     slots = target_depth - current
+
+    def _record_no_op(reason: str) -> None:
+        # Witness a no-op cycle on the append-only stop ledger (D-2): a cycle
+        # that did discovery work yet emitted zero tasks. Audit-only -- the
+        # pass still returns its zero-emit result unchanged. The subject is the
+        # queue's tasks_dir; the detail names the reason plus the observed and
+        # target queue depths. Never deduped: an idle cycle recurring across
+        # daemon ticks is a recurring stop, and the recurrence is the signal.
+        # The queue-already-at-target short-circuit below is deliberately NOT
+        # recorded -- a full queue is healthy backpressure, not a dead-end.
+        if control is None:
+            return
+        clock = now if now is not None else (lambda: datetime.now(timezone.utc))
+        control.record_stop_event(
+            kind=STOP_NO_OP_CYCLE,
+            subject=str(tasks_dir),
+            detail=(
+                f"{reason} (observed queue depth {current}, "
+                f"target {target_depth})"
+            ),
+            occurred_at=clock(),
+        )
+
     if slots <= 0:
         return AutopilotPassResult(
             queue_depth_before=current,
@@ -1699,6 +1729,7 @@ async def run_refill_pass(
 
     sequenced = sequence_findings(findings, weights)
     if not sequenced:
+        _record_no_op("no actionable findings this cycle; idling without emitting")
         return AutopilotPassResult(
             queue_depth_before=current,
             target_depth=target_depth,
@@ -1735,6 +1766,8 @@ async def run_refill_pass(
         if emitted_paths
         else "no grader-bearing task could be authored this cycle"
     )
+    if not emitted_paths:
+        _record_no_op("no grader-bearing task could be authored this cycle")
     return AutopilotPassResult(
         emitted_paths=tuple(emitted_paths),
         emitted=tuple(emitted),

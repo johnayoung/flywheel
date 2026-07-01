@@ -218,6 +218,68 @@ def test_full_page_with_log_none_does_not_crash() -> None:
     assert len(items) == 200
 
 
+def test_full_page_records_one_source_truncation_on_sink() -> None:
+    gh = _FakeGh(_full_page())
+    events: list[tuple[str, str, str]] = []
+    source = _source(
+        gh,
+        default_graders=(CommandGrader(run="true"),),
+        stop_sink=lambda k, s, d: events.append((k, s, d)),
+    )
+
+    items = source.list_work()
+
+    assert len(items) == 200  # sequence unchanged by the sink
+    truncations = [e for e in events if e[0] == "source-truncation"]
+    assert len(truncations) == 1
+    _, subject, detail = truncations[0]
+    assert subject == source.source_name
+    assert "truncated at one page" in detail
+    assert "some items were not read this pass" in detail
+
+
+def test_below_cap_records_no_source_truncation_on_sink() -> None:
+    gh = _FakeGh(json.dumps([_issue(n, body="Please.") for n in range(1, 200)]))
+    events: list[tuple[str, str, str]] = []
+    source = _source(
+        gh,
+        default_graders=(CommandGrader(run="true"),),
+        stop_sink=lambda k, s, d: events.append((k, s, d)),
+    )
+
+    source.list_work()
+
+    assert [e for e in events if e[0] == "source-truncation"] == []
+
+
+def test_zero_grader_issue_records_zero_grader_drop_on_sink() -> None:
+    gh = _FakeGh(json.dumps([_issue(4, title="Vague wish", body="")]))
+    events: list[tuple[str, str, str]] = []
+    source = _source(gh, stop_sink=lambda k, s, d: events.append((k, s, d)))
+
+    assert source.list_work() == []  # still dropped from the sequence
+    drops = [e for e in events if e[0] == "zero-grader-drop"]
+    assert len(drops) == 1
+    _, subject, detail = drops[0]
+    assert subject == source.source_name
+    assert "octo/widgets#4" in detail
+    assert "not runnable" in detail
+
+
+def test_stop_sink_is_a_side_channel() -> None:
+    page = _full_page()
+    with_sink = _source(
+        _FakeGh(page),
+        default_graders=(CommandGrader(run="true"),),
+        stop_sink=lambda *_: None,
+    ).list_work()
+    without_sink = _source(
+        _FakeGh(page), default_graders=(CommandGrader(run="true"),)
+    ).list_work()
+
+    assert [i.task.id for i in with_sink] == [i.task.id for i in without_sink]
+
+
 def test_failed_listing_raises_and_never_returns_empty() -> None:
     def _failing(argv) -> str:
         raise WorkSourceError("gh issue list failed (exit 1): boom")

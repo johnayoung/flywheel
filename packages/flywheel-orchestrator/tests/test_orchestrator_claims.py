@@ -30,6 +30,11 @@ from flywheel_orchestrator import (
     InMemoryClaimStore,
     SqliteClaimStore,
 )
+from flywheel_orchestrator._claims import (
+    STOP_DANGLING_PREREQUISITE,
+    STOP_NO_OP_CYCLE,
+    STOP_PREPARE_SKIP,
+)
 
 if TYPE_CHECKING:
     from flywheel_orchestrator import PostgresClaimStore
@@ -548,6 +553,107 @@ def test_read_api_global_stream_and_per_task_timeline(
         assert not hasattr(event_store, forbidden)
 
 
+# --- stop-event ledger (schema v6) ------------------------------------------
+
+
+def test_record_stop_event_appends_to_global_and_subject_streams(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    event_store.record_stop_event(
+        kind=STOP_DANGLING_PREREQUISITE,
+        subject="task-a",
+        detail="prerequisite 'missing' resolves to no work item",
+        occurred_at=_t(0),
+    )
+    event_store.record_stop_event(
+        kind=STOP_NO_OP_CYCLE,
+        subject="queue-dir",
+        detail="idle (observed queue depth 0, target 5)",
+        occurred_at=_t(1),
+    )
+    rows = event_store.list_stop_events()
+    assert [(r.kind, r.subject) for r in rows] == [
+        (STOP_DANGLING_PREREQUISITE, "task-a"),
+        (STOP_NO_OP_CYCLE, "queue-dir"),
+    ]
+    # Strictly increasing insertion ids, id-ordered.
+    assert [r.id for r in rows] == sorted(r.id for r in rows)
+    # Per-subject timeline filters to one subject.
+    only_a = event_store.list_subject_stop_events("task-a")
+    assert [r.kind for r in only_a] == [STOP_DANGLING_PREREQUISITE]
+    assert only_a[0].detail.startswith("prerequisite 'missing'")
+    assert only_a[0].occurred_at == _t(0)
+
+
+def test_stop_events_are_never_deduped(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # An identical stop recorded on three passes is three rows -- recurrence is
+    # the signal, so a ledger that collapses them must fail.
+    for _ in range(3):
+        event_store.record_stop_event(
+            kind=STOP_NO_OP_CYCLE,
+            subject="queue-dir",
+            detail="idle (observed queue depth 0, target 5)",
+            occurred_at=_t(0),
+        )
+    rows = event_store.list_subject_stop_events("queue-dir")
+    assert len(rows) == 3
+    assert len({r.id for r in rows}) == 3  # distinct, monotonic ids
+
+
+def test_record_prepare_skip_releases_claim_and_records_stop(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    claim = event_store.acquire_claim(
+        "task-a", "worker-1", now=_t(0), lease_seconds=30
+    )
+    assert claim is not None
+    event_store.record_prepare_skip(
+        claim, detail="RuntimeError: sandbox boom", now=_t(5)
+    )
+    # Same call released the claim (a ``released`` event) AND wrote the stop.
+    assert event_store.load_claim("task-a") is None
+    assert _types(event_store.list_task_events("task-a")) == [
+        EVENT_ACQUIRED,
+        EVENT_RELEASED,
+    ]
+    stops = event_store.list_subject_stop_events("task-a")
+    assert [r.kind for r in stops] == [STOP_PREPARE_SKIP]
+    assert stops[0].detail == "RuntimeError: sandbox boom"
+    assert stops[0].occurred_at == _t(5)
+
+
+def test_recurring_prepare_skip_records_one_row_per_occurrence(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    # A prepare-preflight failure recurring across three cycles is three stop
+    # rows (the claim is re-acquired each cycle), never deduped.
+    for cycle in range(3):
+        claim = event_store.acquire_claim(
+            "task-a", "worker-1", now=_t(cycle * 10), lease_seconds=5
+        )
+        assert claim is not None
+        event_store.record_prepare_skip(
+            claim, detail=f"cycle {cycle}", now=_t(cycle * 10 + 1)
+        )
+    stops = event_store.list_subject_stop_events("task-a")
+    assert [r.detail for r in stops] == ["cycle 0", "cycle 1", "cycle 2"]
+
+
+def test_stop_ledger_exposes_no_mutating_surface(
+    event_store: InMemoryClaimStore | SqliteClaimStore,
+) -> None:
+    for forbidden in (
+        "update_stop_event",
+        "delete_stop_event",
+        "edit_stop_event",
+        "remove_stop_event",
+        "clear_stop_events",
+    ):
+        assert not hasattr(event_store, forbidden)
+
+
 def _build_v3_sqlite_store(path: Path) -> None:
     """Materialize a schema-v3 orchestrator store (pre-ledger) with rows.
 
@@ -1054,6 +1160,65 @@ def test_sqlite_postgres_event_ledger_parity(
             assert _event_tuples(
                 sqlite_store.list_task_events(task_id)
             ) == _event_tuples(pg_store.list_task_events(task_id))
+    finally:
+        sqlite_store.close()
+        pg_store.close()
+
+
+def test_sqlite_postgres_stop_event_ledger_parity(
+    tmp_path: Path,
+    postgres_dsn: str | None,
+) -> None:
+    # The stop-event ledger reads back identically across the durable backends:
+    # same kind spellings, subjects, details, and insertion order (ids dropped).
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    from flywheel_orchestrator import PostgresClaimStore
+
+    sqlite_store = SqliteClaimStore(tmp_path / "stop_parity.db")
+    pg_store = PostgresClaimStore(
+        postgres_dsn,
+        schema=f"flywheel_claims_test_{uuid4().hex[:12]}",
+        pool_min=1,
+        pool_max=4,
+    )
+
+    def _drive_stops(store: SqliteClaimStore | PostgresClaimStore) -> None:
+        store.record_stop_event(
+            kind=STOP_DANGLING_PREREQUISITE,
+            subject="task-a",
+            detail="prerequisite 'missing' resolves to no work item",
+            occurred_at=_t(0),
+        )
+        claim = store.acquire_claim(
+            "task-a", "worker-1", now=_t(1), lease_seconds=30
+        )
+        assert claim is not None
+        store.record_prepare_skip(claim, detail="boom", now=_t(2))
+        # Recurrence is preserved: the same no-op stop twice is two rows.
+        for _ in range(2):
+            store.record_stop_event(
+                kind=STOP_NO_OP_CYCLE,
+                subject="queue-dir",
+                detail="idle (observed queue depth 0, target 5)",
+                occurred_at=_t(3),
+            )
+
+    def _stop_tuples(rows: list) -> list:
+        return [(r.kind, r.subject, r.detail, r.occurred_at) for r in rows]
+
+    try:
+        _drive_stops(sqlite_store)
+        _drive_stops(pg_store)
+        assert _stop_tuples(sqlite_store.list_stop_events()) == _stop_tuples(
+            pg_store.list_stop_events()
+        )
+        for subject in ("task-a", "queue-dir"):
+            assert _stop_tuples(
+                sqlite_store.list_subject_stop_events(subject)
+            ) == _stop_tuples(pg_store.list_subject_stop_events(subject))
+        # queue-dir carries two identical rows: the ledger never dedupes.
+        assert len(pg_store.list_subject_stop_events("queue-dir")) == 2
     finally:
         sqlite_store.close()
         pg_store.close()

@@ -25,15 +25,23 @@ from flywheel_core import (
     Status,
     ValidEnvelope,
 )
+import flywheel_orchestrator._github as _github_mod
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_core.task import CommandGrader, Task
 from flywheel_orchestrator import (
     DirectoryWorkSource,
+    InMemoryClaimStore,
     WorkItem,
     WorkReport,
+    build_work_source,
+    load_policy,
     orchestrate,
     select_next_task,
     status_rows_for_items,
+)
+from flywheel_orchestrator._claims import (
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
 )
 
 
@@ -315,6 +323,71 @@ def test_orchestrate_requires_exactly_one_of_tasks_dir_and_source(
                 sandbox_root=tmp_path / "sb",
             )
         )
+
+
+# --- stop ledger: source signals routed through the production builder ------
+
+
+def _github_policy(tmp_path: Path, *, with_graders: bool):
+    lines = [
+        "[source]",
+        'kind = "github"',
+        'repo = "octo/widgets"',
+        'label = "flywheel"',
+    ]
+    if with_graders:
+        lines += ["[[defaults.graders]]", 'type = "command"', 'run = "true"']
+    (tmp_path / "flywheel.toml").write_text("\n".join(lines), encoding="utf-8")
+    return load_policy(tmp_path / "flywheel.toml")
+
+
+def test_source_truncation_records_durable_row_and_keeps_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = _github_policy(tmp_path, with_graders=True)
+    page = json.dumps(
+        [
+            {"number": n, "title": "t", "body": "Please.", "url": "u"}
+            for n in range(1, 201)
+        ]
+    )
+    monkeypatch.setattr(_github_mod, "_default_runner", lambda argv: page)
+
+    # The sequence a source returns is byte-for-byte identical with or without
+    # a control store bound (the record is a pure side channel).
+    baseline = build_work_source(policy).list_work()
+    control = InMemoryClaimStore()
+    witnessed = build_work_source(policy, control=control).list_work()
+
+    assert [i.task.id for i in witnessed] == [i.task.id for i in baseline]
+    assert len(witnessed) == 200
+    truncations = [
+        r
+        for r in control.list_stop_events()
+        if r.kind == STOP_SOURCE_TRUNCATION
+    ]
+    assert len(truncations) == 1
+
+
+def test_zero_grader_drop_records_durable_row_and_keeps_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = _github_policy(tmp_path, with_graders=False)
+    payload = json.dumps(
+        [{"number": 4, "title": "Vague", "body": "", "url": "u"}]
+    )
+    monkeypatch.setattr(_github_mod, "_default_runner", lambda argv: payload)
+
+    baseline = build_work_source(policy).list_work()
+    control = InMemoryClaimStore()
+    witnessed = build_work_source(policy, control=control).list_work()
+
+    # The zero-grader item is dropped from the sequence with or without a store.
+    assert baseline == [] and witnessed == []
+    drops = [
+        r for r in control.list_stop_events() if r.kind == STOP_ZERO_GRADER_DROP
+    ]
+    assert len(drops) == 1
 
 
 def test_directory_backed_orchestrate_unchanged(tmp_path: Path) -> None:

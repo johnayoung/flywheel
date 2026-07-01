@@ -35,10 +35,12 @@ from flywheel_orchestrator._claims import (
     EVENT_RENEWED,
     EVENT_STOLEN,
     ClaimLostError,
+    STOP_PREPARE_SKIP,
     GraphSnapshotItem,
     GraphSnapshotRecord,
     OrchestratorEventRecord,
     OrchestratorSchemaError,
+    OrchestratorStopEventRecord,
     SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
@@ -85,6 +87,12 @@ _ORCH_EVENT_SELECT = """
     SELECT id, task_id, worker_id, event_type, version,
            lease_expires_at, occurred_at
     FROM orchestrator_events
+"""
+
+
+_ORCH_STOP_EVENT_SELECT = """
+    SELECT id, kind, subject, detail, occurred_at
+    FROM orchestrator_stop_events
 """
 
 
@@ -147,6 +155,18 @@ def _row_to_orchestrator_event_record(
         event_type=row["event_type"],
         version=int(row["version"]),
         lease_expires_at=row["lease_expires_at"],
+        occurred_at=row["occurred_at"],
+    )
+
+
+def _row_to_orchestrator_stop_event_record(
+    row: dict[str, Any],
+) -> OrchestratorStopEventRecord:
+    return OrchestratorStopEventRecord(
+        id=int(row["id"]),
+        kind=row["kind"],
+        subject=row["subject"],
+        detail=row["detail"],
         occurred_at=row["occurred_at"],
     )
 
@@ -397,20 +417,44 @@ class PostgresClaimStore:
                       ON graph_snapshot_items (snapshot_id)
                     """
                 )
+                # Additive v6 migration: the append-only orchestrator
+                # stop-event ledger (the closed pre-run dead-end taxonomy).
+                # CREATE TABLE IF NOT EXISTS materializes it on open, so a
+                # pre-existing v1..v5 store keeps every prior row and simply
+                # gains an empty stop-event stream -- no drop-and-recreate.
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
+                      id          BIGSERIAL PRIMARY KEY,
+                      kind        TEXT NOT NULL,
+                      subject     TEXT NOT NULL,
+                      detail      TEXT NOT NULL,
+                      occurred_at TIMESTAMPTZ NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_orchestrator_stop_events_subject
+                      ON orchestrator_stop_events (subject, id)
+                    """
+                )
                 cur.execute(
                     "INSERT INTO orchestrator_schema_version (id, version) "
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
                 )
-                # Additive forward migration v1/v2/v3/v4 -> v5: the WorkGraph
+                # Additive forward migration v1..v5 -> v6: the WorkGraph
                 # tables (v2), the conflict-keys column (v3), the
-                # orchestrator_events ledger (v4), and the graph_snapshots /
-                # graph_snapshot_items tables (v5) were just materialized above,
-                # so a pre-existing store keeps its task_claims / work_items /
-                # source_syncs / orchestrator_events rows intact. Converge any
-                # older sentinel forward rather than refusing the store; a
-                # newer-than-current version still trips the mismatch guard
-                # below.
+                # orchestrator_events ledger (v4), the graph_snapshots /
+                # graph_snapshot_items tables (v5), and the
+                # orchestrator_stop_events ledger (v6) were just materialized
+                # above, so a pre-existing store keeps its task_claims /
+                # work_items / source_syncs / orchestrator_events rows intact.
+                # Converge any older sentinel forward rather than refusing the
+                # store; a newer-than-current version still trips the mismatch
+                # guard below.
                 cur.execute(
                     "UPDATE orchestrator_schema_version SET version = %s "
                     "WHERE id = 1 AND version < %s",
@@ -726,6 +770,109 @@ class PostgresClaimStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_orchestrator_event_record(row) for row in rows]
+
+    # -- orchestrator stop-event ledger (schema v6) ------------------------
+
+    def _insert_stop_event(
+        self,
+        cur: Cursor[Any],
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Append one stop row using the caller's cursor, so a prepare-skip stop
+        # commits atomically with the claim release it accompanies (D-3). Never
+        # dedupes -- recurrence is the signal.
+        cur.execute(
+            """
+            INSERT INTO orchestrator_stop_events
+                (kind, subject, detail, occurred_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (kind, subject, detail, occurred_at),
+        )
+
+    def record_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Audit-witness only: append one row naming the stop and its cause.
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                self._insert_stop_event(
+                    cur,
+                    kind=kind,
+                    subject=subject,
+                    detail=detail,
+                    occurred_at=occurred_at,
+                )
+
+    def record_prepare_skip(
+        self,
+        claim: TaskClaim,
+        *,
+        detail: str,
+        now: datetime,
+    ) -> None:
+        # A sandbox prepare/preflight failure: the claim release (with its
+        # ``released`` event when the token still owns a row) and the
+        # ``prepare-skip`` stop row commit in one transaction (D-3). The stop
+        # row is written unconditionally -- the dead-end happened regardless of
+        # whether the release found a matching row to delete.
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM task_claims "
+                    "WHERE task_id = %s AND version = %s AND worker_id = %s "
+                    "RETURNING task_id",
+                    (claim.task_id, claim.version, claim.worker_id),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    self._append_event(
+                        cur,
+                        task_id=claim.task_id,
+                        worker_id=claim.worker_id,
+                        event_type=EVENT_RELEASED,
+                        version=claim.version,
+                        lease_expires_at=claim.lease_expires_at,
+                        occurred_at=now,
+                    )
+                self._insert_stop_event(
+                    cur,
+                    kind=STOP_PREPARE_SKIP,
+                    subject=claim.task_id,
+                    detail=detail,
+                    occurred_at=now,
+                )
+
+    def list_stop_events(self) -> list[OrchestratorStopEventRecord]:
+        # Global stream: every recorded stop in id (insertion) order.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_ORCH_STOP_EVENT_SELECT + " ORDER BY id")
+                rows = cur.fetchall()
+        return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
+    def list_subject_stop_events(
+        self, subject: str
+    ) -> list[OrchestratorStopEventRecord]:
+        # Per-subject timeline: one subject's stops in id order.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _ORCH_STOP_EVENT_SELECT
+                    + " WHERE subject = %s ORDER BY id",
+                    (subject,),
+                )
+                rows = cur.fetchall()
+        return [_row_to_orchestrator_stop_event_record(row) for row in rows]
 
     # -- WorkGraph snapshots (schema v5) -----------------------------------
 

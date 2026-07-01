@@ -65,7 +65,19 @@ if TYPE_CHECKING:
 # pre-existing v1/v2/v3/v4 store keeps every existing row and simply gains an
 # empty snapshot stream; the sentinel converges forward, no drop-and-recreate,
 # no hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 5
+#
+# v6 adds the additive append-only ``orchestrator_stop_events`` ledger (spec
+# per-task-stop-records): one immutable row per pre-run dead-end that produced
+# no run_id -- a dangling prerequisite, a no-op autopilot cycle, a recurring
+# container prepare-preflight skip, a source-listing truncation, or a
+# zero-grader item drop -- naming the stop's ``kind`` (a member of
+# :data:`ORCHESTRATOR_STOP_EVENT_KINDS`), its ``subject`` (the task id or the
+# source name), and its ``detail`` (the cause). The bump is additive --
+# ``CREATE TABLE IF NOT EXISTS`` materializes the table on open, so a
+# pre-existing v1..v5 store keeps every existing row and simply gains an empty
+# stop-event ledger; the sentinel converges forward, no drop-and-recreate, no
+# hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 6
 
 # The five event types the ledger records, one per committed ``task_claims``
 # insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
@@ -84,6 +96,37 @@ ORCHESTRATOR_EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_RENEWED,
         EVENT_RELEASED,
         EVENT_EXPIRED,
+    }
+)
+
+# The five stop-event kinds the orchestrator records for a pre-run dead-end that
+# produced no run_id (spec per-task-stop-records). A CLOSED taxonomy mirroring
+# the claim-event taxonomy above: audit-witness rows that name a stop and its
+# cause without changing which work is (or is not) scheduled. Recurrence is the
+# signal, so the ledger never dedupes -- one row per occurrence.
+#
+# * ``dangling-prerequisite`` -- a task whose declared prerequisite resolves to
+#   no work item this pass; the task stays out of the ready set.
+# * ``no-op-cycle`` -- an autopilot refill cycle that emitted zero tasks.
+# * ``prepare-skip`` -- a sandbox prepare/preflight failure that releases the
+#   claim and continues without minting a run.
+# * ``source-truncation`` -- a work-source listing that filled its one-page cap,
+#   so some candidate items were not read this pass.
+# * ``zero-grader-drop`` -- a candidate item a source dropped as not runnable
+#   because it resolved to no graders.
+STOP_DANGLING_PREREQUISITE: str = "dangling-prerequisite"
+STOP_NO_OP_CYCLE: str = "no-op-cycle"
+STOP_PREPARE_SKIP: str = "prepare-skip"
+STOP_SOURCE_TRUNCATION: str = "source-truncation"
+STOP_ZERO_GRADER_DROP: str = "zero-grader-drop"
+
+ORCHESTRATOR_STOP_EVENT_KINDS: frozenset[str] = frozenset(
+    {
+        STOP_DANGLING_PREREQUISITE,
+        STOP_NO_OP_CYCLE,
+        STOP_PREPARE_SKIP,
+        STOP_SOURCE_TRUNCATION,
+        STOP_ZERO_GRADER_DROP,
     }
 )
 
@@ -201,6 +244,51 @@ class OrchestratorEventRecord:
     version: int
     lease_expires_at: datetime
     occurred_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
+class OrchestratorStopEventRecord:
+    """One immutable ``orchestrator_stop_events`` row -- a pre-run dead-end
+    that produced no run_id (spec per-task-stop-records).
+
+    Append-only, never updated or deleted, and never deduped: recurrence is the
+    signal, so a stop observed on N passes is N rows. ``id`` is the monotonic,
+    backend-assigned insertion id, so both the global stream and a per-subject
+    timeline read back in ``id`` order. ``kind`` is one member of
+    :data:`ORCHESTRATOR_STOP_EVENT_KINDS`; ``subject`` names what the stop is
+    about (a task id for ``dangling-prerequisite`` / ``prepare-skip``, a source
+    name for ``no-op-cycle`` / ``source-truncation`` / ``zero-grader-drop``);
+    ``detail`` carries the cause (the missing prerequisite id, the no-op reason
+    plus observed/target depth, the prepare failure text, the truncation or
+    zero-grader specifics). ``occurred_at`` is the injected timestamp -- never a
+    wall clock, so the ledger is deterministic and testable.
+    """
+
+    id: int
+    kind: str
+    subject: str
+    detail: str
+    occurred_at: datetime
+
+
+@runtime_checkable
+class StopEventStore(Protocol):
+    """The narrow sink a stop-event producer records through.
+
+    Every :class:`ClaimStore` backend also satisfies this protocol, so the
+    work-source stop sink, the orchestrator loop (dangling prerequisite,
+    prepare skip), and the autopilot pass (no-op cycle) all record through the
+    same append-only ledger without depending on a concrete backend type.
+    """
+
+    def record_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -402,6 +490,18 @@ def _row_to_orchestrator_event_record(
     )
 
 
+def _row_to_orchestrator_stop_event_record(
+    row: sqlite3.Row,
+) -> OrchestratorStopEventRecord:
+    return OrchestratorStopEventRecord(
+        id=int(row["id"]),
+        kind=row["kind"],
+        subject=row["subject"],
+        detail=row["detail"],
+        occurred_at=_parse_iso(row["occurred_at"]),
+    )
+
+
 def _row_to_graph_snapshot_record(row: sqlite3.Row) -> GraphSnapshotRecord:
     return GraphSnapshotRecord(
         id=int(row["id"]),
@@ -475,6 +575,7 @@ class InMemoryClaimStore:
         self._claims: dict[str, TaskClaim] = {}
         self._conflict_keys: dict[str, frozenset[str]] = {}
         self._events: list[OrchestratorEventRecord] = []
+        self._stop_events: list[OrchestratorStopEventRecord] = []
         self._snapshots: list[GraphSnapshotRecord] = []
         self._snapshot_items: dict[int, list[GraphSnapshotItem]] = {}
 
@@ -499,6 +600,27 @@ class InMemoryClaimStore:
                 event_type=event_type,
                 version=version,
                 lease_expires_at=lease_expires_at,
+                occurred_at=occurred_at,
+            )
+        )
+
+    def _append_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Append-only, never deduped: a fresh monotonic id (1-based) per
+        # recorded stop, stored in insertion order so both read accessors
+        # return in id order without sorting.
+        self._stop_events.append(
+            OrchestratorStopEventRecord(
+                id=len(self._stop_events) + 1,
+                kind=kind,
+                subject=subject,
+                detail=detail,
                 occurred_at=occurred_at,
             )
         )
@@ -667,6 +789,64 @@ class InMemoryClaimStore:
         # Per-task timeline: one task's events in id order.
         return [event for event in self._events if event.task_id == task_id]
 
+    def record_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Audit-witness only: append one row naming the stop and its cause.
+        # Never dedupes -- recurrence is the signal.
+        self._append_stop_event(
+            kind=kind, subject=subject, detail=detail, occurred_at=occurred_at
+        )
+
+    def record_prepare_skip(
+        self,
+        claim: TaskClaim,
+        *,
+        detail: str,
+        now: datetime,
+    ) -> None:
+        # A sandbox prepare/preflight failure: release the claim AND record the
+        # stop event together (D-3). The release records ``released`` only when
+        # the token still owns a row (mirroring release_claim); the stop event
+        # is recorded unconditionally, since the dead-end happened regardless.
+        existing = self._claims.get(claim.task_id)
+        if (
+            existing is not None
+            and existing.version == claim.version
+            and existing.worker_id == claim.worker_id
+        ):
+            del self._claims[claim.task_id]
+            self._conflict_keys.pop(claim.task_id, None)
+            self._append_event(
+                task_id=claim.task_id,
+                worker_id=claim.worker_id,
+                event_type=EVENT_RELEASED,
+                version=claim.version,
+                lease_expires_at=claim.lease_expires_at,
+                occurred_at=now,
+            )
+        self._append_stop_event(
+            kind=STOP_PREPARE_SKIP,
+            subject=claim.task_id,
+            detail=detail,
+            occurred_at=now,
+        )
+
+    def list_stop_events(self) -> list[OrchestratorStopEventRecord]:
+        # Global stream: every recorded stop in id (insertion) order.
+        return list(self._stop_events)
+
+    def list_subject_stop_events(
+        self, subject: str
+    ) -> list[OrchestratorStopEventRecord]:
+        # Per-subject timeline: one subject's stops in id order.
+        return [e for e in self._stop_events if e.subject == subject]
+
     def record_graph_snapshot(
         self,
         items: Iterable[GraphSnapshotItem],
@@ -783,6 +963,17 @@ CREATE TABLE IF NOT EXISTS orchestrator_events (
 CREATE INDEX IF NOT EXISTS idx_orchestrator_events_task
   ON orchestrator_events (task_id, id);
 
+CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind        TEXT NOT NULL,
+  subject     TEXT NOT NULL,
+  detail      TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_subject
+  ON orchestrator_stop_events (subject, id);
+
 CREATE TABLE IF NOT EXISTS graph_snapshots (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   captured_at   TEXT NOT NULL,
@@ -870,14 +1061,15 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1/v2/v3/v4 -> v5: the WorkGraph tables
-        # (v2), the conflict-keys column (v3), the orchestrator_events ledger
-        # (v4), and the graph_snapshots/graph_snapshot_items tables (v5) were
-        # all materialized above via CREATE TABLE IF NOT EXISTS, so a
-        # pre-existing store keeps its task_claims/work_items/source_syncs/
-        # orchestrator_events rows intact and simply gains an empty snapshot
-        # stream. Converge the sentinel forward rather than refusing the store;
-        # a newer-than-current version still trips the mismatch guard below.
+        # Additive forward migration v1..v5 -> v6: the WorkGraph tables (v2),
+        # the conflict-keys column (v3), the orchestrator_events ledger (v4),
+        # the graph_snapshots/graph_snapshot_items tables (v5), and the
+        # orchestrator_stop_events ledger (v6) were all materialized above via
+        # CREATE TABLE IF NOT EXISTS, so a pre-existing store keeps its
+        # task_claims/work_items/source_syncs/orchestrator_events/snapshot rows
+        # intact and simply gains an empty stop-event stream. Converge the
+        # sentinel forward rather than refusing the store; a newer-than-current
+        # version still trips the mismatch guard below.
         if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
                 "UPDATE orchestrator_schema_version SET version = ? "
@@ -1199,6 +1391,95 @@ class SqliteClaimStore:
         ).fetchall()
         return [_row_to_orchestrator_event_record(row) for row in rows]
 
+    # -- stop-event ledger (schema v6) -------------------------------------
+
+    def _insert_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Append one stop row. MUST be called inside an open ``_transaction`` so
+        # a prepare-skip stop commits atomically with the claim release it
+        # accompanies (D-3). Never dedupes -- recurrence is the signal.
+        self._connection.execute(
+            "INSERT INTO orchestrator_stop_events (kind, subject, detail, "
+            "occurred_at) VALUES (?, ?, ?, ?)",
+            (kind, subject, detail, _iso(occurred_at)),
+        )
+
+    def record_stop_event(
+        self,
+        *,
+        kind: str,
+        subject: str,
+        detail: str,
+        occurred_at: datetime,
+    ) -> None:
+        # Audit-witness only: append one row naming the stop and its cause.
+        with self._transaction():
+            self._insert_stop_event(
+                kind=kind,
+                subject=subject,
+                detail=detail,
+                occurred_at=occurred_at,
+            )
+
+    def record_prepare_skip(
+        self,
+        claim: TaskClaim,
+        *,
+        detail: str,
+        now: datetime,
+    ) -> None:
+        # A sandbox prepare/preflight failure: the claim release (with its
+        # ``released`` event when the token still owns a row) and the
+        # ``prepare-skip`` stop row commit in one transaction (D-3). The stop
+        # row is written unconditionally -- the dead-end happened regardless of
+        # whether the release found a matching row to delete.
+        with self._transaction():
+            cursor = self._connection.execute(
+                "DELETE FROM task_claims "
+                "WHERE task_id = ? AND version = ? AND worker_id = ?",
+                (claim.task_id, claim.version, claim.worker_id),
+            )
+            if cursor.rowcount == 1:
+                self._append_event(
+                    task_id=claim.task_id,
+                    worker_id=claim.worker_id,
+                    event_type=EVENT_RELEASED,
+                    version=claim.version,
+                    lease_expires_at=claim.lease_expires_at,
+                    occurred_at=now,
+                )
+            self._insert_stop_event(
+                kind=STOP_PREPARE_SKIP,
+                subject=claim.task_id,
+                detail=detail,
+                occurred_at=now,
+            )
+
+    def list_stop_events(self) -> list[OrchestratorStopEventRecord]:
+        # Global stream: every recorded stop in id (insertion) order.
+        rows = self._connection.execute(
+            "SELECT id, kind, subject, detail, occurred_at "
+            "FROM orchestrator_stop_events ORDER BY id"
+        ).fetchall()
+        return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
+    def list_subject_stop_events(
+        self, subject: str
+    ) -> list[OrchestratorStopEventRecord]:
+        # Per-subject timeline: one subject's stops in id order.
+        rows = self._connection.execute(
+            "SELECT id, kind, subject, detail, occurred_at "
+            "FROM orchestrator_stop_events WHERE subject = ? ORDER BY id",
+            (subject,),
+        ).fetchall()
+        return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
     # -- WorkGraph snapshots (schema v5) -----------------------------------
 
     def record_graph_snapshot(
@@ -1509,6 +1790,12 @@ __all__ = [
     "EVENT_RENEWED",
     "EVENT_STOLEN",
     "ORCHESTRATOR_EVENT_TYPES",
+    "ORCHESTRATOR_STOP_EVENT_KINDS",
+    "STOP_DANGLING_PREREQUISITE",
+    "STOP_NO_OP_CYCLE",
+    "STOP_PREPARE_SKIP",
+    "STOP_SOURCE_TRUNCATION",
+    "STOP_ZERO_GRADER_DROP",
     "ClaimLostError",
     "ClaimStore",
     "GraphSnapshotItem",
@@ -1517,7 +1804,9 @@ __all__ = [
     "SqliteClaimStore",
     "OrchestratorEventRecord",
     "OrchestratorSchemaError",
+    "OrchestratorStopEventRecord",
     "SourceSyncRecord",
+    "StopEventStore",
     "TaskClaim",
     "WorkItemRecord",
 ]

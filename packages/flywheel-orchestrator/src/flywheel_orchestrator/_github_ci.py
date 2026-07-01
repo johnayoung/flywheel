@@ -49,6 +49,10 @@ from typing import Any
 
 from flywheel_core.task import Context, Grader, Task, ValidationError
 
+from flywheel_orchestrator._claims import (
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
+)
 from flywheel_orchestrator._github import (
     GhRunner,
     _default_runner,
@@ -56,6 +60,7 @@ from flywheel_orchestrator._github import (
     emit_truncation_warning,
 )
 from flywheel_orchestrator._sources import (
+    StopEventSink,
     WorkItem,
     WorkReport,
     WorkSourceError,
@@ -134,6 +139,7 @@ class GithubCiWorkSource:
         failure_filter: str = _DEFAULT_FAILURE_FILTER,
         runner: GhRunner | None = None,
         log: Callable[[str], None] | None = None,
+        stop_sink: StopEventSink | None = None,
     ) -> None:
         if not repo:
             raise ValueError("repo must be a non-empty 'owner/repo' string")
@@ -144,6 +150,7 @@ class GithubCiWorkSource:
         self.failure_filter = failure_filter
         self._run = runner if runner is not None else _default_runner
         self._log = log
+        self._stop_sink = stop_sink
         #: Number of run rows the most recent :meth:`list_work` skipped
         #: because they could not be compiled into a valid item (malformed
         #: output, missing identity field, failed validation). A reconciler
@@ -194,6 +201,13 @@ class GithubCiWorkSource:
             emit_truncation_warning(
                 self._log, source="github_ci", what="run"
             )
+            if self._stop_sink is not None:
+                self._stop_sink(
+                    STOP_SOURCE_TRUNCATION,
+                    self.source_name,
+                    f"run listing truncated at one page ({_LIST_LIMIT} "
+                    f"runs); some runs were not read this pass",
+                )
 
         # One uncompilable run row is skipped (counted + logged), not fatal:
         # it must not hide every other failing run. ``skipped`` feeds
@@ -275,6 +289,13 @@ class GithubCiWorkSource:
                 self._log(
                     f"[github_ci] skipping {item_id} ({workflow} on "
                     f"{branch}): no default grader policy -- not runnable"
+                )
+            if self._stop_sink is not None:
+                self._stop_sink(
+                    STOP_ZERO_GRADER_DROP,
+                    self.source_name,
+                    f"{item_id} ({workflow} on {branch}): no default grader "
+                    f"policy -- not runnable",
                 )
             return None
 

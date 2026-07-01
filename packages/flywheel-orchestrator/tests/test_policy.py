@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+import flywheel_orchestrator._github as _github_mod
 from flywheel_core.task import CommandGrader, TranscriptGrader
 from flywheel_orchestrator import (
     DEFAULT_TASKS_DIR,
     DirectoryWorkSource,
     GithubWorkSource,
+    InMemoryClaimStore,
     PolicyError,
     build_work_source,
     load_policy,
 )
+from flywheel_orchestrator._claims import (
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
+)
+from flywheel_orchestrator._policy import build_github_source
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -646,6 +654,94 @@ def test_build_github_source_carries_policy(tmp_path: Path) -> None:
     assert source.label == "flywheel"
     assert source.done_action == "close"
     assert len(source.default_graders) == 1
+
+
+# --- source builders wire the stop sink to the durable ledger ---------------
+
+
+def _github_policy(tmp_path: Path, *, with_graders: bool):
+    lines = [
+        "[source]",
+        'kind = "github"',
+        'repo = "octo/widgets"',
+        'label = "flywheel"',
+    ]
+    if with_graders:
+        lines += ["[[defaults.graders]]", 'type = "command"', 'run = "true"']
+    return load_policy(_write(tmp_path, "\n".join(lines)))
+
+
+def test_build_github_source_wires_zero_grader_drop_to_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No default graders + an issue with no flywheel block -> the item drops
+    # from the sequence AND the drop is witnessed on the durable ledger.
+    policy = _github_policy(tmp_path, with_graders=False)
+    payload = json.dumps(
+        [{"number": 4, "title": "Vague", "body": "", "url": "u"}]
+    )
+    monkeypatch.setattr(_github_mod, "_default_runner", lambda argv: payload)
+    control = InMemoryClaimStore()
+
+    source = build_work_source(policy, control=control)
+    assert isinstance(source, GithubWorkSource)
+    assert source.list_work() == []  # sequence unchanged: still dropped
+
+    rows = control.list_stop_events()
+    assert [r.kind for r in rows] == [STOP_ZERO_GRADER_DROP]
+    assert rows[0].subject == source.source_name
+
+
+def test_build_github_source_wires_truncation_to_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = _github_policy(tmp_path, with_graders=True)
+    page = json.dumps(
+        [
+            {"number": n, "title": "t", "body": "Please.", "url": "u"}
+            for n in range(1, 201)
+        ]
+    )
+    monkeypatch.setattr(_github_mod, "_default_runner", lambda argv: page)
+    control = InMemoryClaimStore()
+
+    source = build_github_source(policy, control=control)
+    assert isinstance(source, GithubWorkSource)
+    items = source.list_work()
+
+    assert len(items) == 200  # sequence unchanged by the sink
+    truncations = [
+        r for r in control.list_stop_events() if r.kind == STOP_SOURCE_TRUNCATION
+    ]
+    assert len(truncations) == 1
+    assert truncations[0].subject == source.source_name
+
+
+def test_build_source_without_control_records_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Absent a control store the source behaves byte-for-byte as before: the
+    # zero-grader item still drops, and nothing is recorded (no sink at all).
+    policy = _github_policy(tmp_path, with_graders=False)
+    payload = json.dumps(
+        [{"number": 4, "title": "Vague", "body": "", "url": "u"}]
+    )
+    monkeypatch.setattr(_github_mod, "_default_runner", lambda argv: payload)
+
+    source = build_work_source(policy)
+    assert source.list_work() == []  # unchanged sequence, no store, no crash
+
+
+def test_build_directory_source_accepts_control_and_records_nothing(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\ntasks_dir = "queue"\n')
+    )
+    control = InMemoryClaimStore()
+    source = build_work_source(policy, control=control)
+    assert isinstance(source, DirectoryWorkSource)
+    assert control.list_stop_events() == []
 
 
 # --- [submit] protected_paths -------------------------------------------------

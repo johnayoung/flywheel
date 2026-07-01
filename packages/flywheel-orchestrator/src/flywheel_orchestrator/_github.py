@@ -52,7 +52,12 @@ from flywheel_core.lifecycle import Status
 from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.task import Context, Grader, Task, ValidationError
 
+from flywheel_orchestrator._claims import (
+    STOP_SOURCE_TRUNCATION,
+    STOP_ZERO_GRADER_DROP,
+)
 from flywheel_orchestrator._sources import (
+    StopEventSink,
     WorkItem,
     WorkReport,
     WorkSourceError,
@@ -227,6 +232,7 @@ class GithubWorkSource:
         done_action: str = "comment",
         runner: GhRunner | None = None,
         log: Callable[[str], None] | None = None,
+        stop_sink: StopEventSink | None = None,
     ) -> None:
         if done_action not in ("comment", "close"):
             raise ValueError(
@@ -239,6 +245,7 @@ class GithubWorkSource:
         self.done_action = done_action
         self._run = runner if runner is not None else _default_runner
         self._log = log
+        self._stop_sink = stop_sink
 
     @property
     def source_name(self) -> str:
@@ -277,6 +284,13 @@ class GithubWorkSource:
             )
         if len(issues) == int(_LIST_LIMIT):
             emit_truncation_warning(self._log, source="github", what="issue")
+            if self._stop_sink is not None:
+                self._stop_sink(
+                    STOP_SOURCE_TRUNCATION,
+                    self.source_name,
+                    f"issue listing truncated at one page ({_LIST_LIMIT} "
+                    f"items); some items were not read this pass",
+                )
         items: list[WorkItem] = []
         skipped: list[WorkSourceError] = []
         for issue in sorted(
@@ -329,6 +343,13 @@ class GithubWorkSource:
                     f"[github] skipping {source_ref}: no graders in the "
                     f"issue's flywheel block and no default grader policy "
                     f"-- not runnable"
+                )
+            if self._stop_sink is not None:
+                self._stop_sink(
+                    STOP_ZERO_GRADER_DROP,
+                    self.source_name,
+                    f"{source_ref}: no graders in the issue's flywheel block "
+                    f"and no default grader policy -- not runnable",
                 )
             return None
 

@@ -8,8 +8,13 @@ without depending on the CLI being installed or authenticated.
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from typing import Any
+
+import psycopg
+import psycopg_pool
+import pytest
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -34,6 +39,12 @@ from flywheel_core.envelope import (
     TruncatedEnvelope,
     ValidEnvelope,
 )
+from flywheel_core.faults import (
+    BackoffPolicy,
+    FaultClass,
+    classify_fault,
+    wait_backoff,
+)
 from flywheel_core.invoker import (
     InvocationSignals,
     IterationResult,
@@ -42,6 +53,12 @@ from flywheel_core.invoker import (
     _serialize_sdk_message,
     invoke_iteration,
 )
+from flywheel_core.store_protocols import (
+    CURRENT_SCHEMA_VERSION,
+    OptimisticConcurrencyError,
+    StoreSchemaError,
+)
+from flywheel_orchestrator._claims import OrchestratorSchemaError
 
 
 def _wrap_envelope(payload: str) -> str:
@@ -610,3 +627,89 @@ class TestOnMessageObserver:
             invoke_iteration(prompt="ignored", message_stream=_stream(a))
         )
         assert result.messages == (a,)
+
+
+# --- Fault classification + bounded backoff --------------------------------
+
+
+_CLASSIFICATION_MATRIX: list[tuple[object, FaultClass | None]] = [
+    # rate-limit / overload surfaced as an HTTP-ish status -> TRANSIENT
+    (429, FaultClass.TRANSIENT),
+    (529, FaultClass.TRANSIENT),
+    # SQLite still busy after its busy_timeout elapsed -> TRANSIENT
+    (sqlite3.OperationalError("database is locked"), FaultClass.TRANSIENT),
+    # dropped Postgres connection -> TRANSIENT
+    (
+        psycopg.OperationalError("server closed the connection unexpectedly"),
+        FaultClass.TRANSIENT,
+    ),
+    # Postgres pool checkout timeout -> TRANSIENT
+    (
+        psycopg_pool.PoolTimeout("couldn't get a connection after 30.0 sec"),
+        FaultClass.TRANSIENT,
+    ),
+    # schema-version mismatch (core store) -> PERMANENT
+    (
+        StoreSchemaError(
+            observed_version=1, expected_version=CURRENT_SCHEMA_VERSION
+        ),
+        FaultClass.PERMANENT,
+    ),
+    # schema-version mismatch (orchestrator store) -> PERMANENT
+    (OrchestratorSchemaError(observed=1, expected=5), FaultClass.PERMANENT),
+    # optimistic-concurrency conflict is NOT transient (harness loop-retries
+    # it) -> classified out of scope, never TRANSIENT
+    (
+        OptimisticConcurrencyError(
+            "run-1", expected_version=3, actual_version=4
+        ),
+        None,
+    ),
+]
+
+
+class TestTransientClassificationMatrix:
+    @pytest.mark.parametrize(
+        "fault, expected",
+        _CLASSIFICATION_MATRIX,
+        ids=[type(f).__name__ if not isinstance(f, int) else str(f) for f, _ in _CLASSIFICATION_MATRIX],
+    )
+    def test_transient_classification_matrix(
+        self, fault: object, expected: FaultClass | None
+    ) -> None:
+        assert classify_fault(fault) is expected
+
+
+class TestBackoffBounded:
+    def test_backoff_bounded(self) -> None:
+        policy = BackoffPolicy(base_seconds=0.5, factor=2.0, cap_seconds=8.0)
+        recorded: list[float] = []
+        delays = [
+            wait_backoff(attempt, policy=policy, sleep=recorded.append)
+            for attempt in range(10)
+        ]
+
+        # The injected sleep captures every wait deterministically, in order.
+        assert recorded == delays
+
+        # Monotonic non-decreasing: each wait is >= the one before it.
+        assert all(b >= a for a, b in zip(delays, delays[1:]))
+
+        # It actually grows -- a constant delay (sleep(0) "backoff") would
+        # produce no strictly-increasing step and fail this assertion.
+        assert any(b > a for a, b in zip(delays, delays[1:]))
+        assert delays[1] > delays[0]
+
+        # Every wait is bounded by the configured cap.
+        assert all(d <= policy.cap_seconds for d in delays)
+        # The cap is reached and then held (the schedule is genuinely capped).
+        assert delays[-1] == policy.cap_seconds
+
+        # Guard the assertions above by showing what they reject: an uncapped
+        # exponential exceeds the cap, and a constant delay never grows.
+        uncapped = [
+            policy.base_seconds * policy.factor**i for i in range(10)
+        ]
+        assert any(u > policy.cap_seconds for u in uncapped)
+        constant = [1.0] * 10
+        assert not any(b > a for a, b in zip(constant, constant[1:]))

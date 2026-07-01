@@ -56,6 +56,13 @@ from flywheel_core.events import (
     apply,
     replay,
 )
+from flywheel_core.faults import (
+    BackoffPolicy,
+    DEFAULT_BACKOFF,
+    FaultClass,
+    classify_fault,
+    wait_backoff,
+)
 from flywheel_core.grader_command import (
     DEFAULT_TAIL_BYTES,
     run_command_graders,
@@ -130,6 +137,7 @@ from flywheel_core.store_protocols import (
     LifecycleNotFoundError,
     LifecycleStore,
     OptimisticConcurrencyError,
+    SchemaMismatchError,
     SdkMessageRecord,
     SpendSummary,
     StoreConflictError,
@@ -195,6 +203,7 @@ __all__ = [
     "AttemptStore",
     "AuditLoggerHandle",
     "AuditRecord",
+    "BackoffPolicy",
     "Blocked",
     "BlockedRequirement",
     "BreachedField",
@@ -207,6 +216,7 @@ __all__ = [
     "ControlCommandRecord",
     "ControlCommandStore",
     "DEFAULT_AGENT_ITERATION_SECONDS",
+    "DEFAULT_BACKOFF",
     "DEFAULT_AUTOPILOT_AGENT_SECONDS",
     "DEFAULT_COMMAND_GRADER_SECONDS",
     "DEFAULT_DEADLINE_SECONDS",
@@ -225,6 +235,7 @@ __all__ = [
     "EventHandler",
     "EventRecord",
     "EventReplayError",
+    "FaultClass",
     "FileExistsRequirement",
     "FileTelemetrySink",
     "Grader",
@@ -262,6 +273,7 @@ __all__ = [
     "RetryScheduled",
     "RubricGrader",
     "RunNotifier",
+    "SchemaMismatchError",
     "SdkMessageRecord",
     "SessionRecorded",
     "SpendSummary",
@@ -294,6 +306,7 @@ __all__ = [
     "apply",
     "attach_logger",
     "build_iteration_prompt",
+    "classify_fault",
     "deadline_config_from_mapping",
     "derive_slug",
     "enforce_transcript_limits",
@@ -317,4 +330,5 @@ __all__ = [
     "subscribe",
     "total_tokens_from_usage",
     "validate_task",
+    "wait_backoff",
 ]

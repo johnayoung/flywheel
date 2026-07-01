@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from flywheel_core.loaders import task_digest
+from flywheel_core.store_protocols import SchemaMismatchError
 
 if TYPE_CHECKING:
     from flywheel_orchestrator._sources import WorkItem
@@ -811,8 +812,13 @@ CREATE INDEX IF NOT EXISTS idx_graph_snapshot_items_snapshot
 """
 
 
-class OrchestratorSchemaError(Exception):
-    """Raised when the orchestrator's on-disk schema version mismatches."""
+class OrchestratorSchemaError(SchemaMismatchError):
+    """Raised when the orchestrator's on-disk schema version mismatches.
+
+    Subclasses the shared :class:`~flywheel_core.store_protocols.SchemaMismatchError`
+    so the fault classifier buckets it PERMANENT alongside the core store's
+    ``StoreSchemaError``.
+    """
 
     def __init__(self, *, observed: int | None, expected: int) -> None:
         super().__init__(

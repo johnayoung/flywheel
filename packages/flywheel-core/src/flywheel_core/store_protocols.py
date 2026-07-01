@@ -75,6 +75,19 @@ class LifecycleNotFoundError(StoreConflictError):
 # --- Schema-version mismatch signal ----------------------------------------
 
 
+class SchemaMismatchError(Exception):
+    """Shared marker base for a schema-version mismatch across store layers.
+
+    Both the core store's :class:`StoreSchemaError` and the orchestrator
+    store's ``OrchestratorSchemaError`` subclass this, so a single fault
+    classifier (``flywheel_core.faults.classify_fault``) can bucket any
+    schema-version mismatch as PERMANENT via one ``isinstance`` check without
+    the core (which cannot import downstream packages) reaching into the
+    orchestrator. Retrying a mismatch cannot reconcile an incompatible
+    on-disk schema — the store must be re-created.
+    """
+
+
 # Bumped whenever the persistence schema gains a backwards-incompatible
 # change. Stores compare their on-disk row against this constant and
 # raise :class:`StoreSchemaError` when it does not match (v11 databases
@@ -83,7 +96,7 @@ class LifecycleNotFoundError(StoreConflictError):
 CURRENT_SCHEMA_VERSION: int = 12
 
 
-class StoreSchemaError(Exception):
+class StoreSchemaError(SchemaMismatchError):
     """Raised when a concrete store opens a database whose
     ``schema_version`` row does not match
     :data:`CURRENT_SCHEMA_VERSION`.
@@ -604,6 +617,7 @@ __all__ = [
     "LifecycleNotFoundError",
     "LifecycleStore",
     "OptimisticConcurrencyError",
+    "SchemaMismatchError",
     "SdkMessageRecord",
     "SpendSummary",
     "StoreConflictError",

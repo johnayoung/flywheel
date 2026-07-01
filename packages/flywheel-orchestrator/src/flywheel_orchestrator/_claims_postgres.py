@@ -29,6 +29,7 @@ from flywheel_core.loaders import task_digest
 
 from flywheel_orchestrator._claims import (
     CURRENT_ORCH_SCHEMA_VERSION,
+    HUMAN_REVIEW_QUEUE_REASONS,
     EVENT_ACQUIRED,
     EVENT_EXPIRED,
     EVENT_RELEASED,
@@ -38,12 +39,14 @@ from flywheel_orchestrator._claims import (
     STOP_PREPARE_SKIP,
     GraphSnapshotItem,
     GraphSnapshotRecord,
+    HumanReviewQueueEntry,
     OrchestratorEventRecord,
     OrchestratorSchemaError,
     OrchestratorStopEventRecord,
     SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
+    _require_review_reason,
     decode_str_set,
     encode_str_set,
 )
@@ -91,7 +94,7 @@ _ORCH_EVENT_SELECT = """
 
 
 _ORCH_STOP_EVENT_SELECT = """
-    SELECT id, kind, subject, detail, occurred_at
+    SELECT id, kind, subject, detail, occurred_at, run_id
     FROM orchestrator_stop_events
 """
 
@@ -166,6 +169,18 @@ def _row_to_orchestrator_stop_event_record(
         id=int(row["id"]),
         kind=row["kind"],
         subject=row["subject"],
+        detail=row["detail"],
+        occurred_at=row["occurred_at"],
+        run_id=row["run_id"],
+    )
+
+
+def _row_to_human_review_entry(row: dict[str, Any]) -> HumanReviewQueueEntry:
+    return HumanReviewQueueEntry(
+        id=int(row["id"]),
+        task_id=row["subject"],
+        run_id=row["run_id"],
+        reason=row["kind"],
         detail=row["detail"],
         occurred_at=row["occurred_at"],
     )
@@ -429,8 +444,19 @@ class PostgresClaimStore:
                       kind        TEXT NOT NULL,
                       subject     TEXT NOT NULL,
                       detail      TEXT NOT NULL,
-                      occurred_at TIMESTAMPTZ NOT NULL
+                      occurred_at TIMESTAMPTZ NOT NULL,
+                      run_id      TEXT NOT NULL DEFAULT ''
                     )
+                    """
+                )
+                # Additive v7 migration: a pre-existing v6 store has an
+                # orchestrator_stop_events table predating the run_id column.
+                # ADD COLUMN IF NOT EXISTS adds it in place (default '', so
+                # every existing stop row survives); new stores already have it.
+                cur.execute(
+                    """
+                    ALTER TABLE orchestrator_stop_events ADD COLUMN IF NOT
+                      EXISTS run_id TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cur.execute(
@@ -445,16 +471,17 @@ class PostgresClaimStore:
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
                 )
-                # Additive forward migration v1..v5 -> v6: the WorkGraph
+                # Additive forward migration v1..v6 -> v7: the WorkGraph
                 # tables (v2), the conflict-keys column (v3), the
                 # orchestrator_events ledger (v4), the graph_snapshots /
-                # graph_snapshot_items tables (v5), and the
-                # orchestrator_stop_events ledger (v6) were just materialized
-                # above, so a pre-existing store keeps its task_claims /
-                # work_items / source_syncs / orchestrator_events rows intact.
-                # Converge any older sentinel forward rather than refusing the
-                # store; a newer-than-current version still trips the mismatch
-                # guard below.
+                # graph_snapshot_items tables (v5), the
+                # orchestrator_stop_events ledger (v6), and its run_id column
+                # (v7) were just materialized above, so a pre-existing store
+                # keeps its task_claims / work_items / source_syncs /
+                # orchestrator_events / stop rows intact and simply gains the
+                # run_id column. Converge any older sentinel forward rather
+                # than refusing the store; a newer-than-current version still
+                # trips the mismatch guard below.
                 cur.execute(
                     "UPDATE orchestrator_schema_version SET version = %s "
                     "WHERE id = 1 AND version < %s",
@@ -781,6 +808,7 @@ class PostgresClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        run_id: str = "",
     ) -> None:
         # Append one stop row using the caller's cursor, so a prepare-skip stop
         # commits atomically with the claim release it accompanies (D-3). Never
@@ -788,10 +816,10 @@ class PostgresClaimStore:
         cur.execute(
             """
             INSERT INTO orchestrator_stop_events
-                (kind, subject, detail, occurred_at)
-            VALUES (%s, %s, %s, %s)
+                (kind, subject, detail, occurred_at, run_id)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (kind, subject, detail, occurred_at),
+            (kind, subject, detail, occurred_at, run_id),
         )
 
     def record_stop_event(
@@ -873,6 +901,45 @@ class PostgresClaimStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
+    def record_human_review(
+        self,
+        *,
+        reason: str,
+        task_id: str,
+        occurred_at: datetime,
+        run_id: str = "",
+        detail: str = "",
+    ) -> None:
+        # Route one unit into the single human-review queue by appending a stop
+        # row whose ``kind`` is the machine-readable ``reason`` (no new silo).
+        # The reason MUST be a stable token from HUMAN_REVIEW_QUEUE_REASONS,
+        # never free text. Append-only, never deduped.
+        _require_review_reason(reason)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                self._insert_stop_event(
+                    cur,
+                    kind=reason,
+                    subject=task_id,
+                    detail=detail,
+                    occurred_at=occurred_at,
+                    run_id=run_id,
+                )
+
+    def list_human_review_queue(self) -> list[HumanReviewQueueEntry]:
+        # The single queue read: every routed unit across all kinds, in id
+        # (insertion) order. Filters the shared ledger to rows whose kind is a
+        # review reason (disjoint from the pre-run stop kinds). Empty -> [].
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _ORCH_STOP_EVENT_SELECT
+                    + " WHERE kind = ANY(%s) ORDER BY id",
+                    (sorted(HUMAN_REVIEW_QUEUE_REASONS),),
+                )
+                rows = cur.fetchall()
+        return [_row_to_human_review_entry(row) for row in rows]
 
     # -- WorkGraph snapshots (schema v5) -----------------------------------
 

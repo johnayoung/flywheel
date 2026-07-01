@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from flywheel_core.events import LANDING_PARK_KINDS
 from flywheel_core.loaders import task_digest
 from flywheel_core.store_protocols import SchemaMismatchError
 
@@ -77,7 +78,18 @@ if TYPE_CHECKING:
 # pre-existing v1..v5 store keeps every existing row and simply gains an empty
 # stop-event ledger; the sentinel converges forward, no drop-and-recreate, no
 # hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 6
+#
+# v7 adds the additive ``orchestrator_stop_events.run_id`` column (spec
+# 00069-work-redriver, queue-surface): the single human-review queue is built by
+# reusing this same stop-event ledger -- a routed unit that could not be
+# auto-recovered is appended with a machine-readable ``reason`` (its ``kind``)
+# and, for a run-keyed stop (landing park, retry exhaustion, abort, budget
+# ceiling), the ``run_id`` of the offending run, so a queue entry carries both
+# task and run identity. The bump is additive -- a pre-existing v1..v6 store
+# gains the column via ``ALTER TABLE ADD COLUMN`` (default ``''``, so every
+# surviving stop row keeps its data) and converges its sentinel forward; no new
+# silo table, no drop-and-recreate, no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 7
 
 # The five event types the ledger records, one per committed ``task_claims``
 # insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
@@ -129,6 +141,73 @@ ORCHESTRATOR_STOP_EVENT_KINDS: frozenset[str] = frozenset(
         STOP_ZERO_GRADER_DROP,
     }
 )
+
+
+# The human-review queue vocabulary (spec 00069-work-redriver, queue-surface).
+#
+# The single visible human-review queue is NOT a new silo: it is a routed view
+# over this same append-only stop-event ledger. When a routing layer (landing
+# re-driver, retry escalation, prereq re-driver, no-progress back-off, human-gate
+# routing) cannot auto-recover a unit, it appends one stop row whose ``kind`` is
+# a member of :data:`HUMAN_REVIEW_QUEUE_REASONS` -- a stable, machine-readable
+# token, never a free-text detail string -- and ``list_human_review_queue`` reads
+# every such row back as a :class:`HumanReviewQueueEntry` carrying its task/run
+# identity and that reason. The reason tokens are deliberately DISJOINT from the
+# pre-run :data:`ORCHESTRATOR_STOP_EVENT_KINDS` above, so the two logical streams
+# coexist in one table without colliding and a reader tells them apart by
+# membership alone.
+#
+# * ``retries-exhausted-after-escalation`` -- a task that exhausted its retry
+#   budget a second time, after its one sanctioned escalation (D-A; criterion #6).
+# * ``prerequisite-missing`` -- a task whose declared prerequisite stayed absent
+#   past the re-drive bound (criterion #8); the missing prerequisite id rides in
+#   ``detail``.
+# * ``no-progress`` -- a unit backed off after a bound of fruitless cycles
+#   (criterion #9).
+# * ``awaiting-approval`` -- a lifecycle parked on a manual gate, surfaced without
+#   being transitioned (D-E; criterion #10).
+# * ``abort`` / ``budget-ceiling`` -- an intentional human/budget stop, surfaced
+#   and never re-dispatched (D-E; criterion #11).
+#
+# A parked landing (criterion #4) is routed with its park cause AS the reason --
+# one of :data:`flywheel_core.events.LANDING_PARK_KINDS` -- so the queue entry's
+# machine-readable reason names the ``park_kind`` directly. Those tokens are
+# folded into the queue vocabulary below.
+REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION: str = (
+    "retries-exhausted-after-escalation"
+)
+REASON_PREREQUISITE_MISSING: str = "prerequisite-missing"
+REASON_NO_PROGRESS: str = "no-progress"
+REASON_AWAITING_APPROVAL: str = "awaiting-approval"
+REASON_ABORTED: str = "abort"
+REASON_BUDGET_CEILING: str = "budget-ceiling"
+
+HUMAN_REVIEW_QUEUE_REASONS: frozenset[str] = (
+    frozenset(
+        {
+            REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
+            REASON_PREREQUISITE_MISSING,
+            REASON_NO_PROGRESS,
+            REASON_AWAITING_APPROVAL,
+            REASON_ABORTED,
+            REASON_BUDGET_CEILING,
+        }
+    )
+    | LANDING_PARK_KINDS
+)
+
+
+def _require_review_reason(reason: str) -> None:
+    """Guard that a human-review routing carries a stable, machine-readable
+    token (a member of :data:`HUMAN_REVIEW_QUEUE_REASONS`), never a free-text
+    detail string. Raises :class:`ValueError` on an unknown reason so a routing
+    layer cannot smuggle prose into the ``reason`` field (edge case: the reason
+    must be machine-readable, not only a human-readable detail)."""
+    if reason not in HUMAN_REVIEW_QUEUE_REASONS:
+        raise ValueError(
+            f"unknown human-review reason {reason!r}; must be one of "
+            f"{sorted(HUMAN_REVIEW_QUEUE_REASONS)}"
+        )
 
 
 class ClaimLostError(Exception):
@@ -262,11 +341,45 @@ class OrchestratorStopEventRecord:
     plus observed/target depth, the prepare failure text, the truncation or
     zero-grader specifics). ``occurred_at`` is the injected timestamp -- never a
     wall clock, so the ledger is deterministic and testable.
+
+    ``run_id`` (schema v7) is the offending run for a routed human-review entry
+    (spec 00069): a landing park / retry exhaustion / abort / budget stop carries
+    the run whose lifecycle produced it. Pre-run dead-ends have no run and leave
+    it ``''``.
     """
 
     id: int
     kind: str
     subject: str
+    detail: str
+    occurred_at: datetime
+    run_id: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class HumanReviewQueueEntry:
+    """One entry in the single visible human-review queue (spec 00069).
+
+    A routed view over the append-only stop-event ledger: every unit that a
+    routing layer could not auto-recover surfaces here exactly once per routing,
+    carrying its task/run identity and a machine-readable ``reason``. The queue
+    is NOT a new persistence silo -- an entry is one ``orchestrator_stop_events``
+    row whose ``kind`` is a member of :data:`HUMAN_REVIEW_QUEUE_REASONS`; the
+    read simply projects those rows.
+
+    ``task_id`` is the unit the human must look at; ``run_id`` is the offending
+    run when the stop is run-keyed (a landing park, a retry exhaustion, an abort
+    or budget breach) and ``''`` for a task-keyed stop with no run (a missing
+    prerequisite, a no-progress back-off). ``reason`` is the stable token
+    (never a free-text string); ``detail`` is the human-readable cause;
+    ``occurred_at`` is the injected routing timestamp; ``id`` is the underlying
+    ledger row id, so the queue reads back in insertion order.
+    """
+
+    id: int
+    task_id: str
+    run_id: str
+    reason: str
     detail: str
     occurred_at: datetime
 
@@ -499,6 +612,18 @@ def _row_to_orchestrator_stop_event_record(
         subject=row["subject"],
         detail=row["detail"],
         occurred_at=_parse_iso(row["occurred_at"]),
+        run_id=row["run_id"],
+    )
+
+
+def _row_to_human_review_entry(row: sqlite3.Row) -> HumanReviewQueueEntry:
+    return HumanReviewQueueEntry(
+        id=int(row["id"]),
+        task_id=row["subject"],
+        run_id=row["run_id"],
+        reason=row["kind"],
+        detail=row["detail"],
+        occurred_at=_parse_iso(row["occurred_at"]),
     )
 
 
@@ -611,6 +736,7 @@ class InMemoryClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        run_id: str = "",
     ) -> None:
         # Append-only, never deduped: a fresh monotonic id (1-based) per
         # recorded stop, stored in insertion order so both read accessors
@@ -622,6 +748,7 @@ class InMemoryClaimStore:
                 subject=subject,
                 detail=detail,
                 occurred_at=occurred_at,
+                run_id=run_id,
             )
         )
 
@@ -847,6 +974,47 @@ class InMemoryClaimStore:
         # Per-subject timeline: one subject's stops in id order.
         return [e for e in self._stop_events if e.subject == subject]
 
+    def record_human_review(
+        self,
+        *,
+        reason: str,
+        task_id: str,
+        occurred_at: datetime,
+        run_id: str = "",
+        detail: str = "",
+    ) -> None:
+        # Route one unit into the single human-review queue by appending a stop
+        # row whose ``kind`` is the machine-readable ``reason``. Reusing the
+        # ledger keeps the queue on the existing surface (no new silo); the
+        # reason MUST be a stable token from HUMAN_REVIEW_QUEUE_REASONS, never a
+        # free-text detail string. Append-only, never deduped.
+        _require_review_reason(reason)
+        self._append_stop_event(
+            kind=reason,
+            subject=task_id,
+            detail=detail,
+            occurred_at=occurred_at,
+            run_id=run_id,
+        )
+
+    def list_human_review_queue(self) -> list[HumanReviewQueueEntry]:
+        # The single queue read: every routed unit across all kinds, in id
+        # (insertion) order. An empty queue returns an empty list, not an error.
+        # Pre-run stop rows (dangling-prereq, no-op, prepare-skip, ...) are NOT
+        # queue entries -- their kinds are disjoint from the review vocabulary.
+        return [
+            HumanReviewQueueEntry(
+                id=e.id,
+                task_id=e.subject,
+                run_id=e.run_id,
+                reason=e.kind,
+                detail=e.detail,
+                occurred_at=e.occurred_at,
+            )
+            for e in self._stop_events
+            if e.kind in HUMAN_REVIEW_QUEUE_REASONS
+        ]
+
     def record_graph_snapshot(
         self,
         items: Iterable[GraphSnapshotItem],
@@ -968,7 +1136,8 @@ CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
   kind        TEXT NOT NULL,
   subject     TEXT NOT NULL,
   detail      TEXT NOT NULL,
-  occurred_at TEXT NOT NULL
+  occurred_at TEXT NOT NULL,
+  run_id      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_subject
@@ -1052,6 +1221,22 @@ class SqliteClaimStore:
                 "ALTER TABLE task_claims "
                 "ADD COLUMN conflict_keys_json TEXT NOT NULL DEFAULT '[]'"
             )
+        # Additive v7 migration: a pre-existing v6 store has an
+        # orchestrator_stop_events table predating the run_id column. CREATE
+        # TABLE IF NOT EXISTS leaves that older table untouched, so add the
+        # column in place (defaulting to '', preserving every existing stop
+        # row). New stores already have it from the CREATE TABLE above.
+        stop_columns = {
+            str(r["name"])
+            for r in conn.execute(
+                "PRAGMA table_info(orchestrator_stop_events)"
+            ).fetchall()
+        }
+        if "run_id" not in stop_columns:
+            conn.execute(
+                "ALTER TABLE orchestrator_stop_events "
+                "ADD COLUMN run_id TEXT NOT NULL DEFAULT ''"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO orchestrator_schema_version (id, version) "
             "VALUES (1, ?)",
@@ -1061,15 +1246,16 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1..v5 -> v6: the WorkGraph tables (v2),
+        # Additive forward migration v1..v6 -> v7: the WorkGraph tables (v2),
         # the conflict-keys column (v3), the orchestrator_events ledger (v4),
-        # the graph_snapshots/graph_snapshot_items tables (v5), and the
-        # orchestrator_stop_events ledger (v6) were all materialized above via
-        # CREATE TABLE IF NOT EXISTS, so a pre-existing store keeps its
-        # task_claims/work_items/source_syncs/orchestrator_events/snapshot rows
-        # intact and simply gains an empty stop-event stream. Converge the
-        # sentinel forward rather than refusing the store; a newer-than-current
-        # version still trips the mismatch guard below.
+        # the graph_snapshots/graph_snapshot_items tables (v5), the
+        # orchestrator_stop_events ledger (v6), and its run_id column (v7) were
+        # all materialized above (CREATE TABLE IF NOT EXISTS plus the additive
+        # ALTERs), so a pre-existing store keeps its
+        # task_claims/work_items/source_syncs/orchestrator_events/snapshot/stop
+        # rows intact and simply gains the run_id column. Converge the sentinel
+        # forward rather than refusing the store; a newer-than-current version
+        # still trips the mismatch guard below.
         if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
                 "UPDATE orchestrator_schema_version SET version = ? "
@@ -1400,14 +1586,15 @@ class SqliteClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        run_id: str = "",
     ) -> None:
         # Append one stop row. MUST be called inside an open ``_transaction`` so
         # a prepare-skip stop commits atomically with the claim release it
         # accompanies (D-3). Never dedupes -- recurrence is the signal.
         self._connection.execute(
             "INSERT INTO orchestrator_stop_events (kind, subject, detail, "
-            "occurred_at) VALUES (?, ?, ?, ?)",
-            (kind, subject, detail, _iso(occurred_at)),
+            "occurred_at, run_id) VALUES (?, ?, ?, ?, ?)",
+            (kind, subject, detail, _iso(occurred_at), run_id),
         )
 
     def record_stop_event(
@@ -1464,7 +1651,7 @@ class SqliteClaimStore:
     def list_stop_events(self) -> list[OrchestratorStopEventRecord]:
         # Global stream: every recorded stop in id (insertion) order.
         rows = self._connection.execute(
-            "SELECT id, kind, subject, detail, occurred_at "
+            "SELECT id, kind, subject, detail, occurred_at, run_id "
             "FROM orchestrator_stop_events ORDER BY id"
         ).fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
@@ -1474,11 +1661,48 @@ class SqliteClaimStore:
     ) -> list[OrchestratorStopEventRecord]:
         # Per-subject timeline: one subject's stops in id order.
         rows = self._connection.execute(
-            "SELECT id, kind, subject, detail, occurred_at "
+            "SELECT id, kind, subject, detail, occurred_at, run_id "
             "FROM orchestrator_stop_events WHERE subject = ? ORDER BY id",
             (subject,),
         ).fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
+    def record_human_review(
+        self,
+        *,
+        reason: str,
+        task_id: str,
+        occurred_at: datetime,
+        run_id: str = "",
+        detail: str = "",
+    ) -> None:
+        # Route one unit into the single human-review queue by appending a stop
+        # row whose ``kind`` is the machine-readable ``reason`` (no new silo).
+        # The reason MUST be a stable token from HUMAN_REVIEW_QUEUE_REASONS,
+        # never free text. Append-only, never deduped.
+        _require_review_reason(reason)
+        with self._transaction():
+            self._insert_stop_event(
+                kind=reason,
+                subject=task_id,
+                detail=detail,
+                occurred_at=occurred_at,
+                run_id=run_id,
+            )
+
+    def list_human_review_queue(self) -> list[HumanReviewQueueEntry]:
+        # The single queue read: every routed unit across all kinds, in id
+        # (insertion) order. Filters the shared ledger to rows whose kind is a
+        # review reason (disjoint from the pre-run stop kinds), so pre-run
+        # dead-ends never leak into the queue. Empty queue -> empty list.
+        placeholders = ",".join("?" for _ in HUMAN_REVIEW_QUEUE_REASONS)
+        rows = self._connection.execute(
+            "SELECT id, kind, subject, detail, occurred_at, run_id "
+            "FROM orchestrator_stop_events "
+            f"WHERE kind IN ({placeholders}) ORDER BY id",
+            tuple(sorted(HUMAN_REVIEW_QUEUE_REASONS)),
+        ).fetchall()
+        return [_row_to_human_review_entry(row) for row in rows]
 
     # -- WorkGraph snapshots (schema v5) -----------------------------------
 
@@ -1791,6 +2015,13 @@ __all__ = [
     "EVENT_STOLEN",
     "ORCHESTRATOR_EVENT_TYPES",
     "ORCHESTRATOR_STOP_EVENT_KINDS",
+    "HUMAN_REVIEW_QUEUE_REASONS",
+    "REASON_ABORTED",
+    "REASON_AWAITING_APPROVAL",
+    "REASON_BUDGET_CEILING",
+    "REASON_NO_PROGRESS",
+    "REASON_PREREQUISITE_MISSING",
+    "REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION",
     "STOP_DANGLING_PREREQUISITE",
     "STOP_NO_OP_CYCLE",
     "STOP_PREPARE_SKIP",
@@ -1800,6 +2031,7 @@ __all__ = [
     "ClaimStore",
     "GraphSnapshotItem",
     "GraphSnapshotRecord",
+    "HumanReviewQueueEntry",
     "InMemoryClaimStore",
     "SqliteClaimStore",
     "OrchestratorEventRecord",

@@ -147,6 +147,15 @@ class PostgresStore:
     pool_min, pool_max:
         Lower and upper bound on the internal
         ``psycopg_pool.ConnectionPool``. Defaults match the spec.
+    pool_timeout:
+        Bounded wait, in seconds, for checking a connection out of the
+        pool. When the pool is exhausted (every connection held) a
+        competing checkout blocks at most this long before raising
+        ``psycopg_pool.PoolTimeout`` -- a subclass of
+        ``psycopg.OperationalError``, so ``flywheel_core.faults`` classifies
+        it TRANSIENT and the retry site backs off and retries instead of
+        blocking unboundedly. Never left implicit: an uncapped checkout
+        would surface pool exhaustion as an indefinite hang.
     schema:
         Postgres schema name under which every table, index, and
         trigger is created. Validated against an identifier-safe regex
@@ -166,12 +175,19 @@ class PostgresStore:
     _LISTEN_POLL_SECONDS: float = 1.0
     _LISTEN_JOIN_SECONDS: float = 2.0
 
+    # Default bounded pool-acquisition wait (seconds). Matches
+    # psycopg_pool's own default; made explicit here so pool exhaustion
+    # surfaces as a bounded, TRANSIENT-classified PoolTimeout rather than an
+    # implicit hang, and so callers can tighten it.
+    _DEFAULT_POOL_TIMEOUT_SECONDS: float = 30.0
+
     def __init__(
         self,
         dsn: str,
         *,
         pool_min: int = 1,
         pool_max: int = 10,
+        pool_timeout: float = _DEFAULT_POOL_TIMEOUT_SECONDS,
         schema: str = "public",
         notifier: RunNotifier | None = None,
         listen: bool = False,
@@ -200,6 +216,7 @@ class PostgresStore:
                 dsn,
                 min_size=pool_min,
                 max_size=pool_max,
+                timeout=pool_timeout,
                 open=False,
                 configure=self._configure_connection,
             )

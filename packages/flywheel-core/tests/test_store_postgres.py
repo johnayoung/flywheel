@@ -373,6 +373,55 @@ def test_pool_supports_parallel_reads(fresh_schema: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bounded pool acquisition: an exhausted pool times out TRANSIENT, not forever.
+# ---------------------------------------------------------------------------
+
+
+def test_pool_acquire_bounded(fresh_schema: str) -> None:
+    """With the pool exhausted, a competing checkout must raise a bounded,
+    TRANSIENT-classified failure rather than blocking indefinitely.
+
+    A single-connection pool with a short ``pool_timeout`` is fully exhausted
+    by holding its one connection; a second checkout then waits at most the
+    configured bound before raising ``psycopg_pool.PoolTimeout`` (a subclass
+    of ``psycopg.OperationalError`` that ``classify_fault`` buckets TRANSIENT).
+    The wall-time upper bound is generous to CI yet finite, so an unbounded
+    acquire that blocked forever would fail it."""
+    dsn = _dsn_or_skip()
+    import psycopg_pool
+
+    from flywheel_core import PostgresStore
+    from flywheel_core.faults import FaultClass, classify_fault
+
+    pool_timeout = 0.5
+    store = PostgresStore(
+        dsn,
+        schema=fresh_schema,
+        pool_min=1,
+        pool_max=1,
+        pool_timeout=pool_timeout,
+    )
+    try:
+        # Hold the pool's only connection so the pool is fully exhausted, then
+        # race a competing checkout against the bounded acquisition wait.
+        with store._pool.connection():
+            start = time.monotonic()
+            with pytest.raises(psycopg_pool.PoolTimeout) as exc_info:
+                with store._pool.connection():
+                    pass  # pragma: no cover - the checkout must not succeed
+            elapsed = time.monotonic() - start
+
+        # Finite, CI-generous upper bound: an unbounded acquire that blocked
+        # forever would blow this assertion.
+        assert elapsed < 10.0
+        # The pool-exhaustion timeout classifies TRANSIENT (retryable), never
+        # an unclassified PoolTimeout the breaker would treat as fatal.
+        assert classify_fault(exc_info.value) is FaultClass.TRANSIENT
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # Schema-name isolation: two stores against the same DB don't collide.
 # ---------------------------------------------------------------------------
 

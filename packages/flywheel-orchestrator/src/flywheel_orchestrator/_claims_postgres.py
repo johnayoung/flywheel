@@ -186,12 +186,19 @@ def _row_to_work_item_record(row: dict[str, Any]) -> WorkItemRecord:
 class PostgresClaimStore:
     """Postgres-backed per-task lease store."""
 
+    # Default bounded pool-acquisition wait (seconds). Mirrors
+    # ``PostgresStore``: an explicit bound so pool exhaustion surfaces as a
+    # bounded, TRANSIENT-classified ``PoolTimeout`` instead of an indefinite
+    # hang.
+    _DEFAULT_POOL_TIMEOUT_SECONDS: float = 30.0
+
     def __init__(
         self,
         dsn: str,
         *,
         pool_min: int = 1,
         pool_max: int = 10,
+        pool_timeout: float = _DEFAULT_POOL_TIMEOUT_SECONDS,
         schema: str = "public",
     ) -> None:
         self._schema = _validate_schema(schema)
@@ -203,6 +210,7 @@ class PostgresClaimStore:
                 dsn,
                 min_size=pool_min,
                 max_size=pool_max,
+                timeout=pool_timeout,
                 open=False,
                 configure=self._configure_connection,
             )

@@ -142,6 +142,19 @@ ORCHESTRATOR_STOP_EVENT_KINDS: frozenset[str] = frozenset(
     }
 )
 
+# The retry-escalation re-driver's boundedness marker (spec 00069, criteria
+# #5/#6; D-A). When a task exhausts its retry budget the re-driver escalates
+# exactly ONCE -- a stronger-model / re-decompose re-drive -- and appends one
+# ``retries-escalated`` stop row keyed to the task id as the durable witness
+# that its single sanctioned escalation is spent. The re-driver counts these
+# rows (``list_subject_stop_events``) to enforce the bound: with one present, a
+# SECOND exhaustion routes the task to the human-review queue with
+# ``retries-exhausted-after-escalation`` instead of re-escalating. The marker is
+# DELIBERATELY neither a pre-run stop (:data:`ORCHESTRATOR_STOP_EVENT_KINDS`) nor
+# a queue reason (:data:`HUMAN_REVIEW_QUEUE_REASONS`) -- it is an internal
+# bookkeeping witness, so it never leaks into the human-review queue read.
+STOP_RETRIES_ESCALATED: str = "retries-escalated"
+
 
 # The human-review queue vocabulary (spec 00069-work-redriver, queue-surface).
 #
@@ -2025,6 +2038,7 @@ __all__ = [
     "STOP_DANGLING_PREREQUISITE",
     "STOP_NO_OP_CYCLE",
     "STOP_PREPARE_SKIP",
+    "STOP_RETRIES_ESCALATED",
     "STOP_SOURCE_TRUNCATION",
     "STOP_ZERO_GRADER_DROP",
     "ClaimLostError",

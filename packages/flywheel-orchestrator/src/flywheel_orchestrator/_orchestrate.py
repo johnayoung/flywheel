@@ -51,7 +51,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -71,7 +71,7 @@ from flywheel_core.events import (
     LandingParked,
 )
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
-from flywheel_core.lifecycle import Status
+from flywheel_core.lifecycle import Lifecycle, Outcome, Status
 from flywheel_core.store_protocols import (
     OptimisticConcurrencyError,
     TelemetrySink,
@@ -88,7 +88,9 @@ if TYPE_CHECKING:
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
+    REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
     STOP_DANGLING_PREREQUISITE,
+    STOP_RETRIES_ESCALATED,
     ClaimLostError,
     GraphSnapshotItem,
     SourceSyncRecord,
@@ -180,6 +182,18 @@ DEFAULT_SWEEP_SECONDS: float = 15.0
 # enough to ride out a transient base-divergence race yet bounded so a
 # genuinely-stuck strand reaches a human promptly.
 DEFAULT_LANDING_REDRIVE_BOUND: int = 3
+
+# How many sanctioned escalations the retry-escalation re-driver spends before
+# routing a task to the human-review queue (spec 00069, criteria #5/#6; D-A).
+# On first retry-budget exhaustion the re-driver escalates exactly ONCE -- a
+# stronger-model / re-decompose re-drive under the existing per-run budget
+# ceilings -- and on the NEXT exhaustion (the escalated run also spent its
+# budget) routes the task to the queue with
+# ``retries-exhausted-after-escalation`` instead of re-escalating. One is the
+# whole point: the escalation is bounded so a genuinely-stuck task reaches a
+# human after a single stronger attempt, never re-escalating on every
+# exhaustion.
+DEFAULT_ESCALATION_BOUND: int = 1
 
 
 def _utcnow() -> datetime:
@@ -885,6 +899,285 @@ def redrive_parked_landings(
                 result="in-progress",
                 attempts=attempts,
                 park_kind=parks[-1].park_kind,
+            )
+        )
+    return tuple(outcomes)
+
+
+# The outcomes that mark a terminal FAILED lifecycle as one reached by *retry
+# exhaustion* rather than an abort. A failed validation or an internal error is
+# a retry-source failure the harness re-tries until the budget runs out; an
+# ``AGENT_ERROR`` is an abort (a deliberate agent/operator stop) that reaches
+# FAILED without exhausting a retry budget and must NEVER be escalated -- it is
+# surfaced to the queue by the D-E routing layer instead.
+_RETRY_EXHAUSTION_OUTCOMES: frozenset[Outcome] = frozenset(
+    {Outcome.VALIDATION_FAILED, Outcome.INTERNAL_ERROR}
+)
+
+
+@dataclass
+class EscalationRequest:
+    """A candidate the retry-escalation re-driver may escalate.
+
+    ``run_id`` names the terminal run to inspect for retry exhaustion;
+    ``task`` is re-driven (under the escalation model / a re-decompose) when the
+    run is found exhausted and its single sanctioned escalation is unspent. The
+    caller need not pre-filter -- a non-exhausted run (still retryable, DONE, an
+    abort) is dropped cheaply by the exhaustion check.
+    """
+
+    task_id: str
+    task: Task
+    run_id: str
+
+
+@dataclass
+class EscalationOutcome:
+    """What the retry-escalation re-driver did with one candidate in a pass.
+
+    ``result`` is the disposition:
+
+    * ``"escalated"`` -- the run exhausted its retry budget for the first time
+      and the re-driver spent its single sanctioned escalation, re-driving the
+      task under the escalation config; ``escalated_run_id`` names the fresh run.
+    * ``"queued"`` -- the escalated run also exhausted (a second exhaustion), so
+      the task was routed to the single human-review queue with
+      ``retries-exhausted-after-escalation`` as the machine-readable reason (or
+      was already routed on a prior pass, in which case ``escalated_run_id`` is
+      empty -- the terminal, no-further-attempt state).
+    * ``"in-progress"`` -- a peer held the task's claim (or the drive minted no
+      run), so the escalation is left for a later pass.
+    * ``"skipped"`` -- reserved; the re-driver drops a non-exhausted candidate
+      before emitting an outcome, so this is not currently produced.
+
+    ``escalations`` is the number of sanctioned escalations spent on this task
+    after the call (0 before the first escalation, 1 after); ``escalated_run_id``
+    is the run minted by the escalation (empty unless ``result`` is
+    ``"escalated"``).
+    """
+
+    run_id: str
+    task_id: str
+    result: Literal["escalated", "queued", "in-progress", "skipped"]
+    escalations: int
+    escalated_run_id: str = ""
+
+
+def _is_retry_exhausted(lifecycle: Lifecycle, max_retries: int) -> bool:
+    """True when ``lifecycle`` reached a terminal FAILED by *retry exhaustion*.
+
+    The re-driver escalates a genuine budget exhaustion only: the lifecycle is
+    terminally ``FAILED``, its ``retries`` counter reached ``max_retries`` (the
+    budget is spent), and its last attempt ended in a retry-source failure (a
+    failed validation or an internal error -- see
+    :data:`_RETRY_EXHAUSTION_OUTCOMES`). An abort (``AGENT_ERROR``) or a
+    manual/budget stop reaches ``FAILED`` too but is not a retry exhaustion --
+    those are surfaced to the queue directly, never escalated.
+    """
+    if lifecycle.status is not Status.FAILED:
+        return False
+    if lifecycle.retries < max_retries:
+        return False
+    if not lifecycle.attempts:
+        return False
+    return lifecycle.attempts[-1].outcome in _RETRY_EXHAUSTION_OUTCOMES
+
+
+def _escalation_count(claims: SqliteClaimStore, task_id: str) -> int:
+    """How many sanctioned escalations have been recorded for ``task_id``.
+
+    Each escalation appends one :data:`STOP_RETRIES_ESCALATED` marker keyed to
+    the task; counting them is how the re-driver enforces its bound -- one
+    marker present means the single sanctioned escalation is spent, so the next
+    exhaustion routes to the queue instead of re-escalating.
+    """
+    return sum(
+        1
+        for event in claims.list_subject_stop_events(task_id)
+        if event.kind == STOP_RETRIES_ESCALATED
+    )
+
+
+def _already_queued_after_escalation(
+    claims: SqliteClaimStore, task_id: str
+) -> bool:
+    """True once this task has been routed to the queue post-escalation.
+
+    The terminal guard behind criterion #6's no-further-attempt state: a task
+    routed with :data:`REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION` carries that
+    stop row keyed to its id. Its presence stops the re-driver from ever
+    re-escalating OR re-queuing it, so a genuinely-stuck task costs exactly one
+    escalation and one queue entry.
+    """
+    return any(
+        event.kind == REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION
+        for event in claims.list_subject_stop_events(task_id)
+    )
+
+
+EscalationDriver = Callable[["EscalationRequest", "str | None"], Awaitable["str | None"]]
+
+
+async def redrive_exhausted_retries(
+    control: SqliteStore | PostgresStore,
+    claims: SqliteClaimStore,
+    worker_id: str,
+    *,
+    requests: Iterable[EscalationRequest],
+    drive: EscalationDriver,
+    escalation_model: str | None = None,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    bound: int = DEFAULT_ESCALATION_BOUND,
+    lease_seconds: float,
+    now: Callable[[], datetime],
+    stream: TextIO | None = None,
+) -> tuple[EscalationOutcome, ...]:
+    """Bounded escalate-once-then-queue re-drive of exhausted retries.
+
+    Spec 00069, criteria #5/#6/#13; decisions D-A/D-C. A task that spends its
+    entire retry budget without grading green is a strand the loop must clear,
+    not leave in a silent terminal ``FAILED``. For each ``request`` naming such
+    a terminal run this:
+
+    1. Drops a run that did not exhaust its retry budget (still retryable,
+       ``DONE``, or an abort -- an ``AGENT_ERROR`` is not a budget exhaustion);
+       the caller need not pre-filter.
+    2. Short-circuits a task already routed to the queue after its escalation
+       (the terminal, no-further-attempt state -- criterion #6), making no
+       further attempt and never re-queuing it.
+    3. On the FIRST exhaustion (no escalation marker yet) escalates exactly
+       ONCE: under a freshly acquired claim (a sanctioned claim API, never a raw
+       lifecycle write) it re-drives the task through ``drive`` -- a
+       stronger-model / re-decompose attempt selected from existing config and
+       passed ``escalation_model`` -- which mints and returns a fresh run id.
+       The escalated run runs under the existing per-run budget ceilings. A
+       :data:`STOP_RETRIES_ESCALATED` marker is then recorded so the escalation
+       is spent exactly once; the first exhaustion is deliberately NOT routed to
+       the queue (D-A: never a silent terminal FAILED, never re-escalation).
+    4. On a SECOND exhaustion (the escalation marker is present, ``bound``
+       reached) routes the task to the single human-review queue with
+       :data:`REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION` as the machine-readable
+       reason, and makes no further attempt (criterion #6).
+
+    The harness owns every lifecycle transition: this re-driver only reads
+    authoritative lifecycle state, requests a fresh run through the sanctioned
+    ``drive`` seam, and appends ledger rows. It never calls ``transition_to``,
+    forges a status, or fabricates an agent envelope. Returns one
+    :class:`EscalationOutcome` per candidate the re-driver actually touched, in
+    input order.
+    """
+    outcomes: list[EscalationOutcome] = []
+    for request in requests:
+        run_id = request.run_id
+        task_id = request.task_id
+        lifecycle = control.load_lifecycle(run_id)
+        if lifecycle is None or not _is_retry_exhausted(lifecycle, max_retries):
+            continue  # not an exhausted run: nothing to escalate
+        # Terminal guard (criterion #6): a task already routed post-escalation
+        # is never re-escalated (no bound+1) and never re-queued.
+        if _already_queued_after_escalation(claims, task_id):
+            outcomes.append(
+                EscalationOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="queued",
+                    escalations=_escalation_count(claims, task_id),
+                )
+            )
+            continue
+        escalations = _escalation_count(claims, task_id)
+        if escalations >= bound:
+            # Second exhaustion: the single sanctioned escalation is spent and
+            # the escalated run also exhausted -> route to the human-review
+            # queue, never a silent terminal FAILED (D-A).
+            detail = (
+                f"retry budget exhausted again on run {run_id!r} after the "
+                f"single sanctioned escalation (retries={lifecycle.retries}, "
+                f"max_retries={max_retries})"
+            )
+            claims.record_human_review(
+                reason=REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
+                task_id=task_id,
+                run_id=run_id,
+                detail=detail,
+                occurred_at=now(),
+            )
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: retries exhausted after "
+                    f"escalation; routed to the human-review queue "
+                    f"(reason {REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION!r})",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                EscalationOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="queued",
+                    escalations=escalations,
+                )
+            )
+            continue
+        # First exhaustion: escalate exactly once under a freshly acquired
+        # claim so no peer double-escalates the same task.
+        claim = claims.acquire_claim(
+            task_id, worker_id, now=now(), lease_seconds=lease_seconds
+        )
+        if claim is None:
+            outcomes.append(
+                EscalationOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="in-progress",
+                    escalations=escalations,
+                )
+            )
+            continue
+        try:
+            escalated_run_id = await drive(request, escalation_model)
+        finally:
+            claims.release_claim(claim)
+        if not escalated_run_id:
+            # The drive minted no run (it could not run this pass): leave the
+            # escalation for a later pass, marker unrecorded so the single
+            # escalation is never spent without an actual re-drive.
+            outcomes.append(
+                EscalationOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="in-progress",
+                    escalations=escalations,
+                )
+            )
+            continue
+        # Record the boundedness marker only after a successful re-drive, so the
+        # single sanctioned escalation is spent exactly once and a later pass
+        # (should the escalated run also exhaust) routes to the queue.
+        detail = (
+            f"escalated once after retry-budget exhaustion on run "
+            f"{run_id!r}; escalated run {escalated_run_id!r}"
+        )
+        claims.record_stop_event(
+            kind=STOP_RETRIES_ESCALATED,
+            subject=task_id,
+            detail=detail,
+            occurred_at=now(),
+        )
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: retries exhausted; escalated once "
+                f"to run {escalated_run_id!r}",
+                file=stream,
+                flush=True,
+            )
+        outcomes.append(
+            EscalationOutcome(
+                run_id=run_id,
+                task_id=task_id,
+                result="escalated",
+                escalations=escalations + 1,
+                escalated_run_id=escalated_run_id,
             )
         )
     return tuple(outcomes)
@@ -2216,10 +2509,14 @@ async def _drive_or_relinquish(
 
 
 __all__ = [
+    "DEFAULT_ESCALATION_BOUND",
     "DEFAULT_LANDING_REDRIVE_BOUND",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_SWEEP_SECONDS",
+    "EscalationDriver",
+    "EscalationOutcome",
+    "EscalationRequest",
     "OrchestratorReport",
     "RedriveOutcome",
     "RunRecord",
@@ -2229,6 +2526,7 @@ __all__ = [
     "Submitter",
     "orchestrate",
     "reconcile_live_runs",
+    "redrive_exhausted_retries",
     "redrive_parked_landings",
     "sweep_expired_leases",
 ]

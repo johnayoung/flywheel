@@ -4207,6 +4207,16 @@ def _emit_rubric_events(
         )
 
 
+# The stable prefix every per-run budget-ceiling breach error carries (specs
+# 00039/00042). A budget kill and an ``intent=abort`` both reach a terminal
+# ``Status.FAILED`` with an ``Outcome.AGENT_ERROR`` final attempt, so this prefix
+# on the attempt's ``error`` is the durable, control-store-readable discriminator
+# the work re-driver (spec 00069) uses to route a breach to the human-review
+# queue with ``budget-ceiling`` rather than ``abort``. Keep it in lockstep with
+# ``_finalize_budget_breach`` below.
+BUDGET_CEILING_ERROR_PREFIX: str = "budget ceiling breached:"
+
+
 def _finalize_budget_breach(
     *,
     store: HarnessStore,
@@ -4229,7 +4239,9 @@ def _finalize_budget_breach(
     directly (terminal, non-retryable). ``ceiling`` names the dimension
     (``cost_usd`` / ``tokens`` / ``wall_clock_seconds``).
     """
-    breach_error = f"budget ceiling breached: {ceiling} {observed} >= limit {limit}"
+    breach_error = (
+        f"{BUDGET_CEILING_ERROR_PREFIX} {ceiling} {observed} >= limit {limit}"
+    )
     _finalize_attempt(
         store=store,
         telemetry=telemetry,

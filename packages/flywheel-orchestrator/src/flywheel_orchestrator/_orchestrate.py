@@ -60,6 +60,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 from uuid import uuid4
 
 from flywheel_core.harness import (
+    BUDGET_CEILING_ERROR_PREFIX,
     InvokeFunc,
     finalize_stranded_lifecycle,
     recheck_blocked_lifecycle,
@@ -88,6 +89,9 @@ if TYPE_CHECKING:
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
+    REASON_ABORTED,
+    REASON_AWAITING_APPROVAL,
+    REASON_BUDGET_CEILING,
     REASON_NO_PROGRESS,
     REASON_PREREQUISITE_MISSING,
     REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
@@ -1601,6 +1605,197 @@ def redrive_no_progress(
     return tuple(outcomes)
 
 
+@dataclass(frozen=True, kw_only=True)
+class HumanGateRequest:
+    """A parked or terminal run the human-gate re-driver inspects for an
+    intentional stop (spec 00069, criteria #10/#11; D-E).
+
+    ``run_id`` names the lifecycle to classify; ``task_id`` is the review
+    subject the queue entry carries. The caller need not pre-filter -- a run
+    that is not an intentional human/budget stop (still running, DONE, or a
+    retry-exhausted FAILED) is dropped cheaply by the classifier.
+    """
+
+    task_id: str
+    run_id: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class HumanGateOutcome:
+    """What the human-gate re-driver did with one run in a pass.
+
+    ``reason`` is the machine-readable stop cause when the run is an intentional
+    stop (``awaiting-approval`` / ``abort`` / ``budget-ceiling``), empty
+    otherwise. ``result`` is the disposition:
+
+    * ``"queued"`` -- an intentional stop surfaced to the human-review queue for
+      the first time (its status left untouched).
+    * ``"already-queued"`` -- an intentional stop already surfaced on a prior
+      pass; nothing further recorded (the terminal, once-per-run state).
+    * ``"skipped"`` -- the run is not an intentional human/budget stop, so it was
+      neither surfaced nor touched.
+    """
+
+    run_id: str
+    task_id: str
+    result: Literal["queued", "already-queued", "skipped"]
+    reason: str = ""
+
+
+def _classify_human_gate(lifecycle: Lifecycle) -> str | None:
+    """The human-review reason for ``lifecycle``'s intentional stop, or ``None``.
+
+    An intentional human stop is one of exactly three durable lifecycle shapes:
+
+    * ``AWAITING_APPROVAL`` -- parked on a manual-approval gate -> ``awaiting
+      -approval``.
+    * a terminal ``FAILED`` whose final attempt is ``AGENT_ERROR`` -- the shape
+      both ``intent=abort`` and a budget-ceiling breach reach (both are terminal,
+      non-retryable). The two are told apart by the attempt's ``error``: a budget
+      kill carries :data:`BUDGET_CEILING_ERROR_PREFIX` -> ``budget-ceiling``;
+      anything else is an abort -> ``abort``.
+
+    Every other state is NOT a human gate and returns ``None``: a live
+    ``RUNNING``/``VALIDATING`` run, a ``DONE`` run, and -- crucially -- a
+    retry-exhausted ``FAILED`` whose final attempt is ``VALIDATION_FAILED`` /
+    ``INTERNAL_ERROR`` (that is the escalation re-driver's territory, not a human
+    gate), so the two failure families never cross-route.
+    """
+    if lifecycle.status is Status.AWAITING_APPROVAL:
+        return REASON_AWAITING_APPROVAL
+    if lifecycle.status is Status.FAILED and lifecycle.attempts:
+        tail = lifecycle.attempts[-1]
+        if tail.outcome is Outcome.AGENT_ERROR:
+            if tail.error.startswith(BUDGET_CEILING_ERROR_PREFIX):
+                return REASON_BUDGET_CEILING
+            return REASON_ABORTED
+    return None
+
+
+def _human_gate_detail(
+    lifecycle: Lifecycle, task_id: str, run_id: str, reason: str
+) -> str:
+    """Human-readable cause for the queue entry (the reason is the machine key)."""
+    if reason == REASON_AWAITING_APPROVAL:
+        return (
+            f"human gate: {task_id!r} run {run_id!r} is awaiting manual "
+            f"approval; left parked for a human (status unchanged)"
+        )
+    error = lifecycle.attempts[-1].error if lifecycle.attempts else ""
+    if reason == REASON_BUDGET_CEILING:
+        return (
+            f"run {run_id!r} breached a per-run budget ceiling ({error}); "
+            f"routed for a human, never re-dispatched"
+        )
+    return (
+        f"run {run_id!r} ended via intent=abort ({error}); routed for a human, "
+        f"never re-dispatched"
+    )
+
+
+def _human_gate_already_queued(
+    claims: SqliteClaimStore, task_id: str, run_id: str, reason: str
+) -> bool:
+    """True once this run's intentional stop has been surfaced to the queue.
+
+    The once-per-run guard: a routed stop carries an ``orchestrator_stop_events``
+    row keyed to its task whose ``kind`` is the human-review ``reason`` and whose
+    ``run_id`` matches. Its presence stops the re-driver from re-surfacing the
+    same stop every pass, so an unresolved gate costs exactly one queue entry.
+    """
+    return any(
+        event.run_id == run_id and event.kind == reason
+        for event in claims.list_subject_stop_events(task_id)
+    )
+
+
+def redrive_human_gates(
+    control: SqliteStore | PostgresStore,
+    claims: SqliteClaimStore,
+    *,
+    requests: Iterable[HumanGateRequest],
+    now: Callable[[], datetime],
+    stream: TextIO | None = None,
+) -> tuple[HumanGateOutcome, ...]:
+    """Surface intentional human stops into the queue, never bypass them (spec
+    00069, criteria #10/#11; D-E).
+
+    AWAITING_APPROVAL, ``intent=abort``, and a budget-ceiling breach are
+    *intended* stops -- a human's decision, or a deliberate budget/abort ceiling.
+    Unlike a transient strand they must NOT be auto-recovered: the re-driver only
+    makes them visible. For each ``request`` naming a candidate run this:
+
+    1. Classifies the run via :func:`_classify_human_gate`. A run that is not an
+       intentional stop (still running, DONE, or a retry-exhausted FAILED --
+       which is the escalation re-driver's job, not a human gate) is skipped
+       cleanly, so the two failure families never cross-route.
+    2. Short-circuits a stop already surfaced on a prior pass (the once-per-run
+       terminal state), recording nothing further so an unresolved gate produces
+       exactly one queue entry rather than one every pass.
+    3. Otherwise records ONE human-review entry with the machine-readable reason
+       naming the cause (``awaiting-approval`` / ``abort`` / ``budget-ceiling``)
+       and the offending run id.
+
+    It NEVER transitions a lifecycle: it does not approve or reject an approval
+    gate, does not re-drive an abort or budget breach, and does not write a
+    status or forge an agent claim. The lifecycle's status is byte-identical
+    before and after -- only a human resolves these (D-E, criterion #14). Because
+    the re-driver never re-dispatches, an abort/budget stop is never re-run
+    (criterion #11), and because it never resolves the gate an AWAITING_APPROVAL
+    lifecycle stays AWAITING_APPROVAL across any number of re-drive/sweep cycles
+    (criterion #10). Returns one :class:`HumanGateOutcome` per request, in input
+    order.
+    """
+    outcomes: list[HumanGateOutcome] = []
+    for request in requests:
+        run_id = request.run_id
+        task_id = request.task_id
+        lifecycle = control.load_lifecycle(run_id)
+        if lifecycle is None:
+            continue
+        reason = _classify_human_gate(lifecycle)
+        if reason is None:
+            outcomes.append(
+                HumanGateOutcome(
+                    run_id=run_id, task_id=task_id, result="skipped"
+                )
+            )
+            continue
+        if _human_gate_already_queued(claims, task_id, run_id, reason):
+            outcomes.append(
+                HumanGateOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="already-queued",
+                    reason=reason,
+                )
+            )
+            continue
+        claims.record_human_review(
+            reason=reason,
+            task_id=task_id,
+            run_id=run_id,
+            detail=_human_gate_detail(lifecycle, task_id, run_id, reason),
+            occurred_at=now(),
+        )
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: intentional stop surfaced to the "
+                f"human-review queue (reason {reason!r}); status left unchanged",
+                file=stream,
+                flush=True,
+            )
+        outcomes.append(
+            HumanGateOutcome(
+                run_id=run_id,
+                task_id=task_id,
+                result="queued",
+                reason=reason,
+            )
+        )
+    return tuple(outcomes)
+
+
 class _ClaimHeartbeat:
     """Renew a task lease on a timer while its run is in flight.
 
@@ -2060,6 +2255,31 @@ async def orchestrate(
                 claims,
                 issues=validation.issues,
                 bound=prereq_redrive_bound,
+                now=clock,
+                stream=stream,
+            )
+            # Human-gate routing (spec 00069, criteria #10/#11; D-E). An
+            # intentional stop -- a lifecycle parked AWAITING_APPROVAL, or a run
+            # terminated by ``intent=abort`` or a budget-ceiling breach -- is a
+            # human's decision, never a transient strand to auto-recover. Surface
+            # each into the human-review queue ONCE with a reason naming its cause
+            # WITHOUT touching its status: the gate stays parked (no auto-approve /
+            # auto-reject) and the abort/budget FAILED is never re-dispatched (the
+            # scheduler already excludes terminal FAILED from selection). Purely a
+            # read-and-append side channel -- it changes no lifecycle and no
+            # scheduling decision this pass.
+            redrive_human_gates(
+                control,
+                claims,
+                requests=[
+                    HumanGateRequest(
+                        task_id=r.task.id, run_id=r.latest_run_id
+                    )
+                    for r in rows
+                    if r.latest_run_id is not None
+                    and r.latest_status
+                    in (Status.AWAITING_APPROVAL, Status.FAILED)
+                ],
                 now=clock,
                 stream=stream,
             )
@@ -2952,6 +3172,8 @@ __all__ = [
     "EscalationDriver",
     "EscalationOutcome",
     "EscalationRequest",
+    "HumanGateOutcome",
+    "HumanGateRequest",
     "OrchestratorReport",
     "RedriveOutcome",
     "RunRecord",
@@ -2962,6 +3184,7 @@ __all__ = [
     "orchestrate",
     "reconcile_live_runs",
     "redrive_exhausted_retries",
+    "redrive_human_gates",
     "redrive_parked_landings",
     "sweep_expired_leases",
 ]

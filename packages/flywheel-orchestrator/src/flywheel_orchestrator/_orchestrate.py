@@ -51,7 +51,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -65,7 +65,11 @@ from flywheel_core.harness import (
     recheck_blocked_lifecycle,
     resolve_manual_approval,
 )
-from flywheel_core.events import PARK_KIND_HELD_OUT_GATE, LandingParked
+from flywheel_core.events import (
+    LANDING_PARK_KINDS,
+    PARK_KIND_HELD_OUT_GATE,
+    LandingParked,
+)
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
 from flywheel_core.lifecycle import Status
 from flywheel_core.store_protocols import (
@@ -165,6 +169,17 @@ DEFAULT_RECONCILE_SECONDS: float = 15.0
 # negligible store traffic, and well inside a healthy lease window so a live
 # claim is never in the reap set.
 DEFAULT_SWEEP_SECONDS: float = 15.0
+
+# How many automatic land re-attempts the landing re-driver makes for one parked
+# run before routing it to the human-review queue (spec 00069, criteria #3/#4).
+# A parked DONE run -- work finished and graded green but the strategy could not
+# land it (divergent base, a failed standing build invariant) -- is re-driven
+# through the strategy's own rebase/reverify/standing/FF path up to this many
+# times; on the bound it is routed to the queue with its park_kind as the
+# machine-readable reason and no further attempt is made. Three is generous
+# enough to ride out a transient base-divergence race yet bounded so a
+# genuinely-stuck strand reaches a human promptly.
+DEFAULT_LANDING_REDRIVE_BOUND: int = 3
 
 
 def _utcnow() -> datetime:
@@ -622,6 +637,259 @@ async def _lease_sweep_loop(
                 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class RedriveOutcome:
+    """What the landing re-driver did with one parked run in a pass.
+
+    ``result`` is the disposition:
+
+    * ``"landed"`` -- a re-attempt merged the branch (no fresh park appended),
+      so the strand cleared.
+    * ``"queued"`` -- the run exhausted its re-drive ``bound`` without landing
+      and was routed to the human-review queue with ``park_kind`` as the
+      machine-readable reason (or was already queued on a prior pass, in which
+      case ``attempts`` is 0 -- the terminal, no-further-attempt state).
+    * ``"in-progress"`` -- a re-attempt was made but the run neither landed nor
+      hit the bound (e.g. a peer held the claim), so it is left for a later
+      pass.
+    * ``"skipped"`` -- the run is no longer a landable parked change (already
+      landed, or its committed change vanished), so it was neither re-driven nor
+      queued.
+
+    ``attempts`` counts the sanctioned land re-attempts this call made for the
+    run; ``park_kind`` is the last observed park cause (empty for ``landed``).
+    """
+
+    run_id: str
+    task_id: str
+    result: Literal["landed", "queued", "in-progress", "skipped"]
+    attempts: int
+    park_kind: str = ""
+
+
+def _landing_parks(
+    control: SqliteStore | PostgresStore, run_id: str
+) -> list[LandingParked]:
+    """Every :class:`LandingParked` event on ``run_id``, in ledger order.
+
+    The re-driver counts these to bound its re-attempts: the original
+    land-suppression appends the first park, and each failed re-attempt appends
+    one more, so ``len(parks) - 1`` is the number of re-attempts already made
+    against this run. An empty list means the run never parked (it landed
+    cleanly or never finished), so there is nothing to re-drive.
+    """
+    return [
+        event
+        for event in control.list_domain_events(run_id)
+        if isinstance(event, LandingParked)
+    ]
+
+
+def _landing_already_queued(
+    claims: SqliteClaimStore, task_id: str, run_id: str
+) -> bool:
+    """True once this run's parked landing has been routed to the queue.
+
+    The terminal guard behind criterion #4's "no (bound+1)th attempt": a run
+    whose landing was routed carries an ``orchestrator_stop_events`` row keyed
+    to its id whose ``kind`` is a landing park cause. Its presence stops the
+    re-driver from ever re-attempting the land again OR re-queuing it, so a
+    genuinely-stuck strand costs exactly ``bound`` attempts and one queue entry.
+    """
+    return any(
+        event.run_id == run_id and event.kind in LANDING_PARK_KINDS
+        for event in claims.list_subject_stop_events(task_id)
+    )
+
+
+def redrive_parked_landings(
+    control: SqliteStore | PostgresStore,
+    claims: SqliteClaimStore,
+    strategy: SubmitStrategy,
+    worker_id: str,
+    *,
+    requests: Iterable[SubmitRequest],
+    bound: int = DEFAULT_LANDING_REDRIVE_BOUND,
+    lease_seconds: float,
+    now: Callable[[], datetime],
+    stream: TextIO | None = None,
+) -> tuple[RedriveOutcome, ...]:
+    """Bounded re-drive of runs parked unlanded (spec 00069, criteria #3/#4/#13).
+
+    A run parked unlanded -- a :class:`LandingParked` witness on a ``DONE`` run
+    whose work graded green but whose strategy could not land it (a divergent
+    base, a failed ``[submit] verify`` standing build invariant) -- is a strand
+    the loop must actively clear, not leave to accrue. For each ``request``
+    describing such a run this:
+
+    1. Skips a run that never parked, and short-circuits one already routed to
+       the queue (the terminal, no-further-attempt state -- criterion #4).
+    2. Confirms the run is still a *landable* parked change via the strategy's
+       read-only :data:`LandabilityProbe`. A run that has since landed (its
+       branch merged, no commits beyond base) or whose committed change vanished
+       reports not-landable and drops out -- neither re-driven nor queued -- so a
+       cleared strand is never wrongly re-parked.
+    3. Re-attempts the land up to ``bound`` times by re-invoking
+       ``strategy.submit`` under a freshly acquired claim (a sanctioned claim
+       API, never a raw lifecycle write). Each ``submit`` re-runs the strategy's
+       own rebase + command/standing re-verification against the exact base it
+       lands on -- nothing lands unverified. A re-attempt that lands appends no
+       park (the strand clears); one that fails appends a fresh park, advancing
+       the count toward the bound.
+    4. On the bound -- ``bound`` re-attempts made without landing -- routes the
+       run to the single human-review queue with its ``park_kind`` as the
+       machine-readable reason, and makes no further attempt (criterion #4).
+
+    ``requests`` may include non-parked ``DONE`` runs (the caller need not
+    pre-filter); the parked-check drops them cheaply. Returns one
+    :class:`RedriveOutcome` per run the re-driver actually touched, in input
+    order, so a caller can react to a ``landed`` result (which advanced the
+    base and may promote dependents).
+    """
+    outcomes: list[RedriveOutcome] = []
+    for request in requests:
+        run_id = request.run_id
+        task_id = request.task_id
+        parks = _landing_parks(control, run_id)
+        if not parks:
+            continue  # never parked: nothing to re-drive
+        # Terminal guard (criterion #4): a run already routed to the queue is
+        # never re-attempted (no bound+1) and never re-queued.
+        if _landing_already_queued(claims, task_id, run_id):
+            outcomes.append(
+                RedriveOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="queued",
+                    attempts=0,
+                    park_kind=parks[-1].park_kind,
+                )
+            )
+            continue
+        # Is this still an unlanded, landable change? A landed run's branch has
+        # merged (no commits beyond base) or its worktree is gone, so the
+        # strategy reports it not-landable and it drops out -- a cleared strand
+        # is neither re-driven nor queued. A probe error fails open to
+        # not-landable (skip): a buggy predicate must never wedge the re-driver
+        # into re-parking work.
+        try:
+            verdict = probe_landability(strategy, request)
+        except Exception as exc:  # noqa: BLE001 - probe is consumer code
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: landability probe failed during "
+                    f"re-drive ({type(exc).__name__}: {exc}); skipping",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                RedriveOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="skipped",
+                    attempts=0,
+                    park_kind=parks[-1].park_kind,
+                )
+            )
+            continue
+        if not verdict.landable:
+            outcomes.append(
+                RedriveOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="skipped",
+                    attempts=0,
+                    park_kind=parks[-1].park_kind,
+                )
+            )
+            continue
+        # Bounded re-drive. ``made`` is the re-attempts already spent on this
+        # run (the original suppression is park #1, not a re-attempt); each loop
+        # turn is one more sanctioned land re-attempt.
+        made = len(parks) - 1
+        attempts = 0
+        landed = False
+        while made < bound:
+            claim = claims.acquire_claim(
+                task_id, worker_id, now=now(), lease_seconds=lease_seconds
+            )
+            if claim is None:
+                break  # a peer holds the claim; retry on a later pass
+            try:
+                strategy.submit(request)
+            finally:
+                claims.release_claim(claim)
+            attempts += 1
+            new_parks = _landing_parks(control, run_id)
+            if len(new_parks) == len(parks):
+                # No fresh park: the re-attempt landed and cleared the strand.
+                landed = True
+                break
+            parks = new_parks
+            made = len(parks) - 1
+        if landed:
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: re-drove parked landing to a "
+                    f"merge after {attempts} re-attempt(s)",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                RedriveOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="landed",
+                    attempts=attempts,
+                )
+            )
+            continue
+        if made >= bound:
+            park_kind = parks[-1].park_kind
+            detail = (
+                f"landing re-drive exhausted {bound} re-attempt(s) without "
+                f"landing; last park cause {park_kind!r}: "
+                f"{parks[-1].detail}"
+            )
+            claims.record_human_review(
+                reason=park_kind,
+                task_id=task_id,
+                run_id=run_id,
+                detail=detail,
+                occurred_at=now(),
+            )
+            if stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: parked landing routed to the "
+                    f"human-review queue after {attempts} re-attempt(s) "
+                    f"(reason {park_kind!r})",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                RedriveOutcome(
+                    run_id=run_id,
+                    task_id=task_id,
+                    result="queued",
+                    attempts=attempts,
+                    park_kind=park_kind,
+                )
+            )
+            continue
+        # Broke out before landing or hitting the bound (claim unavailable):
+        # leave it for a later pass.
+        outcomes.append(
+            RedriveOutcome(
+                run_id=run_id,
+                task_id=task_id,
+                result="in-progress",
+                attempts=attempts,
+                park_kind=parks[-1].park_kind,
+            )
+        )
+    return tuple(outcomes)
+
+
 class _ClaimHeartbeat:
     """Renew a task lease on a timer while its run is in flight.
 
@@ -799,6 +1067,7 @@ async def orchestrate(
     strategy: SubmitStrategy | None = None,
     reconcile_seconds: float | None = None,
     sweep_seconds: float | None = None,
+    landing_redrive_bound: int | None = None,
     repo_root: Path | None = None,
     held_out_source: HeldOutGraderSource | None = None,
 ) -> OrchestratorReport:
@@ -851,6 +1120,18 @@ async def orchestrate(
     recovery, which still runs. ``None``/``0`` (the default) disables it,
     preserving prior behavior for library callers; the CLI and the worktree
     daemon enable it by default.
+
+    ``landing_redrive_bound`` enables the bounded landing re-driver (spec
+    00069): after each pass a run parked unlanded (a :class:`LandingParked`
+    witness on a ``DONE`` run whose strategy could not merge it) is re-driven
+    through the strategy's own rebase/reverify/standing/FF path up to this many
+    times (see :func:`redrive_parked_landings`); a cleared cause lands and one
+    that never clears is routed to the human-review queue with its park cause as
+    the reason, with no further attempt. It requires a bundled ``strategy`` (the
+    landability probe distinguishes a still-parked change from an already-landed
+    one); ``None``/``0`` (the default) disables it, preserving prior behavior for
+    library callers and callers that wired the bare submit callable. The CLI and
+    the worktree daemon enable it by default.
 
     ``policy`` selects the store backend: construction routes through the
     store factory (:func:`~flywheel_orchestrator._store_factory.build_store`),
@@ -1246,6 +1527,50 @@ async def orchestrate(
                     claims.release_claim(claim)
             if progressed:
                 continue
+
+            # 1c. Bounded re-drive of parked landings (spec 00069). A run that
+            #     finished and graded green but whose strategy could not land it
+            #     (divergent base, failed standing verify) sits parked on an
+            #     unmerged branch; the re-driver re-attempts the land through the
+            #     strategy's own rebase/reverify/standing/FF path up to the bound
+            #     and routes a never-clearing strand to the human-review queue.
+            #     Opt-in and strategy-gated: the landability probe (a bundled
+            #     strategy) is what distinguishes a still-parked change from one
+            #     that has since landed, so it never runs for a bare-callable
+            #     caller. A re-attempt that lands advanced the base and may
+            #     promote dependents, so we re-read state on the next pass.
+            if (
+                landing_redrive_bound is not None
+                and landing_redrive_bound > 0
+                and strategy is not None
+            ):
+                redrive_requests = [
+                    SubmitRequest(
+                        task_id=row.task.id,
+                        task_file=row.task_file,
+                        task=row.task,
+                        run_id=row.latest_run_id,
+                        status=Status.DONE,
+                        sandbox=sandbox_root / row.task.id,
+                        source_ref=row.source_ref,
+                    )
+                    for row in rows
+                    if row.latest_run_id is not None
+                    and row.latest_status == Status.DONE
+                ]
+                outcomes = redrive_parked_landings(
+                    control,
+                    claims,
+                    strategy,
+                    wid,
+                    requests=redrive_requests,
+                    bound=landing_redrive_bound,
+                    lease_seconds=lease_seconds,
+                    now=clock,
+                    stream=stream,
+                )
+                if any(o.result == "landed" for o in outcomes):
+                    continue
 
             # 2. Fresh selection over the prerequisite graph. Exclude
             #    still-blocked lifecycles and tasks already run this session
@@ -1891,10 +2216,12 @@ async def _drive_or_relinquish(
 
 
 __all__ = [
+    "DEFAULT_LANDING_REDRIVE_BOUND",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_SWEEP_SECONDS",
     "OrchestratorReport",
+    "RedriveOutcome",
     "RunRecord",
     "SandboxProvider",
     "SandboxRequest",
@@ -1902,5 +2229,6 @@ __all__ = [
     "Submitter",
     "orchestrate",
     "reconcile_live_runs",
+    "redrive_parked_landings",
     "sweep_expired_leases",
 ]

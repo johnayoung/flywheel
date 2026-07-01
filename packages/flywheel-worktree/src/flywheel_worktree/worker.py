@@ -71,6 +71,7 @@ from flywheel_core.events import (
     LandingParked,
 )
 from flywheel_orchestrator import (
+    DEFAULT_LANDING_REDRIVE_BOUND,
     DEFAULT_SWEEP_SECONDS,
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
@@ -1211,6 +1212,7 @@ def run_once(
     lease_seconds: float = 300.0,
     reconcile_seconds: float | None = None,
     sweep_seconds: float | None = DEFAULT_SWEEP_SECONDS,
+    landing_redrive_bound: int | None = DEFAULT_LANDING_REDRIVE_BOUND,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     log: Logger | None = None,
@@ -1244,6 +1246,14 @@ def run_once(
     execute-time held-out landing gate (spec 00050): a DONE task whose
     operator-declared held-out graders fail is blocked from landing and its
     worktree parked. ``None`` (the default) leaves landing byte-identical.
+
+    ``landing_redrive_bound`` is forwarded to ``orchestrate`` to enable the
+    bounded landing re-driver (spec 00069): a run parked unlanded (a failed
+    ``[submit] verify`` standing invariant, a divergent base) is re-driven
+    through ``submitter``'s own rebase/reverify/standing/FF path up to this many
+    times before its strand is routed to the human-review queue. It defaults to
+    ``DEFAULT_LANDING_REDRIVE_BOUND`` because the worker always drives a
+    landability-probing git strategy; pass ``None``/``0`` to disable.
     """
     log = log or submitter.log
     record_phase_bases(
@@ -1263,6 +1273,7 @@ def run_once(
             lease_seconds=lease_seconds,
             reconcile_seconds=reconcile_seconds,
             sweep_seconds=sweep_seconds,
+            landing_redrive_bound=landing_redrive_bound,
             strategy=strategy if strategy is not None else submitter,
             stream=stream,
             repo_root=submitter.repo_root,

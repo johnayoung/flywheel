@@ -445,46 +445,110 @@ def test_claim_is_released_after_a_run(tmp_path: Path) -> None:
 
 
 def test_two_workers_run_each_task_exactly_once(tmp_path: Path) -> None:
-    phase = tmp_path / "tasks" / "active" / "01-phase"
+    """Two workers contending for the same four tasks run each exactly once.
+
+    Deterministic (not raced) regression for the fresh-selection double-claim.
+    Worker B builds its per-pass snapshot while all four tasks are READY, then
+    parks between snapshot and claim acquisition until worker A has driven every
+    task to DONE and released each claim. ``release_claim`` deletes the claim
+    row, so when B wakes it freely re-acquires each freed claim on its stale
+    (all-READY) snapshot -- the exact TOCTOU that flaked under load's overlap.
+    The post-claim terminal-state recheck must make B decline every already-DONE
+    task rather than mint a second run, so together the workers cover the task
+    set exactly once.
+
+    The interleave is forced by a controlled clock (not a sleep-based race),
+    mirroring ``test_fresh_selection_rechecks_terminal_state_under_claim``: B's
+    clock parks it on its first ``acquire_claim`` until A signals it has drained
+    and released the whole set.
+    """
+    import threading
+
+    tasks_dir = tmp_path / "tasks"
+    phase = tasks_dir / "active" / "01-phase"
     task_ids = ["t1", "t2", "t3", "t4"]
     for tid in task_ids:
         _write_task(phase, tid)
     db_path = tmp_path / "flywheel.sqlite"
 
-    async def _slow_verify_invoke(request: InvocationRequest):
-        # A short delay so the two workers overlap and actually contend for
-        # claims rather than serializing by accident.
-        await asyncio.sleep(0.02)
+    b_snapshot_taken = threading.Event()
+    a_finished_all = threading.Event()
+
+    class _SignalWhenDrainedSource:
+        """Worker A's source. One task runs per pass, so for N tasks the
+        (N+1)th ``list_work`` is the terminal no-progress pass -- fired only
+        after every task is committed DONE and every claim released. That call
+        signals B that the whole set is drained."""
+
+        def __init__(self) -> None:
+            self._inner = DirectoryWorkSource(tasks_dir)
+            self._calls = 0
+
+        def list_work(self):
+            items = self._inner.list_work()
+            self._calls += 1
+            if self._calls == len(task_ids) + 1:
+                a_finished_all.set()
+            return items
+
+        def report(self, report) -> None:  # type: ignore[no-untyped-def]
+            self._inner.report(report)
+
+    async def _invoke_a(request: InvocationRequest) -> IterationResult:
+        # Do not finalize the first task until B has taken its (all-READY)
+        # snapshot, so B is guaranteed to select off the stale view.
+        b_snapshot_taken.wait(5)
         return _verify_result()
+
+    async def _invoke_b(request: InvocationRequest) -> IterationResult:
+        return _verify_result()
+
+    # Worker B's clock parks it between snapshot and claim. The first call is
+    # the per-pass graph snapshot, fired right AFTER B's states snapshot is
+    # built -> signal and proceed. Every later call (the next is acquire_claim)
+    # waits until A has drained and released the whole set, so B re-acquires each
+    # freed (deleted) claim on its stale snapshot.
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def _clock_b() -> datetime:
+        if not b_snapshot_taken.is_set():
+            b_snapshot_taken.set()
+            return t0
+        a_finished_all.wait(5)
+        return t0
 
     results: dict[str, object] = {}
 
-    def _worker(name: str) -> None:
-        results[name] = asyncio.run(
-            orchestrate(
-                tasks_dir=tmp_path / "tasks",
-                db_path=db_path,
-                sandbox_root=tmp_path / "sb" / name,
-                invoke=_slow_verify_invoke,
-                worker_id=name,
-                max_retries=0,
-                max_turns=4,
-                lease_seconds=60,
-                stream=io.StringIO(),
-            )
+    def _run(worker_id, source, invoke, clock=None) -> None:  # type: ignore[no-untyped-def]
+        kwargs: dict[str, object] = dict(
+            source=source,
+            db_path=db_path,
+            sandbox_root=tmp_path / "sb" / worker_id,
+            invoke=invoke,
+            worker_id=worker_id,
+            max_retries=0,
+            max_turns=4,
+            lease_seconds=60,
+            stream=io.StringIO(),
         )
+        if clock is not None:
+            kwargs["now"] = clock
+        results[worker_id] = asyncio.run(orchestrate(**kwargs))  # type: ignore[arg-type]
 
-    import threading
-
-    threads = [
-        threading.Thread(target=_worker, args=(name,))
-        for name in ("worker-a", "worker-b")
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
-    assert all(not t.is_alive() for t in threads)
+    ta = threading.Thread(
+        target=_run,
+        args=("worker-a", _SignalWhenDrainedSource(), _invoke_a),
+    )
+    tb = threading.Thread(
+        target=_run,
+        args=("worker-b", DirectoryWorkSource(tasks_dir), _invoke_b),
+        kwargs={"clock": _clock_b},
+    )
+    tb.start()
+    ta.start()
+    ta.join(30)
+    tb.join(30)
+    assert not ta.is_alive() and not tb.is_alive()
 
     report_a = results["worker-a"]
     report_b = results["worker-b"]

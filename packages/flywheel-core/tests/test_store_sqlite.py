@@ -565,3 +565,101 @@ def test_seed_event_carries_source_through_fold_and_replay(
         assert replayed.source == folded.source
     finally:
         store.close()
+
+
+# --- Locked-past-busy_timeout retry with bounded backoff ---------------------
+
+
+def test_locked_retry_returns_real_result_when_lock_clears_within_budget(
+    tmp_path: Path,
+) -> None:
+    """A write blocked past ``busy_timeout`` is retried with bounded backoff;
+    once the competing writer releases the lock within the transient budget,
+    the retry runs the operation for real and returns its ACTUAL result -- not
+    a fabricated/empty success."""
+    from flywheel_core import CommandGrader, Task
+    from flywheel_core.faults import BackoffPolicy
+    from flywheel_core.loaders import task_digest
+
+    db = tmp_path / "locked-retry.db"
+    holder: dict[str, sqlite3.Connection | None] = {}
+
+    def release_lock_on_backoff(_delay: float) -> None:
+        # Injected in place of a real sleep so the wait is deterministic: the
+        # first backoff releases the competing writer, so the next retry
+        # acquires the write lock and completes the operation.
+        blocker = holder.get("conn")
+        if blocker is not None:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+            holder["conn"] = None
+
+    # Construct before the lock is taken so the bootstrap writes are
+    # uncontended; the tiny busy_timeout makes each locked attempt fail fast.
+    store = SqliteStore(
+        db,
+        busy_timeout_ms=50,
+        max_transient_retries=5,
+        transient_backoff=BackoffPolicy(
+            base_seconds=0.001, factor=1.0, cap_seconds=0.001
+        ),
+        transient_sleep=release_lock_on_backoff,
+    )
+    blocker = sqlite3.connect(str(db), isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")  # holds the write lock on the file
+    holder["conn"] = blocker
+    try:
+        task = Task(
+            id="t-locked",
+            goal="survive a held write lock",
+            graders=[CommandGrader(run="true")],
+        )
+        digest = store.save_task(
+            task, now=datetime(2024, 1, 1, tzinfo=timezone.utc)
+        )
+        # The real operation ran on retry: the returned digest is the true
+        # content hash and the row is actually persisted and reloadable. A
+        # fabricated/empty success would return neither.
+        assert digest == task_digest(task)
+        loaded = store.load_task("t-locked")
+        assert loaded is not None
+        assert loaded.goal == "survive a held write lock"
+    finally:
+        leftover = holder.get("conn")
+        if leftover is not None:
+            leftover.close()
+        store.close()
+
+
+def test_locked_classified_raises_transient_when_lock_outlives_budget(
+    tmp_path: Path,
+) -> None:
+    """A lock held longer than the whole transient budget exhausts the retries
+    and surfaces the still-locked ``OperationalError`` -- which the shared
+    classifier buckets TRANSIENT -- instead of a fabricated success."""
+    from flywheel_core.faults import BackoffPolicy, FaultClass, classify_fault
+
+    db = tmp_path / "locked-classified.db"
+    store = SqliteStore(
+        db,
+        busy_timeout_ms=25,
+        max_transient_retries=2,
+        transient_backoff=BackoffPolicy(
+            base_seconds=0.001, factor=1.0, cap_seconds=0.001
+        ),
+        transient_sleep=lambda _delay: None,  # never releases the lock
+    )
+    blocker = sqlite3.connect(str(db), isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")  # held for the whole call
+    try:
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            store.create_lifecycle(Lifecycle(task_id="t", run_id="r1"))
+        assert "locked" in str(excinfo.value).lower()
+        assert classify_fault(excinfo.value) is FaultClass.TRANSIENT
+        # No fabricated write leaked through: nothing was persisted (WAL lets
+        # this read see the last committed snapshot while the writer is held).
+        assert store.load_lifecycle("r1") is None
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        store.close()

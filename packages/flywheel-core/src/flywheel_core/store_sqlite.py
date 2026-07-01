@@ -31,17 +31,26 @@ a caller bypasses the protocol surface.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
-from collections.abc import Collection, Iterator, Mapping
+import time
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.resources.abc import Traversable
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from flywheel_core.event_serde import event_from_record, event_kind, event_payload
+from flywheel_core.faults import (
+    DEFAULT_BACKOFF,
+    BackoffPolicy,
+    FaultClass,
+    classify_fault,
+    wait_backoff,
+)
 from flywheel_core.events import (
     AttemptFinalized,
     AttemptStarted,
@@ -123,6 +132,42 @@ def _read_schema_sql() -> str:
     return _SCHEMA_PATH.read_text(encoding="utf-8")
 
 
+# Default per-connection wait before SQLite reports "database is locked".
+# Kept at the historical 5s so behavior is unchanged for existing callers;
+# the retry-with-backoff wrapper below is what actually makes contention (and
+# dropped connections busy_timeout cannot cover) survivable.
+DEFAULT_BUSY_TIMEOUT_MS: int = 5000
+
+# Bounded transient-retry budget for the locked-past-busy_timeout path, mirroring
+# the harness's ``max_transient_retries`` default so the two retry sites share
+# one budget convention.
+DEFAULT_MAX_TRANSIENT_RETRIES: int = 6
+
+_R = TypeVar("_R")
+
+
+def _with_locked_retry(
+    method: Callable[..., _R],
+) -> Callable[..., _R]:
+    """Wrap a store method so a locked-past-``busy_timeout`` write retries.
+
+    The whole method body is re-run on retry. Every store operation is
+    idempotent under this policy: a ``"database is locked"`` error is raised
+    while acquiring the write lock, before any row is committed (autocommit
+    statements never partially apply, and ``BEGIN IMMEDIATE`` fails atomically),
+    so re-running double-applies nothing. Non-TRANSIENT faults (schema
+    mismatch, optimistic-concurrency conflict) are re-raised untouched.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: SqliteStore, *args: Any, **kwargs: Any) -> _R:
+        return self._run_with_locked_retry(
+            lambda: method(self, *args, **kwargs)
+        )
+
+    return wrapper
+
+
 class SqliteStore:
     """SQLite implementation of every store protocol.
 
@@ -146,11 +191,27 @@ class SqliteStore:
         path: str | Path = ":memory:",
         *,
         notifier: RunNotifier | None = None,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        max_transient_retries: int = DEFAULT_MAX_TRANSIENT_RETRIES,
+        transient_backoff: BackoffPolicy = DEFAULT_BACKOFF,
+        transient_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         # Default-on in-process reactivity: a consumer sharing this store
         # instance gets push wakeups; separate instances (e.g. another
         # process on the same file) fall back to the audit follower's poll.
         self.notifier: RunNotifier = notifier or RunNotifier()
+        # Retry policy for the locked-past-busy_timeout path. The backoff
+        # helper and TRANSIENT classifier are shared with every other retry
+        # site; ``transient_sleep`` is injectable so tests capture the waits
+        # deterministically instead of blocking on a real clock.
+        self._busy_timeout_ms = busy_timeout_ms
+        self._max_transient_retries = max_transient_retries
+        self._transient_backoff = transient_backoff
+        self._transient_sleep = transient_sleep
+        # Re-entrancy guard: only the outermost public call retries. A method
+        # that calls another store method (e.g. append_domain_event -> both
+        # holding BEGIN IMMEDIATE) must not restart mid-transaction.
+        self._in_locked_retry = False
         self._connection = sqlite3.connect(
             str(path),
             check_same_thread=False,
@@ -158,6 +219,42 @@ class SqliteStore:
         )
         self._connection.row_factory = sqlite3.Row
         self._bootstrap()
+
+    def _run_with_locked_retry(self, op: Callable[[], _R]) -> _R:
+        """Run ``op``, retrying a locked-past-``busy_timeout`` write.
+
+        A ``sqlite3.OperationalError`` that :func:`classify_fault` buckets
+        TRANSIENT (SQLite still ``"database is locked"`` after ``busy_timeout``
+        elapsed, which also covers a dropped connection a wider timeout could
+        not) is retried up to ``max_transient_retries`` times, backing off
+        between tries with the shared :class:`BackoffPolicy`. On success the
+        operation's real result is returned. On budget exhaustion the last
+        error propagates -- still TRANSIENT-classified -- so callers route it
+        as a transient failure, not a fabricated success. Any non-TRANSIENT
+        fault (schema mismatch, version conflict) is re-raised immediately and
+        never retried.
+        """
+        if self._in_locked_retry:
+            return op()
+        self._in_locked_retry = True
+        try:
+            attempt = 0
+            while True:
+                try:
+                    return op()
+                except sqlite3.OperationalError as exc:
+                    if classify_fault(exc) is not FaultClass.TRANSIENT:
+                        raise
+                    if attempt >= self._max_transient_retries:
+                        raise
+                    wait_backoff(
+                        attempt,
+                        policy=self._transient_backoff,
+                        sleep=self._transient_sleep,
+                    )
+                    attempt += 1
+        finally:
+            self._in_locked_retry = False
 
     def _bootstrap(self) -> None:
         conn = self._connection
@@ -172,7 +269,10 @@ class SqliteStore:
         # (each its own connection, e.g. competing for task claims), make a
         # blocked writer wait for the lock instead of erroring immediately
         # with "database is locked". Per-connection, so set on every open.
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        # busy_timeout alone cannot cover a dropped connection or a lock held
+        # past the wait -- the retry-with-backoff wrapper handles those -- so
+        # the default is unchanged and only the wait-before-first-retry.
+        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)};")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
         # Version pin: a database whose schema_version row does not match is
@@ -241,6 +341,7 @@ class SqliteStore:
 
     # --- LifecycleStore ---------------------------------------------------
 
+    @_with_locked_retry
     def create_lifecycle(self, lifecycle: Lifecycle) -> None:
         # Auto-register the task identity so lifecycles.task_id -> tasks(id)
         # always holds: a run can never reference a task the catalog has
@@ -282,6 +383,7 @@ class SqliteStore:
                 raise LifecycleAlreadyExistsError(lifecycle.run_id) from exc
             raise
 
+    @_with_locked_retry
     def update_lifecycle(
         self,
         lifecycle: Lifecycle,
@@ -343,6 +445,7 @@ class SqliteStore:
             actual_version=int(existing["version"]),
         )
 
+    @_with_locked_retry
     def load_lifecycle(self, run_id: str) -> Lifecycle | None:
         row = self._connection.execute(
             """
@@ -380,6 +483,7 @@ class SqliteStore:
         lc.attempts = self.list_attempts(run_id)
         return lc
 
+    @_with_locked_retry
     def list_lifecycles(
         self,
         *,
@@ -411,6 +515,7 @@ class SqliteStore:
         folded = [self.load_lifecycle(row["run_id"]) for row in rows]
         return [lc for lc in folded if lc is not None]
 
+    @_with_locked_retry
     def summarize_spend(
         self,
         *,
@@ -473,6 +578,7 @@ class SqliteStore:
             (task_id, now_iso, now_iso),
         )
 
+    @_with_locked_retry
     def save_task(self, task: Task, *, now: datetime) -> str:
         content_hash = task_digest(task)
         data = serialize_task(task)
@@ -506,6 +612,7 @@ class SqliteStore:
             )
         return content_hash
 
+    @_with_locked_retry
     def load_task(
         self, task_id: str, content_hash: str | None = None
     ) -> Task | None:
@@ -534,6 +641,7 @@ class SqliteStore:
             }
         )
 
+    @_with_locked_retry
     def load_task_for_run(self, run_id: str) -> Task | None:
         row = self._connection.execute(
             "SELECT task_id, task_content_hash FROM lifecycles "
@@ -546,6 +654,7 @@ class SqliteStore:
 
     # --- DomainEventStore -------------------------------------------------
 
+    @_with_locked_retry
     def append_domain_event(
         self,
         event: DomainEvent,
@@ -629,6 +738,7 @@ class SqliteStore:
                 )
             )
 
+    @_with_locked_retry
     def list_domain_events(self, run_id: str) -> list[DomainEvent]:
         rows = self._connection.execute(
             """
@@ -644,6 +754,7 @@ class SqliteStore:
 
     # --- AttemptStore -----------------------------------------------------
 
+    @_with_locked_retry
     def save_attempt(
         self,
         run_id: str,
@@ -716,6 +827,7 @@ class SqliteStore:
             ),
         )
 
+    @_with_locked_retry
     def load_attempt(self, run_id: str, number: int) -> Attempt | None:
         row = self._connection.execute(
             """
@@ -733,6 +845,7 @@ class SqliteStore:
             return None
         return _row_to_attempt(row)
 
+    @_with_locked_retry
     def list_attempts(self, run_id: str) -> list[Attempt]:
         rows = self._connection.execute(
             """
@@ -751,6 +864,7 @@ class SqliteStore:
 
     # --- GraderResultStore ------------------------------------------------
 
+    @_with_locked_retry
     def append_grader_result(
         self, result: GraderResultRecord
     ) -> GraderResultRecord:
@@ -788,6 +902,7 @@ class SqliteStore:
             id=cursor.lastrowid,
         )
 
+    @_with_locked_retry
     def list_grader_results(
         self,
         run_id: str,
@@ -808,6 +923,7 @@ class SqliteStore:
 
     # --- ControlCommandStore ----------------------------------------------
 
+    @_with_locked_retry
     def enqueue_command(
         self,
         run_id: str,
@@ -837,6 +953,7 @@ class SqliteStore:
             id=cursor.lastrowid,
         )
 
+    @_with_locked_retry
     def claim_commands(
         self,
         run_id: str,
@@ -865,6 +982,7 @@ class SqliteStore:
         records.sort(key=lambda r: r.id if r.id is not None else 0)
         return records
 
+    @_with_locked_retry
     def delete_command(self, command_id: int) -> None:
         # Queue hygiene (spec 00025 FR-10): the consumer deletes an
         # applied row only after the steering domain event committed.

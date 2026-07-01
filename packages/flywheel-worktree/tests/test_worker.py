@@ -33,6 +33,7 @@ from flywheel_core import (
     Task,
     ValidEnvelope,
 )
+from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
     FilesystemHeldOutGraderSource,
@@ -1245,6 +1246,94 @@ def test_submit_unprotected_path_merges(tmp_path: Path) -> None:
     # The gate only bites on protected paths; ordinary work lands as before.
     assert (repo / "feature.txt").exists()
     assert not wt.exists()
+
+
+# --- submit: audit witness for suppressed lands --------------------------------
+
+
+class _RecordingLedger:
+    """Minimal LandingLedger stub: a non-None lifecycle and a captured event
+    list, enough to assert the submitter records a LandingParked witness."""
+
+    def __init__(self) -> None:
+        self.events: list[DomainEvent] = []
+
+    class _Lifecycle:
+        version = 0
+
+    def load_lifecycle(self, run_id: str) -> "_RecordingLedger._Lifecycle":
+        return self._Lifecycle()
+
+    def append_domain_event(
+        self, event: DomainEvent, *, expected_version: int
+    ) -> "_RecordingLedger._Lifecycle":
+        self.events.append(event)
+        return self._Lifecycle()
+
+
+def _protected_submitter_with_store(
+    repo: Path, patterns: list[str], store: _RecordingLedger
+) -> "worker.GitWorktreeSubmitter":
+    worktrees = repo / ".flywheel" / "worktrees"
+    worktrees.mkdir(parents=True, exist_ok=True)
+    return worker.GitWorktreeSubmitter(
+        repo_root=repo,
+        tasks_dir=repo / ".flywheel" / "tasks",
+        worktrees_dir=worktrees,
+        phase_base="main",
+        lock_path=repo / ".flywheel" / ".merge.lock",
+        log=lambda _m: None,
+        protected_paths=patterns,
+        store=store,  # type: ignore[arg-type]
+    )
+
+
+def test_submit_protected_path_records_park(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    ledger = _RecordingLedger()
+    s = _protected_submitter_with_store(repo, ["conftest.py"], ledger)
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "conftest.py", "tampered", "edit conftest")
+    base_before = _rev(repo, "main")
+
+    s.submit(_submit_req(tf, "t1", wt, Status.DONE))
+
+    # Land is still suppressed (base untouched, worktree parked) ...
+    assert _rev(repo, "main") == base_before
+    assert wt.exists()
+    # ... and the reason is now a queryable protected-paths witness naming the
+    # offending path.
+    parked = [e for e in ledger.events if isinstance(e, LandingParked)]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "protected-paths"
+    assert "conftest.py" in parked[0].detail
+
+
+def test_submit_swallowed_error_records_park(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    ledger = _RecordingLedger()
+    s = _protected_submitter_with_store(repo, [], ledger)
+    tf = _task_file(repo, "01-phase", "t1")
+
+    wt = s.prepare_sandbox(_sandbox_req(tf, "t1"))
+    _commit(wt, "feature.txt", "x", "feat")
+
+    def _boom(_req: SubmitRequest) -> None:
+        raise RuntimeError("boom in submit")
+
+    s._submit = _boom  # type: ignore[method-assign]
+
+    # The exception stays swallowed: submit returns None, never re-raises ...
+    assert s.submit(_submit_req(tf, "t1", wt, Status.DONE)) is None
+    # ... and leaves a submit-error witness carrying the swallowed text.
+    parked = [e for e in ledger.events if isinstance(e, LandingParked)]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "submit-error"
+    assert "boom in submit" in parked[0].detail
 
 
 # --- prepare: sandbox setup hook -----------------------------------------------

@@ -64,7 +64,12 @@ from flywheel_core import (
     classify_fault,
     run_command_graders,
 )
-from flywheel_core.events import DomainEvent, LandingParked
+from flywheel_core.events import (
+    PARK_KIND_PROTECTED_PATHS,
+    PARK_KIND_SUBMIT_ERROR,
+    DomainEvent,
+    LandingParked,
+)
 from flywheel_orchestrator import (
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
@@ -511,9 +516,22 @@ class GitWorktreeSubmitter:
         try:
             self._submit(req)
         except Exception as exc:  # noqa: BLE001 - must not escape into orchestrate
+            worktree = self._worktree(req.task_id)
             self.log(
                 f"submit error for {req.task_id} ({type(exc).__name__}: "
-                f"{exc}); worktree left parked at {self._worktree(req.task_id)}"
+                f"{exc}); worktree left parked at {worktree}"
+            )
+            # Audit-witness for the swallowed error: the land is still
+            # suppressed (the exception stays swallowed, the worktree stays
+            # parked); this only records why. _record_landing_park never
+            # raises, so submit() still cannot escape into orchestrate.
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_SUBMIT_ERROR,
+                detail=(
+                    f"submit raised {type(exc).__name__}: {exc}; worktree "
+                    f"left parked at {worktree}"
+                ),
             )
 
     def is_landable(self, req: SubmitRequest) -> LandabilityVerdict:
@@ -604,6 +622,15 @@ class GitWorktreeSubmitter:
                     f"{task_id} touches protected path(s) "
                     f"{', '.join(violations)}; refusing to merge, parking "
                     f"worktree at {worktree}"
+                )
+                self._record_landing_park(
+                    req.run_id,
+                    park_kind=PARK_KIND_PROTECTED_PATHS,
+                    detail=(
+                        f"{branch} touches protected path(s) "
+                        f"{', '.join(violations)}; refusing to merge, worktree "
+                        f"preserved at {worktree}"
+                    ),
                 )
                 return
 
@@ -915,8 +942,10 @@ class GitWorktreeSubmitter:
         self, run_id: str, *, park_kind: str, detail: str
     ) -> None:
         """Append a queryable ``LANDING_PARKED`` audit-witness event for a
-        parked DONE run (``park_kind`` ``"uncommitted-work"`` or
-        ``"divergent-base"``).
+        parked DONE run (``park_kind`` is one of
+        :data:`~flywheel_core.events.LANDING_PARK_KINDS`, e.g.
+        ``"uncommitted-work"``, ``"divergent-base"``, ``"protected-paths"``, or
+        ``"submit-error"``).
 
         The run already finalized ``DONE`` (terminal); this records the park
         cause on the run's ledger via ``append_domain_event`` WITHOUT any

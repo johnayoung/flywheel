@@ -28,7 +28,10 @@ from flywheel_core import (
     Status,
     ValidEnvelope,
 )
+from flywheel_core.events import LandingParked
+from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator import (
+    FilesystemHeldOutGraderSource,
     LandabilityVerdict,
     SandboxRequest,
     SubmitRequest,
@@ -233,6 +236,63 @@ def test_landable_run_lands_on_first_attempt(tmp_path: Path) -> None:
     assert len(strategy.probe_calls) == 1
     assert len(strategy.submit_calls) == 1
     assert strategy.submit_calls[0].status is Status.DONE
+
+
+def test_failing_held_out_gate_records_park(tmp_path: Path) -> None:
+    """A DONE run blocked by a FAILing held-out landing gate leaves a durable
+    held-out-gate ``LandingParked`` on its ledger AND nothing lands.
+
+    The held-out gate's verdict otherwise survives only on the in-process
+    ``RunRecord``; this pins that a blocked land now persists a queryable
+    audit-witness (via ``list_domain_events``) while remaining audit-only --
+    the run stays DONE and ``submit`` is never invoked.
+    """
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    # The visible grader passes (the run reports DONE), but the held-out grader
+    # exits non-zero, so the gate blocks the land.
+    _write_task(phase, "alpha", grader_run="true")
+    held_out = tmp_path / "held_out"
+    held_out.mkdir(parents=True, exist_ok=True)
+    (held_out / "alpha.json").write_text(
+        json.dumps(
+            [{"type": "command", "run": "exit 1", "name": "gate-check"}]
+        )
+    )
+
+    strategy = _RecordingStrategy(
+        tmp_path / "prepared",
+        verdicts=[LandabilityVerdict(landable=True)],
+    )
+    db_path = tmp_path / "flywheel.sqlite"
+
+    report = asyncio.run(
+        orchestrate(
+            tasks_dir=tmp_path / "tasks",
+            db_path=db_path,
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_always_verify(),
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+            strategy=strategy,
+            held_out_source=FilesystemHeldOutGraderSource(root=held_out),
+        )
+    )
+
+    # DONE, but nothing landed: the gate blocked and submit was never called.
+    assert [r.status for r in report.runs] == [Status.DONE]
+    assert strategy.submit_calls == []
+
+    run_id = report.runs[0].run_id
+    store = SqliteStore(str(db_path))
+    try:
+        events = store.list_domain_events(run_id)
+    finally:
+        store.close()
+    parked = [e for e in events if isinstance(e, LandingParked)]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "held-out-gate"
+    assert "gate-check" in parked[0].detail
 
 
 def test_no_predicate_strategy_lands_unaffected(tmp_path: Path) -> None:

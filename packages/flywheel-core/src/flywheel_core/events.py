@@ -228,12 +228,17 @@ class LandingParked(_DomainEventBase):
     the identity (it advances ``version`` only and performs no state change).
     The run stays ``Status.DONE``.
 
-    ``park_kind`` discriminates the cause on one shared surface:
-    ``"uncommitted-work"`` (the agent reached DONE with an uncommitted tree,
-    spec 00027), ``"divergent-base"`` (the configured base could not
-    fast-forward even after rebase + re-verify, spec 00026), or
+    ``park_kind`` discriminates the cause on one shared surface (see
+    :data:`LANDING_PARK_KINDS`): ``"uncommitted-work"`` (the agent reached DONE
+    with an uncommitted tree, spec 00027), ``"divergent-base"`` (the configured
+    base could not fast-forward even after rebase + re-verify, spec 00026),
     ``"standing-verify"`` (the ``[submit] verify`` standing build invariant
-    failed against the tree about to land, spec 00064). ``detail`` is a
+    failed against the tree about to land, spec 00064), ``"held-out-gate"`` (the
+    execute-time held-out landing gate blocked the land, spec 00050),
+    ``"protected-paths"`` (the branch touched a protected path so the merge/PR
+    was refused), ``"push-failed"`` (the PR strategy could not push the branch or
+    open the pull request), or ``"submit-error"`` (the submit step raised and the
+    exception was swallowed, leaving the worktree parked). ``detail`` is a
     human-readable reason, queryable via ``list_domain_events(run_id)``.
     """
 
@@ -241,6 +246,34 @@ class LandingParked(_DomainEventBase):
 
     park_kind: str
     detail: str = ""
+
+
+# Landing-park cause vocabulary. Every site that suppresses a land -- the merge
+# and PR protected-path refusals, a failed push / PR open, a swallowed submit
+# error, and the held-out landing gate -- names its cause with one of these
+# stable kebab-case spellings, kept identical across the worker, PR, and
+# orchestrate emit sites so a single status reader recognizes them all. The
+# first three predate this set; the rest were added so every land-suppression
+# path leaves a durable witness.
+PARK_KIND_UNCOMMITTED_WORK = "uncommitted-work"
+PARK_KIND_DIVERGENT_BASE = "divergent-base"
+PARK_KIND_STANDING_VERIFY = "standing-verify"
+PARK_KIND_HELD_OUT_GATE = "held-out-gate"
+PARK_KIND_PROTECTED_PATHS = "protected-paths"
+PARK_KIND_PUSH_FAILED = "push-failed"
+PARK_KIND_SUBMIT_ERROR = "submit-error"
+
+LANDING_PARK_KINDS: frozenset[str] = frozenset(
+    {
+        PARK_KIND_UNCOMMITTED_WORK,
+        PARK_KIND_DIVERGENT_BASE,
+        PARK_KIND_STANDING_VERIFY,
+        PARK_KIND_HELD_OUT_GATE,
+        PARK_KIND_PROTECTED_PATHS,
+        PARK_KIND_PUSH_FAILED,
+        PARK_KIND_SUBMIT_ERROR,
+    }
+)
 
 
 DomainEvent = (

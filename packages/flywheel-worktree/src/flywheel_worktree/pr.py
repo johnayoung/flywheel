@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from flywheel_core import Status
+from flywheel_core.events import (
+    PARK_KIND_PROTECTED_PATHS,
+    PARK_KIND_PUSH_FAILED,
+)
 from flywheel_orchestrator import GhRunner, SubmitRequest, WorkPolicy
 
 from flywheel_worktree.worker import (
@@ -229,6 +233,15 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
                 f"{', '.join(violations)}; refusing to open a PR, parking "
                 f"worktree at {worktree}"
             )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_PROTECTED_PATHS,
+                detail=(
+                    f"{branch} touches protected path(s) "
+                    f"{', '.join(violations)}; refusing to open a PR, worktree "
+                    f"preserved at {worktree}"
+                ),
+            )
             return
 
         push = _git(
@@ -243,9 +256,35 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
                 f"push of {branch} to {self.remote} failed "
                 f"({push.stderr.strip()}); parking worktree at {worktree}"
             )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_PUSH_FAILED,
+                detail=(
+                    f"push of {branch} to {self.remote} failed: "
+                    f"{push.stderr.strip()}; worktree preserved at {worktree}"
+                ),
+            )
             return
 
-        url = self._ensure_pr(branch, req)
+        try:
+            url = self._ensure_pr(branch, req)
+        except GhError as exc:
+            # A failed PR open is the same class of land-suppression as a failed
+            # push: the branch is pushed but the PR never opened, so the work
+            # has not landed. Record the reason and leave the worktree parked.
+            self.log(
+                f"opening a PR for {branch} failed ({exc}); parking worktree "
+                f"at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_PUSH_FAILED,
+                detail=(
+                    f"opening a PR for {branch} failed: {exc}; worktree "
+                    f"preserved at {worktree}"
+                ),
+            )
+            return
         self.log(
             f"Landed {branch} as PR {url} ({commit_count} commit(s)); "
             f"merge is review/CI's call"

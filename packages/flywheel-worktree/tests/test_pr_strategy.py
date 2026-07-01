@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from flywheel_core import CommandGrader, Status, Task
+from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_orchestrator import (
     GraderReceipt,
     SandboxRequest,
@@ -20,6 +21,27 @@ from flywheel_orchestrator import (
 )
 
 from flywheel_worktree.pr import GitPullRequestSubmitter, render_pr_body
+
+
+class _RecordingLedger:
+    """Minimal LandingLedger stub capturing appended domain events, enough to
+    assert the PR strategy records a LandingParked witness for a suppressed
+    land."""
+
+    def __init__(self) -> None:
+        self.events: list[DomainEvent] = []
+
+    class _Lifecycle:
+        version = 0
+
+    def load_lifecycle(self, run_id: str) -> "_RecordingLedger._Lifecycle":
+        return self._Lifecycle()
+
+    def append_domain_event(
+        self, event: DomainEvent, *, expected_version: int
+    ) -> "_RecordingLedger._Lifecycle":
+        self.events.append(event)
+        return self._Lifecycle()
 
 
 # --- git / fixture helpers ----------------------------------------------------
@@ -279,6 +301,56 @@ def test_push_failure_parks(tmp_path: Path) -> None:
 
     assert wt.exists()
     assert gh.calls == []
+
+
+def test_protected_path_records_park(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    remote = _init_repo_with_remote(repo)
+    gh = _FakeGh()
+    ledger = _RecordingLedger()
+    s = _submitter(repo, gh, protected_paths=["conftest.py"], store=ledger)
+    tf = _task_file(repo, "t1")
+
+    wt = s.prepare_sandbox(
+        SandboxRequest(task_id="t1", task_file=tf, run_id=None, mode="fresh")
+    )
+    _commit(wt, "conftest.py", "tampered", "edit conftest")
+
+    s.submit(_req(tf, "t1", wt, Status.DONE))
+
+    # Land still suppressed (nothing pushed, no PR), plus a protected-paths
+    # witness naming the offending path.
+    assert not _remote_branch_exists(remote, "flywheel/01-phase/t1")
+    assert gh.calls == []
+    parked = [e for e in ledger.events if isinstance(e, LandingParked)]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "protected-paths"
+    assert "conftest.py" in parked[0].detail
+
+
+def test_push_failure_records_park(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo_with_remote(repo)
+    gh = _FakeGh()
+    ledger = _RecordingLedger()
+    # A remote that does not exist makes the real push fail.
+    s = _submitter(repo, gh, remote="nonexistent", store=ledger)
+    tf = _task_file(repo, "t1")
+
+    wt = s.prepare_sandbox(
+        SandboxRequest(task_id="t1", task_file=tf, run_id=None, mode="fresh")
+    )
+    _commit(wt, "feature.txt", "x", "feat")
+
+    s.submit(_req(tf, "t1", wt, Status.DONE))
+
+    # Land still suppressed (worktree parked, no PR), plus a push-failed witness.
+    assert wt.exists()
+    assert gh.calls == []
+    parked = [e for e in ledger.events if isinstance(e, LandingParked)]
+    assert len(parked) == 1
+    assert parked[0].park_kind == "push-failed"
+    assert "nonexistent" in parked[0].detail
 
 
 def test_pr_submitter_is_a_submit_strategy(tmp_path: Path) -> None:

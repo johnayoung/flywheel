@@ -65,6 +65,7 @@ from flywheel_core.harness import (
     recheck_blocked_lifecycle,
     resolve_manual_approval,
 )
+from flywheel_core.events import PARK_KIND_HELD_OUT_GATE, LandingParked
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
 from flywheel_core.lifecycle import Status
 from flywheel_core.store_protocols import (
@@ -1290,6 +1291,48 @@ def _evaluate_landing_gate(
     return verdict
 
 
+def _record_held_out_gate_park(
+    control: SqliteStore | PostgresStore,
+    *,
+    run_id: str,
+    detail: str,
+    task_id: str,
+    stream: TextIO | None,
+) -> None:
+    """Append a ``held-out-gate`` :class:`LandingParked` audit-witness to the
+    blocked DONE run's ledger.
+
+    The held-out gate's verdict otherwise lives only on the in-process
+    ``RunRecord``; this persists it so an operator can see *why* the land was
+    suppressed. Audit-witness only (D-2): the run stays ``Status.DONE`` and the
+    submit is still not invoked -- ``LandingParked`` folds to the identity and
+    only advances ``version``. Best-effort: a missing lifecycle or any store
+    error is logged to ``stream`` and swallowed so the orchestrate loop never
+    unwinds on a recording failure.
+    """
+    try:
+        lifecycle = control.load_lifecycle(run_id)
+        if lifecycle is None:
+            return
+        control.append_domain_event(
+            LandingParked(
+                run_id=run_id,
+                ts=_utcnow(),
+                park_kind=PARK_KIND_HELD_OUT_GATE,
+                detail=detail,
+            ),
+            expected_version=lifecycle.version,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort audit witness
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: failed to record held-out-gate "
+                f"landing-parked event ({type(exc).__name__}: {exc})",
+                file=stream,
+                flush=True,
+            )
+
+
 async def _drive_under_lease(
     control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
@@ -1489,6 +1532,18 @@ async def _drive_under_lease(
                     flush=True,
                 )
         gate_blocked = gate is not None and gate.blocks_landing
+        if gate is not None and gate.blocks_landing:
+            # The gate FAILed and is suppressing the land (submit is not called
+            # below). Persist the verdict as a held-out-gate LandingParked so the
+            # blocked strand is visible on the run's ledger; this does not change
+            # whether the land is suppressed (D-2).
+            _record_held_out_gate_park(
+                control,
+                run_id=outcome.lifecycle.run_id,
+                detail=gate.reason or "held-out landing gate blocked the land",
+                task_id=task_id,
+                stream=stream,
+            )
         if submit is not None and not gate_blocked and not gate_errored:
             submit(
                 SubmitRequest(

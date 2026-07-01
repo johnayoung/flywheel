@@ -899,6 +899,73 @@ def test_snapshot_captured_at_uses_the_injected_clock(tmp_path: Path) -> None:
         claims.close()
 
 
+def test_schema_mismatch_permanent_stop(tmp_path: Path) -> None:
+    # A store whose schema_version row is wrong: reopening it raises
+    # StoreSchemaError, which classify_fault buckets PERMANENT. The driver
+    # reopens the store at the top of every pass, so the same error would raise
+    # identically on cycles 1..5 -- burning ALL five breaker strikes (with a
+    # backoff between each) if it were treated as a transient cycle failure. The
+    # permanent-stop path must instead stop after exactly ONE cycle via a
+    # distinct signal, never retry it, and never reach the transient give-up.
+    import sqlite3
+
+    from flywheel_core.store_protocols import (
+        CURRENT_SCHEMA_VERSION,
+        StoreSchemaError,
+    )
+    from flywheel_orchestrator._autopilot import AutopilotPassResult
+    from flywheel_orchestrator._autopilot_run import (
+        MAX_CONSECUTIVE_CYCLE_FAILURES,
+        run_daemon_loop,
+    )
+
+    db_path = tmp_path / "flywheel.sqlite"
+    # Materialize a valid store, then rewrite its schema_version to a value that
+    # is neither CURRENT nor the one supported forward-migration source (11), so
+    # a subsequent open is refused with StoreSchemaError rather than upgraded.
+    SqliteStore(db_path).close()
+    bad_version = CURRENT_SCHEMA_VERSION + 1000
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "UPDATE schema_version SET version = ? WHERE id = 1", (bad_version,)
+    )
+    conn.commit()
+    conn.close()
+
+    def run_cycle() -> AutopilotPassResult:
+        # Mirrors the driver reopening the store at the top of each pass: the
+        # store open raises StoreSchemaError before any work is listed, so this
+        # never returns normally.
+        _orchestrate(tmp_path, _always_verify())
+        raise AssertionError("unreachable: store open must have raised")
+
+    permanent: list[BaseException] = []
+    strikes: list[int] = []
+    gave_up: list[int] = []
+
+    cycles = run_daemon_loop(
+        run_cycle=run_cycle,
+        interval_seconds=0.0,
+        should_stop=lambda: False,
+        sleep=lambda _seconds, _stop: None,
+        on_cycle_failure=lambda exc, n: strikes.append(n),
+        on_give_up=gave_up.append,
+        on_permanent_stop=permanent.append,
+        # Safety bound so a regression that keeps retrying cannot loop forever;
+        # the assertion below proves the loop stopped at 1, well under this.
+        max_cycles=MAX_CONSECUTIVE_CYCLE_FAILURES,
+    )
+
+    # Exactly ONE cycle -- not MAX_CONSECUTIVE_CYCLE_FAILURES strikes.
+    assert cycles == 1
+    # The permanent-stop signal fired once, carrying the schema mismatch.
+    assert len(permanent) == 1
+    assert isinstance(permanent[0], StoreSchemaError)
+    # And it took the permanent path, NOT the transient strike / give-up path.
+    assert strikes == []
+    assert gave_up == []
+
+
 def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
     from flywheel_orchestrator._orchestrate import _ClaimHeartbeat
 

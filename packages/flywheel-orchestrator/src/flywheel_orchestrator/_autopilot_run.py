@@ -21,6 +21,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from flywheel_core.faults import FaultClass, classify_fault
 from flywheel_orchestrator._autopilot import (
     DEFAULT_WEIGHTS,
     AutopilotPassResult,
@@ -210,6 +211,7 @@ def run_daemon_loop(
     before_cycle: Callable[[], None] | None = None,
     on_cycle_failure: Callable[[BaseException, int], None] | None = None,
     on_give_up: Callable[[int], None] | None = None,
+    on_permanent_stop: Callable[[BaseException], None] | None = None,
     max_cycles: int | None = None,
 ) -> int:
     """Run refill passes on an interval until an explicit stop signal.
@@ -232,6 +234,15 @@ def run_daemon_loop(
     never a silent exit. ``KeyboardInterrupt``/``asyncio.CancelledError`` are
     not counted: they stop the loop immediately.
 
+    Permanent stop (distinct from the transient breaker): a raised fault that
+    ``flywheel_core.faults.classify_fault`` buckets PERMANENT -- e.g. a
+    ``StoreSchemaError``/``OrchestratorSchemaError`` from reopening a store
+    whose ``schema_version`` row is wrong -- can never succeed on retry. It is
+    NOT counted as a transient strike (it would otherwise burn all five and
+    back off between each); instead the loop counts exactly this one cycle,
+    calls ``on_permanent_stop`` (a signal distinct from ``on_cycle_failure`` /
+    ``on_give_up`` that a caller/grader can assert on), and stops immediately.
+
     Every collaborator is injected so the loop runs with no real wall-clock
     waits and no live model: ``run_cycle`` is the (scripted) pass, ``sleep``
     the interruptible wait, ``should_stop`` the stop signal. ``before_cycle``
@@ -251,6 +262,16 @@ def run_daemon_loop(
         except (KeyboardInterrupt, asyncio.CancelledError):
             break
         except Exception as exc:  # noqa: BLE001 - one bad cycle must not crash the daemon
+            # Permanent faults (a schema-version mismatch reopening the store
+            # every cycle) can never succeed on retry, so they must not burn
+            # the transient-strike budget: classify PERMANENT, count this one
+            # cycle, surface the distinct permanent-stop signal, and stop --
+            # never one strike per cycle up to MAX_CONSECUTIVE_CYCLE_FAILURES.
+            if classify_fault(exc) is FaultClass.PERMANENT:
+                cycles += 1
+                if on_permanent_stop is not None:
+                    on_permanent_stop(exc)
+                break
             consecutive_failures += 1
             cycles += 1
             if on_cycle_failure is not None:

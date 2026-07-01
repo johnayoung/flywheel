@@ -56,10 +56,12 @@ from uuid import uuid4
 
 from flywheel_core import (
     CommandGrader,
+    FaultClass,
     GraderResultRecord,
     InvokeFunc,
     Lifecycle,
     Status,
+    classify_fault,
     run_command_graders,
 )
 from flywheel_core.events import DomainEvent, LandingParked
@@ -102,6 +104,11 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5
 # cross-cycle backstop that replaces the bash SPAWN_FAILURES circuit breaker.
 MAX_CONSECUTIVE_CYCLE_FAILURES = 5
 CYCLE_FAILURE_BACKOFF_SECONDS = 10
+# Distinct exit code for a permanent-stop: a cycle fault that can never succeed
+# on retry (a schema-version mismatch reopening the store every cycle). It stops
+# the loop after a single cycle -- separate from the transient give-up exit (1)
+# so an operator/grader can tell "wrong on-disk schema" from "five flaky cycles".
+PERMANENT_STOP_EXIT_CODE = 2
 
 # Worker-pool supervision (spec 00060). How long the pool's group shutdown
 # gives each member's SIGTERM window before escalating to SIGKILL, and how
@@ -2115,6 +2122,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 break
             except Exception as exc:  # noqa: BLE001 - one bad cycle must not crash the daemon
+                # A permanent fault (a schema-version mismatch reopening the
+                # store every cycle) can never succeed on retry, so it must not
+                # ride all five breaker strikes: classify PERMANENT and stop the
+                # loop after this single cycle via a distinctly-labelled
+                # permanent-stop exit, separate from the transient give-up path.
+                if classify_fault(exc) is FaultClass.PERMANENT:
+                    log(
+                        f"Cycle hit a permanent fault "
+                        f"({type(exc).__name__}: {exc}); stopping the worker "
+                        f"loop after one cycle for operator inspection "
+                        f"(retrying cannot reconcile it)."
+                    )
+                    return PERMANENT_STOP_EXIT_CODE
                 consecutive_failures += 1
                 log(
                     f"Cycle failed ({type(exc).__name__}: {exc}) "

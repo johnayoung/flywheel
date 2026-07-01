@@ -88,6 +88,7 @@ if TYPE_CHECKING:
 from flywheel_core.task import Task
 from flywheel_core.validation import validate_task
 from flywheel_orchestrator._claims import (
+    REASON_PREREQUISITE_MISSING,
     REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
     STOP_DANGLING_PREREQUISITE,
     STOP_RETRIES_ESCALATED,
@@ -122,7 +123,11 @@ from flywheel_orchestrator._sources import (
     WorkSource,
 )
 from flywheel_orchestrator._store_factory import open_sqlite_bound_store
-from flywheel_orchestrator._work_graph import WorkGraph, WorkGraphBuilder
+from flywheel_orchestrator._work_graph import (
+    GraphValidationIssue,
+    WorkGraph,
+    WorkGraphBuilder,
+)
 from flywheel_orchestrator._strategy import (
     SandboxHandle,
     SandboxProvider,
@@ -194,6 +199,22 @@ DEFAULT_LANDING_REDRIVE_BOUND: int = 3
 # human after a single stronger attempt, never re-escalating on every
 # exhaustion.
 DEFAULT_ESCALATION_BOUND: int = 1
+
+# How many consecutive scheduling cycles a task's declared prerequisite may stay
+# missing before the referencing task is routed to the human-review queue (spec
+# 00069, criteria #7/#8/#13). While the prerequisite is absent the referencing
+# task stays out of the ready set -- it is never dispatched against an
+# unsatisfied prereq -- exactly as before; each cycle the prerequisite is still
+# dangling records one ``dangling-prerequisite`` witness on the append-only stop
+# ledger. On the cycle the witness count reaches this bound the task is routed to
+# the queue ONCE with ``prerequisite-missing`` and the missing prerequisite id in
+# the detail, and no further routing occurs. If the prerequisite instead appears
+# (criterion #7) the graph rebuild resolves the edge and the task becomes
+# eligible and is driven -- the bound is never reached. Three is generous enough
+# to ride out a sibling source that lists its half of a cross-source dependency a
+# pass or two late, yet finite so a genuinely absent prerequisite reaches a human
+# promptly rather than spinning ineligible forever.
+DEFAULT_PREREQ_REDRIVE_BOUND: int = 3
 
 
 def _utcnow() -> datetime:
@@ -1183,6 +1204,185 @@ async def redrive_exhausted_retries(
     return tuple(outcomes)
 
 
+@dataclass(frozen=True, kw_only=True)
+class PrereqRedriveOutcome:
+    """What the dangling-prerequisite re-driver did with one issue in a pass.
+
+    ``referencing_id`` is the task that declared the edge, ``missing_id`` the
+    prerequisite that resolves to no work item this pass. ``cycles`` is the
+    number of consecutive scheduling cycles the prerequisite has now been
+    observed missing (the count of ``dangling-prerequisite`` witnesses on the
+    referencing task's stop ledger, including this pass's). ``result`` is the
+    disposition:
+
+    * ``"waiting"`` -- the prerequisite is still missing but the bound is not yet
+      reached, so the referencing task stays out of the ready set (never
+      dispatched) and the re-driver waits for it to appear or the bound to cross.
+    * ``"queued"`` -- the prerequisite stayed missing through the bound, so the
+      referencing task was routed to the single human-review queue ONCE with
+      :data:`REASON_PREREQUISITE_MISSING` and the missing id named in the detail
+      (or was already routed on a prior pass, the terminal no-further-routing
+      state).
+    """
+
+    referencing_id: str
+    missing_id: str
+    result: Literal["waiting", "queued"]
+    cycles: int
+
+
+def _prereq_dangling_cycles(
+    claims: SqliteClaimStore, referencing_id: str, missing_id: str
+) -> int:
+    """How many cycles ``referencing_id``'s edge to ``missing_id`` has dangled.
+
+    Counts the ``dangling-prerequisite`` witnesses the re-driver appended for
+    this referencing/missing pair -- one per scheduling cycle the prerequisite
+    stayed missing. The missing id is matched by its ``repr`` in the witness
+    detail so a task with two distinct dangling prerequisites bounds each edge
+    independently. This count is how the re-driver enforces its bound.
+    """
+    needle = repr(missing_id)
+    return sum(
+        1
+        for event in claims.list_subject_stop_events(referencing_id)
+        if event.kind == STOP_DANGLING_PREREQUISITE and needle in event.detail
+    )
+
+
+def _prereq_already_queued(
+    claims: SqliteClaimStore, referencing_id: str, missing_id: str
+) -> bool:
+    """True once this referencing/missing edge has been routed to the queue.
+
+    The terminal guard behind criterion #8's "exactly one queue entry, not an
+    infinite ineligible spin": a task routed with
+    :data:`REASON_PREREQUISITE_MISSING` naming this missing id carries that stop
+    row keyed to its id. Its presence stops the re-driver from ever re-routing
+    the same edge OR appending further witnesses, so a genuinely absent
+    prerequisite costs exactly ``bound`` witnesses and one queue entry.
+    """
+    needle = repr(missing_id)
+    return any(
+        event.kind == REASON_PREREQUISITE_MISSING and needle in event.detail
+        for event in claims.list_subject_stop_events(referencing_id)
+    )
+
+
+def redrive_missing_prerequisites(
+    claims: SqliteClaimStore,
+    *,
+    issues: Iterable[GraphValidationIssue],
+    bound: int = DEFAULT_PREREQ_REDRIVE_BOUND,
+    now: Callable[[], datetime],
+    stream: TextIO | None = None,
+) -> tuple[PrereqRedriveOutcome, ...]:
+    """Bounded re-drive of tasks blocked on a missing prerequisite (spec 00069,
+    criteria #7/#8/#13).
+
+    A task whose declared prerequisite resolves to no work item this pass is a
+    :class:`GraphValidationIssue`: it stays out of the ready set (never
+    dispatched against an unsatisfied prereq) exactly as before. This re-driver
+    turns that permanent dead-end into a bounded one. For each still-dangling
+    ``issue`` this pass it:
+
+    1. Short-circuits an edge already routed to the queue (the terminal,
+       no-further-routing state -- criterion #8), recording nothing further so a
+       genuinely absent prerequisite produces exactly one queue entry.
+    2. Appends one ``dangling-prerequisite`` witness to the referencing task's
+       append-only stop ledger, advancing the cycle count -- the durable,
+       recurrence-preserving record that the prerequisite is still missing (spec
+       00068).
+    3. On the cycle the witness count reaches ``bound``, routes the referencing
+       task to the single human-review queue ONCE with
+       :data:`REASON_PREREQUISITE_MISSING` and the missing prerequisite id named
+       in the detail (a machine-readable reason naming the missing id --
+       criterion #8). Below the bound it merely waits.
+
+    Criterion #7 -- a once-dangling task becoming eligible when its prerequisite
+    later appears -- is satisfied by the scheduler's per-pass graph rebuild, not
+    here: once the prerequisite is listed and DONE the edge resolves, no issue is
+    produced for it, this re-driver is never called for it, and the task enters
+    the ready set and is driven. So the bound is only ever reached by a
+    prerequisite that stays genuinely absent, never by one that merely arrives
+    late.
+
+    The re-driver only appends ledger rows -- it never claims, transitions a
+    lifecycle, or forges a status (criterion #14). Returns one
+    :class:`PrereqRedriveOutcome` per issue, in input order.
+    """
+    outcomes: list[PrereqRedriveOutcome] = []
+    for issue in issues:
+        referencing_id = issue.referencing_id
+        missing_id = issue.missing_id
+        # Terminal guard (criterion #8): an edge already routed to the queue is
+        # never re-witnessed and never re-queued -- exactly one queue entry.
+        if _prereq_already_queued(claims, referencing_id, missing_id):
+            outcomes.append(
+                PrereqRedriveOutcome(
+                    referencing_id=referencing_id,
+                    missing_id=missing_id,
+                    result="queued",
+                    cycles=_prereq_dangling_cycles(
+                        claims, referencing_id, missing_id
+                    ),
+                )
+            )
+            continue
+        # Witness this cycle's dangling edge (spec 00068): one row per pass the
+        # prerequisite stays missing, never deduped -- the recurrence is the
+        # signal and the count is the bound.
+        claims.record_stop_event(
+            kind=STOP_DANGLING_PREREQUISITE,
+            subject=referencing_id,
+            detail=(
+                f"prerequisite {missing_id!r} resolves to no work item; "
+                f"{referencing_id!r} stays out of the ready set"
+            ),
+            occurred_at=now(),
+        )
+        cycles = _prereq_dangling_cycles(claims, referencing_id, missing_id)
+        if cycles >= bound:
+            detail = (
+                f"prerequisite {missing_id!r} stayed missing for {cycles} "
+                f"cycle(s) (bound {bound}); {referencing_id!r} was never "
+                f"dispatched against an unsatisfied prerequisite"
+            )
+            claims.record_human_review(
+                reason=REASON_PREREQUISITE_MISSING,
+                task_id=referencing_id,
+                detail=detail,
+                occurred_at=now(),
+            )
+            if stream is not None:
+                print(
+                    f"[orchestrate] {referencing_id}: prerequisite "
+                    f"{missing_id!r} missing past {bound} cycle(s); routed to "
+                    f"the human-review queue "
+                    f"(reason {REASON_PREREQUISITE_MISSING!r})",
+                    file=stream,
+                    flush=True,
+                )
+            outcomes.append(
+                PrereqRedriveOutcome(
+                    referencing_id=referencing_id,
+                    missing_id=missing_id,
+                    result="queued",
+                    cycles=cycles,
+                )
+            )
+            continue
+        outcomes.append(
+            PrereqRedriveOutcome(
+                referencing_id=referencing_id,
+                missing_id=missing_id,
+                result="waiting",
+                cycles=cycles,
+            )
+        )
+    return tuple(outcomes)
+
+
 class _ClaimHeartbeat:
     """Renew a task lease on a timer while its run is in flight.
 
@@ -1361,6 +1561,7 @@ async def orchestrate(
     reconcile_seconds: float | None = None,
     sweep_seconds: float | None = None,
     landing_redrive_bound: int | None = None,
+    prereq_redrive_bound: int = DEFAULT_PREREQ_REDRIVE_BOUND,
     repo_root: Path | None = None,
     held_out_source: HeldOutGraderSource | None = None,
 ) -> OrchestratorReport:
@@ -1425,6 +1626,20 @@ async def orchestrate(
     one); ``None``/``0`` (the default) disables it, preserving prior behavior for
     library callers and callers that wired the bare submit callable. The CLI and
     the worktree daemon enable it by default.
+
+    ``prereq_redrive_bound`` bounds the dangling-prerequisite re-driver (spec
+    00069): a task whose declared prerequisite resolves to no work item stays out
+    of the ready set (never dispatched) exactly as before, and each pass the
+    prerequisite is still missing records one witness; once the prerequisite
+    stays missing through this many cycles the referencing task is routed once to
+    the human-review queue with ``prerequisite-missing`` naming the missing id
+    (see :func:`redrive_missing_prerequisites`). If the prerequisite instead
+    appears, the per-pass graph rebuild resolves the edge and the task becomes
+    eligible and is driven, so the bound is only reached by a genuinely absent
+    prerequisite. Always on (the dangling-prerequisite witnesses were recorded
+    unconditionally before this too); the default bound is generous enough to
+    tolerate a sibling source listing its half of a cross-source dependency a
+    pass or two late.
 
     ``policy`` selects the store backend: construction routes through the
     store factory (:func:`~flywheel_orchestrator._store_factory.build_store`),
@@ -1610,24 +1825,26 @@ async def orchestrate(
             # set exactly as today (spec 00047, decision D-1).
             validation = WorkGraph.build(items)
             graph = validation.graph
-            # Witness every dangling prerequisite this pass surfaced (D-2): a
-            # task whose declared prerequisite resolves to no work item stays
-            # out of the ready set exactly as before, but the dead-end is now
-            # recorded on the append-only stop ledger, naming the referencing
-            # task and the missing id. One row per issue per pass -- never
-            # deduped, since a prerequisite that stays dangling across passes
-            # is a recurring stop and the recurrence is the signal.
-            for issue in validation.issues:
-                claims.record_stop_event(
-                    kind=STOP_DANGLING_PREREQUISITE,
-                    subject=issue.referencing_id,
-                    detail=(
-                        f"prerequisite {issue.missing_id!r} resolves to no "
-                        f"work item; {issue.referencing_id!r} stays out of "
-                        f"the ready set"
-                    ),
-                    occurred_at=clock(),
-                )
+            # Bounded dangling-prerequisite re-drive (spec 00069, criteria
+            # #7/#8/#13). A task whose declared prerequisite resolves to no work
+            # item stays out of the ready set exactly as before -- never
+            # dispatched against an unsatisfied prereq. Each such pass appends one
+            # ``dangling-prerequisite`` witness to the append-only stop ledger
+            # (spec 00068, naming the referencing task and the missing id; never
+            # deduped, so the recurrence is the signal). When the prerequisite
+            # stays missing through ``prereq_redrive_bound`` cycles the
+            # referencing task is routed ONCE to the human-review queue with
+            # ``prerequisite-missing`` naming the missing id; if instead the
+            # prerequisite appears, the next pass's graph rebuild resolves the
+            # edge, no issue is produced, and the task becomes eligible and is
+            # driven (criterion #7).
+            redrive_missing_prerequisites(
+                claims,
+                issues=validation.issues,
+                bound=prereq_redrive_bound,
+                now=clock,
+                stream=stream,
+            )
             states: dict[str, TaskState] = {r.task.id: r.state for r in rows}
             task_by_id: dict[str, Task] = {r.task.id: r.task for r in rows}
             row_by_id: dict[str, TaskStatusRow] = {

@@ -1087,7 +1087,13 @@ def _format_heartbeat(row: LiveRunRow, now: datetime) -> str:
     )
     iter_str = f"iter={row.iteration}" if row.iteration is not None else "iter=?"
     if row.iterations_completed == 0:
-        totals = "tokens=0 cost=-- turns=0"
+        # No iteration has completed yet, so the per-iteration rollup
+        # (tokens/cost/turns come from harness.iteration_completed events)
+        # has no data. The agent is still working its first iteration --
+        # render that honestly. "tokens=0 turns=0" reads as a frozen run
+        # when it is in fact mid-flight; the `age` field shows how long the
+        # in-progress iteration has been running.
+        totals = "working (first-iteration metrics pending)"
     else:
         totals = (
             f"tokens={row.tokens_total} "

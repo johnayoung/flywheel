@@ -690,9 +690,12 @@ def test_heartbeat_renders_dashes_when_no_iteration_event_yet() -> None:
         turns_total=0,
     )
     line = worker._format_heartbeat(row, datetime.now(timezone.utc))  # type: ignore[arg-type]
-    assert "cost=--" in line
-    assert "tokens=0" in line
-    assert "turns=0" in line
+    # Before any iteration completes the per-iteration rollup has no data.
+    # The line must read as "working" rather than the misleading
+    # "tokens=0 turns=0", which looks like a frozen run mid-flight.
+    assert "working" in line
+    assert "metrics pending" in line
+    assert "tokens=0 cost=-- turns=0" not in line
 
 
 def test_heartbeat_unknown_breadcrumb_renders_question_marks() -> None:

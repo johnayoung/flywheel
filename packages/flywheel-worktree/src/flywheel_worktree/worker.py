@@ -71,6 +71,7 @@ from flywheel_core.events import (
     LandingParked,
 )
 from flywheel_orchestrator import (
+    DEFAULT_SWEEP_SECONDS,
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
     HeldOutGraderSource,
@@ -1209,6 +1210,7 @@ def run_once(
     worker_id: str | None = None,
     lease_seconds: float = 300.0,
     reconcile_seconds: float | None = None,
+    sweep_seconds: float | None = DEFAULT_SWEEP_SECONDS,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     log: Logger | None = None,
@@ -1260,6 +1262,7 @@ def run_once(
             worker_id=worker_id,
             lease_seconds=lease_seconds,
             reconcile_seconds=reconcile_seconds,
+            sweep_seconds=sweep_seconds,
             strategy=strategy if strategy is not None else submitter,
             stream=stream,
             repo_root=submitter.repo_root,

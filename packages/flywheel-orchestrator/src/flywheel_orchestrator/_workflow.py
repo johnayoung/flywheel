@@ -872,7 +872,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     # now lives in the flywheel-orchestrator package. This lazy import is the
     # one remaining core -> consumer reference; it goes away in Phase 3b when
     # the multi-task CLI moves to the orchestrator package.
-    from flywheel_orchestrator import orchestrate
+    from flywheel_orchestrator import DEFAULT_SWEEP_SECONDS, orchestrate
 
     policy = _load_effective_policy(args)
     source = _resolve_work_source(args, policy)
@@ -895,6 +895,7 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
             worker_id=args.worker_id,
             lease_seconds=args.lease_seconds,
             reconcile_seconds=args.reconcile_seconds or None,
+            sweep_seconds=DEFAULT_SWEEP_SECONDS,
         )
     )
     for run_id in report.recovered:

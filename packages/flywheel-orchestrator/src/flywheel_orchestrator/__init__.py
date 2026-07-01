@@ -91,10 +91,12 @@ from flywheel_orchestrator._claims import (
 from flywheel_orchestrator._orchestrate import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_RECONCILE_SECONDS,
+    DEFAULT_SWEEP_SECONDS,
     OrchestratorReport,
     RunRecord,
     orchestrate,
     reconcile_live_runs,
+    sweep_expired_leases,
     sync_work_source,
 )
 from flywheel_orchestrator._strategy import (
@@ -290,6 +292,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
+    "DEFAULT_SWEEP_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DEFAULT_WORKER_CONCURRENCY",
     "DirectoryWorkSource",
@@ -378,6 +381,7 @@ __all__ = [
     "resolve_postgres_dsn",
     "select_next_task",
     "status_rows_for_items",
+    "sweep_expired_leases",
     "sync_work_source",
     "task_state",
     "write_oracle_registration",

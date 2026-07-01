@@ -157,6 +157,15 @@ DEFAULT_LEASE_SECONDS: float = 300.0
 # a cancelled item keeps burning tokens.
 DEFAULT_RECONCILE_SECONDS: float = 15.0
 
+# How often the in-loop expired-lease sweep runs while the loop drives (spec
+# 00069). The active counterpart to the entry-time recovery backstop: a worker
+# that dies mid-task has its lapsed lease released and its stranded lifecycle
+# finalized on this cadence, so the task returns to eligibility without waiting
+# for another worker to happen to re-select it. 15s mirrors the reconciler --
+# negligible store traffic, and well inside a healthy lease window so a live
+# claim is never in the reap set.
+DEFAULT_SWEEP_SECONDS: float = 15.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -504,6 +513,115 @@ def _recover_claimable_stranded(
     return tuple(recovered)
 
 
+def sweep_expired_leases(
+    control: SqliteStore | PostgresStore,
+    claims: SqliteClaimStore,
+    worker_id: str,
+    *,
+    lease_seconds: float,
+    now: Callable[[], datetime],
+    sink: TelemetrySink | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """One expired-lease sweep: finalize claimable stranded lifecycles, then
+    reap any remaining lapsed claim rows (spec 00069, criteria #1/#2).
+
+    The active counterpart to the entry-time :func:`_recover_claimable_stranded`
+    backstop, run on a bounded cadence *while the loop drives* (see
+    :func:`_lease_sweep_loop`). Two steps, in order:
+
+    1. :func:`_recover_claimable_stranded` finalizes every stranded
+       ``running``/``validating`` lifecycle whose task the sweeper can claim --
+       acquiring the claim proves no live worker holds it -- through the
+       sanctioned :func:`finalize_stranded_lifecycle` path (never a direct
+       status write), then releases the claim so the task returns to an
+       eligible, re-selectable state. Its liveness guard is the criterion #2
+       safety: a task a live peer is actively running cannot be claimed, so its
+       run is left untouched.
+    2. :meth:`SqliteClaimStore.sweep_expired_claims` batch-drops any *remaining*
+       lapsed claim rows -- a lease that lapsed with no stranded lifecycle behind
+       it -- so a dead worker's leaked lease never wedges its task's conflict
+       keys. It reaps only rows with ``lease_expires_at <= now``; a still-live
+       lease (criterion #2) is never touched.
+
+    Returns ``(recovered_run_ids, released_task_ids)``: the run ids finalized in
+    step 1 and the task ids reaped in step 2. Both empty on a quiet store.
+    """
+    recovered = _recover_claimable_stranded(
+        control,
+        claims,
+        worker_id,
+        lease_seconds=lease_seconds,
+        now=now,
+        sink=sink,
+    )
+    released = tuple(claims.sweep_expired_claims(now=now()))
+    return recovered, released
+
+
+async def _lease_sweep_loop(
+    *,
+    control: SqliteStore | PostgresStore,
+    claims: SqliteClaimStore,
+    worker_id: str,
+    lease_seconds: float,
+    interval: float,
+    now: Callable[[], datetime],
+    sink: TelemetrySink | None,
+    stream: TextIO | None,
+) -> None:
+    """Tick :func:`sweep_expired_leases` every ``interval`` seconds (spec 00069).
+
+    Runs as a sibling asyncio task while :func:`orchestrate` awaits drives,
+    mirroring :func:`_source_reconcile_loop`: a worker that dies mid-task has its
+    lapsed lease actively released and its stranded lifecycle finalized on a
+    bounded cadence, so the task returns to eligibility WITHOUT waiting for some
+    other worker to happen to re-select that exact task id (criterion #1). The
+    live-claim safety is inherited from :func:`sweep_expired_leases` -- a future
+    lease, or a task a live peer is actively running, is never swept or
+    reclaimed (criterion #2).
+
+    Failure posture matches the reconciler: a store error skips the tick, is
+    logged to ``stream``, and is retried on the next tick; the loop only exits by
+    cancellation. The entry-time :func:`_recover_claimable_stranded` backstop is
+    unaffected -- this in-loop sweep is additive, not a replacement.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            recovered, released = sweep_expired_leases(
+                control,
+                claims,
+                worker_id,
+                lease_seconds=lease_seconds,
+                now=now,
+                sink=sink,
+            )
+        except Exception as exc:  # noqa: BLE001 - transient store error
+            if stream is not None:
+                print(
+                    f"[orchestrate] lease-sweep failed "
+                    f"({type(exc).__name__}: {exc}); retrying next tick",
+                    file=stream,
+                    flush=True,
+                )
+            continue
+        if stream is not None:
+            for run_id in recovered:
+                print(
+                    f"[orchestrate] lease-sweep: finalized stranded run "
+                    f"{run_id}; its task is eligible again",
+                    file=stream,
+                    flush=True,
+                )
+            for task_id in released:
+                print(
+                    f"[orchestrate] lease-sweep: released lapsed lease on "
+                    f"task {task_id!r}",
+                    file=stream,
+                    flush=True,
+                )
+
+
 class _ClaimHeartbeat:
     """Renew a task lease on a timer while its run is in flight.
 
@@ -680,6 +798,7 @@ async def orchestrate(
     submit: Submitter | None = None,
     strategy: SubmitStrategy | None = None,
     reconcile_seconds: float | None = None,
+    sweep_seconds: float | None = None,
     repo_root: Path | None = None,
     held_out_source: HeldOutGraderSource | None = None,
 ) -> OrchestratorReport:
@@ -719,6 +838,17 @@ async def orchestrate(
     sibling task re-lists the source and enqueues an ``interrupt`` control
     command for any in-flight run whose item is no longer listed (see
     :func:`reconcile_live_runs`). ``None``/``0`` (the default) disables it,
+    preserving prior behavior for library callers; the CLI and the worktree
+    daemon enable it by default.
+
+    ``sweep_seconds`` enables the in-loop expired-lease sweep (spec 00069):
+    every N seconds a sibling task releases any lapsed claim and finalizes its
+    stranded lifecycle (see :func:`sweep_expired_leases`), so a worker that dies
+    mid-task has its task returned to eligibility on a bounded cadence without
+    waiting for another worker to re-select it. It reuses the live-claim safety
+    of :func:`_recover_claimable_stranded`: a future lease, or a task a live peer
+    is actively running, is never swept or reclaimed. Additive to the entry-time
+    recovery, which still runs. ``None``/``0`` (the default) disables it,
     preserving prior behavior for library callers; the CLI and the worktree
     daemon enable it by default.
 
@@ -823,6 +953,7 @@ async def orchestrate(
     # db_path), so out-of-band interventions land in the run's timeline.
     sink = FileTelemetrySink(db_path.parent / "logs")
     reconciler: asyncio.Task[None] | None = None
+    sweeper: asyncio.Task[None] | None = None
     try:
         recovered = _recover_claimable_stranded(
             control,
@@ -842,6 +973,32 @@ async def orchestrate(
                     stream=stream,
                 ),
                 name="flywheel-source-reconciler",
+            )
+        if sweep_seconds is not None and sweep_seconds > 0:
+            # The in-loop sweeper MUST claim under a distinct worker id, never
+            # this driver's own ``wid`` (spec 00069, criterion #2). acquire_claim
+            # lets the *same* worker re-take its own live lease, so a sweeper
+            # sharing ``wid`` would reclaim a task THIS worker is actively running
+            # -- a live claim + RUNNING lifecycle -- and wrongly finalize it
+            # mid-run. A separate id makes that live claim look like a peer's: the
+            # lease is still in the future, so acquire_claim returns None and the
+            # running task is left untouched. A genuinely stranded task's lease is
+            # lapsed, so it is reclaimable regardless of which id sweeps it. The
+            # entry-time recovery keeps ``wid`` safely -- no task is being driven
+            # yet, so this worker holds no live claim to trip over.
+            sweep_wid = f"{wid}-sweeper"
+            sweeper = asyncio.create_task(
+                _lease_sweep_loop(
+                    control=control,
+                    claims=claims,
+                    worker_id=sweep_wid,
+                    lease_seconds=lease_seconds,
+                    interval=sweep_seconds,
+                    now=clock,
+                    sink=sink,
+                    stream=stream,
+                ),
+                name="flywheel-lease-sweeper",
             )
         runs: list[RunRecord] = []
         attempted_fresh: set[str] = set()
@@ -1258,6 +1415,10 @@ async def orchestrate(
             reconciler.cancel()
             with suppress(asyncio.CancelledError):
                 await reconciler
+        if sweeper is not None:
+            sweeper.cancel()
+            with suppress(asyncio.CancelledError):
+                await sweeper
         control.close()
         claims.close()
         sink.close()
@@ -1732,6 +1893,7 @@ async def _drive_or_relinquish(
 __all__ = [
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_RECONCILE_SECONDS",
+    "DEFAULT_SWEEP_SECONDS",
     "OrchestratorReport",
     "RunRecord",
     "SandboxProvider",
@@ -1740,4 +1902,5 @@ __all__ = [
     "Submitter",
     "orchestrate",
     "reconcile_live_runs",
+    "sweep_expired_leases",
 ]

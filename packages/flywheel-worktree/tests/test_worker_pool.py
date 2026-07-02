@@ -290,6 +290,7 @@ def _full_args(**overrides: object) -> argparse.Namespace:
         "max_turns": 12,
         "max_retries": 4,
         "worktree_retention_days": 7,
+        "run_log_retention": worker.DEFAULT_RUN_LOG_RETENTION,
         "heartbeat": 30,
         "poll_interval": 5,
         "lease_seconds": 300.0,
@@ -318,6 +319,7 @@ def test_pool_member_argv_forwards_run_knobs() -> None:
         max_turns=9,
         max_retries=2,
         lease_seconds=120.0,
+        run_log_retention=42,
         tasks_dir="/tmp/tasks",
         db="/tmp/db.sqlite",
         once=True,
@@ -326,6 +328,7 @@ def test_pool_member_argv_forwards_run_knobs() -> None:
     assert argv[argv.index("--max-turns") + 1] == "9"
     assert argv[argv.index("--max-retries") + 1] == "2"
     assert argv[argv.index("--lease-seconds") + 1] == "120.0"
+    assert argv[argv.index("--run-log-retention") + 1] == "42"
     assert argv[argv.index("--tasks-dir") + 1] == "/tmp/tasks"
     assert argv[argv.index("--db") + 1] == "/tmp/db.sqlite"
     assert argv[argv.index("--model") + 1] == "sonnet"

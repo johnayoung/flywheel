@@ -106,6 +106,13 @@ from flywheel_orchestrator import (
 from flywheel_worktree._submit_registry import SUBMIT_STRATEGIES
 
 DEFAULT_RETENTION_DAYS = 7
+# Default cap on per-run telemetry JSONL files kept under
+# .flywheel/logs/runs/. The harness's sink writes one <run_id>.jsonl per run
+# and never rotates them, so without an active bound the directory grows
+# without limit. The worker reclaims the oldest files past this cap each cycle;
+# the most-recent runs (including the one in flight) always survive. Magnitude
+# is a default, not a contract.
+DEFAULT_RUN_LOG_RETENTION = 500
 DEFAULT_HEARTBEAT_SECONDS = 10
 DEFAULT_POLL_INTERVAL_SECONDS = 5
 # Consecutive whole-cycle failures (orchestrate raising unexpectedly) before
@@ -1054,10 +1061,56 @@ def archive_phases(
         log(f"Archived phase: {dest}")
 
 
-# Per-run forensics live in the run telemetry JSONL the harness's sink
-# writes at .flywheel/logs/runs/<run_id>.jsonl (spec 00025). The worker
-# renders nothing from the store and never deletes or rotates those
-# files -- their lifecycle is operator-owned (logrotate etc.).
+# Per-run forensics live in the run telemetry JSONL the harness's sink writes
+# at .flywheel/logs/runs/<run_id>.jsonl (spec 00025). The worker renders
+# nothing from the store; it holds that directory at or under a configured
+# bound via sweep_run_logs (default-on), reclaiming the oldest run files while
+# the most-recent runs -- including the one in flight -- always survive.
+
+
+def sweep_run_logs(runs_dir: Path, max_run_files: int, log: Logger) -> None:
+    """Hold ``runs_dir`` at or under ``max_run_files`` per-run JSONL files by
+    deleting the oldest (by mtime) and preserving the most-recent
+    ``max_run_files``.
+
+    Default-on companion to :func:`retention_sweep` for the telemetry stream:
+    the harness's sink writes one ``<run_id>.jsonl`` per run and never rotates
+    them, so without this the directory grows unbounded. The newest file -- the
+    run in flight -- is always in the surviving set, so an active run is never
+    reclaimed. A no-op when the directory is absent, ``max_run_files`` is
+    non-positive (retention disabled), or there are already at or fewer than
+    ``max_run_files`` files. Reclaim failures on individual files are skipped,
+    never raised, so housekeeping cannot escape into the run loop.
+    """
+    if max_run_files <= 0 or not runs_dir.is_dir():
+        return
+    entries: list[tuple[float, str, Path]] = []
+    for entry in runs_dir.iterdir():
+        if entry.suffix != ".jsonl" or not entry.is_file():
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        entries.append((mtime, entry.name, entry))
+    if len(entries) <= max_run_files:
+        return
+    # Newest first: (mtime, name) descending keeps exactly the most-recent
+    # files and breaks mtime ties deterministically by name. Everything past
+    # the bound is the oldest tail, which is what we reclaim.
+    entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    reclaimed = 0
+    for _mtime, _name, path in entries[max_run_files:]:
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        reclaimed += 1
+    if reclaimed:
+        log(
+            f"Run-log retention: reclaimed {reclaimed} old run file(s), "
+            f"keeping the most-recent {max_run_files}"
+        )
 
 
 def retention_sweep(
@@ -1646,6 +1699,8 @@ def _pool_member_argv(
         str(args.max_retries),
         "--worktree-retention-days",
         str(args.worktree_retention_days),
+        "--run-log-retention",
+        str(args.run_log_retention),
         "--heartbeat",
         str(args.heartbeat),
         "--poll-interval",
@@ -1817,6 +1872,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument(
         "--worktree-retention-days", type=int, default=DEFAULT_RETENTION_DAYS
+    )
+    parser.add_argument(
+        "--run-log-retention",
+        type=int,
+        default=DEFAULT_RUN_LOG_RETENTION,
+        help=(
+            "Cap on per-run telemetry JSONL files kept under "
+            ".flywheel/logs/runs/; the oldest past the cap are reclaimed "
+            "each cycle so the most-recent runs survive (0 disables)."
+        ),
     )
     parser.add_argument(
         "--heartbeat",
@@ -2277,7 +2342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"current cycle."
         )
 
+    run_logs_dir = db_path.parent / "logs" / "runs"
+
     def _run_cycle() -> None:
+        # Default-on run-log retention: hold .flywheel/logs/runs/ at or under
+        # the configured bound before draining, so a long-running daemon does
+        # not accumulate per-run JSONL files without limit.
+        sweep_run_logs(run_logs_dir, args.run_log_retention, log)
         run_once(
             submitter,
             tasks_dir=tasks_dir,

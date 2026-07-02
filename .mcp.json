@@ -6,7 +6,8 @@
         "--from", "git+https://github.com/oraios/serena",
         "serena", "start-mcp-server",
         "--context", "ide-assistant",
-        "--project-from-cwd"
+        "--project-from-cwd",
+        "--enable-web-dashboard", "False"
       ]
     }
   }

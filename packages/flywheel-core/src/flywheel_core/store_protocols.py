@@ -265,6 +265,40 @@ class ControlCommandRecord:
     id: int | None = None
 
 
+@dataclass(frozen=True)
+class DegradedSpaceRecord:
+    """A queryable witness that a disk/inode preflight declined an
+    authoritative store write because free space or free inodes fell below
+    threshold.
+
+    Pure data. It is produced by the worker-layer preflight (which owns the
+    ``shutil.disk_usage`` / ``os.statvfs`` probe — this module imports no IO)
+    and surfaced on the worker's status/telemetry surface so an operator can
+    see the decline as first-class state instead of a half-written store row
+    or a swallowed ``ENOSPC`` crash. The record exists precisely because the
+    crashing write was *not* attempted: it is emitted before that write, never
+    after catching its failure.
+
+    ``below_bytes`` / ``below_inodes`` say which dimension tripped (either, or
+    both); at least one is always ``True`` on a record that exists. The
+    observed ``free_bytes`` / ``free_inodes`` and the configured
+    ``min_free_bytes`` / ``min_free_inodes`` thresholds are captured verbatim
+    so the decision is auditable. ``run_id`` locates the declined unit when
+    the preflight guards a run-scoped write; it is ``None`` for writes not
+    tied to a run.
+    """
+
+    path: str
+    free_bytes: int
+    free_inodes: int
+    min_free_bytes: int
+    min_free_inodes: int
+    below_bytes: bool
+    below_inodes: bool
+    ts: datetime
+    run_id: str | None = None
+
+
 # --- Aggregate read shapes --------------------------------------------------
 
 
@@ -608,6 +642,7 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "ControlCommandRecord",
     "ControlCommandStore",
+    "DegradedSpaceRecord",
     "DomainEventStore",
     "EventRecord",
     "GraderResultRecord",

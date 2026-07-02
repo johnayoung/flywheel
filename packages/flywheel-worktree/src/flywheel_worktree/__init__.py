@@ -10,6 +10,11 @@ the daemon is launched through the unified product shell as
 in-process.
 """
 
+from flywheel_worktree._disk_preflight import (
+    DiskPreflight,
+    DiskThreshold,
+    SpaceProbe,
+)
 from flywheel_worktree.worker import (
     GitWorktreeSubmitter,
     PrepareSandboxError,
@@ -19,8 +24,11 @@ from flywheel_worktree.worker import (
 )
 
 __all__ = [
+    "DiskPreflight",
+    "DiskThreshold",
     "GitWorktreeSubmitter",
     "PrepareSandboxError",
+    "SpaceProbe",
     "main",
     "phase_of_task_file",
     "run_once",

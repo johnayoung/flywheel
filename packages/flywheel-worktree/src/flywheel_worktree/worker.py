@@ -103,6 +103,7 @@ from flywheel_orchestrator import (
     write_phase_base_if_missing,
 )
 
+from flywheel_worktree._disk_preflight import DiskPreflight
 from flywheel_worktree._submit_registry import SUBMIT_STRATEGIES
 
 DEFAULT_RETENTION_DAYS = 7
@@ -289,6 +290,7 @@ class GitWorktreeSubmitter:
         store: LandingLedger | None = None,
         grader_env: Mapping[str, str] | None = None,
         verify_command: str | None = None,
+        disk_preflight: DiskPreflight | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -322,6 +324,18 @@ class GitWorktreeSubmitter:
         # divergent-base). None (e.g. a bare direct construction) degrades to
         # the log-only park the worktree still preserves.
         self.store = store
+        # Disk/inode preflight guarding the authoritative ledger write below
+        # (_record_landing_park). Default-on: a bare construction still probes
+        # free space/inodes ahead of the append so a near-full disk yields a
+        # queryable degraded-space record instead of an ENOSPC crash that tears
+        # the store row. Threshold is configurable by injecting a DiskPreflight;
+        # on a healthy host the defaults never trip, so landing proceeds as
+        # before.
+        self.disk_preflight = (
+            disk_preflight
+            if disk_preflight is not None
+            else DiskPreflight(log=log)
+        )
 
     def _branch(self, task_id: str, phase: str) -> str:
         return f"flywheel/{phase}/{task_id}"
@@ -967,18 +981,29 @@ class GitWorktreeSubmitter:
         lifecycle transition — ``LandingParked`` folds to the identity, so the
         status stays ``DONE`` and only ``version`` advances. Best-effort: a
         missing store handle or any store error is logged, never raised, so
-        ``submit()`` cannot escape into orchestrate (criterion 7)."""
+        ``submit()`` cannot escape into orchestrate (criterion 7).
+
+        The append is an authoritative ledger write, so it is gated by the
+        disk/inode preflight first: when free space or inodes are below
+        threshold the preflight records a queryable degraded-space witness and
+        this returns WITHOUT attempting the append — declining the crashing
+        write before it can tear the store row, rather than catching an
+        ENOSPC failure after the fact. Above threshold the write is reached
+        exactly as before."""
         if self.store is None:
             return
-        try:
-            lifecycle = self.store.load_lifecycle(run_id)
+
+        store = self.store
+
+        def _append() -> None:
+            lifecycle = store.load_lifecycle(run_id)
             if lifecycle is None:
                 self.log(
                     f"cannot record landing-parked event: no lifecycle for "
                     f"{run_id}"
                 )
                 return
-            self.store.append_domain_event(
+            store.append_domain_event(
                 LandingParked(
                     run_id=run_id,
                     ts=datetime.now(timezone.utc),
@@ -986,6 +1011,11 @@ class GitWorktreeSubmitter:
                     detail=detail,
                 ),
                 expected_version=lifecycle.version,
+            )
+
+        try:
+            self.disk_preflight.guard(
+                self.repo_root, _append, run_id=run_id
             )
         except Exception as exc:  # noqa: BLE001 - must not escape submit
             self.log(

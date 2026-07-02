@@ -53,6 +53,69 @@ from flywheel_orchestrator._supervision_policy import (
 # a few seconds of headroom is ample. Tests override to stay snappy.
 DEFAULT_STOP_TIMEOUT_SECONDS: float = 10.0
 
+# Every supervisor log is ``autopilot-supervisor-<ts>-<seq>.log`` under the log
+# dir; the reclaim seam globs on this prefix so it only ever touches supervisor
+# logs, never the sibling ``activity.json`` or anything else in the directory.
+LOG_FILENAME_PREFIX: str = "autopilot-supervisor-"
+
+# Default-on ceiling (spec 00071 criterion #1 / decision D-1): the supervisor
+# log directory's total footprint is held at or under this many bytes across
+# repeated starts by reclaiming the OLDEST logs. The magnitude is not
+# load-bearing -- bounded + default-on is the requirement -- so this is a sane
+# default a caller may override via ``AutopilotSupervisor(max_log_bytes=...)``.
+DEFAULT_MAX_LOG_BYTES: int = 8 * 1024 * 1024
+
+
+def reclaim_supervisor_logs(log_dir: Path, *, max_bytes: int) -> None:
+    """Delete the oldest supervisor logs until the footprint is at or under
+    ``max_bytes``, always preserving the single most-recent log.
+
+    Reclaims whole files oldest-first (by mtime, then name -- the filename
+    encodes the creation timestamp, so it is a stable tiebreaker for logs that
+    share an mtime). The most-recent log is never deleted or truncated: even a
+    lone log larger than ``max_bytes`` survives intact, so recent forensic
+    content always outlives the bound (decision D-1 -- a "rotation" that empties
+    the directory is a defect). A directory holding one log or none is left
+    untouched -- there is nothing older to reclaim.
+
+    Callers open the *new* log only after this returns, so the log preserved
+    here is the most-recent *content-bearing* one, not a just-created empty
+    file.
+    """
+    try:
+        candidates = [
+            p
+            for p in log_dir.glob(f"{LOG_FILENAME_PREFIX}*.log")
+            if p.is_file()
+        ]
+    except OSError:
+        return
+    if len(candidates) <= 1:
+        return  # only the most-recent log (or none) -- nothing to reclaim.
+
+    entries: list[tuple[float, str, Path, int]] = []
+    for path in candidates:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        entries.append((st.st_mtime, path.name, path, st.st_size))
+    if len(entries) <= 1:
+        return
+    entries.sort(key=lambda e: (e[0], e[1]))  # oldest first
+
+    total = sum(size for _, _, _, size in entries)
+    # Iterate oldest-first but stop before the last (newest) entry so at least
+    # one log always survives -- the directory is never emptied.
+    for _mtime, _name, path, size in entries[:-1]:
+        if total <= max_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+
 
 class AutopilotState(str, enum.Enum):
     """The states the console's status surface renders for autopilot.
@@ -153,11 +216,21 @@ class AutopilotSupervisor:
         model: str | None = None,
         activity_path: Path | None = None,
         policy: SupervisionPolicy | None = None,
+        max_log_bytes: int = DEFAULT_MAX_LOG_BYTES,
     ) -> None:
         self._policy = policy
         self._log_dir = (
             log_dir if log_dir is not None else Path(".flywheel/logs/autopilot")
         )
+        # Default-on ceiling for the log directory's footprint: every start
+        # reclaims the oldest logs to hold the directory at or under this many
+        # bytes (spec 00071 #1 / D-1), so repeated starts cannot grow one
+        # unbounded file per start forever.
+        self._max_log_bytes = max_log_bytes
+        # Monotonic per-supervisor counter that makes each log filename unique
+        # even when two starts land in the same clock second, so a rapid restart
+        # never reopens (and appends to) a prior start's log.
+        self._log_seq = 0
         # The activity snapshot the daemon writes and ``status()`` reads. The
         # supervisor owns the path and hands it to the child via ``--activity-
         # file`` so both ends agree without the daemon guessing.
@@ -487,8 +560,16 @@ class AutopilotSupervisor:
 
     def _open_log(self) -> IO[bytes]:
         self._log_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        path = self._log_dir / f"autopilot-supervisor-{ts}.log"
+        # Reclaim BEFORE opening the new (empty) log: at this point the newest
+        # log on disk is the previous start's *content-bearing* one, so it is
+        # the log the reclaim preserves. Reclaiming after would make the
+        # just-created empty file the survivor and could prune every log that
+        # actually holds output -- a footprint-zero "rotation" D-1 forbids.
+        reclaim_supervisor_logs(self._log_dir, max_bytes=self._max_log_bytes)
+        now = datetime.now(timezone.utc)
+        ts = f"{now.strftime('%Y%m%dT%H%M%S')}-{self._log_seq:04d}"
+        self._log_seq += 1
+        path = self._log_dir / f"{LOG_FILENAME_PREFIX}{ts}.log"
         handle = open(path, "ab", buffering=0)
         self._log_handle = handle
         self._log_path = path
@@ -508,9 +589,12 @@ class AutopilotSupervisor:
 
 
 __all__ = [
+    "DEFAULT_MAX_LOG_BYTES",
     "DEFAULT_STOP_TIMEOUT_SECONDS",
+    "LOG_FILENAME_PREFIX",
     "AutopilotState",
     "AutopilotStatus",
     "AutopilotSupervisor",
     "build_autopilot_spawn_argv",
+    "reclaim_supervisor_logs",
 ]

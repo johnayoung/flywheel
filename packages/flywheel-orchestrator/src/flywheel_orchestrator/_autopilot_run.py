@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import enum
 import os
 import signal
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
@@ -46,6 +48,10 @@ from flywheel_orchestrator._autopilot_activity import (
     AutopilotActivity,
     EmittedSummary,
     write_activity,
+)
+from flywheel_orchestrator._supervision_policy import (
+    RespawnDecision,
+    SupervisionPolicy,
 )
 from flywheel_orchestrator._policy import PolicyError, WorkPolicy
 from flywheel_orchestrator._workflow import (
@@ -506,6 +512,164 @@ class _ActivityRecorder:
         self._last_result = result
         now = self._clock()
         self._write(PHASE_IDLE, now=now, next_cycle_at=now + self._interval)
+
+
+# --- Headless supervised run (headless-supervised-autopilot) -----------------
+
+
+def _no_terminate() -> None:
+    """Default no-op ``terminate`` for a child needing no orphan cleanup."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class SupervisedChild:
+    """One spawned autopilot daemon the headless supervisor waits on.
+
+    A thin handle over the running daemon so :func:`run_supervised` is agnostic
+    to how it was launched: ``wait`` blocks until the child exits and returns its
+    exit code (a crash OR a forwarded-signal graceful shutdown), and
+    ``terminate`` brings the child and everything it spawned down orphan-free
+    (SIGTERM the session group, escalate to SIGKILL). Tests inject a scripted
+    stand-in so respawn is deterministic; production wraps a ``subprocess.Popen``
+    of the neverending daemon (see :mod:`._autopilot_supervised_run`).
+    """
+
+    pid: int
+    wait: Callable[[], int]
+    terminate: Callable[[], None] = _no_terminate
+
+
+class SupervisedOutcome(enum.Enum):
+    """How a headless supervised run ended.
+
+    ``ADOPTED`` -- a live daemon already held a fresh liveness record at startup,
+    so the entrypoint adopted it and spawned nothing (spawn count 0).
+    ``STOPPED`` -- an external stop signal ended the run after a graceful child
+    shutdown. ``DEAD_AFTER_BUDGET`` -- the daemon kept dying and exhausted the
+    shared windowed crash-loop budget, so the entrypoint stopped respawning and
+    latched this loud terminal state instead of crash-looping forever (the
+    autopilot analogue of the console supervisor's
+    ``AutopilotState.DEAD_AFTER_BUDGET`` -- the unattended-base-branch interlock).
+    """
+
+    ADOPTED = "adopted"
+    STOPPED = "stopped"
+    DEAD_AFTER_BUDGET = "dead_after_budget"
+
+
+@dataclass(frozen=True, kw_only=True)
+class SupervisedRunResult:
+    """The terminal snapshot of a :func:`run_supervised` call.
+
+    ``spawn_count`` is the number of daemon children actually launched (0 on
+    adoption -- what criterion #6 asserts); ``deaths`` counts children that died
+    on their own (a forwarded-signal shutdown is not a death); ``adopted_pid``
+    names the foreign daemon on ``ADOPTED``; ``last_pid`` is the most recently
+    spawned child.
+    """
+
+    outcome: SupervisedOutcome
+    spawn_count: int
+    deaths: int = 0
+    adopted_pid: int | None = None
+    last_pid: int | None = None
+
+
+def run_supervised(
+    *,
+    spawn: Callable[[], SupervisedChild],
+    policy: SupervisionPolicy,
+    should_stop: Callable[[], bool],
+    read_liveness: Callable[[], AutopilotActivity | None],
+    on_spawn: Callable[[SupervisedChild], None] | None = None,
+    on_death: Callable[[int, RespawnDecision], None] | None = None,
+    on_adopt: Callable[[AutopilotActivity], None] | None = None,
+    max_spawns: int | None = None,
+) -> SupervisedRunResult:
+    """Run the autopilot daemon headless under the shared crash-loop policy.
+
+    The headless counterpart of the console ``AutopilotSupervisor``: it enforces
+    the SAME shared :class:`SupervisionPolicy` budget/window and the SAME
+    liveness-record adoption (``read_live_activity``) the console supervisor
+    enforces -- not a parallel policy -- differing only in shell: a blocking
+    spawn/wait/respawn loop rather than a status surface a TUI polls. Every
+    collaborator is injected so the loop runs deterministically with no real
+    subprocess and no wall-clock: ``spawn`` launches one daemon child and returns
+    its :class:`SupervisedChild`; ``read_liveness`` reads the liveness record
+    (production: ``lambda: read_live_activity(activity_path)``); ``should_stop``
+    is the stop signal (a SIGTERM/SIGINT flag in production).
+
+    Adoption first (criterion #6): if ``read_liveness`` returns a live record at
+    startup -- a console-detached or peer daemon already running -- the entrypoint
+    adopts it and returns ``ADOPTED`` with ``spawn_count == 0``, spawning no
+    duplicate. A stale record reads back as ``None`` (the ``read_live_activity``
+    staleness rule, identical to a lapsed worker lease) and does not block a
+    spawn.
+
+    Otherwise it spawns the daemon and waits. When a child dies on its own it
+    charges the death against the shared policy: ``RESPAWN`` while inside budget
+    launches a fresh child and the loop continues (criterion #5 -- a daemon that
+    dies once is restarted and a further cycle runs); ``EXHAUSTED`` once the
+    windowed budget is spent stops respawning and returns ``DEAD_AFTER_BUDGET``
+    rather than looping forever. A child that exits after ``should_stop`` flipped
+    (a forwarded graceful shutdown) is not counted as a death and is not
+    respawned, and the orphan-free ``finally`` terminates a still-live child on
+    the way out so the wrapper never leaves an orphan on stop.
+
+    ``max_spawns`` is a test-only safety bound (mirroring ``run_daemon_loop``'s
+    ``max_cycles``); production leaves it ``None``.
+    """
+    live = read_liveness()
+    if live is not None:
+        if on_adopt is not None:
+            on_adopt(live)
+        return SupervisedRunResult(
+            outcome=SupervisedOutcome.ADOPTED,
+            spawn_count=0,
+            adopted_pid=live.pid,
+        )
+
+    spawn_count = 0
+    deaths = 0
+    last_pid: int | None = None
+    child: SupervisedChild | None = None
+    try:
+        while not should_stop():
+            if max_spawns is not None and spawn_count >= max_spawns:
+                break
+            child = spawn()
+            spawn_count += 1
+            last_pid = child.pid
+            if on_spawn is not None:
+                on_spawn(child)
+            exit_code = child.wait()
+            if should_stop():
+                # A forwarded stop signal brought the child down gracefully:
+                # not a crash, so do not charge the budget and do not respawn.
+                break
+            deaths += 1
+            decision = policy.record_death()
+            if on_death is not None:
+                on_death(exit_code, decision)
+            if decision is RespawnDecision.EXHAUSTED:
+                return SupervisedRunResult(
+                    outcome=SupervisedOutcome.DEAD_AFTER_BUDGET,
+                    spawn_count=spawn_count,
+                    deaths=deaths,
+                    last_pid=last_pid,
+                )
+            # RESPAWN: the dead child was reaped by its own wait(); drop the
+            # handle so the orphan-free finally never re-signals a dead group.
+            child = None
+    finally:
+        if child is not None:
+            child.terminate()
+    return SupervisedRunResult(
+        outcome=SupervisedOutcome.STOPPED,
+        spawn_count=spawn_count,
+        deaths=deaths,
+        last_pid=last_pid,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

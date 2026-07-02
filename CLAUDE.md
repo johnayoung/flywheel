@@ -50,6 +50,10 @@ Python 3.13 required. `uv` is the package manager and task runner — do not inv
 
 **Run the full suite through `scripts/check.sh`, not bare `uv run pytest`.** It wraps each gate in `scripts/run_silent.sh` (context-efficient backpressure): output is suppressed on success — one `ok` line per gate — and dumped in full only on the first failure, so passing runs do not flood the transcript. Use the bare `uv run pytest -k ...` forms above only while iterating on a single test; set `RUN_SILENT_VERBOSE=1` to stream output live. Run any other verification command the same way: `scripts/run_silent.sh "<desc>" <command>`.
 
+## Reading large modules
+
+The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides language-server-backed symbol retrieval. For any file over ~800 lines — e.g. `_orchestrate.py`, `_claims.py`, `worker.py`, `harness.py` — use `get_symbols_overview` to map it, then `find_symbol` to pull only the target symbol and `find_referencing_symbols` for its callers. Do not `Read` a whole large module to make a localized edit: whole-file reads of these modules are the dominant per-task context cost, and reading one repeatedly across an iteration is what triggers SDK auto-compaction.
+
 ## Non-negotiable invariants
 
 - **IMPORTANT: `flywheel_core.task` and `flywheel_core.lifecycle` are pure.** No `json`/`pathlib`/`io` imports, no `open()`. Enforced by `packages/flywheel-core/tests/test_task_module_purity.py` and `test_lifecycle_module_purity.py`. Do not weaken these tests to make a feature fit — move file/JSON code into `flywheel_core.loaders` instead.

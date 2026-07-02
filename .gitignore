@@ -57,3 +57,6 @@ Thumbs.db
 .claude/*
 !.claude/commands/
 !.claude/workflows/
+
+# Serena MCP (symbol retrieval) per-project cache/config/memories
+.serena/

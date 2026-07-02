@@ -1181,6 +1181,27 @@ def retention_sweep(
                 _git(repo_root, "branch", "-D", branch.strip())
 
 
+def retention_cadence_tick(
+    repo_root: Path,
+    worktrees_dir: Path,
+    retention_days: int,
+    log: Logger,
+    *,
+    now: Callable[[], float] = time.time,
+) -> None:
+    """Run one :func:`retention_sweep` pass, reading the clock fresh.
+
+    The daemon invokes this once per cycle -- not once at boot -- so a parked
+    worktree that ages past the retention window is reclaimed mid-run without a
+    restart, while a within-window worktree survives. Reading ``now`` on each
+    tick is what advances the cutoff between cycles; it is injectable so a test
+    can drive the cadence without wall-clock time. A single pass has exactly
+    :func:`retention_sweep`'s removal semantics -- this controls only *when* the
+    sweep runs, never *what* one sweep removes.
+    """
+    retention_sweep(repo_root, worktrees_dir, retention_days, now(), log)
+
+
 def reap_container_orphans(log: Logger) -> None:
     """Startup backstop: force-remove flywheel-owned orphan containers a prior
     killed worker left behind — the SIGKILL/OOM case the container backend's
@@ -2380,9 +2401,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"logs={db_path.parent / 'logs' / 'runs'}"
     )
 
-    retention_sweep(
-        repo_root, worktrees_dir, args.worktree_retention_days, time.time(), log
-    )
     # Reap any flywheel-owned container a prior killed worker left orphaned: the
     # SIGKILL/OOM case the container backend's atexit registry cannot cover
     # (spec 00071 #5). Runs once at boot, before the main loop, and is a no-op
@@ -2409,6 +2427,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the configured bound before draining, so a long-running daemon does
         # not accumulate per-run JSONL files without limit.
         sweep_run_logs(run_logs_dir, args.run_log_retention, log)
+        # Worktree retention runs every cycle, not once at boot: a parked
+        # worktree that ages past the window is reclaimed mid-run without a
+        # restart, while a within-window worktree survives. The clock is read
+        # fresh each tick so the cutoff advances between cycles.
+        retention_cadence_tick(
+            repo_root, worktrees_dir, args.worktree_retention_days, log
+        )
         run_once(
             submitter,
             tasks_dir=tasks_dir,

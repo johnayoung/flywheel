@@ -13,7 +13,14 @@
       "name": "purity-holdout"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "disk"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "disk"
+  ],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the worker run path that drives a unit into the authoritative store write; add a guarded low-space preflight (a free-space/inode probe via shutil.disk_usage / os.statvfs) ahead of that write.",

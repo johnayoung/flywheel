@@ -1,7 +1,9 @@
 {
   "id": "reap-orphan-containers",
   "goal": "When a worker starts and a flywheel-owned orphan container left by a prior killed worker is present, the worker's startup reap removes that orphan (the SIGKILL/OOM case the atexit backstop misses) while leaving non-flywheel containers untouched.",
-  "prerequisites": ["container-owner-marker"],
+  "prerequisites": [
+    "container-owner-marker"
+  ],
   "graders": [
     {
       "type": "command",
@@ -14,7 +16,15 @@
       "name": "seam-holdout"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "container"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "container"
+  ],
+  "conflict_keys": [
+    "packages/flywheel-container/src/flywheel_container/_docker.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel-container/src/flywheel_container/_docker.py -- the owner marker + selector from container-owner-marker (the scan keys on it); force_remove_container_sync()/remove_container() (lines 367-427) are the removal primitives; the atexit _flush_cleanup_registry (402-427) is the backstop that does NOT run on SIGKILL/OOM, which this startup reap covers.",

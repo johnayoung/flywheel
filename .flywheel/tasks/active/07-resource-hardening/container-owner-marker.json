@@ -13,7 +13,14 @@
       "name": "regression-holdout"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "container"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "container"
+  ],
+  "conflict_keys": [
+    "packages/flywheel-container/src/flywheel_container/_docker.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel-container/src/flywheel_container/_docker.py -- build_run_argv() (around lines 89-128) emits `docker run -d --name <name> ...` with NO label; add a stable flywheel-owner marker (a --label / owner identifier) to the created argv, and expose ONE selector (the same identifier) the orphan scan will use.",

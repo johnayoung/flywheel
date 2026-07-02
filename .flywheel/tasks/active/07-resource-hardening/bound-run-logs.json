@@ -13,7 +13,14 @@
       "name": "purity-holdout"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "logs"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "logs"
+  ],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the comment at lines 1013-1016 explicitly leaves .flywheel/logs/runs/ operator-owned and never rotated; this task replaces that disclaimer with an active default-on retention behavior the worker runs",

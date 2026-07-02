@@ -8,7 +8,15 @@
       "name": "behavior"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "autopilot", "logs"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "autopilot",
+    "logs"
+  ],
+  "conflict_keys": [
+    "packages/flywheel/src/flywheel/_autopilot_supervisor.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel/src/flywheel/_autopilot_supervisor.py -- _open_log() (around lines 340-347) opens a NEW autopilot-supervisor-<ts>.log on every start with nothing reclaiming the old ones; bound the directory footprint here (rotation/cap/retention by age or count)",

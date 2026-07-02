@@ -18,7 +18,14 @@
       "name": "regression-holdout"
     }
   ],
-  "tags": ["resource-hardening", "reliability", "worktree"],
+  "tags": [
+    "resource-hardening",
+    "reliability",
+    "worktree"
+  ],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+  ],
   "context": {
     "relevant": [
       "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- retention_sweep() at lines 1019-1054 removes worktrees older than retention_days and their branches; the main loop calls it ONCE at boot (line 2072). Make the sweep recur on a bounded cadence inside the `while not shutdown[...]` loop (per-cycle or on an interval), preserving exactly what one sweep does.",

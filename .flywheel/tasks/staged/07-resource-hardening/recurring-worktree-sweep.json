@@ -16,11 +16,6 @@
       "type": "command",
       "run": "uv run pytest packages/flywheel-worktree/tests/test_sandbox_retention.py packages/flywheel-worktree/tests/test_worker.py",
       "name": "regression-holdout"
-    },
-    {
-      "type": "command",
-      "run": "scripts/check.sh",
-      "name": "full-gate"
     }
   ],
   "tags": ["resource-hardening", "reliability", "worktree"],

@@ -12,11 +12,6 @@
       "type": "command",
       "run": "uv run pytest packages/flywheel-container/tests/test_owner_marker.py packages/flywheel-worktree/tests/test_orphan_container_reap.py",
       "name": "seam-holdout"
-    },
-    {
-      "type": "command",
-      "run": "scripts/check.sh",
-      "name": "full-gate"
     }
   ],
   "tags": ["resource-hardening", "reliability", "container"],

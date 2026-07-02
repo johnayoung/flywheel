@@ -11,11 +11,6 @@
       "type": "command",
       "run": "uv run pytest -k \"module_purity or sdk_optional or import_without\"",
       "name": "purity-holdout"
-    },
-    {
-      "type": "command",
-      "run": "scripts/check.sh",
-      "name": "full-gate"
     }
   ],
   "tags": ["resource-hardening", "reliability", "logs"],

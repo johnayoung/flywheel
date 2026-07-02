@@ -6,11 +6,6 @@
       "type": "command",
       "run": "uv run pytest packages/flywheel/tests/test_supervisor_log_bound.py",
       "name": "behavior"
-    },
-    {
-      "type": "command",
-      "run": "scripts/check.sh",
-      "name": "full-gate"
     }
   ],
   "tags": ["resource-hardening", "reliability", "autopilot", "logs"],

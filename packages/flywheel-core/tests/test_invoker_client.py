@@ -27,13 +27,20 @@ from claude_agent_sdk import (
     TextBlock,
 )
 
-from flywheel_core.envelope import CLOSING_FENCE, OPENING_FENCE, Intent, ValidEnvelope
+from flywheel_core.envelope import (
+    CLOSING_FENCE,
+    OPENING_FENCE,
+    Intent,
+    MissingEnvelope,
+    ValidEnvelope,
+)
 from flywheel_core.invoker_client import (
     CONTROL_COMMAND_APPROVE,
     CONTROL_COMMAND_INTERRUPT,
     CONTROL_COMMAND_REJECT,
     CONTROL_COMMAND_SAY,
     CONTROL_COMMAND_SET_MODEL,
+    ENVELOPE_SALVAGE_PROMPT,
     EVENT_CONTROL_APPLIED,
     EVENT_CONTROL_CLAIM_FAILED,
     EVENT_CONTROL_FAILED,
@@ -1549,3 +1556,194 @@ class TestSteeringLedgerSeam:
 
         asyncio.run(_run())
         assert [c.kind for c in applied] == [CONTROL_COMMAND_INTERRUPT]
+
+
+def _assistant_text_stop(text: str, stop_reason: str) -> AssistantMessage:
+    """An assistant text message with an explicit non-default stop reason."""
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude-test",
+        stop_reason=stop_reason,
+        session_id="sess-1",
+    )
+
+
+def _result_stop(stop_reason: str) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="sess-1",
+        stop_reason=stop_reason,
+        total_cost_usd=0.01,
+    )
+
+
+class _MultiTurnFakeClient(_FakeClient):
+    """Fake client that hands a distinct message list per ``receive_response``.
+
+    The lost-envelope salvage drives the live session a second time on the
+    same client. This fake pops the next queued turn's messages on each
+    ``receive_response`` call so a test can script the initial (envelope-less)
+    turn followed by the salvage turn's re-emitted envelope. ``query`` records
+    the initial prompt first, then the salvage prompt into ``injected`` (the
+    inherited contract), so a test asserts exactly how many salvage re-prompts
+    were sent.
+    """
+
+    def __init__(self, turns: list[list[Message]]) -> None:
+        super().__init__(messages=[])
+        self._turns = [list(t) for t in turns]
+        self.receive_calls = 0
+
+    async def receive_response(self) -> AsyncIterator[Message]:
+        index = self.receive_calls
+        self.receive_calls += 1
+        turn = self._turns[index] if index < len(self._turns) else []
+        for msg in turn:
+            yield msg
+
+
+class TestLostEnvelopeSalvage:
+    """A clean end_turn with a missing/truncated envelope is salvaged in place."""
+
+    def test_missing_envelope_is_salvaged_via_reprompt(self) -> None:
+        recovered = _wrap_envelope('{"intent": "verify", "reason": "done"}')
+        client = _MultiTurnFakeClient(
+            turns=[
+                [_assistant_text("did the work, forgot the envelope"), _result()],
+                [_assistant_text(recovered), _result()],
+            ]
+        )
+        store = InMemoryStore()
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.01,
+            )
+            # The recovered envelope is adopted verbatim.
+            assert isinstance(result.envelope, ValidEnvelope)
+            assert result.envelope.intent is Intent.VERIFY
+            # Exactly one bounded salvage re-prompt was sent on the session.
+            assert client.injected == [ENVELOPE_SALVAGE_PROMPT]
+            assert client.receive_calls == 2
+            # Both turns' transcripts are preserved in agent_output.
+            assert "did the work" in result.transcript
+            # The salvage turn's messages fold into the merged result so the
+            # harness observation counts the whole iteration.
+            assert len(result.messages) == 4
+
+        asyncio.run(_run())
+
+    def test_truncated_envelope_is_salvaged_via_reprompt(self) -> None:
+        # An opening fence with no matching close -- the envelope was cut off.
+        truncated = f"{OPENING_FENCE}\n" + '{"intent": "verify"'
+        recovered = _wrap_envelope('{"intent": "verify", "reason": "ok"}')
+        client = _MultiTurnFakeClient(
+            turns=[
+                [_assistant_text(truncated), _result()],
+                [_assistant_text(recovered), _result()],
+            ]
+        )
+        store = InMemoryStore()
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.01,
+            )
+            assert isinstance(result.envelope, ValidEnvelope)
+            assert client.injected == [ENVELOPE_SALVAGE_PROMPT]
+
+        asyncio.run(_run())
+
+    def test_salvage_that_stays_missing_keeps_original_and_is_bounded(self) -> None:
+        client = _MultiTurnFakeClient(
+            turns=[
+                [_assistant_text("no envelope here"), _result()],
+                [_assistant_text("still no envelope"), _result()],
+            ]
+        )
+        store = InMemoryStore()
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.01,
+            )
+            # Salvage did not produce a valid envelope: the original
+            # missing-envelope verdict stands (so the harness still finalizes
+            # a genuinely broken agent as a protocol failure).
+            assert isinstance(result.envelope, MissingEnvelope)
+            # Exactly one salvage attempt -- never an unbounded re-prompt loop.
+            assert client.injected == [ENVELOPE_SALVAGE_PROMPT]
+            assert client.receive_calls == 2
+
+        asyncio.run(_run())
+
+    def test_valid_envelope_is_not_salvaged(self) -> None:
+        envelope = _wrap_envelope('{"intent": "verify", "reason": "go"}')
+        client = _MultiTurnFakeClient(
+            turns=[[_assistant_text(envelope), _result()]]
+        )
+        store = InMemoryStore()
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.01,
+            )
+            assert isinstance(result.envelope, ValidEnvelope)
+            # No salvage re-prompt and no second receive_response.
+            assert client.injected == []
+            assert client.receive_calls == 1
+
+        asyncio.run(_run())
+
+    def test_missing_envelope_without_end_turn_is_not_salvaged(self) -> None:
+        # A non-end_turn stop (e.g. a limit / tool stop) is NOT the lost-tail
+        # fingerprint -- it routes to existing handling, not the salvage path.
+        client = _MultiTurnFakeClient(
+            turns=[
+                [
+                    _assistant_text_stop("cut off mid-work", "max_tokens"),
+                    _result_stop("max_tokens"),
+                ],
+                [_assistant_text(_wrap_envelope('{"intent": "verify"}')), _result()],
+            ]
+        )
+        store = InMemoryStore()
+
+        async def _run() -> None:
+            result = await invoke_iteration_with_client(
+                prompt="go",
+                options=ClaudeAgentOptions(),
+                control_store=store,
+                run_id="run-1",
+                client_factory=_factory(client),
+                poll_interval=0.01,
+            )
+            assert isinstance(result.envelope, MissingEnvelope)
+            assert client.injected == []
+            assert client.receive_calls == 1
+
+        asyncio.run(_run())

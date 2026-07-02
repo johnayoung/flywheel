@@ -52,6 +52,8 @@ from flywheel_core.invoker import (
     ToolResultObservation,
     _serialize_sdk_message,
     invoke_iteration,
+    iteration_envelope_is_salvageable,
+    merge_salvaged_iteration,
 )
 from flywheel_core.store_protocols import (
     CURRENT_SCHEMA_VERSION,
@@ -713,3 +715,77 @@ class TestBackoffBounded:
         assert any(u > policy.cap_seconds for u in uncapped)
         constant = [1.0] * 10
         assert not any(b > a for a, b in zip(constant, constant[1:]))
+
+
+class TestEnvelopeSalvageHelpers:
+    """Pure unit coverage for the lost-envelope detection + merge helpers."""
+
+    def _build(self, *items: Message) -> IterationResult:
+        return _run(
+            invoke_iteration(prompt="ignored", message_stream=_stream(*items))
+        )
+
+    def test_missing_after_clean_end_is_salvageable(self) -> None:
+        result = self._build(
+            _assistant(TextBlock(text="did work, no envelope")),
+            _result(stop_reason="end_turn"),
+        )
+        assert isinstance(result.envelope, MissingEnvelope)
+        assert iteration_envelope_is_salvageable(result)
+
+    def test_truncated_after_clean_end_is_salvageable(self) -> None:
+        result = self._build(
+            _assistant(TextBlock(text=f"{OPENING_FENCE}\n" + '{"intent"')),
+            _result(stop_reason="end_turn"),
+        )
+        assert isinstance(result.envelope, TruncatedEnvelope)
+        assert iteration_envelope_is_salvageable(result)
+
+    def test_valid_envelope_is_not_salvageable(self) -> None:
+        result = self._build(
+            _assistant(TextBlock(text=_wrap_envelope('{"intent": "verify"}'))),
+            _result(stop_reason="end_turn"),
+        )
+        assert isinstance(result.envelope, ValidEnvelope)
+        assert not iteration_envelope_is_salvageable(result)
+
+    def test_missing_without_end_turn_is_not_salvageable(self) -> None:
+        result = self._build(
+            _assistant(TextBlock(text="cut off"), stop_reason="max_tokens"),
+            _result(stop_reason="max_tokens"),
+        )
+        assert isinstance(result.envelope, MissingEnvelope)
+        assert not iteration_envelope_is_salvageable(result)
+
+    def test_pending_tool_use_is_not_salvageable(self) -> None:
+        # An unresolved tool call at stop means the turn was not a clean end;
+        # it must not be treated as a lost-envelope tail.
+        result = self._build(
+            _assistant(
+                ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+            ),
+            _result(stop_reason="end_turn"),
+        )
+        assert result.signals.pending_tool_use_at_stop
+        assert not iteration_envelope_is_salvageable(result)
+
+    def test_merge_adopts_salvage_envelope_and_folds_signals(self) -> None:
+        base = self._build(
+            _assistant(TextBlock(text="the work"), model="claude-test"),
+            _result(num_turns=40, total_cost_usd=3.50, stop_reason="end_turn"),
+        )
+        salvage = self._build(
+            _assistant(TextBlock(text=_wrap_envelope('{"intent": "verify"}'))),
+            _result(num_turns=1, total_cost_usd=0.05, stop_reason="end_turn"),
+        )
+        merged = merge_salvaged_iteration(base, salvage)
+        # The recovered envelope wins verbatim (not re-parsed from concatenated
+        # text, so a leftover fence cannot corrupt the verdict).
+        assert merged.envelope is salvage.envelope
+        assert isinstance(merged.envelope, ValidEnvelope)
+        # Transcript and messages are the union of both turns.
+        assert "the work" in merged.transcript
+        assert merged.messages == base.messages + salvage.messages
+        # Cost/turns sum across the base work and the salvage turn.
+        assert merged.signals.total_cost_usd == pytest.approx(3.55)
+        assert merged.signals.num_turns == 41

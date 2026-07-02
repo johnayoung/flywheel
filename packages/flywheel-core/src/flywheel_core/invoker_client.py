@@ -37,7 +37,13 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from flywheel_core.invoker import IterationResult, invoke_iteration
+from flywheel_core.envelope import ValidEnvelope
+from flywheel_core.invoker import (
+    IterationResult,
+    invoke_iteration,
+    iteration_envelope_is_salvageable,
+    merge_salvaged_iteration,
+)
 
 if TYPE_CHECKING:
     from claude_agent_sdk import (
@@ -47,6 +53,22 @@ if TYPE_CHECKING:
         Message,
     )
 from flywheel_core.store_protocols import ControlCommandRecord, ControlCommandStore
+
+
+# One-shot re-prompt sent on the SAME live session when an iteration ends
+# cleanly (``end_turn``) but its closing ``LOOP_STATUS`` envelope was missing
+# or truncated -- the fingerprint of an SDK auto-compaction dropping the
+# protocol instruction on a context-heavy iteration. Asking only for the
+# envelope recovers the completed work instead of discarding the whole attempt
+# and re-running it from a fresh session. Bounded to a single attempt; only a
+# VALID re-emitted envelope is adopted (see ``_drive_invocation``).
+ENVELOPE_SALVAGE_PROMPT: str = (
+    "Your previous response ended without the required LOOP_STATUS iteration "
+    "envelope. Do not take any further action or make any further edits. "
+    "Emit exactly one iteration envelope now -- the fenced `<!-- LOOP_STATUS "
+    "-->` block defined in your instructions -- describing the state you have "
+    "already reached, and output nothing else."
+)
 
 
 # Default poll tick the watcher uses when the store has no pending row.
@@ -446,11 +468,32 @@ async def invoke_iteration_with_client(
         # consult the recovery flag and translate to
         # :class:`HarnessRecoveryRequested`.
         async def _drive_invocation() -> IterationResult:
-            return await invoke_iteration(
+            result = await invoke_iteration(
                 prompt=prompt,
                 message_stream=client.receive_response(),
                 on_message=on_message,
             )
+            if not iteration_envelope_is_salvageable(result):
+                return result
+            # Lost-envelope salvage: the agent finished its turn but the
+            # closing envelope did not survive (typically an SDK
+            # auto-compaction). Re-prompt the SAME live session for just the
+            # envelope -- one bounded attempt -- so the completed work is not
+            # thrown away. Runs inside this watched task so operator-interrupt
+            # / mid-turn-recovery cancellation and the outer drain apply to
+            # the salvage turn exactly as to the main iteration. Only a VALID
+            # re-emitted envelope is adopted; anything else leaves the
+            # original missing/truncated result untouched, so a genuinely
+            # broken agent still finalizes as a protocol failure as before.
+            await client.query(ENVELOPE_SALVAGE_PROMPT)
+            salvage = await invoke_iteration(
+                prompt=ENVELOPE_SALVAGE_PROMPT,
+                message_stream=client.receive_response(),
+                on_message=on_message,
+            )
+            if isinstance(salvage.envelope, ValidEnvelope):
+                return merge_salvaged_iteration(result, salvage)
+            return result
 
         iteration_task: asyncio.Task[IterationResult] = asyncio.create_task(
             _drive_invocation()
@@ -585,6 +628,7 @@ __all__ = [
     "CONTROL_COMMAND_SET_MODEL",
     "ContextUsageObserver",
     "DEFAULT_CONTROL_POLL_INTERVAL",
+    "ENVELOPE_SALVAGE_PROMPT",
     "EVENT_CONTROL_APPLIED",
     "EVENT_CONTROL_CLAIM_FAILED",
     "EVENT_CONTROL_FAILED",

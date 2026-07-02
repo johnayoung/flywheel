@@ -336,6 +336,126 @@ async def invoke_iteration(
     )
 
 
+# Envelope verdicts worth salvaging: the agent completed its turn but the
+# closing ``LOOP_STATUS`` envelope did not come through intact. ``missing``
+# (no envelope at all -- the signature of an SDK auto-compaction dropping the
+# protocol instruction after a long, context-heavy iteration) and
+# ``truncated`` (an opening fence with no matching close -- the final message
+# was cut off) are both a *lost tail* on otherwise-complete work, recoverable
+# by asking the still-live session to re-emit just the envelope. ``malformed``
+# and ``duplicate`` are structural agent errors (the agent emitted something
+# wrong, not nothing), so they are deliberately NOT salvaged.
+_SALVAGEABLE_ENVELOPE_KINDS: frozenset[str] = frozenset({"missing", "truncated"})
+
+
+def iteration_envelope_is_salvageable(result: IterationResult) -> bool:
+    """True when an iteration finished cleanly but lost its envelope tail.
+
+    Returns ``True`` only when the agent ended its turn normally
+    (``stop_reason == "end_turn"``) with no crash and no tool call still
+    pending, yet produced a missing or truncated envelope. That combination
+    is the fingerprint of a lost closing envelope (typically an SDK
+    auto-compaction summarizing away the ``LOOP_STATUS`` instruction on a
+    context-heavy iteration), which is recoverable by re-prompting the live
+    session for the envelope alone rather than discarding the whole attempt.
+    A crash, a mid-tool-call stop, or any non-``end_turn`` stop reason is not
+    salvageable here and routes to its existing handling unchanged.
+    """
+    if result.failure is not None:
+        return False
+    if result.envelope.kind not in _SALVAGEABLE_ENVELOPE_KINDS:
+        return False
+    signals = result.signals
+    if signals.pending_tool_use_at_stop:
+        return False
+    return signals.stop_reason == "end_turn"
+
+
+def _sum_optional(a: float | None, b: float | None) -> float | None:
+    """Add two optional numeric signals, treating a missing side as absent.
+
+    Returns ``None`` only when both are ``None`` (nothing observed on either
+    invocation); otherwise the present values sum (a missing side is 0).
+    """
+    if a is None and b is None:
+        return None
+    return (a or 0) + (b or 0)
+
+
+def _merge_usage(
+    a: Mapping[str, int] | None, b: Mapping[str, int] | None
+) -> Mapping[str, int] | None:
+    """Sum two optional usage mappings key-wise.
+
+    ``None`` on both sides stays ``None`` (the SDK-backed default, where the
+    harness derives usage from the merged ``messages`` instead). When either
+    side carries an explicit mapping (the SDK-free container backend), the
+    per-key totals add so the salvage turn's tokens are not lost.
+    """
+    if a is None and b is None:
+        return None
+    merged: dict[str, int] = {k: v for k, v in (a or {}).items()}
+    for key, value in (b or {}).items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
+
+
+def merge_salvaged_iteration(
+    base: IterationResult, salvage: IterationResult
+) -> IterationResult:
+    """Fold a successful envelope-salvage re-invocation into the base result.
+
+    The salvage re-prompt continues the SAME live session, so its messages,
+    turns, and usage are a genuine continuation of ``base``. The merged
+    result carries the salvaged (valid) envelope; both transcripts
+    concatenated (so ``agent_output`` records the work and the recovered
+    envelope); both message tuples concatenated (so the harness's observation
+    counts turns/tokens across the whole iteration); and summed cost/turns
+    with the salvage's terminal stop signals. Signals describing the agent's
+    work (tool interactions, rate-limit / hook events, permission denials) are
+    unioned base-then-salvage so nothing the base observed is dropped. The
+    envelope is taken from ``salvage`` verbatim rather than re-parsed from the
+    concatenated transcript, so a leftover truncated fence in ``base`` cannot
+    turn the merged text into a spurious duplicate/malformed verdict.
+    """
+    base_sig, salv_sig = base.signals, salvage.signals
+    merged_signals = dataclasses.replace(
+        base_sig,
+        stop_reason=salv_sig.stop_reason or base_sig.stop_reason,
+        num_turns=_sum_optional(base_sig.num_turns, salv_sig.num_turns),
+        total_cost_usd=_sum_optional(
+            base_sig.total_cost_usd, salv_sig.total_cost_usd
+        ),
+        result_is_error=salv_sig.result_is_error,
+        result_subtype=salv_sig.result_subtype,
+        api_error_status=(
+            salv_sig.api_error_status
+            if salv_sig.api_error_status is not None
+            else base_sig.api_error_status
+        ),
+        session_id=salv_sig.session_id or base_sig.session_id,
+        permission_denials=base_sig.permission_denials
+        + salv_sig.permission_denials,
+        rate_limit_events=base_sig.rate_limit_events
+        + salv_sig.rate_limit_events,
+        tool_interactions=base_sig.tool_interactions
+        + salv_sig.tool_interactions,
+        tool_result_blocks=base_sig.tool_result_blocks
+        + salv_sig.tool_result_blocks,
+        hook_events=base_sig.hook_events + salv_sig.hook_events,
+        pending_tool_use_at_stop=salv_sig.pending_tool_use_at_stop,
+    )
+    return dataclasses.replace(
+        base,
+        transcript=base.transcript + "\n" + salvage.transcript,
+        messages=base.messages + salvage.messages,
+        envelope=salvage.envelope,
+        failure=salvage.failure,
+        signals=merged_signals,
+        usage=_merge_usage(base.usage, salvage.usage),
+    )
+
+
 def _to_jsonable(value: Any) -> Any:
     """Recursively convert ``value`` to JSON-compatible primitives.
 
@@ -391,4 +511,6 @@ __all__ = [
     "ToolInteraction",
     "ToolResultObservation",
     "invoke_iteration",
+    "iteration_envelope_is_salvageable",
+    "merge_salvaged_iteration",
 ]

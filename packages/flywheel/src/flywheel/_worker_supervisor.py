@@ -43,6 +43,11 @@ from pathlib import Path
 from typing import IO, Sequence
 from urllib.parse import quote
 
+from flywheel_orchestrator._supervision_policy import (
+    RespawnDecision,
+    SupervisionPolicy,
+)
+
 
 # How long ``stop()`` waits for the child to exit after SIGTERM before
 # giving up and reporting failure. The worker's graceful shutdown
@@ -53,7 +58,7 @@ DEFAULT_STOP_TIMEOUT_SECONDS: float = 10.0
 
 
 class WorkerState(str, enum.Enum):
-    """The five states the console's status bar renders.
+    """The states the console's status bar renders.
 
     ``SUPERVISED`` -- this console owns a child it spawned and the
     child is alive (``poll()`` returns ``None``). Quit prompts the
@@ -69,10 +74,18 @@ class WorkerState(str, enum.Enum):
     advertises ``/worker start``.
 
     ``DEAD`` -- the supervised child terminated unexpectedly mid-
-    session. The status bar surfaces this so the operator can
+    session and was NOT respawned (no crash-loop policy, or a disabled
+    budget-0 policy). The status bar surfaces this so the operator can
     ``/worker start`` to respawn (the new worker's startup recovery
     sweep handles any stranded lifecycles, per existing worker
     semantics).
+
+    ``DEAD_AFTER_BUDGET`` -- the supervised child kept dying and
+    exhausted the shared windowed crash-loop budget: the supervisor
+    stopped auto-respawning and latched this distinct, queryable
+    terminal state (the safety interlock -- see spec 00070). Unlike
+    ``DEAD`` it means "we tried and gave up", not "died once"; an
+    operator ``/worker start`` re-arms a fresh budget window.
 
     ``ERROR`` -- the most recent ``start()`` call failed before the
     child could be launched (bad env, missing executable). The
@@ -84,6 +97,7 @@ class WorkerState(str, enum.Enum):
     DETACHED = "detached"
     NONE = "none"
     DEAD = "dead"
+    DEAD_AFTER_BUDGET = "dead_after_budget"
     ERROR = "error"
 
 
@@ -93,10 +107,12 @@ class WorkerStatus:
 
     Immutable so the dashboard can stash one per tick without worrying
     about the supervisor mutating it from underneath. ``pid`` is set
-    only for ``SUPERVISED`` / ``DEAD`` (the only states where this
-    console knows the PID); ``message`` carries human-readable detail
-    for ``DEAD`` (exit code) and ``ERROR`` (spawn failure) so the
-    status bar can show it inline.
+    only for ``SUPERVISED`` / ``DEAD`` / ``DEAD_AFTER_BUDGET`` (the
+    states where this console knows the PID -- the last dead child's
+    for the two terminal ones); ``message`` carries human-readable
+    detail for ``DEAD`` / ``DEAD_AFTER_BUDGET`` (exit code + captured
+    reason) and ``ERROR`` (spawn failure) so the status bar can show
+    it inline.
     """
 
     state: WorkerState
@@ -262,6 +278,16 @@ class WorkerSupervisor:
             ``--model <value>`` when set, omitted entirely otherwise so
             the SDK keeps falling through to the Claude Code default.
             Ignored when ``spawn_argv`` is provided.
+        policy: Optional shared crash-loop supervision policy (spec
+            00070). When ``None`` (the default) the supervisor keeps its
+            pre-respawn behavior exactly -- an unexpected death is
+            reported ``DEAD`` and never auto-respawned. When supplied,
+            a death inside the policy's windowed budget is auto-respawned
+            (a real new child, inside ``status()`` with no operator
+            ``start()``), and a death past the budget latches the
+            distinct ``DEAD_AFTER_BUDGET`` state. A disabled (budget-0)
+            policy behaves exactly like ``None``: the operator's
+            unattended-base-branch safety override.
     """
 
     def __init__(
@@ -272,8 +298,10 @@ class WorkerSupervisor:
         spawn_argv: Sequence[str] | None = None,
         tasks_dir: Path | None = None,
         model: str | None = None,
+        policy: SupervisionPolicy | None = None,
     ) -> None:
         self._db_path = db_path
+        self._policy = policy
         self._log_dir = (
             log_dir if log_dir is not None else Path(".flywheel/logs/worker")
         )
@@ -299,6 +327,10 @@ class WorkerSupervisor:
         self._dead_pid: int | None = None
         self._dead_exit: int | None = None
         self._dead_reason: str | None = None
+        # Latched ``True`` once a policy-governed child exhausts the
+        # crash-loop budget: the supervisor stops respawning and reports
+        # ``DEAD_AFTER_BUDGET`` until an operator ``start()`` re-arms it.
+        self._dead_after_budget: bool = False
 
     # ----- Public seams -----------------------------------------------------
 
@@ -318,13 +350,22 @@ class WorkerSupervisor:
                     state=WorkerState.SUPERVISED, pid=self._child.pid
                 )
             # Child died on its own; capture *why* (the log tail) before
-            # reaping, then remember the death so subsequent ticks keep
-            # reporting DEAD until the operator respawns.
-            self._dead_pid = self._child.pid
-            self._dead_exit = rc
-            self._dead_reason = read_supervised_death_reason(self._log_path)
+            # reaping, then let the crash-loop policy decide whether this
+            # tick auto-respawns it or latches the exhausted terminal state.
+            dead_pid = self._child.pid
+            dead_exit = rc
+            dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
+            respawned = self._respawn_or_retire(dead_pid, dead_exit, dead_reason)
+            if respawned is not None:
+                return respawned
 
+        if self._dead_after_budget:
+            return WorkerStatus(
+                state=WorkerState.DEAD_AFTER_BUDGET,
+                pid=self._dead_pid,
+                message=format_dead_message(self._dead_exit, self._dead_reason),
+            )
         if self._dead_pid is not None:
             return WorkerStatus(
                 state=WorkerState.DEAD,
@@ -380,11 +421,13 @@ class WorkerSupervisor:
         if current.state == WorkerState.DETACHED:
             return current
 
-        # Clear any leftover DEAD / ERROR state from prior attempts so
-        # the supervisor's snapshot matches reality post-spawn.
+        # Clear any leftover DEAD / DEAD_AFTER_BUDGET / ERROR state from
+        # prior attempts so the supervisor's snapshot matches reality
+        # post-spawn.
         self._dead_pid = None
         self._dead_exit = None
         self._dead_reason = None
+        self._dead_after_budget = False
         self._last_error = None
 
         # A DEAD / ERROR status short-circuits status() *before* its
@@ -397,36 +440,13 @@ class WorkerSupervisor:
         if rechecked.state == WorkerState.DETACHED:
             return rechecked
 
-        try:
-            log_handle = self._open_log()
-        except OSError as exc:
-            self._last_error = f"cannot open worker log: {exc}"
-            return WorkerStatus(
-                state=WorkerState.ERROR, message=self._last_error
-            )
+        # An operator start() re-arms the crash-loop budget: forget the prior
+        # window's deaths so a manual restart begins with a full budget again
+        # (after DEAD_AFTER_BUDGET, this is what lets the operator retry).
+        if self._policy is not None:
+            self._policy.reset()
 
-        try:
-            child = subprocess.Popen(
-                self._spawn_argv,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
-                # New session so SIGINT to the console terminal does
-                # not reach the worker; ``stop()`` is the only path
-                # that signals it.
-                start_new_session=True,
-                close_fds=True,
-            )
-        except (OSError, ValueError) as exc:
-            log_handle.close()
-            self._log_handle = None
-            self._last_error = f"spawn failed: {exc}"
-            return WorkerStatus(
-                state=WorkerState.ERROR, message=self._last_error
-            )
-
-        self._child = child
-        return WorkerStatus(state=WorkerState.SUPERVISED, pid=child.pid)
+        return self._spawn_child()
 
     def stop(
         self, *, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS
@@ -499,6 +519,7 @@ class WorkerSupervisor:
         self._dead_pid = None
         self._dead_exit = None
         self._dead_reason = None
+        self._dead_after_budget = False
         self._close_log()
 
     def close(self) -> None:
@@ -514,6 +535,94 @@ class WorkerSupervisor:
         self.detach()
 
     # ----- Internal helpers ------------------------------------------------
+
+    def _respawn_or_retire(
+        self,
+        dead_pid: int,
+        dead_exit: int | None,
+        dead_reason: str | None,
+    ) -> WorkerStatus | None:
+        """Decide what to do about a child that died on its own.
+
+        With no policy, or a disabled (budget-0) policy, this reproduces the
+        pre-respawn behavior exactly: record the death and fall through to a
+        plain ``DEAD`` status, never respawning (the operator's unattended-
+        base-branch safety override). With an active policy it charges the
+        death against the shared windowed crash-loop budget -- a death inside
+        budget launches a real new child (returning ``SUPERVISED`` with the new
+        pid, no operator ``start()``); a death past budget stops respawning and
+        latches the distinct ``DEAD_AFTER_BUDGET`` terminal state.
+
+        Returns the ``SUPERVISED`` status when a respawn was launched (so
+        ``status()`` returns it directly); otherwise ``None`` so ``status()``
+        falls through to its DEAD / DEAD_AFTER_BUDGET tail.
+        """
+        if self._policy is None or self._policy.budget.disabled:
+            self._dead_pid = dead_pid
+            self._dead_exit = dead_exit
+            self._dead_reason = dead_reason
+            return None
+        if self._policy.record_death() is RespawnDecision.RESPAWN:
+            # Inside budget: launch a real new child. Clear the prior death
+            # markers first so a successful respawn presents as clean
+            # SUPERVISED rather than trailing a stale DEAD reason.
+            self._dead_pid = None
+            self._dead_exit = None
+            self._dead_reason = None
+            self._dead_after_budget = False
+            self._last_error = None
+            spawned = self._spawn_child()
+            if spawned.state == WorkerState.SUPERVISED:
+                return spawned
+            # The respawn's own spawn failed -> ERROR is already latched in
+            # _last_error; fall through so status() surfaces it.
+            return None
+        # Budget exhausted: stop respawning and latch the loud terminal state.
+        self._dead_pid = dead_pid
+        self._dead_exit = dead_exit
+        self._dead_reason = dead_reason
+        self._dead_after_budget = True
+        return None
+
+    def _spawn_child(self) -> WorkerStatus:
+        """Spawn one worker child, redirecting its output to a fresh log.
+
+        The single spawn seam shared by the operator ``start()`` and the
+        automatic in-budget respawn, so both take the identical orphan-safe
+        path: the child is placed in its own session
+        (``start_new_session=True``) so a Ctrl+C on the console terminal never
+        reaches it (only ``stop()`` signals it), and its stdout/stderr land in
+        a per-spawn supervisor log. Returns ``SUPERVISED`` with the new pid on
+        success, or ``ERROR`` (with the cause latched in ``_last_error``) when
+        the log cannot be opened or ``Popen`` raises.
+        """
+        try:
+            log_handle = self._open_log()
+        except OSError as exc:
+            self._last_error = f"cannot open worker log: {exc}"
+            return WorkerStatus(
+                state=WorkerState.ERROR, message=self._last_error
+            )
+
+        try:
+            child = subprocess.Popen(
+                self._spawn_argv,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError) as exc:
+            log_handle.close()
+            self._log_handle = None
+            self._last_error = f"spawn failed: {exc}"
+            return WorkerStatus(
+                state=WorkerState.ERROR, message=self._last_error
+            )
+
+        self._child = child
+        return WorkerStatus(state=WorkerState.SUPERVISED, pid=child.pid)
 
     def _signal_group(self, sig: int) -> bool:
         """Signal the child's process group; ``False`` if it no longer exists.

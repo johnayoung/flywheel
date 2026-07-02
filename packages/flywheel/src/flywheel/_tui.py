@@ -43,6 +43,8 @@ from flywheel_orchestrator import (
     DirectoryWorkSource,
     PolicyError,
     StoreConfigError,
+    SupervisionBudget,
+    SupervisionPolicy,
     WorkPolicy,
     WorkSource,
     HistoryRow,
@@ -70,6 +72,15 @@ from flywheel._snapshot import (
 )
 from flywheel._autopilot_supervisor import AutopilotSupervisor
 from flywheel._worker_supervisor import WorkerSupervisor
+
+# Shared crash-loop budget for the two console-supervised daemons (spec 00070).
+# The worker and the autopilot enforce the *same* budget -- a handful of
+# respawns inside a rolling window -- so a transient death self-heals while a
+# persistent boot-loop is contained before it can spin (for the autopilot, that
+# caps unattended writes to the operator's base branch). Each supervisor is
+# handed its own ``SupervisionPolicy`` built from this one budget so their
+# windows decay independently while the policy they enforce stays identical.
+_SUPERVISION_BUDGET = SupervisionBudget(max_respawns=5, window_seconds=300.0)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -390,7 +401,10 @@ def _run_dashboard(
     started_at = datetime.now(timezone.utc)
     store = open_sqlite_bound_store(policy, db_path=db_path)
     supervisor = WorkerSupervisor(
-        db_path=db_path, tasks_dir=tasks_dir, model=model
+        db_path=db_path,
+        tasks_dir=tasks_dir,
+        model=model,
+        policy=SupervisionPolicy(_SUPERVISION_BUDGET),
     )
     if not no_worker:
         supervisor.start()
@@ -399,7 +413,11 @@ def _run_dashboard(
     # on console launch (it writes to the base branch unattended). The
     # supervisor is constructed unconditionally so the status surface and the
     # console action exist; it is detached (never killed) on console exit.
-    autopilot_supervisor = AutopilotSupervisor(tasks_dir=tasks_dir, model=model)
+    autopilot_supervisor = AutopilotSupervisor(
+        tasks_dir=tasks_dir,
+        model=model,
+        policy=SupervisionPolicy(_SUPERVISION_BUDGET),
+    )
 
     def poll() -> DashboardSnapshot:
         return build_snapshot(

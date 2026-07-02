@@ -1199,6 +1199,13 @@ def _format_worker_status(status: WorkerStatus) -> Text:
             f"worker: dead -- type '/worker start' to respawn{detail}",
             style="bold red",
         )
+    if state == WorkerState.DEAD_AFTER_BUDGET:
+        detail = f" ({status.message})" if status.message else ""
+        return Text(
+            "worker: dead (crash-loop budget exhausted) -- "
+            f"type '/worker start' to re-arm{detail}",
+            style="bold red",
+        )
     if state == WorkerState.ERROR:
         return Text(
             f"worker: error: {status.message or 'unknown'}",
@@ -1281,6 +1288,13 @@ def _format_autopilot_status(
         detail = f" ({status.message})" if status.message else ""
         return Text(
             f"autopilot: dead -- type '/autopilot start' to respawn{detail}",
+            style="bold red",
+        )
+    if state == AutopilotState.DEAD_AFTER_BUDGET:
+        detail = f" ({status.message})" if status.message else ""
+        return Text(
+            "autopilot: dead (crash-loop budget exhausted) -- "
+            f"type '/autopilot start' to re-arm{detail}",
             style="bold red",
         )
     if state == AutopilotState.ERROR:

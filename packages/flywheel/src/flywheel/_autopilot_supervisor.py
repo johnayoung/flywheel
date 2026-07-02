@@ -36,6 +36,10 @@ from flywheel_orchestrator._autopilot_activity import (
     AutopilotActivity,
     read_activity,
 )
+from flywheel_orchestrator._supervision_policy import (
+    RespawnDecision,
+    SupervisionPolicy,
+)
 
 # Same SIGTERM wait window as the worker supervisor: the autopilot daemon's
 # graceful-shutdown path exits promptly on signal (it idles between cycles), so
@@ -49,8 +53,13 @@ class AutopilotState(str, enum.Enum):
     ``SUPERVISED`` -- this console owns a live autopilot child it spawned.
     ``NONE`` -- no supervised child; the status surface advertises
     ``/autopilot start``. ``DEAD`` -- the supervised child exited unexpectedly
-    mid-session. ``ERROR`` -- the most recent ``start()`` failed before the
-    child could launch.
+    mid-session and was NOT respawned (no crash-loop policy, or a disabled
+    budget-0 policy). ``DEAD_AFTER_BUDGET`` -- the child kept dying and
+    exhausted the shared windowed crash-loop budget, so the supervisor stopped
+    auto-respawning and latched this distinct, queryable terminal state (the
+    unattended-base-branch safety interlock -- spec 00070); an operator
+    ``/autopilot start`` re-arms a fresh budget window. ``ERROR`` -- the most
+    recent ``start()`` failed before the child could launch.
 
     There is intentionally no ``DETACHED`` state: autopilot writes no lease, so
     a daemon another console launched (or that this console detached) is not
@@ -60,6 +69,7 @@ class AutopilotState(str, enum.Enum):
     SUPERVISED = "supervised"
     NONE = "none"
     DEAD = "dead"
+    DEAD_AFTER_BUDGET = "dead_after_budget"
     ERROR = "error"
 
 
@@ -124,7 +134,9 @@ class AutopilotSupervisor:
         tasks_dir: Path | None = None,
         model: str | None = None,
         activity_path: Path | None = None,
+        policy: SupervisionPolicy | None = None,
     ) -> None:
+        self._policy = policy
         self._log_dir = (
             log_dir if log_dir is not None else Path(".flywheel/logs/autopilot")
         )
@@ -151,6 +163,10 @@ class AutopilotSupervisor:
         self._dead_pid: int | None = None
         self._dead_exit: int | None = None
         self._dead_reason: str | None = None
+        # Latched ``True`` once a policy-governed child exhausts the crash-loop
+        # budget: the supervisor stops respawning and reports
+        # ``DEAD_AFTER_BUDGET`` until an operator ``start()`` re-arms it.
+        self._dead_after_budget: bool = False
 
     # ----- Public seams -----------------------------------------------------
 
@@ -169,11 +185,23 @@ class AutopilotSupervisor:
                     pid=self._child.pid,
                     activity=self._read_owned_activity(self._child.pid),
                 )
-            self._dead_pid = self._child.pid
-            self._dead_exit = rc
-            self._dead_reason = read_supervised_death_reason(self._log_path)
+            # Child died on its own; capture *why* before reaping, then let the
+            # crash-loop policy decide whether this tick auto-respawns it or
+            # latches the exhausted terminal state.
+            dead_pid = self._child.pid
+            dead_exit = rc
+            dead_reason = read_supervised_death_reason(self._log_path)
             self._reap_child()
+            respawned = self._respawn_or_retire(dead_pid, dead_exit, dead_reason)
+            if respawned is not None:
+                return respawned
 
+        if self._dead_after_budget:
+            return AutopilotStatus(
+                state=AutopilotState.DEAD_AFTER_BUDGET,
+                pid=self._dead_pid,
+                message=format_dead_message(self._dead_exit, self._dead_reason),
+            )
         if self._dead_pid is not None:
             return AutopilotStatus(
                 state=AutopilotState.DEAD,
@@ -206,35 +234,16 @@ class AutopilotSupervisor:
         self._dead_pid = None
         self._dead_exit = None
         self._dead_reason = None
+        self._dead_after_budget = False
         self._last_error = None
 
-        try:
-            log_handle = self._open_log()
-        except OSError as exc:
-            self._last_error = f"cannot open autopilot log: {exc}"
-            return AutopilotStatus(
-                state=AutopilotState.ERROR, message=self._last_error
-            )
+        # An operator start() re-arms the crash-loop budget: forget the prior
+        # window's deaths so a manual restart begins with a full budget again
+        # (after DEAD_AFTER_BUDGET, this is what lets the operator retry).
+        if self._policy is not None:
+            self._policy.reset()
 
-        try:
-            child = subprocess.Popen(
-                self._spawn_argv,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
-                start_new_session=True,
-                close_fds=True,
-            )
-        except (OSError, ValueError) as exc:
-            log_handle.close()
-            self._log_handle = None
-            self._last_error = f"spawn failed: {exc}"
-            return AutopilotStatus(
-                state=AutopilotState.ERROR, message=self._last_error
-            )
-
-        self._child = child
-        return AutopilotStatus(state=AutopilotState.SUPERVISED, pid=child.pid)
+        return self._spawn_child()
 
     def stop(self, *, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS) -> bool:
         """Stop the supervised daemon and everything it spawned.
@@ -295,6 +304,7 @@ class AutopilotSupervisor:
         self._dead_pid = None
         self._dead_exit = None
         self._dead_reason = None
+        self._dead_after_budget = False
         self._close_log()
 
     def close(self) -> None:
@@ -302,6 +312,94 @@ class AutopilotSupervisor:
         self.detach()
 
     # ----- Internal helpers ------------------------------------------------
+
+    def _respawn_or_retire(
+        self,
+        dead_pid: int,
+        dead_exit: int | None,
+        dead_reason: str | None,
+    ) -> AutopilotStatus | None:
+        """Decide what to do about a daemon child that died on its own.
+
+        With no policy, or a disabled (budget-0) policy, this reproduces the
+        pre-respawn behavior exactly: record the death and fall through to a
+        plain ``DEAD`` status, never respawning (the operator's unattended-
+        base-branch safety override). With an active policy it charges the
+        death against the shared windowed crash-loop budget -- a death inside
+        budget launches a real new child (returning ``SUPERVISED`` with the new
+        pid, no operator ``start()``); a death past budget stops respawning and
+        latches the distinct ``DEAD_AFTER_BUDGET`` terminal state.
+
+        Returns the ``SUPERVISED`` status when a respawn was launched;
+        otherwise ``None`` so ``status()`` falls through to its DEAD /
+        DEAD_AFTER_BUDGET tail.
+        """
+        if self._policy is None or self._policy.budget.disabled:
+            self._dead_pid = dead_pid
+            self._dead_exit = dead_exit
+            self._dead_reason = dead_reason
+            return None
+        if self._policy.record_death() is RespawnDecision.RESPAWN:
+            # Inside budget: launch a real new child. Clear the prior death
+            # markers first so a successful respawn presents as clean
+            # SUPERVISED rather than trailing a stale DEAD reason.
+            self._dead_pid = None
+            self._dead_exit = None
+            self._dead_reason = None
+            self._dead_after_budget = False
+            self._last_error = None
+            spawned = self._spawn_child()
+            if spawned.state == AutopilotState.SUPERVISED:
+                return spawned
+            # The respawn's own spawn failed -> ERROR is already latched in
+            # _last_error; fall through so status() surfaces it.
+            return None
+        # Budget exhausted: stop respawning and latch the loud terminal state.
+        self._dead_pid = dead_pid
+        self._dead_exit = dead_exit
+        self._dead_reason = dead_reason
+        self._dead_after_budget = True
+        return None
+
+    def _spawn_child(self) -> AutopilotStatus:
+        """Spawn one autopilot daemon child, redirecting output to a fresh log.
+
+        The single spawn seam shared by the operator ``start()`` and the
+        automatic in-budget respawn, so both take the identical orphan-safe
+        path: the child is placed in its own session
+        (``start_new_session=True``) so a Ctrl+C on the console terminal never
+        reaches it and it survives console exit (only ``stop()`` signals it).
+        Returns ``SUPERVISED`` with the new pid on success, or ``ERROR`` (with
+        the cause latched in ``_last_error``) when the log cannot be opened or
+        ``Popen`` raises.
+        """
+        try:
+            log_handle = self._open_log()
+        except OSError as exc:
+            self._last_error = f"cannot open autopilot log: {exc}"
+            return AutopilotStatus(
+                state=AutopilotState.ERROR, message=self._last_error
+            )
+
+        try:
+            child = subprocess.Popen(
+                self._spawn_argv,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (OSError, ValueError) as exc:
+            log_handle.close()
+            self._log_handle = None
+            self._last_error = f"spawn failed: {exc}"
+            return AutopilotStatus(
+                state=AutopilotState.ERROR, message=self._last_error
+            )
+
+        self._child = child
+        return AutopilotStatus(state=AutopilotState.SUPERVISED, pid=child.pid)
 
     def _signal_group(self, sig: int) -> bool:
         """Signal the child's process group; ``False`` if it no longer exists.

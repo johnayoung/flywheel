@@ -117,6 +117,11 @@ from flywheel_orchestrator._orchestrate import (
     sweep_expired_leases,
     sync_work_source,
 )
+from flywheel_orchestrator._supervision_policy import (
+    RespawnDecision,
+    SupervisionBudget,
+    SupervisionPolicy,
+)
 from flywheel_orchestrator._strategy import (
     LANDABLE,
     LandabilityProbe,
@@ -361,6 +366,7 @@ __all__ = [
     "PG_DSN_FALLBACK_ENV",
     "PrereqRedriveOutcome",
     "RedriveOutcome",
+    "RespawnDecision",
     "RunRecord",
     "SandboxHandle",
     "SandboxProvider",
@@ -369,6 +375,8 @@ __all__ = [
     "SubmitRequest",
     "SubmitStrategy",
     "Submitter",
+    "SupervisionBudget",
+    "SupervisionPolicy",
     "TaskState",
     "TaskStatusRow",
     "ExcludedTask",

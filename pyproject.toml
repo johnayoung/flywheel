@@ -48,6 +48,7 @@ dev = [
     "flywheel-container",
     "flywheel",
     "pytest>=9.0.3",
+    "pytest-xdist>=3.6",
     "testcontainers>=4.0",
     "ruff>=0.9",
     "pyright>=1.1.390",

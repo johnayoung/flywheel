@@ -18,4 +18,9 @@ cd "$REPO_ROOT"
 
 scripts/run_silent.sh "ruff"    uv run ruff check .
 scripts/run_silent.sh "pyright" uv run pyright
-scripts/run_silent.sh "pytest"  uv run pytest
+# Parallelize the full suite with pytest-xdist. --dist loadscope keeps each
+# module's tests on one worker, so the subprocess-/daemon-heavy modules never
+# get split across workers (which would contend on ports, docker, and the merge
+# flock). 4 workers is the measured sweet spot (~2.3x faster, stable); override
+# with PYTEST_WORKERS (e.g. =1 for a serial run, =auto to match core count).
+scripts/run_silent.sh "pytest"  uv run pytest -n "${PYTEST_WORKERS:-4}" --dist loadscope

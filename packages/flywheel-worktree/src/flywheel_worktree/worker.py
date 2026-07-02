@@ -1181,6 +1181,31 @@ def retention_sweep(
                 _git(repo_root, "branch", "-D", branch.strip())
 
 
+def reap_container_orphans(log: Logger) -> None:
+    """Startup backstop: force-remove flywheel-owned orphan containers a prior
+    killed worker left behind — the SIGKILL/OOM case the container backend's
+    atexit registry never covers (spec 00071 #5).
+
+    Lazy-imports the container backend so ``flywheel-container`` stays an
+    optional extra: if it is not installed this system could not have created a
+    container, so the reap is a clean no-op. The scan selects strictly on the
+    shared flywheel-owner label, so unrelated containers are never touched, and
+    the reap excludes any container this live process still owns. Best-effort:
+    a docker error (e.g. the daemon is absent) is logged and swallowed so the
+    worker still starts."""
+    try:
+        from flywheel_container import reap_orphan_containers
+    except ImportError:
+        return
+    try:
+        reaped = reap_orphan_containers()
+    except Exception as exc:  # noqa: BLE001 - startup reap is strictly best-effort
+        log(f"Container orphan reap skipped ({type(exc).__name__}: {exc})")
+        return
+    for name in reaped:
+        log(f"Reaped orphan container {name}")
+
+
 # Hard ceiling on the rendered action so a runaway tool-call payload can
 # never wrap the single-line heartbeat unboundedly. The per-field
 # summarizers in `flywheel_core.workflow` already truncate individual values;
@@ -2358,6 +2383,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     retention_sweep(
         repo_root, worktrees_dir, args.worktree_retention_days, time.time(), log
     )
+    # Reap any flywheel-owned container a prior killed worker left orphaned: the
+    # SIGKILL/OOM case the container backend's atexit registry cannot cover
+    # (spec 00071 #5). Runs once at boot, before the main loop, and is a no-op
+    # when the container backend is not installed or no orphan is present.
+    reap_container_orphans(log)
     heartbeat = Heartbeat(
         db_path, args.heartbeat, make_logger("[heartbeat]"), policy=policy
     )

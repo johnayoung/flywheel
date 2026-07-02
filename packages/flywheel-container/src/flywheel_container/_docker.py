@@ -20,7 +20,7 @@ from __future__ import annotations
 import atexit
 import subprocess
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 from flywheel_core.deadline_config import DeadlineClass, resolve_deadlines
@@ -535,3 +535,85 @@ def _flush_cleanup_registry() -> None:
             _remover(name)
         except Exception:  # noqa: BLE001 - cleanup is strictly best-effort
             pass
+
+
+# --- startup orphan reap ----------------------------------------------------
+# The atexit registry above is a best-effort backstop for NORMAL exit; it never
+# runs on SIGKILL/OOM-kill, so a killed worker leaves its labelled container
+# alive with no reclaim path (spec 00071 #5 / D-3). The next worker to start
+# scans for flywheel-owned containers by the shared ``OWNER_LABEL_SELECTOR`` and
+# force-removes each orphan. Unrelated, non-flywheel containers never carry the
+# marker, so the owner-label filter never returns them: the reap cannot touch a
+# container this system did not create.
+
+
+def active_container_names() -> frozenset[str]:
+    """Snapshot of the container names THIS process registered for cleanup.
+
+    These are the containers a live worker here still owns; the startup orphan
+    reap excludes them so it targets only genuine orphans and never removes a
+    container that is still in active use."""
+    with _registry_lock:
+        return frozenset(_registered)
+
+
+def list_owned_containers(
+    *, timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT
+) -> list[str]:
+    """Names of every flywheel-owned container (running or exited).
+
+    Runs ``docker ps -a --filter <OWNER_LABEL_SELECTOR> --format {{.Names}}`` —
+    selecting on the shared owner label alone (imported, never re-derived), so
+    an unrelated container the daemon happens to be running is never returned.
+    Best-effort: an ordinary docker failure (e.g. the daemon is absent) yields
+    an empty list, but a :class:`DockerTimeoutError` re-raises so a wedged
+    daemon is not silently mistaken for 'no containers'."""
+    try:
+        out = _run_docker(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                OWNER_LABEL_SELECTOR,
+                "--format",
+                "{{.Names}}",
+            ],
+            timeout=timeout,
+        )
+    except DockerTimeoutError:
+        raise
+    except DockerError:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def reap_orphan_containers(
+    *,
+    active: Collection[str] | None = None,
+    timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT,
+) -> list[str]:
+    """Force-remove every flywheel-owned orphan container; return their names.
+
+    The startup backstop for the SIGKILL/OOM case the atexit registry cannot
+    cover: a killed worker's ``atexit`` never ran, so its labelled container
+    survives. On the next worker start this scans for flywheel-owned containers
+    (:func:`list_owned_containers`) and ``docker rm -f`` each orphan — every one
+    whose name is not in ``active`` (defaults to :func:`active_container_names`,
+    the containers a live worker in THIS process still owns). Unrelated,
+    non-flywheel containers are invisible to the owner-label filter and are
+    never touched.
+
+    Best-effort per container (mirrors the atexit flush): an ordinary removal
+    failure is swallowed inside :func:`force_remove_container_sync` so one
+    wedged container does not block reaping the rest; a
+    :class:`DockerTimeoutError` propagates so a wedged daemon surfaces."""
+    if active is None:
+        active = active_container_names()
+    reaped: list[str] = []
+    for name in list_owned_containers(timeout=timeout):
+        if name in active:
+            continue
+        force_remove_container_sync(name, timeout=timeout)
+        reaped.append(name)
+    return reaped

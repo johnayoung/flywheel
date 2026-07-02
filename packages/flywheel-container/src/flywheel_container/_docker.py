@@ -43,6 +43,22 @@ DEFAULT_MANAGEMENT_TIMEOUT: float | None = resolve_deadlines().for_class(
     DeadlineClass.DOCKER_MANAGEMENT
 )
 
+# --- flywheel owner marker --------------------------------------------------
+# Every container this backend creates carries ``OWNER_LABEL`` as a Docker
+# label; the orphan-reap scan filters on the SAME identifier via
+# ``OWNER_LABEL_SELECTOR``. Both derive from one constant so the marker written
+# at creation and the selector read by the scan can never drift: the scan
+# matches *exactly* the containers this backend creates and never an unrelated
+# one. The label rides in ``docker ps``/``docker inspect`` output, so the reaper
+# keys on it — not on the disposable per-task ``--name`` (spec 00044 G5). The
+# value is a presence flag; selection is by key, so its content is irrelevant.
+OWNER_LABEL = "flywheel.owner"
+OWNER_LABEL_VALUE = "1"
+# The single ``docker ps --filter <...>`` argument that selects flywheel-owned
+# containers. Consumers (the orphan-reap scan) import this rather than
+# re-deriving the string, so there is exactly one source of truth.
+OWNER_LABEL_SELECTOR = f"label={OWNER_LABEL}"
+
 
 class DockerError(RuntimeError):
     """A ``docker`` invocation failed (non-zero exit or spawn error)."""
@@ -122,15 +138,20 @@ def build_run_argv(
     groups: Sequence[str | int] = (),
     devices: Sequence[str] = (),
     cpus: float | None = None,
+    labels: Mapping[str, str] | None = None,
     command: Sequence[str] = (),
 ) -> list[str]:
     """Build the ``docker run -d`` argv. Pure — no subprocess.
 
     Flag order is deterministic (env, volumes, workdir, user, network, groups,
-    devices, cpus) so it is assertable in tests. The container is detached; it
-    stays alive for subsequent ``docker exec`` calls via the image's
-    ``sleep infinity`` entrypoint, or via an explicit ``command`` override
-    (appended after the image — e.g. a generic base image in tests).
+    devices, cpus, labels) so it is assertable in tests. The container is
+    detached; it stays alive for subsequent ``docker exec`` calls via the
+    image's ``sleep infinity`` entrypoint, or via an explicit ``command``
+    override (appended after the image — e.g. a generic base image in tests).
+
+    ``labels`` emit ``--label key=value`` flags; the flywheel-owner marker
+    (:data:`OWNER_LABEL`) is threaded through here by :func:`start_container` so
+    every real container carries it. No label is added when ``labels`` is empty.
     """
     argv = ["docker", "run", "-d", "--name", name]
     for key, value in (env or {}).items():
@@ -149,6 +170,8 @@ def build_run_argv(
         argv += ["--device", device]
     if cpus is not None:
         argv += ["--cpus", str(cpus)]
+    for key, value in (labels or {}).items():
+        argv += ["--label", f"{key}={value}"]
     argv.append(image)
     argv.extend(command)
     return argv
@@ -268,10 +291,16 @@ def start_container(
     groups: Sequence[str | int] = (),
     devices: Sequence[str] = (),
     cpus: float | None = None,
+    labels: Mapping[str, str] | None = None,
     command: Sequence[str] = (),
     timeout: float | None = 120.0,
 ) -> str:
-    """``docker run -d`` a detached container; return its id."""
+    """``docker run -d`` a detached container; return its id.
+
+    The flywheel-owner marker (:data:`OWNER_LABEL`) is always folded in so every
+    container this backend starts is selectable by :data:`OWNER_LABEL_SELECTOR`;
+    caller-supplied ``labels`` are merged on top.
+    """
     argv = build_run_argv(
         name,
         image,
@@ -283,6 +312,7 @@ def start_container(
         groups=groups,
         devices=devices,
         cpus=cpus,
+        labels={OWNER_LABEL: OWNER_LABEL_VALUE, **(labels or {})},
         command=command,
     )
     return _run_docker(argv, timeout=timeout).strip()

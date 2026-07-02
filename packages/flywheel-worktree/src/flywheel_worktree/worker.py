@@ -79,9 +79,12 @@ from flywheel_orchestrator import (
     LandabilityVerdict,
     OrchestratorReport,
     PolicyError,
+    RespawnDecision,
     SandboxRequest,
     SubmitRequest,
     SubmitStrategy,
+    SupervisionBudget,
+    SupervisionPolicy,
     WorkPolicy,
     load_effective_policy,
     open_sqlite_bound_store,
@@ -124,12 +127,15 @@ PERMANENT_STOP_EXIT_CODE = 2
 # stop signal or a member crash is noticed promptly without busy-spinning.
 DEFAULT_POOL_STOP_TIMEOUT_SECONDS = 10.0
 POOL_SUPERVISE_POLL_SECONDS = 0.2
-# Per-slot restart budget: a member that keeps crashing (e.g. a misconfigured
-# environment, not a flaky task) is respawned at most this many times before
-# the pool gives up and exits non-zero for operator inspection. The per-task
-# retry ceiling lives in the lease/lifecycle machinery (D-2); this is the
-# cross-restart backstop that keeps a crash-loop from spinning forever.
-MAX_POOL_RESTARTS_PER_SLOT = 5
+# Per-slot windowed crash-loop budget (spec 00070, decisions D-B/D-C). A member
+# that keeps crashing is respawned at most this many times within a rolling
+# window; the next death inside the window RETIRES that one slot in isolation
+# and the pool keeps supervising every other live member -- one bad slot never
+# group-kills the healthy fleet. Windowed, not lifetime: a slot that dips once
+# after a long healthy interval replenishes its budget rather than carrying an
+# old burst forever. Mirrors the console supervisors' default budget.
+DEFAULT_POOL_RESTARTS_PER_SLOT = 5
+DEFAULT_POOL_RESTART_WINDOW_SECONDS = 300.0
 
 
 Logger = Callable[[str], None]
@@ -1327,7 +1333,11 @@ class WorkerPool:
     respawned so the live pool returns to ``size``, and its in-flight task's
     lease lapses (or, on a same-worker-id respawn, is reclaimed immediately) so
     a live member finishes it exactly once (#8). Per-slot restarts are bounded
-    so a member that crashes instantly cannot spin forever.
+    by a shared *windowed* crash-loop budget (spec 00070): a slot that exhausts
+    its budget is retired in isolation while every other live member keeps
+    running -- one bad slot never group-kills the healthy fleet (D-C). The
+    budget is windowed, not lifetime, so a slot that dips once after a long
+    healthy interval is respawned, not retired.
 
     Shutdown reuses the group-kill supervisor model: each member is a session
     leader whose agent/MCP children share its process group, so :meth:`stop`
@@ -1353,7 +1363,9 @@ class WorkerPool:
         env: Mapping[str, str] | None = None,
         stop_timeout: float = DEFAULT_POOL_STOP_TIMEOUT_SECONDS,
         poll_interval: float = POOL_SUPERVISE_POLL_SECONDS,
-        max_restarts_per_slot: int = MAX_POOL_RESTARTS_PER_SLOT,
+        max_restarts_per_slot: int = DEFAULT_POOL_RESTARTS_PER_SLOT,
+        restart_window_seconds: float = DEFAULT_POOL_RESTART_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if size < 1:
             raise ValueError(f"worker pool size must be >= 1, got {size}")
@@ -1366,10 +1378,20 @@ class WorkerPool:
         self._env = dict(env) if env is not None else None
         self._stop_timeout = stop_timeout
         self._poll_interval = poll_interval
-        self._max_restarts = max(max_restarts_per_slot, 0)
+        # One shared windowed crash-loop budget shape; each slot gets its own
+        # SupervisionPolicy so slots decay independently (spec 00070). The
+        # injected clock lets tests drive the window deterministically.
+        self._budget = SupervisionBudget(
+            max_respawns=max(max_restarts_per_slot, 0),
+            window_seconds=restart_window_seconds,
+        )
+        self._clock = clock
+        self._policies: dict[int, SupervisionPolicy] = {}
         self._members: dict[int, _PoolMember] = {}
+        # Slots no longer supervised: cleanly drained (--once, exit 0) or
+        # quarantined after exhausting their crash-loop budget (``_exhausted``).
         self._retired: set[int] = set()
-        self._restarts: dict[int, int] = {}
+        self._exhausted: set[int] = set()
         self._stop_requested = False
         self._stopped = False
         self._exit_code = 0
@@ -1419,7 +1441,14 @@ class WorkerPool:
 
     def _supervise_tick(self) -> None:
         """One supervision pass: reap exited members, retire cleanly drained
-        ``--once`` members, and respawn crashed ones (bounded per slot)."""
+        ``--once`` members, respawn crashed ones within their windowed budget,
+        and retire (in isolation) a slot that exhausts that budget.
+
+        Budget exhaustion retires only the offending slot and leaves every
+        other live member running (spec 00070, D-C) -- it never sets a pool-wide
+        stop or group-kills the fleet. Once every slot is retired the pool has
+        nothing left to supervise, so the loop is asked to stop rather than
+        spin below-strength forever."""
         for slot in range(self._size):
             if slot in self._retired:
                 continue
@@ -1439,25 +1468,40 @@ class WorkerPool:
                     f"pool member {member.worker_id} drained (exit 0)"
                 )
                 continue
-            # Non-zero exit, or an unexpected daemon-mode exit: restart-and-
-            # reclaim to restore the pool to size (D-2). The dead member's task
-            # is reclaimed by a live worker via the existing lease machinery.
-            if self._restarts.get(slot, 0) >= self._max_restarts:
-                self._log(
-                    f"pool member {member.worker_id} exceeded "
-                    f"{self._max_restarts} restarts (last exit {code}); "
-                    f"giving up"
-                )
-                self._members.pop(slot, None)
-                self._exit_code = 1
-                self._stop_requested = True
-                return
-            self._restarts[slot] = self._restarts.get(slot, 0) + 1
-            self._log(
-                f"pool member {member.worker_id} exited {code}; respawning "
-                f"(restart {self._restarts[slot]}/{self._max_restarts})"
+            # Non-zero exit, or an unexpected daemon-mode exit: charge the death
+            # against this slot's windowed crash-loop budget. Inside budget it
+            # is restart-and-reclaimed to restore the pool to size (D-2) -- the
+            # dead member's task is reclaimed by a live worker via the existing
+            # lease machinery. Past budget the slot is retired in isolation.
+            policy = self._policies.setdefault(
+                slot, SupervisionPolicy(self._budget, clock=self._clock)
             )
-            self._spawn_slot(slot)
+            if policy.record_death() is RespawnDecision.RESPAWN:
+                self._log(
+                    f"pool member {member.worker_id} exited {code}; respawning "
+                    f"(death {policy.deaths_in_window} within "
+                    f"{self._budget.window_seconds:g}s window, budget "
+                    f"{self._budget.max_respawns})"
+                )
+                self._spawn_slot(slot)
+                continue
+            # Budget exhausted: retire THIS slot only and keep supervising the
+            # rest of the fleet (D-C). No pool-wide stop, no group-kill of the
+            # healthy members -- a smaller live fleet beats a dead one.
+            self._retired.add(slot)
+            self._exhausted.add(slot)
+            self._members.pop(slot, None)
+            self._exit_code = 1
+            self._log(
+                f"pool member {member.worker_id} exhausted its crash-loop "
+                f"budget ({self._budget.max_respawns} respawns within "
+                f"{self._budget.window_seconds:g}s, last exit {code}); "
+                f"retiring this slot -- other members keep running"
+            )
+        # Every slot retired (drained or quarantined): nothing left to
+        # supervise, so end the loop rather than spin below-strength forever.
+        if len(self._retired) >= self._size:
+            self._stop_requested = True
 
     def stop(self, *, timeout: float | None = None) -> None:
         """Group-kill every surviving member; idempotent.

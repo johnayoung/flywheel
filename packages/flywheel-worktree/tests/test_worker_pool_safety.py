@@ -20,10 +20,14 @@ load) and exercises the exact claim + merge-flock code a subprocess pool runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
+import os
 import subprocess
+import sys
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -500,3 +504,135 @@ def test_single_worker_keeps_at_most_one_task_in_progress(
     # ...and never had more than one task executing at once. The probe must have
     # observed activity (peak >= 1), and that peak must be exactly 1.
     assert probe.peak == 1, f"single worker overlapped tasks: peak={probe.peak}"
+
+
+# --- #4: single-slot retirement spares the healthy fleet --------------------
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_slot_retire_keeps_fleet() -> None:
+    """A pool of size 2 where one slot crash-loops past its budget retires THAT
+    slot in isolation and keeps the other, healthy member running (spec 00070,
+    D-C / criterion #4).
+
+    This is the discriminating case the old lifetime-counter-plus-group-kill
+    failed: on budget exhaustion ``_supervise_tick`` set ``_stop_requested`` and
+    the ``finally: stop()`` group-killed *every* live member. Here slot 0 exits
+    non-zero on every (re)start while slot 1 sleeps; with a budget of one
+    respawn, slot 0 is respawned once then quarantined on its second crash. The
+    proof the fleet was NOT group-killed on exhaustion: slot 1's pid is still
+    alive after slot 0 retires, the pool requested no pool-wide stop, and it is
+    still supervising the surviving member. ``stop()`` afterwards still leaves
+    nothing alive, so orphan-free shutdown is preserved.
+    """
+
+    def spawn(worker_id: str) -> list[str]:
+        # Slot 0 crash-loops; slot 1 is a long-lived healthy member.
+        if worker_id.endswith("-0"):
+            return [sys.executable, "-c", "import sys; sys.exit(7)"]
+        return [sys.executable, "-c", "import time; time.sleep(300)"]
+
+    pool = worker.WorkerPool(
+        size=2,
+        spawn_member=spawn,
+        log=lambda _m: None,
+        once=False,
+        prefix="fleet",
+        # One respawn per window: slot 0's 2nd crash inside the window exhausts.
+        max_restarts_per_slot=1,
+    )
+    try:
+        pool.start()
+        healthy_pid = pool._members[1].proc.pid
+        assert _alive(healthy_pid)
+
+        # Drive supervision until slot 0 exhausts its budget and is retired.
+        # Each tick reaps the dead slot-0 child (respawning it, then finally
+        # retiring it); wait for the current slot-0 child to actually exit
+        # before each tick so the tick observes the crash.
+        deadline = time.monotonic() + 15.0
+        while 0 not in pool._retired and time.monotonic() < deadline:
+            member0 = pool._members.get(0)
+            if member0 is not None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    member0.proc.wait(timeout=5)
+            pool._supervise_tick()
+
+        # The failing slot retired for exhaustion...
+        assert 0 in pool._retired, "failing slot never retired"
+        assert 0 in pool._exhausted
+        # ...and the healthy member is STILL ALIVE (no group-kill of the fleet).
+        assert _alive(healthy_pid)
+        assert pool.live_member_pids() == [healthy_pid]
+        # The pool keeps supervising: no pool-wide stop, surviving slot intact.
+        assert not pool._stop_requested
+        assert 1 not in pool._retired
+    finally:
+        # Orphan-free shutdown still holds: stop() leaves nothing alive.
+        pool.stop(timeout=1.0)
+    assert pool.live_member_pids() == []
+    assert not _alive(healthy_pid)
+
+
+def test_pool_slot_budget_is_windowed_not_lifetime() -> None:
+    """A slot whose two crashes straddle the crash-loop window is respawned on
+    the second, not retired -- the budget is windowed, not a lifetime counter
+    (spec 00070, D-B).
+
+    With ``max_restarts_per_slot=1`` and a 10s window under an injected clock:
+    the first crash (t=0) respawns within budget; advancing the clock past the
+    window decays that death out, so the second crash respawns again rather than
+    exhausting. A lifetime per-slot counter (the code this replaced) would
+    retire the slot on the second crash -- this asserts it does not, and counts
+    real respawns so a stubbed no-op cannot pass.
+    """
+    clock = {"t": 0.0}
+    spawns: list[str] = []
+
+    def spawn(worker_id: str) -> list[str]:
+        spawns.append(worker_id)
+        return [sys.executable, "-c", "import sys; sys.exit(7)"]
+
+    pool = worker.WorkerPool(
+        size=1,
+        spawn_member=spawn,
+        log=lambda _m: None,
+        once=False,
+        prefix="w",
+        max_restarts_per_slot=1,
+        restart_window_seconds=10.0,
+        clock=lambda: clock["t"],
+    )
+    try:
+        pool.start()
+        assert len(spawns) == 1  # initial spawn
+
+        # Death 1 at t=0: within budget -> respawn (slot not retired).
+        pool._members[0].proc.wait(timeout=5)
+        pool._supervise_tick()
+        assert 0 not in pool._retired
+        assert len(spawns) == 2  # respawned within the window
+
+        # Advance the clock past the window so death 1 decays out entirely.
+        clock["t"] = 25.0
+
+        # Death 2 after the window: a lifetime counter would retire here; the
+        # windowed budget has replenished, so the slot is respawned again.
+        pool._members[0].proc.wait(timeout=5)
+        pool._supervise_tick()
+        assert 0 not in pool._retired, (
+            "windowed budget must replenish after the window elapses"
+        )
+        assert 0 not in pool._exhausted
+        assert len(spawns) == 3  # respawned again, not retired
+    finally:
+        pool.stop(timeout=1.0)

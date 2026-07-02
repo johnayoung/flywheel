@@ -216,10 +216,15 @@ def test_pool_gives_up_after_restart_budget() -> None:
         max_restarts_per_slot=2,
     )
     code = pool.run_supervised()
-    # A member that crashes on every (re)start exhausts the budget and the pool
-    # exits non-zero rather than spinning forever.
+    # A member that crashes on every (re)start exhausts its windowed crash-loop
+    # budget and the pool RETIRES that slot rather than spinning forever
+    # (spec 00070, D-C). Retirement is per-slot, not a group-kill: here the
+    # single slot is the whole fleet, so once it is retired the pool has nothing
+    # left to supervise and ends. A slot quarantined for exhaustion (never a
+    # clean drain) surfaces as a non-zero exit for operator inspection.
     assert code == 1
     assert pool.live_member_pids() == []
+    assert pool._exhausted == {0}  # retired for exhaustion, not a clean drain
 
 
 # --- orphan-free shutdown (#9) ----------------------------------------------

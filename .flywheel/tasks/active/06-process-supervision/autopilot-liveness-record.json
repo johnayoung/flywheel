@@ -1,7 +1,7 @@
 {
   "id": "autopilot-liveness-record",
   "goal": "A running autopilot daemon publishes a liveness record (PID plus freshness) so a second supervisor reads it, finds the live daemon, and adopts it instead of spawning a duplicate, while a stale record reads as not-live exactly like a lapsed worker lease.",
-  "prerequisites": ["supervision-policy-core"],
+  "prerequisites": ["supervision-policy-core", "console-supervisor-respawn"],
   "graders": [
     {
       "type": "command",

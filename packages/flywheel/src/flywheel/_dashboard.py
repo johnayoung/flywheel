@@ -1262,10 +1262,11 @@ def _format_autopilot_status(
     """Render one ``autopilot:`` line for the status bar.
 
     Mirrors :func:`_format_worker_status`'s vocabulary against the autopilot
-    supervisor's states (``supervised`` / ``none`` / ``dead`` / ``error``);
-    autopilot has no ``detached`` state (it writes no lease). When the
-    supervised daemon has recorded live activity, its per-cycle summary
-    (current cycle, last emitted/dropped, time-to-next-cycle) is appended.
+    supervisor's states (``supervised`` / ``detached`` / ``none`` / ``dead`` /
+    ``error``). ``detached`` names a live daemon this console adopted from its
+    liveness record rather than one it spawned. When a daemon (owned or adopted)
+    has recorded live activity, its per-cycle summary (current cycle, last
+    emitted/dropped, time-to-next-cycle) is appended.
     """
     state = status.state
     if state == AutopilotState.SUPERVISED:
@@ -1279,6 +1280,17 @@ def _format_autopilot_status(
             )
             text += f" -- {_format_autopilot_activity(status.activity, clock)}"
         return Text(text, style="green")
+    if state == AutopilotState.DETACHED:
+        pid = f" pid={status.pid}" if status.pid is not None else ""
+        text = f"autopilot: detached{pid} (this console did not spawn it)"
+        if status.activity is not None:
+            clock = (
+                now
+                if now is not None
+                else datetime.now(timezone.utc).timestamp()
+            )
+            text += f" -- {_format_autopilot_activity(status.activity, clock)}"
+        return Text(text, style="yellow")
     if state == AutopilotState.NONE:
         return Text(
             "autopilot: none -- type '/autopilot start' to spawn one",

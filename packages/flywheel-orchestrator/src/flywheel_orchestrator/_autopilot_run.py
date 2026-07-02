@@ -417,6 +417,17 @@ def _log_result(log: Callable[[str], None], result: AutopilotPassResult) -> None
         log(f"dropped {drop.finding.id}: {drop.reason}")
 
 
+# The liveness record's freshness window is one interval (the gap between the
+# daemon's record writes while it idles between cycles) plus this grace, so a
+# healthy daemon -- idling between cycles or busy inside one -- always writes its
+# next record before the deadline lapses, exactly as the worker's lease (300s)
+# comfortably outlives its heartbeat (10s). Kept modestly larger than one
+# interval (not the worker's 30x lease/heartbeat ratio) so a dead daemon's
+# record still lapses within roughly one cycle rather than reading live for
+# hours -- the "don't adopt a corpse" bound.
+LIVENESS_GRACE_SECONDS = 60.0
+
+
 class _ActivityRecorder:
     """Writes the daemon's per-cycle activity snapshots for the console.
 
@@ -428,6 +439,11 @@ class _ActivityRecorder:
     after each cycle. ``clock`` is injected so ``next_cycle_at`` is deterministic
     in tests. Snapshot I/O is best-effort -- a write failure never crashes a
     cycle.
+
+    Every snapshot doubles as the daemon's liveness record: each write stamps
+    ``expires_at = now + interval + LIVENESS_GRACE_SECONDS`` so a second
+    supervisor reading the file (via ``read_live_activity``) sees a fresh
+    deadline while this daemon lives and a lapsed one once it dies.
     """
 
     def __init__(
@@ -456,6 +472,7 @@ class _ActivityRecorder:
             updated_at=now,
             interval_seconds=self._interval,
             next_cycle_at=next_cycle_at,
+            expires_at=now + self._interval + LIVENESS_GRACE_SECONDS,
             last_emitted=0 if result is None else result.emitted_count,
             last_dropped=0 if result is None else len(result.dropped),
             last_reason="" if result is None else result.reason,

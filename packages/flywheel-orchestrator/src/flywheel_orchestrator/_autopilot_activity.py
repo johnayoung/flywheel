@@ -9,6 +9,16 @@ writes an :class:`AutopilotActivity` snapshot here; the console-side
 which cycle it is on, the last cycle's emitted/dropped counts, and when the next
 cycle fires.
 
+The snapshot doubles as the daemon's cross-process **liveness record**: it
+carries the daemon ``pid`` plus an ``expires_at`` freshness deadline (epoch
+seconds) that the daemon pushes forward on every write. A second supervisor
+reads that deadline through :func:`read_live_activity` to decide whether a live
+daemon is already running -- if so it adopts it (reports ``DETACHED``) instead
+of spawning a duplicate. The staleness rule mirrors the worker lease exactly
+(``flywheel._worker_supervisor.has_live_lease``): a record whose ``expires_at``
+is at/before ``now`` reads as not-live, just like a lapsed ``lease_expires_at``,
+so a truly dead daemon is respawned rather than adopted forever.
+
 This file is a live activity surface only; it is NOT authoritative lifecycle
 state. A stale file left by a previous daemon is ignored on the read side by
 pid mismatch, and any malformed/missing/old-schema file reads back as ``None``.
@@ -19,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +61,15 @@ class AutopilotActivity:
     countdown without parsing -- both processes share one machine clock.
     ``next_cycle_at`` is set only while ``phase == PHASE_IDLE`` (sleeping between
     cycles); during a cycle it is ``None`` (the daemon is busy, not waiting).
+
+    ``expires_at`` is the liveness-record freshness deadline (epoch seconds):
+    the wall-clock instant at/after which this record reads as not-live. The
+    daemon pushes it forward on every write to ``now + interval + grace`` so a
+    healthy daemon -- idling between cycles or busy inside one -- always reads
+    live, while a dead daemon's last record lapses and reads not-live. It is the
+    autopilot analogue of the worker lease's ``lease_expires_at``; the read is
+    the identical ``deadline > now`` comparison (see :func:`is_record_live`). A
+    record with ``expires_at is None`` (e.g. an older writer) reads not-live.
     """
 
     pid: int
@@ -58,6 +78,7 @@ class AutopilotActivity:
     updated_at: float
     interval_seconds: float
     next_cycle_at: float | None = None
+    expires_at: float | None = None
     last_emitted: int = 0
     last_dropped: int = 0
     last_reason: str = ""
@@ -74,6 +95,7 @@ def _to_dict(activity: AutopilotActivity) -> dict[str, object]:
         "updated_at": activity.updated_at,
         "interval_seconds": activity.interval_seconds,
         "next_cycle_at": activity.next_cycle_at,
+        "expires_at": activity.expires_at,
         "last_emitted": activity.last_emitted,
         "last_dropped": activity.last_dropped,
         "last_reason": activity.last_reason,
@@ -105,6 +127,13 @@ def _from_dict(data: object) -> AutopilotActivity | None:
         next_cycle_at = None if raw_next is None else float(raw_next)
     except (TypeError, ValueError):
         next_cycle_at = None
+
+    raw_expires = data.get("expires_at")
+    expires_at: float | None
+    try:
+        expires_at = None if raw_expires is None else float(raw_expires)
+    except (TypeError, ValueError):
+        expires_at = None
 
     tasks: list[EmittedSummary] = []
     raw_tasks = data.get("last_emitted_tasks")
@@ -139,6 +168,7 @@ def _from_dict(data: object) -> AutopilotActivity | None:
         updated_at=updated_at,
         interval_seconds=interval_seconds,
         next_cycle_at=next_cycle_at,
+        expires_at=expires_at,
         last_emitted=int(data.get("last_emitted", 0) or 0),
         last_dropped=int(data.get("last_dropped", 0) or 0),
         last_reason=str(data.get("last_reason", "")),
@@ -189,6 +219,40 @@ def read_activity(path: Path | None) -> AutopilotActivity | None:
     return _from_dict(data)
 
 
+def is_record_live(activity: AutopilotActivity | None, *, now: float) -> bool:
+    """Whether the record represents a live daemon at ``now`` (epoch seconds).
+
+    The autopilot analogue of ``has_live_lease``'s ``lease_expires_at > now``:
+    a record whose ``expires_at`` freshness deadline is strictly in the future
+    reads as live; a record at/before ``now`` (a lapsed record) reads as
+    not-live, so a truly dead daemon is respawned rather than adopted forever.
+    A missing record (``None``) or one without a freshness deadline
+    (``expires_at is None``) is not-live -- the same "no lease, no live worker"
+    default the worker takes for an absent ``task_claims`` row.
+    """
+    if activity is None or activity.expires_at is None:
+        return False
+    return activity.expires_at > now
+
+
+def read_live_activity(
+    path: Path | None, *, now: float | None = None
+) -> AutopilotActivity | None:
+    """Read the liveness record and return it only if it reads live at ``now``.
+
+    Composes :func:`read_activity` with :func:`is_record_live` so a caller
+    (a second supervisor) gets the live daemon's record -- ``pid`` and all --
+    to adopt, or ``None`` when there is no live daemon to adopt (missing,
+    malformed, or stale record). ``now`` defaults to the shared machine clock
+    (``time.time()``); tests inject a fixed instant. The returned record's
+    ``pid`` lets the caller distinguish a foreign daemon from a child it owns
+    (the same pid guard the SUPERVISED activity read uses).
+    """
+    activity = read_activity(path)
+    moment = now if now is not None else time.time()
+    return activity if is_record_live(activity, now=moment) else None
+
+
 __all__ = [
     "ACTIVITY_SCHEMA_VERSION",
     "PHASE_IDLE",
@@ -196,6 +260,8 @@ __all__ = [
     "PHASE_STARTING",
     "AutopilotActivity",
     "EmittedSummary",
+    "is_record_live",
     "read_activity",
+    "read_live_activity",
     "write_activity",
 ]

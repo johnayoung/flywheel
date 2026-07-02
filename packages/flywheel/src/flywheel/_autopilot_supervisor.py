@@ -9,11 +9,17 @@ spawn / detach / stop pattern (decision D-6) -- it is deliberately the same
 shape so the console gains an autopilot status the way it shows worker status.
 
 The one difference from the worker supervisor: autopilot writes no
-``task_claims`` lease, so liveness is determined purely from the child this
-supervisor spawned (``SUPERVISED`` / ``DEAD`` / ``NONE`` / ``ERROR``), with no
-cross-process ``DETACHED`` detection. A detached autopilot daemon keeps running
-after the console exits (``start_new_session=True``); the next console simply
-does not adopt it.
+``task_claims`` lease. Instead, cross-process liveness rides on the daemon's
+activity snapshot, which doubles as a **liveness record** -- it carries the
+daemon ``pid`` plus an ``expires_at`` freshness deadline the daemon pushes
+forward every cycle (see :mod:`flywheel_orchestrator._autopilot_activity`). A
+second supervisor reads that record (``read_live_activity``) and, finding a live
+daemon it does not own, adopts it -- reporting ``DETACHED`` and spawning nothing,
+exactly as the worker supervisor treats a live foreign ``task_claims`` lease. A
+*stale* record (``expires_at`` at/before now) reads as not-live by the identical
+rule the worker uses for a lapsed lease, so a dead daemon's leftover record does
+not block a respawn. A detached daemon keeps running after the console exits
+(``start_new_session=True``); the next console adopts it via its record.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ from flywheel._worker_supervisor import (
 from flywheel_orchestrator._autopilot_activity import (
     AutopilotActivity,
     read_activity,
+    read_live_activity,
 )
 from flywheel_orchestrator._supervision_policy import (
     RespawnDecision,
@@ -51,22 +58,30 @@ class AutopilotState(str, enum.Enum):
     """The states the console's status surface renders for autopilot.
 
     ``SUPERVISED`` -- this console owns a live autopilot child it spawned.
-    ``NONE`` -- no supervised child; the status surface advertises
-    ``/autopilot start``. ``DEAD`` -- the supervised child exited unexpectedly
-    mid-session and was NOT respawned (no crash-loop policy, or a disabled
-    budget-0 policy). ``DEAD_AFTER_BUDGET`` -- the child kept dying and
-    exhausted the shared windowed crash-loop budget, so the supervisor stopped
-    auto-respawning and latched this distinct, queryable terminal state (the
-    unattended-base-branch safety interlock -- spec 00070); an operator
-    ``/autopilot start`` re-arms a fresh budget window. ``ERROR`` -- the most
-    recent ``start()`` failed before the child could launch.
+    ``DETACHED`` -- a live daemon this console does NOT own holds a fresh
+    liveness record (its ``expires_at`` is still in the future). Either a
+    previous console detached its child or another console launched it; this
+    console adopts it -- it spawns nothing and does not signal it (``stop()`` is
+    a no-op with an inline notice), mirroring how the worker supervisor treats a
+    live foreign ``task_claims`` lease. ``NONE`` -- no supervised child and no
+    live record; the status surface advertises ``/autopilot start``. ``DEAD`` --
+    the supervised child exited unexpectedly mid-session and was NOT respawned
+    (no crash-loop policy, or a disabled budget-0 policy). ``DEAD_AFTER_BUDGET``
+    -- the child kept dying and exhausted the shared windowed crash-loop budget,
+    so the supervisor stopped auto-respawning and latched this distinct,
+    queryable terminal state (the unattended-base-branch safety interlock --
+    spec 00070); an operator ``/autopilot start`` re-arms a fresh budget window.
+    ``ERROR`` -- the most recent ``start()`` failed before the child could
+    launch.
 
-    There is intentionally no ``DETACHED`` state: autopilot writes no lease, so
-    a daemon another console launched (or that this console detached) is not
-    detectable here -- it simply keeps running.
+    A record whose freshness deadline is at/before now (a lapsed record) is
+    treated as no live daemon -- the identical staleness rule the worker applies
+    to a lapsed lease -- so a dead daemon's leftover record never latches
+    ``DETACHED`` nor blocks a respawn.
     """
 
     SUPERVISED = "supervised"
+    DETACHED = "detached"
     NONE = "none"
     DEAD = "dead"
     DEAD_AFTER_BUDGET = "dead_after_budget"
@@ -78,9 +93,12 @@ class AutopilotStatus:
     """Snapshot of supervisor state for the console's status surface.
 
     ``activity`` is the live per-cycle snapshot the daemon writes (which cycle,
-    last cycle's emitted/dropped counts, time-to-next-cycle). It is populated
-    only while ``state == SUPERVISED`` and the snapshot's pid matches the owned
-    child -- a stale file from a previous daemon is ignored.
+    last cycle's emitted/dropped counts, time-to-next-cycle). For
+    ``state == SUPERVISED`` it is populated only when the snapshot's pid matches
+    the owned child (a stale file from a previous daemon is ignored). For
+    ``state == DETACHED`` it is the adopted foreign daemon's live record, and
+    ``pid`` is that daemon's pid -- so the console can name which daemon it
+    adopted rather than duplicating it.
     """
 
     state: AutopilotState
@@ -174,8 +192,15 @@ class AutopilotSupervisor:
         """Compute the current :class:`AutopilotStatus`.
 
         A live owned child reports ``SUPERVISED``; a child that exited on its
-        own flips to ``DEAD`` until the operator respawns; otherwise ``NONE``
-        (or ``ERROR`` after a failed spawn).
+        own flips to ``DEAD`` until the operator respawns. With no owned child,
+        a live liveness record from a daemon this console does not own reports
+        ``DETACHED`` (adopt, spawn nothing); otherwise ``NONE`` (or ``ERROR``
+        after a failed spawn).
+
+        Order mirrors the worker supervisor: an owned/dead/errored child is
+        resolved from local state first, and only then is the cross-process
+        record consulted -- so a just-died owned child reads ``DEAD`` (its own
+        lapsing record never masks the death as ``DETACHED``).
         """
         if self._child is not None:
             rc = self._child.poll()
@@ -212,6 +237,15 @@ class AutopilotSupervisor:
             return AutopilotStatus(
                 state=AutopilotState.ERROR, message=self._last_error
             )
+        live = read_live_activity(self._activity_path)
+        if live is not None:
+            # A fresh record from a daemon this console does not own: adopt it
+            # (report DETACHED, carrying the foreign pid + record) rather than
+            # spawning a duplicate. A stale record read back as None and falls
+            # through to NONE -- the dead-daemon respawn path.
+            return AutopilotStatus(
+                state=AutopilotState.DETACHED, pid=live.pid, activity=live
+            )
         return AutopilotStatus(state=AutopilotState.NONE)
 
     def owns_supervised_child(self) -> bool:
@@ -222,13 +256,19 @@ class AutopilotSupervisor:
         """Spawn the autopilot daemon if none is owned; idempotent otherwise.
 
         An already-``SUPERVISED`` supervisor returns unchanged without spawning
-        a second daemon (idempotent start). The child is placed in its own
-        session (``start_new_session=True``) so a Ctrl+C on the console
-        terminal never reaches it and it survives the console's exit -- only an
-        explicit :meth:`stop` signals it.
+        a second daemon (idempotent start). A ``DETACHED`` supervisor -- a live
+        daemon it does not own already holds a fresh liveness record -- likewise
+        returns unchanged without spawning, adopting that daemon instead of
+        duplicating it (the same no-spawn branch the worker takes on a live
+        foreign lease). The child is placed in its own session
+        (``start_new_session=True``) so a Ctrl+C on the console terminal never
+        reaches it and it survives the console's exit -- only an explicit
+        :meth:`stop` signals it.
         """
         current = self.status()
         if current.state == AutopilotState.SUPERVISED:
+            return current
+        if current.state == AutopilotState.DETACHED:
             return current
 
         self._dead_pid = None
@@ -236,6 +276,16 @@ class AutopilotSupervisor:
         self._dead_reason = None
         self._dead_after_budget = False
         self._last_error = None
+
+        # A DEAD / ERROR status short-circuits status() *before* its liveness
+        # read, so a live record (a peer daemon's, or this console's own
+        # just-detached child) would otherwise be missed and we would spawn a
+        # duplicate against a store that already has a live daemon. Now that the
+        # DEAD/ERROR flags are cleared, re-evaluate: a live record surfaces as
+        # DETACHED and we adopt it rather than spawn.
+        rechecked = self.status()
+        if rechecked.state == AutopilotState.DETACHED:
+            return rechecked
 
         # An operator start() re-arms the crash-loop budget: forget the prior
         # window's deaths so a manual restart begins with a full budget again

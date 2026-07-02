@@ -79,7 +79,7 @@ The default lease is `DEFAULT_LEASE_SECONDS = 300.0` (`_orchestrate.py:142`), ov
 
 `acquire_claim` refuses a claim whose `conflict_keys` overlap a **different live claim's** keys, so two tasks that touch the same resource never run concurrently. The task's own row is excluded and lapsed claims do not block, so the refusal clears once the conflicting claim is released or lapses. Empty `conflict_keys` (the default) is never refused on that basis. Keys are supplied at acquire time and persisted on the claim row (`conflict_keys_json`).
 
-**Partial: the store enforces conflict keys, but the shipped worker loop does not yet pass them.** Every `acquire_claim` call site in `orchestrate` passes the empty default, so the live loop never exercises conflict exclusion today (`_orchestrate.py:477,884,985,1072`). It is a store capability a consumer can drive, not active behavior of `flywheel worker`.
+The loop passes keys wherever a claim gates repo work: the fresh-dispatch and blocked-resume acquires carry the `WorkItem`'s `conflict_keys`, and the claim is held through verify and landing, so two overlapping items never have concurrent edit-to-land windows. Bookkeeping acquires (stranded finalize, retry escalation, approval resolve, landing re-drive) deliberately pass none — record-keeping on one task must not queue behind an unrelated task that merely shares a file key, and a parked branch's textual conflicts are already baked in by re-land time. A conflict-refused task is skipped for the pass, not consumed: it stays eligible and is retried once the overlapping claim releases.
 
 ### Liveness sweep
 

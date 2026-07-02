@@ -42,6 +42,7 @@ def _write_task(
     task_id: str,
     *,
     prerequisites: list[str] | None = None,
+    conflict_keys: list[str] | None = None,
     grader_run: str = "true",
 ) -> None:
     phase.mkdir(parents=True, exist_ok=True)
@@ -52,6 +53,8 @@ def _write_task(
     }
     if prerequisites:
         payload["prerequisites"] = prerequisites
+    if conflict_keys:
+        payload["conflict_keys"] = conflict_keys
     (phase / f"{task_id}.json").write_text(json.dumps(payload))
 
 
@@ -442,6 +445,126 @@ def test_claim_is_released_after_a_run(tmp_path: Path) -> None:
         assert store.load_claim("solo") is None
     finally:
         store.close()
+
+
+def test_peer_conflict_key_claim_excludes_overlapping_task(
+    tmp_path: Path,
+) -> None:
+    """A live keyed claim excludes a different task sharing a key.
+
+    Discriminates the loop wiring: were the dispatch acquire keyless, the
+    store would grant it (empty keys are never refused on overlap) and
+    ``overlap`` would run despite the peer's live keyed claim.
+    """
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "free")
+    _write_task(phase, "overlap", conflict_keys=["src/hot.py"])
+    db_path = tmp_path / "flywheel.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # A peer worker holds a live keyed claim on some other task.
+    holder = SqliteClaimStore(db_path)
+    try:
+        claim = holder.acquire_claim(
+            "peer-task",
+            "other-worker",
+            now=datetime.now(timezone.utc),
+            lease_seconds=3600,
+            conflict_keys=frozenset({"src/hot.py"}),
+        )
+        assert claim is not None
+    finally:
+        holder.close()
+
+    report = _orchestrate(tmp_path, _always_verify())
+    # The keyless task runs; the overlapping one is skipped, not consumed.
+    assert [r.task_id for r in report.runs] == ["free"]
+
+    releaser = SqliteClaimStore(db_path)
+    try:
+        releaser.release_claim(claim)
+    finally:
+        releaser.close()
+    report2 = _orchestrate(tmp_path, _always_verify())
+    assert [r.task_id for r in report2.runs] == ["overlap"]
+    assert report2.runs[0].status is Status.DONE
+
+
+def test_conflicting_tasks_serialize_within_one_session(
+    tmp_path: Path,
+) -> None:
+    """Two items sharing a key both finish in one session, one at a time.
+
+    Each run's claim is released before the next fresh pass, so shared keys
+    serialize the pair without deadlocking a single worker.
+    """
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "first", conflict_keys=["src/hot.py"])
+    _write_task(phase, "second", conflict_keys=["src/hot.py"])
+
+    report = _orchestrate(tmp_path, _always_verify())
+    assert sorted(r.task_id for r in report.runs) == ["first", "second"]
+    assert all(r.status is Status.DONE for r in report.runs)
+
+
+def test_peer_conflict_key_claim_defers_blocked_resume(
+    tmp_path: Path,
+) -> None:
+    """The blocked-resume acquire carries keys too, not just fresh dispatch."""
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "gated", conflict_keys=["src/hot.py"])
+    sentinel = tmp_path / "unblock-me"
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        if not sentinel.exists():
+            return IterationResult(
+                transcript="blocked",
+                messages=_messages(),  # type: ignore[arg-type]
+                envelope=ValidEnvelope(
+                    intent=Intent.BLOCKED,
+                    reason="waiting on artifact",
+                    requires=(
+                        FileExistsRequirement(
+                            path=str(sentinel), present=True
+                        ),
+                    ),
+                ),
+                signals=_signals(),
+                failure=None,
+            )
+        return _verify_result()
+
+    # Session 1: the task blocks on the missing sentinel.
+    report = _orchestrate(tmp_path, _invoke)
+    assert [r.status for r in report.runs] == [Status.INTERRUPTED]
+
+    # The predicate now holds, but a peer holds a live overlapping claim.
+    sentinel.write_text("ready")
+    holder = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        claim = holder.acquire_claim(
+            "peer-task",
+            "other-worker",
+            now=datetime.now(timezone.utc),
+            lease_seconds=3600,
+            conflict_keys=frozenset({"src/hot.py"}),
+        )
+        assert claim is not None
+    finally:
+        holder.close()
+    report2 = _orchestrate(tmp_path, _invoke)
+    assert report2.runs == ()
+
+    # Released: the next session resumes the blocked run to DONE.
+    releaser = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        releaser.release_claim(claim)
+    finally:
+        releaser.close()
+    report3 = _orchestrate(tmp_path, _invoke)
+    assert [(r.task_id, r.mode, r.status) for r in report3.runs] == [
+        ("gated", "resume", Status.DONE)
+    ]
 
 
 def test_two_workers_run_each_task_exactly_once(tmp_path: Path) -> None:

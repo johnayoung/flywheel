@@ -2288,6 +2288,17 @@ async def orchestrate(
             row_by_id: dict[str, TaskStatusRow] = {
                 r.task.id: r for r in rows
             }
+            # Claim-time conflict keys come off the same list_work() pass
+            # (spec 00049). The dispatch and resume acquires below carry an
+            # item's keys, and the claim is held through verify and landing,
+            # so two items with overlapping keys never have concurrent
+            # edit-to-land windows. Bookkeeping acquires (stranded finalize,
+            # retry escalation, approval resolve, landing re-drive) stay
+            # keyless: record-keeping on one task must not queue behind an
+            # unrelated task that merely shares a file key.
+            conflict_keys_by_id: dict[str, frozenset[str]] = {
+                item.task.id: item.conflict_keys for item in items
+            }
             blocked_ids = frozenset(
                 r.task.id for r in rows if _is_blocked_interrupted(r)
             )
@@ -2330,6 +2341,9 @@ async def orchestrate(
                     wid,
                     now=clock(),
                     lease_seconds=lease_seconds,
+                    conflict_keys=conflict_keys_by_id.get(
+                        row.task.id, frozenset()
+                    ),
                 )
                 if claim is None:
                     continue  # another worker owns this task right now
@@ -2575,6 +2589,9 @@ async def orchestrate(
                     wid,
                     now=clock(),
                     lease_seconds=lease_seconds,
+                    conflict_keys=conflict_keys_by_id.get(
+                        pick.task.id, frozenset()
+                    ),
                 )
                 if claim is None:
                     held.add(pick.task.id)

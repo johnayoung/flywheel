@@ -1415,13 +1415,20 @@ def run_once(
             held_out_source=held_out_source,
         )
     )
-    archive_phases(
-        tasks_dir,
-        db_path,
-        log,
-        repo_root=submitter.repo_root,
-        policy=policy,
-    )
+    # Under the same merge_lock record_phase_bases and the FF-merge path use:
+    # pool members share one repo_root/lock_path and each runs run_once every
+    # cycle, so two members finishing the last task of the same phase would
+    # otherwise both pass archive_completed_phases' unlocked ``if dest.exists()``
+    # check and both call shutil.move -- the loser raising FileNotFoundError
+    # into run_daemon_loop as a spurious cycle-failure strike.
+    with merge_lock(submitter.lock_path):
+        archive_phases(
+            tasks_dir,
+            db_path,
+            log,
+            repo_root=submitter.repo_root,
+            policy=policy,
+        )
     return report
 
 

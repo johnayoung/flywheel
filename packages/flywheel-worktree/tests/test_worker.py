@@ -1053,6 +1053,78 @@ def test_archive_phases_accepts_repeated_factory_calls(
         worker.archive_phases(tasks_dir, db_path, lambda _m: None, policy=policy)
 
 
+def test_concurrent_phase_archive_is_serialized_by_merge_lock(
+    tmp_path: Path,
+) -> None:
+    # M2: pool members share one repo_root/lock_path and each runs run_once
+    # every cycle. Two members finishing the last task of the same phase both
+    # reach the archive step; without merge_lock they both pass
+    # archive_completed_phases' unlocked ``if dest.exists()`` check and race
+    # shutil.move -- the loser raising FileNotFoundError as a spurious
+    # cycle-failure strike. run_once now wraps the archive in merge_lock; this
+    # proves that pairing archives the phase exactly once, neither racer raises,
+    # and it does not self-deadlock on the shared lock.
+    import threading
+    from datetime import datetime, timezone
+
+    from flywheel_core import Lifecycle
+
+    db_path = tmp_path / "flywheel.sqlite"
+    tasks_dir = tmp_path / "tasks"
+    phase = tasks_dir / "active" / "01-phase"
+    phase.mkdir(parents=True)
+    (phase / "t1.json").write_text(
+        json.dumps(
+            {
+                "id": "t1",
+                "goal": "g",
+                "graders": [{"type": "command", "run": "true"}],
+            }
+        )
+    )
+    lock_path = tmp_path / ".merge.lock"
+    policy = WorkPolicy(source_kind="directory", tasks_dir=tasks_dir)
+
+    # Seed a DONE lifecycle for the phase's only task so it is archive-eligible.
+    store = SqliteStore(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t1", run_id="run-t1")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        lc.transition_to(Status.DONE, now=now)
+        store.create_lifecycle(lc)
+    finally:
+        store.close()
+
+    errors: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def _archive() -> None:
+        start.wait(timeout=5)
+        try:
+            with worker.merge_lock(lock_path):
+                worker.archive_phases(
+                    tasks_dir, db_path, lambda _m: None, policy=policy
+                )
+        except BaseException as exc:  # noqa: BLE001 - surfaced via errors
+            errors.append(exc)
+
+    ta = threading.Thread(target=_archive)
+    tb = threading.Thread(target=_archive)
+    ta.start()
+    tb.start()
+    ta.join(timeout=10)
+    tb.join(timeout=10)
+    assert not ta.is_alive() and not tb.is_alive()
+
+    assert errors == [], errors
+    # Archived exactly once: gone from active/, present under archive/.
+    assert not (tasks_dir / "active" / "01-phase").exists()
+    assert (tasks_dir / "archive" / "01-phase").exists()
+
+
 def test_submitter_is_a_submit_strategy(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)

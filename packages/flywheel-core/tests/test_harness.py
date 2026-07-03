@@ -2118,6 +2118,44 @@ class TestIterationAwareInterrupt:
         assert second_version == first_version
         assert second_interrupted_count == first_interrupted_count == 1
 
+    def test_interrupt_transition_failure_is_observable(self) -> None:
+        # H4: if the INTERRUPTED transition's store write fails (a transient
+        # fault during shutdown), _handle_interrupt must not raise back into
+        # the shutdown path -- but the failure must not be swallowed silently.
+        # A harness.crash event makes the row left stuck at RUNNING observable
+        # for the stranded-recovery sweep. attempt=None isolates the only store
+        # write to the transition itself.
+        class _FailingAppendStore:
+            def append_domain_event(self, event, *, expected_version):  # type: ignore[no-untyped-def]
+                raise RuntimeError("database is locked")
+
+        sink = _ListSink()
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t", run_id="run-interrupt-transition-fail")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+
+        # Must return normally (no exception into the shutdown path).
+        _handle_interrupt(
+            store=_FailingAppendStore(),  # type: ignore[arg-type]
+            telemetry=_RunTelemetry(
+                sink, run_id=lc.run_id, clock=lambda: now
+            ),
+            lifecycle=lc,
+            attempt=None,
+            clock=lambda: now,
+        )
+
+        # The failed write is surfaced as a harness.crash event.
+        crash = [e for e in sink.events(lc.run_id) if e.kind == "harness.crash"]
+        assert len(crash) == 1
+        assert crash[0].payload["classification"] == "interrupt_transition_failed"
+        assert crash[0].payload["exception_type"] == "RuntimeError"
+        assert "database is locked" in crash[0].payload["message"]
+        # The transition never landed: the in-memory row is still RUNNING,
+        # left for the stranded-recovery sweep to repair.
+        assert lc.status == Status.RUNNING
+
     def test_interrupt_during_validating_finalizes_interrupted(
         self, tmp_path: Path
     ) -> None:

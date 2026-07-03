@@ -1042,6 +1042,13 @@ def _handle_interrupt(
     Best-effort append: a store-side failure inside the AttemptFinalized
     append is swallowed (the interrupt finalizer must not raise back into
     the shutdown path). The status transition remains the source of truth.
+
+    If the INTERRUPTED transition itself fails (a transient store fault
+    during shutdown), it too must not raise back into the shutdown path,
+    but the failure is not swallowed silently: a ``harness.crash`` event
+    (``classification='interrupt_transition_failed'``) is emitted so the
+    row left stuck at RUNNING/VALIDATING is observable. The stranded-
+    recovery sweep repairs the row on the next worker start.
     """
     if lifecycle.status not in _INTERRUPTIBLE_STATUSES:
         return
@@ -1097,8 +1104,22 @@ def _handle_interrupt(
             store=store,
             now=clock,
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - must not raise into shutdown
+        # The INTERRUPTED write failed (transient store fault during
+        # shutdown). We must not raise back into the shutdown path, but the
+        # failure has to be observable: the row is left in RUNNING/VALIDATING
+        # for the stranded-recovery sweep to repair on the next worker start.
+        # Mirror the harness.crash payload shape so no new event schema is
+        # introduced.
+        telemetry.emit(
+            kind="harness.crash",
+            payload={
+                "classification": "interrupt_transition_failed",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+            },
+            attempt_number=attempt.number if attempt is not None else None,
+        )
 
 
 def _handle_hang_detected(

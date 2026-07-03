@@ -31,6 +31,44 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def _dead(pid: int) -> bool:
+    """True when ``pid`` is gone or a zombie (killed, awaiting reap).
+
+    ``os.kill(pid, 0)`` still succeeds for a zombie, so an orphaned grandchild
+    that has been SIGKILL'd but not yet reaped by init reads as alive. A zombie
+    is not runnable, so treat it as dead; on a platform without ``/proc`` fall
+    back to the resolvable-means-alive semantics of :func:`_alive`.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, OSError):
+        return True
+    fields = stat.rpartition(")")[2].split()
+    return bool(fields) and fields[0] == "Z"
+
+
+def _wait_dead(pid: int, *, timeout: float = 5.0) -> bool:
+    """Poll until ``pid`` is dead (gone or zombie), bounded by ``timeout``.
+
+    SIGKILL is asynchronous: ``stop()`` returns once the group signal is sent,
+    but the OS may not have torn the process down yet -- especially an orphaned
+    grandchild reaped by init on a loaded CI runner. Waiting a bounded interval
+    closes that race without weakening the assertion.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _dead(pid):
+            return True
+        time.sleep(0.02)
+    return _dead(pid)
+
+
 def _ignore_term_with_child_argv(pidfile: Path) -> list[str]:
     """A child that ignores SIGTERM and spawns a grandchild that does too.
 
@@ -84,8 +122,9 @@ def test_autopilot_stop_force_kills_sigterm_ignoring_group(tmp_path) -> None:
         # SIGTERM is ignored, so this must escalate to SIGKILL within the window.
         stopped = sup.stop(timeout=0.5)
         assert stopped is True
-        assert not _alive(child_pid)
-        assert not _alive(grandchild_pid)  # the group-kill reached the grandchild
+        # SIGKILL is async; wait (bounded) for the group teardown to complete.
+        assert _wait_dead(child_pid)
+        assert _wait_dead(grandchild_pid)  # the group-kill reached the grandchild
         assert sup.status().state == AutopilotState.DEAD
     finally:
         _reap_group(child_pid)
@@ -108,8 +147,9 @@ def test_worker_stop_force_kills_sigterm_ignoring_group(tmp_path) -> None:
         assert _alive(child_pid) and _alive(grandchild_pid)
         stopped = sup.stop(timeout=0.5)
         assert stopped is True
-        assert not _alive(child_pid)
-        assert not _alive(grandchild_pid)
+        # SIGKILL is async; wait (bounded) for the group teardown to complete.
+        assert _wait_dead(child_pid)
+        assert _wait_dead(grandchild_pid)
         assert sup.status().state == WorkerState.DEAD
     finally:
         _reap_group(child_pid)

@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from typing import Literal
 from uuid import uuid4
@@ -5,6 +6,44 @@ from uuid import uuid4
 
 class ValidationError(ValueError):
     """Raised when a task or grader violates docs/task-schema.md."""
+
+
+# A single path/ref segment of a task id: consumers join ``id`` into
+# filesystem paths (worktree/sandbox roots) and git ref names, so each
+# ``/``-separated segment is constrained to a conservative path-safe set.
+_ID_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _validate_id_path_safe(task_id: str) -> None:
+    """Reject a task id that is not a relative, traversal-free path.
+
+    ``id`` is joined into filesystem paths and git ref names downstream
+    (``worktrees_dir / id``, ``sandbox_root / id``, ``flywheel/<phase>/<id>``).
+    An absolute or ``..``-bearing id would let those joins escape their base
+    (pathlib discards the base on an absolute right operand and never collapses
+    ``..``). This is pure string validation -- no filesystem access -- so
+    ``flywheel_core.task`` stays import-side-effect free.
+
+    ``/``-separated segments are allowed (a nested id maps to a nested branch
+    inside the worktree root); each segment must be non-empty, must not be the
+    parent-directory marker ``..``, and must contain only ``[A-Za-z0-9._-]``
+    (which also rejects backslashes, colons, and null bytes).
+    """
+    for segment in task_id.split("/"):
+        if not segment:
+            raise ValidationError(
+                f"id {task_id!r} must be a relative path with no empty "
+                "segments (no leading, trailing, or doubled '/')"
+            )
+        if segment == "..":
+            raise ValidationError(
+                f"id {task_id!r} must not contain a '..' path segment"
+            )
+        if not _ID_SEGMENT_RE.fullmatch(segment):
+            raise ValidationError(
+                f"id {task_id!r} segment {segment!r} must contain only "
+                "[A-Za-z0-9._-]"
+            )
 
 
 @dataclass(kw_only=True)
@@ -107,6 +146,7 @@ class Task:
             raise ValidationError("id must be a non-empty string")
         if any(ch.isspace() for ch in self.id):
             raise ValidationError(f"id {self.id!r} must not contain whitespace")
+        _validate_id_path_safe(self.id)
 
         if not isinstance(self.goal, str) or not self.goal.strip():
             raise ValidationError("goal must be a non-empty string")

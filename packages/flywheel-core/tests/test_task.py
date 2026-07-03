@@ -88,6 +88,32 @@ def test_validate_rejects_whitespace_in_id() -> None:
         task.validate()
 
 
+def test_validate_rejects_absolute_and_traversal_ids() -> None:
+    # id is joined into filesystem paths and git ref names downstream; an
+    # absolute or ``..``-bearing id would let those joins escape their base.
+    bad_ids = ["/abs", "../x", "a/../b", "a/", "a//b", "sub/..", "..", r"a\b"]
+    for bad in bad_ids:
+        task = Task(id=bad, goal="g", graders=[CommandGrader(run="x")])
+        with pytest.raises(ValidationError, match="id "):
+            task.validate()
+
+
+def test_validate_rejects_out_of_charset_id() -> None:
+    for bad in ["a:b", "task@1", "a#b", "a b".replace(" ", "\t")]:
+        task = Task(id=bad, goal="g", graders=[CommandGrader(run="x")])
+        with pytest.raises(ValidationError):
+            task.validate()
+
+
+def test_validate_accepts_nested_and_dotted_ids() -> None:
+    # Nested (a valid multi-level branch inside the worktree root) and dotted
+    # segments are legitimate; the default uuid and gh-N ids stay valid.
+    for good in ["gh-12", "task-1a2b", "sub/evil", "some.task.name", "t1-fix"]:
+        Task(
+            id=good, goal="g", graders=[CommandGrader(run="x")]
+        ).validate()
+
+
 def test_transcript_grader_rejects_construction_with_no_limits() -> None:
     with pytest.raises(ValidationError, match="transcript"):
         TranscriptGrader()

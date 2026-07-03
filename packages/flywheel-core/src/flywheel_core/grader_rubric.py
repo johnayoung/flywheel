@@ -159,6 +159,15 @@ def parse_verdict(text: str) -> VerdictResult:
             reason=f"verdict payload is not valid JSON: {exc.msg}",
             offending=_truncate(inner),
         )
+    except RecursionError:
+        # Deeply-nested untrusted judge output overflows the C JSON scanner's
+        # recursion. RecursionError is a RuntimeError, not JSONDecodeError, so
+        # it would otherwise escape this closed-contract parser and crash the
+        # harness. Treat it as a malformed payload.
+        return MalformedVerdict(
+            reason="verdict payload nests too deeply to parse",
+            offending=_truncate(inner),
+        )
 
     if not isinstance(data, dict):
         return MalformedVerdict(

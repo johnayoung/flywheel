@@ -139,6 +139,15 @@ def _extract_spec_block(body: str, *, source: str) -> dict[str, Any] | None:
                 raise WorkSourceError(
                     f"{source}: invalid JSON in flywheel spec block: {exc}"
                 ) from exc
+            except RecursionError as exc:
+                # A deeply-nested spec block (fully attacker-authored issue
+                # body) overflows the C JSON scanner's recursion. RecursionError
+                # is a RuntimeError, not JSONDecodeError, so it would otherwise
+                # escape past list_work's per-item WorkSourceError guard and
+                # blackout the whole board. Report it as an invalid block.
+                raise WorkSourceError(
+                    f"{source}: flywheel spec block nests too deeply to parse"
+                ) from exc
             if not isinstance(data, dict):
                 raise WorkSourceError(
                     f"{source}: flywheel spec block must be a JSON object, "

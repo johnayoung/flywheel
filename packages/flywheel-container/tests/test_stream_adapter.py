@@ -96,6 +96,21 @@ def test_non_json_lines_are_skipped() -> None:
     assert out.result_text == "ok"
 
 
+def test_deeply_nested_line_is_skipped_not_recursion_error() -> None:
+    # An adversarial/compromised in-container agent can emit a single
+    # deeply-nested JSON line. json.loads raises RecursionError (a RuntimeError,
+    # not a ValueError) on it, which would otherwise escape parse_stream_json
+    # and crash the invoke step, forcing the run to terminal FAILED and
+    # bypassing max_retries. The line must be skipped like any other malformed
+    # line while the surrounding well-formed lines still parse.
+    depth = 20000
+    nested = "[" * depth + "]" * depth
+    lines = [_assistant("hi"), nested, _result("ok", cost=0.0, turns=1)]
+    out = parse_stream_json(lines)
+    assert out.transcript == "hi"
+    assert out.result_text == "ok"
+
+
 def test_iteration_result_parses_envelope_and_carries_usage() -> None:
     lines = [
         _assistant(

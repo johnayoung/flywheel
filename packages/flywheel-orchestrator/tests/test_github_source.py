@@ -146,6 +146,20 @@ def test_invalid_spec_json_raises_instead_of_silent_fallback() -> None:
         _source(gh).list_work()
 
 
+def test_deeply_nested_spec_block_raises_worksourceerror_not_recursion() -> None:
+    # The spec block is the entire body of an attacker-authored fenced block.
+    # A deeply-nested payload makes json.loads raise RecursionError (a
+    # RuntimeError, not JSONDecodeError), which would otherwise escape past
+    # list_work's per-item WorkSourceError guard and blackout the whole board.
+    # It must surface as a WorkSourceError like any other invalid block.
+    depth = 20000
+    body = "```flywheel\n" + "[" * depth + "]" * depth + "\n```"
+    gh = _FakeGh(json.dumps([_issue(9, body=body)]))
+
+    with pytest.raises(WorkSourceError, match="octo/widgets#9.*too deeply"):
+        _source(gh).list_work()
+
+
 def test_unclosed_spec_fence_raises() -> None:
     body = "```flywheel\n{}"
     gh = _FakeGh(json.dumps([_issue(9, body=body)]))

@@ -184,6 +184,19 @@ class TestParseHandoffFailures:
         assert isinstance(result, MalformedHandoff)
         assert "JSON object" in result.reason
 
+    def test_deeply_nested_payload_is_malformed_not_recursion_error(
+        self,
+    ) -> None:
+        # Untrusted summarizer output: a payload nested far beyond the JSON
+        # scanner's recursion limit must map to MalformedHandoff, not leak a
+        # RecursionError out of this closed-contract parser. Otherwise the
+        # escaped RecursionError forces the run to terminal FAILED, bypassing
+        # max_retries, while an ordinary malformed payload stays retry-eligible.
+        depth = 20000
+        result = parse_handoff(_wrap("[" * depth + "]" * depth))
+        assert isinstance(result, MalformedHandoff)
+        assert "deep" in result.reason
+
     def test_missing_work_done(self) -> None:
         import json
 

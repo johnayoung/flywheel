@@ -206,6 +206,19 @@ class TestParseVerdictFailures:
         assert isinstance(result, MalformedVerdict)
         assert "JSON object" in result.reason
 
+    def test_deeply_nested_payload_is_malformed_not_recursion_error(
+        self,
+    ) -> None:
+        # Untrusted judge output: a payload nested far beyond the JSON
+        # scanner's recursion limit must map to MalformedVerdict, not leak a
+        # RecursionError out of this closed-contract parser. Otherwise the
+        # escaped RecursionError forces the run to terminal FAILED, bypassing
+        # max_retries, while an ordinary malformed payload stays retry-eligible.
+        depth = 20000
+        result = parse_verdict(_wrap("[" * depth + "]" * depth))
+        assert isinstance(result, MalformedVerdict)
+        assert "deep" in result.reason
+
     def test_missing_passed_field(self) -> None:
         result = parse_verdict(_wrap('{"summary": "ok"}'))
         assert isinstance(result, MalformedVerdict)

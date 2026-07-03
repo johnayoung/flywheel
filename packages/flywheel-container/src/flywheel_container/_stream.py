@@ -91,7 +91,10 @@ def parse_stream_json(lines: Iterable[str]) -> StreamOutcome:
             continue
         try:
             obj = json.loads(stripped)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # A deeply-nested JSON line from the in-container agent CLI overflows
+            # the C JSON scanner's recursion (RecursionError is a RuntimeError,
+            # not a ValueError). Skip the malformed line like any other.
             continue
         if not isinstance(obj, Mapping):
             continue

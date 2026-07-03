@@ -6,6 +6,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import io
+import re
 from pathlib import Path
 
 import pytest
@@ -307,3 +308,47 @@ def test_init_reconfigure_regenerates_skills_with_new_source(
     ).read_text()
     assert "gh issue create" in plan
     assert "octo/widgets" in plan
+
+
+# --- docs drift guard ----------------------------------------------------------
+#
+# docs/workflow.md hand-maintains prose about the fw-* authoring skills, but the
+# real source of truth is SKILL_NAMES / the _skill_templates. When a skill is
+# renamed or added and the doc is not updated, the doc silently rots -- exactly
+# how docs/workflow.md kept describing the removed /define and /task commands.
+# These two tests fail CI on that drift instead.
+
+
+def _find_repo_doc(relpath: str) -> Path | None:
+    """Walk up from this test file to the repo root and return ``relpath``
+    if it exists there. Returns None outside a source checkout."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / relpath
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def test_workflow_doc_documents_every_shipped_skill() -> None:
+    doc_path = _find_repo_doc("docs/workflow.md")
+    if doc_path is None:
+        pytest.skip("docs/workflow.md not found (not a source checkout)")
+    doc = doc_path.read_text(encoding="utf-8")
+    missing = [name for name in SKILL_NAMES if name not in doc]
+    assert not missing, (
+        f"docs/workflow.md does not mention shipped skill(s): {missing}. "
+        "Update the pipeline table and stage contracts when SKILL_NAMES changes."
+    )
+
+
+def test_workflow_doc_names_no_stale_fw_skill() -> None:
+    doc_path = _find_repo_doc("docs/workflow.md")
+    if doc_path is None:
+        pytest.skip("docs/workflow.md not found (not a source checkout)")
+    doc = doc_path.read_text(encoding="utf-8")
+    referenced = set(re.findall(r"fw-[a-z]+", doc))
+    unknown = referenced - set(SKILL_NAMES)
+    assert not unknown, (
+        f"docs/workflow.md references unknown fw-* skill(s): {sorted(unknown)}. "
+        "A skill was renamed/removed, or the doc has a typo."
+    )

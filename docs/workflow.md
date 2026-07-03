@@ -6,22 +6,24 @@ How flywheel develops itself. Every feature since the Postgres store has gone th
 
 ## Pipeline at a glance
 
-| Stage     | Command                    | Input                       | Output                                                           |
-| --------- | -------------------------- | --------------------------- | ---------------------------------------------------------------- |
-| Define    | `/define`                  | vague feature idea          | spec: `.flywheel/specs/NNNNN-FEATURE-<name>.md`                  |
-| Decompose | `/task`                    | spec reference or free text | task JSONs: `.flywheel/tasks/active/NN-<phase>/<id>.json`        |
-| Execute   | `flywheel worker` daemon   | active phase dirs           | landed work (FF-merge into the base, or a PR), lifecycles in the store, archived phase |
-| Audit     | `/audit-phase`             | store + logs for a phase    | findings: `.flywheel/audits/<phase>.md`                          |
-| Propose   | `/propose-improvements`    | one or more audits          | ranked proposals, each handed to `/define`, `/task`, or "accept" |
+| Stage   | Skill                    | Input                       | Output                                                           |
+| ------- | ------------------------ | --------------------------- | ---------------------------------------------------------------- |
+| Spec    | `/fw-spec`               | vague feature idea          | spec with held-out, ungameable success criteria: `.flywheel/specs/NNNNN-FEATURE-<name>.md` |
+| Plan    | `/fw-plan`               | spec reference or free text | task JSONs, each spined on a grader: `.flywheel/tasks/active/NN-<phase>/<id>.json` |
+| Verify  | `/fw-verify` (optional)  | planned tasks for a phase   | blind-authored held-out oracles: discrimination proof in `.flywheel/audits/`, throwaway oracle in git-ignored `.flywheel/verification/`, optional `[held_out] root` registration. Runs between plan and execute |
+| Execute | `flywheel worker` daemon | active phase dirs           | landed work (FF-merge into the base, or a PR), lifecycles in the store, archived phase |
+| Retro   | `/fw-retro`              | store + logs for a phase    | cited loop-friction findings: `.flywheel/audits/<phase>.md`     |
+| Improve | `/fw-improve`            | one or more retros          | ranked proposals, each handed to `/fw-spec`, `/fw-plan`, or "accept": `.flywheel/proposals/<phase>.md` |
 
-The loop closes: proposals become specs become phases become audits. Two further commands review the *work* rather than the loop (`/review-phase`, `/arewedone`); they live at user level (`~/.claude/commands/`), not in this repo.
+The loop closes: proposals become specs become phases become retros. The five stages ship as the `fw-*` skills `flywheel init --skills` installs into any repo (flywheel's own included); the old `/define`, `/task`, `/audit-phase`, and `/propose-improvements` slash commands they were promoted from no longer exist. Two further commands review the *work* rather than the loop (`/review-phase`, `/arewedone`); they live at user level (`~/.claude/commands/`), not in this repo.
 
 ### Stage contracts
 
-- **`/define`** is a requirements interview: it asks `AskUserQuestion` rounds until scope, behavior, edge cases, and integration points are unambiguous, then emits a spec with a Decisions Log. It also runs the loop-path trigger check (below) and records the result in the spec.
-- **`/task`** converts a spec into one JSON file per task per `docs/task-schema.md`. Discipline it enforces: one-sentence `goal`, at least one grader, `prerequisites` as the only ordering mechanism, no procedure prescription, a constraint telling the agent to commit before `intent=verify`. It always presents the proposal before writing files.
-- **`/audit-phase`** audits *flywheel*, not the shipped code. Every finding cites a `run_id`, `events.id`, grader row, or log file:line, and stops at diagnosis — proposing fixes is explicitly forbidden. A phase the loop never ran gets a short "nothing to audit" note, not an invented report.
-- **`/propose-improvements`** is the action half: every proposal must trace to a cited audit finding, states an observable outcome (never an implementation), and ends in a handoff. "Accept — do not fix" is a valid proposal. The operator picks what advances via `AskUserQuestion`.
+- **`/fw-spec`** is a requirements interview whose product is justified trust, not a feature description: it asks rationed `AskUserQuestion` rounds until it can author *ungameable* success criteria — each atomic, in EARS condition->response form, grading an observable end-state, and carrying a grader type, a `visible|held-out` flag, a `verify:` line (the exact check), and a `defends against:` line (the cheapest fake it forecloses). A criterion that cannot be lowered to a grader is a blocking defect. It runs a blocking gradeability gate and a verification-surface gate, then emits an immutable spec with a Decisions Log.
+- **`/fw-plan`** compiles each spec criterion into one JSON task per `docs/task-schema.md`, grader first: it writes the strongest reward-hack-resistant grader the worker can run out-of-band before the `goal`. Discipline it enforces: one-sentence `goal` naming an observable behavior change, at least one grader, `prerequisites` as the only ordering mechanism, per-task graders scoped narrow (never the whole-repo gate), `context.relevant` pinned and the grading surface fenced in `context.non_goals`, a constraint telling the agent to commit before verify. It always presents the proposal before writing files.
+- **`/fw-verify`** (optional, between plan and execute) blind-authors a held-out test *oracle* for each held-out behavior criterion, so the agent never writes the test that grades it. It proves the oracle DISCRIMINATES — kills a synthesized plausible-wrong reference and passes a correct one — and records that proof under `.flywheel/audits/`; the throwaway oracle lands only in git-ignored `.flywheel/verification/`, never in the committed tree. A criterion no discriminating oracle can be authored for routes to manual or back upstream to `/fw-spec` as under-specified.
+- **`/fw-retro`** is a forensic audit of *the loop's execution*, not the shipped code. Every finding carries a re-verifiable pointer (a `run_id`, an audit record, a grader receipt, or a transcript line) or is dropped, and it stops at diagnosis — proposing fixes is explicitly forbidden. A phase the loop never ran gets a short "not observed" note, not an invented report.
+- **`/fw-improve`** is the action half: every proposal traces to a cited retro finding, states an observable outcome (never an implementation), is ranked by leverage, and ends in a handoff to `/fw-spec`, `/fw-plan`, or "accept — do not fix". The operator picks what advances via `AskUserQuestion`.
 
 ## Artifact layout
 
@@ -59,14 +61,14 @@ Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` (`
 
 ### The in-loop-verification gate
 
-`archive_completed_phases` diffs the phase against its recorded base (the loop-base ref while active; materialized into the archived dir as a `.loop-base` dotfile) and scans for five watched signals (`flywheel_core/loop_path_marker.py`): a new `Status`/`Outcome`/transition rule, a new schema column or table, a new `Grader` variant, a new store-Protocol method with dispatch, a new control-command verb. If any trips, the phase cannot archive without either a DONE task tagged `in-loop-verification` (a test that drives the real `orchestrate` loop with a scripted invoker) or a committed `loop-path-exempt.md` opt-out. `/define` flags the trigger at spec time, `/task` emits the tagged slot, and `/audit-phase` re-derives the signals after archive to catch slips and contradicted opt-outs.
+`archive_completed_phases` diffs the phase against its recorded base (the loop-base ref while active; materialized into the archived dir as a `.loop-base` dotfile) and scans for five watched signals (`flywheel_core/loop_path_marker.py`): a new `Status`/`Outcome`/transition rule, a new schema column or table, a new `Grader` variant, a new store-Protocol method with dispatch, a new control-command verb. If any trips, the phase cannot archive without either a DONE task tagged `in-loop-verification` (a test that drives the real `orchestrate` loop with a scripted invoker) or a committed `loop-path-exempt.md` opt-out. The gate is enforced mechanically by the archive step (`flywheel_orchestrator/_workflow.py`), not by the authoring skills: the shipped `fw-*` skills are project-agnostic and carry no loop-path logic, so on flywheel's own repo the operator adds the tagged in-loop-verification task or the opt-out by hand.
 
 ## Why it works this way
 
 Each rule exists because an audit caught its absence:
 
-- **Discovery before tasks.** Under-specified tasks are the dominant source of loop waste — the agent burns context discovering what the operator already knew. `/define` forces ambiguity to zero before any task exists; `context.relevant` in task JSONs is the single biggest lever on context burn.
-- **Evidence and action are separate commands.** `/audit-phase` may not propose; `/propose-improvements` may not invent findings. Splitting them prevents audits from padding into feature backlogs and keeps every proposal traceable to a cited row.
+- **Discovery before tasks.** Under-specified tasks are the dominant source of loop waste — the agent burns context discovering what the operator already knew. `/fw-spec` forces ambiguity to zero and authors ungameable criteria before any task exists; `context.relevant` in task JSONs is the single biggest lever on context burn.
+- **Evidence and action are separate skills.** `/fw-retro` may not propose; `/fw-improve` may not invent findings. Splitting them prevents audits from padding into feature backlogs and keeps every proposal traceable to a cited pointer.
 - **The gate exists because unit tests lied.** Phase 08 shipped a schema change whose graders passed while the live store was never migrated; phase 17 built the manual-approval gate without ever producing an `AWAITING_APPROVAL` lifecycle in-loop; phase 19 merged code a stale worker process never executed. The gate makes "the real loop ran the new path" a mechanical archive precondition instead of a hope.
 - **Enumerate dependents of shared invariants.** A task that changes a shape other graders assert against must update those tests in the same commit, or the next task inherits a red suite (phase 02 audit).
 - **One task per file, phases as bare directories.** The worker iterates files; keeping phase semantics out of the schema keeps `Task` tight and ordering explicit.

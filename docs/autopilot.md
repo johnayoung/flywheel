@@ -113,7 +113,7 @@ From the interactive console, `/autopilot start` spawns the neverending autopilo
 - The daemon spawns in its own session (`start_new_session=True`), so console Ctrl+C never reaches it and it **survives console exit**. The next console does not adopt a surviving daemon — autopilot writes no claim lease, so there is no detached-adoption state.
 - `stop` SIGTERMs the child and waits up to 10 seconds; it acts only when this console owns the daemon, otherwise it reports "no supervised autopilot to stop".
 
-For where autopilot sits in the define/task/execute/audit pipeline — it is the unattended intake half — see [workflow.md](workflow.md); for how emitted work lands, see [strategy.md](strategy.md).
+For where autopilot sits in the spec/plan/verify/execute/retro pipeline — it is the unattended intake half — see [workflow.md](workflow.md); for how emitted work lands, see [strategy.md](strategy.md).
 
 ---
 

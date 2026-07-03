@@ -10,6 +10,7 @@ contract suite.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -247,6 +248,120 @@ def test_list_claims_enumerates_held_and_drops_released(
     store.release_claim(a)
     remaining = {(c.task_id, c.worker_id) for c in store.list_claims()}
     assert remaining == {("task-b", "worker-2")}
+
+
+# -- Postgres acquire_claim serialization (H2) ----------------------------
+#
+# On SQLite the conflict-key check-then-upsert is serialized by BEGIN
+# IMMEDIATE's write lock. The Postgres path runs under READ COMMITTED, so
+# without an explicit lock two different task_ids with overlapping conflict
+# keys can both pass the pre-check before either commits. acquire_claim now
+# takes pg_advisory_xact_lock(_CLAIM_ACQUIRE_LOCK_KEY) as the Postgres analog.
+
+
+def _pg_store(dsn: str) -> "PostgresClaimStore":
+    from flywheel_orchestrator import PostgresClaimStore
+
+    return PostgresClaimStore(
+        dsn,
+        schema=f"flywheel_claims_test_{uuid4().hex[:12]}",
+        pool_min=1,
+        pool_max=4,
+    )
+
+
+def test_postgres_acquire_claim_serializes_on_advisory_lock(
+    postgres_dsn: str | None,
+) -> None:
+    """acquire_claim must block while another session holds the shared claim
+    advisory lock -- proof the check-then-upsert is serialized (the fix). On
+    the pre-fix code no lock is taken, so the call would complete immediately
+    and this test would fail at the ``is_alive`` assertion."""
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    import psycopg
+
+    from flywheel_orchestrator._claims_postgres import _CLAIM_ACQUIRE_LOCK_KEY
+
+    store = _pg_store(postgres_dsn)
+    holder = psycopg.connect(postgres_dsn)
+    result: dict[str, object] = {}
+
+    def _acquire() -> None:
+        try:
+            result["claim"] = store.acquire_claim(
+                "task-a", "worker-1", now=_t(0), lease_seconds=30
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via result
+            result["error"] = exc
+
+    try:
+        # Hold the shared acquire lock in a live transaction on a separate
+        # session; the store's acquire path must block on it.
+        with holder.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (_CLAIM_ACQUIRE_LOCK_KEY,)
+            )
+        worker = threading.Thread(target=_acquire)
+        worker.start()
+        worker.join(timeout=1.5)
+        assert worker.is_alive(), (
+            "acquire_claim returned while the advisory lock was held; "
+            "the acquire path is not serialized on Postgres"
+        )
+        # Release the lock; acquire must now complete and succeed.
+        holder.commit()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert "error" not in result, result.get("error")
+        claim = result["claim"]
+        assert claim is not None and getattr(claim, "worker_id") == "worker-1"
+    finally:
+        holder.close()
+        store.close()
+
+
+def test_postgres_two_workers_overlapping_conflict_keys_exactly_one_wins(
+    postgres_dsn: str | None,
+) -> None:
+    """Two concurrent acquisitions on *different* task_ids that share a
+    conflict key must not both succeed. With the acquire path serialized,
+    exactly one wins and the other is refused (returns None)."""
+    if postgres_dsn is None:
+        pytest.skip("Postgres backend skipped: no database reachable")
+    store = _pg_store(postgres_dsn)
+    key = frozenset({"file:shared.py"})
+    start = threading.Barrier(2)
+    results: dict[str, object] = {}
+
+    def _acquire(task_id: str, worker_id: str) -> None:
+        start.wait(timeout=5)
+        try:
+            results[task_id] = store.acquire_claim(
+                task_id, worker_id, now=_t(0), lease_seconds=30,
+                conflict_keys=key,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via results
+            results[task_id] = exc
+
+    try:
+        ta = threading.Thread(target=_acquire, args=("task-x", "worker-1"))
+        tb = threading.Thread(target=_acquire, args=("task-y", "worker-2"))
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+        assert not ta.is_alive() and not tb.is_alive()
+
+        outcomes = [results["task-x"], results["task-y"]]
+        assert all(not isinstance(o, Exception) for o in outcomes), outcomes
+        winners = [o for o in outcomes if o is not None]
+        losers = [o for o in outcomes if o is None]
+        # Exactly one claim survives; the overlapping-key peer is refused.
+        assert len(winners) == 1 and len(losers) == 1
+        assert len(store.list_claims()) == 1
+    finally:
+        store.close()
 
 
 # -- orchestrator_events ledger (spec 00054) ------------------------------

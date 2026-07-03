@@ -56,6 +56,15 @@ if TYPE_CHECKING:
 
 _SCHEMA_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Fixed key serializing every acquire_claim transaction on this store, the
+# Postgres analog of the SQLite claim store's BEGIN IMMEDIATE write lock. Under
+# the default READ COMMITTED isolation the conflict-key SELECT and the row
+# upsert are otherwise a check-then-act race: two different task_ids with
+# overlapping conflict_keys could each pass the pre-check before either commits.
+# 0x666C7977 == "flyw"; fits a signed 32-bit int so the single-arg
+# pg_advisory_xact_lock(bigint) form is unambiguous.
+_CLAIM_ACQUIRE_LOCK_KEY = 0x666C7977
+
 
 def _validate_schema(schema: str) -> str:
     if not isinstance(schema, str) or not _SCHEMA_NAME_RE.match(schema):
@@ -543,6 +552,16 @@ class PostgresClaimStore:
         keys_json = encode_str_set(incoming)
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                # Serialize the conflict-key check-then-upsert against every other
+                # acquire_claim on this store so two different task_ids with
+                # overlapping conflict_keys cannot both pass the pre-check before
+                # committing. Transaction-scoped: released automatically at commit
+                # or rollback. This is the Postgres analog of SQLite BEGIN
+                # IMMEDIATE and is taken unconditionally so an empty-key claim
+                # cannot slip between a keyed claim's check and its upsert.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (_CLAIM_ACQUIRE_LOCK_KEY,)
+                )
                 # Refuse on conflict-key overlap with a *different* live claim.
                 # Run in the same transaction as the upsert; the task's own row
                 # is excluded and lapsed claims do not block, so the refusal

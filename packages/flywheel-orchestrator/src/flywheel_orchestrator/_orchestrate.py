@@ -1822,6 +1822,12 @@ class _ClaimHeartbeat:
         self._interval = interval
         self._now = now
         self._stop = threading.Event()
+        # Set when renewal observes the lease is no longer ours (a peer stole
+        # it after a sustained heartbeat stall). The driving coroutine polls
+        # lost() so it can stop before landing or reporting a run whose claim
+        # was taken over, instead of racing on the lifecycle version CAS.
+        # See _drive_under_lease.
+        self._lost = threading.Event()
         self._lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
@@ -1842,11 +1848,20 @@ class _ClaimHeartbeat:
                     lease_seconds=self._lease_seconds,
                 )
             except ClaimLostError:
+                # Signal the driving coroutine that the lease was stolen so it
+                # stops before writing a terminal result against a stale
+                # version. Ending the thread silently (the prior behavior) left
+                # the run to discover the loss only via the lifecycle CAS race.
+                self._lost.set()
                 return
             except Exception:  # noqa: BLE001 - transient store error; retry
                 continue
             with self._lock:
                 self._claim = renewed
+
+    def lost(self) -> bool:
+        """True once renewal has observed the lease was stolen by a peer."""
+        return self._lost.is_set()
 
     def stop(self) -> TaskClaim:
         """Stop renewing and return the latest token for release."""
@@ -2963,6 +2978,15 @@ async def _drive_under_lease(
                 _landability_gate if landability_probe is not None else None
             ),
         )
+        # A sustained heartbeat stall can let a peer's lease sweep steal this
+        # claim and finalize the lifecycle out from under us while the run was
+        # in flight. If renewal observed that loss, stop here: do NOT land or
+        # report a run whose claim a peer now owns (the peer may already have
+        # recorded its own terminal state). Raising ClaimLostError routes to
+        # _drive_or_relinquish's existing containment deterministically, rather
+        # than relying on the lifecycle version CAS to happen to conflict.
+        if heartbeat.lost():
+            raise ClaimLostError(task_id)
         # Projected once, shared by the consumer submit step and the
         # work-source report. Best-effort: a store hiccup costs the
         # receipts, never the landing or the schedule.

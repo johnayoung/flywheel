@@ -1176,3 +1176,82 @@ def test_heartbeat_renews_the_lease(tmp_path: Path) -> None:
         assert reloaded.version >= 2
     finally:
         store.close()
+
+
+def test_heartbeat_signals_lost_when_lease_stolen(tmp_path: Path) -> None:
+    # H3: renewal against a lease a peer already stole must set lost(), so the
+    # driving coroutine can stop before landing/reporting instead of only
+    # discovering the loss via the lifecycle version CAS race.
+    from datetime import timedelta
+
+    from flywheel_orchestrator._orchestrate import _ClaimHeartbeat
+
+    store = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        start = datetime.now(timezone.utc)
+        claim = store.acquire_claim("t", "w", now=start, lease_seconds=10)
+        assert claim is not None
+        # A peer steals the now-lapsed lease: the row becomes w2/v2, so the
+        # original token no longer matches and renewal raises ClaimLostError.
+        stolen = store.acquire_claim(
+            "t", "w2", now=start + timedelta(seconds=20), lease_seconds=10
+        )
+        assert stolen is not None and stolen.worker_id == "w2"
+
+        heartbeat = _ClaimHeartbeat(
+            claims=store,
+            claim=claim,
+            lease_seconds=10,
+            interval=0.02,
+            now=lambda: start + timedelta(seconds=21),
+        ).start()
+        try:
+            deadline = time.monotonic() + 2.0
+            while not heartbeat.lost() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert heartbeat.lost()
+        finally:
+            heartbeat.stop()
+    finally:
+        store.close()
+
+
+def test_mid_run_claim_loss_relinquishes_without_landing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # H3: if the heartbeat observes the lease was stolen while the run was in
+    # flight, _drive_under_lease must relinquish (raise ClaimLostError ->
+    # contained to None by _drive_or_relinquish) rather than land/report a run
+    # whose claim a peer now owns. Simulate the loss with a heartbeat whose
+    # lost() is always True; the run finalizes but must not be recorded.
+    import flywheel_orchestrator._orchestrate as orch
+
+    class _LostHeartbeat:
+        def __init__(self, *, claims, claim, lease_seconds, interval, now):  # type: ignore[no-untyped-def]
+            self._claim = claim
+
+        def start(self) -> "_LostHeartbeat":
+            return self
+
+        def lost(self) -> bool:
+            return True
+
+        def stop(self):  # type: ignore[no-untyped-def]
+            return self._claim
+
+    monkeypatch.setattr(orch, "_ClaimHeartbeat", _LostHeartbeat)
+
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+
+    # orchestrate returns normally (the worker is not killed) and records no run
+    # for the relinquished task.
+    report = _orchestrate(tmp_path, _always_verify())
+    assert report.runs == ()
+
+    # The stale claim is still released on the way out (finally path).
+    store = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        assert store.load_claim("solo") is None
+    finally:
+        store.close()

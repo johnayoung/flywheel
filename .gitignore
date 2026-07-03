@@ -60,3 +60,6 @@ Thumbs.db
 
 # Serena MCP (symbol retrieval) per-project cache/config/memories
 .serena/
+
+# Playwright
+.playwright*

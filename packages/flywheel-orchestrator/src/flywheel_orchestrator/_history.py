@@ -84,7 +84,10 @@ class HistoryRun:
     reads, so live and history surfaces agree on a run's numbers.
     ``finished_at`` is the terminal transition's timestamp (falling back
     to the row's ``updated_at``); ``started_at`` is the earliest recorded
-    transition.
+    signal — the folded transition stamps and the first attempt's start.
+    (Per-status stamps are overwritten when a retry re-enters a status,
+    so on a retried run only the attempt record still carries the true
+    start.)
     """
 
     run_id: str
@@ -211,20 +214,24 @@ def build_task_phase_index(tasks_dir: Path) -> dict[str, str]:
 
 def _attempt_rollups(
     store: _HistoryReadStore, run_id: str
-) -> tuple[int, int, float, int]:
-    """``(attempts, tokens_total, cost_usd_total, turns_total)`` for a run.
+) -> tuple[int, int, float, int, datetime | None]:
+    """``(attempts, tokens_total, cost_usd_total, turns_total,
+    first_started_at)`` for a run.
 
     Sums the per-attempt rolled-up counters through the backend-agnostic
     ``list_attempts`` seam so the rollup is identical on SQLite and
     Postgres. ``tokens_total`` is the four token columns summed across the
     run's attempts (``Attempt.total_tokens`` per attempt); ``cost`` and
-    ``turns`` are the matching per-attempt sums.
+    ``turns`` are the matching per-attempt sums. ``first_started_at`` is
+    attempt 1's start (``list_attempts`` orders by number), ``None`` when
+    the run recorded no attempts.
     """
     attempts = store.list_attempts(run_id)
     tokens = sum(a.total_tokens for a in attempts)
     cost = sum(a.total_cost_usd for a in attempts)
     turns = sum(a.turns for a in attempts)
-    return (len(attempts), tokens, float(cost), turns)
+    first_started = attempts[0].started_at if attempts else None
+    return (len(attempts), tokens, float(cost), turns, first_started)
 
 
 def _history_run_from_row(
@@ -238,10 +245,17 @@ def _history_run_from_row(
     # run always records its terminal status' stamp, so this resolves in
     # practice; an unstamped row degrades finished_at to None.
     finished = stamps.get(status)
-    started = min(stamps.values()) if stamps else None
-    attempts, tokens, cost, turns = _attempt_rollups(
+    attempts, tokens, cost, turns, first_attempt_started = _attempt_rollups(
         store, lifecycle.run_id
     )
+    # The folded per-status stamps are overwritten when a retry re-enters
+    # a status (READY/RUNNING), so min(stamps) alone reports the *latest*
+    # attempt's start on a retried run. Attempt 1's start is the honest
+    # run start; take the earliest signal available.
+    candidates = list(stamps.values())
+    if first_attempt_started is not None:
+        candidates.append(first_attempt_started)
+    started = min(candidates) if candidates else None
     return HistoryRun(
         run_id=lifecycle.run_id,
         task_id=lifecycle.task_id,

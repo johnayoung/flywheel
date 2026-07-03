@@ -216,6 +216,53 @@ def test_history_rolls_up_attempt_totals() -> None:
     assert row.latest.started_at < row.latest.finished_at
 
 
+def test_history_started_at_survives_retry_stamp_overwrite() -> None:
+    """A retried run re-enters READY/RUNNING/VALIDATING, overwriting
+    those folded per-status stamps; ``started_at`` must still report the
+    run's true start (attempt 1's start), not the retry's."""
+    store = SqliteStore(":memory:")
+    lc = Lifecycle(task_id="t-retry", run_id="run-retry")
+    lc.transition_to(Status.READY, now=_T0)
+    lc.transition_to(Status.RUNNING, now=_T0 + timedelta(seconds=1))
+    lc.transition_to(Status.VALIDATING, now=_T0 + timedelta(minutes=18))
+    lc.transition_to(
+        Status.FAILED_VALIDATION,
+        error="protocol failure",
+        now=_T0 + timedelta(minutes=19),
+    )
+    # The retry: every pre-retry stamp except FAILED_VALIDATION is
+    # overwritten, so min(stamps) alone would report minute 19.
+    lc.transition_to(Status.READY, now=_T0 + timedelta(minutes=20))
+    lc.transition_to(Status.RUNNING, now=_T0 + timedelta(minutes=21))
+    lc.transition_to(Status.VALIDATING, now=_T0 + timedelta(minutes=29))
+    lc.transition_to(Status.DONE, now=_T0 + timedelta(minutes=30))
+    store.create_lifecycle(lc)
+    store.save_attempt(
+        "run-retry",
+        Attempt(
+            number=1,
+            run_id="run-retry",
+            started_at=_T0 + timedelta(seconds=1),
+            ended_at=_T0 + timedelta(minutes=19),
+            outcome=Outcome.AGENT_ERROR,
+        ),
+    )
+    store.save_attempt(
+        "run-retry",
+        Attempt(
+            number=2,
+            run_id="run-retry",
+            started_at=_T0 + timedelta(minutes=21),
+            ended_at=_T0 + timedelta(minutes=30),
+            outcome=Outcome.SUCCEEDED,
+        ),
+    )
+
+    (row,) = collect_history_rows(store)
+    assert row.latest.started_at == _T0 + timedelta(seconds=1)
+    assert row.latest.finished_at == _T0 + timedelta(minutes=30)
+
+
 # --- build_task_phase_index --------------------------------------------------
 
 

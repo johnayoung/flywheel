@@ -843,6 +843,22 @@ def test_cli_json_mode_emits_ndjson_with_full_payload(
     ]
 
 
+def test_cli_missing_store_fails_fast_without_creating_it(
+    tmp_path: Path,
+) -> None:
+    """A nonexistent ``--db`` path is an operator error: exit 2 with a
+    clear stderr line, and the file must NOT be created as a side effect
+    (SqliteStore would otherwise bootstrap an empty database and the
+    unknown-run_id branch would report a false "no records")."""
+    db = tmp_path / "nowhere" / "flywheel.sqlite"
+
+    code, stdout, stderr = _run_cli("run-x", "--db", str(db))
+    assert code == 2
+    assert stdout == ""
+    assert f"no store at {db}" in stderr
+    assert not db.exists()
+
+
 def test_cli_unknown_run_id_prints_empty_state_message_and_exits_zero(
     tmp_path: Path,
 ) -> None:

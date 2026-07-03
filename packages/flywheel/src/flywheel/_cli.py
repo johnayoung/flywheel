@@ -30,6 +30,11 @@ from collections.abc import Sequence
 
 from flywheel_core.audit._cli import main as _audit_main
 from flywheel_core.workflow import main as _core_main
+from flywheel_orchestrator import (
+    PolicyError,
+    load_effective_policy,
+    resolve_db_path,
+)
 from flywheel_orchestrator._autopilot_run import main as _autopilot_main
 from flywheel_orchestrator._workflow import main as _orchestrator_main
 from flywheel_worktree.worker import main as _worker_main
@@ -102,6 +107,29 @@ that verb's specific flags.
 """
 
 
+def _delegate_audit(rest: list[str]) -> int:
+    """Forward ``audit`` to core's CLI with the product's db resolution.
+
+    Core's audit plumbing defaults ``--db`` to ``$FLYWHEEL_DB`` or
+    ``./flywheel.db``; every sibling verb resolves the store as ``--db``
+    > policy ``[paths] db`` > ``.flywheel/flywheel.sqlite``. Inject the
+    resolved path when the operator did not pass ``--db`` so ``fw audit``
+    reads the same store ``fw history`` / ``fw show`` do. An explicit
+    ``--db`` (or a bare ``--help``) forwards untouched.
+    """
+    if any(a == "--db" or a.startswith("--db=") for a in rest) or any(
+        a in ("-h", "--help") for a in rest
+    ):
+        return _audit_main(rest)
+    try:
+        policy = load_effective_policy(None)
+    except PolicyError as exc:
+        print(f"{_PROG}: policy error: {exc}", file=sys.stderr)
+        return 2
+    db_path = resolve_db_path(None, policy=policy)
+    return _audit_main(["--db", str(db_path), *rest])
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Route ``flywheel <verb> ...`` (or ``fw <verb> ...``) to the
     pre-existing implementation.
@@ -148,7 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # --once runs a single refill pass.
         return _autopilot_main(rest)
     if verb == _AUDIT_VERB:
-        return _audit_main(rest)
+        return _delegate_audit(rest)
 
     print(f"{_PROG}: unknown command: {verb}", file=sys.stderr)
     print(f"  see '{_PROG} --help' for the verb list", file=sys.stderr)

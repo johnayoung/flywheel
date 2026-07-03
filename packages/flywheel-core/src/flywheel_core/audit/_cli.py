@@ -683,6 +683,18 @@ def main(
             return 2
 
     db_path = _resolve_db(args.db)
+    # A nonexistent store file is an operator error, not an empty result:
+    # opening it would silently bootstrap an empty database (sqlite
+    # creates the file on connect) and the unknown-run_id branch below
+    # would then report a false "no records" for a run that exists in
+    # the real store.
+    if not db_path.exists():
+        print(
+            f"error: no store at {db_path} (pass --db or set "
+            "$FLYWHEEL_DB)",
+            file=err,
+        )
+        return 2
     store = SqliteStore(db_path)
     try:
         # Spec error-handling table: unknown run_id yields nothing and

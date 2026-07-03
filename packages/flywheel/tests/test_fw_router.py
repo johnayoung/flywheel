@@ -370,6 +370,52 @@ def test_fw_audit_unknown_run_exits_zero_with_stderr_notice(
     assert "no records for run_id run-ghost" in err
 
 
+def test_fw_audit_resolves_db_from_policy_when_flag_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without ``--db``, ``fw audit`` resolves the store like every
+    sibling verb (policy ``[paths] db``, else the ``.flywheel`` default)
+    instead of core's bare ``./flywheel.db`` plumbing default."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FLYWHEEL_DB", raising=False)
+    db = tmp_path / "custom" / "store.sqlite"
+    db.parent.mkdir()
+    SqliteStore(db).close()
+    (tmp_path / "flywheel.toml").write_text(
+        '[source]\nkind = "directory"\n'
+        '[paths]\ndb = "custom/store.sqlite"\n',
+        encoding="utf-8",
+    )
+
+    rc = main(["audit", "run-ghost"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    # The policy-resolved store was opened (unknown-run notice), and the
+    # core default path was neither consulted nor created.
+    assert "no records for run_id run-ghost" in err
+    assert not (tmp_path / "flywheel.db").exists()
+
+
+def test_fw_audit_missing_store_exits_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With no policy and no store on disk, ``fw audit`` fails fast with
+    the core CLI's missing-store error instead of bootstrapping an empty
+    database and reporting a false "no records"."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FLYWHEEL_DB", raising=False)
+
+    rc = main(["audit", "run-ghost"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "no store at" in err
+    assert not (tmp_path / "flywheel.db").exists()
+
+
 def test_fw_worker_help_exits_zero(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

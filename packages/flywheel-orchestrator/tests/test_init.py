@@ -143,6 +143,39 @@ def test_init_scaffolds_flywheel_dir_and_policy(repo: Path, capsys) -> None:
     assert "Next steps:" in out
 
 
+def test_init_appends_dockerignore_when_dockerfile_present(
+    repo: Path, capsys
+) -> None:
+    """Docker ignores .gitignore, so a repo that builds images with
+    ``COPY . .`` would ship every nested worktree's setup artifacts into
+    the build context; init closes that hole when a Dockerfile is there."""
+    (repo / "Dockerfile").write_text("FROM scratch\nCOPY . /app\n")
+    assert main(["init"]) == 0
+    assert ".flywheel/" in (repo / ".dockerignore").read_text()
+    assert "updated: .dockerignore" in capsys.readouterr().out
+
+
+def test_init_dockerignore_idempotent_and_appends_to_existing(
+    repo: Path,
+) -> None:
+    (repo / "Dockerfile").write_text("FROM scratch\n")
+    (repo / ".dockerignore").write_text("node_modules\n")
+    assert main(["init"]) == 0
+    text = (repo / ".dockerignore").read_text()
+    assert text.startswith("node_modules\n")
+    assert text.count(".flywheel/") == 1
+    # A re-run never duplicates the entry.
+    assert main(["init"]) == 0
+    assert (repo / ".dockerignore").read_text() == text
+
+
+def test_init_writes_no_dockerignore_without_dockerfile(repo: Path) -> None:
+    """No Dockerfile means no docker build context to protect: init must
+    not invent a .dockerignore the repo never asked for."""
+    assert main(["init"]) == 0
+    assert not (repo / ".dockerignore").exists()
+
+
 def test_init_policy_is_loadable_and_points_into_flywheel_dir(
     repo: Path,
 ) -> None:
@@ -152,7 +185,7 @@ def test_init_policy_is_loadable_and_points_into_flywheel_dir(
     assert policy.source_kind == "directory"
     assert policy.tasks_dir == Path(".flywheel/tasks")
     assert policy.db_path == Path(".flywheel/flywheel.sqlite")
-    assert policy.sandbox_root == Path(".flywheel/sandboxes")
+    assert policy.sandbox_root == Path(".flywheel/worktrees")
     # The scaffolded [agent] block is commented out by default, so model
     # stays unset; the worker falls back to its CLI / built-in default.
     assert policy.model is None

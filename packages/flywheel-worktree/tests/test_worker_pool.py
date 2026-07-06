@@ -297,6 +297,7 @@ def _full_args(**overrides: object) -> argparse.Namespace:
         "reconcile_seconds": 15.0,
         "tasks_dir": None,
         "db": None,
+        "sandbox_root": None,
         "once": False,
     }
     base.update(overrides)
@@ -322,6 +323,7 @@ def test_pool_member_argv_forwards_run_knobs() -> None:
         run_log_retention=42,
         tasks_dir="/tmp/tasks",
         db="/tmp/db.sqlite",
+        sandbox_root="@cache",
         once=True,
     )
     argv = worker._pool_member_argv(args, "fleet-0", model="sonnet")
@@ -331,6 +333,7 @@ def test_pool_member_argv_forwards_run_knobs() -> None:
     assert argv[argv.index("--run-log-retention") + 1] == "42"
     assert argv[argv.index("--tasks-dir") + 1] == "/tmp/tasks"
     assert argv[argv.index("--db") + 1] == "/tmp/db.sqlite"
+    assert argv[argv.index("--sandbox-root") + 1] == "@cache"
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert "--once" in argv
 
@@ -339,6 +342,7 @@ def test_pool_member_argv_omits_optional_flags_when_unset() -> None:
     argv = worker._pool_member_argv(_full_args(), "fleet-0", model=None)
     assert "--tasks-dir" not in argv
     assert "--db" not in argv
+    assert "--sandbox-root" not in argv
     assert "--model" not in argv
     assert "--once" not in argv
 

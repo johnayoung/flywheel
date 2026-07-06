@@ -32,7 +32,7 @@ Structural corruption raises `WorkGraphValidationError` (`_work_graph.py:64`) wi
 3. every **declared** prerequisite resolves to a node whose state is `done` — a dangling prerequisite fails this gate;
 4. its `required_capabilities` is a subset of `worker_capabilities`.
 
-Results are ordered by **descending `priority`**, ties broken by construction/walk order via a stable sort (`_work_graph.py:308`); an all-default (priority 0) set is byte-identical to pure walk order. The loop takes `ready[0]` (`_orchestrate.py:1050`). The `select_next_task` CLI path (`_workflow.py:296`, used by `flywheel next`) applies the identical predicates but returns only the single highest-priority match.
+Results are ordered by **descending `priority`**, ties broken by construction/walk order via a stable sort (`_work_graph.py:308`); an all-default (priority 0) set is byte-identical to pure walk order. The loop takes `ready[0]` (`_orchestrate.py:1050`). The `select_next_task` CLI path (`_workflow.py:302`, used by `flywheel next`) applies the identical predicates but returns only the single highest-priority match.
 
 An excluded id drops from candidacy but still satisfies a dependent's prerequisite — exclusion is a "skip this one now," not a "treat it as undone."
 
@@ -51,7 +51,7 @@ Two scheduling dimensions ride on each task, both read off the `WorkItem`:
 
 For a directory source, both are read from the task file's top-level JSON keys (`priority`, `required_capabilities`, `conflict_keys`) by `DirectoryWorkSource`; GitHub-derived sources do not yet populate them. A task with empty `required_capabilities` runs on any worker, including a worker advertising no capabilities.
 
-The worker's advertised set is `WorkPolicy.execution_capabilities`, configured under `[execution] capabilities` in `flywheel.toml` (`_policy.py:389`), defaulting to empty. **`[execution] capabilities` (worker work-classes) is distinct from `[sandbox.capabilities]` (agent tools/skills/MCP)** — see [configuration.md](configuration.md). Priority and capability filtering apply in both execution modes.
+The worker's advertised set is `WorkPolicy.execution_capabilities`, configured under `[execution] capabilities` in `flywheel.toml` (`_policy.py:458`), defaulting to empty. **`[execution] capabilities` (worker work-classes) is distinct from `[sandbox.capabilities]` (agent tools/skills/MCP)** — see [configuration.md](configuration.md). Priority and capability filtering apply in both execution modes.
 
 ## Claims and leases (multi-worker mutual exclusion)
 
@@ -147,6 +147,6 @@ The rollup is phase-grouped (file-backed rows group under their phase directory;
 
 ## Distributed mode
 
-`[execution] mode` defaults to `local`; setting it to `distributed` requires `[store] backend = "postgres"` or `load_policy` fails fast with a `PolicyError` (`_policy.py:460`). SQLite corrupts under multi-host contention, so distributed runs must use the Postgres backend. See [configuration.md](configuration.md) for the `[execution]` and `[store]` tables.
+`[execution] mode` defaults to `local`; setting it to `distributed` requires `[store] backend = "postgres"` or `load_policy` fails fast with a `PolicyError` (`_policy.py:531`). SQLite corrupts under multi-host contention, so distributed runs must use the Postgres backend. See [configuration.md](configuration.md) for the `[execution]` and `[store]` tables.
 
 **Scheduling, claims, and leases are always on, regardless of `[execution] mode`.** Today `execution_mode` is a pure load-time assertion — it gates no runtime behavior. Per-task leases, priority/capability selection, the WorkGraph, and both ledgers run identically in `local` and `distributed`; `mode = "distributed"` only forces the Postgres backend at load time. Distributed coordination across hosts is what the Postgres claim store provides; the mode flag is the assertion that you are using it.

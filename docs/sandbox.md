@@ -29,7 +29,7 @@ Landing (aspect 4) is owned by `[submit]`, not `[sandbox.*]`. Provisioning (aspe
 
 ## Presets
 
-Three code-owned presets (`flywheel_orchestrator._policy._SANDBOX_PRESETS`, `_policy.py:301`). A preset is the *baseline*; sparse per-key overrides merge on top.
+Three code-owned presets (`flywheel_orchestrator._policy._SANDBOX_PRESETS`, `_policy.py:359`). A preset is the *baseline*; sparse per-key overrides merge on top.
 
 | Preset | Restricts | vs `fast` |
 | --- | --- | --- |
@@ -52,7 +52,7 @@ Resolution follows build -> release -> run (`_optional_sandbox_policy`, `_policy
 
 **List-replace, never append.** A declared list (`allow_hosts`, `allowed_tools`, ...) *replaces* the preset's list wholesale; it does not extend it.
 
-**`backend = "container"` requires `[sandbox.container] image`** — omitting it raises `PolicyError` at load (`_policy.py:1305`).
+**`backend = "container"` requires `[sandbox.container] image`** — omitting it raises `PolicyError` at load (`_policy.py:1552`).
 
 ## `[sandbox]` (top-level)
 
@@ -65,7 +65,7 @@ Resolution follows build -> release -> run (`_optional_sandbox_policy`, `_policy
 
 ### `[sandbox.exec]`
 
-Bash command isolation, mapped to the SDK `ClaudeAgentOptions.sandbox` (`SandboxExec`, `_policy.py:163`).
+Bash command isolation, mapped to the SDK `ClaudeAgentOptions.sandbox` (`SandboxExec`, `_policy.py:181`).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -74,7 +74,7 @@ Bash command isolation, mapped to the SDK `ClaudeAgentOptions.sandbox` (`Sandbox
 
 ### `[sandbox.capabilities]` and `[sandbox.capabilities.mcp]`
 
-The skills/tools/MCP surface (`SandboxCapabilities`, `_policy.py:174`).
+The skills/tools/MCP surface (`SandboxCapabilities`, `_policy.py:193`).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -89,7 +89,7 @@ The skills/tools/MCP surface (`SandboxCapabilities`, `_policy.py:174`).
 
 ### `[sandbox.network]`
 
-Network policy (`SandboxNetwork`, `_policy.py:191`).
+Network policy (`SandboxNetwork`, `_policy.py:211`).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -101,7 +101,7 @@ Network policy (`SandboxNetwork`, `_policy.py:191`).
 
 ### `[sandbox.env]`
 
-Credential/secret name allowlist — the declaration half. Values live in the operator environment, never the policy file (`SandboxEnv`, `_policy.py:204`).
+Credential/secret name allowlist — the declaration half. Values live in the operator environment, never the policy file (`SandboxEnv`, `_policy.py:224`).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -113,7 +113,7 @@ Credential/secret name allowlist — the declaration half. Values live in the op
 
 ### `[sandbox.limits]`
 
-Resource/budget ceilings (`SandboxLimits`, `_policy.py:219`).
+Resource/budget ceilings (`SandboxLimits`, `_policy.py:275`).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -128,7 +128,7 @@ Resource/budget ceilings (`SandboxLimits`, `_policy.py:219`).
 
 ### `[sandbox.retention]`
 
-Teardown/disposal policy (`SandboxRetention`, `_policy.py:235`). Threaded through the worktree submitter.
+Teardown/disposal policy (`SandboxRetention`, `_policy.py:293`). Threaded through the worktree submitter.
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |
@@ -140,7 +140,7 @@ Teardown/disposal policy (`SandboxRetention`, `_policy.py:235`). Threaded throug
 
 ### `[sandbox.container]`
 
-Container backend config (`SandboxContainer`, `_policy.py:248`). Inert unless `backend = "container"`. Full operator quickstart in [container-backend.md](container-backend.md).
+Container backend config (`SandboxContainer`, `_policy.py:307`). Inert unless `backend = "container"`. Full operator quickstart in [container-backend.md](container-backend.md).
 
 | Key | Type | Default | Controls | Enforced where |
 | --- | --- | --- | --- | --- |

@@ -179,3 +179,58 @@ def test_cadence_recurs(tmp_path: Path) -> None:
     assert not _branch_exists(repo, "flywheel/_root/aging")
     assert survivor.exists()  # within-window worktree survived every tick
     assert _branch_exists(repo, "flywheel/_root/survivor")
+
+
+def test_retention_targets_single_when_root_is_the_legacy_default(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    worktrees_dir = _worktrees_dir(repo)  # the legacy .flywheel/worktrees
+    assert worker.retention_targets(repo, worktrees_dir) == (worktrees_dir,)
+
+
+def test_retention_targets_include_populated_legacy_location(
+    tmp_path: Path,
+) -> None:
+    """A repo whose ``sandbox_root`` moved off ``.flywheel/worktrees`` still
+    sweeps the legacy dir while it exists -- worktrees created before the
+    knob became live on this path must keep aging out, not strand."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    legacy = _worktrees_dir(repo)
+    relocated = tmp_path / "elsewhere" / "worktrees"
+    relocated.mkdir(parents=True)
+    assert worker.retention_targets(repo, relocated) == (relocated, legacy)
+
+
+def test_retention_targets_skip_absent_legacy_location(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    relocated = tmp_path / "elsewhere" / "worktrees"
+    relocated.mkdir(parents=True)
+    assert worker.retention_targets(repo, relocated) == (relocated,)
+
+
+def test_sweep_reclaims_aged_legacy_worktree_after_relocation(
+    tmp_path: Path,
+) -> None:
+    """End to end: with the root relocated, one pass over the retention
+    targets reclaims an aged worktree parked at the legacy location."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    legacy = _worktrees_dir(repo)
+    relocated = tmp_path / "elsewhere" / "worktrees"
+    relocated.mkdir(parents=True)
+    stranded = _add_worktree(repo, legacy, "stranded")
+
+    now = 1_000_000_000.0
+    _set_mtime(stranded, now - (WINDOW + DAY))
+
+    for target in worker.retention_targets(repo, relocated):
+        worker.retention_cadence_tick(
+            repo, target, RETENTION_DAYS, lambda _m: None, now=lambda: now
+        )
+
+    assert not stranded.exists()
+    assert not _branch_exists(repo, "flywheel/_root/stranded")

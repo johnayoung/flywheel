@@ -83,9 +83,9 @@ The gate is config-only — there is no CLI verb or flag. It activates when `fly
 root = ".flywheel/verification/held-out"
 ```
 
-**There is deliberately no default root.** A default would silently activate gating on upgrade (spec 00051 #2). When `[held_out] root` is absent, `WorkPolicy.held_out_root` is `None` (`_policy.py:397`) and the gate runs for no task. A typo never leaves the gate silently inert: a non-string or empty value raises `PolicyError` (`_policy.py:871-892`).
+**There is deliberately no default root.** A default would silently activate gating on upgrade (spec 00051 #2). When `[held_out] root` is absent, `WorkPolicy.held_out_root` is `None` (`_policy.py:468`) and the gate runs for no task. A typo never leaves the gate silently inert: a non-string or empty value raises `PolicyError` (`_policy.py:1116-1138`).
 
-The worker resolves the root via `build_held_out_source(policy, repo_root)` (`worker.py:1358`): a relative root resolves against the repo root (`<repo_root>/<root>`, independent of the worker's cwd or any sandbox path); an absolute root is honored as written. When a source is built, `flywheel worker` logs `held-out gate active root=<...>` on startup and forwards the source into every `run_once(...)`. See [configuration.md](configuration.md) and [cli.md](cli.md).
+The worker resolves the root via `build_held_out_source(policy, repo_root)` (`worker.py:2221`): a relative root resolves against the repo root (`<repo_root>/<root>`, independent of the worker's cwd or any sandbox path); an absolute root is honored as written. When a source is built, `flywheel worker` logs `held-out gate active root=<...>` on startup and forwards the source into every `run_once(...)`. See [configuration.md](configuration.md) and [cli.md](cli.md).
 
 This repo's committed config sets `root = ".flywheel/verification/held-out"`, so the gate is live here.
 

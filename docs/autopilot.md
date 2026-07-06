@@ -65,7 +65,7 @@ Flag precedence is CLI flag > policy > code default (`_resolve_runtime`, `_autop
 
 ## Configuration
 
-The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `WorkPolicy` (`_policy.py:895`). A malformed value raises `PolicyError` so a typo never silently degrades autopilot. See [configuration.md](configuration.md).
+The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `WorkPolicy` (`_policy.py:1140`). A malformed value raises `PolicyError` so a typo never silently degrades autopilot. See [configuration.md](configuration.md).
 
 ```toml
 [autopilot]

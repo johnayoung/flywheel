@@ -2,13 +2,13 @@
 
 A single `flywheel.toml` at the repo root is the consumer repo's versioned contract with the orchestrator: where work comes from, what "runnable" means by default, and how finished work lands. Switching a project between a task directory and an issue tracker is a committed config change, not a flywheel code change.
 
-One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (`_policy.py:405`) parses the file with stdlib `tomllib` into a frozen `WorkPolicy` (`_policy.py:324`). Every key is validated there, every default lives there.
+One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (`_policy.py:476`) parses the file with stdlib `tomllib` into a frozen `WorkPolicy` (`_policy.py:383`). Every key is validated there, every default lives there.
 
 ## Precedence and validation
 
-- **Precedence**: an explicit CLI flag wins over the file, the file wins over the built-in default. The read commands (`status`, `live`, `worker`, `autopilot`, ...) auto-detect `flywheel.toml` in the cwd (`_workflow.py:783`); `--policy` overrides the path, and an explicit `--tasks-dir`/`--db`/`--sandbox-root`/`--model` always beats the file.
+- **Precedence**: an explicit CLI flag wins over the file, the file wins over the built-in default. The read commands (`status`, `live`, `worker`, `autopilot`, ...) auto-detect `flywheel.toml` in the cwd (`_workflow.py:798`); `--policy` overrides the path, and an explicit `--tasks-dir`/`--db`/`--sandbox-root`/`--model` always beats the file.
 - **Strict on values, lenient on keys**: a wrong-typed or out-of-enum value fails fast with a `PolicyError` that names the offending file and key — a typo never silently degrades behavior. Unknown *keys* under a known table, and unknown *section* tables, are ignored for forward-compatibility (`_optional_*` helpers).
-- **`[source]` is the only required table.** Its absence raises `PolicyError` "missing required `[source]` table" (`_policy.py:417`). Every other section is optional; an absent section yields a back-compat default so a pre-existing file keeps loading unchanged.
+- **`[source]` is the only required table.** Its absence raises `PolicyError` "missing required `[source]` table" (`_policy.py:489`). Every other section is optional; an absent section yields a back-compat default so a pre-existing file keeps loading unchanged.
 - **Credentials and DSNs never live in the file.** Postgres DSNs, API tokens, and OAuth tokens are read from named environment variables only (see [Environment variables](#environment-variables)). Config carries env var *names*, never values.
 
 ## Sections at a glance
@@ -66,18 +66,23 @@ Where work comes from. `kind` selects the `WorkSource` backend; the remaining ke
 | `done_action` | enum `comment`/`close` | `comment` | `github` | post the outcome as a comment, or close the issue |
 | `failure_filter` | str | `failure` | `github_ci` | `gh run --status` filter for which CI runs become work |
 
-`github_review` lists unresolved PR review threads; its grade is the policy's `[[defaults.graders]]` run out-of-band, never the thread's `isResolved` state (`_policy.py:1352`).
+`github_review` lists unresolved PR review threads; its grade is the policy's `[[defaults.graders]]` run out-of-band, never the thread's `isResolved` state (`_policy.py:1644`).
 
 ## `[paths]` (optional)
 
-Where runtime state lives. When a key is unset the CLI falls back to its built-in default (`_policy.py:653`).
+Where runtime state lives. When a key is unset the CLI falls back to its built-in default (`_policy.py:392`).
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `db` | path | `.flywheel/flywheel.sqlite` | SQLite store location |
-| `sandbox_root` | path | `.flywheel/worktrees` | root under which each task's worktree/sandbox is created |
+| `sandbox_root` | path or token | `.flywheel/worktrees` | root under which each task's worktree/sandbox is created |
 
-Any non-empty string is accepted. Note: the `init`-rendered template and the `_policy.py` docstring example write `.flywheel/sandboxes` for `sandbox_root` while the committed repo file uses `.flywheel/worktrees` — the difference is cosmetic.
+`sandbox_root` resolution (`resolve_sandbox_root`, `_policy.py:755`): a relative path anchors at the repo root (never the process cwd); an absolute path is used verbatim; two tokens opt into out-of-tree layouts:
+
+- `@cache` — `<cache-base>/flywheel/<repo-name>-<id>/worktrees`, where `<cache-base>` is the first writable of `$XDG_CACHE_HOME`, `~/.cache`, and the platform tmpdir, and `<id>` keys the repo by the realpath of its git common dir (clones never collide; a linked worktree maps to its main repo).
+- `@sibling` — `<repo-parent>/<repo-name>.worktrees`; refused at startup (`PolicyError`) when the parent directory is read-only (CI mounts).
+
+Both `flywheel worker` and `flywheel orchestrate` honor the key; `--sandbox-root` overrides it. When the resolved root differs from the legacy `.flywheel/worktrees`, the worker's retention sweep also covers the legacy directory while it exists, so worktrees created before a relocation still age out. An out-of-tree root stays out of docker build contexts by construction; for the default nested root, `flywheel init` appends `.flywheel/` to `.dockerignore` when a Dockerfile is present (docker does not read `.gitignore`).
 
 ## `[agent]` (optional)
 
@@ -85,11 +90,11 @@ Any non-empty string is accepted. Note: the `init`-rendered template and the `_p
 |-----|------|---------|----------|
 | `model` | str (opaque) | unset | the model id passed verbatim to the SDK |
 
-The value is opaque: flywheel maintains no allowlist. Model resolution precedence is `--model` flag > `[agent] model` > SDK/Claude Code default (`worker.py:1238`). An empty or whitespace-only string raises `PolicyError`.
+The value is opaque: flywheel maintains no allowlist. Model resolution precedence is `--model` flag > `[agent] model` > SDK/Claude Code default (`worker.py:2060`). An empty or whitespace-only string raises `PolicyError`.
 
 ## `[[defaults.graders]]` (optional)
 
-Default grader policy, parsed as the standard `Grader` array via `flywheel_core.loaders.load_graders` (`_policy.py:426`). See [task-schema.md](task-schema.md) for the `Grader` shape.
+Default grader policy, parsed as the standard `Grader` array via `flywheel_core.loaders.load_graders` (`_policy.py:502`). See [task-schema.md](task-schema.md) for the `Grader` shape.
 
 **Meaningful only for tracker sources** (`github`/`github_ci`/`github_review`): applied to a work item that declares no graders of its own. Directory task files always carry their own graders (the schema requires at least one), so the default is inert for `directory`. A tracker item with no graders and no default policy is not runnable and never reaches the scheduler.
 
@@ -101,7 +106,7 @@ run = "uv run pytest"
 
 ## `[store]` (optional)
 
-Persistence backend. An absent section means `sqlite` (`_policy.py:688`).
+Persistence backend. An absent section means `sqlite` (`_policy.py:888`).
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
@@ -119,7 +124,7 @@ Distribution and capability matching. See [orchestration.md](orchestration.md).
 | `mode` | enum `local`/`distributed` | `local` | distribution posture |
 | `capabilities` | list of str | `[]` | this worker's advertised capability set |
 
-**`mode = "distributed"` requires `store.backend = "postgres"` or `load_policy` raises** (`_policy.py:460`). That postgres requirement is `mode`'s *only* runtime effect: `execution_mode` is a pure load-time validation assertion (`_policy.py:348`) — it is never read by any scheduler/claim/lease code path, so it does not itself change how work is scheduled, claimed, or leased. `capabilities` is the *worker's* advertised set: the scheduler offers this worker only items whose `required_capabilities` is a subset of it. This is distinct from `[sandbox.capabilities]`, which is the *agent's* tool/skill/MCP surface inside the sandbox.
+**`mode = "distributed"` requires `store.backend = "postgres"` or `load_policy` raises** (`_policy.py:531`). That postgres requirement is `mode`'s *only* runtime effect: `execution_mode` is a pure load-time validation assertion (`_policy.py:408`) — it is never read by any scheduler/claim/lease code path, so it does not itself change how work is scheduled, claimed, or leased. `capabilities` is the *worker's* advertised set: the scheduler offers this worker only items whose `required_capabilities` is a subset of it. This is distinct from `[sandbox.capabilities]`, which is the *agent's* tool/skill/MCP surface inside the sandbox.
 
 ## `[worker]` (optional)
 
@@ -144,7 +149,7 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 | `base` | str | unset (checked-out branch) | explicit landing/phase-base branch |
 | `verify` | str (shell) | unset (no gate) | standing build invariant re-run under the merge lock against the exact tree about to become the base, on every land path; a non-zero exit refuses landing and parks the work (`park_kind="standing-verify"`) |
 
-`protected_paths` is honored by both strategies (`worker.py:598`); it protects the verification surface — grader configs, CI, harness state — from being rewritten by the work it judges.
+`protected_paths` is honored by both strategies (`worker.py:772`); it protects the verification surface — grader configs, CI, harness state — from being rewritten by the work it judges.
 
 `verify` is the "trunk must always build" gate (spec 00064): repo-wide and independent of the task's own (often crate-scoped) command graders, it catches a *semantic merge skew* where two independently-valid changes union into a tree that does not build. It runs serialized under the merge lock — a slow command bottlenecks landings — and inherits the resolved `[sandbox.env]`. Example: `verify = "cargo build --workspace --tests"` or `verify = "uv run pytest"`.
 
@@ -154,7 +159,7 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 |-----|------|---------|----------|
 | `verify` | str (shell) | unset (no gate) | command run against the merged phase base once every task in a phase has landed; a non-zero exit leaves the phase active |
 
-Consumed at `worker.py:833`. Unset means today's archival behavior with no gate.
+Consumed at `worker.py:1087`. Unset means today's archival behavior with no gate.
 
 ## `[held_out]` (optional)
 
@@ -164,7 +169,7 @@ Execute-time held-out landing gate. See [held-out-gate.md](held-out-gate.md).
 |-----|------|---------|----------|
 | `root` | path | unset (no gate) | directory of operator-declared held-out grader registrations (one `<task_id>.json` per gated task) the gate reads |
 
-**There is deliberately no default `root`.** Unset means the worker builds no held-out source and landing is byte-identical to today (`_policy.py:885`); a default would silently activate gating on upgrade. A relative `root` resolves against the repo root (`worker.py:1376`).
+**There is deliberately no default `root`.** Unset means the worker builds no held-out source and landing is byte-identical to today (`_policy.py:1116`); a default would silently activate gating on upgrade. A relative `root` resolves against the repo root (`worker.py:2241`).
 
 ## `[autopilot]` and `[autopilot.weights]` (optional)
 
@@ -200,7 +205,7 @@ The `[sandbox]` table configures provisioning and the agent's execution environm
 | `backend` | enum `worktree`/`container` | `worktree` | execution backend; `container` lazy-wraps the submit strategy |
 | `permission_mode` | str | `bypassPermissions` | SDK permission mode |
 
-`setup` is consumed at `worker.py:1414`; `backend` selects the container wrap in `maybe_wrap_for_backend` (`worker.py:1303`). Several subtable behaviors are enforced only under `backend = "container"` — see [sandbox.md](sandbox.md) for which.
+`setup` is consumed at `worker.py:2394`; `backend` selects the container wrap in `maybe_wrap_for_backend` (`worker.py:2166`). Several subtable behaviors are enforced only under `backend = "container"` — see [sandbox.md](sandbox.md) for which.
 
 ## Environment variables
 
@@ -215,7 +220,7 @@ Secrets and connection strings live in the environment, never in `flywheel.toml`
 
 ## What `flywheel init` scaffolds
 
-`flywheel init` writes only a thin subset of the surface (`_render_init_policy`, `_workflow.py:2043`). It is idempotent and never overwrites a non-managed file. See [cli.md](cli.md) for the full init flag list.
+`flywheel init` writes only a thin subset of the surface (`_render_init_policy`, `_workflow.py:2302`). It is idempotent and never overwrites a non-managed file. See [cli.md](cli.md) for the full init flag list.
 
 Rendered:
 

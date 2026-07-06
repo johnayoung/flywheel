@@ -4,7 +4,7 @@ With `[sandbox] backend = "container"`, the agent's own CLI runs **inside a Dock
 
 Status: SHIPPED and live-verified (spec 00044 increment G, config switch 00045). See [sandbox.md](sandbox.md) for the full `[sandbox.*]` model and [strategy.md](strategy.md) for the `SandboxHandle` seam this backend hangs on.
 
-**The `flywheel-container` package is SDK-free.** Importing `flywheel_container` never needs `claude-agent-sdk` — the agent runs as its own CLI in the image; the package only shells out to `docker` (`flywheel_container/__init__.py`). The host worker lazy-imports it only when `backend="container"` (`flywheel_worktree.worker.maybe_wrap_for_backend`, `worker.py:1303`); a missing package raises a clear install hint.
+**The `flywheel-container` package is SDK-free.** Importing `flywheel_container` never needs `claude-agent-sdk` — the agent runs as its own CLI in the image; the package only shells out to `docker` (`flywheel_container/__init__.py`). The host worker lazy-imports it only when `backend="container"` (`flywheel_worktree.worker.maybe_wrap_for_backend`, `worker.py:2166`); a missing package raises a clear install hint.
 
 `ContainerSubmitStrategy` (`_submit.py:95`) does not replace landing — it **composes an inner landing strategy** (the git-worktree merge/PR submitter). The inner strategy provisions and lands the worktree host-side; this layer starts the container, runs the agent CLI in it, and tears the container down.
 

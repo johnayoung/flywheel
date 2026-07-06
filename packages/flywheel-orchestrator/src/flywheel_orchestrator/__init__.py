@@ -165,6 +165,7 @@ from flywheel_orchestrator._policy import (
     build_work_source,
     load_policy,
     resolve_grader_env,
+    resolve_sandbox_root,
 )
 from flywheel_orchestrator._sources import (
     DirectoryWorkSource,
@@ -422,6 +423,7 @@ __all__ = [
     "redrive_parked_landings",
     "resolve_db_path",
     "resolve_grader_env",
+    "resolve_sandbox_root",
     "resolve_postgres_dsn",
     "select_next_task",
     "status_rows_for_items",

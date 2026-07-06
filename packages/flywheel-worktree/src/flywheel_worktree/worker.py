@@ -90,6 +90,7 @@ from flywheel_orchestrator import (
     open_sqlite_bound_store,
     orchestrate,
     resolve_grader_env,
+    resolve_sandbox_root,
 )
 from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
@@ -1181,6 +1182,27 @@ def retention_sweep(
                 _git(repo_root, "branch", "-D", branch.strip())
 
 
+def retention_targets(repo_root: Path, worktrees_dir: Path) -> tuple[Path, ...]:
+    """The worktree roots one retention pass covers.
+
+    Always the active root; additionally the legacy hardcoded
+    ``.flywheel/worktrees`` while it still exists on disk. ``[paths]
+    sandbox_root`` used to be silently ignored on this path, so a repo that
+    pinned it has in-flight/parked worktrees at the legacy location the
+    moment the knob became live -- those must keep aging out of the same
+    retention window instead of stranding forever.
+    """
+    targets = [worktrees_dir]
+    legacy = repo_root / ".flywheel" / "worktrees"
+    try:
+        distinct = legacy.resolve() != worktrees_dir.resolve()
+    except OSError:
+        distinct = True
+    if distinct and legacy.is_dir():
+        targets.append(legacy)
+    return tuple(targets)
+
+
 def retention_cadence_tick(
     repo_root: Path,
     worktrees_dir: Path,
@@ -1797,6 +1819,8 @@ def _pool_member_argv(
         argv.extend(["--tasks-dir", str(args.tasks_dir)])
     if args.db is not None:
         argv.extend(["--db", str(args.db)])
+    if args.sandbox_root is not None:
+        argv.extend(["--sandbox-root", str(args.sandbox_root)])
     if model is not None:
         argv.extend(["--model", str(model)])
     if args.once:
@@ -1950,6 +1974,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tasks-dir", default=None)
     parser.add_argument("--db", default=None)
+    parser.add_argument(
+        "--sandbox-root",
+        default=None,
+        help=(
+            "Root under which each task's worktree is created (default: "
+            "[paths] sandbox_root in flywheel.toml, else "
+            ".flywheel/worktrees). Relative paths anchor at the repo root; "
+            "@cache and @sibling select out-of-tree layouts."
+        ),
+    )
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
@@ -2316,6 +2350,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # non-integer flag) must fail fast and loud, naming the setting, with
         # no lifecycle or claim row created.
         concurrency = _resolve_concurrency(args, policy)
+        # Resolve the worktree root here too: an unknown @token or an
+        # unwritable @sibling parent must fail fast, before any store opens.
+        worktrees_dir = resolve_sandbox_root(
+            args.sandbox_root
+            or (policy.sandbox_root if policy is not None else None),
+            repo_root=repo_root,
+        )
     except PolicyError as exc:
         print(f"flywheel worker: policy error: {exc}", file=sys.stderr)
         return 2
@@ -2329,7 +2370,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     db_path = (
         Path(args.db) if args.db else repo_root / ".flywheel" / "flywheel.sqlite"
     )
-    worktrees_dir = repo_root / ".flywheel" / "worktrees"
     lock_path = repo_root / ".flywheel" / ".merge.lock"
 
     worktrees_dir.mkdir(parents=True, exist_ok=True)
@@ -2437,10 +2477,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Worktree retention runs every cycle, not once at boot: a parked
         # worktree that ages past the window is reclaimed mid-run without a
         # restart, while a within-window worktree survives. The clock is read
-        # fresh each tick so the cutoff advances between cycles.
-        retention_cadence_tick(
-            repo_root, worktrees_dir, args.worktree_retention_days, log
-        )
+        # fresh each tick so the cutoff advances between cycles. When the
+        # configured root moved off the legacy .flywheel/worktrees, that
+        # location is swept too until it empties out.
+        for sweep_root in retention_targets(repo_root, worktrees_dir):
+            retention_cadence_tick(
+                repo_root, sweep_root, args.worktree_retention_days, log
+            )
         run_once(
             submitter,
             tasks_dir=tasks_dir,

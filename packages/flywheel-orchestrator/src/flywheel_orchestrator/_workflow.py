@@ -83,6 +83,7 @@ from flywheel_orchestrator._policy import (
     WorkPolicy,
     build_work_source,
     load_policy,
+    resolve_sandbox_root,
 )
 from flywheel_orchestrator._skills import (
     DEFAULT_SKILLS_ROOT,
@@ -877,12 +878,11 @@ def _cmd_orchestrate(args: argparse.Namespace) -> int:
     policy = _load_effective_policy(args)
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
-    if args.sandbox_root:
-        sandbox_root = Path(args.sandbox_root)
-    elif policy is not None and policy.sandbox_root is not None:
-        sandbox_root = policy.sandbox_root
-    else:
-        sandbox_root = Path(".flywheel/worktrees")
+    sandbox_root = resolve_sandbox_root(
+        args.sandbox_root
+        or (policy.sandbox_root if policy is not None else None),
+        repo_root=Path.cwd(),
+    )
     report = asyncio.run(
         orchestrate(
             source=source,
@@ -2022,6 +2022,43 @@ logs/
 verification/
 """
 
+_DOCKERIGNORE_ENTRY = ".flywheel/"
+
+
+def _ensure_dockerignore_covers_flywheel(root: Path) -> str | None:
+    """Keep ``.flywheel/`` (worktrees, logs, db) out of docker build contexts.
+
+    Docker does not read ``.gitignore``, so a repo that builds an image with
+    ``COPY . .`` would otherwise ship every nested worktree's setup artifacts
+    (.venv, node_modules) into the context. Acts only when a Dockerfile or
+    Containerfile sits at the context root; appends the entry once and never
+    rewrites an existing one, so re-running init stays idempotent.
+
+    Returns the line appended, or ``None`` when nothing was written.
+    """
+    has_dockerfile = any(
+        next(root.glob(pattern), None) is not None
+        for pattern in ("Dockerfile*", "Containerfile*")
+    )
+    if not has_dockerfile:
+        return None
+    dockerignore = root / ".dockerignore"
+    prior = ""
+    if dockerignore.is_file():
+        prior = dockerignore.read_text(encoding="utf-8")
+        existing = {line.strip() for line in prior.splitlines()}
+        if existing & {".flywheel", ".flywheel/", "/.flywheel", "/.flywheel/"}:
+            return None
+    prefix = "" if not prior or prior.endswith("\n") else "\n"
+    with dockerignore.open("a", encoding="utf-8") as handle:
+        handle.write(
+            prefix
+            + "# Flywheel runtime state (worktrees, logs, db): keep out of "
+            "image build contexts.\n"
+            f"{_DOCKERIGNORE_ENTRY}\n"
+        )
+    return _DOCKERIGNORE_ENTRY
+
 _INIT_POLICY_HEADER = """\
 # Flywheel work policy: where work comes from, where runtime state lives, and
 # how finished work lands. Committed with the repo; CLI flags always override.
@@ -2035,7 +2072,10 @@ _INIT_POLICY_HEADER = """\
 _INIT_POLICY_TAIL_HEAD = """\
 [paths]
 db = ".flywheel/flywheel.sqlite"
-sandbox_root = ".flywheel/sandboxes"
+# Worktree/sandbox root. A relative path anchors at the repo root; "@cache"
+# (XDG cache dir keyed by repo identity) and "@sibling"
+# (<repo-parent>/<repo>.worktrees) opt into out-of-tree layouts.
+sandbox_root = ".flywheel/worktrees"
 
 # --- Default graders -------------------------------------------------------
 # Verification commands for work items that declare none. Tracker sources
@@ -2939,6 +2979,9 @@ def _cmd_init_agent(policy_path: Path) -> int:
     print(f"created: {result.policy_path}")
     for line in result.gitignore_added:
         print(f"gitignore: +{line}")
+    dockerignore_added = _ensure_dockerignore_covers_flywheel(repo_root)
+    if dockerignore_added is not None:
+        print(f"dockerignore: +{dockerignore_added}")
     _report_agent_auth()
     print()
     _print_init_next_steps(result.policy.store_backend)
@@ -2989,6 +3032,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"created: {path}")
     for path in existing:
         print(f"exists:  {path} (left untouched)")
+    dockerignore_added = _ensure_dockerignore_covers_flywheel(Path.cwd())
+    if dockerignore_added is not None:
+        print(f"updated: .dockerignore (+{dockerignore_added})")
 
     policy_path = Path(DEFAULT_POLICY_FILENAME)
     interactive = sys.stdin.isatty() and not args.defaults
@@ -3229,7 +3275,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Root under which each task runs in <sandbox-root>/<task-id> "
-            "(default: .flywheel/worktrees)."
+            "(default: .flywheel/worktrees). Relative paths anchor at the "
+            "repo root; @cache and @sibling select out-of-tree layouts."
         ),
     )
     p_orchestrate.add_argument(

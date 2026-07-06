@@ -107,13 +107,15 @@ def test_paths_table_parses(tmp_path: Path) -> None:
                     'kind = "directory"',
                     "[paths]",
                     'db = ".flywheel/flywheel.sqlite"',
-                    'sandbox_root = ".flywheel/sandboxes"',
+                    'sandbox_root = "custom/worktrees"',
                 ]
             ),
         )
     )
     assert policy.db_path == Path(".flywheel/flywheel.sqlite")
-    assert policy.sandbox_root == Path(".flywheel/sandboxes")
+    # Stored verbatim: resolution (repo-root anchoring, @tokens) happens in
+    # resolve_sandbox_root at use time, not at parse time.
+    assert policy.sandbox_root == Path("custom/worktrees")
 
 
 def test_paths_default_to_none(tmp_path: Path) -> None:

@@ -35,15 +35,15 @@ Every delegated verb resolves its inputs the same way: **explicit flag wins, the
 
 | Input | Explicit flag | Policy key | Built-in default | Anchor |
 |---|---|---|---|---|
-| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd | none (`.flywheel/` defaults) | `_workflow.py:773` |
-| DB path | `--db PATH` | `[paths] db` | `.flywheel/flywheel.sqlite` | `_workflow.py:816` |
-| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `.flywheel/tasks` | `_workflow.py:801` |
+| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd | none (`.flywheel/` defaults) | `_workflow.py:779` |
+| DB path | `--db PATH` | `[paths] db` | `.flywheel/flywheel.sqlite` | `_workflow.py:822` |
+| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `.flywheel/tasks` | `_workflow.py:807` |
 
 The Postgres DSN is never stored in `flywheel.toml`. It is read only from the environment: `FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL` (`_store_factory.py:33-35`). See [configuration.md](configuration.md) for the full policy schema.
 
 ## Read verbs
 
-Delegated to `flywheel_orchestrator._workflow.main`. On a load/policy/work-source error these print `error: ...` to stderr and exit 2 (`_workflow.py:3196-3201`).
+Delegated to `flywheel_orchestrator._workflow.main`. On a load/policy/work-source error these print `error: ...` to stderr and exit 2 (`_workflow.py:3527-3532`).
 
 | Verb | What it does | Key flags |
 |---|---|---|
@@ -78,12 +78,13 @@ The shell's `say` is a surface rename of core's `steer` verb; the underlying cor
 
 ### `worker [--once]`
 
-The blessed headless drain, delegated in-process to `flywheel_worktree.worker.main` (`worker.py:1176`). It drives tasks under active phase dirs, each in its own git worktree, fast-forward-merging on done and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
+The blessed headless drain, delegated in-process to `flywheel_worktree.worker.main` (`worker.py:2335`). It drives tasks under active phase dirs, each in its own git worktree, fast-forward-merging on done and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
 
 | Flag | Controls |
 |---|---|
 | `--once` | single drain cycle, no daemon loop |
 | `--tasks-dir`, `--db`, `--policy` | standard resolution inputs |
+| `--sandbox-root` | worktree root (overrides `[paths] sandbox_root`); accepts a path or the `@cache`/`@sibling` tokens (see [configuration.md](configuration.md)) |
 | `--model` | agent model (overrides `[agent] model`) |
 | `--max-turns`, `--max-retries` | per-run ceilings |
 | `--worker-id` | identity stamped on claims |
@@ -218,9 +219,9 @@ An unknown verb leaves the typed line populated for editing rather than erroring
 
 ## `init`
 
-Scaffolds `.flywheel/` and a `flywheel.toml` work policy (`_cmd_init`, `_workflow.py:2678`). Idempotent: existing files are left untouched and reported.
+Scaffolds `.flywheel/` and a `flywheel.toml` work policy (`_cmd_init`, `_workflow.py:2991`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`_ensure_dockerignore_covers_flywheel`, `_workflow.py:2028`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
 
-**Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`_workflow.py:2617`). The state `init` produces must be one the worker's own preconditions accept.
+**Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`_workflow.py:2876`). The state `init` produces must be one the worker's own preconditions accept.
 
 | Flag | Effect |
 |---|---|

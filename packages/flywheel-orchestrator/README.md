@@ -97,7 +97,7 @@ label = "flywheel"
 
 [paths]                    # optional; CLI flags still win
 db = ".flywheel/flywheel.sqlite"
-sandbox_root = ".flywheel/sandboxes"
+sandbox_root = ".flywheel/worktrees"
 
 [[defaults.graders]]
 type = "command"

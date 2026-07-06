@@ -27,10 +27,13 @@ Format (TOML, stdlib ``tomllib``)::
     #                               # isResolved state (spec 00053, D-4).
 
     # Where runtime state lives (optional). CLI flags still win; without
-    # these the built-in .flywheel/ defaults apply.
+    # these the built-in .flywheel/ defaults apply. sandbox_root also
+    # accepts the tokens "@cache" (XDG cache dir keyed by repo identity)
+    # and "@sibling" (<repo-parent>/<repo>.worktrees); relative paths
+    # anchor at the repo root -- see resolve_sandbox_root.
     [paths]
     db = ".flywheel/flywheel.sqlite"
-    sandbox_root = ".flywheel/sandboxes"
+    sandbox_root = ".flywheel/worktrees"
 
     # Default grader policy: applied by tracker-backed sources to items
     # that do not declare their own graders. Directory tasks always carry
@@ -108,7 +111,10 @@ default policy is not runnable and never reaches the scheduler.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
+import tempfile
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -384,7 +390,9 @@ class WorkPolicy:
     ``kind = "github_review"``. ``default_graders`` is empty when the file
     declares none. ``db_path``/``sandbox_root`` mirror the optional
     ``[paths]`` table and are ``None`` when unset (the CLI then falls
-    back to its built-in defaults). ``model`` mirrors the optional
+    back to its built-in defaults). ``sandbox_root`` is stored verbatim --
+    a path or an ``@cache``/``@sibling`` token -- and is turned into the
+    absolute worktree root by :func:`resolve_sandbox_root` at use time. ``model`` mirrors the optional
     ``[agent] model`` key -- an opaque, repo-pinned model id passed
     verbatim to the SDK; ``None`` when unset (the worker then falls back
     to its CLI flag / built-in default). ``store_backend``/``store_schema``
@@ -738,6 +746,121 @@ def _optional_path(
             f"{policy_file}: paths.{key} must be a non-empty string"
         )
     return Path(value)
+
+
+_SANDBOX_ROOT_CACHE_TOKEN = "@cache"
+_SANDBOX_ROOT_SIBLING_TOKEN = "@sibling"
+
+
+def resolve_sandbox_root(
+    configured: str | Path | None,
+    *,
+    repo_root: Path,
+) -> Path:
+    """Resolve ``[paths] sandbox_root`` to the absolute worktree root.
+
+    ``None`` (unset) keeps the built-in nested default
+    ``<repo_root>/.flywheel/worktrees``. A relative path anchors at
+    ``repo_root`` -- never the process cwd -- so the same policy file means
+    the same location no matter where the CLI is invoked from. An absolute
+    path is used verbatim. Two tokens opt into out-of-tree layouts:
+
+    * ``@cache`` -- ``<cache-base>/flywheel/<repo-name>-<id>/worktrees``,
+      where ``<cache-base>`` is the first writable of ``$XDG_CACHE_HOME``,
+      ``~/.cache``, and the platform tmpdir, and ``<id>`` keys the repo by
+      the realpath of its git common dir (two clones never collide; a
+      linked-worktree checkout maps to its main repo).
+    * ``@sibling`` -- ``<repo-parent>/<repo-name>.worktrees``, refused with
+      :class:`PolicyError` when the parent directory is not writable
+      (read-only CI mounts), rather than failing later mid-task.
+    """
+    if configured is None:
+        return (repo_root / ".flywheel" / "worktrees").resolve()
+    raw = str(configured)
+    if raw == _SANDBOX_ROOT_CACHE_TOKEN:
+        return _cache_sandbox_root(repo_root)
+    if raw == _SANDBOX_ROOT_SIBLING_TOKEN:
+        return _sibling_sandbox_root(repo_root)
+    if raw.startswith("@"):
+        raise PolicyError(
+            f"paths.sandbox_root: unknown token {raw!r} "
+            f"(supported: {_SANDBOX_ROOT_CACHE_TOKEN}, "
+            f"{_SANDBOX_ROOT_SIBLING_TOKEN})"
+        )
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return (repo_root / path).resolve()
+
+
+def _sibling_sandbox_root(repo_root: Path) -> Path:
+    root = repo_root.resolve()
+    parent = root.parent
+    if parent == root:
+        raise PolicyError(
+            "paths.sandbox_root: @sibling needs a parent directory, but "
+            f"{root} is the filesystem root"
+        )
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise PolicyError(
+            "paths.sandbox_root: @sibling requires a writable parent "
+            f"directory, but {parent} is not writable (read-only mount?); "
+            "use @cache or a literal path instead"
+        )
+    return parent / f"{root.name}.worktrees"
+
+
+def _cache_sandbox_root(repo_root: Path) -> Path:
+    base = _first_writable_cache_base()
+    identity = _repo_identity(repo_root)
+    digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
+    name = repo_root.resolve().name or "repo"
+    return base / "flywheel" / f"{name}-{digest}" / "worktrees"
+
+
+def _first_writable_cache_base() -> Path:
+    candidates: list[Path] = []
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        candidates.append(Path(xdg))
+    try:
+        candidates.append(Path.home() / ".cache")
+    except RuntimeError:
+        pass
+    candidates.append(Path(tempfile.gettempdir()))
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(candidate, os.W_OK | os.X_OK):
+            return candidate
+    raise PolicyError(
+        "paths.sandbox_root: @cache found no writable cache directory "
+        f"(tried {', '.join(str(c) for c in candidates)})"
+    )
+
+
+def _repo_identity(repo_root: Path) -> Path:
+    """The path that names this repo for ``@cache`` keying.
+
+    The realpath of the git common dir, so every checkout of one repo --
+    including linked worktrees -- shares a cache dir, while two clones at
+    different paths never collide. Outside a git repo (the orchestrate
+    plain-dir path) the realpath of ``repo_root`` itself is the identity.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0 and proc.stdout.strip():
+        common = Path(proc.stdout.strip())
+        if not common.is_absolute():
+            common = repo_root / common
+        return Path(os.path.realpath(common))
+    return Path(os.path.realpath(repo_root))
 
 
 def _optional_agent_model(

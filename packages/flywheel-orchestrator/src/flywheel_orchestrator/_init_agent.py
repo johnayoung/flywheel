@@ -240,7 +240,7 @@ def render_agent_policy(proposal: InitProposal, *, submit_base: str | None) -> s
         "\n",
         "[paths]\n"
         'db = ".flywheel/flywheel.sqlite"\n'
-        'sandbox_root = ".flywheel/sandboxes"\n',
+        'sandbox_root = ".flywheel/worktrees"\n',
     ]
 
     if proposal.default_graders:

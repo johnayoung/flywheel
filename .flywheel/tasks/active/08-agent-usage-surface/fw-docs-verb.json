@@ -1,0 +1,41 @@
+{
+  "id": "fw-docs-verb",
+  "goal": "The fw/flywheel CLI gains a docs verb that prints each of the nine curated operator docs byte-identical to the canonical docs/ sources from any working directory, lists exactly those topics when called bare, and exits non-zero naming any unknown topic.",
+  "tags": ["cli", "docs", "spec-00072"],
+  "graders": [
+    { "type": "command", "name": "parity-from-anywhere",
+      "run": "WT=\"$PWD\" && cd \"$(mktemp -d)\" && for t in cli configuration task-schema workflow loop strategy sandbox autopilot held-out-gate; do uv run --project \"$WT\" flywheel docs \"$t\" > \"$t.out\" || exit 1; cmp -s \"$t.out\" \"$WT/docs/$t.md\" || { echo \"parity fail: $t\"; exit 1; }; done" },
+    { "type": "command", "name": "bare-listing",
+      "run": "WT=\"$PWD\" && cd \"$(mktemp -d)\" && uv run --project \"$WT\" flywheel docs > list.out && for t in cli configuration task-schema workflow loop strategy sandbox autopilot held-out-gate; do grep -q \"^$t \" list.out || { echo \"missing topic: $t\"; exit 1; }; done && test \"$(grep -cE '^[a-z][a-z-]* ' list.out)\" -eq 9" },
+    { "type": "command", "name": "unknown-topic",
+      "run": "WT=\"$PWD\" && cd \"$(mktemp -d)\" && if uv run --project \"$WT\" flywheel docs no-such-topic >out.txt 2>err.txt; then echo 'unknown topic exited 0'; exit 1; fi && grep -q 'no-such-topic' err.txt && ! test -s out.txt" },
+    { "type": "command", "name": "parity-harness-discriminates",
+      "run": "TMP=$(mktemp) && mv docs/loop.md \"$TMP\" && if uv run pytest packages/flywheel/tests/test_docs_parity.py -q >/dev/null 2>&1; then mv \"$TMP\" docs/loop.md; echo 'parity harness passed with a missing source doc'; exit 1; else mv \"$TMP\" docs/loop.md; fi" },
+    { "type": "command", "name": "package-suite",
+      "run": "uv run pytest packages/flywheel/tests/ -q" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel/src/flywheel/_cli.py -- the fw/flywheel verb router the docs verb joins",
+      "packages/flywheel/pyproject.toml -- packaging; the curated docs ship as package data of this dist",
+      "docs/README.md -- source of one-line topic descriptions for the bare listing",
+      "packages/flywheel/tests/test_fw_router.py -- keep this suite green",
+      "packages/flywheel/tests/test_docs_parity.py -- NEW: the parity harness; must iterate the canonical topic-set constant against docs/<topic>.md and fail loudly on a missing source"
+    ],
+    "constraints": [
+      "Expose the curated topic set as ONE importable constant in the flywheel package; the listing, the serving path, and the parity test must all consume it -- no local copies",
+      "Serve content from package data (importlib.resources) embedded from the canonical docs/*.md at build time -- never re-authored prose, never a path resolved outside the installed package",
+      "The verb must work with no flywheel.toml present (docs are knowledge, not policy; no policy load)",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify the content of any existing docs/*.md to make parity pass",
+      "Do not weaken or delete existing tests; do not special-case topic names inside the parity test",
+      "Do not add an MCP server or any always-on context surface (spec 00072 D-1)"
+    ],
+    "edge_cases": [
+      "A renamed or deleted source doc must fail the parity harness naming the topic (spec criterion 4)",
+      "Bare listing and per-topic serving must not drift: both derive from the same constant"
+    ]
+  }
+}

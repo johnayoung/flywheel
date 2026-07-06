@@ -1,0 +1,32 @@
+{
+  "id": "init-claudemd-breadcrumb",
+  "goal": "flywheel init prints one copy-pasteable CLAUDE.md pointer line naming the flywheel-ops skill and fw docs, and provably never creates or modifies a root CLAUDE.md.",
+  "prerequisites": ["flywheel-ops-skill"],
+  "tags": ["init", "spec-00072"],
+  "graders": [
+    { "type": "command", "name": "suggestion-printed",
+      "run": "WT=\"$PWD\" && T=$(mktemp -d) && cd \"$T\" && git init -qb main && git -c user.email=t@t -c user.name=t commit -qm root --allow-empty && uv run --project \"$WT\" flywheel init --defaults > out.txt 2>&1; grep -q 'flywheel-ops' out.txt && grep -q 'fw docs' out.txt" },
+    { "type": "command", "name": "claudemd-untouched",
+      "run": "WT=\"$PWD\" && T=$(mktemp -d) && cd \"$T\" && git init -qb main && git -c user.email=t@t -c user.name=t commit -qm root --allow-empty && uv run --project \"$WT\" flywheel init --defaults >/dev/null 2>&1; test ! -f CLAUDE.md || { echo 'init created CLAUDE.md'; exit 1; }; T2=$(mktemp -d) && cd \"$T2\" && git init -qb main && git -c user.email=t@t -c user.name=t commit -qm root --allow-empty && printf 'operator content\\n' > CLAUDE.md && H=$(md5sum < CLAUDE.md) && uv run --project \"$WT\" flywheel init --defaults >/dev/null 2>&1; test \"$(md5sum < CLAUDE.md)\" = \"$H\" || { echo 'init modified CLAUDE.md'; exit 1; }" },
+    { "type": "command", "name": "init-suite",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_init.py -q" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- init's next-steps output, where the suggestion line joins",
+      "packages/flywheel-orchestrator/tests/test_init.py -- keep green; extend for the suggestion and the no-touch guarantee"
+    ],
+    "constraints": [
+      "One line, copy-pasteable, naming both 'flywheel-ops' and 'fw docs'; printed on interactive AND --defaults paths",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Never write, create, or reformat CLAUDE.md -- printing the suggestion is the entire feature (spec 00072 D-3)",
+      "Do not add new init flags",
+      "Do not weaken or delete existing tests"
+    ],
+    "edge_cases": [
+      "Re-running init prints the same suggestion again (printing is stateless; only file writes are idempotent-guarded)"
+    ]
+  }
+}

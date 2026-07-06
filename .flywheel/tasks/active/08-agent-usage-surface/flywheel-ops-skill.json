@@ -1,0 +1,42 @@
+{
+  "id": "flywheel-ops-skill",
+  "goal": "flywheel init --skills installs a sixth managed skill, flywheel-ops, whose loop-operating guidance references only CLI verbs and fw docs topics that actually exist.",
+  "prerequisites": ["fw-docs-verb"],
+  "tags": ["skills", "init", "spec-00072"],
+  "graders": [
+    { "type": "command", "name": "installs-six-with-anchors",
+      "run": "WT=\"$PWD\" && T=$(mktemp -d) && cd \"$T\" && git init -qb main && git -c user.email=t@t -c user.name=t commit -qm root --allow-empty && uv run --project \"$WT\" flywheel init --defaults --skills >/dev/null 2>&1; test -f .claude/skills/flywheel-ops/SKILL.md || { echo 'flywheel-ops not installed'; exit 1; } && grep -q 'managed-by: flywheel init' .claude/skills/flywheel-ops/SKILL.md && test \"$(ls .claude/skills | wc -l)\" -eq 6 && for a in 'worker' 'status --rollup' 'live' 'history' 'show' 'parked' 'stranded' 'fw docs'; do grep -q -- \"$a\" .claude/skills/flywheel-ops/SKILL.md || { echo \"missing anchor: $a\"; exit 1; }; done" },
+    { "type": "command", "name": "no-hallucinated-surface",
+      "run": "uv run pytest packages/flywheel/tests/test_ops_skill_surface.py -q" },
+    { "type": "command", "name": "skills-suite",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_skills.py -q" },
+    { "type": "rubric", "name": "operability-screen",
+      "assertions": [
+        "Reading only the rendered flywheel-ops skill, an agent could start the worker, drain a phase, and check its status. MET or UNMET.",
+        "The skill explains how to diagnose a parked worktree and the concrete recovery path. MET or UNMET.",
+        "The skill explains what a stranded DONE landing means and how to recover it. MET or UNMET."
+      ] }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skills.py -- SKILL_NAMES registry and the five existing managed templates; the new template lives here",
+      "packages/flywheel-orchestrator/tests/test_skills.py -- keep green; extend for the sixth skill",
+      "packages/flywheel/src/flywheel/_cli.py -- read-only: the router's verb sets the seam test validates against",
+      "packages/flywheel/tests/test_ops_skill_surface.py -- NEW: the seam holdout; every fw/flywheel verb token in the rendered template must be in the router's dispatch sets, every named docs topic in the curated topic-set constant"
+    ],
+    "constraints": [
+      "The seam test imports the router verb sets and the curated topic constant -- never a copied list (the flywheel dist already depends on the orchestrator, so the product tests can see both sides)",
+      "The template renders with the same managed-by header and install mechanics as the existing five",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify the five existing skill templates' content",
+      "Do not add or rename router verbs to make a skill reference real -- the skill conforms to the CLI, never the reverse",
+      "Do not weaken or delete existing tests"
+    ],
+    "edge_cases": [
+      "A verb mentioned in prose (e.g. 'fw show RUN_ID') must validate the verb token, not the placeholder argument",
+      "The skill must direct agents to 'fw docs <topic>' for depth rather than duplicating doc content inline"
+    ]
+  }
+}

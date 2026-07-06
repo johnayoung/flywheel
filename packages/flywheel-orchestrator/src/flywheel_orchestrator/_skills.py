@@ -14,6 +14,14 @@ held-out oracle -> retro -> proposals) is one slash command away in Claude Code:
 * ``/fw-improve`` — turn cited retro findings into ranked, scoped proposals,
   each ending in a handoff (``/fw-spec``, ``/fw-plan``, or accept)
 
+A sixth skill sits beside the authoring pipeline rather than in it:
+
+* ``/flywheel-ops`` — operate the *running* loop: start and drain the
+  worker, read run state off grader receipts, and recover parked or
+  stranded work. It references only real ``fw`` verbs and ``fw docs``
+  topics (enforced by ``flywheel/tests/test_ops_skill_surface.py``) and
+  points to ``fw docs <topic>`` for depth instead of duplicating it.
+
 The markdown lives as greenfield templates under ``_skill_templates/``
 (package data) with ``__FW_*__`` placeholder tokens; rendering binds them
 to the repo's actual settings (task directory, state directories, and —
@@ -36,14 +44,17 @@ from pathlib import Path
 
 from flywheel_orchestrator._policy import WorkPolicy
 
-# Installed skill names, in pipeline order. Each becomes
-# ``.claude/skills/<name>/SKILL.md`` and is invoked as ``/<name>``.
+# Installed skill names. The first five are the authoring pipeline, in
+# pipeline order; ``flywheel-ops`` is the operability companion (driving the
+# already-built loop). Each becomes ``.claude/skills/<name>/SKILL.md`` and is
+# invoked as ``/<name>``.
 SKILL_NAMES: tuple[str, ...] = (
     "fw-spec",
     "fw-plan",
     "fw-verify",
     "fw-retro",
     "fw-improve",
+    "flywheel-ops",
 )
 
 # Sentinel line every generated SKILL.md carries (right after the

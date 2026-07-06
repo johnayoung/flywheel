@@ -107,6 +107,29 @@ def test_fw_verify_instructs_held_out_registration_and_keeps_fence() -> None:
     assert "__FW_" not in text
 
 
+def test_flywheel_ops_is_shipped_and_renders_operability_runbook() -> None:
+    """The sixth managed skill is the operability companion, not part of the
+    authoring pipeline. It must ship in SKILL_NAMES, render marker-bearing,
+    and carry the operability spine the run/drain/recover runbook needs. The
+    surface-conformance holdout (every verb/topic is real) lives in the
+    product suite (``flywheel/tests/test_ops_skill_surface.py``); here we only
+    assert the template ships and reads as an operability runbook."""
+    assert "flywheel-ops" in SKILL_NAMES
+    text = render_skill("flywheel-ops", SkillRenderSettings())
+    assert text.startswith("---\n")
+    assert "name: flywheel-ops" in text
+    assert MANAGED_MARKER in text
+    assert "__FW_" not in text
+    # Operability anchors: run/drain, evidence-derived status, and both
+    # recovery shapes the skill exists to explain.
+    assert "fw worker" in text
+    assert "status --rollup" in text
+    assert "parked" in text
+    assert "stranded" in text
+    # Depth is delegated to the curated docs, never duplicated inline.
+    assert "fw docs" in text
+
+
 def test_render_binds_custom_tasks_dir() -> None:
     settings = SkillRenderSettings(tasks_dir=Path("work/tasks"))
     text = render_skill("fw-plan", settings)

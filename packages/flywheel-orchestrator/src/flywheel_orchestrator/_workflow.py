@@ -2024,6 +2024,17 @@ verification/
 
 _DOCKERIGNORE_ENTRY = ".flywheel/"
 
+# A copy-pasteable, single-line pointer init PRINTS (never writes) so an
+# operator can drop it into their own CLAUDE.md. Naming both the
+# ``flywheel-ops`` skill and the ``fw docs`` verb closes the discovery gap
+# ("sessions forget the skills exist") without tooling ever editing the
+# operator-owned instruction file (spec 00072 D-3).
+_INIT_CLAUDEMD_POINTER = (
+    "This repository runs on flywheel: load the `flywheel-ops` skill to "
+    "operate the loop, and run `fw docs <topic>` for authoritative flywheel "
+    "documentation."
+)
+
 
 def _ensure_dockerignore_covers_flywheel(root: Path) -> str | None:
     """Keep ``.flywheel/`` (worktrees, logs, db) out of docker build contexts.
@@ -2707,6 +2718,12 @@ def _print_init_next_steps(
             "create the schema and tables now instead of on the first "
             "worker run."
         )
+    print()
+    print(
+        "To help future Claude Code sessions discover flywheel, paste this "
+        "line into your CLAUDE.md (init never edits it for you):"
+    )
+    print(f"  {_INIT_CLAUDEMD_POINTER}")
 
 
 # Matches a top-level TOML table (``[name]``) or array-of-tables

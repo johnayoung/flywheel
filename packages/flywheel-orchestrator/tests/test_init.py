@@ -852,3 +852,62 @@ def test_init_postgres_dsn_priority_flywheel_var_wins(
     monkeypatch.setattr(_workflow, "run_postgres_preflight", fake)
     assert main(["init", "--store", "postgres", "--defaults"]) == 0
     assert seen == ["postgresql://primary/db"]
+
+
+# --- CLAUDE.md breadcrumb (spec 00072 #8 / #9, D-3) --------------------------
+
+
+def test_init_defaults_prints_claudemd_pointer(repo: Path, capsys) -> None:
+    """--defaults init prints one copy-pasteable pointer line naming both
+    the flywheel-ops skill and `fw docs` (spec 00072 #8)."""
+    assert main(["init", "--defaults"]) == 0
+    out = capsys.readouterr().out
+    assert "flywheel-ops" in out
+    assert "fw docs" in out
+    # The pointer is a single copy-pasteable line carrying both tokens.
+    pointer_lines = [
+        line
+        for line in out.splitlines()
+        if "flywheel-ops" in line and "fw docs" in line
+    ]
+    assert len(pointer_lines) == 1
+
+
+def test_init_interactive_prints_claudemd_pointer(
+    repo: Path, monkeypatch, capsys
+) -> None:
+    """The interactive (all-defaults, three enters) path prints the same
+    pointer line, so discovery works whether or not --defaults is used."""
+    _interactive(monkeypatch, "", "", "")
+    assert main(["init"]) == 0
+    out = capsys.readouterr().out
+    assert "flywheel-ops" in out
+    assert "fw docs" in out
+
+
+def test_init_pointer_reprints_on_rerun(repo: Path, capsys) -> None:
+    """Printing is stateless: a re-run over an existing policy prints the
+    same pointer again (only file writes are idempotent-guarded)."""
+    assert main(["init", "--defaults"]) == 0
+    capsys.readouterr()
+    assert main(["init", "--defaults"]) == 0
+    out = capsys.readouterr().out
+    assert "exists:  flywheel.toml (left untouched)" in out
+    assert "flywheel-ops" in out
+    assert "fw docs" in out
+
+
+def test_init_never_creates_claudemd(repo: Path) -> None:
+    """init must not create a root CLAUDE.md the repo never had (D-3)."""
+    assert not (repo / "CLAUDE.md").exists()
+    assert main(["init", "--defaults"]) == 0
+    assert not (repo / "CLAUDE.md").exists()
+
+
+def test_init_never_modifies_existing_claudemd(repo: Path) -> None:
+    """An operator-owned CLAUDE.md survives init byte-for-byte (D-3)."""
+    claudemd = repo / "CLAUDE.md"
+    claudemd.write_text("operator content\n", encoding="utf-8")
+    before = claudemd.read_bytes()
+    assert main(["init", "--defaults"]) == 0
+    assert claudemd.read_bytes() == before

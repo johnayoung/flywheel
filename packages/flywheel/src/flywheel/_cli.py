@@ -39,6 +39,7 @@ from flywheel_orchestrator._autopilot_run import main as _autopilot_main
 from flywheel_orchestrator._workflow import main as _orchestrator_main
 from flywheel_worktree.worker import main as _worker_main
 
+from flywheel._docs import main as _docs_main
 from flywheel._tui import main as _tui_main
 
 
@@ -73,6 +74,7 @@ _CORE_STEER_VERB = "steer"
 _WORKER_VERB = "worker"
 _AUTOPILOT_VERB = "autopilot"
 _AUDIT_VERB = "audit"
+_DOCS_VERB = "docs"
 
 _USAGE = """\
 usage: flywheel [--json] [--help] <verb> [args...]
@@ -100,6 +102,7 @@ Verbs:
   recheck-blocked  re-evaluate blocked lifecycles' requires
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
+  docs [TOPIC]     print a curated operator doc (bare: list the topics)
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
@@ -177,6 +180,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _autopilot_main(rest)
     if verb == _AUDIT_VERB:
         return _delegate_audit(rest)
+    if verb == _DOCS_VERB:
+        # Curated operator docs served from package data -- knowledge, not
+        # policy: no flywheel.toml load, no store, works from any directory.
+        return _docs_main(rest)
 
     print(f"{_PROG}: unknown command: {verb}", file=sys.stderr)
     print(f"  see '{_PROG} --help' for the verb list", file=sys.stderr)

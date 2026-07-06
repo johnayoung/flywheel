@@ -449,3 +449,54 @@ def test_fw_approve_help_exits_zero(
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
     assert "RUN_ID" in out
+
+
+# --- docs verb -------------------------------------------------------------
+
+
+def test_fw_docs_bare_lists_every_curated_topic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fw docs`` lists exactly the curated topics -- from any directory,
+    with no flywheel.toml present (docs are knowledge, not policy)."""
+    from flywheel._docs import TOPICS
+
+    monkeypatch.chdir(tmp_path)
+    rc = main(["docs"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    listed = {
+        line.split(" ", 1)[0]
+        for line in out.splitlines()
+        if line[:1].islower() and " " in line
+    }
+    assert listed == set(TOPICS)
+
+
+def test_fw_docs_topic_serves_package_data_verbatim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``fw docs <topic>`` writes the package-data page verbatim, resolved
+    from the installed package rather than the working directory."""
+    from flywheel._docs import render_topic
+
+    monkeypatch.chdir(tmp_path)
+    rc = main(["docs", "loop"])
+    assert rc == 0
+    assert capsys.readouterr().out == render_topic("loop")
+
+
+def test_fw_docs_unknown_topic_exits_two_naming_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unknown docs topic exits non-zero, names the topic on stderr, and
+    writes nothing to stdout."""
+    rc = main(["docs", "no-such-topic"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no-such-topic" in captured.err

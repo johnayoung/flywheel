@@ -1,0 +1,184 @@
+# Task Schema
+
+A task is the unit of work in flywheel. It describes the desired outcome and how to verify it.
+
+The schema is intentionally minimal: one required field (`goal`), the rest optional with sensible defaults. The agent plans its own approach — the task states the goal, not the procedure.
+
+## Required fields
+
+| Field     | Type     | Description                                                   |
+| --------- | -------- | ------------------------------------------------------------- |
+| `goal`    | string   | Desired outcome. 1-2 sentences. Must pass the one-sentence diff test. |
+
+## Optional fields
+
+| Field           | Type     | Default   | Description                                |
+| --------------- | -------- | --------- | ------------------------------------------ |
+| `graders`       | []Grader | `[]`      | Verification checks; all must pass for `done`. Empty = unverified run (`done` reflects the agent's own claim, nothing external is checked). |
+| `id`            | string   | `task-<uuid4 hex>` | Unique identifier, no whitespace           |
+| `tags`          | []string | `[]`      | Free-form labels for filtering and grouping |
+| `context`       | Context  | (empty)   | Briefing material the agent reads upfront  |
+
+Flywheel core owns the lifecycle of a *single* task, so the schema describes one task in isolation. Cross-task scheduling — the dependency DAG (`prerequisites`), phases, and queueing — is an **orchestration-layer** concern owned by consumers built on flywheel (e.g. `flywheel-orchestrator`), not part of the core `Task`. A consumer's task source may carry a `prerequisites` key; core ignores it, and the orchestrator parses it to schedule. Git workflow concerns (commit messages, branch naming) and loading concerns (files, queues, APIs) likewise live outside the schema.
+
+## Context
+
+A bundle of optional briefing fields. Provide none, one, or all. Use these to give the agent what it can't infer from the code; skip them when not needed.
+
+| Field         | Type     | Description                                                       |
+| ------------- | -------- | ----------------------------------------------------------------- |
+| `relevant`    | []string | Files, URLs, or doc paths the agent should consult upfront        |
+| `references`  | []string | Patterns to mirror or prior implementations to follow             |
+| `constraints` | []string | Hard rules the agent must respect (e.g. "don't change the public API") |
+| `non_goals`   | []string | Explicitly out-of-scope work                                      |
+| `edge_cases`  | []string | Non-obvious cases and known pitfalls                              |
+| `notes`       | string   | Free-form markdown for anything that doesn't fit above            |
+
+`relevant` is the single biggest lever for cutting context burn — pointing the agent at the right files saves it from reading the wrong ones.
+
+## Graders
+
+Each entry in `graders` is a typed object. The `type` field selects which other fields apply. A task is `done` only when every grader passes. Graders are binary — no partial credit, no weights. An empty `graders` list reaches `done` vacuously: an unverified run that trusts the agent's claim. Use it for exploratory work; add at least one grader the moment "done" must mean something checkable.
+
+In Python, `Grader` is a discriminated union of `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at construction, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON shape is unchanged: loaders dispatch on `type` to build the right variant.
+
+The harness runs graders cost-cheapest-first: `command` → `transcript` → `rubric` → `manual`. Within a type, list order is respected. A failure inside one type aborts the rest of that type and skips later (more expensive) types. `manual` graders are executed as a human-approval gate: when the automated types all pass, the harness finalizes the attempt `succeeded` and parks the lifecycle at `awaiting_approval` (one gate at a time, in `task.graders` order) instead of promoting to `done`. See [task-lifecycle.md](task-lifecycle.md) for the state and [loop.md](loop.md) for the `approve`/`reject` resolution model.
+
+### `command` — deterministic shell check
+
+The general workhorse. Tests, lint, typecheck, build, custom scripts, filesystem state checks (`test -f ...`, `grep -q ...`). Pass = exit 0.
+
+| Field  | Required | Description                         |
+| ------ | -------- | ----------------------------------- |
+| `run`  | yes      | Shell command to execute            |
+| `name` | no       | Short label for logs/UI attribution |
+
+```json
+{ "type": "command", "run": "uv run pytest tests/http", "name": "tests" }
+```
+
+**Security: a task file is executable code.** `run` is executed with
+`shell=True` in the agent's sandbox, inheriting the worker's full
+environment (including any API keys). Loading and running a task is
+equivalent to running its `run` strings as the worker. The grader's
+stdout/stderr are persisted verbatim and unredacted to the store and
+artifact files, so a `run` that prints secrets durably captures them.
+Only run task files you trust, and keep deployment secrets out of the
+worker's environment.
+
+### `rubric` — LLM-judged semantic check
+
+Natural-language assertions evaluated by a separate LLM call against the goal, diff, and execution artifacts. Use for intent-level checks that deterministic commands cannot express.
+
+| Field           | Required | Description                                                  |
+| --------------- | -------- | ------------------------------------------------------------ |
+| `assertions`    | yes      | List of natural-language statements; all must be judged true |
+| `rubric`        | no       | Path to a markdown file with extended judging guidance       |
+| `name`          | no       | Short label                                                  |
+| `judge_model`   | no       | Override `HarnessConfig.rubric_judge_model` for this grader  |
+| `retry_on_fail` | no       | Default `true`; when `false` a failing verdict routes to `INTERRUPTED` instead of `FAILED_VALIDATION` |
+
+```json
+{
+  "type": "rubric",
+  "assertions": [
+    "Retries on 5xx and timeout errors only",
+    "Respects max_retries config (default 3)"
+  ]
+}
+```
+
+### `manual` — human approval
+
+Declared human-approval gate. When the automated grader types all pass, the harness finalizes the attempt `succeeded` and parks the lifecycle at `awaiting_approval` on the first manual gate; an operator resolves each gate out-of-band via `flywheel approve RUN_ID` / `flywheel reject RUN_ID [--feedback TEXT]`. Approve advances to the next gate (or `done` if none remain); reject writes a `passed=false` receipt with the operator's feedback, routes the lifecycle to `failed_validation`, and the feedback flows into the next attempt's `# Reviewer feedback` prompt section. Pass = operator approves.
+
+| Field         | Required | Description                                |
+| ------------- | -------- | ------------------------------------------ |
+| `instruction` | yes      | What the operator should review and decide |
+| `name`        | no       | Short label                                |
+
+```json
+{ "type": "manual", "instruction": "Confirm jitter algorithm fits upstream rate limits" }
+```
+
+### `transcript` — path-level constraint
+
+Asserts against the run record rather than the produced outcome. The harness also enforces these as hard limits during execution, not only at grade time — `max_turns` will abort a runaway loop before the grader stage is reached.
+
+| Field              | Required | Description                              |
+| ------------------ | -------- | ---------------------------------------- |
+| `max_turns`        | no       | Maximum agent turns                      |
+| `max_total_tokens` | no       | Maximum cumulative tokens across the run |
+| `max_wall_seconds` | no       | Maximum wall-clock duration              |
+
+At least one constraint field must be set.
+
+```json
+{ "type": "transcript", "max_turns": 20 }
+```
+
+## Examples
+
+### Minimum viable
+
+Two fields. `id` is generated; everything else is omitted.
+
+```json
+{
+  "goal": "Add exponential backoff retry to the HTTP client.",
+  "graders": [
+    { "type": "command", "run": "uv run pytest tests/http" }
+  ]
+}
+```
+
+### Fully briefed
+
+```json
+{
+  "id": "add-retry-logic",
+  "goal": "HTTP client retries 5xx and timeout failures with exponential backoff and jitter.",
+  "prerequisites": ["setup-http-client"],
+  "tags": ["http", "reliability"],
+  "context": {
+    "relevant": [
+      "src/flywheel/http/client.py",
+      "src/flywheel/http/config.py"
+    ],
+    "references": [
+      "src/flywheel/db/retry.py — mirror this backoff structure"
+    ],
+    "constraints": [
+      "Use stdlib + existing deps; no new packages",
+      "Don't change ClientConfig's public surface beyond adding fields"
+    ],
+    "non_goals": [
+      "Don't touch tests outside tests/http",
+      "No changes to logging format"
+    ],
+    "edge_cases": [
+      "Respect Retry-After when the server provides it",
+      "Cap jitter at base_delay * 2 to avoid pathological backoff"
+    ]
+  },
+  "graders": [
+    { "type": "command",    "run": "uv run pytest tests/http",      "name": "tests" },
+    { "type": "command",    "run": "uv run ruff check .",           "name": "lint" },
+    { "type": "command",    "run": "uv run mypy src/flywheel/http", "name": "typecheck" },
+    { "type": "rubric",     "assertions": [
+        "Retries on 5xx and timeout errors only",
+        "Respects max_retries config (default 3)"
+    ]},
+    { "type": "transcript", "max_turns": 20 },
+    { "type": "manual",     "instruction": "Confirm jitter algorithm fits upstream rate limits" }
+  ]
+}
+```
+
+## Authoring discipline
+
+- **`goal` is the one-sentence diff test.** If the expected change doesn't fit in one sentence, the task is too large — split along architectural layers (migration, model, service, handler) and chain via `prerequisites`.
+- **Prefer `context.relevant` over agent discovery.** Files read is the real context cost.
+- **`graders` defines "done."** If you can't write one, you can't size the task — drop to an empty `graders` list only for deliberately unverified, exploratory runs.
+- **`context.notes` is the escape hatch, not the default.** Reach for it only when nothing structured fits.
+- **Don't prescribe procedure.** State the outcome; the agent plans the approach.

@@ -31,7 +31,8 @@
     "non_goals": [
       "Do not modify the content of any existing docs/*.md to make parity pass",
       "Do not weaken or delete existing tests; do not special-case topic names inside the parity test",
-      "Do not add an MCP server or any always-on context surface (spec 00072 D-1)"
+      "Do not add an MCP server or any always-on context surface (spec 00072 D-1)",
+      "Do not read or write under .flywheel/verification/"
     ],
     "edge_cases": [
       "A renamed or deleted source doc must fail the parity harness naming the topic (spec criterion 4)",

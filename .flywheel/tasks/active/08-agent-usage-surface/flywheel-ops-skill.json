@@ -32,7 +32,8 @@
     "non_goals": [
       "Do not modify the five existing skill templates' content",
       "Do not add or rename router verbs to make a skill reference real -- the skill conforms to the CLI, never the reverse",
-      "Do not weaken or delete existing tests"
+      "Do not weaken or delete existing tests",
+      "Do not read or write under .flywheel/verification/"
     ],
     "edge_cases": [
       "A verb mentioned in prose (e.g. 'fw show RUN_ID') must validate the verb token, not the placeholder argument",

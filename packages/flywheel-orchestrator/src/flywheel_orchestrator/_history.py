@@ -31,6 +31,13 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePath
 from typing import Protocol
 
+from flywheel_core.events import (
+    DomainEvent,
+    HeldOutGateEvaluated,
+    Landed,
+    LandingParked,
+    LandingRedriven,
+)
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.store_protocols import GraderResultRecord
 from flywheel_core.task import Task
@@ -140,6 +147,11 @@ class RunDetail:
     attempts: tuple[AttemptSummary, ...]
     grader_results: tuple[GraderResultRecord, ...]
     related_runs: tuple[HistoryRun, ...]
+    # Landing-stage decision records from the domain-event ledger (spec 00073):
+    # gate verdicts, parks, landings, redrives, in ascending-sequence order.
+    # Sourced from the store, never the telemetry file, so they survive JSONL
+    # deletion (criterion 8). Empty for a run with no landing decision.
+    decisions: tuple[DomainEvent, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -368,6 +380,49 @@ def resolve_run_id(store: _HistoryReadStore, run_or_task_id: str) -> str | None:
     return lifecycles[0].run_id if lifecycles else None
 
 
+# The landing-stage domain events the run-detail surface promotes to
+# first-class "decision" records: the held-out gate verdict, the land-park
+# witness, the positive landing, and the re-drive disposition. Every other
+# domain event (transitions, grader receipts, attempt bookkeeping) is already
+# surfaced through the lifecycle/attempts/grader_results projections, so the
+# decision list stays scoped to the trust decisions the loop took at land time.
+_LANDING_DECISION_TYPES: tuple[type[DomainEvent], ...] = (
+    HeldOutGateEvaluated,
+    LandingParked,
+    Landed,
+    LandingRedriven,
+)
+
+
+def _landing_decisions(
+    store: _HistoryReadStore, run_id: str
+) -> tuple[DomainEvent, ...]:
+    """Read the run's landing-stage decision records from the ledger.
+
+    Reads the authoritative domain-event ledger via the store's optional
+    ``list_domain_events`` and keeps only the landing-stage decision events
+    (:data:`_LANDING_DECISION_TYPES`), in ledger (ascending-sequence) order.
+    These decisions are appended to the store *after* the run finalized and
+    are never written to the run's telemetry file, so retrieval here survives
+    a deleted JSONL (spec 00073, criterion 8/D-5).
+
+    Best-effort and read-only, mirroring the audit stream's ledger projection:
+    a store without ``list_domain_events`` or a read that raises yields no
+    decisions — the ledger is authoritative and this list is a disposable
+    projection, so a lookup failure must never break the run-detail surface.
+    """
+    lister = getattr(store, "list_domain_events", None)
+    if lister is None:
+        return ()
+    try:
+        events = lister(run_id)
+    except Exception:  # noqa: BLE001 - a ledger read must not break show
+        return ()
+    return tuple(
+        event for event in events if isinstance(event, _LANDING_DECISION_TYPES)
+    )
+
+
 def collect_run_detail(
     store: _HistoryReadStore,
     run_id: str,
@@ -432,6 +487,7 @@ def collect_run_detail(
         attempts=attempts,
         grader_results=grader_results,
         related_runs=related,
+        decisions=_landing_decisions(store, run_id),
     )
 
 

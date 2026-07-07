@@ -40,11 +40,13 @@ from flywheel_core.harness import (
     RecheckOutcome,
     recheck_blocked_lifecycle,
 )
-from flywheel_core.events import LandingParked
+from flywheel_core.event_serde import event_kind, event_payload
+from flywheel_core.events import DomainEvent, LandingParked
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
-from flywheel_core.store_protocols import GraderResultRecord
+from flywheel_core.redaction import Redactor, default_policy
+from flywheel_core.store_protocols import EventRecord, GraderResultRecord
 from flywheel_core.store_sqlite import SqliteStore
 
 if TYPE_CHECKING:
@@ -1885,7 +1887,9 @@ def _cmd_history(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_run_detail(detail: RunDetail) -> None:
+def _print_run_detail(
+    detail: RunDetail, *, redactor: Redactor | None = None
+) -> None:
     run = detail.run
     print(f"task     : {run.task_id}")
     print(f"phase    : {detail.phase or '—'}")
@@ -1922,6 +1926,11 @@ def _print_run_detail(detail: RunDetail) -> None:
                     f"      {verdict}  {g.grader_type:<10} {name}  "
                     f"({g.duration_ms} ms)"
                 )
+    if detail.decisions:
+        print("decisions:")
+        for event in detail.decisions:
+            for line in _format_decision_lines(event, redactor):
+                print(line)
     if detail.agent_output:
         print("agent output:")
         print(detail.agent_output)
@@ -1945,7 +1954,95 @@ def _grader_result_to_dict(g: GraderResultRecord) -> dict[str, Any]:
     }
 
 
-def _run_detail_to_dict(detail: RunDetail) -> dict[str, Any]:
+def _decision_to_dict(
+    event: DomainEvent, redactor: Redactor | None
+) -> dict[str, Any]:
+    """Render one landing-stage decision event as a JSON-ready dict.
+
+    The event-specific payload (``event_payload``) carries the diagnosable
+    fields the spec names -- the gate ``outcome``/``receipts`` with each
+    grader's ``output_excerpt`` (00073 #1), a park's ``park_kind``/``detail``
+    (#2), a landing's ``strategy``/``landed_ref`` (#3), a redrive's ``result``
+    (#5) -- flattened onto the record beside a ``kind`` discriminator and the
+    ledger coordinates.
+
+    Redaction runs through the exact audit path: the payload is wrapped in an
+    :class:`EventRecord` and passed through ``redactor`` so every string leaf
+    (including a nested ``receipts[].output_excerpt``) is scrubbed by the same
+    rules the audit stream uses. ``redactor=None`` -- the ``--raw`` opt-out --
+    renders the stored value verbatim (00073 #10).
+    """
+    payload: dict[str, Any] = event_payload(event)
+    if redactor is not None:
+        redacted = redactor.redact(
+            EventRecord(
+                run_id=event.run_id,
+                ts=event.ts,
+                kind=event_kind(event),
+                payload=payload,
+                attempt_number=event.attempt_number,
+                sequence=event.sequence,
+            )
+        )
+        payload = dict(redacted.payload)
+    return {
+        "kind": event_kind(event),
+        "ts": event.ts.isoformat(),
+        "attempt_number": event.attempt_number,
+        "sequence": event.sequence,
+        **payload,
+    }
+
+
+def _format_decision_lines(
+    event: DomainEvent, redactor: Redactor | None
+) -> list[str]:
+    """Format one decision event as human-readable text lines.
+
+    Reuses :func:`_decision_to_dict` so the text view redacts identically to
+    the JSON view. The first line is a ``<kind>`` summary; a gate verdict adds
+    one indented line per executed grader carrying its (redacted) output
+    excerpt.
+    """
+    data = _decision_to_dict(event, redactor)
+    kind = data["kind"]
+    lines: list[str] = []
+    if kind == "held_out_gate_evaluated":
+        summary = f"  gate      {data.get('outcome', '')}"
+        reason = data.get("reason") or ""
+        if reason:
+            summary += f"  {_short(reason, 80)}"
+        lines.append(summary)
+        for receipt in data.get("receipts", []):
+            verdict = "pass" if receipt.get("passed") else "FAIL"
+            name = receipt.get("grader_name") or "(unnamed)"
+            excerpt = _short(str(receipt.get("output_excerpt", "")), 120)
+            lines.append(f"      {verdict}  {name}  {excerpt}")
+    elif kind == "landing_parked":
+        detail_text = data.get("detail") or ""
+        line = f"  parked    {data.get('park_kind', '')}"
+        if detail_text:
+            line += f"  {_short(detail_text, 80)}"
+        lines.append(line)
+    elif kind == "landed":
+        lines.append(
+            f"  landed    {data.get('strategy', '')}  "
+            f"{data.get('landed_ref', '')}"
+        )
+    elif kind == "landing_redriven":
+        park_kind = data.get("park_kind") or ""
+        line = f"  redriven  {data.get('result', '')}"
+        if park_kind:
+            line += f"  (was {park_kind})"
+        lines.append(line)
+    else:  # pragma: no cover - defensive over the closed decision set
+        lines.append(f"  {kind}")
+    return lines
+
+
+def _run_detail_to_dict(
+    detail: RunDetail, *, redactor: Redactor | None = None
+) -> dict[str, Any]:
     return {
         "run": _history_run_to_dict(detail.run),
         "phase": detail.phase,
@@ -1982,6 +2079,13 @@ def _run_detail_to_dict(detail: RunDetail) -> dict[str, Any]:
         "related_runs": [
             _history_run_to_dict(r) for r in detail.related_runs
         ],
+        # Landing-stage decisions from the ledger (00073): gate verdicts,
+        # parks, landings, redrives. Read from the store, so they survive
+        # telemetry-file loss (#8); secret-shaped values are redacted unless
+        # the caller opted into --raw (#10).
+        "decisions": [
+            _decision_to_dict(d, redactor) for d in detail.decisions
+        ],
     }
 
 
@@ -2005,10 +2109,18 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if detail is None:
         print(f"{args.run_or_task_id}: no run or task with that id")
         return 1
+    # Redaction is on by default (00073 #10): decision-record output excerpts
+    # pass through the same best-effort pattern set the audit surface uses.
+    # --raw opts back into verbatim output for authorized forensics.
+    redactor = None if args.raw else default_policy()
     if args.json:
-        print(json.dumps(_run_detail_to_dict(detail), indent=2))
+        print(
+            json.dumps(
+                _run_detail_to_dict(detail, redactor=redactor), indent=2
+            )
+        )
         return 0
-    _print_run_detail(detail)
+    _print_run_detail(detail, redactor=redactor)
     return 0
 
 
@@ -3463,6 +3575,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Emit machine-readable JSON instead of the text report.",
+    )
+    p_show.add_argument(
+        "--raw",
+        action="store_true",
+        help=(
+            "Disable redaction of decision-record output excerpts and emit "
+            "them verbatim as stored. On by default, decision output passes "
+            "through a best-effort secret-redaction policy; use --raw only "
+            "for authorized forensics on trusted output sinks."
+        ),
     )
     p_show.set_defaults(func=_cmd_show)
 

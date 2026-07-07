@@ -93,7 +93,7 @@ This repo's committed config sets `root = ".flywheel/verification/held-out"`, so
 
 The verdict lands on the in-process `RunRecord`: `gate: GateOutcome | None` and `gate_reason: str` (`_orchestrate.py:410-411`). This makes a gate-blocked land distinguishable from a clean land and from an agent-run failure — **only a gate-blocked land carries `status == DONE` with `gate is GateOutcome.FAIL`**. The verdict is also logged to the run stream as `[orchestrate] <task_id>: held-out landing gate {BLOCKED|passed} (<reason>)` for any outcome other than `NO_GATE` (`_orchestrate.py:1215`).
 
-The gate's verdict is recorded on the `RunRecord` only — it is not persisted into the lifecycle store and the held-out grader receipts are not added to the work-source report.
+Every evaluation — pass, fail, or `NO_GATE` — also appends a `HeldOutGateEvaluated` domain event to the run's ledger (`_record_held_out_gate_verdict`), so the verdict is diagnosable from the store alone via `list_domain_events(run_id)`, not only from the in-process `RunRecord`. The record carries the outcome, the reason, and one `GateGraderReceipt` per executed grader (name, `passed`, and a raw output tail capped at 8192 bytes per grader; redaction is a render-time concern). A `NO_GATE` record has empty receipts but is still a positive fact, distinct from no record at all. It is an audit witness: the run stays `DONE` and the gate decision is unchanged. A FAIL additionally appends the `held-out-gate` `LandingParked` witness. The receipts are not added to the work-source report.
 
 ## Authoring tie-in: write the oracle before the work
 

@@ -9,7 +9,9 @@ from flywheel_core.events import (
     CommandApplied,
     DomainEventKind,
     EventReplayError,
+    GateGraderReceipt,
     GraderEvaluated,
+    HeldOutGateEvaluated,
     LandingParked,
     LifecycleInitialized,
     RetryScheduled,
@@ -369,3 +371,134 @@ def test_landing_parked_round_trips_through_serde() -> None:
     )
     assert isinstance(restored, LandingParked)
     assert restored == event
+
+
+def test_held_out_gate_evaluated_kind_discriminator_is_stable() -> None:
+    assert (
+        HeldOutGateEvaluated.KIND
+        is DomainEventKind.HELD_OUT_GATE_EVALUATED
+    )
+    # Wire tag is the stable persisted discriminator.
+    assert (
+        DomainEventKind.HELD_OUT_GATE_EVALUATED.value
+        == "held_out_gate_evaluated"
+    )
+
+
+def test_held_out_gate_evaluated_folds_to_identity_leaving_terminal_done() -> None:
+    # The gate runs after the run finalized DONE; recording its verdict is an
+    # audit witness that advances version only and never moves off DONE (D-2).
+    done = replay(
+        [
+            _init(0),
+            TransitionedTo(run_id="run-1", ts=_ts(1), target=Status.READY),
+            TransitionedTo(run_id="run-1", ts=_ts(2), target=Status.RUNNING),
+            TransitionedTo(run_id="run-1", ts=_ts(3), target=Status.VALIDATING),
+            TransitionedTo(run_id="run-1", ts=_ts(4), target=Status.DONE),
+        ]
+    )
+    assert done.status is Status.DONE
+
+    evaluated = apply(
+        done,
+        HeldOutGateEvaluated(
+            run_id="run-1",
+            ts=_ts(5),
+            outcome="fail",
+            reason="held-out gate FAILED",
+            receipts=(
+                GateGraderReceipt(
+                    grader_name="oracle",
+                    passed=False,
+                    output_excerpt="boom\n",
+                ),
+            ),
+        ),
+    )
+    assert evaluated.status is Status.DONE
+    assert evaluated.version == done.version + 1
+
+
+def test_held_out_gate_evaluated_round_trips_through_serde() -> None:
+    event = HeldOutGateEvaluated(
+        run_id="run-9",
+        ts=_ts(5),
+        attempt_number=None,
+        outcome="fail",
+        reason="held-out gate FAILED: 2 of 2 grader(s) ran; [oracle-b] "
+        "exited exit_code=1",
+        receipts=(
+            GateGraderReceipt(
+                grader_name="oracle-a",
+                passed=True,
+                output_excerpt="all good\n",
+            ),
+            # A grader with no declared name and a distinct excerpt: the wire
+            # shape must round-trip a None name and preserve per-grader tails.
+            GateGraderReceipt(
+                grader_name=None,
+                passed=False,
+                output_excerpt="assertion failed\n",
+            ),
+        ),
+    )
+    assert event_kind(event) == "held_out_gate_evaluated"
+    payload = event_payload(event)
+    assert payload == {
+        "outcome": "fail",
+        "reason": "held-out gate FAILED: 2 of 2 grader(s) ran; [oracle-b] "
+        "exited exit_code=1",
+        "receipts": [
+            {
+                "grader_name": "oracle-a",
+                "passed": True,
+                "output_excerpt": "all good\n",
+            },
+            {
+                "grader_name": None,
+                "passed": False,
+                "output_excerpt": "assertion failed\n",
+            },
+        ],
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, HeldOutGateEvaluated)
+    assert restored == event
+
+
+def test_held_out_gate_evaluated_no_gate_round_trips_with_empty_receipts() -> None:
+    # A no-gate evaluation is a positive record with no receipts -- it must
+    # round-trip as a distinct, present fact (D-1).
+    event = HeldOutGateEvaluated(
+        run_id="run-9",
+        ts=_ts(6),
+        attempt_number=None,
+        outcome="no_gate",
+        reason="no held-out graders registered for this task",
+    )
+    payload = event_payload(event)
+    assert payload == {
+        "outcome": "no_gate",
+        "reason": "no held-out graders registered for this task",
+        "receipts": [],
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, HeldOutGateEvaluated)
+    assert restored == event
+    assert restored.receipts == ()

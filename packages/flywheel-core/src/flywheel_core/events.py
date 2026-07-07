@@ -48,6 +48,7 @@ class DomainEventKind(str, Enum):
     GRADER_EVALUATED = "grader_evaluated"
     COMMAND_APPLIED = "command_applied"
     LANDING_PARKED = "landing_parked"
+    HELD_OUT_GATE_EVALUATED = "held_out_gate_evaluated"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -248,6 +249,62 @@ class LandingParked(_DomainEventBase):
     detail: str = ""
 
 
+#: Per-grader output excerpt bound carried on a :class:`GateGraderReceipt`.
+#: The excerpt is a *tail* of the grader's captured output, capped at this many
+#: bytes and stored raw; redaction is a render-time concern, never applied at
+#: persist time (spec 00073, D-2). Mirrors the command-runner's stream tail
+#: bound so a receipt shows the same final content an operator would see.
+GATE_EXCERPT_MAX_BYTES: int = 8192
+
+
+@dataclass(frozen=True)
+class GateGraderReceipt:
+    """One executed held-out gate grader's receipt on a verdict record.
+
+    Carries the diagnosable minimum for a single grader the held-out landing
+    gate ran: its ``grader_name`` (``None`` for an unnamed grader), its
+    ``passed`` outcome, and a bounded ``output_excerpt`` -- a raw tail of the
+    grader's captured output capped at :data:`GATE_EXCERPT_MAX_BYTES` bytes
+    (spec 00073, criteria 1/11). The excerpt retains the *final* content when
+    the grader emitted more than the bound, so the reason a gate blocked is
+    visible from the store alone. Stored raw: redaction is applied at render
+    time, not persist time (D-2).
+    """
+
+    grader_name: str | None = None
+    passed: bool = False
+    output_excerpt: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class HeldOutGateEvaluated(_DomainEventBase):
+    """Records a held-out landing-gate evaluation's verdict on the run's ledger.
+
+    Emitted for *every* gate evaluation -- pass, fail, or no-gate (spec 00073,
+    D-1) -- so a gate-decided park is diagnosable from the store alone rather
+    than only from the in-process ``RunRecord``. An audit-witness event like
+    :class:`LandingParked`: the gate runs after the run already finalized
+    ``DONE`` and the harness owns lifecycle transitions, so this event's fold is
+    the identity (it advances ``version`` only and performs no state change).
+
+    ``outcome`` is the terminal gate outcome's stable wire value
+    (``"no_gate"`` / ``"pass"`` / ``"fail"``) -- a plain string because the gate
+    engine's ``GateOutcome`` enum lives in the orchestrator, downstream of this
+    pure module. ``reason`` mirrors the verdict's operator-readable summary.
+    ``receipts`` carries one :class:`GateGraderReceipt` per executed held-out
+    grader in execution order: populated for ``pass``/``fail`` verdicts, empty
+    for ``no_gate`` and for a load-time fail-closed where no grader ran. A
+    ``no_gate`` record with empty receipts is still distinguishable from *no
+    record at all* -- the evaluation happened and found nothing to gate.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.HELD_OUT_GATE_EVALUATED
+
+    outcome: str
+    reason: str = ""
+    receipts: tuple[GateGraderReceipt, ...] = ()
+
+
 # Landing-park cause vocabulary. Every site that suppresses a land -- the merge
 # and PR protected-path refusals, a failed push / PR open, a swallowed submit
 # error, and the held-out landing gate -- names its cause with one of these
@@ -289,6 +346,7 @@ DomainEvent = (
     | GraderEvaluated
     | CommandApplied
     | LandingParked
+    | HeldOutGateEvaluated
 )
 
 
@@ -396,7 +454,14 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
         new.session_id = event.session_id
     elif isinstance(
         event,
-        (Unblocked, RetryScheduled, GraderEvaluated, CommandApplied, LandingParked),
+        (
+            Unblocked,
+            RetryScheduled,
+            GraderEvaluated,
+            CommandApplied,
+            LandingParked,
+            HeldOutGateEvaluated,
+        ),
     ):
         # Identity fold: these carry audit intent or project a separate table.
         # They still advance version as members of the domain-event sequence.

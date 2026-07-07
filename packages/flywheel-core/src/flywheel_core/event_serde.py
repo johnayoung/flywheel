@@ -27,7 +27,9 @@ from flywheel_core.events import (
     CommandApplied,
     DomainEvent,
     DomainEventKind,
+    GateGraderReceipt,
     GraderEvaluated,
+    HeldOutGateEvaluated,
     LandingParked,
     LifecycleInitialized,
     RetryScheduled,
@@ -105,6 +107,19 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
         }
     if isinstance(event, LandingParked):
         return {"park_kind": event.park_kind, "detail": event.detail}
+    if isinstance(event, HeldOutGateEvaluated):
+        return {
+            "outcome": event.outcome,
+            "reason": event.reason,
+            "receipts": [
+                {
+                    "grader_name": receipt.grader_name,
+                    "passed": receipt.passed,
+                    "output_excerpt": receipt.output_excerpt,
+                }
+                for receipt in event.receipts
+            ],
+        }
     raise TypeError(f"cannot serialize unknown domain event {type(event)!r}")
 
 
@@ -201,6 +216,20 @@ def event_from_record(
         return LandingParked(
             park_kind=payload["park_kind"],
             detail=payload.get("detail", ""),
+            **common,
+        )
+    if event_kind_enum is DomainEventKind.HELD_OUT_GATE_EVALUATED:
+        return HeldOutGateEvaluated(
+            outcome=payload["outcome"],
+            reason=payload.get("reason", ""),
+            receipts=tuple(
+                GateGraderReceipt(
+                    grader_name=receipt.get("grader_name"),
+                    passed=receipt["passed"],
+                    output_excerpt=receipt.get("output_excerpt", ""),
+                )
+                for receipt in payload.get("receipts", [])
+            ),
             **common,
         )
     raise ValueError(f"unknown domain event kind {kind!r}")

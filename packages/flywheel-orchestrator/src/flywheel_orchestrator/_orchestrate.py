@@ -67,8 +67,11 @@ from flywheel_core.harness import (
     resolve_manual_approval,
 )
 from flywheel_core.events import (
+    GATE_EXCERPT_MAX_BYTES,
     LANDING_PARK_KINDS,
     PARK_KIND_HELD_OUT_GATE,
+    GateGraderReceipt,
+    HeldOutGateEvaluated,
     LandingParked,
 )
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
@@ -2838,6 +2841,85 @@ def _record_held_out_gate_park(
             )
 
 
+def _gate_grader_excerpt(
+    payload: Mapping[str, Any], *, bound: int = GATE_EXCERPT_MAX_BYTES
+) -> str:
+    """Build one held-out grader's bounded output tail for a verdict receipt.
+
+    Combines the command grader's captured stdout/stderr tails (and a spawn
+    error, when the subprocess never started) into one raw excerpt, then re-caps
+    it to ``bound`` bytes as a *tail* so the final content survives when a grader
+    emitted more than the bound (spec 00073, criterion 11). The per-stream tails
+    the runner captures are each already bounded, so the common single-stream
+    case passes through unchanged. Stored raw: no redaction here -- that is a
+    render-time concern (spec 00073, D-2).
+    """
+    segments: list[str] = []
+    for key in ("stdout_tail", "stderr_tail", "spawn_error"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            segments.append(value)
+    combined = "\n".join(segments)
+    encoded = combined.encode("utf-8")
+    if len(encoded) <= bound:
+        return combined
+    return encoded[-bound:].decode("utf-8", errors="replace")
+
+
+def _record_held_out_gate_verdict(
+    control: SqliteStore | PostgresStore,
+    *,
+    run_id: str,
+    verdict: GateVerdict,
+    task_id: str,
+    stream: TextIO | None,
+) -> None:
+    """Append a :class:`HeldOutGateEvaluated` verdict record to the run's ledger.
+
+    Emitted for EVERY gate evaluation -- pass, fail, or no-gate (spec 00073,
+    D-1) -- carrying the outcome, the operator-readable reason, and one
+    :class:`GateGraderReceipt` per executed held-out grader (its name, outcome,
+    and bounded raw output tail). This persists the verdict that otherwise lived
+    only on the in-process ``RunRecord``, so a gate-decided park is diagnosable
+    from the store alone. Audit-witness only: ``HeldOutGateEvaluated`` folds to
+    the identity and only advances ``version`` -- the run stays ``Status.DONE``
+    and the gate decision (what lands, blocks, or fails closed) is untouched
+    (D-2). Best-effort: a missing lifecycle or any store error is logged to
+    ``stream`` and swallowed so the orchestrate loop never unwinds on a
+    recording failure.
+    """
+    try:
+        lifecycle = control.load_lifecycle(run_id)
+        if lifecycle is None:
+            return
+        receipts = tuple(
+            GateGraderReceipt(
+                grader_name=record.grader_name,
+                passed=record.passed,
+                output_excerpt=_gate_grader_excerpt(record.payload),
+            )
+            for record in verdict.results
+        )
+        control.append_domain_event(
+            HeldOutGateEvaluated(
+                run_id=run_id,
+                ts=_utcnow(),
+                outcome=verdict.outcome.value,
+                reason=verdict.reason,
+                receipts=receipts,
+            ),
+            expected_version=lifecycle.version,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort audit witness
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: failed to record held-out-gate "
+                f"verdict event ({type(exc).__name__}: {exc})",
+                file=stream,
+                flush=True,
+            )
+
+
 async def _drive_under_lease(
     control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
@@ -3045,6 +3127,21 @@ async def _drive_under_lease(
                     file=stream,
                     flush=True,
                 )
+        if gate is not None:
+            # Persist the gate verdict for EVERY evaluation -- pass, fail, or
+            # no-gate (spec 00073, D-1) -- so the decision and its per-grader
+            # receipts (name, outcome, bounded output tail) are diagnosable from
+            # the store alone, not only from the in-process RunRecord. Recorded
+            # before the park witness below so a blocked run carries both the
+            # verdict record and the landing-parked fact. Audit-witness only:
+            # this never changes whether the land is suppressed (D-2).
+            _record_held_out_gate_verdict(
+                control,
+                run_id=outcome.lifecycle.run_id,
+                verdict=gate,
+                task_id=task_id,
+                stream=stream,
+            )
         gate_blocked = gate is not None and gate.blocks_landing
         if gate is not None and gate.blocks_landing:
             # The gate FAILed and is suppressing the land (submit is not called

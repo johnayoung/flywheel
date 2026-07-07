@@ -39,6 +39,7 @@ from flywheel_core.envelope import (
     parse_envelope,
 )
 from flywheel_core.events import (
+    GATE_EXCERPT_MAX_BYTES,
     AttemptFinalized,
     AttemptStarted,
     Blocked,
@@ -46,7 +47,9 @@ from flywheel_core.events import (
     DomainEvent,
     DomainEventKind,
     EventReplayError,
+    GateGraderReceipt,
     GraderEvaluated,
+    HeldOutGateEvaluated,
     LandingParked,
     LifecycleInitialized,
     RetryScheduled,
@@ -197,7 +200,10 @@ def hello() -> str:
 
 __all__ = [
     "Attempt",
+    "GATE_EXCERPT_MAX_BYTES",
+    "GateGraderReceipt",
     "GraderEvaluated",
+    "HeldOutGateEvaluated",
     "LandingParked",
     "AttemptFinalized",
     "AttemptStarted",

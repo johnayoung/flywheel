@@ -1,0 +1,43 @@
+{
+  "id": "redrive-gate-reevaluation",
+  "goal": "A re-driven landing completes only after a fresh held-out gate evaluation passes against the content landing, with gate failures re-parking, counting toward the redrive bound, and failing closed, while ungated redrives land exactly as today.",
+  "tags": ["spec-00074", "redrive-gate-integrity"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redrive_gate_reevaluation.py -q" },
+    { "type": "command", "name": "redriver-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_landing.py packages/flywheel-orchestrator/tests/test_redriver_queue.py -q" },
+    { "type": "command", "name": "gate-suite", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_held_out_gate.py packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py packages/flywheel-orchestrator/tests/test_gate_verdict_record.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- redrive_parked_landings and the landing-gate evaluation seam; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- evaluate_held_out_gate / GateVerdict (read-only reference)",
+      "packages/flywheel-orchestrator/tests/test_redriver_landing.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_redriver_queue.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_gate_verdict_record.py -- keep green; the re-evaluation must flow through this same record path"
+    ],
+    "references": [
+      ".flywheel/specs/00074-FEATURE-redrive-gate-integrity.md -- criteria 1-7; decisions D-1, D-2",
+      ".flywheel/audits/00073-run-decision-record-verify.md -- execution addendum: the live bypass this closes"
+    ],
+    "constraints": [
+      "Every landing re-attempt gets a fresh gate evaluation (spec D-1), reusing the same evaluation and verdict-record path as first attempts (spec D-2) -- do not fork a second evaluation path",
+      "If the redrive entry point's signature changes, update every caller and test in this same change",
+      "Gate evaluation errors fail closed on the re-attempt path exactly as on the first attempt",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not change what the gate checks, the registration format, or the human-review queue mechanics",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A gate failure on a re-attempt must consume a redrive-bound attempt and route to human review at the bound (criterion 7)",
+      "An unexecutable oracle at redrive time must not land (criterion 5)",
+      "A redrive with no held-out source configured must behave byte-for-byte as today (criterion 6)",
+      "The fresh verdict record must carry the re-evaluation's own grader output -- reusing the first evaluation's record must fail the behavior test (criterion 3)"
+    ]
+  }
+}

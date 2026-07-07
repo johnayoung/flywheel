@@ -1,0 +1,43 @@
+{
+  "id": "park-output-excerpts",
+  "goal": "A landing parked by the standing build invariant or by failing post-rebase re-verification carries the deciding check's output excerpt in its park record, on both the merge and PR land paths.",
+  "tags": ["spec-00074", "redrive-gate-integrity"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_park_output_excerpts.py -q" },
+    { "type": "command", "name": "parks-unchanged", "run": "uv run pytest packages/flywheel-worktree/tests/test_submit_standing_verify.py packages/flywheel-worktree/tests/test_pr_strategy.py -q" },
+    { "type": "command", "name": "landing-suite", "run": "uv run pytest packages/flywheel-worktree/tests/test_landing_record.py -q" },
+    { "type": "command", "name": "events-serde", "run": "uv run pytest packages/flywheel-core/tests/test_events.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-worktree" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- standing-verify and post-rebase re-verification park sites and the in-memory re-verify receipts; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- the PR land path's standing-verify park",
+      "packages/flywheel-core/src/flywheel_core/events.py -- the LandingParked payload and the excerpt shape shipped by spec 00073; reuse it, do not fork",
+      "packages/flywheel-core/src/flywheel_core/event_serde.py -- round-trip any payload extension in this same change",
+      "packages/flywheel-worktree/tests/test_submit_standing_verify.py -- keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_pr_strategy.py -- keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_landing_record.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00074-FEATURE-redrive-gate-integrity.md -- criteria 8-10; decision D-3",
+      ".flywheel/audits/00073-run-decision-record-verify.md -- finding 2: standing-verify parks carry a fixed message today"
+    ],
+    "constraints": [
+      "Reuse the 00073 excerpt format: tail capped at 8192 bytes per check, stored raw, redaction applied at render time (spec D-3)",
+      "Both land paths (merge FF and PR) carry the output on their standing-verify parks",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change which conditions park or any park kind string",
+      "Do not touch CLI rendering; the 00073 decision surfaces already render park payloads",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A park carrying only the existing fixed message must fail the behavior test -- assert on real check output content",
+      "Non-check parks (uncommitted-work, protected-paths, push-failed, submit-error, rebase-conflict) are byte-for-byte unchanged",
+      "Output exceeding the bound persists a truncated tail retaining the final content; a secret-shaped value renders redacted by default (criterion 10)"
+    ]
+  }
+}

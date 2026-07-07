@@ -220,6 +220,37 @@ class CommandApplied(_DomainEventBase):
     command_id: int | None = None
 
 
+#: Per-grader output excerpt bound carried on a :class:`GateGraderReceipt`.
+#: The excerpt is a *tail* of the grader's captured output, capped at this many
+#: bytes and stored raw; redaction is a render-time concern, never applied at
+#: persist time (spec 00073, D-2). Mirrors the command-runner's stream tail
+#: bound so a receipt shows the same final content an operator would see.
+GATE_EXCERPT_MAX_BYTES: int = 8192
+
+
+@dataclass(frozen=True)
+class GateGraderReceipt:
+    """One executed check's receipt on a decision record.
+
+    Carries the diagnosable minimum for a single check: its ``grader_name``
+    (``None`` for an unnamed check), its ``passed`` outcome, and a bounded
+    ``output_excerpt`` -- a raw tail of the check's captured output capped at
+    :data:`GATE_EXCERPT_MAX_BYTES` bytes (spec 00073, criteria 1/11). The
+    excerpt retains the *final* content when the check emitted more than the
+    bound, so the reason a decision was taken is visible from the store alone.
+    Stored raw: redaction is applied at render time, not persist time (D-2).
+
+    Reused by the held-out landing gate's :class:`HeldOutGateEvaluated` verdict
+    and by a grader-decided :class:`LandingParked` record (the ``[submit]
+    verify`` standing build invariant or a post-rebase re-verification), so both
+    surface a deciding check's output through one shape.
+    """
+
+    grader_name: str | None = None
+    passed: bool = False
+    output_excerpt: str = ""
+
+
 @dataclass(frozen=True, kw_only=True)
 class LandingParked(_DomainEventBase):
     """Records that a DONE run's branch could not be landed at submit time and
@@ -243,12 +274,21 @@ class LandingParked(_DomainEventBase):
     open the pull request), or ``"submit-error"`` (the submit step raised and the
     exception was swallowed, leaving the worktree parked). ``detail`` is a
     human-readable reason, queryable via ``list_domain_events(run_id)``.
+
+    ``receipts`` carries the deciding check's output for a park a grader
+    decided -- the ``[submit] verify`` standing build invariant
+    (``"standing-verify"``) or a post-rebase re-verification (``"divergent-base"``
+    after the rebase re-run) -- one :class:`GateGraderReceipt` per executed check,
+    reusing the 00073 excerpt shape (a raw tail capped at
+    :data:`GATE_EXCERPT_MAX_BYTES`, redacted at render time). Empty for every
+    other park kind, whose cause is fully carried by ``park_kind`` / ``detail``.
     """
 
     KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDING_PARKED
 
     park_kind: str
     detail: str = ""
+    receipts: tuple[GateGraderReceipt, ...] = ()
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -308,33 +348,6 @@ class LandingRedriven(_DomainEventBase):
 
     result: str
     park_kind: str = ""
-
-
-#: Per-grader output excerpt bound carried on a :class:`GateGraderReceipt`.
-#: The excerpt is a *tail* of the grader's captured output, capped at this many
-#: bytes and stored raw; redaction is a render-time concern, never applied at
-#: persist time (spec 00073, D-2). Mirrors the command-runner's stream tail
-#: bound so a receipt shows the same final content an operator would see.
-GATE_EXCERPT_MAX_BYTES: int = 8192
-
-
-@dataclass(frozen=True)
-class GateGraderReceipt:
-    """One executed held-out gate grader's receipt on a verdict record.
-
-    Carries the diagnosable minimum for a single grader the held-out landing
-    gate ran: its ``grader_name`` (``None`` for an unnamed grader), its
-    ``passed`` outcome, and a bounded ``output_excerpt`` -- a raw tail of the
-    grader's captured output capped at :data:`GATE_EXCERPT_MAX_BYTES` bytes
-    (spec 00073, criteria 1/11). The excerpt retains the *final* content when
-    the grader emitted more than the bound, so the reason a gate blocked is
-    visible from the store alone. Stored raw: redaction is applied at render
-    time, not persist time (D-2).
-    """
-
-    grader_name: str | None = None
-    passed: bool = False
-    output_excerpt: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)

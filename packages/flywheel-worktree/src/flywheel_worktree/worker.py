@@ -65,10 +65,12 @@ from flywheel_core import (
     run_command_graders,
 )
 from flywheel_core.events import (
+    GATE_EXCERPT_MAX_BYTES,
     LANDING_STRATEGY_MERGE,
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_SUBMIT_ERROR,
     DomainEvent,
+    GateGraderReceipt,
     Landed,
     LandingParked,
 )
@@ -238,6 +240,35 @@ def phase_of_task_file(task_file: Path, tasks_dir: Path) -> str:
 
 
 # --- git submit strategy ----------------------------------------------------
+
+
+def _bounded_output_excerpt(
+    *segments: str, bound: int = GATE_EXCERPT_MAX_BYTES
+) -> str:
+    """Combine a deciding check's captured output into one raw tail bounded to
+    ``bound`` bytes, mirroring the held-out gate's excerpt builder (spec 00073,
+    criterion 11): non-empty segments join with newlines, then the combined
+    text is re-capped as a *tail* so the final content survives when the check
+    emitted more than the bound. Stored raw -- redaction is a render-time
+    concern, never applied here (spec 00074, D-3 / spec 00073, D-2)."""
+    combined = "\n".join(s for s in segments if s)
+    encoded = combined.encode("utf-8")
+    if len(encoded) <= bound:
+        return combined
+    return encoded[-bound:].decode("utf-8", errors="replace")
+
+
+def _payload_excerpt(payload: Mapping[str, object]) -> str:
+    """Bounded output tail for a re-verify command grader's receipt, read from
+    the same ``stdout_tail`` / ``stderr_tail`` / ``spawn_error`` payload keys
+    the command runner records (identical to the held-out gate's source)."""
+    segments = [
+        value
+        for key in ("stdout_tail", "stderr_tail", "spawn_error")
+        for value in (payload.get(key),)
+        if isinstance(value, str) and value
+    ]
+    return _bounded_output_excerpt(*segments)
 
 
 class _ReverifyRecorder:
@@ -672,7 +703,10 @@ class GitWorktreeSubmitter:
             # Under the merge lock the base cannot move, so this ancestry check
             # predicts the FF outcome exactly.
             if self._is_ancestor(self.phase_base, branch):
-                if not self._standing_verify(req, worktree):
+                verify_passed, verify_receipts = self._standing_verify(
+                    req, worktree
+                )
+                if not verify_passed:
                     self.log(
                         f"standing verify failed for {branch}; refusing to "
                         f"merge, parking worktree at {worktree}"
@@ -685,6 +719,7 @@ class GitWorktreeSubmitter:
                             f"([submit] verify) against the tree it would land; "
                             f"worktree preserved at {worktree}"
                         ),
+                        receipts=verify_receipts,
                     )
                     return
                 if self._ff_merge(branch):
@@ -722,15 +757,34 @@ class GitWorktreeSubmitter:
                     ),
                 )
                 return
-            if not self._reverify(req, worktree):
+            reverify_passed, reverify_receipts = self._reverify(req, worktree)
+            if not reverify_passed:
                 self.log(
                     f"post-rebase re-verification failed for {branch}; "
                     f"parking worktree at {worktree}"
                 )
+                # A failed re-verify is a divergent-base park: the branch cannot
+                # land because it no longer verifies against the advanced base
+                # it rebased onto. Record the deciding graders' output so the
+                # park is diagnosable from the store alone (spec 00074).
+                self._record_landing_park(
+                    req.run_id,
+                    park_kind="divergent-base",
+                    detail=(
+                        f"{branch} failed post-rebase re-verification against "
+                        f"the advanced {self.phase_base}; its command graders no "
+                        f"longer pass on the rebased tree; worktree preserved at "
+                        f"{worktree}"
+                    ),
+                    receipts=reverify_receipts,
+                )
                 return
             # The rebased worktree is now the exact post-merge tree: gate it on
             # the standing build invariant before the FF, same as the clean path.
-            if not self._standing_verify(req, worktree):
+            verify_passed, verify_receipts = self._standing_verify(
+                req, worktree
+            )
+            if not verify_passed:
                 self.log(
                     f"post-rebase standing verify failed for {branch}; "
                     f"parking worktree at {worktree}"
@@ -743,6 +797,7 @@ class GitWorktreeSubmitter:
                         f"([submit] verify) against the rebased tree it would "
                         f"land; worktree preserved at {worktree}"
                     ),
+                    receipts=verify_receipts,
                 )
                 return
             if self._ff_merge(branch):
@@ -808,7 +863,9 @@ class GitWorktreeSubmitter:
             )
         ]
 
-    def _reverify(self, req: SubmitRequest, worktree: Path) -> bool:
+    def _reverify(
+        self, req: SubmitRequest, worktree: Path
+    ) -> tuple[bool, tuple[GateGraderReceipt, ...]]:
         """Re-run the task's command graders against the rebased tree.
 
         A submit-time rebase moves the work onto a base the in-run graders
@@ -821,6 +878,12 @@ class GitWorktreeSubmitter:
         graders judge the agent's work, not the tree, and stay valid across
         a clean rebase; a task with no command graders has nothing
         tree-dependent to re-check.
+
+        Returns the pass/fail verdict paired with one :class:`GateGraderReceipt`
+        per re-run command grader (name, outcome, bounded output tail), so a
+        park the failing re-verification decides can carry the deciding check's
+        output in its record (spec 00074). No command graders => passes with no
+        receipts.
         """
         command_count = sum(
             isinstance(g, CommandGrader) for g in req.task.graders
@@ -830,7 +893,7 @@ class GitWorktreeSubmitter:
                 f"{req.task_id} has no command graders; nothing to re-verify "
                 f"after rebase"
             )
-            return True
+            return True, ()
         records = run_command_graders(
             req.task,
             _ReverifyRecorder(),
@@ -841,6 +904,7 @@ class GitWorktreeSubmitter:
             cwd=worktree,
             env=self.grader_env,
         )
+        receipts: list[GateGraderReceipt] = []
         for record in records:
             label = record.grader_name or str(record.grader_spec.get("run", ""))
             verdict = "pass" if record.passed else "FAIL"
@@ -848,7 +912,17 @@ class GitWorktreeSubmitter:
                 f"re-verify {req.task_id}: {verdict} [{label}] "
                 f"({record.duration_ms}ms)"
             )
-        return len(records) == command_count and all(r.passed for r in records)
+            receipts.append(
+                GateGraderReceipt(
+                    grader_name=record.grader_name or label,
+                    passed=record.passed,
+                    output_excerpt=_payload_excerpt(record.payload),
+                )
+            )
+        passed = len(records) == command_count and all(
+            r.passed for r in records
+        )
+        return passed, tuple(receipts)
 
     def _is_ancestor(self, ancestor: str, rev: str) -> bool:
         """True when ``ancestor`` is reachable from ``rev`` -- i.e. a
@@ -864,7 +938,9 @@ class GitWorktreeSubmitter:
             == 0
         )
 
-    def _standing_verify(self, req: SubmitRequest, worktree: Path) -> bool:
+    def _standing_verify(
+        self, req: SubmitRequest, worktree: Path
+    ) -> tuple[bool, tuple[GateGraderReceipt, ...]]:
         """Run the policy's standing build invariant (``[submit] verify``,
         spec 00064) against the exact tree about to become the base.
 
@@ -875,9 +951,15 @@ class GitWorktreeSubmitter:
         per-task graders run in isolation cannot. Unset (``None``) => no gate.
         Runs with ``grader_env`` exactly as :meth:`_reverify` runs graders so the
         build shares the same cache/toolchain. A non-zero exit returns ``False``
-        (the caller parks); the command never raises into :meth:`submit`."""
+        (the caller parks); the command never raises into :meth:`submit`.
+
+        Returns the pass/fail verdict paired with a single
+        :class:`GateGraderReceipt` capturing the command, its outcome, and a
+        bounded tail of its combined stdout/stderr, so the park a failing gate
+        decides carries the deciding check's output in its record (spec 00074).
+        Unset gate => passes with no receipt."""
         if self.verify_command is None:
-            return True
+            return True, ()
         self.log(
             f"standing verify for {req.task_id}: {self.verify_command!r} in "
             f"{worktree}"
@@ -891,13 +973,21 @@ class GitWorktreeSubmitter:
             capture_output=True,
             check=False,
         )
-        if proc.returncode != 0:
+        passed = proc.returncode == 0
+        if not passed:
             tail = (proc.stderr or proc.stdout).strip()[-2000:]
             self.log(
                 f"standing verify FAILED (exit {proc.returncode}) for "
                 f"{req.task_id}: {tail}"
             )
-        return proc.returncode == 0
+        receipt = GateGraderReceipt(
+            grader_name=self.verify_command,
+            passed=passed,
+            output_excerpt=_bounded_output_excerpt(
+                proc.stdout or "", proc.stderr or ""
+            ),
+        )
+        return passed, (receipt,)
 
     def _commit_count(self, branch: str) -> int:
         res = _git(
@@ -987,7 +1077,12 @@ class GitWorktreeSubmitter:
         )
 
     def _record_landing_park(
-        self, run_id: str, *, park_kind: str, detail: str
+        self,
+        run_id: str,
+        *,
+        park_kind: str,
+        detail: str,
+        receipts: tuple[GateGraderReceipt, ...] = (),
     ) -> None:
         """Append a queryable ``LANDING_PARKED`` audit-witness event for a
         parked DONE run (``park_kind`` is one of
@@ -1001,6 +1096,13 @@ class GitWorktreeSubmitter:
         status stays ``DONE`` and only ``version`` advances. Best-effort: a
         missing store handle or any store error is logged, never raised, so
         ``submit()`` cannot escape into orchestrate (criterion 7).
+
+        ``receipts`` carries the deciding check's bounded output for a park a
+        grader decided -- the standing build invariant or a failing post-rebase
+        re-verification (spec 00074) -- and is empty for every other cause,
+        whose reason ``park_kind`` / ``detail`` already carry. Shared by both
+        the merge strategy and the PR subclass that inherits this method, so a
+        grader-decided park carries the same output on either land path.
 
         The append is an authoritative ledger write, so it is gated by the
         disk/inode preflight first: when free space or inodes are below
@@ -1028,6 +1130,7 @@ class GitWorktreeSubmitter:
                     ts=datetime.now(timezone.utc),
                     park_kind=park_kind,
                     detail=detail,
+                    receipts=receipts,
                 ),
                 expected_version=lifecycle.version,
             )

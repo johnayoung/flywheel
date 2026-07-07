@@ -108,7 +108,22 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
             "command_id": event.command_id,
         }
     if isinstance(event, LandingParked):
-        return {"park_kind": event.park_kind, "detail": event.detail}
+        parked: dict[str, Any] = {
+            "park_kind": event.park_kind,
+            "detail": event.detail,
+        }
+        # Emitted only when a check decided the park, so a park with no
+        # receipts round-trips to the original two-key payload unchanged.
+        if event.receipts:
+            parked["receipts"] = [
+                {
+                    "grader_name": receipt.grader_name,
+                    "passed": receipt.passed,
+                    "output_excerpt": receipt.output_excerpt,
+                }
+                for receipt in event.receipts
+            ]
+        return parked
     if isinstance(event, Landed):
         return {"strategy": event.strategy, "landed_ref": event.landed_ref}
     if isinstance(event, LandingRedriven):
@@ -222,6 +237,14 @@ def event_from_record(
         return LandingParked(
             park_kind=payload["park_kind"],
             detail=payload.get("detail", ""),
+            receipts=tuple(
+                GateGraderReceipt(
+                    grader_name=receipt.get("grader_name"),
+                    passed=receipt["passed"],
+                    output_excerpt=receipt.get("output_excerpt", ""),
+                )
+                for receipt in payload.get("receipts", [])
+            ),
             **common,
         )
     if event_kind_enum is DomainEventKind.LANDED:

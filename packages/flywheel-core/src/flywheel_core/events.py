@@ -48,6 +48,7 @@ class DomainEventKind(str, Enum):
     GRADER_EVALUATED = "grader_evaluated"
     COMMAND_APPLIED = "command_applied"
     LANDING_PARKED = "landing_parked"
+    LANDED = "landed"
     HELD_OUT_GATE_EVALUATED = "held_out_gate_evaluated"
 
 
@@ -249,6 +250,34 @@ class LandingParked(_DomainEventBase):
     detail: str = ""
 
 
+@dataclass(frozen=True, kw_only=True)
+class Landed(_DomainEventBase):
+    """Records that a DONE run's branch actually landed at submit time, carrying
+    the landed reference.
+
+    The success counterpart to :class:`LandingParked`: appended only *after* the
+    land completes -- a fast-forward merge into the base or an opened pull
+    request -- so an incomplete land (parked, errored, or suppressed) leaves no
+    :class:`Landed` record. An audit-witness event like :class:`LandingParked`:
+    landing happens after the run already finalized ``DONE``, the harness owns
+    lifecycle transitions, and ``DONE`` is terminal -- so this event's fold is
+    the identity (it advances ``version`` only and performs no state change).
+    The run stays ``Status.DONE``.
+
+    ``strategy`` names the submit strategy that landed the work (see
+    :data:`LANDING_STRATEGIES`): ``"merge"`` for a fast-forward merge or ``"pr"``
+    for an opened pull request. ``landed_ref`` is the corresponding reference --
+    the landed commit sha (the base head the merge advanced to) for a merge land,
+    the pull-request identifier for a PR land -- queryable via
+    ``list_domain_events(run_id)``.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDED
+
+    strategy: str
+    landed_ref: str
+
+
 #: Per-grader output excerpt bound carried on a :class:`GateGraderReceipt`.
 #: The excerpt is a *tail* of the grader's captured output, capped at this many
 #: bytes and stored raw; redaction is a render-time concern, never applied at
@@ -333,6 +362,21 @@ LANDING_PARK_KINDS: frozenset[str] = frozenset(
 )
 
 
+# Landing-strategy vocabulary carried on a :class:`Landed` record's ``strategy``
+# field. Each successful land site names itself with one of these stable
+# spellings, kept identical across the merge worker and the PR strategy so a
+# single reader can tell a landed commit sha from a landed PR identifier.
+LANDING_STRATEGY_MERGE = "merge"
+LANDING_STRATEGY_PR = "pr"
+
+LANDING_STRATEGIES: frozenset[str] = frozenset(
+    {
+        LANDING_STRATEGY_MERGE,
+        LANDING_STRATEGY_PR,
+    }
+)
+
+
 DomainEvent = (
     LifecycleInitialized
     | TransitionedTo
@@ -346,6 +390,7 @@ DomainEvent = (
     | GraderEvaluated
     | CommandApplied
     | LandingParked
+    | Landed
     | HeldOutGateEvaluated
 )
 
@@ -460,6 +505,7 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
             GraderEvaluated,
             CommandApplied,
             LandingParked,
+            Landed,
             HeldOutGateEvaluated,
         ),
     ):

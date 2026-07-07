@@ -32,6 +32,7 @@ from typing import Mapping, Sequence
 
 from flywheel_core import Status
 from flywheel_core.events import (
+    LANDING_STRATEGY_PR,
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_PUSH_FAILED,
 )
@@ -288,6 +289,11 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         self.log(
             f"Landed {branch} as PR {url} ({commit_count} commit(s)); "
             f"merge is review/CI's call"
+        )
+        # The land completed (branch pushed, PR open): record the landed
+        # reference -- the PR identifier -- before tearing down the local copies.
+        self._record_landing(
+            req.run_id, strategy=LANDING_STRATEGY_PR, landed_ref=url
         )
         # The remote branch + PR now hold the work; local copies are done.
         # -D, not -d (inside _cleanup): the branch is deliberately unmerged

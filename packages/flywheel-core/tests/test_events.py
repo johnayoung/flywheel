@@ -12,6 +12,7 @@ from flywheel_core.events import (
     GateGraderReceipt,
     GraderEvaluated,
     HeldOutGateEvaluated,
+    Landed,
     LandingParked,
     LifecycleInitialized,
     RetryScheduled,
@@ -370,6 +371,94 @@ def test_landing_parked_round_trips_through_serde() -> None:
         id=None,
     )
     assert isinstance(restored, LandingParked)
+    assert restored == event
+
+
+def test_landed_kind_discriminator_is_stable() -> None:
+    assert Landed.KIND is DomainEventKind.LANDED
+    # Wire tag is the stable persisted discriminator.
+    assert DomainEventKind.LANDED.value == "landed"
+
+
+def test_landed_folds_to_identity_leaving_terminal_done() -> None:
+    # A successful land is recorded after the run finalized DONE: the
+    # audit-witness event advances version only and never moves off DONE.
+    done = replay(
+        [
+            _init(0),
+            TransitionedTo(run_id="run-1", ts=_ts(1), target=Status.READY),
+            TransitionedTo(run_id="run-1", ts=_ts(2), target=Status.RUNNING),
+            TransitionedTo(run_id="run-1", ts=_ts(3), target=Status.VALIDATING),
+            TransitionedTo(run_id="run-1", ts=_ts(4), target=Status.DONE),
+        ]
+    )
+    assert done.status is Status.DONE
+
+    landed = apply(
+        done,
+        Landed(
+            run_id="run-1",
+            ts=_ts(5),
+            strategy="merge",
+            landed_ref="a" * 40,
+        ),
+    )
+    assert landed.status is Status.DONE
+    assert landed.version == done.version + 1
+
+
+def test_landed_round_trips_through_serde() -> None:
+    event = Landed(
+        run_id="run-9",
+        ts=_ts(5),
+        attempt_number=None,
+        strategy="merge",
+        landed_ref="0123456789abcdef0123456789abcdef01234567",
+    )
+    assert event_kind(event) == "landed"
+    payload = event_payload(event)
+    assert payload == {
+        "strategy": "merge",
+        "landed_ref": "0123456789abcdef0123456789abcdef01234567",
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, Landed)
+    assert restored == event
+
+
+def test_landed_pr_reference_round_trips_through_serde() -> None:
+    # A PR land carries the pull-request identifier, not a commit sha; the wire
+    # shape must round-trip either reference under the one ``strategy`` tag.
+    event = Landed(
+        run_id="run-9",
+        ts=_ts(6),
+        attempt_number=None,
+        strategy="pr",
+        landed_ref="https://example.test/pr/7",
+    )
+    payload = event_payload(event)
+    assert payload == {
+        "strategy": "pr",
+        "landed_ref": "https://example.test/pr/7",
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, Landed)
     assert restored == event
 
 

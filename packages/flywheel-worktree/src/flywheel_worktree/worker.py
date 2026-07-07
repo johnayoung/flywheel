@@ -65,9 +65,11 @@ from flywheel_core import (
     run_command_graders,
 )
 from flywheel_core.events import (
+    LANDING_STRATEGY_MERGE,
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_SUBMIT_ERROR,
     DomainEvent,
+    Landed,
     LandingParked,
 )
 from flywheel_orchestrator import (
@@ -686,9 +688,17 @@ class GitWorktreeSubmitter:
                     )
                     return
                 if self._ff_merge(branch):
+                    landed_ref = _git(
+                        self.repo_root, "rev-parse", self.phase_base
+                    ).stdout.strip()
                     self.log(
                         f"Merged {branch} into {self.phase_base} "
                         f"({commit_count} commit(s))"
+                    )
+                    self._record_landing(
+                        req.run_id,
+                        strategy=LANDING_STRATEGY_MERGE,
+                        landed_ref=landed_ref,
                     )
                     self._teardown_on_done(worktree, branch)
                     return
@@ -736,9 +746,17 @@ class GitWorktreeSubmitter:
                 )
                 return
             if self._ff_merge(branch):
+                landed_ref = _git(
+                    self.repo_root, "rev-parse", self.phase_base
+                ).stdout.strip()
                 self.log(
                     f"Merged {branch} into {self.phase_base} after rebase "
                     f"({commit_count} commit(s))"
+                )
+                self._record_landing(
+                    req.run_id,
+                    strategy=LANDING_STRATEGY_MERGE,
+                    landed_ref=landed_ref,
                 )
                 self._teardown_on_done(worktree, branch)
                 return
@@ -1021,6 +1039,57 @@ class GitWorktreeSubmitter:
         except Exception as exc:  # noqa: BLE001 - must not escape submit
             self.log(
                 f"failed to record landing-parked event for {run_id} "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    def _record_landing(
+        self, run_id: str, *, strategy: str, landed_ref: str
+    ) -> None:
+        """Append a queryable ``LANDED`` audit-witness event for a run whose
+        branch actually landed, carrying the landed reference (``strategy`` is
+        one of :data:`~flywheel_core.events.LANDING_STRATEGIES`; ``landed_ref``
+        is the landed commit sha for a merge land or the PR identifier for a PR
+        land).
+
+        The success counterpart to :meth:`_record_landing_park`: the caller
+        invokes it only *after* the land completed, so an incomplete land leaves
+        no ``Landed`` record. The run already finalized ``DONE`` (terminal); this
+        records the landing on the run's ledger via ``append_domain_event``
+        WITHOUT any lifecycle transition -- ``Landed`` folds to the identity, so
+        the status stays ``DONE`` and only ``version`` advances. Best-effort: a
+        missing store handle or any store error is logged, never raised, so
+        ``submit()`` cannot escape into orchestrate. Gated by the same
+        disk/inode preflight as :meth:`_record_landing_park`, since the append is
+        an authoritative ledger write."""
+        if self.store is None:
+            return
+
+        store = self.store
+
+        def _append() -> None:
+            lifecycle = store.load_lifecycle(run_id)
+            if lifecycle is None:
+                self.log(
+                    f"cannot record landed event: no lifecycle for {run_id}"
+                )
+                return
+            store.append_domain_event(
+                Landed(
+                    run_id=run_id,
+                    ts=datetime.now(timezone.utc),
+                    strategy=strategy,
+                    landed_ref=landed_ref,
+                ),
+                expected_version=lifecycle.version,
+            )
+
+        try:
+            self.disk_preflight.guard(
+                self.repo_root, _append, run_id=run_id
+            )
+        except Exception as exc:  # noqa: BLE001 - must not escape submit
+            self.log(
+                f"failed to record landed event for {run_id} "
                 f"({type(exc).__name__}: {exc})"
             )
 

@@ -50,6 +50,7 @@ class DomainEventKind(str, Enum):
     LANDING_PARKED = "landing_parked"
     LANDED = "landed"
     HELD_OUT_GATE_EVALUATED = "held_out_gate_evaluated"
+    LANDING_REDRIVEN = "landing_redriven"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -278,6 +279,37 @@ class Landed(_DomainEventBase):
     landed_ref: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class LandingRedriven(_DomainEventBase):
+    """Records the disposition of one bounded landing re-drive of a parked run.
+
+    Appended by the orchestrator's landing re-driver only *after* a real land
+    re-attempt (or the terminal routing) produced its outcome, so the record is
+    always paired with a durable outcome witness (spec 00073, criterion 5):
+
+    * ``"landed"`` -- the re-attempt merged the branch; paired with the
+      :class:`Landed` witness the submit strategy appended on the same pass.
+    * ``"re-parked"`` -- the re-attempt failed to land and appended a fresh
+      :class:`LandingParked`; paired with that new park.
+    * ``"routed"`` -- the re-drive exhausted its bound without landing and the
+      run was routed to the single human-review queue; paired with that queue
+      entry (an ``orchestrator_stop_events`` row keyed to the run).
+
+    Recording ``"redriven"`` without a real re-attempt is the foreclosed cheat:
+    the record exists only because one of those witnesses does. Like
+    :class:`LandingParked` / :class:`Landed`, this is an audit-witness event --
+    the run already finalized ``DONE`` and the harness owns transitions, so its
+    fold is the identity (it advances ``version`` only). ``result`` is one of
+    :data:`LANDING_REDRIVE_RESULTS`; ``park_kind`` snapshots the park cause the
+    re-drive was clearing, queryable via ``list_domain_events(run_id)``.
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDING_REDRIVEN
+
+    result: str
+    park_kind: str = ""
+
+
 #: Per-grader output excerpt bound carried on a :class:`GateGraderReceipt`.
 #: The excerpt is a *tail* of the grader's captured output, capped at this many
 #: bytes and stored raw; redaction is a render-time concern, never applied at
@@ -377,6 +409,25 @@ LANDING_STRATEGIES: frozenset[str] = frozenset(
 )
 
 
+# Landing re-drive result vocabulary carried on a :class:`LandingRedriven`
+# record's ``result`` field. Each disposition names itself with one of these
+# stable spellings so a single reader can tell which outcome witness the record
+# is paired with: a :class:`Landed` for ``"landed"``, a fresh
+# :class:`LandingParked` for ``"re-parked"``, or a human-review queue entry for
+# ``"routed"``.
+REDRIVE_RESULT_LANDED = "landed"
+REDRIVE_RESULT_REPARKED = "re-parked"
+REDRIVE_RESULT_ROUTED = "routed"
+
+LANDING_REDRIVE_RESULTS: frozenset[str] = frozenset(
+    {
+        REDRIVE_RESULT_LANDED,
+        REDRIVE_RESULT_REPARKED,
+        REDRIVE_RESULT_ROUTED,
+    }
+)
+
+
 DomainEvent = (
     LifecycleInitialized
     | TransitionedTo
@@ -392,6 +443,7 @@ DomainEvent = (
     | LandingParked
     | Landed
     | HeldOutGateEvaluated
+    | LandingRedriven
 )
 
 
@@ -507,6 +559,7 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
             LandingParked,
             Landed,
             HeldOutGateEvaluated,
+            LandingRedriven,
         ),
     ):
         # Identity fold: these carry audit intent or project a separate table.

@@ -14,7 +14,11 @@ from flywheel_core.events import (
     HeldOutGateEvaluated,
     Landed,
     LandingParked,
+    LandingRedriven,
     LifecycleInitialized,
+    REDRIVE_RESULT_LANDED,
+    REDRIVE_RESULT_REPARKED,
+    REDRIVE_RESULT_ROUTED,
     RetryScheduled,
     SessionRecorded,
     TransitionedTo,
@@ -591,3 +595,85 @@ def test_held_out_gate_evaluated_no_gate_round_trips_with_empty_receipts() -> No
     assert isinstance(restored, HeldOutGateEvaluated)
     assert restored == event
     assert restored.receipts == ()
+
+
+def test_landing_redriven_kind_discriminator_is_stable() -> None:
+    assert LandingRedriven.KIND is DomainEventKind.LANDING_REDRIVEN
+    # Wire tag is the stable persisted discriminator.
+    assert DomainEventKind.LANDING_REDRIVEN.value == "landing_redriven"
+
+
+def test_landing_redriven_folds_to_identity_leaving_terminal_done() -> None:
+    # The re-drive runs after the run finalized DONE; recording its disposition
+    # is an audit witness that advances version only and never moves off DONE.
+    done = replay(
+        [
+            _init(0),
+            TransitionedTo(run_id="run-1", ts=_ts(1), target=Status.READY),
+            TransitionedTo(run_id="run-1", ts=_ts(2), target=Status.RUNNING),
+            TransitionedTo(run_id="run-1", ts=_ts(3), target=Status.VALIDATING),
+            TransitionedTo(run_id="run-1", ts=_ts(4), target=Status.DONE),
+        ]
+    )
+    assert done.status is Status.DONE
+
+    redriven = apply(
+        done,
+        LandingRedriven(
+            run_id="run-1",
+            ts=_ts(5),
+            result=REDRIVE_RESULT_LANDED,
+            park_kind="standing-verify",
+        ),
+    )
+    assert redriven.status is Status.DONE
+    assert redriven.version == done.version + 1
+
+
+@pytest.mark.parametrize(
+    "result",
+    [REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED],
+)
+def test_landing_redriven_round_trips_through_serde(result: str) -> None:
+    event = LandingRedriven(
+        run_id="run-9",
+        ts=_ts(5),
+        attempt_number=None,
+        result=result,
+        park_kind="divergent-base",
+    )
+    assert event_kind(event) == "landing_redriven"
+    payload = event_payload(event)
+    assert payload == {"result": result, "park_kind": "divergent-base"}
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, LandingRedriven)
+    assert restored == event
+
+
+def test_landing_redriven_default_park_kind_round_trips() -> None:
+    # ``park_kind`` is optional on the record; a stored row missing it restores
+    # to the empty-string default rather than raising.
+    event = LandingRedriven(
+        run_id="run-9", ts=_ts(6), result=REDRIVE_RESULT_ROUTED
+    )
+    payload = event_payload(event)
+    assert payload == {"result": REDRIVE_RESULT_ROUTED, "park_kind": ""}
+    restored = event_from_record(
+        kind="landing_redriven",
+        payload={"result": REDRIVE_RESULT_ROUTED},
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=None,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, LandingRedriven)
+    assert restored == event

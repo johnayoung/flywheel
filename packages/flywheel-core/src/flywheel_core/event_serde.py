@@ -32,6 +32,7 @@ from flywheel_core.events import (
     HeldOutGateEvaluated,
     Landed,
     LandingParked,
+    LandingRedriven,
     LifecycleInitialized,
     RetryScheduled,
     SessionRecorded,
@@ -110,6 +111,8 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
         return {"park_kind": event.park_kind, "detail": event.detail}
     if isinstance(event, Landed):
         return {"strategy": event.strategy, "landed_ref": event.landed_ref}
+    if isinstance(event, LandingRedriven):
+        return {"result": event.result, "park_kind": event.park_kind}
     if isinstance(event, HeldOutGateEvaluated):
         return {
             "outcome": event.outcome,
@@ -225,6 +228,12 @@ def event_from_record(
         return Landed(
             strategy=payload["strategy"],
             landed_ref=payload["landed_ref"],
+            **common,
+        )
+    if event_kind_enum is DomainEventKind.LANDING_REDRIVEN:
+        return LandingRedriven(
+            result=payload["result"],
+            park_kind=payload.get("park_kind", ""),
             **common,
         )
     if event_kind_enum is DomainEventKind.HELD_OUT_GATE_EVALUATED:

@@ -70,9 +70,13 @@ from flywheel_core.events import (
     GATE_EXCERPT_MAX_BYTES,
     LANDING_PARK_KINDS,
     PARK_KIND_HELD_OUT_GATE,
+    REDRIVE_RESULT_LANDED,
+    REDRIVE_RESULT_REPARKED,
+    REDRIVE_RESULT_ROUTED,
     GateGraderReceipt,
     HeldOutGateEvaluated,
     LandingParked,
+    LandingRedriven,
 )
 from flywheel_core.invoker_client import CONTROL_COMMAND_INTERRUPT
 from flywheel_core.lifecycle import Lifecycle, Outcome, Status
@@ -761,6 +765,50 @@ def _landing_already_queued(
     )
 
 
+def _record_landing_redrive(
+    control: SqliteStore | PostgresStore,
+    *,
+    run_id: str,
+    result: str,
+    park_kind: str,
+    task_id: str,
+    stream: TextIO | None,
+) -> None:
+    """Append a :class:`LandingRedriven` record to the run's ledger, pairing one
+    re-drive disposition with the outcome witness it just produced (spec 00073,
+    criterion 5).
+
+    Called only *after* a real re-attempt landed / re-parked, or the run was
+    routed to the human-review queue -- so the record is never the ``redriven``
+    cheat: its paired witness (a :class:`Landed`, a fresh :class:`LandingParked`,
+    or the queue entry) already exists in the store. ``LandingRedriven`` folds to
+    the identity, so the run stays ``Status.DONE`` and only ``version`` advances.
+    Best-effort: a missing lifecycle or any store error is logged to ``stream``
+    and swallowed so the re-drive loop never unwinds on a recording failure.
+    """
+    try:
+        lifecycle = control.load_lifecycle(run_id)
+        if lifecycle is None:
+            return
+        control.append_domain_event(
+            LandingRedriven(
+                run_id=run_id,
+                ts=_utcnow(),
+                result=result,
+                park_kind=park_kind,
+            ),
+            expected_version=lifecycle.version,
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort audit witness
+        if stream is not None:
+            print(
+                f"[orchestrate] {task_id}: failed to record landing-redrive "
+                f"event ({type(exc).__name__}: {exc})",
+                file=stream,
+                flush=True,
+            )
+
+
 def redrive_parked_landings(
     control: SqliteStore | PostgresStore,
     claims: SqliteClaimStore,
@@ -882,10 +930,30 @@ def redrive_parked_landings(
             new_parks = _landing_parks(control, run_id)
             if len(new_parks) == len(parks):
                 # No fresh park: the re-attempt landed and cleared the strand.
+                # Pair the redrive record with the ``Landed`` witness the submit
+                # strategy just appended (criterion 5).
                 landed = True
+                _record_landing_redrive(
+                    control,
+                    run_id=run_id,
+                    result=REDRIVE_RESULT_LANDED,
+                    park_kind=parks[-1].park_kind,
+                    task_id=task_id,
+                    stream=stream,
+                )
                 break
+            # A fresh park: the re-attempt re-parked. Pair the redrive record
+            # with the new ``LandingParked`` witness (criterion 5).
             parks = new_parks
             made = len(parks) - 1
+            _record_landing_redrive(
+                control,
+                run_id=run_id,
+                result=REDRIVE_RESULT_REPARKED,
+                park_kind=parks[-1].park_kind,
+                task_id=task_id,
+                stream=stream,
+            )
         if landed:
             if stream is not None:
                 print(
@@ -916,6 +984,16 @@ def redrive_parked_landings(
                 run_id=run_id,
                 detail=detail,
                 occurred_at=now(),
+            )
+            # Pair the redrive record with the human-review queue entry just
+            # written (criterion 5): the run exhausted its bound and was routed.
+            _record_landing_redrive(
+                control,
+                run_id=run_id,
+                result=REDRIVE_RESULT_ROUTED,
+                park_kind=park_kind,
+                task_id=task_id,
+                stream=stream,
             )
             if stream is not None:
                 print(

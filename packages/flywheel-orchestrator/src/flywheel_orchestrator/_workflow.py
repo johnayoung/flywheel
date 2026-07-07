@@ -44,6 +44,7 @@ from flywheel_core.events import LandingParked
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
+from flywheel_core.store_protocols import GraderResultRecord
 from flywheel_core.store_sqlite import SqliteStore
 
 if TYPE_CHECKING:
@@ -1914,16 +1915,13 @@ def _print_run_detail(detail: RunDetail) -> None:
             if a.error:
                 line += f"  -- {_short(a.error, 80)}"
             print(line)
-    if detail.grader_results:
-        last = detail.attempts[-1].number if detail.attempts else "?"
-        print(f"graders  : (attempt {last})")
-        for g in detail.grader_results:
-            verdict = "pass" if g.passed else "FAIL"
-            name = g.grader_name or g.grader_type
-            print(
-                f"  {verdict}  {g.grader_type:<10} {name}  "
-                f"({g.duration_ms} ms)"
-            )
+            for g in a.grader_results:
+                verdict = "pass" if g.passed else "FAIL"
+                name = g.grader_name or g.grader_type
+                print(
+                    f"      {verdict}  {g.grader_type:<10} {name}  "
+                    f"({g.duration_ms} ms)"
+                )
     if detail.agent_output:
         print("agent output:")
         print(detail.agent_output)
@@ -1934,6 +1932,17 @@ def _print_run_detail(detail: RunDetail) -> None:
                 f"  {r.run_id}  {r.status.value:<17} "
                 f"{_format_history_ts(r.finished_at)}"
             )
+
+
+def _grader_result_to_dict(g: GraderResultRecord) -> dict[str, Any]:
+    return {
+        "attempt_number": g.attempt_number,
+        "ordinal": g.ordinal,
+        "grader_type": g.grader_type,
+        "grader_name": g.grader_name,
+        "passed": g.passed,
+        "duration_ms": g.duration_ms,
+    }
 
 
 def _run_detail_to_dict(detail: RunDetail) -> dict[str, Any]:
@@ -1957,19 +1966,18 @@ def _run_detail_to_dict(detail: RunDetail) -> dict[str, Any]:
                 "tokens": a.tokens,
                 "cost_usd": a.cost_usd,
                 "error": a.error,
+                # Each attempt's verdicts keyed to that attempt (00073 #6):
+                # a retried run surfaces the discarded attempt's receipts too.
+                "grader_results": [
+                    _grader_result_to_dict(g) for g in a.grader_results
+                ],
             }
             for a in detail.attempts
         ],
+        # Flat view of every attempt's receipts (each carries attempt_number);
+        # attempts[].grader_results above is the per-attempt keyed split.
         "grader_results": [
-            {
-                "attempt_number": g.attempt_number,
-                "ordinal": g.ordinal,
-                "grader_type": g.grader_type,
-                "grader_name": g.grader_name,
-                "passed": g.passed,
-                "duration_ms": g.duration_ms,
-            }
-            for g in detail.grader_results
+            _grader_result_to_dict(g) for g in detail.grader_results
         ],
         "related_runs": [
             _history_run_to_dict(r) for r in detail.related_runs

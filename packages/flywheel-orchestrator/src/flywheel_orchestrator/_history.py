@@ -124,10 +124,13 @@ class RunDetail:
     """Everything ``show`` renders for one run.
 
     ``task`` is the exact definition the run pinned (content-addressed);
-    ``None`` when the pin cannot resolve. ``grader_results`` are the
-    receipts of the latest attempt. ``related_runs`` are the task's other
-    runs (any status), most recent first, so the operator sees the full
-    retry story from one screen.
+    ``None`` when the pin cannot resolve. ``grader_results`` are *every*
+    attempt's receipts, ordered by attempt then ordinal (each record
+    carries its own ``attempt_number``); the per-attempt split lives on
+    each ``AttemptSummary.grader_results`` so a retried run shows the
+    verdicts of the discarded attempt too, not only the last. ``related_runs``
+    are the task's other runs (any status), most recent first, so the
+    operator sees the full retry story from one screen.
     """
 
     run: HistoryRun
@@ -141,7 +144,13 @@ class RunDetail:
 
 @dataclass(frozen=True, kw_only=True)
 class AttemptSummary:
-    """One attempt's render-ready rollup for the ``show`` surface."""
+    """One attempt's render-ready rollup for the ``show`` surface.
+
+    ``grader_results`` are that attempt's own receipts in ordinal order
+    (empty when the attempt was finalized before grading — e.g. a protocol
+    failure). Keying each receipt set to its own attempt is what lets the
+    run detail carry every attempt's verdicts, not only the last.
+    """
 
     number: int
     outcome: str
@@ -152,6 +161,7 @@ class AttemptSummary:
     tokens: int
     cost_usd: float
     error: str
+    grader_results: tuple[GraderResultRecord, ...] = ()
 
 
 def phase_from_source(source: str | None) -> str | None:
@@ -390,16 +400,19 @@ def collect_run_detail(
             tokens=a.total_tokens,
             cost_usd=a.total_cost_usd,
             error=a.error,
+            grader_results=tuple(
+                store.list_grader_results(run_id, a.number)
+            ),
         )
         for a in lifecycle.attempts
     )
-    grader_results: tuple[GraderResultRecord, ...] = ()
-    if lifecycle.attempts:
-        grader_results = tuple(
-            store.list_grader_results(
-                run_id, lifecycle.attempts[-1].number
-            )
-        )
+    # Every attempt's receipts, not just the last one's (F2/D-4). Each
+    # record already carries its own attempt_number, so the flat
+    # concatenation stays keyed by attempt; the per-attempt split lives on
+    # each AttemptSummary above for callers that render by attempt.
+    grader_results: tuple[GraderResultRecord, ...] = tuple(
+        g for a in attempts for g in a.grader_results
+    )
 
     related = tuple(
         _history_run_from_row(store, other)

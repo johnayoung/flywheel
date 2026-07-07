@@ -56,6 +56,8 @@ from flywheel_core.audit._file import (
     read_records_since,
     run_file_path,
 )
+from flywheel_core.event_serde import event_kind, event_payload
+from flywheel_core.events import DomainEventKind
 from flywheel_core.lifecycle import Status
 from flywheel_core.redaction import Redactor
 from flywheel_core.store_protocols import (
@@ -98,6 +100,74 @@ _TERMINAL_STATUSES: frozenset[Status] = frozenset(
         Status.INTERRUPTED,
     }
 )
+
+
+# Kind prefix the in-run mirror (``_RunTelemetry.mirror_domain``) stamps onto a
+# ledger event it writes into the run file. Reused here so a landing-stage
+# record projected from the store carries the identical ``domain.<kind>`` label,
+# and the CLI/logger renderers see one shape regardless of the source.
+_DOMAIN_MIRROR_KIND_PREFIX: str = "domain."
+
+# Landing-stage ledger records the stream projects at the tail, after every file
+# record (i.e. after attempt finalization). These decisions are appended to the
+# store *after* the run finalized, so the harness's in-run mirror never wrote
+# them to the run file; the reader would skip a ``domain.*`` line anyway. They
+# live only in the store (store-only durability), so the stream reads them from
+# the ledger at yield time rather than the file. A run with no landing decision
+# has none of these events and streams exactly as before.
+_LANDING_STAGE_KINDS: frozenset[str] = frozenset(
+    {
+        DomainEventKind.HELD_OUT_GATE_EVALUATED.value,
+        DomainEventKind.LANDING_PARKED.value,
+        DomainEventKind.LANDED.value,
+    }
+)
+
+
+def _landing_stage_records(
+    store: object, run_id: str, *, start_sequence: int
+) -> list[EventRecord]:
+    """Project the run's landing-stage ledger events as tail records.
+
+    Reads the authoritative domain-event ledger via the store's optional
+    ``list_domain_events`` and reconstructs each landing-stage event (held-out
+    gate verdict, landing-parked witness, or landed record) as an
+    :class:`EventRecord` carrying the same ``domain.<kind>`` label and payload
+    projection the in-run mirror uses. Records keep ledger order and are
+    numbered strictly after ``start_sequence`` (the last file record's
+    sequence) so the audit stream's ascending-sequence contract holds across
+    the file/ledger seam.
+
+    Best-effort and read-only: a store without ``list_domain_events`` or a read
+    that raises yields no tail records — the ledger is authoritative and the
+    stream is a disposable projection, so a lookup failure must never break the
+    live file tail. Returns an empty list when the run has no landing decision,
+    which keeps a non-landing run byte-identical to the pre-projection stream.
+    """
+    lister = getattr(store, "list_domain_events", None)
+    if lister is None:
+        return []
+    try:
+        events = lister(run_id)
+    except Exception:  # noqa: BLE001 - a ledger read must not break the stream
+        return []
+    records: list[EventRecord] = []
+    seq = start_sequence
+    for event in events:
+        if event_kind(event) not in _LANDING_STAGE_KINDS:
+            continue
+        seq += 1
+        records.append(
+            EventRecord(
+                run_id=run_id,
+                ts=event.ts,
+                kind=f"{_DOMAIN_MIRROR_KIND_PREFIX}{event_kind(event)}",
+                payload=event_payload(event),
+                attempt_number=event.attempt_number,
+                sequence=seq,
+            )
+        )
+    return records
 
 
 def _record_sequence(record: AuditRecord) -> int:
@@ -226,13 +296,30 @@ def stream(
     and cursor advancement are unchanged. A redactor exception
     propagates to the caller. ``redactor=None`` (the default) is
     verbatim.
+
+    After the file is exhausted (the drain for ``follow=False``, or the
+    terminal-status exit for ``follow=True``) the run's landing-stage
+    ledger records — the held-out gate verdict, the landing-parked
+    witness, and the landed record — are projected from ``store`` and
+    yielded at the tail, numbered strictly after the last file record.
+    Landing is decided after the attempt finalized, so these records
+    always sort last; a run with no landing decision adds none and
+    streams exactly as before.
     """
     path = run_file_path(_resolve_logs_root(logs_root), run_id)
     cursor = FileCursor()
     drained, cursor = read_records_since(path, cursor)
+    last_sequence = 0
     for record in drained:
+        seq = record.sequence
+        if seq is not None and seq > last_sequence:
+            last_sequence = seq
         yield record if redactor is None else redactor.redact(record)
     if not follow:
+        for record in _landing_stage_records(
+            store, run_id, start_sequence=last_sequence
+        ):
+            yield record if redactor is None else redactor.redact(record)
         return
     if not _lifecycle_exists(store, run_id):
         # Spec error-handling table: an unknown run_id yields nothing
@@ -242,6 +329,13 @@ def stream(
         return
     for record in _follow(
         store, run_id, path, cursor=cursor, poll_interval=poll_interval
+    ):
+        seq = record.sequence
+        if seq is not None and seq > last_sequence:
+            last_sequence = seq
+        yield record if redactor is None else redactor.redact(record)
+    for record in _landing_stage_records(
+        store, run_id, start_sequence=last_sequence
     ):
         yield record if redactor is None else redactor.redact(record)
 

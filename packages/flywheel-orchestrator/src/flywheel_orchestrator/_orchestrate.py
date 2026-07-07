@@ -817,6 +817,8 @@ def redrive_parked_landings(
     *,
     requests: Iterable[SubmitRequest],
     bound: int = DEFAULT_LANDING_REDRIVE_BOUND,
+    held_out_source: HeldOutGraderSource | None = None,
+    grader_env: Mapping[str, str] | None = None,
     lease_seconds: float,
     now: Callable[[], datetime],
     stream: TextIO | None = None,
@@ -836,13 +838,22 @@ def redrive_parked_landings(
        branch merged, no commits beyond base) or whose committed change vanished
        reports not-landable and drops out -- neither re-driven nor queued -- so a
        cleared strand is never wrongly re-parked.
-    3. Re-attempts the land up to ``bound`` times by re-invoking
-       ``strategy.submit`` under a freshly acquired claim (a sanctioned claim
-       API, never a raw lifecycle write). Each ``submit`` re-runs the strategy's
-       own rebase + command/standing re-verification against the exact base it
-       lands on -- nothing lands unverified. A re-attempt that lands appends no
-       park (the strand clears); one that fails appends a fresh park, advancing
-       the count toward the bound.
+    3. Re-attempts the land up to ``bound`` times under a freshly acquired claim
+       (a sanctioned claim API, never a raw lifecycle write). Each re-attempt
+       first clears a FRESH held-out landing gate against the content it would
+       land (spec 00074, D-1), reusing the same evaluation and verdict-record
+       path as the first attempt (D-2): a pass -- or no ``held_out_source`` /
+       a non-landing status -- lets ``strategy.submit`` run, which re-runs the
+       strategy's own rebase + command/standing re-verification against the
+       exact base it lands on, so nothing lands unverified; a FAIL (or a
+       fail-closed evaluation error) suppresses ``submit`` and appends a fresh
+       held-out-gate park, so a gate-blocked strand can never slip in on
+       re-drive through the strategy's own checks alone. An ungated re-drive
+       (``held_out_source`` is ``None``) behaves byte-for-byte as before the
+       gate was wired (D-6). A re-attempt that lands appends no park (the strand
+       clears); one that re-parks -- a strategy re-park, a gate block, or a
+       fail-closed error -- appends a fresh park, advancing the count toward the
+       bound.
     4. On the bound -- ``bound`` re-attempts made without landing -- routes the
        run to the single human-review queue with its ``park_kind`` as the
        machine-readable reason, and makes no further attempt (criterion #4).
@@ -922,13 +933,30 @@ def redrive_parked_landings(
             )
             if claim is None:
                 break  # a peer holds the claim; retry on a later pass
+            reattempt_landed = False
             try:
-                strategy.submit(request)
+                # Fresh held-out gate re-evaluation against the content this
+                # re-attempt would land (spec 00074, D-1), reusing the first
+                # attempt's evaluation + verdict-record path (D-2). A pass -- or
+                # no held-out source wired -- lets ``submit`` run exactly as
+                # today; a FAIL (or a fail-closed evaluation error) suppresses it
+                # and leaves a fresh held-out-gate park, so a gate-blocked strand
+                # can never land on re-drive via the strategy's checks alone.
+                if _reevaluate_landing_gate(
+                    control,
+                    held_out_source,
+                    request,
+                    grader_env=grader_env,
+                    stream=stream,
+                ):
+                    strategy.submit(request)
+                    reattempt_landed = len(
+                        _landing_parks(control, run_id)
+                    ) == len(parks)
             finally:
                 claims.release_claim(claim)
             attempts += 1
-            new_parks = _landing_parks(control, run_id)
-            if len(new_parks) == len(parks):
+            if reattempt_landed:
                 # No fresh park: the re-attempt landed and cleared the strand.
                 # Pair the redrive record with the ``Landed`` witness the submit
                 # strategy just appended (criterion 5).
@@ -942,9 +970,11 @@ def redrive_parked_landings(
                     stream=stream,
                 )
                 break
-            # A fresh park: the re-attempt re-parked. Pair the redrive record
-            # with the new ``LandingParked`` witness (criterion 5).
-            parks = new_parks
+            # A fresh park: the re-attempt re-parked -- the strategy could not
+            # land, the gate blocked, or the evaluation failed closed. Each of
+            # those paths appended a ``LandingParked``; pair the redrive record
+            # with it (criterion 5) and advance the count toward the bound.
+            parks = _landing_parks(control, run_id)
             made = len(parks) - 1
             _record_landing_redrive(
                 control,
@@ -2623,6 +2653,8 @@ async def orchestrate(
                     wid,
                     requests=redrive_requests,
                     bound=landing_redrive_bound,
+                    held_out_source=held_out_source,
+                    grader_env=sandbox_primitives["grader_env"],
                     lease_seconds=lease_seconds,
                     now=clock,
                     stream=stream,
@@ -2996,6 +3028,85 @@ def _record_held_out_gate_verdict(
                 file=stream,
                 flush=True,
             )
+
+
+def _reevaluate_landing_gate(
+    control: SqliteStore | PostgresStore,
+    held_out_source: HeldOutGraderSource | None,
+    request: SubmitRequest,
+    *,
+    grader_env: Mapping[str, str] | None,
+    stream: TextIO | None,
+) -> bool:
+    """Fresh held-out gate evaluation for one landing re-attempt (spec 00074).
+
+    A re-driven landing must clear the SAME held-out gate a first landing does,
+    against the content it is about to land (D-1) -- otherwise a park the gate
+    blocked could slip in on re-drive through the strategy's own checks alone.
+    This runs the identical evaluation and verdict-record path as the first
+    attempt (D-2): :func:`_evaluate_landing_gate` computes the verdict against
+    ``request.sandbox`` (the committed tree) and
+    :func:`_record_held_out_gate_verdict` persists it for every evaluation --
+    pass, fail, or no-gate.
+
+    Returns whether the re-attempt may proceed to ``strategy.submit``:
+
+    * ``True`` -- the gate passed, or no held-out source is wired / the run is
+      not at the landing status, so an ungated re-drive lands byte-for-byte as
+      today (D-6).
+    * ``False`` -- the gate FAILED, or the evaluation itself errored (fail
+      closed, exactly as the first attempt suppresses the land). A suppressed
+      re-attempt appends a held-out-gate :class:`LandingParked` so the strand
+      stays durably re-parked and the re-drive bound accounting (the park count)
+      advances -- mirroring how a strategy re-park and a first-attempt gate
+      block both leave a park witness.
+    """
+    gate_errored = False
+    try:
+        gate = _evaluate_landing_gate(
+            held_out_source,
+            request.task,
+            status=request.status,
+            sandbox=request.sandbox,
+            run_id=request.run_id,
+            task_id=request.task_id,
+            grader_env=grader_env,
+            stream=stream,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed, suppress landing
+        gate = None
+        gate_errored = True
+        if stream is not None:
+            print(
+                f"[orchestrate] {request.task_id}: held-out landing gate "
+                f"re-evaluation errored ({type(exc).__name__}: {exc}); landing "
+                f"suppressed (failing closed)",
+                file=stream,
+                flush=True,
+            )
+    if gate is not None:
+        _record_held_out_gate_verdict(
+            control,
+            run_id=request.run_id,
+            verdict=gate,
+            task_id=request.task_id,
+            stream=stream,
+        )
+    if (gate is not None and gate.blocks_landing) or gate_errored:
+        detail = (
+            gate.reason
+            if gate is not None and gate.reason
+            else "held-out landing gate re-evaluation errored; failing closed"
+        )
+        _record_held_out_gate_park(
+            control,
+            run_id=request.run_id,
+            detail=detail,
+            task_id=request.task_id,
+            stream=stream,
+        )
+        return False
+    return True
 
 
 async def _drive_under_lease(

@@ -1,0 +1,41 @@
+{
+  "id": "run-detail-decision-surface",
+  "goal": "The run-detail CLI JSON surfaces every landing decision on a run -- gate verdicts with grader output, parks, redrives, landings -- from the store alone, with secret-shaped values redacted by default.",
+  "prerequisites": ["gate-verdict-record", "landing-success-record", "redrive-record", "attempt-grader-history"],
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_show_decisions.py -q" },
+    { "type": "command", "name": "attempt-surface-holdout", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_history.py packages/flywheel-orchestrator/tests/test_attempt_history.py -q" },
+    { "type": "command", "name": "status-seam", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_history.py -- collect_run_detail gains the decision records",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_show / _run_detail_to_dict / _print_run_detail; module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/src/flywheel_core/audit/ -- reuse its redaction rules for rendered excerpts",
+      "packages/flywheel-orchestrator/tests/test_history.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_attempt_history.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criteria 8, 10 and the retrieval halves of 1, 2, 3, 5; decision D-5"
+    ],
+    "constraints": [
+      "Decision records come from the store; deleting the run's telemetry JSONL must not affect them (criterion 8)",
+      "Default rendering redacts secret-shaped values; the existing raw flag reveals them (criterion 10)",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change the audit verb (audit-landing-stream owns the stream view)",
+      "Do not alter status/live surfaces beyond keeping their tests green",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Run JSONL deleted: decisions still retrievable, exit 0",
+      "A secret-shaped token inside a persisted excerpt renders redacted by default",
+      "A run with no landing decisions renders without error"
+    ]
+  }
+}

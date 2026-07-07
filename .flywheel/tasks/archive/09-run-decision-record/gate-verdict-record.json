@@ -1,0 +1,45 @@
+{
+  "id": "gate-verdict-record",
+  "goal": "Every held-out landing-gate evaluation (pass, fail, or no-gate) appends a ledger record carrying each executed grader's name, outcome, and bounded output tail, so a gate-decided park is diagnosable from the store alone.",
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_gate_verdict_record.py -q" },
+    { "type": "command", "name": "gate-decisions-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_held_out_gate.py packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -q" },
+    { "type": "command", "name": "events-serde", "run": "uv run pytest packages/flywheel-core/tests/test_events.py -q" },
+    { "type": "command", "name": "status-seam", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_held_out_gate.py -- GateVerdict and the in-memory grader receipts that must be persisted",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _evaluate_landing_gate / _record_held_out_gate_park emit sites; module is over 800 lines, use serena symbols instead of whole-file reads",
+      "packages/flywheel-core/src/flywheel_core/events.py -- domain-event vocabulary gains the verdict record",
+      "packages/flywheel-core/src/flywheel_core/event_serde.py -- serde for the new kind, updated in this same change",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py -- keep green, assertions unmodified",
+      "packages/flywheel-core/tests/test_events.py -- extend with round-trip coverage for the new kind",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- status park surfacing must stay green"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criteria 1, 2, 11; decisions D-1, D-2",
+      "docs/held-out-gate.md -- current behavior: verdict lives on RunRecord only, receipts are dropped"
+    ],
+    "constraints": [
+      "Record every evaluation including no-gate (spec D-1); pass and fail records carry per-grader receipts",
+      "The output excerpt is a tail capped at 8192 bytes per grader, stored raw; redaction is applied at render time, not persist time (spec D-2, criterion 10)",
+      "flywheel_core.task and flywheel_core.lifecycle stay pure; follow the existing events.py / event_serde.py pattern",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not change gate decision semantics -- what passes, blocks, or fails closed is untouched",
+      "Do not add CLI rendering; the retrieval surfaces are later tasks",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A verdict record with an empty output excerpt must fail the behavior test -- assert on real oracle output content, not record presence",
+      "A no-gate evaluation leaves a record distinguishable from no record at all",
+      "A grader emitting more than the bound persists a truncated excerpt that retains the final content (criterion 11)"
+    ]
+  }
+}

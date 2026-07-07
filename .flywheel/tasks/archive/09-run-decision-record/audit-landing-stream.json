@@ -1,0 +1,38 @@
+{
+  "id": "audit-landing-stream",
+  "goal": "flywheel audit on a run whose landing was gate-decided streams landing-stage record kinds sequenced after attempt finalization.",
+  "prerequisites": ["gate-verdict-record", "landing-success-record"],
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_audit_landing_stream.py -q" },
+    { "type": "command", "name": "audit-contract", "run": "uv run pytest packages/flywheel-core/tests/test_audit.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/audit/__init__.py -- the stream read path",
+      "packages/flywheel-core/src/flywheel_core/audit/_cli.py -- record rendering (event:<kind> lines)",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- _RunTelemetry.mirror_domain: in-run ledger appends are mirrored to the JSONL, post-run appends are not; module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/tests/test_audit.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criterion 9; decision D-5",
+      "docs/cli.md -- the audit verb contract",
+      "docs/data-taxonomy.md -- the ledger is authoritative; the stream is a projection"
+    ],
+    "constraints": [
+      "The mechanism is open (mirror post-run ledger appends into the run JSONL, or merge ledger records into the stream) -- the grader observes only the end-state",
+      "Audit redaction defaults and flags are unchanged",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not make the JSONL the authoritative source of landing decisions (store-only durability is criterion 8, owned by run-detail-decision-surface)",
+      "Do not weaken, delete, or modify existing assertions in test_audit.py",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Landing-stage kinds appear after attempt_finalized in sequence order",
+      "A run with no landing decisions streams exactly as today"
+    ]
+  }
+}

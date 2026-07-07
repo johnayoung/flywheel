@@ -1,0 +1,35 @@
+{
+  "id": "attempt-grader-history",
+  "goal": "The run-detail CLI JSON includes every attempt's grader verdicts keyed to their attempt, with the run window and token totals spanning all attempts.",
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_attempt_history.py -q" },
+    { "type": "command", "name": "window-regression", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_history.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_history.py -- collect_run_detail reads only the last attempt's grader results today",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _run_detail_to_dict / _print_run_detail rendering; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/tests/test_history.py -- keep green; contains the started_at retry-stamp regression test"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criteria 6, 7; decision D-4",
+      ".flywheel/audits/05-work-redriver-retro.md -- F2, the original window finding"
+    ],
+    "constraints": [
+      "Grader verdicts are keyed by attempt number in the JSON; per-attempt data comes from the existing grader_results storage",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not surface landing decisions (that is run-detail-decision-surface)",
+      "Do not change how grader results are stored",
+      "Do not weaken, delete, or modify existing assertions in test_history.py",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A two-attempt run whose attempt 1 grader outcomes differ from attempt 2's: duplicating the last attempt's receipts across attempts must fail the test",
+      "tokens_total equals the sum over all attempts; started_at is no later than attempt 1's start"
+    ]
+  }
+}

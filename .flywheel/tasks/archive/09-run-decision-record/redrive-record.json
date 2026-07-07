@@ -1,0 +1,38 @@
+{
+  "id": "redrive-record",
+  "goal": "Redriving a parked landing appends a domain-event record paired with its result: landed, re-parked, or routed to human review.",
+  "prerequisites": ["landing-success-record"],
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redrive_record.py -q" },
+    { "type": "command", "name": "redriver-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_landing.py packages/flywheel-orchestrator/tests/test_redriver_queue.py -q" },
+    { "type": "command", "name": "events-serde", "run": "uv run pytest packages/flywheel-core/tests/test_events.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- redrive_parked_landings, _landing_parks, _landing_already_queued; module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/src/flywheel_core/events.py -- vocabulary gains the redrive record",
+      "packages/flywheel-core/src/flywheel_core/event_serde.py -- serde updated in this same change",
+      "packages/flywheel-orchestrator/tests/test_redriver_landing.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_redriver_queue.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criterion 5",
+      ".flywheel/audits/08-agent-usage-surface.md -- F1: the block-and-redrive that was diagnosable only from ephemeral stdout"
+    ],
+    "constraints": [
+      "Each redrive record pairs with its real outcome witness: a landing record for landed, the new park event for re-parked, the human-review queue entry for routed",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change redrive bounds, ordering, or human-review routing behavior",
+      "Do not touch the orchestrator stop-events schema",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A redrive record with no paired outcome witness must fail the behavior test -- recording 'redriven' without re-attempting the land is the named cheat"
+    ]
+  }
+}

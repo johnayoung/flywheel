@@ -1,0 +1,40 @@
+{
+  "id": "landing-success-record",
+  "goal": "Every successful landing, on every submit strategy, appends a domain-event record carrying the landed reference, and an incomplete landing appends none.",
+  "prerequisites": ["gate-verdict-record"],
+  "tags": ["spec-00073", "run-decision-record"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_landing_record.py -q" },
+    { "type": "command", "name": "parks-unchanged", "run": "uv run pytest packages/flywheel-worktree/tests/test_pr_strategy.py -q" },
+    { "type": "command", "name": "events-serde", "run": "uv run pytest packages/flywheel-core/tests/test_events.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-worktree" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the merge/FF submit path; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- the PR landing path (logs 'Landed ... as PR' today)",
+      "packages/flywheel-core/src/flywheel_core/events.py -- vocabulary gains the landing record",
+      "packages/flywheel-core/src/flywheel_core/event_serde.py -- serde updated in this same change",
+      "packages/flywheel-worktree/tests/test_pr_strategy.py -- keep green, assertions unmodified",
+      "packages/flywheel-core/tests/test_events.py -- extend with round-trip coverage for the new kind"
+    ],
+    "references": [
+      ".flywheel/specs/00073-FEATURE-run-decision-record.md -- criteria 3, 4; decision D-3",
+      "packages/flywheel-container/src/flywheel_container/_submit.py -- ContainerSubmitStrategy delegates landing to the inner strategy, so the two worktree paths cover all three strategies"
+    ],
+    "constraints": [
+      "Append the record only after the land actually completes; it carries the landed reference (commit sha for merge landings, PR identifier for PR landings)",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change landing semantics, the standing verify, or park behavior",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not add CLI rendering; the retrieval surfaces are later tasks",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A parked or errored landing appends zero landing records -- a record written at submit-start must fail the test (criterion 4)",
+      "The recorded sha must equal the target-branch head the test observes via git, not a value the recorder invents (criterion 3)"
+    ]
+  }
+}

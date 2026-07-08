@@ -408,7 +408,9 @@ class HarnessConfig:
     ``rubric_judge_model`` is the default model for rubric judges when
     the per-grader ``RubricGrader.judge_model`` is unset; ``None`` falls
     through to the SDK's own default. ``rubric_judge_max_turns`` caps
-    the per-judge-call turn budget (default 8).
+    the per-judge-call turn budget (default 32; judges get the full tool
+    surface and multi-assertion rubrics routinely need more than 8 turns
+    to verify against the worktree before emitting a verdict).
 
     ``rubric_judge_invoke`` is a test seam: when set, the harness passes
     it to ``run_rubric_graders`` instead of the runner's default fresh
@@ -491,7 +493,7 @@ class HarnessConfig:
     worktree: str | os.PathLike[str] | None = None
     grader_env: Mapping[str, str] | None = None
     rubric_judge_model: str | None = None
-    rubric_judge_max_turns: int = 8
+    rubric_judge_max_turns: int = 32
     rubric_judge_invoke: JudgeInvoke | None = None
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     deadlines: DeadlineConfig = field(default_factory=DeadlineConfig)

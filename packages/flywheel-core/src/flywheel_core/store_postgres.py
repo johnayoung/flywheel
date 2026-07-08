@@ -136,6 +136,20 @@ def _read_schema_sql() -> bytes:
     return _SCHEMA_PATH.read_bytes()
 
 
+# Serializes concurrent first-open bootstraps against a fresh schema. Two
+# openers racing the CREATE SCHEMA / CREATE TABLE IF NOT EXISTS sequence below
+# otherwise deadlock on the shared system catalogs (bumping the server's
+# deadlock counter) or trip a pg_namespace unique_violation. Taken as the first
+# statement of the bootstrap transaction, this transaction-scoped advisory lock
+# forces openers through one at a time; each later opener then sees an
+# already-provisioned schema and every IF NOT EXISTS is a clean no-op. Released
+# automatically at commit/rollback. The claim store's bootstrap takes this same
+# key value, so a run store and a claim store initializing one schema
+# concurrently serialize too. Distinct from the claim store's acquire lock
+# (0x666C7977) so runtime claims never wait on a bootstrap. 0x666C7962 == "flyb".
+_BOOTSTRAP_LOCK_KEY = 0x666C7962
+
+
 class PostgresStore:
     """Postgres implementation of every store protocol.
 
@@ -260,6 +274,15 @@ class PostgresStore:
     def _bootstrap(self) -> None:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
+                # Serialize the whole bootstrap against every other opener so
+                # the CREATE SCHEMA / CREATE TABLE IF NOT EXISTS sequence below
+                # cannot race on a fresh schema (deadlock on the shared catalogs
+                # or a pg_namespace unique_violation). Transaction-scoped:
+                # released at the commit that ends this ``with`` block, after
+                # which the next opener sees a fully provisioned schema.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (_BOOTSTRAP_LOCK_KEY,)
+                )
                 cur.execute(
                     sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
                         self._schema_ident

@@ -68,7 +68,6 @@ from flywheel_core.workflow import (
 )
 from flywheel_orchestrator._claims import (
     OrchestratorStopEventRecord,
-    SqliteClaimStore,
 )
 from flywheel_orchestrator._history import (
     TERMINAL_STATUSES,
@@ -105,6 +104,7 @@ from flywheel_orchestrator._sources import (
 from flywheel_orchestrator._store_factory import (
     PG_DSN_ENV,
     PG_DSN_FALLBACK_ENV,
+    build_claim_store,
     open_sqlite_bound_store,
     resolve_postgres_dsn,
 )
@@ -1359,6 +1359,7 @@ def _landing_park_for_run(
 
 
 def _stop_events_by_subject(
+    policy: WorkPolicy | None,
     db_path: Path,
 ) -> dict[str, OrchestratorStopEventRecord]:
     """The most recent pre-run stop event per subject, keyed by subject.
@@ -1377,10 +1378,12 @@ def _stop_events_by_subject(
     on several passes surfaces once here with its latest reason -- ``list_stop_events``
     returns id (insertion) order, so the last row for a subject wins. An empty
     ledger yields an empty map, keeping the omit-when-absent convention intact
-    for a healthy store. The claim store is opened read-only-in-intent on the
-    resolved ``db_path`` and closed before returning.
+    for a healthy store. The claim store is built through the policy-driven
+    :func:`build_claim_store` factory -- so a ``[store]`` backend of postgres
+    reads the shared ledger, never a stale local sqlite file -- opened
+    read-only-in-intent and closed before returning.
     """
-    claims = SqliteClaimStore(db_path)
+    claims = build_claim_store(policy, db_path=db_path)
     try:
         latest: dict[str, OrchestratorStopEventRecord] = {}
         for event in claims.list_stop_events():
@@ -1428,7 +1431,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     # orchestrator claim store's stop-event ledger and unioned into the same
     # stranded surface as the per-run parks above -- keyed by subject (a task id
     # for the per-task kinds, a source name for the source-level kinds).
-    stops_by_subject = _stop_events_by_subject(db_path)
+    stops_by_subject = _stop_events_by_subject(policy, db_path)
     stopped_task_ids = {row.task.id for row in rows}
     if args.json:
         out: list[dict[str, Any]] = []

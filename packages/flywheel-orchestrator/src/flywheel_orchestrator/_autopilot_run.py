@@ -23,7 +23,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from flywheel_core.faults import FaultClass, classify_fault
 from flywheel_orchestrator._autopilot import (
@@ -40,7 +40,7 @@ from flywheel_orchestrator._orchestrate import (
     NoProgressOutcome,
     redrive_no_progress,
 )
-from flywheel_orchestrator._store_factory import build_store
+from flywheel_orchestrator._store_factory import build_claim_store, build_store
 from flywheel_orchestrator._autopilot_activity import (
     PHASE_IDLE,
     PHASE_RUNNING,
@@ -58,6 +58,9 @@ from flywheel_orchestrator._workflow import (
     DEFAULT_TASKS_DIR,
     load_effective_policy,
 )
+
+if TYPE_CHECKING:
+    from flywheel_orchestrator._claims_postgres import PostgresClaimStore
 
 
 def make_logger(prefix: str) -> Callable[[str], None]:
@@ -222,7 +225,7 @@ def _cycle_made_progress(result: AutopilotPassResult) -> bool:
 def apply_no_progress_backoff(
     result: AutopilotPassResult,
     *,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     unit_id: str,
     bound: int = DEFAULT_NO_PROGRESS_BOUND,
     now: Callable[[], datetime] | None = None,
@@ -259,13 +262,18 @@ def _open_backoff_claims(
     policy: WorkPolicy | None,
     repo_root: Path,
     log: Callable[[str], None],
-) -> SqliteClaimStore | None:
+) -> SqliteClaimStore | PostgresClaimStore | None:
     """Open the claim store the no-progress back-off records witnesses on.
 
-    Resolves the same db path the worker/queue-depth counter use (default
-    ``.flywheel/flywheel.sqlite`` under the repo). A build failure (missing
-    backend, locked db) degrades to no back-off rather than crashing the daemon
-    -- the loop simply keeps running, as it does today.
+    Built through the policy-driven :func:`build_claim_store` factory, so a
+    ``[store]`` backend of postgres records (and reads) witnesses on the shared
+    ledger rather than a local sqlite file. For the sqlite backend the db path
+    is resolved exactly as the worker/queue-depth counter resolve it (default
+    ``.flywheel/flywheel.sqlite`` under the repo); the factory ignores it for
+    postgres, which binds its DSN from the environment. A build failure
+    (missing backend, missing extra, locked db, unreachable server) degrades to
+    no back-off rather than crashing the daemon -- the loop simply keeps
+    running, as it does today.
     """
     raw_db = (
         policy.db_path
@@ -274,7 +282,7 @@ def _open_backoff_claims(
     )
     db_path = raw_db if raw_db.is_absolute() else repo_root / raw_db
     try:
-        return SqliteClaimStore(db_path)
+        return build_claim_store(policy, db_path=db_path)
     except Exception as exc:  # noqa: BLE001 - back-off is best-effort
         log(
             f"no-progress back-off store unavailable "

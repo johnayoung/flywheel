@@ -136,7 +136,10 @@ from flywheel_orchestrator._sources import (
     WorkReport,
     WorkSource,
 )
-from flywheel_orchestrator._store_factory import open_sqlite_bound_store
+from flywheel_orchestrator._store_factory import (
+    build_claim_store,
+    open_sqlite_bound_store,
+)
 from flywheel_orchestrator._work_graph import (
     GraphValidationIssue,
     WorkGraph,
@@ -440,7 +443,7 @@ def _assemble_graph_snapshot_items(
     states: dict[str, TaskState],
     *,
     worker_capabilities: frozenset[str],
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
 ) -> list[GraphSnapshotItem]:
     """Materialize each pass work item's full cross-section for one snapshot.
 
@@ -548,7 +551,7 @@ def _is_awaiting_approval(row: TaskStatusRow) -> bool:
 
 def _recover_claimable_stranded(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     worker_id: str,
     *,
     lease_seconds: float,
@@ -593,7 +596,7 @@ def _recover_claimable_stranded(
 
 def sweep_expired_leases(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     worker_id: str,
     *,
     lease_seconds: float,
@@ -639,7 +642,7 @@ def sweep_expired_leases(
 async def _lease_sweep_loop(
     *,
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     worker_id: str,
     lease_seconds: float,
     interval: float,
@@ -749,7 +752,7 @@ def _landing_parks(
 
 
 def _landing_already_queued(
-    claims: SqliteClaimStore, task_id: str, run_id: str
+    claims: SqliteClaimStore | PostgresClaimStore, task_id: str, run_id: str
 ) -> bool:
     """True once this run's parked landing has been routed to the queue.
 
@@ -811,7 +814,7 @@ def _record_landing_redrive(
 
 def redrive_parked_landings(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     strategy: SubmitStrategy,
     worker_id: str,
     *,
@@ -1136,7 +1139,7 @@ def _is_retry_exhausted(lifecycle: Lifecycle, max_retries: int) -> bool:
     return lifecycle.attempts[-1].outcome in _RETRY_EXHAUSTION_OUTCOMES
 
 
-def _escalation_count(claims: SqliteClaimStore, task_id: str) -> int:
+def _escalation_count(claims: SqliteClaimStore | PostgresClaimStore, task_id: str) -> int:
     """How many sanctioned escalations have been recorded for ``task_id``.
 
     Each escalation appends one :data:`STOP_RETRIES_ESCALATED` marker keyed to
@@ -1152,7 +1155,7 @@ def _escalation_count(claims: SqliteClaimStore, task_id: str) -> int:
 
 
 def _already_queued_after_escalation(
-    claims: SqliteClaimStore, task_id: str
+    claims: SqliteClaimStore | PostgresClaimStore, task_id: str
 ) -> bool:
     """True once this task has been routed to the queue post-escalation.
 
@@ -1173,7 +1176,7 @@ EscalationDriver = Callable[["EscalationRequest", "str | None"], Awaitable["str 
 
 async def redrive_exhausted_retries(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     worker_id: str,
     *,
     requests: Iterable[EscalationRequest],
@@ -1364,7 +1367,7 @@ class PrereqRedriveOutcome:
 
 
 def _prereq_dangling_cycles(
-    claims: SqliteClaimStore, referencing_id: str, missing_id: str
+    claims: SqliteClaimStore | PostgresClaimStore, referencing_id: str, missing_id: str
 ) -> int:
     """How many cycles ``referencing_id``'s edge to ``missing_id`` has dangled.
 
@@ -1383,7 +1386,7 @@ def _prereq_dangling_cycles(
 
 
 def _prereq_already_queued(
-    claims: SqliteClaimStore, referencing_id: str, missing_id: str
+    claims: SqliteClaimStore | PostgresClaimStore, referencing_id: str, missing_id: str
 ) -> bool:
     """True once this referencing/missing edge has been routed to the queue.
 
@@ -1402,7 +1405,7 @@ def _prereq_already_queued(
 
 
 def redrive_missing_prerequisites(
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     *,
     issues: Iterable[GraphValidationIssue],
     bound: int = DEFAULT_PREREQ_REDRIVE_BOUND,
@@ -1561,7 +1564,7 @@ class NoProgressOutcome:
     cycles: int
 
 
-def _no_progress_streak(claims: SqliteClaimStore, unit_id: str) -> int:
+def _no_progress_streak(claims: SqliteClaimStore | PostgresClaimStore, unit_id: str) -> int:
     """Length of ``unit_id``'s current consecutive no-progress streak.
 
     Walks the unit's append-only stop ledger and counts ``no-progress-cycle``
@@ -1580,7 +1583,7 @@ def _no_progress_streak(claims: SqliteClaimStore, unit_id: str) -> int:
 
 
 def _no_progress_already_queued(
-    claims: SqliteClaimStore, unit_id: str
+    claims: SqliteClaimStore | PostgresClaimStore, unit_id: str
 ) -> bool:
     """True once ``unit_id`` has been backed off to the human-review queue.
 
@@ -1597,7 +1600,7 @@ def _no_progress_already_queued(
 
 
 def redrive_no_progress(
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     *,
     observations: Iterable[NoProgressObservation],
     bound: int = DEFAULT_NO_PROGRESS_BOUND,
@@ -1805,7 +1808,7 @@ def _human_gate_detail(
 
 
 def _human_gate_already_queued(
-    claims: SqliteClaimStore, task_id: str, run_id: str, reason: str
+    claims: SqliteClaimStore | PostgresClaimStore, task_id: str, run_id: str, reason: str
 ) -> bool:
     """True once this run's intentional stop has been surfaced to the queue.
 
@@ -1822,7 +1825,7 @@ def _human_gate_already_queued(
 
 def redrive_human_gates(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     *,
     requests: Iterable[HumanGateRequest],
     now: Callable[[], datetime],
@@ -1921,7 +1924,7 @@ class _ClaimHeartbeat:
     def __init__(
         self,
         *,
-        claims: SqliteClaimStore,
+        claims: SqliteClaimStore | PostgresClaimStore,
         claim: TaskClaim,
         lease_seconds: float,
         interval: float,
@@ -2269,12 +2272,16 @@ async def orchestrate(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox_root.mkdir(parents=True, exist_ok=True)
 
-    # Two stores on one file: flywheel's core store (lifecycle, run state) and
-    # the orchestrator's own claim store (task_claims). Each owns its tables.
-    # The core store is built through the factory so the policy's backend
-    # selection (and its fail-fast postgres preconditions) apply here too.
+    # flywheel's core store (lifecycle, run state) and the orchestrator's own
+    # claim store (task_claims/leases and every orchestrator ledger). Each owns
+    # its tables. BOTH are built through the policy-driven factory so the
+    # configured backend selects them together (and its fail-fast postgres
+    # preconditions apply here too): under ``backend = "postgres"`` the run
+    # record and the claims land in postgres, with nothing written to sqlite
+    # (spec 00075). On the sqlite default the two stores share one file exactly
+    # as before.
     control = open_sqlite_bound_store(policy, db_path=db_path)
-    claims = SqliteClaimStore(db_path)
+    claims = build_claim_store(policy, db_path=db_path)
     # Control-plane telemetry (recovery sweeps, rechecks, approval
     # resolution) streams to the same per-run JSONL files the harness
     # writes (run_task_object derives the identical logs root from
@@ -3109,9 +3116,29 @@ def _reevaluate_landing_gate(
     return True
 
 
+def _datapath_store(
+    control: SqliteStore | PostgresStore,
+) -> SqliteStore | PostgresStore | None:
+    """The store ``run_task_object`` drives the run record through, or ``None``.
+
+    Under a durable backend the run's whole record -- task version, lifecycle,
+    every attempt, its domain events, and grader results -- is written to the
+    orchestrator's own ``control`` store so it lands in the configured database
+    and no run state leaks to sqlite (spec 00075). On the sqlite default this
+    returns ``None``: ``run_task_object`` opens and closes its own
+    :class:`SqliteStore` on ``db_path`` (a separate WAL connection, visible to
+    ``control`` on the next query), byte-for-byte the historical behavior. The
+    discriminator is the store type itself -- a ``SqliteStore`` keeps the
+    separate-connection path; any other store is injected and shared.
+    """
+    if isinstance(control, SqliteStore):
+        return None
+    return control
+
+
 async def _drive_under_lease(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     claim: TaskClaim,
     row: TaskStatusRow,
     *,
@@ -3151,11 +3178,14 @@ async def _drive_under_lease(
     terminal status to ``submit``, report it to the work source, then
     release the lease.
 
-    ``run_task_object`` opens and closes its own store, so its writes are
-    committed and visible to the orchestrator's control store on the next
-    query (separate SQLite connections under WAL). The control store is
-    touched only by the heartbeat thread for the duration of the run, never
-    concurrently with the main thread.
+    The run's persistence backend is chosen by :func:`_datapath_store`. On the
+    sqlite default ``run_task_object`` opens and closes its own store, so its
+    writes are committed and visible to the orchestrator's control store on the
+    next query (separate SQLite connections under WAL). Under a durable backend
+    the shared ``control`` store is injected instead, so the whole run record
+    lands in the configured database and nothing is written to sqlite (spec
+    00075); that store is pooled, so the concurrent reconcile/sweep tasks and
+    the heartbeat borrow their own connections.
 
     ``submit`` (when provided) runs after the task finalizes but *before* the
     lease is released, so a consumer's merge/park acts under the same
@@ -3223,6 +3253,7 @@ async def _drive_under_lease(
         outcome = await run_task_object(
             row.task,
             db_path=db_path,
+            store=_datapath_store(control),
             sandbox=sandbox,
             model=model,
             max_turns=max_turns,
@@ -3410,7 +3441,7 @@ async def _drive_under_lease(
 
 async def _drive_or_relinquish(
     control: SqliteStore | PostgresStore,
-    claims: SqliteClaimStore,
+    claims: SqliteClaimStore | PostgresClaimStore,
     claim: TaskClaim,
     row: TaskStatusRow,
     *,

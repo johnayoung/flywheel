@@ -22,11 +22,14 @@ from typing import TYPE_CHECKING
 from flywheel_core._registry import MissingExtraError, import_extra, install_hint
 from flywheel_core.store_sqlite import SqliteStore
 
+from flywheel_orchestrator._claims import SqliteClaimStore
 from flywheel_orchestrator._policy import PolicyError, WorkPolicy
-from flywheel_orchestrator._store_registry import STORES
+from flywheel_orchestrator._store_registry import CLAIM_STORES, STORES
 
 if TYPE_CHECKING:
     from flywheel_core.store_postgres import PostgresStore
+
+    from flywheel_orchestrator._claims_postgres import PostgresClaimStore
 
 # DSN environment contract (spec FR-4/FR-6): the flywheel-specific variable
 # wins over the 12-factor fallback, silently.
@@ -139,6 +142,84 @@ def build_store(
     return builder(policy, db_path=db_path, environ=environ)
 
 
+def build_sqlite_claim_store(
+    policy: WorkPolicy | None,
+    *,
+    db_path: Path,
+    environ: Mapping[str, str] | None = None,
+) -> SqliteClaimStore:
+    """Build the sqlite claim store (the registry's ``sqlite`` target).
+
+    Yields ``SqliteClaimStore(db_path)`` exactly as the run loop constructed
+    it before this factory existed; ``db_path`` is the same file the core
+    sqlite store binds (each owns its own tables). ``policy``/``environ`` are
+    unused but kept for the shared builder signature the registry dispatches
+    on.
+    """
+    return SqliteClaimStore(db_path)
+
+
+def build_postgres_claim_store(
+    policy: WorkPolicy | None,
+    *,
+    db_path: Path,
+    environ: Mapping[str, str] | None = None,
+) -> PostgresClaimStore:
+    """Build the postgres claim store (the registry's ``postgres`` target).
+
+    The claim-store analog of :func:`build_postgres_store`: it resolves the
+    DSN via :func:`resolve_postgres_dsn`, imports the store lazily through
+    :func:`~flywheel_core._registry.import_extra` so the ``postgres`` extra
+    stays optional, and passes the policy's ``store_schema`` through when set;
+    pool sizing stays at the store's code defaults. An unreachable database
+    surfaces as the store's own connection error -- never a silent sqlite
+    fallback.
+
+    Raises :class:`StoreConfigError` when neither ``FLYWHEEL_PG_DSN`` nor
+    ``DATABASE_URL`` is set, or when the postgres extra is not installed.
+    """
+    dsn = resolve_postgres_dsn(environ)
+    if dsn is None:
+        raise StoreConfigError(
+            f"store backend is postgres but neither {PG_DSN_ENV} nor "
+            f"{PG_DSN_FALLBACK_ENV} is set; export one with a postgres "
+            f"connection string"
+        )
+    try:
+        module = import_extra(
+            "flywheel_orchestrator._claims_postgres", "postgres"
+        )
+    except MissingExtraError as exc:
+        raise StoreConfigError(
+            f"store backend is postgres but the postgres extra is not "
+            f"installed; {install_hint('postgres')}"
+        ) from exc
+    if policy is not None and policy.store_schema is not None:
+        return module.PostgresClaimStore(dsn, schema=policy.store_schema)
+    return module.PostgresClaimStore(dsn)
+
+
+def build_claim_store(
+    policy: WorkPolicy | None,
+    *,
+    db_path: Path,
+    environ: Mapping[str, str] | None = None,
+) -> SqliteClaimStore | PostgresClaimStore:
+    """Construct the claim store ``policy`` selects.
+
+    The claim-store peer of :func:`build_store`: routes the policy's
+    ``store_backend`` (``sqlite`` when no policy is given) through the
+    :data:`~flywheel_orchestrator._store_registry.CLAIM_STORES` registry, which
+    owns the unknown-backend and missing-extra failures, then calls the
+    resolved builder. This is the single production construction point for
+    claim stores, so a postgres policy lands claims/leases in postgres with
+    the same fail-fast DSN / extra preconditions the core store enforces.
+    """
+    backend = policy.store_backend if policy is not None else "sqlite"
+    builder = CLAIM_STORES.resolve(backend)
+    return builder(policy, db_path=db_path, environ=environ)
+
+
 def open_sqlite_bound_store(
     policy: WorkPolicy | None, *, db_path: Path
 ) -> SqliteStore | PostgresStore:
@@ -167,7 +248,10 @@ __all__ = [
     "PG_DSN_ENV",
     "PG_DSN_FALLBACK_ENV",
     "StoreConfigError",
+    "build_claim_store",
+    "build_postgres_claim_store",
     "build_postgres_store",
+    "build_sqlite_claim_store",
     "build_sqlite_store",
     "build_store",
     "open_sqlite_bound_store",

@@ -46,7 +46,7 @@ from collections.abc import (
 )
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, Protocol, TextIO
 
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions, Message
@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 from flywheel_core.harness import (
     HarnessConfig,
     HarnessOutcome,
+    HarnessStore,
     InvocationRequest,
     InvokeFunc,
     finalize_stranded_lifecycle,
@@ -75,6 +76,7 @@ from flywheel_core.lifecycle import Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.store_protocols import (
     ControlCommandStore,
+    LifecycleStore,
     TelemetryRecord,
     TelemetrySink,
 )
@@ -92,6 +94,22 @@ from flywheel_core.task import (
 DEFAULT_DB_PATH = Path(".flywheel/flywheel.sqlite")
 DEFAULT_MAX_TURNS = 500
 DEFAULT_MAX_RETRIES = 1
+
+
+class RunStore(HarnessStore, LifecycleStore, ControlCommandStore, Protocol):
+    """Composite store contract a single-task run is driven through.
+
+    The union of every store surface :func:`run_task_object` touches: the
+    :class:`~flywheel_core.harness.HarnessStore` the harness writes the run
+    record through (task version, lifecycle, attempts, domain events, grader
+    results), the ``list_lifecycles`` cross-task read stranded recovery needs
+    (:class:`~flywheel_core.store_protocols.LifecycleStore`), and the
+    :class:`~flywheel_core.store_protocols.ControlCommandStore` the control
+    watcher claims from. :class:`~flywheel_core.store_memory.InMemoryStore`,
+    :class:`~flywheel_core.store_sqlite.SqliteStore`, and the postgres backend
+    all satisfy it, so a caller can inject any of them and the whole run record
+    flows through that one object.
+    """
 
 
 # --- Status queries ---------------------------------------------------------
@@ -114,7 +132,7 @@ _STRANDED_STATUSES: frozenset[Status] = frozenset(
 )
 
 
-def _stranded_run_ids(store: SqliteStore | PostgresStore, task_id: str | None = None) -> list[str]:
+def _stranded_run_ids(store: RunStore, task_id: str | None = None) -> list[str]:
     """Return run_ids whose lifecycle is mid-attempt with no live worker.
 
     A run is considered stranded when its status sits in ``running`` or
@@ -134,7 +152,7 @@ def _stranded_run_ids(store: SqliteStore | PostgresStore, task_id: str | None = 
 
 
 def recover_stranded_lifecycles(
-    store: SqliteStore | PostgresStore,
+    store: RunStore,
     *,
     task_id: str | None = None,
     sink: TelemetrySink | None = None,
@@ -741,6 +759,7 @@ async def run_task_object(
     events: str = EVENTS_NONE,
     source: str | None = None,
     sink: TelemetrySink | None = None,
+    store: RunStore | None = None,
     landability_gate: Callable[[], str | None] | None = None,
 ) -> HarnessOutcome:
     """Persist a lifecycle for ``task`` and drive it via ``run_task``.
@@ -774,6 +793,15 @@ async def run_task_object(
     ``.flywheel/logs`` for the default db path), writing one JSONL file
     per run under ``logs/runs/``.
 
+    ``store`` injects the persistence backend the whole run record —
+    task version, lifecycle, every attempt, the run's domain events, and
+    grader results — is driven through (spec 00075). ``None`` (the
+    default) opens the byte-for-byte-unchanged :class:`SqliteStore` at
+    ``db_path`` and closes it on exit. When a store is supplied this call
+    opens no SqliteStore and creates no sqlite file at ``db_path`` at all:
+    every write lands in the injected object, and the caller owns its
+    lifetime (this function never closes it).
+
     ``landability_gate`` is forwarded verbatim onto
     :attr:`HarnessConfig.landability_gate` (spec 00061): a git-free opaque
     callback the orchestrator supplies so a non-landable finished change is
@@ -791,10 +819,21 @@ async def run_task_object(
         else Lifecycle(task_id=task.id, run_id=run_id, source=source or "")
     )
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox.mkdir(parents=True, exist_ok=True)
 
-    backend = SqliteStore(db_path)
+    # Store injection (spec 00075): a caller-supplied store owns the entire
+    # run record and this call opens no SqliteStore and creates no sqlite
+    # file at db_path. With no store the sqlite default is byte-for-byte as
+    # before — including creating db_path.parent and closing the store on
+    # exit. Only a store we opened here is ours to close in the finally.
+    owned_backend: SqliteStore | None = None
+    backend: RunStore
+    if store is None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        owned_backend = SqliteStore(db_path)
+        backend = owned_backend
+    else:
+        backend = store
     owned_sink: FileTelemetrySink | None = None
     if sink is None:
         owned_sink = FileTelemetrySink(db_path.parent / "logs")
@@ -949,7 +988,8 @@ async def run_task_object(
                 flush=True,
             )
     finally:
-        backend.close()
+        if owned_backend is not None:
+            owned_backend.close()
         if owned_sink is not None:
             owned_sink.close()
     return outcome

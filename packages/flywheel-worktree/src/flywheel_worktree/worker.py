@@ -103,6 +103,7 @@ from flywheel_core.workflow import (
 from flywheel_orchestrator import (
     LiveRunRow,
     archive_completed_phases,
+    build_claim_store,
     collect_live_rows,
     iter_active_phase_dirs,
     write_phase_base_if_missing,
@@ -1248,16 +1249,28 @@ def archive_phases(
     gate (spec 00035): the command runs against the merged base in
     ``repo_root`` before an eligible phase archives, and a non-zero exit
     leaves the phase active with the refusal reported via ``log``.
+
+    The sweep threads the orchestrator claim store through so each archived
+    task with a still-surfaced stop row gets a ``stop-resolved`` marker --
+    archival is the verified resolution act, so the stranded/stopped status
+    surface clears with the phase instead of rendering the stale stop forever.
     """
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
-        moved = archive_completed_phases(
-            tasks_dir,
-            store,
-            repo_root=repo_root,
-            log=log,
-            phase_verify=policy.phase_verify if policy is not None else None,
-        )
+        claims = build_claim_store(policy, db_path=db_path)
+        try:
+            moved = archive_completed_phases(
+                tasks_dir,
+                store,
+                repo_root=repo_root,
+                log=log,
+                phase_verify=(
+                    policy.phase_verify if policy is not None else None
+                ),
+                claims=claims,
+            )
+        finally:
+            claims.close()
     finally:
         store.close()
     for dest in moved:

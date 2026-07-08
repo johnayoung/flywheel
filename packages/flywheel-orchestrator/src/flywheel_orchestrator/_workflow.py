@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     # on the psycopg extra. The store factory returns SqliteStore |
     # PostgresStore and both answer these reads through the store protocol.
     from flywheel_core.store_postgres import PostgresStore
+    from flywheel_orchestrator._claims_postgres import PostgresClaimStore
 from flywheel_core.telemetry_file import FileTelemetrySink
 from flywheel_core.task import ManualGrader, Task
 from flywheel_core.validation import TaskDefect, validate_task
@@ -67,7 +68,9 @@ from flywheel_core.workflow import (
     recover_stranded_lifecycles,
 )
 from flywheel_orchestrator._claims import (
+    STOP_RESOLVED,
     OrchestratorStopEventRecord,
+    SqliteClaimStore,
 )
 from flywheel_orchestrator._history import (
     TERMINAL_STATUSES,
@@ -383,6 +386,8 @@ def archive_completed_phases(
     repo_root: Path | None = None,
     log: Callable[[str], None] | None = None,
     phase_verify: str | None = None,
+    claims: SqliteClaimStore | PostgresClaimStore | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> list[Path]:
     """Move ``active/<phase>`` dirs to ``archive/`` when every task is done.
 
@@ -409,6 +414,17 @@ def archive_completed_phases(
     archives exactly as the no-gate path does. ``None`` (the default)
     preserves today's archival behavior for operators who configured no
     gate.
+
+    ``claims`` threads the orchestrator stop-event ledger through the sweep.
+    Archival is the verified resolution act -- a phase moves only when every
+    task is done and the gates above passed against the landed result -- so
+    each archived task whose ledger still surfaces a stop (a queue-routed
+    strand serviced by hand, a dangling prerequisite that later resolved)
+    gets one appended :data:`STOP_RESOLVED` marker, clearing it from the
+    ``status`` stranded view without deleting ledger history. ``None`` (the
+    default) skips the markers, preserving the legacy contract. ``now`` is
+    the marker's injected clock; ``None`` falls back to wall-clock UTC, the
+    same convention as the work-source stop sink.
     """
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
@@ -474,6 +490,24 @@ def archive_completed_phases(
         shutil.move(str(phase_dir), str(dest))
         if repo_root is not None:
             _materialize_loop_base(repo_root, dest)
+        if claims is not None:
+            clock = now if now is not None else (
+                lambda: datetime.now(timezone.utc)
+            )
+            for task in loaded_tasks:
+                events = claims.list_subject_stop_events(task.id)
+                if not events or events[-1].kind == STOP_RESOLVED:
+                    continue
+                claims.record_stop_event(
+                    kind=STOP_RESOLVED,
+                    subject=task.id,
+                    detail=(
+                        f"phase {phase_dir.name!r} archived with every task "
+                        f"done and its exit gates passed; supersedes the "
+                        f"surfaced stop ({events[-1].kind!r})"
+                    ),
+                    occurred_at=clock(),
+                )
         moved.append(dest)
     return moved
 
@@ -1376,17 +1410,24 @@ def _stop_events_by_subject(
 
     Recurrence is the ledger's signal (it never dedupes), so a subject stopped
     on several passes surfaces once here with its latest reason -- ``list_stop_events``
-    returns id (insertion) order, so the last row for a subject wins. An empty
-    ledger yields an empty map, keeping the omit-when-absent convention intact
-    for a healthy store. The claim store is built through the policy-driven
-    :func:`build_claim_store` factory -- so a ``[store]`` backend of postgres
-    reads the shared ledger, never a stale local sqlite file -- opened
-    read-only-in-intent and closed before returning.
+    returns id (insertion) order, so the last row for a subject wins. A
+    :data:`STOP_RESOLVED` marker (appended when the subject's phase archived
+    after landing, or an operator serviced the strand by hand) clears the
+    subject: only a stop appended AFTER the marker -- a fresh recurrence --
+    surfaces again. An empty ledger yields an empty map, keeping the
+    omit-when-absent convention intact for a healthy store. The claim store is
+    built through the policy-driven :func:`build_claim_store` factory -- so a
+    ``[store]`` backend of postgres reads the shared ledger, never a stale
+    local sqlite file -- opened read-only-in-intent and closed before
+    returning.
     """
     claims = build_claim_store(policy, db_path=db_path)
     try:
         latest: dict[str, OrchestratorStopEventRecord] = {}
         for event in claims.list_stop_events():
+            if event.kind == STOP_RESOLVED:
+                latest.pop(event.subject, None)
+                continue
             latest[event.subject] = event
         return latest
     finally:
@@ -1717,7 +1758,11 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
-        moved = archive_completed_phases(tasks_dir, store)
+        claims = build_claim_store(policy, db_path=db_path)
+        try:
+            moved = archive_completed_phases(tasks_dir, store, claims=claims)
+        finally:
+            claims.close()
     finally:
         store.close()
     for dest in moved:

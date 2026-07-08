@@ -56,6 +56,7 @@ from flywheel_orchestrator._claims import (
     STOP_DANGLING_PREREQUISITE,
     STOP_NO_OP_CYCLE,
     STOP_PREPARE_SKIP,
+    STOP_RESOLVED,
     STOP_SOURCE_TRUNCATION,
     STOP_ZERO_GRADER_DROP,
     SqliteClaimStore,
@@ -1805,6 +1806,127 @@ def test_status_enumerates_one_of_each_new_stop_kind(
     text = capsys.readouterr().out
     for kind in every_kind:
         assert kind in text
+
+
+def test_status_clears_stop_after_resolution_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``stop-resolved`` marker clears the subject from the stranded surface;
+    a stop appended AFTER the marker is a fresh recurrence and surfaces again."""
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    _record_stop(db, kind=STOP_PREPARE_SKIP, subject="a", detail="stop cause")
+    _record_stop(db, kind=STOP_RESOLVED, subject="a", detail="serviced")
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    entry = next(e for e in payload if e.get("task_id") == "a")
+    assert "stopped" not in entry
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    assert "stopped:" not in capsys.readouterr().out
+
+    # A recurrence after the marker surfaces again -- the marker is a
+    # supersession point, not a permanent mute.
+    _record_stop(db, kind=STOP_PREPARE_SKIP, subject="a", detail="recurred")
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    entry = next(e for e in payload if e.get("task_id") == "a")
+    assert entry["stopped"] == {
+        "kind": STOP_PREPARE_SKIP,
+        "detail": "recurred",
+    }
+
+
+def test_status_clears_rowless_subject_after_resolution_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A resolved stop whose task left the work list (phase archived) renders
+    no bare-subject line -- the exact stale-forever shape the marker exists
+    to clear -- while an unresolved rowless stop keeps surfacing."""
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    db = tmp_path / "db.sqlite"
+    _record_stop(
+        db, kind=STOP_DANGLING_PREREQUISITE, subject="gone", detail="d1"
+    )
+    _record_stop(db, kind=STOP_RESOLVED, subject="gone", detail="archived")
+
+    assert (
+        orch_main(
+            ["status", "--tasks-dir", str(tmp_path), "--db", str(db), "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert all(e.get("subject") != "gone" for e in payload)
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    assert "gone" not in capsys.readouterr().out
+
+
+def test_archive_records_stop_resolution_markers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Archival is the verified resolution act: each archived task with a
+    surfaced stop gains one marker; tasks with a clean ledger gain nothing."""
+    _write_task(tmp_path / "active" / "01" / "a.json", "a")
+    _write_task(tmp_path / "active" / "01" / "b.json", "b")
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "a")
+        _seed_done(store, "b")
+    finally:
+        store.close()
+    _record_stop(
+        db, kind=STOP_DANGLING_PREREQUISITE, subject="a", detail="stranded"
+    )
+
+    fixed = datetime(2026, 7, 8, 12, 0, tzinfo=timezone.utc)
+    store = SqliteStore(db)
+    claims = SqliteClaimStore(db)
+    try:
+        moved = archive_completed_phases(
+            tmp_path, store, claims=claims, now=lambda: fixed
+        )
+        assert [dest.name for dest in moved] == ["01"]
+        rows_a = claims.list_subject_stop_events("a")
+        assert rows_a[-1].kind == STOP_RESOLVED
+        assert "'01' archived" in rows_a[-1].detail
+        assert rows_a[-1].occurred_at == fixed
+        assert claims.list_subject_stop_events("b") == []
+        # Idempotent: a second sweep has nothing to move and appends nothing.
+        assert (
+            archive_completed_phases(
+                tmp_path, store, claims=claims, now=lambda: fixed
+            )
+            == []
+        )
+        assert len(claims.list_subject_stop_events("a")) == len(rows_a)
+    finally:
+        claims.close()
+        store.close()
+
+    # The archived task's stop no longer renders anywhere on status.
+    assert (
+        orch_main(["status", "--tasks-dir", str(tmp_path), "--db", str(db)])
+        == 0
+    )
+    assert "stopped:" not in capsys.readouterr().out
 
 
 # ---------- Stranded-lifecycle recovery ----------

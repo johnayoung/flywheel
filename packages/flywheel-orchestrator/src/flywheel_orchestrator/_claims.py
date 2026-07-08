@@ -173,6 +173,20 @@ STOP_NO_PROGRESS_RESET: str = "no-progress-reset"
 # bookkeeping witness, so it never leaks into the human-review queue read.
 STOP_RETRIES_ESCALATED: str = "retries-escalated"
 
+# The stop-surface supersession marker. The ledger is append-only and never
+# deletes a row, so once a unit's dead-end is actually serviced -- its phase
+# archived after every task landed (the phase-exit gates are the verified
+# witness), or an operator resolved a queued strand by hand -- the resolution
+# is recorded the same way progress resets a no-progress streak: one appended
+# marker row keyed to the subject. Readers that surface "the latest stop per
+# subject" (the ``status`` stranded view) treat the marker as clearing the
+# subject; a stop appended AFTER the marker is a fresh recurrence and surfaces
+# again. Like ``no-progress-reset`` this marker is DELIBERATELY neither a
+# pre-run stop (:data:`ORCHESTRATOR_STOP_EVENT_KINDS`) nor a queue reason
+# (:data:`HUMAN_REVIEW_QUEUE_REASONS`), so it never renders as a stop and
+# never enters the human-review queue read.
+STOP_RESOLVED: str = "stop-resolved"
+
 
 # The human-review queue vocabulary (spec 00069-work-redriver, queue-surface).
 #
@@ -2058,6 +2072,7 @@ __all__ = [
     "STOP_NO_PROGRESS",
     "STOP_NO_PROGRESS_RESET",
     "STOP_PREPARE_SKIP",
+    "STOP_RESOLVED",
     "STOP_RETRIES_ESCALATED",
     "STOP_SOURCE_TRUNCATION",
     "STOP_ZERO_GRADER_DROP",

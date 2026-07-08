@@ -1053,6 +1053,66 @@ def test_archive_phases_accepts_repeated_factory_calls(
         worker.archive_phases(tasks_dir, db_path, lambda _m: None, policy=policy)
 
 
+def test_archive_phases_resolves_surfaced_stops(tmp_path: Path) -> None:
+    """The worker's sweep threads the claim store through, so archiving a
+    phase appends the ``stop-resolved`` marker for a task whose ledger still
+    surfaces a stop (e.g. a queue-routed strand the operator landed by hand)."""
+    from datetime import datetime, timezone
+
+    from flywheel_core import Lifecycle
+    from flywheel_orchestrator._claims import (
+        STOP_DANGLING_PREREQUISITE,
+        STOP_RESOLVED,
+        SqliteClaimStore,
+    )
+
+    db_path = tmp_path / "flywheel.sqlite"
+    tasks_dir = tmp_path / "tasks"
+    phase = tasks_dir / "active" / "01-phase"
+    phase.mkdir(parents=True)
+    (phase / "t1.json").write_text(
+        json.dumps(
+            {
+                "id": "t1",
+                "goal": "g",
+                "graders": [{"type": "command", "run": "true"}],
+            }
+        )
+    )
+    policy = WorkPolicy(source_kind="directory", tasks_dir=tasks_dir)
+    store = SqliteStore(db_path)
+    try:
+        now = datetime.now(timezone.utc)
+        lc = Lifecycle(task_id="t1", run_id="run-t1")
+        lc.transition_to(Status.READY, now=now)
+        lc.transition_to(Status.RUNNING, now=now)
+        lc.transition_to(Status.VALIDATING, now=now)
+        lc.transition_to(Status.DONE, now=now)
+        store.create_lifecycle(lc)
+    finally:
+        store.close()
+    claims = SqliteClaimStore(db_path)
+    try:
+        claims.record_stop_event(
+            kind=STOP_DANGLING_PREREQUISITE,
+            subject="t1",
+            detail="stranded",
+            occurred_at=datetime.now(timezone.utc),
+        )
+    finally:
+        claims.close()
+
+    worker.archive_phases(tasks_dir, db_path, lambda _m: None, policy=policy)
+
+    assert not (tasks_dir / "active" / "01-phase").exists()
+    claims = SqliteClaimStore(db_path)
+    try:
+        rows = claims.list_subject_stop_events("t1")
+    finally:
+        claims.close()
+    assert rows[-1].kind == STOP_RESOLVED
+
+
 def test_concurrent_phase_archive_is_serialized_by_merge_lock(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,41 @@
+{
+  "id": "distributed-read-surfaces",
+  "goal": "flywheel status and history invoked from a working copy whose local sqlite is empty report the runs, claims, and stop events another instance recorded in the shared postgres database.",
+  "prerequisites": ["postgres-data-plane-routing"],
+  "tags": ["spec-00075", "distributed-store-unification"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "bash -c 's=$(uv run pytest packages/flywheel-orchestrator/tests/test_status_distributed.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "reads-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_history.py packages/flywheel-orchestrator/tests/test_attempt_history.py -q" },
+    { "type": "command", "name": "autopilot-reads", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_loop.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- status/history verbs; _stop_events_by_subject constructs SqliteClaimStore directly (~line 1383); module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- _open_backoff_claims constructs SqliteClaimStore directly (~line 277)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_store_factory.py -- the policy-driven factory these reads must route through",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_history.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_attempt_history.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_autopilot_loop.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- criteria 6, 7"
+    ],
+    "constraints": [
+      "Every production read of claims and stop events routes through the same policy-driven factory postgres-data-plane-routing shipped; no read path constructs a sqlite claim store directly when the backend is postgres",
+      "The new test populates postgres through one store configuration, then reads status/history under a second working copy whose local sqlite is empty, asserting the originating run identifiers and stop-event-derived state appear",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change status/history rendering formats beyond sourcing the data from the configured backend",
+      "Do not add cross-backend dual-read or any sqlite-to-postgres migration (spec D-3)",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "The partial fix must fail: output showing postgres runs while stop events still come from local sqlite fails the behavior test",
+      "An empty postgres under backend = postgres renders the normal empty status, not an error"
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "postgres-data-plane-routing",
+  "goal": "Under [store] backend = postgres, worker-driven runs land their complete run records and claims in the configured postgres database with nothing written to sqlite and no task double-claimed across concurrent instances.",
+  "prerequisites": ["core-run-store-injection", "postgres-bootstrap-serialization"],
+  "tags": ["spec-00075", "distributed-store-unification"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "bash -c 's=$(uv run pytest packages/flywheel-orchestrator/tests/test_postgres_data_plane.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "contention", "run": "bash -c 's=$(uv run pytest packages/flywheel-orchestrator/tests/test_postgres_claim_contention.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "sqlite-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -q" },
+    { "type": "command", "name": "factory-suite", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_store_factory.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the run loop constructs SqliteClaimStore unconditionally (~line 2277) and drives runs via db_path only; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_store_factory.py -- build_store already routes the core store on policy.store_backend; extend the same factory discipline to claim stores",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- PostgresClaimStore, complete but constructed nowhere in production; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- store_backend/store_schema fields and the distributed-mode guard (read-only reference)",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_store_factory.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- criteria 1, 2, 3, 7; decisions D-1, D-2"
+    ],
+    "constraints": [
+      "One policy-driven factory is the single production construction point for claim stores; the run datapath store comes from the same policy-built factory through the injection seam shipped by core-run-store-injection",
+      "The read-only sites that still hardcode SqliteClaimStore (_workflow.py stop-event reads, _autopilot_run.py backoff reads) are a follow-on task -- leave their sqlite behavior intact here",
+      "DSN resolution stays FLYWHEEL_PG_DSN then DATABASE_URL; schema selection stays policy.store_schema",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change claim/lease semantics, scheduling, or the DAG",
+      "Do not add repo-identity columns or any cross-repo pooling -- multi-repo isolation is schema-per-repo (spec D-1)",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Dual-write must fail: after a postgres-backed run, the repo's sqlite db path is absent or byte-identical to its pre-run state",
+      "A contention test that serializes the two claimants must fail -- each claimant must obtain at least one claim while every task is claimed exactly once",
+      "The full record lands in postgres -- task_versions, lifecycles, attempts, grader_results, events, task_claims each carry rows for the run"
+    ]
+  }
+}

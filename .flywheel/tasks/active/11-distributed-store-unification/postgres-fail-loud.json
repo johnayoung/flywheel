@@ -1,0 +1,38 @@
+{
+  "id": "postgres-fail-loud",
+  "goal": "A process configured with [store] backend = postgres and no usable database exits non-zero with an error naming the store misconfiguration, without creating or modifying any sqlite store.",
+  "prerequisites": ["postgres-data-plane-routing"],
+  "tags": ["spec-00075", "distributed-store-unification"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_postgres_fail_loud.py -q" },
+    { "type": "command", "name": "factory-suite", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_store_factory.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_store_factory.py -- DSN resolution (FLYWHEEL_PG_DSN then DATABASE_URL) and postgres store construction",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- store backend fields and the distributed-mode guard (read-only reference)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the worker entry seam where startup preflight must fire before any claim or run activity; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/tests/test_store_factory.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- criterion 5; decision D-2"
+    ],
+    "constraints": [
+      "The failure surfaces at startup, before any run or claim activity; both no-DSN-resolves and server-unreachable produce a non-zero exit whose message names the backend and the DSN sources tried",
+      "Under no condition does a postgres-configured process write run or orchestrator state to sqlite (spec D-2)",
+      "The new test needs no live postgres: cover the unset-DSN case and a connection-refused DSN (closed local port), asserting exit status, message content, and that the sqlite path was not created or modified",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not add retry/backoff availability machinery for postgres outages",
+      "Do not change behavior when the backend is sqlite or unset",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Warn-and-continue fallback must fail: after the failed start the repo sqlite path is absent or byte-identical",
+      "Mid-run outages keep flowing through the existing infrastructure-failure handling; this task only owns the startup gate"
+    ]
+  }
+}

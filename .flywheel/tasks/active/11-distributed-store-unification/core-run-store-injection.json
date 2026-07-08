@@ -1,0 +1,38 @@
+{
+  "id": "core-run-store-injection",
+  "goal": "A single-task run driven with a caller-supplied store persists its complete run record (task version, lifecycle, attempts, events, grader results) through that store and creates no sqlite database.",
+  "tags": ["spec-00075", "distributed-store-unification"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-core/tests/test_workflow_store_injection.py -q" },
+    { "type": "command", "name": "runpath-unchanged", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py packages/flywheel-core/tests/test_sandbox_policy_wiring.py -q" },
+    { "type": "command", "name": "store-contract", "run": "uv run pytest packages/flywheel-core/tests/test_store_contract.py packages/flywheel-core/tests/test_store_protocols.py -q" },
+    { "type": "command", "name": "purity", "run": "uv run pytest packages/flywheel-core/tests/test_task_module_purity.py packages/flywheel-core/tests/test_lifecycle_module_purity.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- run_task_object builds its own SqliteStore from db_path today; module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/src/flywheel_core/store_protocols.py -- the store protocol the injected object satisfies",
+      "packages/flywheel-core/src/flywheel_core/store_memory.py -- MemoryStore, the natural injection vehicle for the new test",
+      "packages/flywheel-core/tests/test_harness.py -- keep green, assertions unmodified",
+      "packages/flywheel-core/tests/test_sandbox_policy_wiring.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- criteria 1, 2, 7; decisions D-2, D-3"
+    ],
+    "constraints": [
+      "The store parameter is optional: a call supplying only db_path behaves byte-for-byte as today, so no existing caller changes in this task",
+      "The complete run record flows through the injected store -- task version, lifecycle, every attempt, run events, grader results -- not a terminal subset",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not touch flywheel-orchestrator, flywheel-worktree, flywheel-container, or the flywheel product package -- wiring the orchestrator is a separate task",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A run given an injected store must not create the db_path sqlite file at all -- an implementation that opens both stores must fail the behavior test",
+      "Grader results and run events must land in the injected store, not only the final lifecycle row -- a terminal-summary-only write must fail"
+    ]
+  }
+}

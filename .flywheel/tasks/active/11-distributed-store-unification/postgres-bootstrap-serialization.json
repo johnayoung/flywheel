@@ -1,0 +1,37 @@
+{
+  "id": "postgres-bootstrap-serialization",
+  "goal": "Concurrent first-time opens of both postgres stores against a fresh schema all succeed with the database's server-side deadlock counter unchanged.",
+  "tags": ["spec-00075", "distributed-store-unification"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "bash -c 's=$(uv run pytest packages/flywheel-orchestrator/tests/test_postgres_bootstrap_concurrency.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "core-pg-suite", "run": "uv run pytest packages/flywheel-core/tests/test_store_postgres.py -q" },
+    { "type": "command", "name": "claims-suite", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_claims.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/store_postgres.py -- PostgresStore._bootstrap runs unserialized DDL on every open; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- PostgresClaimStore._bootstrap, same unserialized shape; module is over 800 lines, use serena symbols",
+      "conftest.py -- the session-scoped postgres testcontainer fixtures (postgres_dsn, require_postgres) the new test builds on"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- criterion 4",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims_postgres.py -- acquire_claim already serializes via pg_advisory_xact_lock; bootstrap needs the same discipline"
+    ],
+    "constraints": [
+      "Safety lives inside the stores: any set of concurrent openers is safe without out-of-band provisioning, on both PostgresStore and PostgresClaimStore",
+      "The new test asserts the server-side deadlock counter (pg_stat_database.deadlocks delta == 0) across at least 8 concurrent fresh-schema opens per store kind, plus zero raised exceptions",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change any table shape, query, or claim/lease semantics",
+      "Do not route any new caller onto the postgres stores -- wiring is a separate task",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Catch-and-retry masking must fail: the server-side deadlock counter increments even when the client swallows DeadlockDetected and retries, so only genuine serialization passes",
+      "Re-opening an already-provisioned schema stays idempotent and does not error while another instance holds the bootstrap lock"
+    ]
+  }
+}

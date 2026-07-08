@@ -220,6 +220,47 @@ def build_claim_store(
     return builder(policy, db_path=db_path, environ=environ)
 
 
+def preflight_store(
+    policy: WorkPolicy | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> None:
+    """Fail loud at startup when a configured postgres store is unusable.
+
+    A no-op for the sqlite backend (and an absent policy): those paths are
+    byte-for-byte unchanged. For ``backend = "postgres"`` this probes the
+    configured store once, before any run or claim activity, so a missing
+    DSN, a missing extra, or an unreachable server terminates the process
+    with a :class:`StoreConfigError` (exit 2 via the CLI's ``PolicyError``
+    handling) instead of the split-brain silent fallback to sqlite this
+    contract exists to kill (spec 00075, decision D-2).
+
+    The no-DSN and missing-extra cases surface with
+    :func:`build_postgres_store`'s own messages, which already name the
+    backend and both DSN env vars. An unreachable server -- whose native
+    error is a psycopg connection failure naming neither -- is wrapped in a
+    :class:`StoreConfigError` that names the backend and the DSN sources
+    tried, never the DSN value (it may carry a password). A reachable store
+    is constructed and immediately closed: this is a probe, not the store
+    the caller runs with, so no sqlite path is created either way.
+    """
+    backend = policy.store_backend if policy is not None else "sqlite"
+    if backend != "postgres":
+        return
+    try:
+        store = build_postgres_store(policy, db_path=Path(), environ=environ)
+    except StoreConfigError:
+        # No DSN resolved, or the postgres extra is missing: the factory's
+        # message already names the backend and both DSN sources.
+        raise
+    except Exception as exc:  # noqa: BLE001 - driver connection failure
+        raise StoreConfigError(
+            f"store backend is postgres but the database is unreachable; "
+            f"checked {PG_DSN_ENV} then {PG_DSN_FALLBACK_ENV} for the DSN"
+        ) from exc
+    store.close()
+
+
 def open_sqlite_bound_store(
     policy: WorkPolicy | None, *, db_path: Path
 ) -> SqliteStore | PostgresStore:
@@ -255,5 +296,6 @@ __all__ = [
     "build_sqlite_store",
     "build_store",
     "open_sqlite_bound_store",
+    "preflight_store",
     "resolve_postgres_dsn",
 ]

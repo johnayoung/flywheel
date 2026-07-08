@@ -139,6 +139,7 @@ from flywheel_orchestrator._sources import (
 from flywheel_orchestrator._store_factory import (
     build_claim_store,
     open_sqlite_bound_store,
+    preflight_store,
 )
 from flywheel_orchestrator._work_graph import (
     GraphValidationIssue,
@@ -2268,6 +2269,15 @@ async def orchestrate(
                 )
             )
         )
+
+    # Startup fail-loud gate (spec 00075, criterion 5, decision D-2): a
+    # postgres backend that resolves no DSN or cannot reach its server
+    # terminates here -- before any filesystem side effect, claim, or run --
+    # with an error naming the backend and the DSN sources tried. This runs
+    # ahead of the mkdir/store construction below so a configured-but-unusable
+    # postgres never silently falls back to sqlite (no run or orchestrator
+    # state is written locally). A no-op for the sqlite/unset backend.
+    preflight_store(policy)
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     sandbox_root.mkdir(parents=True, exist_ok=True)

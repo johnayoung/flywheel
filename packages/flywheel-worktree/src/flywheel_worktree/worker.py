@@ -67,8 +67,15 @@ from flywheel_core import (
 from flywheel_core.events import (
     GATE_EXCERPT_MAX_BYTES,
     LANDING_STRATEGY_MERGE,
+    PARK_KIND_DIVERGENT_BASE,
+    PARK_KIND_HELD_OUT_GATE,
+    PARK_KIND_MERGE_CONFLICT,
     PARK_KIND_PROTECTED_PATHS,
+    PARK_KIND_STANDING_VERIFY,
     PARK_KIND_SUBMIT_ERROR,
+    RUNG_FAST_FORWARD,
+    RUNG_MERGE_FALLBACK,
+    RUNG_REBASE,
     DomainEvent,
     GateGraderReceipt,
     Landed,
@@ -90,6 +97,7 @@ from flywheel_orchestrator import (
     SupervisionBudget,
     SupervisionPolicy,
     WorkPolicy,
+    evaluate_held_out_gate,
     load_effective_policy,
     open_sqlite_bound_store,
     orchestrate,
@@ -325,6 +333,7 @@ class GitWorktreeSubmitter:
         store: LandingLedger | None = None,
         grader_env: Mapping[str, str] | None = None,
         verify_command: str | None = None,
+        held_out_source: HeldOutGraderSource | None = None,
         disk_preflight: DiskPreflight | None = None,
     ) -> None:
         self.repo_root = repo_root
@@ -346,6 +355,13 @@ class GitWorktreeSubmitter:
         # graders. None => no gate (back-compat). Runs with grader_env so the
         # build shares the same cache/toolchain as the in-run graders.
         self.verify_command = verify_command
+        # Declared held-out landing gate (spec 00051), re-run against the MERGED
+        # candidate tree on the merge-fallback recovery rung (spec 00076, D-2):
+        # the orchestrator gates the pre-merge tree, but a merge produces a tree
+        # no grader saw, so nothing lands on the new rung that the held-out gate
+        # would block. None => no gate (byte-identical to an ungated land); the
+        # clean-FF and rebase rungs are unaffected (their gating is unchanged).
+        self.held_out_source = held_out_source
         # Submit-time retention ([sandbox.retention], spec 00041). Defaults
         # reproduce today's hardcoded behavior: a DONE branch's worktree is
         # destroyed after the merge, a non-DONE worktree is parked for
@@ -498,6 +514,50 @@ class GitWorktreeSubmitter:
         _git(self.repo_root, "branch", "-D", branch)
         self._add_worktree(worktree, "-b", branch, self.phase_base)
 
+    def _guard_done_branch(
+        self, run_id: str | None, branch: str, worktree: Path
+    ) -> None:
+        """Refuse to discard a parked worktree+branch that belongs to a DONE
+        run (spec 00076, D-3): automation never deletes verified work.
+
+        A DONE run's branch that could not fast-forward or rebase carries
+        verified commits pending an unattended landing re-drive; the reuse
+        path's discard-on-failed-rebase must not throw that away. When the run
+        owning ``branch`` finalized ``DONE`` this raises
+        :class:`PrepareSandboxError` so the task is skipped for the session with
+        its branch ref and parked worktree intact. A non-DONE retry-reuse (the
+        run is being resumed, or a fresh run with no resolvable status) is
+        untouched -- discard proceeds exactly as before. Best-effort: no store
+        handle, no ``run_id``, or a store read error reads as not-done, so the
+        pre-existing discard behavior is unchanged wherever DONE-ness cannot be
+        established."""
+        if not self._run_is_done(run_id):
+            return
+        self.log(
+            f"parked branch {branch} belongs to a DONE run and cannot rebase "
+            f"onto {self.phase_base}; preserving branch+worktree for landing "
+            f"recovery instead of discarding verified work"
+        )
+        raise PrepareSandboxError(
+            f"{branch} is a DONE run's branch that cannot rebase onto "
+            f"{self.phase_base}; refusing to discard verified work, worktree "
+            f"preserved at {worktree}"
+        )
+
+    def _run_is_done(self, run_id: str | None) -> bool:
+        """Whether the run identified by ``run_id`` finalized ``DONE``.
+
+        Best-effort read through the ledger handle: ``None`` store/``run_id`` or
+        any store error yields ``False`` so a status read never wedges
+        :meth:`prepare_sandbox` (which must still provision or skip cleanly)."""
+        if self.store is None or run_id is None:
+            return False
+        try:
+            lifecycle = self.store.load_lifecycle(run_id)
+        except Exception:  # noqa: BLE001 - a status read must not wedge prepare
+            return False
+        return lifecycle is not None and lifecycle.status is Status.DONE
+
     def prepare_sandbox(self, req: SandboxRequest) -> Path:
         """Provision (or reuse) the worktree a task runs in; return its path.
         Reuses a parked worktree+branch on retry (rebasing onto base first),
@@ -523,6 +583,7 @@ class GitWorktreeSubmitter:
             self.scrub_worktree_locks(worktree, branch)
             if self._rebase_parked_branch(worktree, branch):
                 return worktree
+            self._guard_done_branch(req.run_id, branch, worktree)
             self._discard_and_recreate(worktree, branch)
             self._run_setup(worktree)
             return worktree
@@ -534,6 +595,7 @@ class GitWorktreeSubmitter:
             )
             self._add_worktree(worktree, branch)
             if not self._rebase_parked_branch(worktree, branch):
+                self._guard_done_branch(req.run_id, branch, worktree)
                 self._discard_and_recreate(worktree, branch)
             self._run_setup(worktree)
             return worktree
@@ -735,28 +797,18 @@ class GitWorktreeSubmitter:
                         req.run_id,
                         strategy=LANDING_STRATEGY_MERGE,
                         landed_ref=landed_ref,
+                        rung=RUNG_FAST_FORWARD,
                     )
                     self._teardown_on_done(worktree, branch)
                     return
 
-            # FF failed (base advanced): rebase once, re-verify, retry FF,
-            # else park.
+            # FF failed (base advanced): rebase once, re-verify, retry FF, and
+            # when the rebase itself conflicts fall through to the merge-fallback
+            # recovery rung (spec 00076, D-1) rather than parking here.
             self.log(f"FF failed for {branch}; rebasing onto {self.phase_base}")
             if _git(worktree, "rebase", self.phase_base).returncode != 0:
                 _git(worktree, "rebase", "--abort")
-                self.log(
-                    f"rebase failed for {branch}; parking worktree at "
-                    f"{worktree}"
-                )
-                self._record_landing_park(
-                    req.run_id,
-                    park_kind="divergent-base",
-                    detail=(
-                        f"{branch} cannot fast-forward {self.phase_base}: "
-                        f"rebase onto the diverged base conflicted; worktree "
-                        f"preserved at {worktree}"
-                    ),
-                )
+                self._merge_fallback(req, worktree, branch, commit_count)
                 return
             reverify_passed, reverify_receipts = self._reverify(req, worktree)
             if not reverify_passed:
@@ -813,6 +865,7 @@ class GitWorktreeSubmitter:
                     req.run_id,
                     strategy=LANDING_STRATEGY_MERGE,
                     landed_ref=landed_ref,
+                    rung=RUNG_REBASE,
                 )
                 self._teardown_on_done(worktree, branch)
                 return
@@ -829,6 +882,210 @@ class GitWorktreeSubmitter:
                     f"{worktree}"
                 ),
             )
+
+    def _merge_fallback(
+        self,
+        req: SubmitRequest,
+        worktree: Path,
+        branch: str,
+        commit_count: int,
+    ) -> None:
+        """Merge-fallback recovery rung (spec 00076, D-1/D-2): land a DONE
+        branch that can neither fast-forward nor cleanly rebase onto the
+        advanced base by merging the base into the branch (``--no-ff``) and
+        re-verifying the MERGED candidate tree at rebase parity before the
+        fast-forward.
+
+        The full landing bar runs against the merged tree -- the task's command
+        graders, the standing build invariant (``[submit] verify``), then the
+        declared held-out gate -- so nothing lands that was not verified against
+        the exact base it lands on (D-2). Any failure -- the merge itself
+        conflicts, or any check fails -- resets the branch to its pre-merge tip
+        (leaving the base ref byte-identical), records no ``Landed`` event, and
+        parks the branch+worktree under a queryable park kind (D-3). On success
+        the base fast-forwards to the merge commit (whose parent is the original
+        branch tip, so the branch's commits become ancestors of the advanced
+        base -- criterion 1) and a ``Landed`` event names the merge-fallback
+        rung.
+
+        Runs entirely under the merge lock the caller holds, so the base cannot
+        move between the merge and the fast-forward. Never raises: like every
+        other landing leaf it records its own outcome. When the merge conflicts
+        this parks rather than escalating -- the bounded agentic resolution rung
+        is a later task.
+        """
+        self.log(
+            f"rebase failed for {branch}; attempting merge-fallback of "
+            f"{self.phase_base} into {branch}"
+        )
+        pre_merge = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+        # The worker authors this merge commit (its own landing bookkeeping, not
+        # a change to the agent's work -- D-1); a reused parked worktree may lack
+        # a commit identity, so (re)establish the fixed one before committing.
+        self._set_commit_identity(worktree)
+        merge = _git(
+            worktree,
+            "merge",
+            "--no-ff",
+            "-m",
+            f"flywheel: merge-fallback land of {branch} onto {self.phase_base}",
+            self.phase_base,
+        )
+        if merge.returncode != 0:
+            # The merge itself conflicts: there is no clean candidate tree to
+            # re-verify. Abort back to the pre-merge tip (no in-progress merge
+            # state remains) and park; the agentic rung that resolves this is a
+            # later task.
+            _git(worktree, "merge", "--abort")
+            self.log(
+                f"merge-fallback of {self.phase_base} into {branch} "
+                f"conflicted; parking worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_MERGE_CONFLICT,
+                detail=(
+                    f"{branch} cannot fast-forward or rebase onto "
+                    f"{self.phase_base}; the merge-fallback of the base into "
+                    f"the branch conflicted; worktree preserved at {worktree}"
+                ),
+            )
+            return
+
+        # The merged worktree is the exact tree that would become the base.
+        # Re-verify at rebase parity, each check against the merged tree: task
+        # command graders, then the standing build invariant, then the declared
+        # held-out gate. Any failure resets to the pre-merge tip (base untouched)
+        # and parks with the deciding check's receipts.
+        reverify_passed, reverify_receipts = self._reverify(req, worktree)
+        if not reverify_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"merge-fallback re-verification failed for {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_DIVERGENT_BASE,
+                detail=(
+                    f"{branch} failed post-merge re-verification against the "
+                    f"merged {self.phase_base}; its command graders no longer "
+                    f"pass on the merged tree; worktree preserved at {worktree}"
+                ),
+                receipts=reverify_receipts,
+            )
+            return
+        verify_passed, verify_receipts = self._standing_verify(req, worktree)
+        if not verify_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"merge-fallback standing verify failed for {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_STANDING_VERIFY,
+                detail=(
+                    f"{branch} failed the standing build invariant "
+                    f"([submit] verify) against the merged tree it would land; "
+                    f"worktree preserved at {worktree}"
+                ),
+                receipts=verify_receipts,
+            )
+            return
+        gate_passed, gate_receipts = self._held_out_gate(req, worktree)
+        if not gate_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"merge-fallback held-out gate blocked {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_HELD_OUT_GATE,
+                detail=(
+                    f"{branch} was blocked by the declared held-out landing "
+                    f"gate on the merged tree it would land; worktree preserved "
+                    f"at {worktree}"
+                ),
+                receipts=gate_receipts,
+            )
+            return
+
+        # Every rung passed against the merged tree. The base is an ancestor of
+        # the merge commit, so under the lock the fast-forward is exact.
+        if not self._ff_merge(branch):
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"merge-fallback FF of {branch} onto {self.phase_base} was "
+                f"refused; parking worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_DIVERGENT_BASE,
+                detail=(
+                    f"{branch} passed merge-fallback re-verification but the "
+                    f"fast-forward onto {self.phase_base} was refused; worktree "
+                    f"preserved at {worktree}"
+                ),
+            )
+            return
+        landed_ref = _git(
+            self.repo_root, "rev-parse", self.phase_base
+        ).stdout.strip()
+        self.log(
+            f"Merged {branch} into {self.phase_base} via merge-fallback "
+            f"({commit_count} commit(s))"
+        )
+        self._record_landing(
+            req.run_id,
+            strategy=LANDING_STRATEGY_MERGE,
+            landed_ref=landed_ref,
+            rung=RUNG_MERGE_FALLBACK,
+        )
+        self._teardown_on_done(worktree, branch)
+
+    def _held_out_gate(
+        self, req: SubmitRequest, worktree: Path
+    ) -> tuple[bool, tuple[GateGraderReceipt, ...]]:
+        """Run the declared held-out landing gate against the merged candidate
+        tree (spec 00076, D-2), returning ``(passed, receipts)``.
+
+        The orchestrator gates the *pre-merge* tree; a merge produces a tree no
+        grader saw, so the recovery rung re-runs the held-out gate against the
+        merged worktree before it can land -- nothing lands on the new rung that
+        the held-out gate would block. No held-out source wired (the common
+        case) => passes with no receipts, byte-identical to an ungated land. A
+        blocking verdict (a fail, or a fail-closed evaluation error) returns
+        ``False`` with one :class:`GateGraderReceipt` per executed held-out
+        grader so the park it decides is diagnosable from the store alone. Never
+        raises into :meth:`submit`: :func:`evaluate_held_out_gate` fails closed
+        on any runner error and returns a verdict.
+        """
+        if self.held_out_source is None:
+            return True, ()
+        verdict = evaluate_held_out_gate(
+            req.task,
+            self.held_out_source,
+            committed_tree=worktree,
+            run_id=req.run_id,
+            env=self.grader_env,
+        )
+        receipts = tuple(
+            GateGraderReceipt(
+                grader_name=record.grader_name
+                or str(record.grader_spec.get("run", "")),
+                passed=record.passed,
+                output_excerpt=_payload_excerpt(record.payload),
+            )
+            for record in verdict.results
+        )
+        if verdict.blocks_landing:
+            self.log(
+                f"held-out gate BLOCKED {req.task_id} on the merged tree: "
+                f"{verdict.reason}"
+            )
+        return (not verdict.blocks_landing), receipts
 
     def _protected_violations(self, branch: str) -> list[str]:
         """Repo-relative paths the branch touches that match a protected
@@ -1147,13 +1404,15 @@ class GitWorktreeSubmitter:
             )
 
     def _record_landing(
-        self, run_id: str, *, strategy: str, landed_ref: str
+        self, run_id: str, *, strategy: str, landed_ref: str, rung: str = ""
     ) -> None:
         """Append a queryable ``LANDED`` audit-witness event for a run whose
         branch actually landed, carrying the landed reference (``strategy`` is
         one of :data:`~flywheel_core.events.LANDING_STRATEGIES`; ``landed_ref``
         is the landed commit sha for a merge land or the PR identifier for a PR
-        land).
+        land; ``rung`` names which recovery rung landed the work, one of
+        :data:`~flywheel_core.events.LANDING_RUNGS`, and defaults to empty for a
+        PR land where the rung concept does not apply).
 
         The success counterpart to :meth:`_record_landing_park`: the caller
         invokes it only *after* the land completed, so an incomplete land leaves
@@ -1183,6 +1442,7 @@ class GitWorktreeSubmitter:
                     ts=datetime.now(timezone.utc),
                     strategy=strategy,
                     landed_ref=landed_ref,
+                    rung=rung,
                 ),
                 expected_version=lifecycle.version,
             )
@@ -2317,6 +2577,7 @@ def build_merge_submitter(
     on_failure: str = "park",
     store: LandingLedger | None = None,
     grader_env: Mapping[str, str] | None = None,
+    held_out_source: HeldOutGraderSource | None = None,
 ) -> GitWorktreeSubmitter:
     """Build the merge backend (the registry's ``merge`` target).
 
@@ -2329,7 +2590,10 @@ def build_merge_submitter(
     destroy/park behavior). ``store`` is the run ledger the submitter records a
     queryable ``LANDING_PARKED`` event on when it parks a DONE branch.
     ``grader_env`` is the resolved ``[sandbox.env]`` the submit-time
-    re-verification (and the standing verify) run with.
+    re-verification (and the standing verify) run with. ``held_out_source`` is
+    the declared held-out landing gate (spec 00051) the merge-fallback recovery
+    rung re-runs against the merged candidate tree (spec 00076, D-2); ``None``
+    when no gate is configured.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -2345,6 +2609,7 @@ def build_merge_submitter(
         store=store,
         grader_env=grader_env,
         verify_command=policy.submit_verify if policy is not None else None,
+        held_out_source=held_out_source,
     )
 
 
@@ -2588,6 +2853,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # event on the run ledger when it parks a DONE branch. Same backing store
     # (policy-selected) as the run's lifecycle, opened on db_path.
     submit_store = open_sqlite_bound_store(policy, db_path=db_path)
+    # Execute-time held-out landing gate (spec 00051): opt-in, built only when
+    # [held_out] root is configured, resolved against repo_root. When unset this
+    # is None and landing is byte-identical to today. Built before the submitter
+    # so the merge-fallback recovery rung can re-run it against the merged
+    # candidate tree (spec 00076, D-2) and orchestrate can gate the pre-merge
+    # tree with the same source.
+    held_out_source = build_held_out_source(policy, repo_root)
+    if (
+        held_out_source is not None
+        and policy is not None
+        and policy.held_out_root is not None
+    ):
+        log(f"held-out gate active root={repo_root / policy.held_out_root}")
     # The registry owns name -> builder dispatch (and lazily imports pr.py
     # for the "pr" strategy, which is what keeps that import out of this
     # module's top level). The builders share one signature.
@@ -2606,23 +2884,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         on_failure=on_failure,
         store=submit_store,
         grader_env=grader_env,
+        held_out_source=held_out_source,
     )
     # Select the run's submit strategy from [sandbox] backend: worktree
     # (submitter unchanged) or container (wrap it) — spec 00045.
     run_strategy = maybe_wrap_for_backend(
         submitter, policy, model=model, env=os.environ, log=log
     )
-
-    # Execute-time held-out landing gate (spec 00051): opt-in, built only when
-    # [held_out] root is configured, resolved against repo_root. When unset this
-    # is None and landing is byte-identical to today.
-    held_out_source = build_held_out_source(policy, repo_root)
-    if (
-        held_out_source is not None
-        and policy is not None
-        and policy.held_out_root is not None
-    ):
-        log(f"held-out gate active root={repo_root / policy.held_out_root}")
 
     log(
         f"started pid={os.getpid()} base={phase_base} db={db_path} "

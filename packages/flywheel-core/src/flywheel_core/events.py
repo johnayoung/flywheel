@@ -311,12 +311,21 @@ class Landed(_DomainEventBase):
     the landed commit sha (the base head the merge advanced to) for a merge land,
     the pull-request identifier for a PR land -- queryable via
     ``list_domain_events(run_id)``.
+
+    ``rung`` discriminates *which* rung of the merge strategy's recovery ladder
+    landed the work (see :data:`LANDING_RUNGS`): ``"fast-forward"`` for a clean
+    fast-forward, ``"rebase"`` for a branch rebased onto an advanced base, or
+    ``"merge-fallback"`` for a rebase-conflicting branch recovered by a
+    re-verified ``--no-ff`` merge. It defaults to empty so a PR land (where the
+    rung concept does not apply) and any record written before this field was
+    added stay valid.
     """
 
     KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDED
 
     strategy: str
     landed_ref: str
+    rung: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -393,6 +402,11 @@ PARK_KIND_HELD_OUT_GATE = "held-out-gate"
 PARK_KIND_PROTECTED_PATHS = "protected-paths"
 PARK_KIND_PUSH_FAILED = "push-failed"
 PARK_KIND_SUBMIT_ERROR = "submit-error"
+# A DONE branch whose rebase onto the advanced base conflicts falls through to
+# the merge-fallback rung; when the merge itself conflicts (no clean tree to
+# re-verify), the land is suppressed under this kind. Distinct from
+# ``divergent-base`` (which now marks a *merged* tree that failed re-verify).
+PARK_KIND_MERGE_CONFLICT = "merge-conflict"
 
 LANDING_PARK_KINDS: frozenset[str] = frozenset(
     {
@@ -403,6 +417,7 @@ LANDING_PARK_KINDS: frozenset[str] = frozenset(
         PARK_KIND_PROTECTED_PATHS,
         PARK_KIND_PUSH_FAILED,
         PARK_KIND_SUBMIT_ERROR,
+        PARK_KIND_MERGE_CONFLICT,
     }
 )
 
@@ -418,6 +433,27 @@ LANDING_STRATEGIES: frozenset[str] = frozenset(
     {
         LANDING_STRATEGY_MERGE,
         LANDING_STRATEGY_PR,
+    }
+)
+
+
+# Landing-rung vocabulary carried on a :class:`Landed` record's ``rung`` field:
+# which rung of the merge strategy's recovery ladder (fast-forward -> rebase ->
+# merge-fallback) actually landed the work. A clean fast-forward lands at
+# ``"fast-forward"``; a branch rebased onto an advanced base lands at
+# ``"rebase"``; a branch whose rebase conflicts, recovered by a re-verified
+# ``--no-ff`` merge, lands at ``"merge-fallback"``. Empty is the default so a PR
+# land (whose rung concept does not apply) and any pre-existing record stay
+# valid, queryable via ``list_domain_events(run_id)``.
+RUNG_FAST_FORWARD = "fast-forward"
+RUNG_REBASE = "rebase"
+RUNG_MERGE_FALLBACK = "merge-fallback"
+
+LANDING_RUNGS: frozenset[str] = frozenset(
+    {
+        RUNG_FAST_FORWARD,
+        RUNG_REBASE,
+        RUNG_MERGE_FALLBACK,
     }
 )
 

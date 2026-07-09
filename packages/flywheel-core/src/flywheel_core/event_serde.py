@@ -125,7 +125,16 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
             ]
         return parked
     if isinstance(event, Landed):
-        return {"strategy": event.strategy, "landed_ref": event.landed_ref}
+        landed: dict[str, Any] = {
+            "strategy": event.strategy,
+            "landed_ref": event.landed_ref,
+        }
+        # Emitted only when a recovery rung is named, so a land whose rung is
+        # the default (a PR land, or any record from before this field existed)
+        # round-trips to the original two-key payload unchanged.
+        if event.rung:
+            landed["rung"] = event.rung
+        return landed
     if isinstance(event, LandingRedriven):
         return {"result": event.result, "park_kind": event.park_kind}
     if isinstance(event, HeldOutGateEvaluated):
@@ -251,6 +260,7 @@ def event_from_record(
         return Landed(
             strategy=payload["strategy"],
             landed_ref=payload["landed_ref"],
+            rung=payload.get("rung", ""),
             **common,
         )
     if event_kind_enum is DomainEventKind.LANDING_REDRIVEN:

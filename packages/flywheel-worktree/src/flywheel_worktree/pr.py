@@ -36,7 +36,12 @@ from flywheel_core.events import (
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_PUSH_FAILED,
 )
-from flywheel_orchestrator import GhRunner, SubmitRequest, WorkPolicy
+from flywheel_orchestrator import (
+    GhRunner,
+    HeldOutGraderSource,
+    SubmitRequest,
+    WorkPolicy,
+)
 
 from flywheel_worktree.worker import (
     GitWorktreeSubmitter,
@@ -127,6 +132,7 @@ def build_pr_submitter(
     on_failure: str = "park",
     store: LandingLedger | None = None,
     grader_env: Mapping[str, str] | None = None,
+    held_out_source: HeldOutGraderSource | None = None,
 ) -> GitPullRequestSubmitter:
     """Build the PR backend (the registry's ``pr`` target).
 
@@ -135,6 +141,10 @@ def build_pr_submitter(
     registry dispatches on. ``policy`` is non-``None`` here: the worker only
     selects ``pr`` from a policy that set it. ``grader_env`` flows to the
     inherited submit-time re-verification, matching the merge strategy.
+    ``held_out_source`` rides the shared builder signature too; the PR strategy
+    lands via review/CI rather than a local merge, so it holds no
+    merge-fallback rung to gate, but accepting the argument keeps the registry
+    dispatch uniform across strategies.
     """
     assert policy is not None  # selection of "pr" requires a policy
     submitter = GitPullRequestSubmitter(
@@ -152,6 +162,7 @@ def build_pr_submitter(
         pr_base=policy.submit_pr_base,
         store=store,
         grader_env=grader_env,
+        held_out_source=held_out_source,
     )
     log(
         f"landing strategy: pr (remote={policy.submit_remote} "
@@ -181,6 +192,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         gh: GhRunner | None = None,
         store: LandingLedger | None = None,
         grader_env: Mapping[str, str] | None = None,
+        held_out_source: HeldOutGraderSource | None = None,
     ) -> None:
         super().__init__(
             repo_root=repo_root,
@@ -195,6 +207,7 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             on_failure=on_failure,
             store=store,
             grader_env=grader_env,
+            held_out_source=held_out_source,
         )
         self.remote = remote
         self.pr_base = pr_base or phase_base

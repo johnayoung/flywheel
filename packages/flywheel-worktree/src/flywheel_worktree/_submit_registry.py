@@ -2,8 +2,9 @@
 
 Names the landing strategies an operator can select in ``[submit] strategy``
 and binds each to a builder beside its implementation:
-:func:`~flywheel_worktree.worker.build_merge_submitter` and
-:func:`~flywheel_worktree.pr.build_pr_submitter`. The builders share one
+:func:`~flywheel_worktree.worker.build_merge_submitter`,
+:func:`~flywheel_worktree.pr.build_pr_submitter`, and
+:func:`~flywheel_worktree.worker.build_phase_submitter`. The builders share one
 signature so the worker dispatches by name with no per-strategy branch.
 
 Resolving ``pr`` lazily imports :mod:`flywheel_worktree.pr` (which imports
@@ -33,6 +34,13 @@ SUBMIT_STRATEGIES.register(
         name="pr",
         target="flywheel_worktree.pr:build_pr_submitter",
         summary="push the branch and open a pull request",
+    )
+)
+SUBMIT_STRATEGIES.register(
+    PluginSpec(
+        name="phase",
+        target="flywheel_worktree.worker:build_phase_submitter",
+        summary="land each task onto a per-phase integration branch",
     )
 )
 

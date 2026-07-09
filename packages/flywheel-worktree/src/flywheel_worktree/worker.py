@@ -576,6 +576,31 @@ class GitWorktreeSubmitter:
     def _worktree(self, task_id: str) -> Path:
         return self.worktrees_dir / task_id
 
+    def _landing_base(self, phase: str) -> str:
+        """The ref a task in ``phase`` verifies against and lands onto,
+        resolved per submit request.
+
+        The merge/pr strategies land onto the single configured base regardless
+        of phase, so this returns :attr:`phase_base` unchanged. The phase
+        strategy overrides it to derive a per-phase integration branch (spec
+        00079, D-1). Read-only: it never materializes a ref, so a task that
+        parks never creates one; use :meth:`_materialize_landing_base` at the
+        actual fast-forward to fork the branch on the phase's first landing.
+        """
+        return self.phase_base
+
+    def _materialize_landing_base(self, phase: str, base: str) -> str:
+        """Ensure the ref a passing task fast-forwards onto exists and return
+        it, under the caller's merge lock.
+
+        A no-op for the merge/pr strategies (the configured base always exists),
+        so it returns ``base`` unchanged and landing is byte-identical to today.
+        The phase strategy overrides it to fork ``flywheel/phase/<phase>`` from
+        the then-current true base on the phase's first landing; the true base
+        is never advanced (spec 00079, criterion 1).
+        """
+        return base
+
     def _branch_exists(self, branch: str) -> bool:
         return (
             _git(
@@ -636,15 +661,22 @@ class GitWorktreeSubmitter:
             self.log(f"Scrub: aborting in-progress cherry-pick in {worktree}")
             _git(worktree, "cherry-pick", "--abort")
 
-    def _rebase_parked_branch(self, worktree: Path, branch: str) -> bool:
+    def _rebase_parked_branch(
+        self, worktree: Path, branch: str, base: str | None = None
+    ) -> bool:
         """Rebase a parked branch onto the current base (so its flywheel source
         matches the live DB schema). ``True`` if up to date or rebased cleanly,
-        ``False`` on conflict."""
+        ``False`` on conflict.
+
+        ``base`` is the ref to rebase onto; ``None`` falls back to
+        :attr:`phase_base` (the merge/pr landing base), so the phase strategy
+        rebases a reused worktree onto its integration branch instead."""
+        base = self.phase_base if base is None else base
         res = _git(
             self.repo_root,
             "rev-list",
             "--count",
-            f"{branch}..{self.phase_base}",
+            f"{branch}..{base}",
         )
         behind = (
             int(res.stdout.strip())
@@ -658,15 +690,15 @@ class GitWorktreeSubmitter:
             )
             return True
         self.log(
-            f"Parked {branch} is {behind} commit(s) behind {self.phase_base}; "
+            f"Parked {branch} is {behind} commit(s) behind {base}; "
             f"rebasing..."
         )
-        if _git(worktree, "rebase", self.phase_base).returncode == 0:
+        if _git(worktree, "rebase", base).returncode == 0:
             self.log("Rebase clean; prior commits carry forward.")
             return True
         _git(worktree, "rebase", "--abort")
         self.log(
-            f"Rebase failed against {self.phase_base}; discarding parked "
+            f"Rebase failed against {base}; discarding parked "
             f"worktree+branch and starting fresh."
         )
         return False
@@ -690,14 +722,19 @@ class GitWorktreeSubmitter:
         _git(worktree, "config", "user.email", WORKTREE_COMMIT_IDENTITY_EMAIL)
 
     def _discard_and_recreate(
-        self, worktree: Path, branch: str
+        self, worktree: Path, branch: str, base: str | None = None
     ) -> None:
+        base = self.phase_base if base is None else base
         _git(self.repo_root, "worktree", "remove", "--force", str(worktree))
         _git(self.repo_root, "branch", "-D", branch)
-        self._add_worktree(worktree, "-b", branch, self.phase_base)
+        self._add_worktree(worktree, "-b", branch, base)
 
     def _guard_done_branch(
-        self, run_id: str | None, branch: str, worktree: Path
+        self,
+        run_id: str | None,
+        branch: str,
+        worktree: Path,
+        base: str | None = None,
     ) -> None:
         """Refuse to discard a parked worktree+branch that belongs to a DONE
         run (spec 00076, D-3): automation never deletes verified work.
@@ -713,16 +750,17 @@ class GitWorktreeSubmitter:
         handle, no ``run_id``, or a store read error reads as not-done, so the
         pre-existing discard behavior is unchanged wherever DONE-ness cannot be
         established."""
+        base = self.phase_base if base is None else base
         if not self._run_is_done(run_id):
             return
         self.log(
             f"parked branch {branch} belongs to a DONE run and cannot rebase "
-            f"onto {self.phase_base}; preserving branch+worktree for landing "
+            f"onto {base}; preserving branch+worktree for landing "
             f"recovery instead of discarding verified work"
         )
         raise PrepareSandboxError(
             f"{branch} is a DONE run's branch that cannot rebase onto "
-            f"{self.phase_base}; refusing to discard verified work, worktree "
+            f"{base}; refusing to discard verified work, worktree "
             f"preserved at {worktree}"
         )
 
@@ -752,6 +790,10 @@ class GitWorktreeSubmitter:
         phase = phase_of_task_file(req.task_file, self.tasks_dir)
         worktree = self._worktree(task_id)
         branch = self._branch(task_id, phase)
+        # The ref a fresh/reused worktree branches from. Merge/pr: the single
+        # configured base. Phase strategy: the phase's integration branch when
+        # it exists (so tasks stack), else the true base (spec 00079).
+        base = self._landing_base(phase)
 
         worktree_present = worktree.is_dir()
         branch_present = self._branch_exists(branch)
@@ -763,10 +805,10 @@ class GitWorktreeSubmitter:
                     f"refusing to clobber"
                 )
             self.scrub_worktree_locks(worktree, branch)
-            if self._rebase_parked_branch(worktree, branch):
+            if self._rebase_parked_branch(worktree, branch, base):
                 return worktree
-            self._guard_done_branch(req.run_id, branch, worktree)
-            self._discard_and_recreate(worktree, branch)
+            self._guard_done_branch(req.run_id, branch, worktree, base)
+            self._discard_and_recreate(worktree, branch, base)
             self._run_setup(worktree)
             return worktree
 
@@ -776,9 +818,9 @@ class GitWorktreeSubmitter:
                 f"was removed; ref survived)."
             )
             self._add_worktree(worktree, branch)
-            if not self._rebase_parked_branch(worktree, branch):
-                self._guard_done_branch(req.run_id, branch, worktree)
-                self._discard_and_recreate(worktree, branch)
+            if not self._rebase_parked_branch(worktree, branch, base):
+                self._guard_done_branch(req.run_id, branch, worktree, base)
+                self._discard_and_recreate(worktree, branch, base)
             self._run_setup(worktree)
             return worktree
 
@@ -788,7 +830,7 @@ class GitWorktreeSubmitter:
                 f"clobber. Remove the directory manually."
             )
 
-        self._add_worktree(worktree, "-b", branch, self.phase_base)
+        self._add_worktree(worktree, "-b", branch, base)
         self._run_setup(worktree)
         return worktree
 
@@ -860,6 +902,7 @@ class GitWorktreeSubmitter:
         phase = phase_of_task_file(req.task_file, self.tasks_dir)
         worktree = self._worktree(req.task_id)
         branch = self._branch(req.task_id, phase)
+        base = self._landing_base(phase)
 
         porcelain = _git(worktree, "status", "--porcelain").stdout
         if porcelain.strip():
@@ -871,11 +914,11 @@ class GitWorktreeSubmitter:
                 ),
             )
 
-        if self._commit_count(branch) == 0:
+        if self._commit_count(branch, base) == 0:
             return LandabilityVerdict(
                 landable=False,
                 reason=(
-                    f"no commits beyond {self.phase_base} on {branch}: the "
+                    f"no commits beyond {base} on {branch}: the "
                     f"run produced an empty diff against its base"
                 ),
             )
@@ -896,6 +939,11 @@ class GitWorktreeSubmitter:
 
         # All base-branch mutations are serialized across worker processes.
         with merge_lock(self.lock_path):
+            # The ref this task lands onto, resolved per request under the lock.
+            # Merge/pr: the single configured base. Phase strategy: the phase's
+            # integration branch (materialized at the fast-forward, not here, so
+            # a task that parks never creates one) -- spec 00079.
+            base = self._landing_base(phase)
             porcelain = _git(worktree, "status", "--porcelain").stdout
             if porcelain.strip():
                 self.log(
@@ -912,19 +960,19 @@ class GitWorktreeSubmitter:
                 )
                 return
 
-            commit_count = self._commit_count(branch)
+            commit_count = self._commit_count(branch, base)
             if commit_count == 0:
                 # Legitimate no-op: work already on base, or inspection-only
                 # graders with no diff. The lifecycle row is the source of
                 # truth; just clean up the empty branch+worktree.
                 self.log(
                     f"{task_id} reached DONE with no commits beyond "
-                    f"{self.phase_base}; nothing to merge"
+                    f"{base}; nothing to merge"
                 )
                 self._cleanup(worktree, branch)
                 return
 
-            violations = self._protected_violations(branch)
+            violations = self._protected_violations(branch, base)
             if violations:
                 self.log(
                     f"{task_id} touches protected path(s) "
@@ -947,7 +995,7 @@ class GitWorktreeSubmitter:
             # build invariant ([submit] verify) gates it here, before the FF.
             # Under the merge lock the base cannot move, so this ancestry check
             # predicts the FF outcome exactly.
-            if self._is_ancestor(self.phase_base, branch):
+            if self._is_ancestor(base, branch):
                 verify_passed, verify_receipts = self._standing_verify(
                     req, worktree
                 )
@@ -967,15 +1015,19 @@ class GitWorktreeSubmitter:
                         receipts=verify_receipts,
                     )
                     return
-                # Message-only provenance stamp of the exact tree just verified,
-                # before the FF advances the base onto it (spec 00078).
-                self._stamp_trailers(req, worktree, branch)
-                if self._ff_merge(branch):
+                # Only now that the tree has passed do we materialize the ref it
+                # lands onto (a no-op for merge/pr; the phase strategy creates the
+                # integration branch at the current base on the phase's first
+                # landing -- never on a park -- spec 00079). Stamp the exact tree
+                # just verified against that ref, then FF it (spec 00078).
+                land_ref = self._materialize_landing_base(phase, base)
+                self._stamp_trailers(req, worktree, branch, base=land_ref)
+                if self._ff_merge(branch, land_ref):
                     landed_ref = _git(
-                        self.repo_root, "rev-parse", self.phase_base
+                        self.repo_root, "rev-parse", land_ref
                     ).stdout.strip()
                     self.log(
-                        f"Merged {branch} into {self.phase_base} "
+                        f"Merged {branch} into {land_ref} "
                         f"({commit_count} commit(s))"
                     )
                     self._record_landing(
@@ -990,10 +1042,12 @@ class GitWorktreeSubmitter:
             # FF failed (base advanced): rebase once, re-verify, retry FF, and
             # when the rebase itself conflicts fall through to the merge-fallback
             # recovery rung (spec 00076, D-1) rather than parking here.
-            self.log(f"FF failed for {branch}; rebasing onto {self.phase_base}")
-            if _git(worktree, "rebase", self.phase_base).returncode != 0:
+            self.log(f"FF failed for {branch}; rebasing onto {base}")
+            if _git(worktree, "rebase", base).returncode != 0:
                 _git(worktree, "rebase", "--abort")
-                self._merge_fallback(req, worktree, branch, commit_count)
+                self._merge_fallback(
+                    req, worktree, branch, commit_count, base=base
+                )
                 return
             reverify_passed, reverify_receipts = self._reverify(req, worktree)
             if not reverify_passed:
@@ -1010,7 +1064,7 @@ class GitWorktreeSubmitter:
                     park_kind="divergent-base",
                     detail=(
                         f"{branch} failed post-rebase re-verification against "
-                        f"the advanced {self.phase_base}; its command graders no "
+                        f"the advanced {base}; its command graders no "
                         f"longer pass on the rebased tree; worktree preserved at "
                         f"{worktree}"
                     ),
@@ -1038,15 +1092,18 @@ class GitWorktreeSubmitter:
                     receipts=verify_receipts,
                 )
                 return
-            # Same message-only stamp on the rebased tree before its FF: the
-            # rebased worktree is the exact post-merge tree (spec 00078).
-            self._stamp_trailers(req, worktree, branch)
-            if self._ff_merge(branch):
+            # Materialize the landing ref (first-landing create for the phase
+            # strategy; no-op for merge/pr), then the same message-only stamp on
+            # the rebased tree before its FF: the rebased worktree is the exact
+            # post-merge tree (spec 00078).
+            land_ref = self._materialize_landing_base(phase, base)
+            self._stamp_trailers(req, worktree, branch, base=land_ref)
+            if self._ff_merge(branch, land_ref):
                 landed_ref = _git(
-                    self.repo_root, "rev-parse", self.phase_base
+                    self.repo_root, "rev-parse", land_ref
                 ).stdout.strip()
                 self.log(
-                    f"Merged {branch} into {self.phase_base} after rebase "
+                    f"Merged {branch} into {land_ref} after rebase "
                     f"({commit_count} commit(s))"
                 )
                 self._record_landing(
@@ -1065,7 +1122,7 @@ class GitWorktreeSubmitter:
                 req.run_id,
                 park_kind="divergent-base",
                 detail=(
-                    f"{branch} cannot fast-forward {self.phase_base} even after "
+                    f"{branch} cannot fast-forward {land_ref} even after "
                     f"a clean rebase + re-verify; worktree preserved at "
                     f"{worktree}"
                 ),
@@ -1077,6 +1134,8 @@ class GitWorktreeSubmitter:
         worktree: Path,
         branch: str,
         commit_count: int,
+        *,
+        base: str,
     ) -> None:
         """Merge-fallback recovery rung (spec 00076, D-1/D-2): land a DONE
         branch that can neither fast-forward nor cleanly rebase onto the
@@ -1107,7 +1166,7 @@ class GitWorktreeSubmitter:
         """
         self.log(
             f"rebase failed for {branch}; attempting merge-fallback of "
-            f"{self.phase_base} into {branch}"
+            f"{base} into {branch}"
         )
         pre_merge = _git(worktree, "rev-parse", "HEAD").stdout.strip()
         # The worker authors this merge commit (its own landing bookkeeping, not
@@ -1119,8 +1178,8 @@ class GitWorktreeSubmitter:
             "merge",
             "--no-ff",
             "-m",
-            f"flywheel: merge-fallback land of {branch} onto {self.phase_base}",
-            self.phase_base,
+            f"flywheel: merge-fallback land of {branch} onto {base}",
+            base,
         )
         if merge.returncode != 0:
             # The merge itself conflicts: there is no clean candidate tree to
@@ -1131,12 +1190,12 @@ class GitWorktreeSubmitter:
             # pre-merge tip (no in-progress merge state remains) and park.
             if self.recovery_agent_max_turns > 0:
                 self._agent_resolve(
-                    req, worktree, branch, commit_count, pre_merge
+                    req, worktree, branch, commit_count, pre_merge, base=base
                 )
                 return
             _git(worktree, "merge", "--abort")
             self.log(
-                f"merge-fallback of {self.phase_base} into {branch} "
+                f"merge-fallback of {base} into {branch} "
                 f"conflicted; parking worktree at {worktree}"
             )
             self._record_landing_park(
@@ -1144,7 +1203,7 @@ class GitWorktreeSubmitter:
                 park_kind=PARK_KIND_MERGE_CONFLICT,
                 detail=(
                     f"{branch} cannot fast-forward or rebase onto "
-                    f"{self.phase_base}; the merge-fallback of the base into "
+                    f"{base}; the merge-fallback of the base into "
                     f"the branch conflicted; worktree preserved at {worktree}"
                 ),
             )
@@ -1167,7 +1226,7 @@ class GitWorktreeSubmitter:
                 park_kind=PARK_KIND_DIVERGENT_BASE,
                 detail=(
                     f"{branch} failed post-merge re-verification against the "
-                    f"merged {self.phase_base}; its command graders no longer "
+                    f"merged {base}; its command graders no longer "
                     f"pass on the merged tree; worktree preserved at {worktree}"
                 ),
                 receipts=reverify_receipts,
@@ -1210,12 +1269,16 @@ class GitWorktreeSubmitter:
             )
             return
 
-        # Every rung passed against the merged tree. The base is an ancestor of
-        # the merge commit, so under the lock the fast-forward is exact.
-        if not self._ff_merge(branch):
+        # Every rung passed against the merged tree. Materialize the landing ref
+        # (create the phase integration branch at the base on first landing; a
+        # no-op for merge/pr), then FF it. The base is an ancestor of the merge
+        # commit, so under the lock the fast-forward is exact.
+        phase = phase_of_task_file(req.task_file, self.tasks_dir)
+        land_ref = self._materialize_landing_base(phase, base)
+        if not self._ff_merge(branch, land_ref):
             _git(worktree, "reset", "--hard", pre_merge)
             self.log(
-                f"merge-fallback FF of {branch} onto {self.phase_base} was "
+                f"merge-fallback FF of {branch} onto {land_ref} was "
                 f"refused; parking worktree at {worktree}"
             )
             self._record_landing_park(
@@ -1223,16 +1286,16 @@ class GitWorktreeSubmitter:
                 park_kind=PARK_KIND_DIVERGENT_BASE,
                 detail=(
                     f"{branch} passed merge-fallback re-verification but the "
-                    f"fast-forward onto {self.phase_base} was refused; worktree "
+                    f"fast-forward onto {land_ref} was refused; worktree "
                     f"preserved at {worktree}"
                 ),
             )
             return
         landed_ref = _git(
-            self.repo_root, "rev-parse", self.phase_base
+            self.repo_root, "rev-parse", land_ref
         ).stdout.strip()
         self.log(
-            f"Merged {branch} into {self.phase_base} via merge-fallback "
+            f"Merged {branch} into {land_ref} via merge-fallback "
             f"({commit_count} commit(s))"
         )
         self._record_landing(
@@ -1250,6 +1313,8 @@ class GitWorktreeSubmitter:
         branch: str,
         commit_count: int,
         pre_merge: str,
+        *,
+        base: str,
     ) -> None:
         """Bounded agentic conflict-resolution rung (spec 00076, criterion 4).
 
@@ -1278,13 +1343,13 @@ class GitWorktreeSubmitter:
         per re-driver pass (D-4).
         """
         self.log(
-            f"merge-fallback of {self.phase_base} into {branch} conflicted; "
+            f"merge-fallback of {base} into {branch} conflicted; "
             f"escalating to a bounded agent session "
             f"(max_turns={self.recovery_agent_max_turns}, "
             f"max_wall_seconds={self.recovery_agent_max_wall_seconds})"
         )
         prompt = _render_conflict_resolution_prompt(
-            req, branch=branch, base=self.phase_base
+            req, branch=branch, base=base
         )
         started = time.monotonic()
         try:
@@ -1359,6 +1424,7 @@ class GitWorktreeSubmitter:
             branch,
             commit_count,
             pre_merge,
+            base=base,
             turns=turns,
             wall=wall,
         )
@@ -1408,6 +1474,7 @@ class GitWorktreeSubmitter:
         commit_count: int,
         pre_merge: str,
         *,
+        base: str,
         turns: int,
         wall: float,
     ) -> None:
@@ -1436,7 +1503,7 @@ class GitWorktreeSubmitter:
                 detail=(
                     f"{branch} was resolved by a bounded agent session but "
                     f"failed post-merge re-verification against the merged "
-                    f"{self.phase_base}; its command graders no longer pass on "
+                    f"{base}; its command graders no longer pass on "
                     f"the resolved tree; worktree preserved at {worktree}"
                 ),
                 receipts=reverify_receipts,
@@ -1486,10 +1553,12 @@ class GitWorktreeSubmitter:
                 agent_wall_seconds=wall,
             )
             return
-        if not self._ff_merge(branch):
+        phase = phase_of_task_file(req.task_file, self.tasks_dir)
+        land_ref = self._materialize_landing_base(phase, base)
+        if not self._ff_merge(branch, land_ref):
             _git(worktree, "reset", "--hard", pre_merge)
             self.log(
-                f"agent-resolved FF of {branch} onto {self.phase_base} was "
+                f"agent-resolved FF of {branch} onto {land_ref} was "
                 f"refused; parking worktree at {worktree}"
             )
             self._record_landing_park(
@@ -1497,7 +1566,7 @@ class GitWorktreeSubmitter:
                 park_kind=PARK_KIND_DIVERGENT_BASE,
                 detail=(
                     f"{branch} passed agent-resolved re-verification but the "
-                    f"fast-forward onto {self.phase_base} was refused; worktree "
+                    f"fast-forward onto {land_ref} was refused; worktree "
                     f"preserved at {worktree}"
                 ),
                 agent_turns=turns,
@@ -1505,10 +1574,10 @@ class GitWorktreeSubmitter:
             )
             return
         landed_ref = _git(
-            self.repo_root, "rev-parse", self.phase_base
+            self.repo_root, "rev-parse", land_ref
         ).stdout.strip()
         self.log(
-            f"Merged {branch} into {self.phase_base} via agent-resolved "
+            f"Merged {branch} into {land_ref} via agent-resolved "
             f"conflict resolution ({commit_count} commit(s); {turns} "
             f"turn(s)/{wall:.1f}s)"
         )
@@ -1564,14 +1633,19 @@ class GitWorktreeSubmitter:
             )
         return (not verdict.blocks_landing), receipts
 
-    def _protected_violations(self, branch: str) -> list[str]:
+    def _protected_violations(
+        self, branch: str, base: str | None = None
+    ) -> list[str]:
         """Repo-relative paths the branch touches that match a protected
         pattern (``PurePath.full_match`` glob semantics, ``**`` crosses
         directories).
 
         The diff is merge-base scoped (``base...branch``) so only the
         branch's own changes count, never what the base did underneath it.
-        This is the merge-time half of the verification trust boundary:
+        ``base`` defaults to :attr:`phase_base` (the merge/pr landing base);
+        the phase strategy passes the phase's integration branch so the diff
+        is scoped to the task's own commits above that branch, not the whole
+        phase. This is the merge-time half of the verification trust boundary:
         graders execute inside the tree the agent just mutated, so work
         that rewrites the verification surface itself (grader configs, CI,
         harness state) can pass its own judges — the gate refuses to land
@@ -1579,11 +1653,12 @@ class GitWorktreeSubmitter:
         """
         if not self.protected_paths:
             return []
+        base = self.phase_base if base is None else base
         res = _git(
             self.repo_root,
             "diff",
             "--name-only",
-            f"{self.phase_base}...{branch}",
+            f"{base}...{branch}",
         )
         if res.returncode != 0:
             # Cannot establish what the branch touches: fail closed.
@@ -1724,12 +1799,13 @@ class GitWorktreeSubmitter:
         )
         return passed, (receipt,)
 
-    def _commit_count(self, branch: str) -> int:
+    def _commit_count(self, branch: str, base: str | None = None) -> int:
+        base = self.phase_base if base is None else base
         res = _git(
             self.repo_root,
             "rev-list",
             "--count",
-            f"{self.phase_base}..{branch}",
+            f"{base}..{branch}",
         )
         return (
             int(res.stdout.strip())
@@ -1774,29 +1850,34 @@ class GitWorktreeSubmitter:
         )
         _git(worktree, "reset", "--hard", new_tip, check=True)
 
-    def _base_is_checked_out(self) -> bool:
-        """True when the configured base is the operator's checked-out branch in
-        ``repo_root`` (the back-compat default case)."""
-        return _checked_out_branch(self.repo_root) == self.phase_base
+    def _base_is_checked_out(self, base: str | None = None) -> bool:
+        """True when ``base`` is the operator's checked-out branch in
+        ``repo_root`` (the back-compat default case). ``base`` defaults to
+        :attr:`phase_base`; a phase integration branch is never checked out, so
+        the phase strategy always takes the out-of-tree advance path."""
+        base = self.phase_base if base is None else base
+        return _checked_out_branch(self.repo_root) == base
 
-    def _ff_merge(self, branch: str) -> bool:
-        """Fast-forward the base to ``branch``'s tip.
+    def _ff_merge(self, branch: str, base: str | None = None) -> bool:
+        """Fast-forward ``base`` to ``branch``'s tip.
 
-        When the base is the operator's checked-out branch (the unconfigured
+        When ``base`` is the operator's checked-out branch (the unconfigured
         default), advance it in-tree with ``git merge --ff-only`` as before.
-        When the base is NOT checked out (a configured landing base — the
-        safe-landing case), advance its ref out-of-tree via ``git fetch .
-        <branch>:<base>`` so the operator's working tree, index, and HEAD are
-        never touched. Both paths are fast-forward-only: a non-FF advance
-        returns ``False`` and the caller rebases or parks."""
-        if self._base_is_checked_out():
+        When ``base`` is NOT checked out (a configured landing base or a phase
+        integration branch — the safe-landing case), advance its ref out-of-tree
+        via ``git fetch . <branch>:<base>`` so the operator's working tree,
+        index, and HEAD are never touched. Both paths are fast-forward-only: a
+        non-FF advance returns ``False`` and the caller rebases or parks.
+        ``base`` defaults to :attr:`phase_base`."""
+        base = self.phase_base if base is None else base
+        if self._base_is_checked_out(base):
             return (
                 _git(self.repo_root, "merge", "--ff-only", branch).returncode
                 == 0
             )
         return (
             _git(
-                self.repo_root, "fetch", ".", f"{branch}:{self.phase_base}"
+                self.repo_root, "fetch", ".", f"{branch}:{base}"
             ).returncode
             == 0
         )
@@ -1992,6 +2073,60 @@ class GitWorktreeSubmitter:
                 f"failed to record landed event for {run_id} "
                 f"({type(exc).__name__}: {exc})"
             )
+
+
+class PhaseBranchSubmitter(GitWorktreeSubmitter):
+    """Land each task onto a per-phase integration branch (spec 00079).
+
+    Rung derived from the merge strategy: identical provisioning and the full
+    verify ladder (uncommitted-work, protected-paths, clean fast-forward,
+    rebase-once-then-reverify, ``[submit] verify`` standing gate, and the
+    merge-fallback recovery rungs), with one behavioral change -- the ref a
+    passing task fast-forwards onto is the phase's integration branch
+    ``flywheel/phase/<phase>`` derived per submit request from the task's phase
+    directory, not the single configured base.
+
+    The two overrides below are the whole of the difference (D-1). The true
+    base is never advanced: the integration branch is a separate ref advanced
+    out-of-tree, and the base class's out-of-tree fast-forward path already
+    leaves the operator's checkout untouched for any base that is not checked
+    out (a phase integration branch never is). Tasks in the same phase stack
+    because :meth:`prepare_sandbox` branches a fresh worktree off the
+    integration branch once it exists.
+    """
+
+    def _phase_branch(self, phase: str) -> str:
+        """The integration branch a phase lands its tasks onto."""
+        return f"flywheel/phase/{phase}"
+
+    def _landing_base(self, phase: str) -> str:
+        """The ref a task in ``phase`` verifies against and lands onto: the
+        phase's integration branch once it exists (so tasks stack on top of
+        each other and measure only their own commits), else the true base --
+        the branch point for the phase's first task, before any landing has
+        created the integration branch. Read-only (never materializes)."""
+        integration = self._phase_branch(phase)
+        if self._branch_exists(integration):
+            return integration
+        return self.phase_base
+
+    def _materialize_landing_base(self, phase: str, base: str) -> str:
+        """Ensure the phase integration branch exists and return it, under the
+        caller's merge lock.
+
+        Called only at an actual fast-forward (never on a park), so the first
+        passing task in a phase forks ``flywheel/phase/<phase>`` from the
+        then-current true base (``base`` is the true base on that first landing;
+        the integration branch on every subsequent landing). The true base is
+        never advanced -- only the integration ref is (criterion 1). Idempotent:
+        once the branch exists this returns it unchanged."""
+        integration = self._phase_branch(phase)
+        if not self._branch_exists(integration):
+            _git(self.repo_root, "branch", integration, base, check=True)
+            self.log(
+                f"created phase integration branch {integration} at {base}"
+            )
+        return integration
 
 
 # --- daemon-side consumer concerns ------------------------------------------
@@ -3206,6 +3341,68 @@ def build_merge_submitter(
         ),
         recovery_agent_model=policy.model if policy is not None else None,
     )
+
+
+def build_phase_submitter(
+    policy: WorkPolicy | None,
+    *,
+    repo_root: Path,
+    tasks_dir: Path,
+    worktrees_dir: Path,
+    phase_base: str,
+    lock_path: Path,
+    log: Logger,
+    protected_paths: Sequence[str],
+    setup_command: str | None,
+    on_done: str = "destroy",
+    on_failure: str = "park",
+    store: LandingLedger | None = None,
+    grader_env: Mapping[str, str] | None = None,
+    held_out_source: HeldOutGraderSource | None = None,
+) -> PhaseBranchSubmitter:
+    """Build the phase backend (the registry's ``phase`` target, spec 00079).
+
+    Takes the same shared builder arguments the submit-strategy registry
+    dispatches on as :func:`build_merge_submitter`, and reads the identical
+    ``policy`` knobs -- ``[submit] verify`` (the standing build invariant), the
+    bounded conflict-resolution rung's turn/wall bounds, and the resolution
+    model -- because the phase strategy runs the very same verify ladder; only
+    the ref each task lands onto differs (the phase's integration branch rather
+    than the single configured base). Tolerates ``policy is None`` exactly as the
+    merge builder does (the phase landing reads no required policy field), and
+    logs the resolved landing target so an operator can see the strategy that
+    armed.
+    """
+    submitter = PhaseBranchSubmitter(
+        repo_root=repo_root,
+        tasks_dir=tasks_dir,
+        worktrees_dir=worktrees_dir,
+        phase_base=phase_base,
+        lock_path=lock_path,
+        log=log,
+        protected_paths=protected_paths,
+        setup_command=setup_command,
+        on_done=on_done,
+        on_failure=on_failure,
+        store=store,
+        grader_env=grader_env,
+        verify_command=policy.submit_verify if policy is not None else None,
+        held_out_source=held_out_source,
+        recovery_agent_max_turns=(
+            policy.submit_recovery_agent_max_turns if policy is not None else 0
+        ),
+        recovery_agent_max_wall_seconds=(
+            policy.submit_recovery_agent_max_wall_seconds
+            if policy is not None
+            else 900.0
+        ),
+        recovery_agent_model=policy.model if policy is not None else None,
+    )
+    log(
+        f"landing strategy: phase (integration branch flywheel/phase/<phase> "
+        f"per task's phase; true base {phase_base} never advanced)"
+    )
+    return submitter
 
 
 def maybe_wrap_for_backend(

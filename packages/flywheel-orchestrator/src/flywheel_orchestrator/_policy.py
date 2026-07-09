@@ -1142,7 +1142,7 @@ def _optional_protected_paths(
     return tuple(value)
 
 
-_SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr")
+_SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr", "phase")
 
 
 def _optional_submit_strategy(

@@ -69,8 +69,8 @@ def _pr_policy(
 # --- registry shape ----------------------------------------------------------
 
 
-def test_names_are_merge_then_pr() -> None:
-    assert SUBMIT_STRATEGIES.names() == ("merge", "pr")
+def test_names_are_merge_pr_then_phase() -> None:
+    assert SUBMIT_STRATEGIES.names() == ("merge", "pr", "phase")
 
 
 def test_resolve_merge_returns_merge_builder() -> None:
@@ -79,6 +79,10 @@ def test_resolve_merge_returns_merge_builder() -> None:
 
 def test_resolve_pr_returns_pr_builder() -> None:
     assert SUBMIT_STRATEGIES.resolve("pr") is pr.build_pr_submitter
+
+
+def test_resolve_phase_returns_phase_builder() -> None:
+    assert SUBMIT_STRATEGIES.resolve("phase") is worker.build_phase_submitter
 
 
 def test_resolve_unknown_raises_listing_choices() -> None:
@@ -172,6 +176,43 @@ def test_pr_builder_requires_policy(tmp_path: Path) -> None:
         )
 
 
+# --- phase builder -----------------------------------------------------------
+
+
+def test_phase_builder_returns_phase_submitter(tmp_path: Path) -> None:
+    policy = WorkPolicy(source_kind="directory", submit_strategy="phase")
+    submitter = worker.build_phase_submitter(
+        policy, **_kwargs(tmp_path, lambda _m: None)  # type: ignore[arg-type]
+    )
+
+    # The phase backend is a GitWorktreeSubmitter subclass (it inherits the
+    # merge strategy's whole verify ladder), never the PR subclass.
+    assert isinstance(submitter, worker.PhaseBranchSubmitter)
+    assert isinstance(submitter, worker.GitWorktreeSubmitter)
+    assert not isinstance(submitter, pr.GitPullRequestSubmitter)
+
+
+def test_phase_builder_tolerates_policy_none(tmp_path: Path) -> None:
+    # Like the merge builder, the phase landing reads no required policy field,
+    # so policy=None must still build (mirrors build_merge_submitter).
+    submitter = worker.build_phase_submitter(
+        None, **_kwargs(tmp_path, lambda _m: None)  # type: ignore[arg-type]
+    )
+    assert isinstance(submitter, worker.PhaseBranchSubmitter)
+
+
+def test_phase_builder_logs_landing_target(tmp_path: Path) -> None:
+    captured: list[str] = []
+    worker.build_phase_submitter(
+        None, **_kwargs(tmp_path, captured.append)  # type: ignore[arg-type]
+    )
+
+    assert captured, "phase builder must emit a landing log line"
+    joined = " ".join(captured).lower()
+    assert "phase" in joined
+    assert "landing" in joined
+
+
 # --- protocol conformance ----------------------------------------------------
 
 
@@ -184,11 +225,15 @@ def test_both_builders_yield_submit_strategy_conformant_objects(
     pr_submitter = pr.build_pr_submitter(
         _pr_policy(), **_kwargs(tmp_path, lambda _m: None)  # type: ignore[arg-type]
     )
+    phase_submitter = worker.build_phase_submitter(
+        None, **_kwargs(tmp_path, lambda _m: None)  # type: ignore[arg-type]
+    )
 
     # runtime_checkable: the registry yields objects that satisfy the seam's
-    # Protocol, so orchestrate can take either whole.
+    # Protocol, so orchestrate can take any of them whole.
     assert isinstance(merge_submitter, SubmitStrategy)
     assert isinstance(pr_submitter, SubmitStrategy)
+    assert isinstance(phase_submitter, SubmitStrategy)
 
 
 # --- uniform signature -------------------------------------------------------

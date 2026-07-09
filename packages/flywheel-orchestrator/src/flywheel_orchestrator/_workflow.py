@@ -73,6 +73,7 @@ from flywheel_core.workflow import (
     recover_stranded_lifecycles,
 )
 from flywheel_orchestrator._claims import (
+    RESOLUTION_ATTRIBUTION_OPERATOR,
     RESOLUTION_ATTRIBUTION_PROBE,
     STOP_INDETERMINATE_LANDING,
     STOP_RESOLVED,
@@ -607,6 +608,34 @@ def _record_indeterminate_landing(
     )
 
 
+def _has_operator_resolution(
+    claims: SqliteClaimStore | PostgresClaimStore,
+    task_id: str,
+) -> bool:
+    """True when ``task_id``'s latest stop event is an operator resolution.
+
+    The ``resolve`` verb (spec 00077, D-3) appends one
+    :data:`~flywheel_orchestrator._claims.STOP_RESOLVED` marker carrying
+    :data:`~flywheel_orchestrator._claims.RESOLUTION_ATTRIBUTION_OPERATOR`
+    when an operator deliberately abandons a strand. The archive sweep treats
+    such a task as no longer blocking -- its verified work need never land.
+
+    The verdict reads the attribution off the record's own column, never
+    parsed from the free-text ``detail`` prose, so a machine (probe)
+    resolution can never masquerade as an operator decision. Only the LATEST
+    row is consulted, so a fresh stop appended AFTER the marker (a recurrence)
+    makes the task blocking again.
+    """
+    events = claims.list_subject_stop_events(task_id)
+    if not events:
+        return False
+    latest = events[-1]
+    return (
+        latest.kind == STOP_RESOLVED
+        and latest.attribution == RESOLUTION_ATTRIBUTION_OPERATOR
+    )
+
+
 def archive_completed_phases(
     tasks_dir: Path,
     store: SqliteStore | PostgresStore,
@@ -724,6 +753,19 @@ def archive_completed_phases(
         if repo_root is not None and landing_base is not None:
             blocking = False
             for task in loaded_tasks:
+                # An operator-attributed resolution (spec 00077, D-3)
+                # deliberately abandons a strand: the operator ran the
+                # ``resolve`` verb, which appended an operator-attributed
+                # STOP_RESOLVED marker keyed to this task. Such a task no
+                # longer blocks archival even though its work never landed --
+                # skip the landing probe entirely and do not surface it as a
+                # strand. A DIFFERENT unlanded, unresolved task in the same
+                # phase still blocks, since each task is judged on its own
+                # latest marker.
+                if claims is not None and _has_operator_resolution(
+                    claims, task.id
+                ):
+                    continue
                 state = _probe_task_landing(
                     store, repo_root, phase_dir, task.id, landing_base
                 )
@@ -2088,6 +2130,63 @@ def _cmd_recover(args: argparse.Namespace) -> int:
         return 0
     for run_id in finalized:
         print(run_id)
+    return 0
+
+def _cmd_resolve(args: argparse.Namespace) -> int:
+    """Deliberately abandon a strand (spec 00077, criterion 5 / D-3).
+
+    Records an operator-attributed
+    :data:`~flywheel_orchestrator._claims.STOP_RESOLVED` marker keyed to the
+    task id (the stop-event subject), carrying the required ``--reason`` text
+    verbatim, through the policy-selected claim store. That marker both clears
+    the strand from the ``status`` stranded view and, on the next archive
+    sweep, unblocks the otherwise-landed phase -- the only non-probe path to
+    resolution. Never writes direct SQL and never a task-file tombstone.
+
+    Resolving a task id with no unresolved stop event is a deterministic,
+    human-readable refusal (exit 1), never a traceback: there is nothing to
+    abandon when the subject has no stop row, or its latest row is already a
+    resolution.
+    """
+    reason = args.reason
+    if not reason.strip():
+        print("error: --reason must not be empty", file=sys.stderr)
+        return 2
+    policy = _load_effective_policy(args)
+    db_path = _resolve_db_path(args, policy)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    claims = build_claim_store(policy, db_path=db_path)
+    try:
+        events = claims.list_subject_stop_events(args.task_id)
+        latest = events[-1] if events else None
+        if latest is None or latest.kind == STOP_RESOLVED:
+            state = (
+                "already resolved" if latest is not None else "no stop event"
+            )
+            print(
+                f"error: task {args.task_id!r} has no unresolved stop event "
+                f"to abandon ({state})",
+                file=sys.stderr,
+            )
+            return 1
+        # Record the operator resolution verbatim (spec 00077, criterion 5):
+        # the reason round-trips into the marker the audit trail shows, and the
+        # attribution token distinguishes this deliberate abandonment from a
+        # git-truth (probe) resolution. Keyed to the task id, through the
+        # policy-selected claim store -- never direct SQL, never a tombstone.
+        claims.record_stop_event(
+            kind=STOP_RESOLVED,
+            subject=args.task_id,
+            detail=f"operator abandoned the strand: {reason}",
+            occurred_at=datetime.now(timezone.utc),
+            attribution=RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+    finally:
+        claims.close()
+    print(
+        f"resolved {args.task_id}: abandoned strand "
+        f"(superseded {latest.kind!r})"
+    )
     return 0
 
 def _cmd_archive(args: argparse.Namespace) -> int:
@@ -4090,6 +4189,34 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_recover.set_defaults(func=_cmd_recover)
+
+    p_resolve = sub.add_parser(
+        "resolve",
+        help=(
+            "Deliberately abandon a stranded task: record an "
+            "operator-attributed resolution with a reason so the next archive "
+            "sweep archives the otherwise-landed phase. The only non-probe "
+            "path to clearing a strand."
+        ),
+    )
+    p_resolve.add_argument(
+        "task_id",
+        help=(
+            "Task id of the strand to abandon (the stop-event subject). "
+            "One subject per invocation."
+        ),
+    )
+    p_resolve.add_argument(
+        "--reason",
+        required=True,
+        help=(
+            "Why the strand is being abandoned. Recorded verbatim on the "
+            "resolution marker for the audit trail."
+        ),
+    )
+    _add_common_policy(p_resolve)
+    _add_common_db(p_resolve)
+    p_resolve.set_defaults(func=_cmd_resolve)
 
     return parser
 

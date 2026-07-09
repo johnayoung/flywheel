@@ -11,7 +11,7 @@ identical entries on this one implementation.
 The verb map is fixed by spec 00021's FR-4:
 
 * orchestrator: ``init``, ``status``, ``live``, ``archive``,
-  ``recover``, ``recheck-blocked``
+  ``recover``, ``resolve``, ``recheck-blocked``
 * core (single-task producer verbs): ``interrupt``, ``approve``,
   ``reject``, ``say`` (surface name) -> ``steer`` (core verb)
 * worker: ``worker [--once]`` -> the git-worktree daemon loop in
@@ -59,6 +59,7 @@ _ORCHESTRATOR_VERBS: frozenset[str] = frozenset(
         "show",
         "archive",
         "recover",
+        "resolve",
         "recheck-blocked",
         "validate",
     }
@@ -100,6 +101,7 @@ Verbs:
   reject RUN_ID    reject a parked manual-approval gate (--feedback TEXT)
   archive          move done phases out of active/
   recover          finalize stranded lifecycles
+  resolve ID        abandon a strand (--reason TEXT) so its phase archives
   recheck-blocked  re-evaluate blocked lifecycles' requires
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run

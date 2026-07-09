@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Any
 
 from flywheel_core.lifecycle import Status
 from flywheel_core.store_sqlite import SqliteStore
-from flywheel_orchestrator._workflow import TaskState, TaskStatusRow
+from flywheel_orchestrator._workflow import (
+    TaskState,
+    TaskStatusRow,
+    satisfied_prerequisites_from_store,
+)
 
 if TYPE_CHECKING:
     from flywheel_core.store_postgres import PostgresStore
@@ -165,8 +169,17 @@ def build_rollup(
         status_by_id[row.task.id] = status
 
     # Second pass: a not-started task whose prerequisites have not all reached
-    # done is blocked *by* those prerequisites, not merely idle. A missing
-    # prerequisite (absent from the workspace) counts as unsatisfied.
+    # done is blocked *by* those prerequisites, not merely idle. A prerequisite
+    # is satisfied when a listed row classified it as done OR -- for an id no
+    # listed row provides -- the store still carries its DONE lifecycle. The
+    # store is the authoritative record of completion (docs/data-taxonomy.md):
+    # a prerequisite whose defining task left the listing (e.g. its phase
+    # archived) is still satisfied by its DONE lifecycle, so a never-started
+    # dependent must not report blocked_by_prereq against it. Satisfaction runs
+    # through the same store-DONE predicate the scheduler uses
+    # (satisfied_prerequisites_from_store), which reads the store only for ids
+    # absent from ``rows`` -- a fully-listed graph classifies with no extra read.
+    store_done_prereqs = satisfied_prerequisites_from_store(rows, store)
     phases: dict[str, list[TaskRollup]] = {}
     for row, status, passed, total, detail in classified:
         unsatisfied: tuple[str, ...] = ()
@@ -175,6 +188,7 @@ def build_rollup(
                 prereq
                 for prereq in row.prerequisites
                 if status_by_id.get(prereq) not in _DONE_STATUSES
+                and prereq not in store_done_prereqs
             )
             if unsatisfied:
                 status = RollupStatus.BLOCKED_BY_PREREQ

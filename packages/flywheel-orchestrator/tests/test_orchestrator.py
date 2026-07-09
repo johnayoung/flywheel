@@ -1446,7 +1446,7 @@ def _run_driver(
     )
 
 
-def test_session_limit_pause_blocks_peer_then_resumes(tmp_path: Path) -> None:
+def test_session_pause_blocks_peer_then_resumes(tmp_path: Path) -> None:
     """A session limit tripped by driver A's task pauses driver B pool-wide,
     then driver C claims freely once the clamped horizon passes."""
     db_path = tmp_path / "flywheel.sqlite"
@@ -1519,7 +1519,7 @@ def test_session_limit_pause_blocks_peer_then_resumes(tmp_path: Path) -> None:
     assert report_c.runs[0].status is Status.DONE
 
 
-def test_session_limit_ceiling_zero_never_pauses(tmp_path: Path) -> None:
+def test_session_pause_ceiling_zero_never_pauses(tmp_path: Path) -> None:
     """``session_pause_ceiling_seconds == 0`` is today's behavior byte-for-byte:
     a session-limited run records no pause and never blocks a peer's claim."""
     db_path = tmp_path / "flywheel.sqlite"

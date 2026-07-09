@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
+from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.faults import FaultClass, classify_fault
 from flywheel_orchestrator._autopilot import (
     DEFAULT_WEIGHTS,
@@ -154,6 +155,7 @@ def run_single_pass(
     weights: ScoreWeights,
     model: str | None,
     queue_depth: Callable[[Path], int] | None = None,
+    deadlines: DeadlineConfig | None = None,
 ) -> AutopilotPassResult:
     """Drive exactly one refill pass with the real SDK-backed invokers.
 
@@ -161,6 +163,13 @@ def run_single_pass(
     ``None`` falls back to the directory adapter's raw active-file count (spec
     00062: the daemon passes a store-backed counter that excludes terminal
     tasks so a finished-but-unarchived task file never suppresses refill).
+
+    ``deadlines`` is the policy-resolved :class:`DeadlineConfig` (spec 00066)
+    whose ``[deadlines] autopilot_agent_seconds`` ceiling bounds the discovery
+    and authoring agent calls. ``None`` is forwarded unchanged so
+    :func:`run_refill_pass` falls back to a default :class:`DeadlineConfig`
+    (byte-identical to the built-in ceilings); a library/``None``-policy caller
+    thus keeps today's defaults.
     """
     return asyncio.run(
         run_refill_pass(
@@ -171,6 +180,7 @@ def run_single_pass(
             landing=landing,
             model=model,
             queue_depth=queue_depth,
+            deadlines=deadlines,
         )
     )
 
@@ -702,6 +712,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     tasks_dir, target_depth, landing, weights = _resolve_runtime(args, policy)
     model = args.model or (policy.model if policy is not None else None)
     queue_depth = _build_queue_depth(policy, repo_root, log)
+    # Resolve the autopilot agent wall-clock ceiling from [deadlines] (spec
+    # 00066): a loaded policy always carries a DeadlineConfig (a default one when
+    # the table is absent), so a toml override -- including the 0 opt-out --
+    # reaches run_refill_pass. A None policy forwards None, which run_refill_pass
+    # maps to the byte-identical default ceilings.
+    deadlines = policy.deadlines if policy is not None else None
 
     def run_cycle() -> AutopilotPassResult:
         return run_single_pass(
@@ -712,6 +728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             weights=weights,
             model=model,
             queue_depth=queue_depth,
+            deadlines=deadlines,
         )
 
     if args.once:

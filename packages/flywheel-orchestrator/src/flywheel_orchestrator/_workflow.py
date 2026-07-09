@@ -131,6 +131,15 @@ from flywheel_orchestrator._pg_preflight import (
 
 DEFAULT_TASKS_DIR = Path(".flywheel/tasks")
 
+#: The provenance trailer key ``fw show`` reads back off a landed commit to
+#: resolve its producing run (spec 00078, D-3). This mirrors the authoritative
+#: definition ``flywheel_worktree._trailers.TRAILER_KEY_RUN`` — the stamping
+#: engine that writes the trailer lives one layer up (worktree depends on the
+#: orchestrator, never the reverse), so the lookup cannot import it. The two are
+#: pinned equal by ``test_show_commit_lookup`` so the shared vocabulary cannot
+#: drift; do not re-derive the value here from anything else.
+TRAILER_KEY_RUN = "Flywheel-Run"
+
 
 class TaskState(str, Enum):
     """Task-level status derived from the latest lifecycle, if any."""
@@ -2727,16 +2736,98 @@ def _run_detail_to_dict(
     }
 
 
+@dataclass(frozen=True)
+class _CommitProvenance:
+    """How a ``show`` argument resolved against git as a commit object.
+
+    ``is_commit`` is ``True`` iff the argument names a commit in the repo.
+    ``run_id`` carries the commit's ``Flywheel-Run`` trailer value when one is
+    present (spec 00078, criterion 5), else ``None`` — an un-attributed commit
+    (criterion 6). Resolution is git-truth (D-3): the run id is read straight
+    off the commit's trailer, never guessed from a nearby run.
+    """
+
+    is_commit: bool
+    run_id: str | None = None
+
+
+def _show_repo_root(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> Path:
+    """The repo the commit lookup resolves a SHA against.
+
+    Mirrors :func:`_resolve_fallback_phases`' source of a tasks dir: an explicit
+    ``--tasks-dir`` wins, then the policy's directory source, else the current
+    working directory. Git itself walks up from this path to the work tree, so
+    any directory inside the repo resolves the same objects.
+    """
+    if args.tasks_dir:
+        return repo_root_for_tasks_dir(Path(args.tasks_dir))
+    if (
+        policy is not None
+        and policy.source_kind == "directory"
+        and policy.tasks_dir is not None
+    ):
+        return repo_root_for_tasks_dir(policy.tasks_dir)
+    return Path.cwd()
+
+
+def _resolve_commit_provenance(
+    repo_root: Path, ref: str
+) -> _CommitProvenance:
+    """Resolve ``ref`` to its producing run via its ``Flywheel-Run`` trailer.
+
+    Two git reads: ``rev-parse`` peels ``ref`` to a commit object (a non-commit
+    — an unknown id, a tree/blob — yields ``is_commit=False`` so the caller
+    keeps the existing not-found behavior), then ``git show`` extracts the
+    :data:`TRAILER_KEY_RUN` trailer value using git's own trailer parser rather
+    than re-deriving trailer syntax here. A commit with no such trailer is
+    reported as ``run_id=None`` (un-attributed), never mapped to a nearby run.
+    """
+    code, _ = _git_capture(
+        repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"
+    )
+    if code != 0:
+        return _CommitProvenance(is_commit=False)
+    code, out = _git_capture(
+        repo_root,
+        "show",
+        "--no-patch",
+        f"--format=%(trailers:key={TRAILER_KEY_RUN},valueonly)",
+        ref,
+    )
+    if code != 0:
+        return _CommitProvenance(is_commit=False)
+    values = [line for line in out.strip().splitlines() if line.strip()]
+    run_id = values[0].strip() if values else None
+    return _CommitProvenance(is_commit=True, run_id=run_id)
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     policy = _load_effective_policy(args)
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = open_sqlite_bound_store(policy, db_path=db_path)
+    commit: _CommitProvenance | None = None
     try:
         run_id = resolve_run_id(store, args.run_or_task_id)
         if run_id is None:
-            print(f"{args.run_or_task_id}: no run or task with that id")
-            return 1
+            # Not a known run or task id: the argument may be a landed commit.
+            # SHA handling engages only here — run/task resolution above is
+            # byte-identical to before and never touches git (spec 00078 #5/#6).
+            commit = _resolve_commit_provenance(
+                _show_repo_root(args, policy), args.run_or_task_id
+            )
+            if not commit.is_commit:
+                print(f"{args.run_or_task_id}: no run or task with that id")
+                return 1
+            if commit.run_id is None:
+                print(
+                    f"{args.run_or_task_id}: un-attributed commit "
+                    f"(no {TRAILER_KEY_RUN} trailer)"
+                )
+                return 1
+            run_id = commit.run_id
         detail = collect_run_detail(
             store,
             run_id,
@@ -2745,6 +2836,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
     finally:
         store.close()
     if detail is None:
+        if commit is not None:
+            # The commit's trailer named a run absent from the store: a
+            # dangling provenance pointer, distinct from an un-attributed
+            # commit — name the missing run id, never fall back to a guess.
+            print(
+                f"{args.run_or_task_id}: {TRAILER_KEY_RUN} names run "
+                f"{run_id}, which is not in the store"
+            )
+            return 1
         print(f"{args.run_or_task_id}: no run or task with that id")
         return 1
     # Redaction is on by default (00073 #10): decision-record output excerpts

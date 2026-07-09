@@ -124,6 +124,10 @@ from flywheel_orchestrator import (
 
 from flywheel_worktree._disk_preflight import DiskPreflight
 from flywheel_worktree._submit_registry import SUBMIT_STRATEGIES
+from flywheel_worktree._trailers import (
+    provenance_trailers,
+    stamp_commit_messages,
+)
 
 DEFAULT_RETENTION_DAYS = 7
 # Default cap on per-run telemetry JSONL files kept under
@@ -963,6 +967,9 @@ class GitWorktreeSubmitter:
                         receipts=verify_receipts,
                     )
                     return
+                # Message-only provenance stamp of the exact tree just verified,
+                # before the FF advances the base onto it (spec 00078).
+                self._stamp_trailers(req, worktree, branch)
                 if self._ff_merge(branch):
                     landed_ref = _git(
                         self.repo_root, "rev-parse", self.phase_base
@@ -1031,6 +1038,9 @@ class GitWorktreeSubmitter:
                     receipts=verify_receipts,
                 )
                 return
+            # Same message-only stamp on the rebased tree before its FF: the
+            # rebased worktree is the exact post-merge tree (spec 00078).
+            self._stamp_trailers(req, worktree, branch)
             if self._ff_merge(branch):
                 landed_ref = _git(
                     self.repo_root, "rev-parse", self.phase_base
@@ -1726,6 +1736,34 @@ class GitWorktreeSubmitter:
             if res.returncode == 0 and res.stdout.strip().isdigit()
             else 0
         )
+
+    def _stamp_trailers(
+        self, req: SubmitRequest, worktree: Path, branch: str
+    ) -> None:
+        """Stamp harness-authoritative provenance trailers onto the task
+        branch's ``phase_base..branch`` commits, then advance the branch and
+        worktree onto the rewritten tip (spec 00078, criteria 1/3/4).
+
+        Message-only: :func:`~flywheel_worktree._trailers.stamp_commit_messages`
+        recreates every commit over its original tree object, so the tree that
+        just passed re-verify/standing-verify is byte-identically the tree that
+        lands -- stamping never changes what verification approved. Any
+        agent-authored ``Flywheel-*`` trailer is stripped and replaced with the
+        harness values (task id, run id, and phase directory name), so a forged
+        provenance value cannot survive (D-2). Runs under the caller's merge
+        lock, immediately before the fast-forward, so the base cannot move
+        between the stamp and the FF; ``reset --hard`` onto the tree-identical
+        tip changes no file on disk, only the branch ref the FF reads."""
+        phase = phase_of_task_file(req.task_file, self.tasks_dir)
+        new_tip = stamp_commit_messages(
+            self.repo_root,
+            base=self.phase_base,
+            branch=branch,
+            trailers=provenance_trailers(
+                task_id=req.task_id, run_id=req.run_id, phase=phase
+            ),
+        )
+        _git(worktree, "reset", "--hard", new_tip, check=True)
 
     def _base_is_checked_out(self) -> bool:
         """True when the configured base is the operator's checked-out branch in

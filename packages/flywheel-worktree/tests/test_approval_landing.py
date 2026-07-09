@@ -14,11 +14,15 @@ and lands the preserved branch inline through the SAME held-out-gate +
 fast-forward whose recorded ``Landed`` reference is the base head git itself
 reports, advanced to include the branch.
 
-The land is proven WITHOUT the test issuing a single git command after enqueuing
-the approve: the parked branch head is read from git *before* the approve, and
-the post-land assertion is that the recorded ``landed_ref`` -- and the base
-branch git reports -- both equal that head. A record written at submit-start
-(before the approval consumes) would leave the base untouched and fail this.
+The land is proven without the test issuing any git command that could cause it:
+the parked branch head and tree are read from git *before* the approve, and the
+post-land assertion is that the recorded ``landed_ref`` is the base head git now
+reports, advanced past its parked position onto the branch's exact tree. The
+merge strategy stamps provenance trailers onto the branch commits before the
+fast-forward (spec 00078), so the landed sha differs from the parked head while
+its tree is byte-identical and carries the harness run id. A record written at
+submit-start (before the approval consumes) would leave the base untouched and
+fail this.
 """
 
 from __future__ import annotations
@@ -244,6 +248,7 @@ def test_approved_gate_lands_parked_branch_through_ladder(
     # -- the test's last git commands. The branch is genuinely ahead of the base
     # that has not moved during the park, so the land is a clean fast-forward.
     branch_head = _git(worktree, "rev-parse", "HEAD")
+    branch_tree = _git(worktree, "rev-parse", "HEAD^{tree}")
     base_before = _rev(repo, "main")
     assert branch_head != base_before
 
@@ -263,13 +268,29 @@ def test_approved_gate_lands_parked_branch_through_ladder(
     _drive()
 
     # Exactly one ``Landed``, naming the merge strategy, whose reference is the
-    # base head the land advanced to include the branch -- a value read from
-    # git, not invented. Clean FF => the new base head IS the parked branch head.
+    # base head git now reports -- a value read from git, not invented at
+    # submit-start (which would have left the base at base_before). The merge
+    # strategy stamps provenance trailers onto the branch before the FF (spec
+    # 00078), so the landed head differs from the pre-stamp parked head while
+    # its tree is byte-identical and it carries the harness run id.
     landed = ledger.landed()
     assert len(landed) == 1
     assert landed[0].strategy == "merge"
-    assert landed[0].landed_ref == branch_head
-    assert _rev(repo, "main") == branch_head  # the base advanced onto the branch
+    landed_head = _rev(repo, "main")
+    assert landed[0].landed_ref == landed_head
+    assert landed_head != base_before
+    assert landed_head != branch_head
+    assert _rev(repo, "main^{tree}") == branch_tree
+    assert (
+        _git(
+            repo,
+            "log",
+            "-1",
+            "--format=%(trailers:key=Flywheel-Run,valueonly)",
+            "main",
+        )
+        == run_id
+    )
 
     # The lifecycle reached DONE on the same pass that landed it.
     store = SqliteStore(db_path)

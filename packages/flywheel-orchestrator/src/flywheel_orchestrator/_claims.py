@@ -187,6 +187,24 @@ STOP_RETRIES_ESCALATED: str = "retries-escalated"
 # never enters the human-review queue read.
 STOP_RESOLVED: str = "stop-resolved"
 
+# The archive sweep's indeterminate-landing marker (spec 00077, criterion 7 /
+# D-4). Landed means a receipt or ancestry (D-1); when the sweep can prove
+# neither -- no ``Landed`` receipt on a DONE task's latest run AND neither its
+# ``flywheel/<phase>/<task>`` branch nor any recorded head resolves for the
+# ancestry probe -- the landing state is genuinely UNKNOWN, so the sweep fails
+# closed (D-4): the phase stays active and one row with this stable kind is
+# appended, keyed to the task id, so ``flywheel status`` surfaces the strand
+# instead of the sweep silently blessing retention-destroyed evidence as
+# landed. The sweep appends at most one unresolved row per subject (it checks
+# the subject's latest row first), so repeated sweeps over a blocked phase do
+# not flood the ledger. Like ``no-progress-reset`` / ``retries-escalated`` /
+# ``stop-resolved`` this is DELIBERATELY neither a pre-run stop
+# (:data:`ORCHESTRATOR_STOP_EVENT_KINDS`) nor a queue reason
+# (:data:`HUMAN_REVIEW_QUEUE_REASONS`): the ``status`` stranded view surfaces it
+# by subject regardless of kind, and a later :data:`STOP_RESOLVED` (the phase
+# archived once the task landed) supersedes it.
+STOP_INDETERMINATE_LANDING: str = "indeterminate-landing"
+
 
 # The human-review queue vocabulary (spec 00069-work-redriver, queue-surface).
 #
@@ -2068,6 +2086,7 @@ __all__ = [
     "REASON_PREREQUISITE_MISSING",
     "REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION",
     "STOP_DANGLING_PREREQUISITE",
+    "STOP_INDETERMINATE_LANDING",
     "STOP_NO_OP_CYCLE",
     "STOP_NO_PROGRESS",
     "STOP_NO_PROGRESS_RESET",

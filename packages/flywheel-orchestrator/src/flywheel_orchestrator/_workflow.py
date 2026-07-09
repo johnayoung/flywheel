@@ -41,7 +41,7 @@ from flywheel_core.harness import (
     recheck_blocked_lifecycle,
 )
 from flywheel_core.event_serde import event_kind, event_payload
-from flywheel_core.events import DomainEvent, LandingParked
+from flywheel_core.events import DomainEvent, Landed, LandingParked
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
@@ -68,6 +68,7 @@ from flywheel_core.workflow import (
     recover_stranded_lifecycles,
 )
 from flywheel_orchestrator._claims import (
+    STOP_INDETERMINATE_LANDING,
     STOP_RESOLVED,
     OrchestratorStopEventRecord,
     SqliteClaimStore,
@@ -435,6 +436,171 @@ def satisfied_prerequisites_from_store(
 
 IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
 
+class _LandingState(Enum):
+    """The archive sweep's per-task landing verdict (spec 00077, D-1/D-4).
+
+    ``LANDED`` -- a :class:`~flywheel_core.events.Landed` receipt exists on the
+    task's latest run (the fast path), or the ancestry probe confirmed the
+    task's recorded work is an ancestor of the landing base at sweep time.
+    ``NOT_LANDED`` -- the work resolved to a commit but it is NOT an ancestor of
+    the landing base (a determinate strand: a ``divergent-base`` park whose
+    branch head the base cannot fast-forward to). ``INDETERMINATE`` -- no
+    receipt and neither the branch nor any recorded head resolves, so landing
+    state cannot be determined and fails closed (D-4).
+    """
+
+    LANDED = "landed"
+    NOT_LANDED = "not-landed"
+    INDETERMINATE = "indeterminate"
+
+
+def _run_has_landed_receipt(
+    store: SqliteStore | PostgresStore, run_id: str
+) -> bool:
+    """True when ``run_id``'s domain-event stream carries a ``Landed`` receipt.
+
+    The fast path of the landed predicate (D-1): a machine land appends a
+    :class:`~flywheel_core.events.Landed` witness, so a receipt is authoritative
+    proof the work landed even after the branch is deleted. Ancestry is the
+    slower truth for hand-landed / receipt-less work.
+    """
+    return any(
+        isinstance(event, Landed)
+        for event in store.list_domain_events(run_id)
+    )
+
+
+def _resolve_task_head(
+    repo_root: Path, phase_dir: Path, task_id: str
+) -> str | None:
+    """Resolve the commit the task's recorded work points at, or ``None``.
+
+    The recorded work lives on the ``flywheel/<phase>/<task-id>`` branch the
+    worktree strategy names (``flywheel_worktree.worker._branch``); the phase is
+    the active phase directory name. Resolved via ``git rev-parse --verify
+    --quiet refs/heads/<branch>`` against the already-threaded ``repo_root`` --
+    the same shared-object-DB shell-out the loop-path diff uses -- so the
+    orchestrator never imports the worktree package to run the probe. ``None``
+    when the branch ref does not exist (deleted after a sweep, never created),
+    which the caller treats as the branch leg of the D-4 indeterminate check.
+    """
+    branch = f"flywheel/{phase_dir.name}/{task_id}"
+    rc, out = _git_capture(
+        repo_root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"
+    )
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _is_ancestor(repo_root: Path, ancestor: str, rev: str) -> bool:
+    """True when ``ancestor`` is reachable from ``rev`` in ``repo_root``.
+
+    ``git merge-base --is-ancestor`` exits 0 for ancestor, 1 for not, and
+    non-zero (128) when either revision is unresolvable -- both non-zero cases
+    read as "not an ancestor" so an unresolvable landing base fails closed
+    rather than blessing the work as landed. Mirrors
+    ``flywheel_worktree.worker.GitWorktreeSubmitter._is_ancestor``, which
+    predicts the fast-forward outcome exactly under the merge lock.
+    """
+    rc, _ = _git_capture(
+        repo_root, "merge-base", "--is-ancestor", ancestor, rev
+    )
+    return rc == 0
+
+
+def _probe_task_landing(
+    store: SqliteStore | PostgresStore,
+    repo_root: Path,
+    phase_dir: Path,
+    task_id: str,
+    landing_base: str,
+) -> _LandingState:
+    """Decide a DONE task's landing state for the archive sweep (D-1/D-4).
+
+    Receipt first (fast path): a ``Landed`` event on the task's latest run is
+    authoritative even if the branch is gone. Otherwise probe ancestry: resolve
+    the task's recorded work to a commit and ask whether it is an ancestor of
+    ``landing_base`` at sweep time. A resolvable head that is NOT an ancestor is
+    a determinate strand (``NOT_LANDED``); an unresolvable head with no receipt
+    is ``INDETERMINATE`` -- landing state cannot be determined, so it fails
+    closed. A probe that always answered ``LANDED`` would archive the
+    divergent-base strand criterion 1 forbids; keying the truthy answer on real
+    ancestry is what forecloses that.
+    """
+    row = _latest_lifecycle_row(store, task_id)
+    if row is not None and _run_has_landed_receipt(store, row[0]):
+        return _LandingState.LANDED
+    head = _resolve_task_head(repo_root, phase_dir, task_id)
+    if head is None:
+        return _LandingState.INDETERMINATE
+    if _is_ancestor(repo_root, head, landing_base):
+        return _LandingState.LANDED
+    return _LandingState.NOT_LANDED
+
+
+def _format_landing_refusal(
+    phase_dir: Path, task_id: str, state: _LandingState
+) -> str:
+    """Render the refusal message for a phase blocked by an unlanded task.
+
+    Names the offending phase and the blocking task id -- the same
+    ``Callable[[str], None]`` log seam the loop-path and phase-verify refusals
+    use -- so the strand is visible on the sweep's log instead of vanishing when
+    the phase silently stays active. The determinate (``NOT_LANDED``) and
+    indeterminate causes read differently so the operator's next step is
+    unambiguous.
+    """
+    if state is _LandingState.INDETERMINATE:
+        cause = (
+            "its landing state cannot be determined (no landing receipt and "
+            "neither its branch nor a recorded head resolves for the ancestry "
+            "probe)"
+        )
+    else:
+        cause = (
+            "its recorded work is not landed (no landing receipt and its "
+            "branch head is not an ancestor of the landing base)"
+        )
+    return (
+        f"Refusing to archive phase {phase_dir.name}: task {task_id} is not "
+        f"landed -- {cause}"
+    )
+
+
+def _record_indeterminate_landing(
+    claims: SqliteClaimStore | PostgresClaimStore,
+    task_id: str,
+    phase_dir: Path,
+    clock: Callable[[], datetime],
+) -> None:
+    """Append one indeterminate-landing marker for ``task_id``, idempotently.
+
+    Fails closed loudly (D-4): a DONE task whose landing state cannot be
+    determined surfaces in ``flywheel status`` via a stop row with the stable
+    :data:`~flywheel_orchestrator._claims.STOP_INDETERMINATE_LANDING` kind keyed
+    to the task id. The append is skipped when the subject's latest stop row is
+    already an unresolved indeterminate-landing marker, so repeated sweeps over
+    a blocked phase surface the strand once rather than flooding the ledger; a
+    later :data:`~flywheel_orchestrator._claims.STOP_RESOLVED` (the phase
+    archived once the task landed) supersedes it, so a fresh recurrence
+    re-surfaces.
+    """
+    events = claims.list_subject_stop_events(task_id)
+    if events and events[-1].kind == STOP_INDETERMINATE_LANDING:
+        return
+    claims.record_stop_event(
+        kind=STOP_INDETERMINATE_LANDING,
+        subject=task_id,
+        detail=(
+            f"phase {phase_dir.name!r} cannot archive: task {task_id!r} has "
+            f"no landing receipt and neither its branch nor a recorded head "
+            f"resolves for the ancestry probe"
+        ),
+        occurred_at=clock(),
+    )
+
+
 def archive_completed_phases(
     tasks_dir: Path,
     store: SqliteStore | PostgresStore,
@@ -442,6 +608,7 @@ def archive_completed_phases(
     repo_root: Path | None = None,
     log: Callable[[str], None] | None = None,
     phase_verify: str | None = None,
+    landing_base: str | None = None,
     claims: SqliteClaimStore | PostgresClaimStore | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> list[Path]:
@@ -449,6 +616,23 @@ def archive_completed_phases(
 
     Returns the list of moved phase directories (post-move paths). Idempotent:
     safe to call repeatedly. Phases with any non-done task are left in place.
+
+    ``landing_base`` arms the landed predicate (spec 00077, D-1/D-4): a DONE
+    task counts landed only when a :class:`~flywheel_core.events.Landed` receipt
+    exists on its latest run (fast path) OR the ancestry probe confirms its
+    recorded work -- the ``flywheel/<phase>/<task-id>`` branch head -- is an
+    ancestor of ``landing_base`` (a git ref, e.g. the resolved submit base or
+    ``HEAD``) at sweep time. A phase with any task that is not landed stays in
+    ``active/`` and the blocking task id is reported via ``log`` (the same seam
+    the loop-path/phase-verify refusals use); a task whose landing state cannot
+    be determined -- no receipt and no resolvable branch/recorded head -- fails
+    closed as a surfaced indeterminate-landing strand (one
+    :data:`~flywheel_orchestrator._claims.STOP_INDETERMINATE_LANDING` row keyed
+    to the task id via ``claims``) rather than counting as landed. The predicate
+    requires both ``repo_root`` (to run the git probe) and ``landing_base``;
+    ``None`` for either preserves the legacy DONE-only archival contract, so
+    callers that pass neither (and the synthetic archive/loop-path tests) keep
+    their previous behavior.
 
     When ``repo_root`` is supplied, the phase's cumulative diff vs its
     recorded ``.loop-base`` is inspected for the watched loop-path signals
@@ -485,6 +669,9 @@ def archive_completed_phases(
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
     archive_root.mkdir(parents=True, exist_ok=True)
+    clock = now if now is not None else (
+        lambda: datetime.now(timezone.utc)
+    )
 
     for phase_dir in iter_active_phase_dirs(tasks_dir):
         task_files = [
@@ -502,6 +689,35 @@ def archive_completed_phases(
             _has_done_lifecycle(store, task.id) for task in loaded_tasks
         ):
             continue
+
+        # Landed predicate (spec 00077, D-1/D-4): every DONE task's verified
+        # work must be landed -- a receipt on its latest run, or its recorded
+        # work an ancestor of ``landing_base`` -- before the phase may archive.
+        # A determinate strand (resolvable head that is not an ancestor) blocks
+        # and names the task; an indeterminate one (no receipt, no resolvable
+        # head) blocks AND fails closed as a surfaced indeterminate-landing
+        # strand. Armed only when both ``repo_root`` and ``landing_base`` are
+        # threaded, so legacy callers keep the DONE-only contract.
+        if repo_root is not None and landing_base is not None:
+            blocking = False
+            for task in loaded_tasks:
+                state = _probe_task_landing(
+                    store, repo_root, phase_dir, task.id, landing_base
+                )
+                if state is _LandingState.LANDED:
+                    continue
+                blocking = True
+                if log is not None:
+                    log(_format_landing_refusal(phase_dir, task.id, state))
+                if (
+                    state is _LandingState.INDETERMINATE
+                    and claims is not None
+                ):
+                    _record_indeterminate_landing(
+                        claims, task.id, phase_dir, clock
+                    )
+            if blocking:
+                continue
 
         # Loop-path archive gate (FR-2): a non-empty marker requires either
         # a DONE in-loop-verification task or a recorded opt-out artifact.
@@ -547,9 +763,6 @@ def archive_completed_phases(
         if repo_root is not None:
             _materialize_loop_base(repo_root, dest)
         if claims is not None:
-            clock = now if now is not None else (
-                lambda: datetime.now(timezone.utc)
-            )
             for task in loaded_tasks:
                 events = claims.list_subject_stop_events(task.id)
                 if not events or events[-1].kind == STOP_RESOLVED:
@@ -1821,11 +2034,30 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         tasks_dir = DEFAULT_TASKS_DIR
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Thread repo_root + landing_base so the CLI verb applies the same gates
+    # the worker's sweep does: the landed predicate (a phase archives only when
+    # every DONE task's work is landed), the loop-path gate, and any configured
+    # phase-verify. The landing base is the configured submit base, else the
+    # operator's checked-out branch (HEAD). Refusals print to stderr so the
+    # moved-dest stdout stays machine-parseable.
+    repo_root = repo_root_for_tasks_dir(tasks_dir)
+    landing_base = (
+        policy.submit_base if policy is not None else None
+    ) or "HEAD"
+    phase_verify = policy.phase_verify if policy is not None else None
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         claims = build_claim_store(policy, db_path=db_path)
         try:
-            moved = archive_completed_phases(tasks_dir, store, claims=claims)
+            moved = archive_completed_phases(
+                tasks_dir,
+                store,
+                repo_root=repo_root,
+                log=lambda msg: print(msg, file=sys.stderr),
+                phase_verify=phase_verify,
+                landing_base=landing_base,
+                claims=claims,
+            )
         finally:
             claims.close()
     finally:
@@ -1835,7 +2067,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0
 
 
-def _repo_root_for_tasks_dir(tasks_dir: Path) -> Path:
+def repo_root_for_tasks_dir(tasks_dir: Path) -> Path:
     """Resolve the repo root a grader's ``run`` path tokens are relative to.
 
     Tasks live under ``<repo_root>/.flywheel/tasks``; the static path checks
@@ -1881,7 +2113,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         )
     else:
         tasks_dir = DEFAULT_TASKS_DIR
-    repo_root = _repo_root_for_tasks_dir(tasks_dir)
+    repo_root = repo_root_for_tasks_dir(tasks_dir)
     loaded = load_active_tasks(tasks_dir)
     invalid: dict[str, list[TaskDefect]] = {}
     for path, task in loaded:

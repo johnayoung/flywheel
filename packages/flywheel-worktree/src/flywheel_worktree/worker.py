@@ -1951,6 +1951,7 @@ def archive_phases(
     log: Logger,
     *,
     repo_root: Path | None = None,
+    landing_base: str | None = None,
     policy: WorkPolicy | None = None,
 ) -> None:
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
@@ -1962,6 +1963,16 @@ def archive_phases(
     contract. Refusal reasons are reported via the same ``log`` callable
     that announces archived phases so a single log stream tells the
     operator everything the sweep did.
+
+    ``landing_base`` arms the landed predicate (spec 00077): with it (and
+    ``repo_root``) threaded, a DONE task archives only when its work is landed
+    -- a receipt on its latest run, or its ``flywheel/<phase>/<task-id>`` branch
+    head an ancestor of ``landing_base`` at sweep time -- otherwise the phase
+    stays active and the blocking task id is reported via ``log``. Pass the
+    worker's resolved submit base (``GitWorktreeSubmitter.phase_base``);
+    ``None`` preserves the legacy DONE-only contract, which is why the archive
+    seam tests that call this helper without a repo/base still archive on
+    all-DONE.
 
     ``policy`` selects the store backend through the orchestrator's store
     factory; ``None`` keeps the historical sqlite-on-``db_path`` behavior.
@@ -1987,6 +1998,7 @@ def archive_phases(
                 phase_verify=(
                     policy.phase_verify if policy is not None else None
                 ),
+                landing_base=landing_base,
                 claims=claims,
             )
         finally:
@@ -2354,6 +2366,7 @@ def run_once(
             db_path,
             log,
             repo_root=submitter.repo_root,
+            landing_base=submitter.phase_base,
             policy=policy,
         )
     return report

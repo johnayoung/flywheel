@@ -49,11 +49,13 @@ from flywheel_orchestrator import (
     WorkSource,
     HistoryRow,
     archive_completed_phases,
+    build_claim_store,
     build_task_phase_index,
     build_work_source,
     collect_history_rows,
     load_effective_policy,
     open_sqlite_bound_store,
+    repo_root_for_tasks_dir,
     resolve_db_path,
     resolve_postgres_dsn,
 )
@@ -445,11 +447,36 @@ def _run_dashboard(
         the operator sees in the inline notice. Disabled (returns an
         empty list, the screen treats it as a no-op) for tracker
         sources where ``fw archive`` itself errors.
+
+        Threads the same gates the worker/CLI sweeps apply so a manual
+        console archive is not a weaker path: ``repo_root`` +
+        ``landing_base`` arm the landed predicate (a phase archives only
+        when every DONE task's work is landed), ``phase_verify`` runs the
+        configured phase-exit gate, and the claim store carries the
+        stop-event ledger (stop-resolved markers on archive, and the
+        fail-closed indeterminate-landing strand surfaced in ``status``).
+        The landing base is the configured submit base, else ``HEAD``.
         """
 
         if archive_tasks_dir is None:
             return []
-        moved = archive_completed_phases(archive_tasks_dir, store)
+        repo_root = repo_root_for_tasks_dir(archive_tasks_dir)
+        landing_base = (
+            policy.submit_base if policy is not None else None
+        ) or "HEAD"
+        phase_verify = policy.phase_verify if policy is not None else None
+        claims = build_claim_store(policy, db_path=db_path)
+        try:
+            moved = archive_completed_phases(
+                archive_tasks_dir,
+                store,
+                repo_root=repo_root,
+                phase_verify=phase_verify,
+                landing_base=landing_base,
+                claims=claims,
+            )
+        finally:
+            claims.close()
         return [str(path) for path in moved]
 
     def open_session(run_id: str, task_id: str) -> SessionScreen | None:

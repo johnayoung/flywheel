@@ -104,6 +104,7 @@ from flywheel_orchestrator import (
     resolve_grader_env,
     resolve_sandbox_root,
 )
+from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.workflow import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
@@ -2652,6 +2653,11 @@ def maybe_wrap_for_backend(
     auth = resolve_auth(
         container.auth, env=env, token_env=container.auth_env or None
     )
+    # Docker management calls run under the [deadlines] docker_management_seconds
+    # ceiling resolved onto the policy, not the container module's import-time
+    # default. (policy is non-None here -- sandbox derives from it -- but keep a
+    # DeadlineConfig() default so a None policy resolves the same finite ceiling.)
+    deadlines = policy.deadlines if policy is not None else DeadlineConfig()
     log(
         f"backend=container image={container.image} model={resolved_model} "
         f"auth={container.auth} network={sandbox.network.policy}"
@@ -2665,6 +2671,7 @@ def maybe_wrap_for_backend(
         allow_hosts=sandbox.network.allow_hosts,
         egress_network=container.egress_network or None,
         auth=auth,
+        management_timeout=deadlines.docker_management_seconds,
     )
 
 

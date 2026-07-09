@@ -22,6 +22,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Final
 
 from flywheel_core.deadline_config import DeadlineClass, resolve_deadlines
 
@@ -503,36 +504,62 @@ def force_remove_container_sync(
 # uncaught exceptions; the explicit teardown covers the steady-state path.
 
 _registry_lock = threading.Lock()
-_registered: set[str] = set()
+
+
+class _UnsetTimeout:
+    """Sentinel type: a registration supplied no explicit management timeout."""
+
+    __slots__ = ()
+
+
+# A registration with no explicit ``timeout`` keeps the flush call single-arg
+# (``_remover(name)``) so the force-remove applies its own default and callers
+# that never pass a timeout stay byte-identical; an explicit ceiling (including
+# the unbounded ``None`` opt-out) is recorded per name and threaded to the
+# force-remove at flush, so the ``atexit`` backstop honors the same operator
+# override as the inline management calls (spec 00066 criterion 5).
+_UNSET: Final[_UnsetTimeout] = _UnsetTimeout()
+_registered: dict[str, float | None | _UnsetTimeout] = {}
 _atexit_installed = False
 # Indirection so tests can flush against a fake remover without touching docker.
-_remover: Callable[[str], None] = force_remove_container_sync
+_remover: Callable[..., None] = force_remove_container_sync
 
 
-def register_container_cleanup(name: str) -> Callable[[], None]:
+def register_container_cleanup(
+    name: str, *, timeout: float | None | _UnsetTimeout = _UNSET
+) -> Callable[[], None]:
     """Register ``name`` for force-removal at interpreter exit; returns an
-    unregister callback to call once the container is disposed normally."""
+    unregister callback to call once the container is disposed normally.
+
+    ``timeout`` is the wall-clock ceiling the ``atexit`` force-remove applies to
+    this container. Omitting it leaves the force-remove on its own default; the
+    container strategy passes the operator-resolved docker-management ceiling so
+    the backstop cannot wedge interpreter shutdown against a hung ``dockerd``
+    (spec 00066 criterion 5)."""
     global _atexit_installed
     with _registry_lock:
-        _registered.add(name)
+        _registered[name] = timeout
         if not _atexit_installed:
             atexit.register(_flush_cleanup_registry)
             _atexit_installed = True
 
     def _unregister() -> None:
         with _registry_lock:
-            _registered.discard(name)
+            _registered.pop(name, None)
 
     return _unregister
 
 
 def _flush_cleanup_registry() -> None:
     with _registry_lock:
-        names = list(_registered)
+        registered = list(_registered.items())
         _registered.clear()
-    for name in names:
+    for name, timeout in registered:
         try:
-            _remover(name)
+            if isinstance(timeout, _UnsetTimeout):
+                _remover(name)
+            else:
+                _remover(name, timeout=timeout)
         except Exception:  # noqa: BLE001 - cleanup is strictly best-effort
             pass
 

@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from flywheel_orchestrator import SubmitStrategy
 
 from flywheel_container._auth import API_KEY_ENV, OAUTH_TOKEN_ENV, ClaudeAuth
+from flywheel_container._docker import DEFAULT_MANAGEMENT_TIMEOUT
 from flywheel_container._submit import ClaudeCliAgent, ContainerSubmitStrategy
 
 _DEFAULT_TOKEN_ENV: dict[str, str] = {
@@ -64,10 +65,16 @@ def build_container_strategy(
     egress_network: str | None = None,
     auth: ClaudeAuth | None = None,
     env: Mapping[str, str] | None = None,
+    management_timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT,
 ) -> ContainerSubmitStrategy:
     """Wrap ``inner`` in a :class:`ContainerSubmitStrategy` from primitives.
 
     ``exec_timeout`` of ``0`` means unbounded (mapped to ``None``).
+
+    ``management_timeout`` is the wall-clock ceiling for docker *management*
+    calls; it defaults to the module constant so library callers stay
+    byte-identical, while the worktree wiring supplies the policy-resolved
+    ``[deadlines] docker_management_seconds`` value.
     """
     return ContainerSubmitStrategy(
         inner,
@@ -79,4 +86,5 @@ def build_container_strategy(
         allow_hosts=allow_hosts,
         egress_network=egress_network or None,
         exec_timeout=exec_timeout or None,
+        management_timeout=management_timeout,
     )

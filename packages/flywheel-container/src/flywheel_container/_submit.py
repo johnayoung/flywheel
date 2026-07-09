@@ -15,6 +15,7 @@ only plain ``flywheel_core`` types and the orchestrator seam.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import shlex
 import uuid
@@ -38,6 +39,7 @@ from flywheel_container import _docker
 from flywheel_container._auth import ClaudeAuth
 from flywheel_container._docker import (
     DEFAULT_AGENT_HOME,
+    DEFAULT_MANAGEMENT_TIMEOUT,
     DEFAULT_WORKDIR,
     ExecResult,
     VolumeMount,
@@ -119,6 +121,7 @@ class ContainerSubmitStrategy:
         cpus: float | None = None,
         workdir: str = DEFAULT_WORKDIR,
         exec_timeout: float | None = None,
+        management_timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT,
         preflight: bool = True,
         runtime: ContainerRuntime | None = None,
     ) -> None:
@@ -149,8 +152,28 @@ class ContainerSubmitStrategy:
         self._cpus = cpus
         self._workdir = workdir
         self._exec_timeout = exec_timeout
+        self._management_timeout = management_timeout
         self._preflight = preflight
-        self._runtime = runtime or ContainerRuntime()
+        # The default runtime binds the resolved docker-management ceiling into
+        # every management call the strategy issues -- container teardown, the
+        # internal-network ensure, and the atexit force-remove backstop -- so an
+        # operator [deadlines] override reaches them all, not just the inline
+        # check_image_uid preflight below. An injected runtime (tests) is used
+        # as-is; its call sites stay single-arg.
+        if runtime is not None:
+            self._runtime = runtime
+        else:
+            self._runtime = ContainerRuntime(
+                remove=functools.partial(
+                    _docker.remove_container, timeout=management_timeout
+                ),
+                ensure_internal_network=functools.partial(
+                    _docker.ensure_internal_network, timeout=management_timeout
+                ),
+                register_cleanup=functools.partial(
+                    _docker.register_container_cleanup, timeout=management_timeout
+                ),
+            )
 
     def prepare_sandbox(self, request: SandboxRequest) -> SandboxHandle:
         inner_result = self._inner.prepare_sandbox(request)
@@ -162,7 +185,9 @@ class ContainerSubmitStrategy:
         worktree = inner_handle.path
 
         if self._preflight:
-            _docker.check_image_uid(self._image, self._uid)
+            _docker.check_image_uid(
+                self._image, self._uid, timeout=self._management_timeout
+            )
 
         name = f"flywheel-{request.task_id}-{uuid.uuid4().hex[:8]}"
         mounts = (

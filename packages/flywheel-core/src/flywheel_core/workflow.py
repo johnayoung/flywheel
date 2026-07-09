@@ -634,6 +634,11 @@ def _make_claude_code_invoke(
             context_observer=request.context_observer,
             recovery_interrupt_event=request.recovery_interrupt_event,
             on_applied=request.on_command_applied,
+            checkpoint_nudge_seconds=request.checkpoint_nudge_seconds,
+            agent_iteration_ceiling_seconds=(
+                request.agent_iteration_ceiling_seconds
+            ),
+            checkpoint_progress_probe=request.checkpoint_progress_probe,
         )
 
     return _invoke

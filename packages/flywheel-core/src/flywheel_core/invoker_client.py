@@ -71,6 +71,24 @@ ENVELOPE_SALVAGE_PROMPT: str = (
 )
 
 
+# One-shot instruction the harness injects on the SAME live session when the
+# iteration's remaining wall time to the resolved AGENT_ITERATION ceiling drops
+# to the configured threshold AND an injected progress probe reports no new
+# committed progress since the iteration began. It is dispatched through the
+# same ``client.query`` surface an operator ``say`` uses, but is
+# harness-initiated -- it fabricates no operator control-command row. The text
+# asks the agent to checkpoint its work-in-progress NOW so nothing is lost when
+# the iteration is cancelled at the (unchanged) ceiling.
+CHECKPOINT_NUDGE_PROMPT: str = (
+    "You are close to this iteration's wall-clock time limit and no new commit "
+    "has landed yet. Stop what you are doing and commit your work-in-progress "
+    "NOW as one or more incremental checkpoint commits on the current task "
+    "branch, so no progress is lost if the iteration is cut off. Commit "
+    "whatever is on disk even if it is incomplete; you may keep working "
+    "afterward if time still allows."
+)
+
+
 # Default poll tick the watcher uses when the store has no pending row.
 # Short enough that an operator's CLI subcommand is applied with a
 # noticeable but bounded delay; long enough that idle iterations do not
@@ -107,6 +125,13 @@ EVENT_CONTROL_CLAIM_FAILED: str = "harness.control_command_claim_failed"
 EVENT_CONTROL_NOT_APPLICABLE: str = "harness.control_command_not_applicable"
 
 
+# Audit-event kind emitted the single time the checkpoint nudge fires on an
+# in-flight invocation. Distinct from the ``harness.control_command_*`` kinds so
+# the audit stream tells a harness-initiated checkpoint nudge apart from an
+# operator steering command -- the nudge is NOT an operator control-command row.
+EVENT_CHECKPOINT_NUDGE: str = "harness.checkpoint_nudge"
+
+
 AuditEmit = Callable[[str, Mapping[str, Any]], None]
 
 # Observer callback invoked once per watcher poll with the live client's
@@ -118,6 +143,16 @@ AuditEmit = Callable[[str, Mapping[str, Any]], None]
 # error is silently swallowed so the harness's accumulated
 # ``AssistantMessage.usage`` estimate remains the fallback.
 ContextUsageObserver = Callable[["ContextUsageResponse"], None]
+
+
+# Git-free progress probe for the checkpoint nudge (spec: checkpoint-nudge
+# injection). An OPTIONAL closure returning an opaque token; two equal tokens
+# mean "no new progress since the iteration began". The watcher captures a
+# baseline token at iteration start and compares it against a fresh reading when
+# the remaining wall time crosses the threshold. Core stays git-unaware -- the
+# probe is supplied from above (a git commit-count / tree-hash reader lives in
+# the wiring layer, not here) and any exception it raises is contained.
+ProgressProbe = Callable[[], object]
 
 
 class HarnessRecoveryRequested(Exception):
@@ -356,6 +391,21 @@ def _emit_safe(
         pass
 
 
+def _safe_probe(probe: ProgressProbe) -> tuple[bool, object]:
+    """Call the progress probe once, containing any exception it raises.
+
+    Returns ``(True, token)`` when the probe returned a token and
+    ``(False, None)`` when it raised. A raising probe never unwinds the
+    iteration: the caller treats a failed reading as "cannot determine
+    progress this poll" and skips the nudge rather than firing on stale or
+    absent information.
+    """
+    try:
+        return True, probe()
+    except Exception:  # noqa: BLE001 - contained; the nudge is skipped.
+        return False, None
+
+
 async def _read_context_usage(
     client: ClaudeSDKClient,
 ) -> ContextUsageResponse | None:
@@ -391,6 +441,9 @@ async def invoke_iteration_with_client(
     context_observer: ContextUsageObserver | None = None,
     recovery_interrupt_event: asyncio.Event | None = None,
     on_applied: Callable[[ControlCommandRecord], None] | None = None,
+    checkpoint_nudge_seconds: float | None = None,
+    agent_iteration_ceiling_seconds: float | None = None,
+    checkpoint_progress_probe: ProgressProbe | None = None,
 ) -> IterationResult:
     """Drive one iteration through :class:`ClaudeSDKClient` with a watcher.
 
@@ -443,10 +496,63 @@ async def invoke_iteration_with_client(
     the applied queue row. Guarded like ``audit_emit`` — a raising
     callback never breaks the drain. Failed dispatches and
     not-applicable verbs (``approve`` / ``reject``) never reach it.
+
+    Checkpoint-nudge seam (all three parameters off-by-default; existing
+    callers and tests are byte-for-byte unaffected when omitted):
+
+    - ``checkpoint_progress_probe``: a git-free closure returning an
+      opaque progress token. The watcher captures a baseline token at
+      iteration start; when the remaining wall time crosses the threshold
+      it re-reads the probe and treats an EQUAL token as "no new progress
+      since the iteration began". ``None`` (the default) leaves the nudge
+      fully dormant. A probe that raises -- at baseline capture or at
+      check time -- is contained (never unwinds the iteration) and simply
+      disarms/skips the nudge.
+    - ``checkpoint_nudge_seconds``: the remaining-wall-time threshold. A
+      ``None`` or ``<= 0`` value disables the nudge.
+    - ``agent_iteration_ceiling_seconds``: the resolved AGENT_ITERATION
+      wall-clock ceiling the remaining time is measured against. ``None``
+      (the operator opted the class out / unbounded) disables the nudge
+      -- with no deadline there is no remaining time to cross.
+
+    When armed, the watcher fires AT MOST ONCE per in-flight invocation:
+    the first poll where remaining wall time ``<= checkpoint_nudge_seconds``
+    AND the probe reports no new progress dispatches
+    :data:`CHECKPOINT_NUDGE_PROMPT` via :meth:`ClaudeSDKClient.query` -- the
+    same live-session surface an operator ``say`` uses -- and emits a single
+    :data:`EVENT_CHECKPOINT_NUDGE` audit event. The nudge does NOT move the
+    deadline: it fabricates no control-command row and the harness still
+    cancels the iteration at the original ceiling.
     """
     interrupt_flag: list[bool] = [False]
     recovery_requested: list[bool] = [False]
+    nudge_fired: list[bool] = [False]
     stop = asyncio.Event()
+
+    # Arm the checkpoint nudge only when all three inputs are present: a
+    # progress probe, a positive threshold, and a bounded ceiling. Capture
+    # the iteration-start baseline token now so a later equal reading proves
+    # the agent committed no new progress since the iteration began. A probe
+    # that raises while capturing the baseline leaves the nudge disarmed --
+    # contained, never unwinds the iteration. The narrowed non-None locals
+    # let the watcher's per-poll check stay type-clean.
+    nudge_probe: ProgressProbe | None = None
+    nudge_threshold: float | None = None
+    nudge_ceiling: float | None = None
+    nudge_baseline: object = None
+    if (
+        checkpoint_progress_probe is not None
+        and checkpoint_nudge_seconds is not None
+        and checkpoint_nudge_seconds > 0
+        and agent_iteration_ceiling_seconds is not None
+    ):
+        baseline_ok, baseline_token = _safe_probe(checkpoint_progress_probe)
+        if baseline_ok:
+            nudge_probe = checkpoint_progress_probe
+            nudge_threshold = checkpoint_nudge_seconds
+            nudge_ceiling = agent_iteration_ceiling_seconds
+            nudge_baseline = baseline_token
+    iteration_start = now()
 
     if client_factory is None:
         # Agent-driving default: import the SDK lazily so this module stays
@@ -567,6 +673,53 @@ async def invoke_iteration_with_client(
                     recovery_requested[0] = True
                     iteration_task.cancel()
                     return
+                if (
+                    nudge_probe is not None
+                    and nudge_ceiling is not None
+                    and nudge_threshold is not None
+                    and not nudge_fired[0]
+                ):
+                    # Checkpoint nudge: remaining wall time to the resolved
+                    # AGENT_ITERATION ceiling has dropped to the threshold.
+                    # Fire ONCE per in-flight invocation, and only when the
+                    # probe reports no new committed progress since the
+                    # iteration began (baseline token unchanged). A probe
+                    # that raises is contained and the nudge is skipped this
+                    # poll (the invocation is never unwound). The dispatch is
+                    # the same ``client.query`` surface an operator ``say``
+                    # uses -- harness-initiated, not an operator command row --
+                    # and it does NOT touch the deadline: the iteration is
+                    # still cancelled at the original ceiling by the harness's
+                    # ``run_with_deadline`` wrapper.
+                    elapsed = (now() - iteration_start).total_seconds()
+                    remaining = nudge_ceiling - elapsed
+                    if remaining <= nudge_threshold:
+                        probe_ok, token = _safe_probe(nudge_probe)
+                        if probe_ok and token == nudge_baseline:
+                            # Consume the one-shot before dispatch so a
+                            # raising query can never re-fire on a later poll.
+                            nudge_fired[0] = True
+                            try:
+                                await client.query(CHECKPOINT_NUDGE_PROMPT)
+                            except Exception:  # noqa: BLE001 - best-effort.
+                                # A failed inject must not abort the run;
+                                # mirrors the ``on_message`` persistence
+                                # contract. No event lands when the nudge did
+                                # not reach the session.
+                                pass
+                            else:
+                                if audit_emit is not None:
+                                    _emit_safe(
+                                        audit_emit,
+                                        EVENT_CHECKPOINT_NUDGE,
+                                        {
+                                            "ceiling_seconds": nudge_ceiling,
+                                            "threshold_seconds": (
+                                                nudge_threshold
+                                            ),
+                                            "remaining_seconds": remaining,
+                                        },
+                                    )
                 try:
                     await asyncio.wait_for(
                         stop.wait(), timeout=poll_interval
@@ -621,6 +774,7 @@ async def invoke_iteration_with_client(
 
 __all__ = [
     "AuditEmit",
+    "CHECKPOINT_NUDGE_PROMPT",
     "CONTROL_COMMAND_APPROVE",
     "CONTROL_COMMAND_INTERRUPT",
     "CONTROL_COMMAND_REJECT",
@@ -629,10 +783,12 @@ __all__ = [
     "ContextUsageObserver",
     "DEFAULT_CONTROL_POLL_INTERVAL",
     "ENVELOPE_SALVAGE_PROMPT",
+    "EVENT_CHECKPOINT_NUDGE",
     "EVENT_CONTROL_APPLIED",
     "EVENT_CONTROL_CLAIM_FAILED",
     "EVENT_CONTROL_FAILED",
     "EVENT_CONTROL_NOT_APPLICABLE",
     "HarnessRecoveryRequested",
+    "ProgressProbe",
     "invoke_iteration_with_client",
 ]

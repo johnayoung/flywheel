@@ -5690,6 +5690,187 @@ class TestHarnessAgentDeadline:
         )
 
 
+# --- Checkpoint-nudge threading (checkpoint-nudge injection) ---------------
+
+
+class TestHarnessCheckpointNudge:
+    """The harness threads its checkpoint-nudge knob, the resolved
+    AGENT_ITERATION ceiling, and its optional git-free progress probe onto
+    every working-agent ``InvocationRequest`` so a live-client invoker can
+    fire a single checkpoint-commit instruction near the deadline.
+
+    Core stays git-unaware: the probe is an opaque closure and the default
+    (``None`` probe) leaves the nudge dormant. The threading must resolve the
+    ceiling via ``deadlines.for_class`` so operator ``[deadlines]`` overrides
+    flow through, and it must never move the deadline.
+    """
+
+    def test_checkpoint_nudge_config_defaults(self) -> None:
+        # Default-on knob, default-off probe: a bare core run stays dormant.
+        config = HarnessConfig()
+        assert config.checkpoint_nudge_seconds == 300.0
+        assert config.checkpoint_progress_probe is None
+
+    def test_harness_threads_nudge_fields_onto_request(self) -> None:
+        # The resolved ceiling comes from deadlines.for_class(AGENT_ITERATION)
+        # (so a [deadlines] override flows through), the threshold from the
+        # config knob, and the probe object is passed by identity.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-nudge-thread")
+
+        def _probe() -> str:
+            return "tok"
+
+        config = HarnessConfig(
+            checkpoint_nudge_seconds=123.0,
+            checkpoint_progress_probe=_probe,
+            deadlines=DeadlineConfig(agent_iteration_seconds=777.0),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        calls = invoke.calls  # type: ignore[attr-defined]
+        assert len(calls) == 1
+        req = calls[0]
+        assert req.checkpoint_nudge_seconds == 123.0
+        assert req.agent_iteration_ceiling_seconds == 777.0
+        assert req.checkpoint_progress_probe is _probe
+
+    def test_harness_threads_defaults_dormant(self) -> None:
+        # Default config: the knob (300s) and the default-on ceiling (3600s)
+        # thread through, but the probe is None so the nudge is dormant.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-nudge-default")
+        config = HarnessConfig()
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        req = invoke.calls[0]  # type: ignore[attr-defined]
+        assert req.checkpoint_progress_probe is None
+        assert req.checkpoint_nudge_seconds == 300.0
+        assert req.agent_iteration_ceiling_seconds == 3600.0
+
+    def test_harness_threads_none_ceiling_when_agent_iteration_opted_out(
+        self,
+    ) -> None:
+        # An opted-out AGENT_ITERATION class (resolved ceiling None) threads
+        # a None ceiling, which disables the nudge downstream even with a
+        # probe present.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-nudge-optout")
+
+        def _probe() -> str:
+            return "tok"
+
+        config = HarnessConfig(
+            checkpoint_progress_probe=_probe,
+            deadlines=DeadlineConfig(agent_iteration_seconds=None),
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        req = invoke.calls[0]  # type: ignore[attr-defined]
+        assert req.agent_iteration_ceiling_seconds is None
+        assert req.checkpoint_progress_probe is _probe
+
+    def test_harness_nudge_config_does_not_move_the_deadline(self) -> None:
+        # Setting the nudge knob + probe must NOT extend or disable the
+        # agent-iteration deadline: a never-returning invoker is still
+        # cancelled at the ceiling and routed to the timeout-classified
+        # INTERNAL_ERROR path exactly as without the nudge config.
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(goal="g", graders=[])
+        lifecycle = Lifecycle(task_id="t1", run_id="run-nudge-deadline")
+
+        def _probe() -> str:
+            return "tok"
+
+        config = HarnessConfig(
+            max_retries=0,
+            checkpoint_nudge_seconds=0.01,
+            checkpoint_progress_probe=_probe,
+            deadlines=DeadlineConfig(agent_iteration_seconds=0.05),
+        )
+
+        async def never_returning_invoker(
+            request: InvocationRequest,
+        ) -> IterationResult:
+            # The nudge fields are present on the request but the deadline
+            # still owns cancellation.
+            assert request.checkpoint_progress_probe is _probe
+            assert request.agent_iteration_ceiling_seconds == 0.05
+            await asyncio.Future()
+            raise RuntimeError("unreachable")  # pragma: no cover
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=never_returning_invoker,
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.FAILED
+        attempt = outcome.attempts[0]
+        assert attempt.outcome == Outcome.INTERNAL_ERROR
+        assert "deadline" in attempt.error
+        events = sink.events(lifecycle.run_id)
+        deadline_events = [
+            e for e in events if e.kind == "harness.deadline_exceeded"
+        ]
+        assert len(deadline_events) == 1
+        assert deadline_events[0].payload["ceiling_seconds"] == 0.05
+
+
 # --- Context-recovery policy (spec 00018) ---------------------------------
 
 

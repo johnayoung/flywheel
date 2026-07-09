@@ -300,6 +300,22 @@ class InvocationRequest:
     commits; it swallows its own exceptions (an append failure retains
     the row and surfaces on stderr), so invokers do not need to wrap it.
     Invokers without a control plane leave it un-called.
+
+    ``checkpoint_nudge_seconds`` / ``agent_iteration_ceiling_seconds`` /
+    ``checkpoint_progress_probe`` are the checkpoint-nudge seam. The
+    harness threads its ``HarnessConfig.checkpoint_nudge_seconds`` knob,
+    the resolved ``DeadlineClass.AGENT_ITERATION`` ceiling, and its
+    optional git-free ``HarnessConfig.checkpoint_progress_probe`` closure
+    to an invoker backed by a live
+    :class:`claude_agent_sdk.ClaudeSDKClient`. That invoker fires a single
+    checkpoint-commit instruction on the live session -- the same
+    ``client.query`` surface an operator ``say`` uses -- when the
+    remaining wall time to the ceiling drops to the threshold AND the
+    probe reports no new progress. A ``None`` probe (the default) leaves
+    the nudge dormant; an unbounded ceiling (opted-out AGENT_ITERATION)
+    or a non-positive threshold also disables it. Invokers without a live
+    client (the plain ``query`` path, scripted test invokers) ignore
+    these fields.
     """
 
     prompt: str
@@ -310,6 +326,9 @@ class InvocationRequest:
     context_observer: Callable[[ContextUsageResponse], None] | None = None
     recovery_interrupt_event: asyncio.Event | None = None
     on_command_applied: Callable[[ControlCommandRecord], None] | None = None
+    checkpoint_nudge_seconds: float | None = None
+    agent_iteration_ceiling_seconds: float | None = None
+    checkpoint_progress_probe: Callable[[], object] | None = None
 
 
 InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]
@@ -478,6 +497,24 @@ class HarnessConfig:
     git-unaware: the orchestrator supplies the closure that calls the
     strategy's landability predicate, the harness only consults the opaque
     callback.
+
+    ``checkpoint_nudge_seconds`` is the remaining-wall-time threshold (seconds,
+    default ``300.0``) at which the harness injects a single checkpoint-commit
+    instruction onto the live agent session. The nudge fires when the remaining
+    wall time to the resolved ``DeadlineClass.AGENT_ITERATION`` ceiling drops to
+    this threshold AND ``checkpoint_progress_probe`` reports no new progress; it
+    is dispatched through the same live ``ClaudeSDKClient.query`` surface an
+    operator ``say`` uses and emits a distinct ``harness.checkpoint_nudge``
+    event. The nudge does NOT move the deadline -- the iteration is still
+    cancelled at the original ceiling. A value ``<= 0`` disables the nudge, as
+    does an unbounded (opted-out) AGENT_ITERATION ceiling.
+
+    ``checkpoint_progress_probe`` is the git-free, OPTIONAL closure the nudge
+    consults for progress. It returns an opaque token; the invoker captures a
+    baseline at iteration start and an equal token at nudge-check time means "no
+    new progress since the iteration began". ``None`` (the default) leaves the
+    nudge fully dormant so a bare core run is byte-for-byte unchanged. Core
+    gains zero git awareness: the concrete git probe is supplied from above.
     """
 
     max_retries: int = 0
@@ -502,6 +539,8 @@ class HarnessConfig:
     max_context_recoveries: int = 1
     recovery_summarizer_invoke: SummarizerInvoke | None = None
     landability_gate: Callable[[], str | None] | None = None
+    checkpoint_nudge_seconds: float = 300.0
+    checkpoint_progress_probe: Callable[[], object] | None = None
 
     def __post_init__(self) -> None:
         # Reject out-of-range ratio: must be in (0, 1]. Spec 00018
@@ -3102,6 +3141,11 @@ async def _invoke_with_watchdog(
         context_observer=request.context_observer,
         recovery_interrupt_event=request.recovery_interrupt_event,
         on_command_applied=request.on_command_applied,
+        checkpoint_nudge_seconds=request.checkpoint_nudge_seconds,
+        agent_iteration_ceiling_seconds=(
+            request.agent_iteration_ceiling_seconds
+        ),
+        checkpoint_progress_probe=request.checkpoint_progress_probe,
     )
 
     # Wrap the invoker call in a coroutine so asyncio.create_task gets a
@@ -3466,6 +3510,14 @@ async def _drive_iterations(
             latest_sdk_reading[0] = reading
             _check_context_thresholds()
 
+        # Resolve the AGENT_ITERATION wall-clock ceiling once here so it feeds
+        # BOTH the checkpoint-nudge seam on the request below AND the
+        # ``run_with_deadline`` wrapper further down. Reading it via
+        # ``deadlines.for_class`` keeps operator ``[deadlines]`` overrides
+        # (phase 14) flowing through; ``None`` is the opted-out unbounded case.
+        agent_ceiling = config.deadlines.for_class(
+            DeadlineClass.AGENT_ITERATION
+        )
         request = InvocationRequest(
             prompt=prompt,
             transcript_graders=transcript_graders,
@@ -3475,6 +3527,13 @@ async def _drive_iterations(
             context_observer=_context_observer,
             recovery_interrupt_event=recovery_interrupt_event,
             on_command_applied=_record_steering,
+            # Checkpoint-nudge seam: the invoker gates on the probe being
+            # present, the threshold positive, and the ceiling bounded, so
+            # passing the raw values leaves the nudge dormant under the
+            # default (``checkpoint_progress_probe is None``).
+            checkpoint_nudge_seconds=config.checkpoint_nudge_seconds,
+            agent_iteration_ceiling_seconds=agent_ceiling,
+            checkpoint_progress_probe=config.checkpoint_progress_probe,
         )
         # Hang watchdog gate (FR-3 / FR-5): when the threshold is unset or
         # non-positive the watchdog never starts and the call path is
@@ -3513,10 +3572,8 @@ async def _drive_iterations(
         # timeout-classified internal_error containment path (mirroring the
         # hang watchdog), distinct from an operator-driven cancellation. An
         # operator opts out per class with a ``0`` override (resolves to
-        # ``None``), restoring the unbounded await.
-        agent_ceiling = config.deadlines.for_class(
-            DeadlineClass.AGENT_ITERATION
-        )
+        # ``None``), restoring the unbounded await. ``agent_ceiling`` is
+        # resolved once above (it also feeds the checkpoint-nudge seam).
         # Transient rate-limit retry: a 429 / overload / ``rejected``
         # rate-limit iteration is an infrastructure fault that produced no
         # usable completion. Rather than spend the validation retry budget on

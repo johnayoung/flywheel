@@ -34,13 +34,16 @@ from flywheel_core.envelope import (
     MissingEnvelope,
     ValidEnvelope,
 )
+from flywheel_core.deadline import DeadlineExceeded, run_with_deadline
 from flywheel_core.invoker_client import (
+    CHECKPOINT_NUDGE_PROMPT,
     CONTROL_COMMAND_APPROVE,
     CONTROL_COMMAND_INTERRUPT,
     CONTROL_COMMAND_REJECT,
     CONTROL_COMMAND_SAY,
     CONTROL_COMMAND_SET_MODEL,
     ENVELOPE_SALVAGE_PROMPT,
+    EVENT_CHECKPOINT_NUDGE,
     EVENT_CONTROL_APPLIED,
     EVENT_CONTROL_CLAIM_FAILED,
     EVENT_CONTROL_FAILED,
@@ -1747,3 +1750,372 @@ class TestLostEnvelopeSalvage:
             assert client.receive_calls == 1
 
         asyncio.run(_run())
+
+
+class TestCheckpointNudge:
+    """The watcher injects a single checkpoint-commit instruction when the
+    remaining wall time to the resolved AGENT_ITERATION ceiling drops to the
+    threshold and an injected progress probe reports no new progress.
+
+    The nudge rides the same ``ClaudeSDKClient.query`` surface an operator
+    ``say`` uses, fires at most once per in-flight invocation, and never
+    fabricates an operator control-command row.
+    """
+
+    def test_checkpoint_nudge_injects_once_when_no_progress(self) -> None:
+        # threshold (5s) >= ceiling (1s): the nudge is eligible from the very
+        # first watcher check. Held past several poll intervals, the
+        # at-most-once flag must still yield exactly ONE injection (a
+        # fires-every-poll mutation would inject repeatedly).
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release_after_polls() -> None:
+                # Many poll_intervals (0.01s) elapse before release, so the
+                # watcher ticks past the threshold repeatedly.
+                await asyncio.sleep(0.08)
+                gate.set()
+
+            release = asyncio.create_task(_release_after_polls())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=1.0,
+                    checkpoint_progress_probe=lambda: "unchanged",
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        # Exactly one injection despite many polls past the threshold; it is
+        # the checkpoint-commit instruction, not an operator command.
+        assert client.injected == [CHECKPOINT_NUDGE_PROMPT]
+        assert "checkpoint" in CHECKPOINT_NUDGE_PROMPT.lower()
+        assert "commit" in CHECKPOINT_NUDGE_PROMPT.lower()
+        nudge_events = [
+            p for k, p in audit_log if k == EVENT_CHECKPOINT_NUDGE
+        ]
+        assert len(nudge_events) == 1
+        assert nudge_events[0]["ceiling_seconds"] == 1.0
+        assert nudge_events[0]["threshold_seconds"] == 5.0
+        assert "remaining_seconds" in nudge_events[0]
+        # The nudge is harness-initiated -- it does NOT masquerade as an
+        # applied operator control command.
+        assert all(k != EVENT_CONTROL_APPLIED for k, _ in audit_log)
+
+    def test_checkpoint_nudge_skipped_when_progress_reported(self) -> None:
+        # A probe whose token changes on every read means the agent keeps
+        # making progress: the nudge never fires even though the remaining
+        # time is under the threshold.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+        calls = {"n": 0}
+
+        def _probe() -> int:
+            calls["n"] += 1
+            # baseline reads 1; every subsequent check reads a fresh value,
+            # so token != baseline -> progress -> no nudge.
+            return calls["n"]
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.06)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=1.0,
+                    checkpoint_progress_probe=_probe,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+        # The probe was actually re-read on the checks (not just baseline).
+        assert calls["n"] >= 2
+
+    def test_checkpoint_nudge_dormant_when_ceiling_unbounded(self) -> None:
+        # AGENT_ITERATION opted out (resolved ceiling None): with no deadline
+        # there is no remaining time to cross, so the nudge never fires.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=None,
+                    checkpoint_progress_probe=lambda: "unchanged",
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+
+    def test_checkpoint_nudge_dormant_without_probe(self) -> None:
+        # No probe (the default): the nudge is fully dormant even when the
+        # threshold and ceiling would otherwise make it eligible.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=1.0,
+                    checkpoint_progress_probe=None,
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+
+    def test_checkpoint_nudge_not_fired_before_threshold(self) -> None:
+        # Large ceiling, tiny threshold: the remaining wall time never drops
+        # to the threshold in the test window, so the nudge does not fire.
+        # A mutation that ignores the threshold (fires whenever armed) would
+        # inject here.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=0.001,
+                    agent_iteration_ceiling_seconds=1000.0,
+                    checkpoint_progress_probe=lambda: "unchanged",
+                )
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+
+    def test_checkpoint_nudge_contained_when_probe_raises_at_check(
+        self,
+    ) -> None:
+        # Baseline read succeeds (armed), but every check-time probe read
+        # raises: the exception is contained (never unwinds the iteration)
+        # and the nudge is skipped.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+        calls = {"n": 0}
+
+        def _probe() -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "baseline"
+            raise RuntimeError("probe boom")
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.06)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=1.0,
+                    checkpoint_progress_probe=_probe,
+                )
+                # The iteration finished normally -- the raising probe did
+                # not unwind it.
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+        # The probe was re-read at check time (and raised).
+        assert calls["n"] >= 2
+
+    def test_checkpoint_nudge_disarmed_when_baseline_probe_raises(
+        self,
+    ) -> None:
+        # A probe that raises on the baseline read at iteration start leaves
+        # the nudge disarmed for the whole invocation -- contained, never
+        # unwinds the iteration.
+        envelope = _wrap_envelope('{"intent": "verify"}')
+        gate = asyncio.Event()
+        client = _FakeClient(
+            messages=[_assistant_text(envelope), _result()],
+            hold_until_event=gate,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+
+        def _probe() -> str:
+            raise RuntimeError("boom at baseline")
+
+        async def _run() -> None:
+            async def _release() -> None:
+                await asyncio.sleep(0.05)
+                gate.set()
+
+            release = asyncio.create_task(_release())
+            try:
+                result = await invoke_iteration_with_client(
+                    prompt="go",
+                    options=ClaudeAgentOptions(),
+                    control_store=store,
+                    run_id="run-1",
+                    audit_emit=emit,
+                    client_factory=_factory(client),
+                    poll_interval=0.01,
+                    checkpoint_nudge_seconds=5.0,
+                    agent_iteration_ceiling_seconds=1.0,
+                    checkpoint_progress_probe=_probe,
+                )
+                assert isinstance(result.envelope, ValidEnvelope)
+            finally:
+                await release
+
+        asyncio.run(_run())
+        assert client.injected == []
+        assert all(k != EVENT_CHECKPOINT_NUDGE for k, _ in audit_log)
+
+    def test_checkpoint_nudge_does_not_extend_outer_deadline(self) -> None:
+        # After a nudge fires, an OUTER run_with_deadline (exactly how the
+        # harness bounds the invocation) still cancels the invocation at the
+        # original ceiling: the nudge's client.query neither resets the
+        # deadline nor swallows the deadline cancel (a nudge-extends-deadline
+        # mutation would let the invocation outlast the ceiling).
+        never = asyncio.Event()  # never set -> the stream blocks forever
+        client = _FakeClient(
+            messages=[_assistant_text("blocked"), _result()],
+            hold_until_event=never,
+        )
+        store = InMemoryStore()
+        audit_log, emit = _make_audit()
+        ceiling = 0.3
+
+        async def _run() -> None:
+            with pytest.raises(DeadlineExceeded):
+                await run_with_deadline(
+                    invoke_iteration_with_client(
+                        prompt="go",
+                        options=ClaudeAgentOptions(),
+                        control_store=store,
+                        run_id="run-1",
+                        audit_emit=emit,
+                        client_factory=_factory(client),
+                        poll_interval=0.01,
+                        checkpoint_nudge_seconds=5.0,
+                        agent_iteration_ceiling_seconds=ceiling,
+                        checkpoint_progress_probe=lambda: "unchanged",
+                    ),
+                    ceiling,
+                )
+
+        asyncio.run(_run())
+        # The nudge fired exactly once before the deadline cut the run off.
+        assert client.injected == [CHECKPOINT_NUDGE_PROMPT]
+        assert sum(
+            1 for k, _ in audit_log if k == EVENT_CHECKPOINT_NUDGE
+        ) == 1

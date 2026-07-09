@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -29,6 +29,7 @@ from flywheel_orchestrator import (
     ClaimStore,
     GraphSnapshotItem,
     InMemoryClaimStore,
+    SessionPauseRecord,
     SqliteClaimStore,
 )
 from flywheel_orchestrator._claims import (
@@ -1718,3 +1719,183 @@ def test_v4_postgres_store_opens_under_v5_with_rows_and_empty_snapshots(
         assert store.latest_graph_snapshot() is None
     finally:
         store.close()
+
+
+# --- session-limit-driven pool-wide claim pause (spec session-limit-claim-pause)
+#
+# Parametrized over memory / sqlite / postgres via the shared ``store`` fixture,
+# so all three backends prove identical pause semantics: a run that surfaces a
+# structural session-limit reset records a clamped ``pause_until`` behind the
+# claim-store seam, and while any row's horizon is in the future every driver
+# gates on ``session_pause_until``. ``_t`` only spans one wall-clock minute, so
+# the wide (6h) horizons here are built with explicit ``timedelta`` offsets from
+# ``_t(0)``.
+
+_CEILING = 21600.0  # 6h, the shipped [worker] default
+
+
+def test_record_session_pause_within_ceiling_returns_reset(
+    store: object,
+) -> None:
+    # A reset closer than the ceiling is the binding horizon: pause_until is the
+    # reset itself, and the gate returns it while ``now`` is still before it.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset = now + timedelta(hours=1)
+    horizon = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    assert horizon == reset
+    assert store.session_pause_until(now=now) == reset
+    assert store.session_pause_until(now=now + timedelta(minutes=30)) == reset
+
+
+def test_record_session_pause_clamps_far_future_reset_to_ceiling(
+    store: object,
+) -> None:
+    # A reset far beyond the ceiling is clamped to ``now + ceiling``: a
+    # far-future (or malformed) reset can never hold the pool off claiming for
+    # longer than the operator-configured ceiling -- an unbounded pause is
+    # unreachable.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset = now + timedelta(days=30)
+    expected = now + timedelta(seconds=_CEILING)
+    horizon = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    assert horizon == expected
+    assert store.session_pause_until(now=now) == expected
+
+
+def test_record_session_pause_past_reset_records_nothing(store: object) -> None:
+    # A reset already in the past never records a pause and never gates:
+    # ``pause_until`` would not be strictly after ``now``.
+    assert isinstance(store, ClaimStore)
+    now = _t(30)
+    reset = now - timedelta(hours=1)
+    horizon = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    assert horizon is None
+    assert store.session_pause_until(now=now) is None
+    assert store.list_session_pauses() == []
+
+
+def test_record_session_pause_ceiling_zero_disables(store: object) -> None:
+    # ceiling_seconds == 0 disables pausing entirely: nothing is recorded and
+    # the gate stays open -- today's behavior byte-for-byte.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset = now + timedelta(hours=1)
+    horizon = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=0.0, run_id="run-a"
+    )
+    assert horizon is None
+    assert store.session_pause_until(now=now) is None
+    assert store.list_session_pauses() == []
+
+
+def test_session_pause_until_none_when_no_pauses(store: object) -> None:
+    # A store that never observed a session limit never gates.
+    assert isinstance(store, ClaimStore)
+    assert store.session_pause_until(now=_t(0)) is None
+
+
+def test_session_pause_until_expires_once_now_passes_horizon(
+    store: object,
+) -> None:
+    # The pause lifts on its own: the gate returns the horizon while it is in
+    # the future and ``None`` once ``now`` reaches or passes it.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset = now + timedelta(hours=1)
+    store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    assert store.session_pause_until(now=reset - timedelta(seconds=1)) == reset
+    assert store.session_pause_until(now=reset) is None
+    assert store.session_pause_until(now=reset + timedelta(hours=1)) is None
+
+
+def test_record_session_pause_idempotent_no_accumulation(store: object) -> None:
+    # Recording the same reset twice does not push the horizon out: each row is
+    # individually clamped, so the high-water gate returns exactly that reset,
+    # never the sum. Both observations are still preserved as distinct rows.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset = now + timedelta(hours=1)
+    first = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    second = store.record_session_pause(
+        reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-b"
+    )
+    assert first == reset
+    assert second == reset
+    assert store.session_pause_until(now=now) == reset
+    assert len(store.list_session_pauses()) == 2
+
+
+def test_session_pause_until_returns_high_water_over_rows(store: object) -> None:
+    # With several live pauses the gate returns the latest horizon, so the pool
+    # stays paused until every observed reset has passed.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    near = now + timedelta(hours=1)
+    far = now + timedelta(hours=2)
+    store.record_session_pause(
+        reset_at=near, now=now, ceiling_seconds=_CEILING, run_id="run-near"
+    )
+    store.record_session_pause(
+        reset_at=far, now=now, ceiling_seconds=_CEILING, run_id="run-far"
+    )
+    assert store.session_pause_until(now=now) == far
+    # Once the far horizon passes, no live row remains.
+    assert store.session_pause_until(now=far) is None
+
+
+def test_list_session_pauses_streams_in_insertion_order(store: object) -> None:
+    # The append-only ledger enumerates every observation in id order, carrying
+    # the run id, the structural reset, the clamped horizon, and the injected
+    # observation time -- the operator-visible record.
+    assert isinstance(store, ClaimStore)
+    now = _t(0)
+    reset_a = now + timedelta(hours=1)
+    reset_b = now + timedelta(days=30)  # clamped
+    clamped_b = now + timedelta(seconds=_CEILING)
+    store.record_session_pause(
+        reset_at=reset_a, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+    )
+    store.record_session_pause(
+        reset_at=reset_b, now=now, ceiling_seconds=_CEILING, run_id="run-b"
+    )
+    records = store.list_session_pauses()
+    assert [type(r) for r in records] == [SessionPauseRecord, SessionPauseRecord]
+    assert [r.run_id for r in records] == ["run-a", "run-b"]
+    assert [r.reset_at for r in records] == [reset_a, reset_b]
+    assert [r.pause_until for r in records] == [reset_a, clamped_b]
+    assert [r.recorded_at for r in records] == [now, now]
+    assert records[0].id < records[1].id
+
+
+def test_session_pause_survives_reopen_sqlite(tmp_path: Path) -> None:
+    # Cross-process durability: a pause recorded by one SQLite handle is visible
+    # to a second handle opened on the same file -- the pool-wide contract the
+    # in-memory backend cannot itself prove.
+    db_path = tmp_path / "claims.db"
+    now = _t(0)
+    reset = now + timedelta(hours=1)
+    writer = SqliteClaimStore(db_path)
+    try:
+        writer.record_session_pause(
+            reset_at=reset, now=now, ceiling_seconds=_CEILING, run_id="run-a"
+        )
+    finally:
+        writer.close()
+    reader = SqliteClaimStore(db_path)
+    try:
+        assert reader.session_pause_until(now=now) == reset
+        assert [r.run_id for r in reader.list_session_pauses()] == ["run-a"]
+    finally:
+        reader.close()

@@ -86,6 +86,7 @@ from flywheel_core.events import (
 )
 from flywheel_orchestrator import (
     DEFAULT_LANDING_REDRIVE_BOUND,
+    DEFAULT_SESSION_PAUSE_CEILING_SECONDS,
     DEFAULT_SWEEP_SECONDS,
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
@@ -2382,6 +2383,11 @@ def run_once(
             reconcile_seconds=reconcile_seconds,
             sweep_seconds=sweep_seconds,
             landing_redrive_bound=landing_redrive_bound,
+            session_pause_ceiling_seconds=(
+                policy.worker_session_pause_ceiling_seconds
+                if policy is not None
+                else DEFAULT_SESSION_PAUSE_CEILING_SECONDS
+            ),
             strategy=strategy if strategy is not None else submitter,
             stream=stream,
             repo_root=submitter.repo_root,

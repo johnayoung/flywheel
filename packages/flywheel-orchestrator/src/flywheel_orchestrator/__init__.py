@@ -83,6 +83,7 @@ from flywheel_orchestrator._claims import (
     InMemoryClaimStore,
     OrchestratorEventRecord,
     OrchestratorStopEventRecord,
+    SessionPauseRecord,
     SourceSyncRecord,
     SqliteClaimStore,
     TaskClaim,
@@ -157,6 +158,7 @@ from flywheel_orchestrator._github_ci import GithubCiWorkSource
 from flywheel_orchestrator._github_review import GithubReviewWorkSource
 from flywheel_orchestrator._policy import (
     DEFAULT_POLICY_FILENAME,
+    DEFAULT_SESSION_PAUSE_CEILING_SECONDS,
     DEFAULT_WORKER_CONCURRENCY,
     PolicyError,
     WorkPolicy,
@@ -312,6 +314,7 @@ __all__ = [
     "HumanReviewQueueEntry",
     "OrchestratorEventRecord",
     "OrchestratorStopEventRecord",
+    "SessionPauseRecord",
     "HistoryRow",
     "HistoryRun",
     "RunDetail",
@@ -324,6 +327,7 @@ __all__ = [
     "DEFAULT_RECONCILE_SECONDS",
     "DEFAULT_SWEEP_SECONDS",
     "DEFAULT_POLICY_FILENAME",
+    "DEFAULT_SESSION_PAUSE_CEILING_SECONDS",
     "DEFAULT_WORKER_CONCURRENCY",
     "DirectoryWorkSource",
     "EscalationDriver",

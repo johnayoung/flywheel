@@ -2170,6 +2170,7 @@ async def orchestrate(
     sweep_seconds: float | None = None,
     landing_redrive_bound: int | None = None,
     prereq_redrive_bound: int = DEFAULT_PREREQ_REDRIVE_BOUND,
+    session_pause_ceiling_seconds: float = 0.0,
     repo_root: Path | None = None,
     held_out_source: HeldOutGraderSource | None = None,
     progress_probe_factory: Callable[[Path], Callable[[], object]]
@@ -2283,6 +2284,20 @@ async def orchestrate(
     every library caller and the container backend) leaves the nudge dormant.
     The threshold itself rides ``policy`` (``[worker]
     checkpoint_nudge_seconds``), not this parameter.
+
+    ``session_pause_ceiling_seconds`` enables the session-limit-driven pool-wide
+    claim pause (spec session-limit-claim-pause). When a run surfaces a
+    structural session-limit reset (the harness's
+    :attr:`~flywheel_core.harness.HarnessOutcome.session_limit_reset`, never
+    parsed from an error string), a pause is recorded behind the claim-store
+    seam with ``pause_until = min(reset, now + ceiling)``; while that horizon is
+    in the future, EVERY driver against the same claim store declines fresh and
+    resume claims (bookkeeping -- lease sweeps, reconcile, redrives, snapshots --
+    is unaffected), and claiming resumes once it passes. ``0`` (the default for
+    library callers) disables pausing entirely, byte-for-byte today's behavior;
+    the worker threads the ``[worker] session_pause_ceiling_seconds`` policy
+    value (default 21600.0 = 6h). A run with no derived reset never records a
+    pause, so an unbounded pause is unreachable.
 
     ``held_out_source`` enables the execute-time held-out landing gate (spec
     00050): after a task's run finalizes with the landing status (``DONE``) and
@@ -2579,12 +2594,42 @@ async def orchestrate(
                 captured_at=clock(),
             )
 
+            # Session-limit-driven pool-wide claim pause (spec
+            # session-limit-claim-pause). Read the high-water pause horizon
+            # recorded by any run (this driver's or a peer's) that surfaced a
+            # structural session-limit reset. While it is in the future EVERY
+            # driver against this store declines fresh (section 2) and resume
+            # (section 1) claims -- the two agent-dispatching acquires below are
+            # the only ones gated. Bookkeeping (approval resolve, landing
+            # redrive, prereq/human-gate routing, the snapshot above, and the
+            # background sweeper/reconciler) is deliberately NOT gated, so
+            # record-keeping runs exactly as today while claiming is paused. The
+            # whole read is behind ``ceiling > 0`` so a disabled pause is the
+            # byte-for-byte-unchanged code path (no ledger read at all).
+            claim_pause_until: datetime | None = None
+            if session_pause_ceiling_seconds > 0:
+                claim_pause_until = claims.session_pause_until(now=clock())
+                if claim_pause_until is not None and stream is not None:
+                    print(
+                        f"[orchestrate] session-limit pause active until "
+                        f"{claim_pause_until.isoformat()}; declining fresh and "
+                        f"resume claims this pass",
+                        file=stream,
+                        flush=True,
+                    )
+
             # 1. Reactive unblock + resume, claim-gated so only one worker
             #    handles a given blocked task. The first that unblocks is
             #    resumed on its own run_id; we then restart so the changed
             #    state is re-read.
             progressed = False
             for row in rows:
+                # Session-limit pause: decline every resume claim pool-wide
+                # while the horizon is in the future. Bookkeeping sections 1b/1c
+                # below still run this pass; the gate lifts on a later pass once
+                # the horizon passes.
+                if claim_pause_until is not None:
+                    break
                 if not _is_blocked_interrupted(row):
                     continue
                 run_id = row.latest_run_id
@@ -2672,6 +2717,9 @@ async def orchestrate(
                         model=model,
                         max_turns=max_turns,
                         max_retries=max_retries,
+                        session_pause_ceiling_seconds=(
+                            session_pause_ceiling_seconds
+                        ),
                         **drive_primitives,
                         **limit_primitives,
                         **budget_primitives,
@@ -2855,6 +2903,13 @@ async def orchestrate(
             held: set[str] = set()
             ran_fresh = False
             while True:
+                # Session-limit pause: decline every fresh claim pool-wide while
+                # the horizon is in the future, so no new run is dispatched
+                # against a session-limited store. Falls through to the final
+                # break, quiescing this driver; the next orchestrate pass
+                # re-reads the horizon and resumes once it passes.
+                if claim_pause_until is not None:
+                    break
                 exclude = attempted_fresh | blocked_ids | held
                 # Highest-priority-first over the validated graph: ready_set
                 # returns every runnable item (own state eligible, all
@@ -2997,6 +3052,7 @@ async def orchestrate(
                     model=model,
                     max_turns=max_turns,
                     max_retries=max_retries,
+                    session_pause_ceiling_seconds=session_pause_ceiling_seconds,
                     **drive_primitives,
                     **limit_primitives,
                     **budget_primitives,
@@ -3358,6 +3414,7 @@ async def _drive_under_lease(
     deadlines: DeadlineConfig | None,
     rubric_judge_max_turns: int | None,
     checkpoint_nudge_seconds: float,
+    session_pause_ceiling_seconds: float,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -3485,6 +3542,33 @@ async def _drive_under_lease(
             checkpoint_nudge_seconds=checkpoint_nudge_seconds,
             checkpoint_progress_probe=checkpoint_progress_probe,
         )
+        # Session-limit-driven pool-wide claim pause (spec
+        # session-limit-claim-pause). When THIS run surfaced a structural
+        # session-limit reset via the harness's HarnessOutcome (never parsed
+        # from an error string), record a pause behind the claim-store seam so
+        # every driver against this store declines fresh/resume claims until the
+        # reset -- clamped to at most ``session_pause_ceiling_seconds`` ahead.
+        # The store no-ops when the ceiling is non-positive (pausing disabled)
+        # or the reset is already in the past, so an unbounded pause is
+        # unreachable and a run with no derived reset never records one.
+        # Recorded before the claim-loss check below so the pool-wide fact
+        # survives even if a peer stole this lease mid-run; audit-only, it
+        # changes nothing about this run's finalize/land/report path.
+        if outcome.session_limit_reset is not None:
+            paused_until = claims.record_session_pause(
+                reset_at=outcome.session_limit_reset,
+                now=now(),
+                ceiling_seconds=session_pause_ceiling_seconds,
+                run_id=outcome.lifecycle.run_id,
+            )
+            if paused_until is not None and stream is not None:
+                print(
+                    f"[orchestrate] {task_id}: session limit reached (reset "
+                    f"{outcome.session_limit_reset.isoformat()}); pausing "
+                    f"pool-wide claiming until {paused_until.isoformat()}",
+                    file=stream,
+                    flush=True,
+                )
         # A sustained heartbeat stall can let a peer's lease sweep steal this
         # claim and finalize the lifecycle out from under us while the run was
         # in flight. If renewal observed that loss, stop here: do NOT land or

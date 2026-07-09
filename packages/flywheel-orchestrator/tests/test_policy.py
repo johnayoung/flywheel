@@ -11,6 +11,7 @@ import flywheel_orchestrator._github as _github_mod
 from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.task import CommandGrader, TranscriptGrader
 from flywheel_orchestrator import (
+    DEFAULT_SESSION_PAUSE_CEILING_SECONDS,
     DEFAULT_TASKS_DIR,
     DirectoryWorkSource,
     GithubWorkSource,
@@ -1529,6 +1530,122 @@ def test_worker_checkpoint_nudge_carries_on_github_policy(
     )
     assert policy.source_kind == "github"
     assert policy.worker_checkpoint_nudge_seconds == 42.0
+
+
+# --- [worker] session_pause_ceiling_seconds (session-limit-claim-pause) ------
+
+
+def test_worker_session_pause_ceiling_defaults_when_table_absent(
+    tmp_path: Path,
+) -> None:
+    """No [worker] table yields the default-on 21600.0 (6h) ceiling: a
+    session-limited run pauses pool-wide claiming until the reset, bounded to at
+    most 6h."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert (
+        policy.worker_session_pause_ceiling_seconds
+        == DEFAULT_SESSION_PAUSE_CEILING_SECONDS
+        == 21600.0
+    )
+
+
+def test_worker_session_pause_ceiling_defaults_when_key_absent(
+    tmp_path: Path,
+) -> None:
+    """A [worker] table present but no session_pause_ceiling_seconds key yields
+    the default 21600.0."""
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\n[worker]\n')
+    )
+    assert policy.worker_session_pause_ceiling_seconds == 21600.0
+
+
+def test_worker_session_pause_ceiling_parses_float(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\nsession_pause_ceiling_seconds = 900.5\n",
+        )
+    )
+    assert policy.worker_session_pause_ceiling_seconds == 900.5
+
+
+def test_worker_session_pause_ceiling_accepts_integer(tmp_path: Path) -> None:
+    """A TOML integer coerces to float (10800 -> 10800.0)."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\nsession_pause_ceiling_seconds = 10800\n",
+        )
+    )
+    assert policy.worker_session_pause_ceiling_seconds == 10800.0
+
+
+def test_worker_session_pause_ceiling_zero_disables(tmp_path: Path) -> None:
+    """``0`` flows through as 0.0 (not the default): pausing is disabled
+    entirely -- today's behavior byte-for-byte."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\nsession_pause_ceiling_seconds = 0\n",
+        )
+    )
+    assert policy.worker_session_pause_ceiling_seconds == 0.0
+
+
+def test_worker_session_pause_ceiling_rejects_non_number(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="worker.session_pause_ceiling_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[worker]\nsession_pause_ceiling_seconds = "6h"\n',
+            )
+        )
+
+
+def test_worker_session_pause_ceiling_rejects_boolean(tmp_path: Path) -> None:
+    """A TOML boolean is rejected (bool is an int subclass; ``= true`` is a
+    typo, never 1.0)."""
+    with pytest.raises(
+        PolicyError, match="worker.session_pause_ceiling_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[worker]\nsession_pause_ceiling_seconds = true\n",
+            )
+        )
+
+
+def test_worker_session_pause_ceiling_carries_on_github_policy(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[worker]",
+                    "session_pause_ceiling_seconds = 7200.0",
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.worker_session_pause_ceiling_seconds == 7200.0
 
 
 # --- attempt budgets: [deadlines] + rubric_judge_max_turns (spec 00066) ------

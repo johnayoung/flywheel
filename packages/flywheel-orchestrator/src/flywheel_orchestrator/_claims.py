@@ -89,7 +89,18 @@ if TYPE_CHECKING:
 # gains the column via ``ALTER TABLE ADD COLUMN`` (default ``''``, so every
 # surviving stop row keeps its data) and converges its sentinel forward; no new
 # silo table, no drop-and-recreate, no hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 7
+#
+# v8 adds the additive append-only ``orchestrator_session_pauses`` ledger (spec
+# session-limit-claim-pause): one immutable row per observed session-limited run
+# whose derived reset is still in the future, recording the ``reset_at`` that
+# caused it and the clamped ``pause_until`` (= ``min(reset_at, now + ceiling)``).
+# While any row's ``pause_until`` is in the future, every driver against the
+# store declines fresh and resume claims pool-wide; claiming resumes once the
+# high-water ``pause_until`` passes. The bump is additive -- ``CREATE TABLE IF
+# NOT EXISTS`` materializes the table on open, so a pre-existing v1..v7 store
+# keeps every existing row and simply gains an empty pause ledger; the sentinel
+# converges forward, no drop-and-recreate, no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 8
 
 # The five event types the ledger records, one per committed ``task_claims``
 # insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
@@ -420,6 +431,31 @@ class OrchestratorStopEventRecord:
 
 
 @dataclass(frozen=True, kw_only=True)
+class SessionPauseRecord:
+    """One immutable ``orchestrator_session_pauses`` row -- an observed
+    session-limited run whose derived reset was still in the future when seen
+    (spec session-limit-claim-pause).
+
+    Append-only, never updated or deleted, and never deduped: one row per
+    observation, so an operator can see every run that contributed a pause.
+    ``id`` is the monotonic, backend-assigned insertion id. ``run_id`` is the
+    run whose :class:`~flywheel_core.harness.HarnessOutcome` surfaced the reset
+    (``''`` when the caller has no run id to attribute). ``reset_at`` is the
+    structural session-limit reset (never parsed from an error string);
+    ``pause_until`` is the clamped effective pause horizon
+    (``min(reset_at, recorded_at + ceiling)``) -- the value drivers gate on.
+    ``recorded_at`` is the injected observation time -- never a wall clock, so
+    the ledger is deterministic and testable.
+    """
+
+    id: int
+    run_id: str
+    reset_at: datetime
+    pause_until: datetime
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, kw_only=True)
 class HumanReviewQueueEntry:
     """One entry in the single visible human-review queue (spec 00069).
 
@@ -557,9 +593,26 @@ class ClaimStore(Protocol):
       and owned. Returns the released task ids. ``acquire_claim`` /
       ``renew_claim`` / ``release_claim`` semantics for non-lapsed claims are
       unchanged (the sweep only drops already-lapsed rows).
+    * ``record_session_pause`` records a pool-wide claim pause when a run
+      surfaces a structural session-limit reset (spec session-limit-claim-pause).
+      It appends one ledger row with ``pause_until = min(reset_at, now +
+      ceiling_seconds)`` and returns that horizon. It records nothing and returns
+      ``None`` when ``ceiling_seconds <= 0`` (pausing disabled) or when the
+      clamped horizon is not strictly after ``now`` (a reset already in the past
+      never creates a pause, so an unbounded pause is unreachable). Never
+      dedupes -- one row per observation.
+    * ``session_pause_until`` returns the high-water ``pause_until`` over every
+      row still in the future at ``now`` (``pause_until > now``), or ``None``
+      when none remain. While it returns a value, no driver acquires a fresh or
+      resume claim; the pause lifts on its own once every row's horizon passes.
+      Each row is individually clamped to its own ``min(reset, now + ceiling)``,
+      so the maximum can never exceed the latest such horizon -- recording the
+      same reset twice is idempotent and never accumulates.
+    * ``list_session_pauses`` enumerates every recorded pause row in id order for
+      operator surfaces.
 
-    ``now`` is injected (not read from a clock) so lease expiry is
-    deterministic and testable.
+    ``now`` is injected (not read from a clock) so lease expiry and pause
+    horizons are deterministic and testable.
     """
 
     def acquire_claim(
@@ -587,6 +640,19 @@ class ClaimStore(Protocol):
     def list_claims(self) -> list[TaskClaim]: ...
 
     def sweep_expired_claims(self, *, now: datetime) -> list[str]: ...
+
+    def record_session_pause(
+        self,
+        *,
+        reset_at: datetime,
+        now: datetime,
+        ceiling_seconds: float,
+        run_id: str = "",
+    ) -> datetime | None: ...
+
+    def session_pause_until(self, *, now: datetime) -> datetime | None: ...
+
+    def list_session_pauses(self) -> list[SessionPauseRecord]: ...
 
 
 def _iso(ts: datetime) -> str:
@@ -679,6 +745,16 @@ def _row_to_orchestrator_stop_event_record(
     )
 
 
+def _row_to_session_pause_record(row: sqlite3.Row) -> SessionPauseRecord:
+    return SessionPauseRecord(
+        id=int(row["id"]),
+        run_id=row["run_id"],
+        reset_at=_parse_iso(row["reset_at"]),
+        pause_until=_parse_iso(row["pause_until"]),
+        recorded_at=_parse_iso(row["recorded_at"]),
+    )
+
+
 def _row_to_human_review_entry(row: sqlite3.Row) -> HumanReviewQueueEntry:
     return HumanReviewQueueEntry(
         id=int(row["id"]),
@@ -764,6 +840,7 @@ class InMemoryClaimStore:
         self._conflict_keys: dict[str, frozenset[str]] = {}
         self._events: list[OrchestratorEventRecord] = []
         self._stop_events: list[OrchestratorStopEventRecord] = []
+        self._session_pauses: list[SessionPauseRecord] = []
         self._snapshots: list[GraphSnapshotRecord] = []
         self._snapshot_items: dict[int, list[GraphSnapshotItem]] = {}
 
@@ -1037,6 +1114,46 @@ class InMemoryClaimStore:
         # Per-subject timeline: one subject's stops in id order.
         return [e for e in self._stop_events if e.subject == subject]
 
+    def record_session_pause(
+        self,
+        *,
+        reset_at: datetime,
+        now: datetime,
+        ceiling_seconds: float,
+        run_id: str = "",
+    ) -> datetime | None:
+        # Clamp the horizon so a far-future (or malicious) reset can never
+        # exceed now + ceiling, and a reset already in the past never records a
+        # pause -- the unbounded-pause failure mode is unreachable. Disabled
+        # entirely when the ceiling is non-positive.
+        if ceiling_seconds <= 0:
+            return None
+        pause_until = min(reset_at, now + timedelta(seconds=ceiling_seconds))
+        if pause_until <= now:
+            return None
+        self._session_pauses.append(
+            SessionPauseRecord(
+                id=len(self._session_pauses) + 1,
+                run_id=run_id,
+                reset_at=reset_at,
+                pause_until=pause_until,
+                recorded_at=now,
+            )
+        )
+        return pause_until
+
+    def session_pause_until(self, *, now: datetime) -> datetime | None:
+        # High-water horizon over rows still in the future. Each row is
+        # individually clamped, so the max never exceeds the latest
+        # min(reset, recorded_at + ceiling); recording the same reset twice is
+        # idempotent.
+        live = [p.pause_until for p in self._session_pauses if p.pause_until > now]
+        return max(live) if live else None
+
+    def list_session_pauses(self) -> list[SessionPauseRecord]:
+        # Global stream: every recorded pause in id (insertion) order.
+        return list(self._session_pauses)
+
     def record_human_review(
         self,
         *,
@@ -1232,6 +1349,17 @@ CREATE TABLE IF NOT EXISTS graph_snapshot_items (
 
 CREATE INDEX IF NOT EXISTS idx_graph_snapshot_items_snapshot
   ON graph_snapshot_items (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id      TEXT NOT NULL DEFAULT '',
+  reset_at    TEXT NOT NULL,
+  pause_until TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
+  ON orchestrator_session_pauses (pause_until);
 """
 
 
@@ -1309,16 +1437,17 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1..v6 -> v7: the WorkGraph tables (v2),
+        # Additive forward migration v1..v7 -> v8: the WorkGraph tables (v2),
         # the conflict-keys column (v3), the orchestrator_events ledger (v4),
         # the graph_snapshots/graph_snapshot_items tables (v5), the
-        # orchestrator_stop_events ledger (v6), and its run_id column (v7) were
-        # all materialized above (CREATE TABLE IF NOT EXISTS plus the additive
-        # ALTERs), so a pre-existing store keeps its
+        # orchestrator_stop_events ledger (v6), its run_id column (v7), and the
+        # orchestrator_session_pauses ledger (v8) were all materialized above
+        # (CREATE TABLE IF NOT EXISTS plus the additive ALTERs), so a
+        # pre-existing store keeps its
         # task_claims/work_items/source_syncs/orchestrator_events/snapshot/stop
-        # rows intact and simply gains the run_id column. Converge the sentinel
-        # forward rather than refusing the store; a newer-than-current version
-        # still trips the mismatch guard below.
+        # rows intact and simply gains the empty pause ledger. Converge the
+        # sentinel forward rather than refusing the store; a newer-than-current
+        # version still trips the mismatch guard below.
         if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
                 "UPDATE orchestrator_schema_version SET version = ? "
@@ -1730,6 +1859,54 @@ class SqliteClaimStore:
         ).fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
 
+    # -- session-pause ledger (schema v8) ----------------------------------
+
+    def record_session_pause(
+        self,
+        *,
+        reset_at: datetime,
+        now: datetime,
+        ceiling_seconds: float,
+        run_id: str = "",
+    ) -> datetime | None:
+        # Clamp the horizon so a far-future reset can never exceed now +
+        # ceiling, and a reset already in the past never records a pause -- the
+        # unbounded-pause failure mode is unreachable. Disabled entirely when the
+        # ceiling is non-positive. Append-only, never deduped.
+        if ceiling_seconds <= 0:
+            return None
+        pause_until = min(reset_at, now + timedelta(seconds=ceiling_seconds))
+        if pause_until <= now:
+            return None
+        with self._transaction():
+            self._connection.execute(
+                "INSERT INTO orchestrator_session_pauses (run_id, reset_at, "
+                "pause_until, recorded_at) VALUES (?, ?, ?, ?)",
+                (run_id, _iso(reset_at), _iso(pause_until), _iso(now)),
+            )
+        return pause_until
+
+    def session_pause_until(self, *, now: datetime) -> datetime | None:
+        # High-water horizon over rows still in the future. ISO-8601 aware-UTC
+        # timestamps sort lexically the same as chronologically, so MAX() over
+        # the text column is a valid horizon. Each row was individually clamped,
+        # so the max never exceeds the latest min(reset, recorded_at + ceiling).
+        row = self._connection.execute(
+            "SELECT MAX(pause_until) AS horizon "
+            "FROM orchestrator_session_pauses WHERE pause_until > ?",
+            (_iso(now),),
+        ).fetchone()
+        horizon = row["horizon"] if row is not None else None
+        return _parse_iso(horizon) if horizon is not None else None
+
+    def list_session_pauses(self) -> list[SessionPauseRecord]:
+        # Global stream: every recorded pause in id (insertion) order.
+        rows = self._connection.execute(
+            "SELECT id, run_id, reset_at, pause_until, recorded_at "
+            "FROM orchestrator_session_pauses ORDER BY id"
+        ).fetchall()
+        return [_row_to_session_pause_record(row) for row in rows]
+
     def record_human_review(
         self,
         *,
@@ -2105,6 +2282,7 @@ __all__ = [
     "OrchestratorEventRecord",
     "OrchestratorSchemaError",
     "OrchestratorStopEventRecord",
+    "SessionPauseRecord",
     "SourceSyncRecord",
     "StopEventStore",
     "TaskClaim",

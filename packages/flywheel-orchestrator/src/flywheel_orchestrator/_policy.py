@@ -178,6 +178,14 @@ DEFAULT_WORKER_CONCURRENCY: int = 1
 #: disables the nudge. Mirrors :attr:`flywheel_core.harness.HarnessConfig.checkpoint_nudge_seconds`.
 DEFAULT_CHECKPOINT_NUDGE_SECONDS: float = 300.0
 
+#: Default ceiling (seconds) clamping a session-limit-driven pool-wide claim
+#: pause when [worker] omits ``session_pause_ceiling_seconds`` (spec
+#: session-limit-claim-pause). 21600.0 (6h) bounds how long a single derived
+#: reset can hold the pool off claiming, so a far-future reset never yields an
+#: unbounded pause; ``0`` disables pausing entirely (today's behavior
+#: byte-for-byte).
+DEFAULT_SESSION_PAUSE_CEILING_SECONDS: float = 21600.0
+
 #: Default turn ceiling for the merge strategy's bounded conflict-resolution
 #: session when [submit] omits ``recovery_agent_max_turns``. ``0`` disables the
 #: rung entirely (a merge conflict parks exactly as merge-fallback does).
@@ -496,6 +504,9 @@ class WorkPolicy:
     execution_capabilities: frozenset[str] = frozenset()
     worker_concurrency: int = DEFAULT_WORKER_CONCURRENCY
     worker_checkpoint_nudge_seconds: float = DEFAULT_CHECKPOINT_NUDGE_SECONDS
+    worker_session_pause_ceiling_seconds: float = (
+        DEFAULT_SESSION_PAUSE_CEILING_SECONDS
+    )
     protected_paths: tuple[str, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
@@ -626,9 +637,11 @@ def load_policy(path: Path) -> WorkPolicy:
     worker = data.get("worker") or {}
     if not isinstance(worker, dict):
         raise PolicyError(f"{path}: [worker] must be a table")
-    worker_concurrency, worker_checkpoint_nudge_seconds = _optional_worker(
-        worker, policy_file=path
-    )
+    (
+        worker_concurrency,
+        worker_checkpoint_nudge_seconds,
+        worker_session_pause_ceiling_seconds,
+    ) = _optional_worker(worker, policy_file=path)
 
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
@@ -651,6 +664,9 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
             worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
+            worker_session_pause_ceiling_seconds=(
+                worker_session_pause_ceiling_seconds
+            ),
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -697,6 +713,9 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
             worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
+            worker_session_pause_ceiling_seconds=(
+                worker_session_pause_ceiling_seconds
+            ),
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -737,6 +756,9 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
             worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
+            worker_session_pause_ceiling_seconds=(
+                worker_session_pause_ceiling_seconds
+            ),
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -789,6 +811,9 @@ def load_policy(path: Path) -> WorkPolicy:
         execution_capabilities=execution_capabilities,
         worker_concurrency=worker_concurrency,
         worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
+        worker_session_pause_ceiling_seconds=(
+            worker_session_pause_ceiling_seconds
+        ),
         protected_paths=protected_paths,
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
@@ -1037,9 +1062,11 @@ def _optional_execution_capabilities(
     return frozenset(value)
 
 
-def _optional_worker(table: dict, *, policy_file: Path) -> tuple[int, float]:
+def _optional_worker(
+    table: dict, *, policy_file: Path
+) -> tuple[int, float, float]:
     """Validate the optional ``[worker]`` table, returning
-    ``(concurrency, checkpoint_nudge_seconds)``.
+    ``(concurrency, checkpoint_nudge_seconds, session_pause_ceiling_seconds)``.
 
     ``concurrency`` returns ``1`` (the :data:`DEFAULT_WORKER_CONCURRENCY`
     single-serial-worker default) when the section (or the ``concurrency`` key)
@@ -1059,6 +1086,14 @@ def _optional_worker(table: dict, *, policy_file: Path) -> tuple[int, float]:
     loss came from this nudge not existing, so it stays on by default. ``0``
     disables the nudge; a non-number raises :class:`PolicyError` naming
     ``worker.checkpoint_nudge_seconds``.
+
+    ``session_pause_ceiling_seconds`` returns
+    :data:`DEFAULT_SESSION_PAUSE_CEILING_SECONDS` (``21600.0`` = 6h, default-on)
+    when the section or the key is absent -- so a run that surfaces a
+    session-limit reset pauses pool-wide claiming until the reset, clamped to at
+    most this many seconds ahead. ``0`` disables pausing entirely (today's
+    behavior byte-for-byte); a non-number raises :class:`PolicyError` naming
+    ``worker.session_pause_ceiling_seconds``.
     """
     concurrency = _override_int(
         table,
@@ -1074,7 +1109,14 @@ def _optional_worker(table: dict, *, policy_file: Path) -> tuple[int, float]:
         path="worker.checkpoint_nudge_seconds",
         policy_file=policy_file,
     )
-    return concurrency, checkpoint_nudge_seconds
+    session_pause_ceiling_seconds = _override_float(
+        table,
+        "session_pause_ceiling_seconds",
+        DEFAULT_SESSION_PAUSE_CEILING_SECONDS,
+        path="worker.session_pause_ceiling_seconds",
+        policy_file=policy_file,
+    )
+    return concurrency, checkpoint_nudge_seconds, session_pause_ceiling_seconds
 
 
 def _optional_protected_paths(
@@ -1868,6 +1910,7 @@ def build_work_source(
 __all__ = [
     "DEFAULT_CHECKPOINT_NUDGE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
+    "DEFAULT_SESSION_PAUSE_CEILING_SECONDS",
     "DEFAULT_WORKER_CONCURRENCY",
     "PolicyError",
     "SandboxCapabilities",

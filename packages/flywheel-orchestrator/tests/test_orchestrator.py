@@ -11,7 +11,7 @@ import asyncio
 import io
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
@@ -23,6 +23,7 @@ from flywheel_core import (
     InvocationSignals,
     IterationResult,
     Lifecycle,
+    MissingEnvelope,
     Status,
     ValidEnvelope,
 )
@@ -1359,3 +1360,205 @@ def test_checkpoint_nudge_defaults_on_and_probe_dormant_without_factory(
     assert len(captured) == 1
     assert captured[0]["checkpoint_nudge_seconds"] == 300.0
     assert captured[0]["checkpoint_progress_probe"] is None
+
+
+# --- session-limit-driven pool-wide claim pause (spec session-limit-claim-pause)
+#
+# End-to-end proof that a structural session-limit reset surfaced by ONE run
+# pauses fresh/resume claiming for EVERY driver against the same claim store
+# (``db_path``), clamped by ``session_pause_ceiling_seconds``, and that claiming
+# resumes on its own once the horizon passes. The driver that trips the limit
+# and the drivers it blocks read different task directories but share the one
+# ``db_path``, so the pause is proven pool-wide (cross-task, cross-process), not
+# merely intra-driver. The harness derives the reset from the wall clock, so the
+# trip uses a far-future reset that always fast-aborts; the orchestrate-injected
+# clock independently drives the pause/gate timing so the ceiling clamp and the
+# expiry are deterministic.
+
+_FAR_FUTURE_RESET = datetime(2100, 1, 1, tzinfo=timezone.utc)
+_PAUSE_CEILING = 3600.0  # 1h test ceiling
+_T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _session_limit_invoke():
+    """Fake invoke that trips a structural session limit every call.
+
+    Mirrors the harness's fast-abort recipe (MissingEnvelope + a pipe-epoch
+    ``usage limit reached`` transcript + a 429 status): the harness derives
+    ``HarnessOutcome.session_limit_reset`` from the transcript epoch and aborts
+    without transient retry. The epoch is far in the future so the derivation
+    fires against the harness's wall clock regardless of the injected clock.
+    """
+
+    async def _invoke(request: InvocationRequest) -> IterationResult:
+        epoch = int(_FAR_FUTURE_RESET.timestamp())
+        return IterationResult(
+            transcript=f"Claude AI usage limit reached|{epoch}",
+            messages=(),
+            envelope=MissingEnvelope(),
+            signals=InvocationSignals(
+                stop_reason="end_turn",
+                num_turns=1,
+                total_cost_usd=0.0,
+                result_is_error=False,
+                result_subtype="success",
+                api_error_status=429,
+                session_id="sess",
+            ),
+            failure=None,
+        )
+
+    return _invoke
+
+
+def _fixed_clock(moment: datetime):
+    def _clock() -> datetime:
+        return moment
+
+    return _clock
+
+
+def _run_driver(
+    tasks_dir: Path,
+    db_path: Path,
+    sandbox_root: Path,
+    invoke,
+    *,
+    worker_id: str,
+    now: datetime,
+    ceiling: float,
+    stream,
+):
+    return asyncio.run(
+        orchestrate(
+            tasks_dir=tasks_dir,
+            db_path=db_path,
+            sandbox_root=sandbox_root,
+            invoke=invoke,
+            worker_id=worker_id,
+            max_retries=0,
+            max_turns=4,
+            lease_seconds=60,
+            session_pause_ceiling_seconds=ceiling,
+            now=_fixed_clock(now),
+            stream=stream,
+        )
+    )
+
+
+def test_session_limit_pause_blocks_peer_then_resumes(tmp_path: Path) -> None:
+    """A session limit tripped by driver A's task pauses driver B pool-wide,
+    then driver C claims freely once the clamped horizon passes."""
+    db_path = tmp_path / "flywheel.sqlite"
+    # Distinct task dirs, one shared claim store: the pause A records off its
+    # ``limit`` task must block B's UNRELATED ``work`` task -> pool-wide.
+    dir_a = tmp_path / "tasks-a"
+    dir_bc = tmp_path / "tasks-bc"
+    _write_task(dir_a / "active" / "01-phase", "limit")
+    _write_task(dir_bc / "active" / "01-phase", "work")
+
+    # Driver A trips the session limit at T0 and records a pause clamped to
+    # T0 + ceiling (the far-future reset is clamped down to the ceiling).
+    stream_a = io.StringIO()
+    report_a = _run_driver(
+        dir_a,
+        db_path,
+        tmp_path / "sb-a",
+        _session_limit_invoke(),
+        worker_id="worker-a",
+        now=_T0,
+        ceiling=_PAUSE_CEILING,
+        stream=stream_a,
+    )
+    assert [r.task_id for r in report_a.runs] == ["limit"]
+    assert report_a.runs[0].status is Status.FAILED
+    log_a = stream_a.getvalue()
+    assert "session limit reached" in log_a
+    assert "pausing pool-wide claiming until" in log_a
+
+    # The pause is a queryable ledger row behind the shared claim-store seam.
+    inspect = SqliteClaimStore(db_path)
+    try:
+        pauses = inspect.list_session_pauses()
+        assert len(pauses) == 1
+        assert pauses[0].run_id == report_a.runs[0].run_id
+        assert pauses[0].reset_at == _FAR_FUTURE_RESET
+        assert pauses[0].pause_until == _T0 + timedelta(seconds=_PAUSE_CEILING)
+    finally:
+        inspect.close()
+
+    # Driver B, 10s into the window, declines every fresh claim: its unrelated
+    # ``work`` task is NOT run despite being READY.
+    stream_b = io.StringIO()
+    report_b = _run_driver(
+        dir_bc,
+        db_path,
+        tmp_path / "sb-b",
+        _always_verify(),
+        worker_id="worker-b",
+        now=_T0 + timedelta(seconds=10),
+        ceiling=_PAUSE_CEILING,
+        stream=stream_b,
+    )
+    assert report_b.runs == ()
+    assert "session-limit pause active until" in stream_b.getvalue()
+
+    # Driver C, past the clamped horizon, claims freely and drives ``work`` DONE.
+    stream_c = io.StringIO()
+    report_c = _run_driver(
+        dir_bc,
+        db_path,
+        tmp_path / "sb-c",
+        _always_verify(),
+        worker_id="worker-c",
+        now=_T0 + timedelta(seconds=_PAUSE_CEILING + 10),
+        ceiling=_PAUSE_CEILING,
+        stream=stream_c,
+    )
+    assert [r.task_id for r in report_c.runs] == ["work"]
+    assert report_c.runs[0].status is Status.DONE
+
+
+def test_session_limit_ceiling_zero_never_pauses(tmp_path: Path) -> None:
+    """``session_pause_ceiling_seconds == 0`` is today's behavior byte-for-byte:
+    a session-limited run records no pause and never blocks a peer's claim."""
+    db_path = tmp_path / "flywheel.sqlite"
+    dir_a = tmp_path / "tasks-a"
+    dir_b = tmp_path / "tasks-b"
+    _write_task(dir_a / "active" / "01-phase", "limit")
+    _write_task(dir_b / "active" / "01-phase", "work")
+
+    # Driver A trips the limit but pausing is disabled: nothing is recorded.
+    report_a = _run_driver(
+        dir_a,
+        db_path,
+        tmp_path / "sb-a",
+        _session_limit_invoke(),
+        worker_id="worker-a",
+        now=_T0,
+        ceiling=0.0,
+        stream=io.StringIO(),
+    )
+    assert [r.task_id for r in report_a.runs] == ["limit"]
+
+    inspect = SqliteClaimStore(db_path)
+    try:
+        assert inspect.list_session_pauses() == []
+        assert inspect.session_pause_until(now=_T0) is None
+    finally:
+        inspect.close()
+
+    # Driver B, immediately after and inside any hypothetical window, claims
+    # freely: no gate exists, so ``work`` runs to DONE.
+    report_b = _run_driver(
+        dir_b,
+        db_path,
+        tmp_path / "sb-b",
+        _always_verify(),
+        worker_id="worker-b",
+        now=_T0 + timedelta(seconds=10),
+        ceiling=0.0,
+        stream=io.StringIO(),
+    )
+    assert [r.task_id for r in report_b.runs] == ["work"]
+    assert report_b.runs[0].status is Status.DONE

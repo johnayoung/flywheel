@@ -43,6 +43,7 @@ from flywheel_orchestrator._claims import (
     OrchestratorEventRecord,
     OrchestratorSchemaError,
     OrchestratorStopEventRecord,
+    SessionPauseRecord,
     SourceSyncRecord,
     TaskClaim,
     WorkItemRecord,
@@ -120,6 +121,12 @@ _ORCH_STOP_EVENT_SELECT = """
 """
 
 
+_ORCH_SESSION_PAUSE_SELECT = """
+    SELECT id, run_id, reset_at, pause_until, recorded_at
+    FROM orchestrator_session_pauses
+"""
+
+
 _GRAPH_SNAPSHOT_SELECT = """
     SELECT id, captured_at, item_count, last_event_id
     FROM graph_snapshots
@@ -193,6 +200,16 @@ def _row_to_orchestrator_stop_event_record(
         detail=row["detail"],
         occurred_at=row["occurred_at"],
         run_id=row["run_id"],
+    )
+
+
+def _row_to_session_pause_record(row: dict[str, Any]) -> SessionPauseRecord:
+    return SessionPauseRecord(
+        id=int(row["id"]),
+        run_id=row["run_id"],
+        reset_at=row["reset_at"],
+        pause_until=row["pause_until"],
+        recorded_at=row["recorded_at"],
     )
 
 
@@ -496,22 +513,45 @@ class PostgresClaimStore:
                       ON orchestrator_stop_events (subject, id)
                     """
                 )
+                # Additive v8 migration: the append-only session-pause ledger.
+                # CREATE TABLE IF NOT EXISTS materializes it on open, so a
+                # pre-existing v1..v7 store keeps every prior row and simply
+                # gains an empty pause stream -- no drop-and-recreate.
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
+                      id          BIGSERIAL PRIMARY KEY,
+                      run_id      TEXT NOT NULL DEFAULT '',
+                      reset_at    TIMESTAMPTZ NOT NULL,
+                      pause_until TIMESTAMPTZ NOT NULL,
+                      recorded_at TIMESTAMPTZ NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                      idx_orchestrator_session_pauses_pause_until
+                      ON orchestrator_session_pauses (pause_until)
+                    """
+                )
                 cur.execute(
                     "INSERT INTO orchestrator_schema_version (id, version) "
                     "VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
                     (CURRENT_ORCH_SCHEMA_VERSION,),
                 )
-                # Additive forward migration v1..v6 -> v7: the WorkGraph
+                # Additive forward migration v1..v7 -> v8: the WorkGraph
                 # tables (v2), the conflict-keys column (v3), the
                 # orchestrator_events ledger (v4), the graph_snapshots /
                 # graph_snapshot_items tables (v5), the
-                # orchestrator_stop_events ledger (v6), and its run_id column
-                # (v7) were just materialized above, so a pre-existing store
-                # keeps its task_claims / work_items / source_syncs /
+                # orchestrator_stop_events ledger (v6), its run_id column
+                # (v7), and the orchestrator_session_pauses ledger (v8) were
+                # just materialized above, so a pre-existing store keeps its
+                # task_claims / work_items / source_syncs /
                 # orchestrator_events / stop rows intact and simply gains the
-                # run_id column. Converge any older sentinel forward rather
-                # than refusing the store; a newer-than-current version still
-                # trips the mismatch guard below.
+                # empty pause ledger. Converge any older sentinel forward
+                # rather than refusing the store; a newer-than-current version
+                # still trips the mismatch guard below.
                 cur.execute(
                     "UPDATE orchestrator_schema_version SET version = %s "
                     "WHERE id = 1 AND version < %s",
@@ -941,6 +981,58 @@ class PostgresClaimStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
+
+    # -- session-pause ledger (schema v8) ----------------------------------
+
+    def record_session_pause(
+        self,
+        *,
+        reset_at: datetime,
+        now: datetime,
+        ceiling_seconds: float,
+        run_id: str = "",
+    ) -> datetime | None:
+        # Clamp the horizon so a far-future reset can never exceed now +
+        # ceiling, and a reset already in the past never records a pause -- the
+        # unbounded-pause failure mode is unreachable. Disabled entirely when the
+        # ceiling is non-positive. Append-only, never deduped.
+        if ceiling_seconds <= 0:
+            return None
+        pause_until = min(reset_at, now + timedelta(seconds=ceiling_seconds))
+        if pause_until <= now:
+            return None
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO orchestrator_session_pauses "
+                    "(run_id, reset_at, pause_until, recorded_at) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (run_id, reset_at, pause_until, now),
+                )
+        return pause_until
+
+    def session_pause_until(self, *, now: datetime) -> datetime | None:
+        # High-water horizon over rows still in the future. Each row was
+        # individually clamped, so the max never exceeds the latest
+        # min(reset, recorded_at + ceiling); recording the same reset twice is
+        # idempotent.
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT MAX(pause_until) FROM orchestrator_session_pauses "
+                    "WHERE pause_until > %s",
+                    (now,),
+                )
+                row = cur.fetchone()
+        return row[0] if row is not None and row[0] is not None else None
+
+    def list_session_pauses(self) -> list[SessionPauseRecord]:
+        # Global stream: every recorded pause in id (insertion) order.
+        with self._pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(_ORCH_SESSION_PAUSE_SELECT + " ORDER BY id")
+                rows = cur.fetchall()
+        return [_row_to_session_pause_record(row) for row in rows]
 
     def record_human_review(
         self,

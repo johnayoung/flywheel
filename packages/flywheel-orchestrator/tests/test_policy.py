@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import flywheel_orchestrator._github as _github_mod
+from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.task import CommandGrader, TranscriptGrader
 from flywheel_orchestrator import (
     DEFAULT_TASKS_DIR,
@@ -1260,3 +1261,127 @@ def test_worker_concurrency_carries_on_github_policy(tmp_path: Path) -> None:
     )
     assert policy.source_kind == "github"
     assert policy.worker_concurrency == 3
+
+
+# --- attempt budgets: [deadlines] + rubric_judge_max_turns (spec 00066) ------
+
+
+def test_deadlines_absent_defaults_to_default_config(tmp_path: Path) -> None:
+    # Every pre-existing policy file (no [deadlines] table) keeps the harness's
+    # finite default-on ceilings, byte-identical to today.
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.deadlines == DeadlineConfig()
+
+
+def test_deadlines_table_parses_and_opts_out(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[deadlines]",
+                    "agent_iteration_seconds = 120",
+                    "rubric_judge_seconds = 0",
+                ]
+            ),
+        )
+    )
+    assert policy.deadlines.agent_iteration_seconds == 120.0
+    # ``0`` is the on-disk unbounded opt-out -> None, not 0.0 nor the default.
+    assert policy.deadlines.rubric_judge_seconds is None
+    # An omitted class keeps its finite default.
+    assert policy.deadlines.command_grader_seconds == 900.0
+
+
+def test_deadlines_non_numeric_value_raises(tmp_path: Path) -> None:
+    # A non-numeric per-class value is a configuration error: the resolver's
+    # ValueError is wrapped into a PolicyError naming the offending key.
+    with pytest.raises(PolicyError, match="deadlines.agent_iteration_seconds"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[deadlines]\nagent_iteration_seconds = "soon"\n',
+            )
+        )
+
+
+def test_deadlines_boolean_value_raises(tmp_path: Path) -> None:
+    # TOML ``true`` must not slip through as ``1.0`` (bool is an int subclass);
+    # it raises, naming the key.
+    with pytest.raises(PolicyError, match="deadlines.agent_iteration_seconds"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[deadlines]\nagent_iteration_seconds = true\n",
+            )
+        )
+
+
+def test_deadlines_non_table_raises(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match=r"\[deadlines\] must be a table"):
+        load_policy(
+            _write(
+                tmp_path,
+                'deadlines = "nope"\n[source]\nkind = "directory"\n',
+            )
+        )
+
+
+def test_rubric_judge_max_turns_absent_defaults_none(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.sandbox.limits.rubric_judge_max_turns is None
+
+
+def test_rubric_judge_max_turns_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[sandbox.limits]\nrubric_judge_max_turns = 8\n",
+        )
+    )
+    assert policy.sandbox.limits.rubric_judge_max_turns == 8
+
+
+def test_rubric_judge_max_turns_non_positive_raises(tmp_path: Path) -> None:
+    with pytest.raises(
+        PolicyError, match="sandbox.limits.rubric_judge_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[sandbox.limits]\nrubric_judge_max_turns = 0\n",
+            )
+        )
+
+
+def test_rubric_judge_max_turns_boolean_raises(tmp_path: Path) -> None:
+    # bool is an int subclass; ``true`` must not read as ``1``.
+    with pytest.raises(
+        PolicyError, match="sandbox.limits.rubric_judge_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[sandbox.limits]\nrubric_judge_max_turns = true\n",
+            )
+        )
+
+
+def test_rubric_judge_max_turns_non_int_raises(tmp_path: Path) -> None:
+    with pytest.raises(
+        PolicyError, match="sandbox.limits.rubric_judge_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[sandbox.limits]\nrubric_judge_max_turns = "lots"\n',
+            )
+        )

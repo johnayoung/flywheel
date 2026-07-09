@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING, Any, Protocol, TextIO
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions, Message
 
+    from flywheel_core.deadline_config import DeadlineConfig
+
     # Optional postgres backend: imported for typing only so this module
     # never hard-depends on the psycopg extra at runtime. The store factory
     # returns ``SqliteStore | PostgresStore`` and both answer these reads
@@ -753,6 +755,8 @@ async def run_task_object(
     max_cost_usd: float = 0.0,
     max_tokens: int = 0,
     wall_clock_seconds: int = 0,
+    deadlines: DeadlineConfig | None = None,
+    rubric_judge_max_turns: int | None = None,
     invoke: InvokeFunc | None = None,
     stream: TextIO | None = None,
     run_id: str | None = None,
@@ -807,6 +811,14 @@ async def run_task_object(
     callback the orchestrator supplies so a non-landable finished change is
     re-driven by bounded retry instead of landing as ``DONE``. ``None`` (the
     default) disables the gate, byte-identical to today.
+
+    ``deadlines`` and ``rubric_judge_max_turns`` carry repo-owned attempt
+    budgets from ``flywheel.toml`` onto the harness config: ``deadlines`` sets
+    :attr:`HarnessConfig.deadlines` (the wall-clock ceilings, spec 00066) and
+    ``rubric_judge_max_turns`` sets :attr:`HarnessConfig.rubric_judge_max_turns`
+    (the per-judge turn budget). Each is forwarded only when not ``None``, so a
+    caller that passes neither is byte-identical to today: the harness keeps its
+    own defaults (finite default-on deadlines, 32 judge turns).
     """
     out = stream if stream is not None else sys.stderr
     # ``source`` rides the lifecycle into the LifecycleInitialized seed so
@@ -941,6 +953,15 @@ async def run_task_object(
         base_sha = _resolve_base_commit_sha(sandbox)
         if base_sha is not None:
             agent_context["base_commit_sha"] = base_sha
+        # Repo-owned attempt budgets (flywheel.toml) override the harness
+        # defaults only when supplied, so a caller that passes neither knob
+        # constructs a byte-identical HarnessConfig: ``deadlines`` keeps its
+        # finite default-on ceilings and ``rubric_judge_max_turns`` keeps 32.
+        budget_overrides: dict[str, Any] = {}
+        if deadlines is not None:
+            budget_overrides["deadlines"] = deadlines
+        if rubric_judge_max_turns is not None:
+            budget_overrides["rubric_judge_max_turns"] = rubric_judge_max_turns
         try:
             outcome = await run_task(
                 task,
@@ -955,6 +976,7 @@ async def run_task_object(
                     worktree=sandbox,
                     grader_env=grader_env,
                     landability_gate=landability_gate,
+                    **budget_overrides,
                 ),
                 invoke=invoker,
                 sink=run_sink,

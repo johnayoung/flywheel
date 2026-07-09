@@ -121,6 +121,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from flywheel_core.deadline_config import (
+    DeadlineConfig,
+    deadline_config_from_mapping,
+)
 from flywheel_core.loaders import TaskLoadError, load_graders
 from flywheel_core.task import Grader
 
@@ -279,6 +283,10 @@ class SandboxLimits:
     cumulatively via ``HarnessConfig`` (``0`` = unenforced). ``max_turns``/
     ``max_retries``/``lease_seconds`` mirror today's hardcoded values and keep
     their existing CLI/default path (not lifted into ceiling enforcement).
+
+    ``rubric_judge_max_turns`` is the per-judge-call turn budget forwarded onto
+    :attr:`HarnessConfig.rubric_judge_max_turns`. ``None`` (an absent key) keeps
+    the harness default (32); a present value must be a positive integer.
     """
 
     max_turns: int = 500
@@ -287,6 +295,7 @@ class SandboxLimits:
     wall_clock_seconds: int = 0
     max_cost_usd: float = 0.0
     max_tokens: int = 0
+    rubric_judge_max_turns: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -438,6 +447,12 @@ class WorkPolicy:
     the worker builds no held-out source and landing stays byte-identical
     (spec 00051, criterion #2, decision D-3). A default that silently
     activates gating on upgrade is deliberately absent.
+    ``deadlines`` mirrors the optional top-level ``[deadlines]`` table (spec
+    00066): the default-on, operator-overridable wall-clock ceilings resolved
+    via :func:`flywheel_core.deadline_config.deadline_config_from_mapping`. An
+    absent table yields a default :class:`DeadlineConfig` (finite, non-null
+    ceilings), byte-identical to today; a key set to ``0`` opts that class out
+    (unbounded).
     """
 
     source_kind: str
@@ -467,6 +482,7 @@ class WorkPolicy:
     phase_verify: str | None = None
     held_out_root: Path | None = None
     sandbox: SandboxPolicy = field(default_factory=SandboxPolicy)
+    deadlines: DeadlineConfig = field(default_factory=DeadlineConfig)
     autopilot_target_depth: int = DEFAULT_TARGET_DEPTH
     autopilot_landing: str = DEFAULT_LANDING
     autopilot_interval_seconds: float = DEFAULT_AUTOPILOT_INTERVAL_SECONDS
@@ -563,6 +579,8 @@ def load_policy(path: Path) -> WorkPolicy:
         raise PolicyError(f"{path}: [held_out] must be a table")
     held_out_root = _optional_held_out_root(held_out, policy_file=path)
 
+    deadlines = _optional_deadlines(data.get("deadlines"), policy_file=path)
+
     autopilot = data.get("autopilot") or {}
     if not isinstance(autopilot, dict):
         raise PolicyError(f"{path}: [autopilot] must be a table")
@@ -608,6 +626,7 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            deadlines=deadlines,
             autopilot_target_depth=autopilot_target_depth,
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
@@ -648,6 +667,7 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            deadlines=deadlines,
             autopilot_target_depth=autopilot_target_depth,
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
@@ -682,6 +702,7 @@ def load_policy(path: Path) -> WorkPolicy:
             phase_verify=phase_verify,
             held_out_root=held_out_root,
             sandbox=sandbox_policy,
+            deadlines=deadlines,
             autopilot_target_depth=autopilot_target_depth,
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
@@ -1137,6 +1158,52 @@ def _optional_held_out_root(
     return Path(value)
 
 
+def _optional_positive_int(
+    table: dict, key: str, *, path: str, policy_file: Path
+) -> int | None:
+    """Validate an optional positive-integer override, ``None`` when absent.
+
+    Returns ``None`` when the key is absent so the consumer keeps its own
+    default (e.g. the harness's ``rubric_judge_max_turns`` of 32). A TOML
+    boolean (``bool`` is an ``int`` subclass, so ``= true`` would otherwise
+    read as ``1``), a non-integer, or a non-positive value raises
+    :class:`PolicyError` naming ``path`` so a typo never silently degrades the
+    budget.
+    """
+    if key not in table:
+        return None
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PolicyError(
+            f"{policy_file}: {path} must be a positive integer"
+        )
+    return value
+
+
+def _optional_deadlines(
+    table: object, *, policy_file: Path
+) -> DeadlineConfig:
+    """Resolve the optional top-level ``[deadlines]`` table (spec 00066).
+
+    Returns a default :class:`DeadlineConfig` (finite, non-null default-on
+    ceilings) when the table is absent so every pre-existing policy file keeps
+    loading byte-identically. When present it is resolved via
+    :func:`flywheel_core.deadline_config.deadline_config_from_mapping` -- the
+    spec-00066 key mapping consumed as-is, never forked -- so a key set to
+    ``0`` opts that class out (unbounded). A non-table value, or a non-numeric
+    per-class value (the resolver's :class:`ValueError`, wrapped), raises
+    :class:`PolicyError` naming the file and the offending key.
+    """
+    if table is None:
+        return DeadlineConfig()
+    if not isinstance(table, dict):
+        raise PolicyError(f"{policy_file}: [deadlines] must be a table")
+    try:
+        return deadline_config_from_mapping(table)
+    except ValueError as exc:
+        raise PolicyError(f"{policy_file}: {exc}") from exc
+
+
 def _optional_autopilot(
     table: dict, *, policy_file: Path
 ) -> tuple[int, str, float, ScoreWeights | None]:
@@ -1493,6 +1560,11 @@ def _optional_sandbox_policy(
         max_tokens=_override_int(
             limits_tbl, "max_tokens", base.limits.max_tokens,
             path="sandbox.limits.max_tokens", policy_file=policy_file,
+        ),
+        rubric_judge_max_turns=_optional_positive_int(
+            limits_tbl, "rubric_judge_max_turns",
+            path="sandbox.limits.rubric_judge_max_turns",
+            policy_file=policy_file,
         ),
     )
 

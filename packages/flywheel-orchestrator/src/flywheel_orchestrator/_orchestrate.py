@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 from uuid import uuid4
 
+from flywheel_core.deadline_config import DeadlineConfig
 from flywheel_core.harness import (
     BUDGET_CEILING_ERROR_PREFIX,
     InvokeFunc,
@@ -2066,6 +2067,28 @@ def _sandbox_limit_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     )
 
 
+def _attempt_budget_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
+    """Decompose the repo-owned attempt budgets into the primitives the worker
+    threads into ``run_task_object`` (spec 00066).
+
+    The deadline/turn-budget mirror of :func:`_sandbox_limit_primitives`: the
+    top-level ``[deadlines]`` table resolves onto :attr:`WorkPolicy.deadlines`
+    (a :class:`DeadlineConfig`) and ``[sandbox.limits] rubric_judge_max_turns``
+    onto :attr:`SandboxLimits.rubric_judge_max_turns`. A ``None`` policy
+    (library callers) or an absent ``[deadlines]`` table decomposes the default
+    :class:`DeadlineConfig` (finite, non-null default-on ceilings) and a
+    ``None`` turn budget, so ``run_task_object`` keeps the harness defaults and
+    a fast run stays byte-identical. ``rubric_judge_max_turns`` is ``None`` when
+    unset so ``run_task_object`` forwards it only when the operator pinned one.
+    """
+    if policy is None:
+        return dict(deadlines=DeadlineConfig(), rubric_judge_max_turns=None)
+    return dict(
+        deadlines=policy.deadlines,
+        rubric_judge_max_turns=policy.sandbox.limits.rubric_judge_max_turns,
+    )
+
+
 def _apply_handle(
     handle: SandboxHandle,
     sandbox_primitives: dict[str, Any],
@@ -2266,6 +2289,7 @@ async def orchestrate(
     heartbeat_interval = max(lease_seconds / 3.0, 0.001)
     sandbox_primitives = _sandbox_agent_primitives(policy)
     limit_primitives = _sandbox_limit_primitives(policy)
+    budget_primitives = _attempt_budget_primitives(policy)
 
     def resolve_sandbox(
         row: TaskStatusRow,
@@ -2611,6 +2635,7 @@ async def orchestrate(
                         max_retries=max_retries,
                         **drive_primitives,
                         **limit_primitives,
+                        **budget_primitives,
                         stream=stream,
                         now=clock,
                     )
@@ -2892,6 +2917,7 @@ async def orchestrate(
                     max_retries=max_retries,
                     **drive_primitives,
                     **limit_primitives,
+                    **budget_primitives,
                     stream=stream,
                     now=clock,
                 )
@@ -3244,6 +3270,8 @@ async def _drive_under_lease(
     max_cost_usd: float,
     max_tokens: int,
     wall_clock_seconds: int,
+    deadlines: DeadlineConfig | None,
+    rubric_judge_max_turns: int | None,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -3345,6 +3373,8 @@ async def _drive_under_lease(
             max_cost_usd=max_cost_usd,
             max_tokens=max_tokens,
             wall_clock_seconds=wall_clock_seconds,
+            deadlines=deadlines,
+            rubric_judge_max_turns=rubric_judge_max_turns,
             invoke=invoke,
             stream=stream,
             run_id=run_id,

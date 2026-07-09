@@ -18,6 +18,15 @@ model = "claude-opus-4-8"
 [worker]
 concurrency = 3
 
+# How DONE work lands. protected_paths (PurePath.full_match globs, ** crosses
+# directories) refuses landings that touch the verification surface and parks
+# them for operator review; verify (spec 00064) is the standing whole-repo
+# build gate re-run under the merge lock against the exact tree about to land,
+# on every land path (~2 min per landing, serialized).
+[submit]
+protected_paths = [".github/**", "flywheel.toml", "scripts/**", "CLAUDE.md", ".claude/**"]
+verify = "scripts/check.sh"
+
 # Phase-exit integration gate (spec 00035): the full repo gate runs against
 # the merged phase base before a completed phase archives; non-zero exit
 # leaves the phase active.

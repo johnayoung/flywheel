@@ -1738,11 +1738,20 @@ class GitWorktreeSubmitter:
         )
 
     def _stamp_trailers(
-        self, req: SubmitRequest, worktree: Path, branch: str
+        self,
+        req: SubmitRequest,
+        worktree: Path,
+        branch: str,
+        *,
+        base: str | None = None,
     ) -> None:
         """Stamp harness-authoritative provenance trailers onto the task
-        branch's ``phase_base..branch`` commits, then advance the branch and
+        branch's ``base..branch`` commits, then advance the branch and
         worktree onto the rewritten tip (spec 00078, criteria 1/3/4).
+
+        ``base`` defaults to :attr:`phase_base` (the merge path's landing base);
+        the pr strategy passes its ``pr_base`` so the stamped range is exactly
+        the commits the push publishes beyond the PR base.
 
         Message-only: :func:`~flywheel_worktree._trailers.stamp_commit_messages`
         recreates every commit over its original tree object, so the tree that
@@ -1757,7 +1766,7 @@ class GitWorktreeSubmitter:
         phase = phase_of_task_file(req.task_file, self.tasks_dir)
         new_tip = stamp_commit_messages(
             self.repo_root,
-            base=self.phase_base,
+            base=base or self.phase_base,
             branch=branch,
             trailers=provenance_trailers(
                 task_id=req.task_id, run_id=req.run_id, phase=phase

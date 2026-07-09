@@ -258,6 +258,15 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
             )
             return
 
+        # Stamp harness-authoritative provenance onto the pushed range
+        # (``pr_base..branch``) before the push, so the branch on the remote
+        # never lacks trailers while a PR references it. Message-only, tree
+        # byte-identical, forged ``Flywheel-*`` trailers replaced -- the same
+        # shared engine and vocabulary the merge path uses (spec 00078,
+        # criterion 2). This precedes both the push and the PR create/edit in
+        # ``_ensure_pr``.
+        self._stamp_trailers(req, worktree, branch, base=self.pr_base)
+
         push = _git(
             self.repo_root,
             "push",

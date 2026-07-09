@@ -1,0 +1,47 @@
+{
+  "id": "phase-prereq-reachability-hold",
+  "goal": "A task whose prerequisite is DONE but whose prerequisite's landed work is not reachable from the base the dependent task would branch from stays unclaimed with a status surface naming the blocking phase, becoming claimable as soon as reachability holds.",
+  "tags": ["spec-00079", "phase-branch-landing"],
+  "prerequisites": ["phase-strategy-landing", "cross-phase-prereq-scheduling"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_rollup.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_phase_reachability_hold.py -q" },
+    { "type": "command", "name": "scheduling-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_cross_phase_prereqs.py packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_rollup.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- select_next_task and the prerequisite-eligibility predicate; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py -- prerequisite resolution over the WorkGraph",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_rollup.py -- the status projection where the hold reason surfaces",
+      "packages/flywheel-orchestrator/tests/test_cross_phase_prereqs.py -- keep green, assertions unmodified; the cross-phase prerequisite semantics this extends",
+      "packages/flywheel-orchestrator/tests/test_rollup.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00079-FEATURE-phase-branch-landing.md -- criterion 7; decision D-4 (hold, do not stack)"
+    ],
+    "constraints": [
+      "Prerequisite satisfaction under the phase strategy requires the prerequisite's landed work to be reachable (git ancestry) from the base the dependent task would branch from; DONE alone is not sufficient across unmerged phases",
+      "The hold is visible: the status surface names the dependent task, the hold reason, and the blocking phase -- never invisible starvation",
+      "The hold never consumes, parks, or fails the task: it stays eligible and is claimed on the first pass after the blocking phase's branch is reachable, with no operator action",
+      "Behavior for the merge and pr strategies is unchanged (a single shared base makes reachability trivially true), and same-phase prerequisites are unaffected",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "No PR stacking -- do not branch a dependent phase off another phase's unmerged integration branch (spec decision D-4)",
+      "No changes to claim/lease mechanics or conflict_keys semantics",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Two-phase harness: phase A's PR open, phase B's dependent task stays unclaimed with the reason naming phase A; after A's branch is merged into the true base the task is claimed on the next pass",
+      "A DONE-but-parked prerequisite (never landed anywhere) still blocks -- landed-ness comes first, reachability second",
+      "Same-phase prerequisite chains behave exactly as today: both tasks stack on the shared phase branch",
+      "Mutation: an implementation that treats DONE as satisfied without the ancestry check must fail the unmerged-phase case"
+    ]
+  }
+}

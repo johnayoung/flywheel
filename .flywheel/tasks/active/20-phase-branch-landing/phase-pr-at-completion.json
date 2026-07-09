@@ -1,0 +1,50 @@
+{
+  "id": "phase-pr-at-completion",
+  "goal": "When every task in a phase is DONE and landed on the phase branch and the loop-path gate and [phase] verify evaluated against the phase-branch tree pass, the worker pushes the phase branch and ensures exactly one open PR onto the true base whose body aggregates every task's grader receipts and held-out verdict.",
+  "tags": ["spec-00079", "phase-branch-landing"],
+  "prerequisites": ["phase-strategy-landing"],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_phase_pr_completion.py -q" },
+    { "type": "command", "name": "archive-machinery-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_loop_path_optout.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-worktree packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- archive_completed_phases (the completion detection and the [phase] verify invocation whose cwd today is the operator checkout -- the gate must instead evaluate the phase-branch tree); module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- archive_phases (the daemon caller under the merge lock); module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- render_pr_body, _ensure_pr, and the injectable GhRunner: lift the per-task receipt rendering to phase scope",
+      "packages/flywheel-core/src/flywheel_core/events.py -- HeldOutGateEvaluated: the per-run domain event carrying the held-out outcome and receipts; read via list_domain_events(run_id)",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_loop_path_optout.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00079-FEATURE-phase-branch-landing.md -- criterion 3; decisions D-2, D-6",
+      "docs/held-out-gate.md -- verdict semantics (NO_GATE vs PASS vs FAIL) the body must render faithfully"
+    ],
+    "constraints": [
+      "[phase] verify runs against a checkout of the phase branch, never the operator's checkout; a non-zero exit opens no PR and leaves the phase unarchived with the refusal logged",
+      "Exactly one PR per phase: the first completion creates it, later sweeps refresh (edit) it -- never a duplicate",
+      "The PR body aggregates, for every task in the phase, the run's final grader receipts (from the store) and its held-out verdict (from the HeldOutGateEvaluated domain event, rendering NO_GATE distinctly from PASS); receipts are the harness's verdicts, never re-derived from agent output",
+      "The worker pushes and opens/refreshes; it never merges the phase PR",
+      "PR-open failures follow the existing never-raise submit discipline: logged and surfaced, never unwinding the sweep",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "No archival-predicate change (the merged-ancestry block is the dependent task's surface); this task ends at the open, receipt-bearing PR",
+      "Do not change the per-task pr strategy's own PR flow or body rendering for single-task PRs",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A task with no persisted receipts renders the existing receipt-projection-unavailable line rather than being silently omitted from the body",
+      "A phase where one run's held-out verdict is NO_GATE and another's is PASS renders both distinctly",
+      "A second sweep with the PR already open edits the body rather than opening a second PR",
+      "A red [phase] verify against the phase-branch tree opens no PR even though every task is DONE and landed"
+    ]
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "id": "phase-strategy-landing",
+  "goal": "A third registered submit strategy 'phase' lands each DONE task onto a per-phase integration branch derived from the task's phase with the full verify ladder intact, while the true base and the shipped merge/pr strategies stay byte-identical.",
+  "tags": ["spec-00079", "phase-branch-landing"],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/_submit_registry.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_phase_strategy_landing.py -q" },
+    { "type": "command", "name": "landing-paths-unchanged", "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py packages/flywheel-worktree/tests/test_submit_standing_verify.py packages/flywheel-worktree/tests/test_pr_strategy.py packages/flywheel-worktree/tests/test_landing_record.py packages/flywheel-worktree/tests/test_submit_registry.py -q" },
+    { "type": "command", "name": "policy-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-worktree packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- GitWorktreeSubmitter (prepare_sandbox branch creation, _submit, _ff_merge, _reverify, _standing_verify, _protected_violations), resolve_landing_base, build_merge_submitter, phase_of_task_file; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/_submit_registry.py -- SUBMIT_STRATEGIES; register the new strategy here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- _optional_submit_strategy and its allowed-strategy set must accept the new name; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_submit_standing_verify.py -- keep green, assertions unmodified; also the standing-verify harness pattern to mirror",
+      "packages/flywheel-worktree/tests/test_pr_strategy.py -- keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_submit_registry.py -- keep green; extend registration coverage without weakening existing assertions"
+    ],
+    "references": [
+      ".flywheel/specs/00079-FEATURE-phase-branch-landing.md -- criteria 1, 2, 9; decisions D-1, D-6",
+      "docs/strategy.md -- the landing decision tree; every leaf stays a land or a park-with-reason"
+    ],
+    "constraints": [
+      "The landing base is derived per submit request from the task's phase (the phase directory name), never resolved once per process; the integration branch is created from the then-current true base on the phase's first landing, under the merge lock",
+      "Task worktrees for a phase branch off that phase's integration branch when it exists, so tasks within a phase stack and verify against what already landed there",
+      "Full verify-ladder parity on the phase branch: uncommitted-work check, protected paths, rebase-once-then-reverify, and [submit] verify all run exactly as the merge strategy runs them, with the same park kinds",
+      "The true base is never advanced by this strategy's per-task landing, and the merge and pr strategies remain byte-identical -- their existing suites pass unmodified",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "No phase-PR machinery, no archival changes, no scheduling changes -- later tasks in this phase own those surfaces",
+      "Do not change resolve_landing_base semantics for the merge and pr strategies",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Criterion 1: two tasks from one phase land in order on the phase branch while the true base SHA is unchanged from its pre-run value",
+      "Criterion 2: a base-advanced landing whose command graders re-pass but whose standing verify fails parks with park_kind standing-verify and the phase branch unchanged; a protected-path diff parks with park_kind protected-paths",
+      "Criterion 9 mutation: a harness run under strategy merge must create no flywheel/phase/* branch",
+      "Two concurrently active phases land onto two distinct integration branches without touching each other",
+      "A reused parked worktree from the same phase still lands onto the phase branch, not the true base"
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "id": "phase-archival-on-merge",
+  "goal": "Under the phase strategy a completed phase archives only when its integration branch tip is an ancestor of the true base, with unmerged and merged-but-not-ancestor states left active under distinct visible reasons and the same predicate enforced by every archival caller.",
+  "tags": ["spec-00079", "phase-branch-landing"],
+  "prerequisites": ["phase-pr-at-completion", "archive-landed-predicate"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel/src/flywheel/_tui.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_phase_archival_on_merge.py -q" },
+    { "type": "command", "name": "archive-machinery-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py packages/flywheel-orchestrator/tests/test_loop_path_optout.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator packages/flywheel-worktree packages/flywheel" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- archive_completed_phases and its _cmd_archive CLI caller (which today invokes the sweep without gates -- predicate parity closes that bypass); module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- archive_phases, the daemon caller that threads repo_root/phase_verify/claims; module is over 800 lines, use serena symbols",
+      "packages/flywheel/src/flywheel/_tui.py -- the third archival caller; must route through the same predicate",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_loop_path_optout.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00079-FEATURE-phase-branch-landing.md -- criteria 4, 5, 6, 8; decisions D-2, D-3",
+      ".flywheel/specs/00077-FEATURE-phase-archival-integrity.md -- the landed-not-merely-DONE predicate this extends one level up; its strand semantics must stay intact"
+    ],
+    "constraints": [
+      "Merged-ness is git ancestry -- the phase branch tip is an ancestor of the true base -- never a remote PR state string",
+      "While unmerged, repeated sweeps leave the phase directory under active/, surface the open PR as the blocking reason, and never advance the true base themselves (the worker performs no local merge of the phase branch)",
+      "A merged-but-not-ancestor state (squash or rebase merge on the remote) leaves the phase active under a distinct merge-method-mismatch reason, never the generic block and never a silent forever-loop",
+      "On ancestry the next sweep archives with the existing .loop-base materialization and stop-event semantics intact",
+      "Every archival caller (worker daemon, flywheel archive CLI, console) honors the same predicate when the strategy is phase; the gateless CLI/TUI sweep must not remain a one-command bypass",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "No PR-freshness or rebase automation for open phase PRs -- conflicts resolve at merge time by design (spec decision D-5)",
+      "No change to archival behavior for repos on the merge or pr strategies",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Criterion 5: after a merge-commit merge in the harness, the phase archives and git revert -m 1 of that merge commit applies cleanly",
+      "Criterion 6 mutation: a predicate that trusts a merged flag while ancestry fails must fail the behavior test's squash-merge case",
+      "Repeated sweeps against an unmerged PR are idempotent -- no duplicate blocking records, no directory churn",
+      "Spec 00077 strand semantics unchanged: a DONE-but-parked task still blocks archival independently of the PR predicate"
+    ]
+  }
+}

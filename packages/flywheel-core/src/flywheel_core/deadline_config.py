@@ -46,7 +46,7 @@ class DeadlineClass(str, Enum):
 # finite + default-on, not a "correct" number (spec 00066 non-goal). They align
 # with existing bounds where one exists (docker `start_container` is 120s; the
 # container `exec_timeout` default is 1800s).
-DEFAULT_AGENT_ITERATION_SECONDS: Final[float] = 1800.0
+DEFAULT_AGENT_ITERATION_SECONDS: Final[float] = 3600.0
 DEFAULT_RUBRIC_JUDGE_SECONDS: Final[float] = 600.0
 DEFAULT_COMMAND_GRADER_SECONDS: Final[float] = 900.0
 DEFAULT_DOCKER_MANAGEMENT_SECONDS: Final[float] = 120.0

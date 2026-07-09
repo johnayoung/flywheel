@@ -770,6 +770,8 @@ async def run_task_object(
     sink: TelemetrySink | None = None,
     store: RunStore | None = None,
     landability_gate: Callable[[], str | None] | None = None,
+    checkpoint_nudge_seconds: float = 300.0,
+    checkpoint_progress_probe: Callable[[], object] | None = None,
 ) -> HarnessOutcome:
     """Persist a lifecycle for ``task`` and drive it via ``run_task``.
 
@@ -816,6 +818,17 @@ async def run_task_object(
     callback the orchestrator supplies so a non-landable finished change is
     re-driven by bounded retry instead of landing as ``DONE``. ``None`` (the
     default) disables the gate, byte-identical to today.
+
+    ``checkpoint_nudge_seconds`` and ``checkpoint_progress_probe`` are forwarded
+    verbatim onto the like-named :class:`HarnessConfig` fields (the
+    checkpoint-nudge seam): the remaining-wall-time threshold (default
+    ``300.0``; ``<= 0`` disables) and the git-free, OPTIONAL progress-probe
+    closure the consumer supplies. ``checkpoint_progress_probe`` defaults to
+    ``None`` (the nudge stays dormant, byte-identical to today); when both are
+    set the harness threads them to the live-session invoker, which fires a
+    single checkpoint-commit instruction when an iteration nears its
+    ``AGENT_ITERATION`` ceiling with no new progress. Core stays git-unaware --
+    the concrete probe is supplied from above.
 
     ``deadlines`` and ``rubric_judge_max_turns`` carry repo-owned attempt
     budgets from ``flywheel.toml`` onto the harness config: ``deadlines`` sets
@@ -981,6 +994,8 @@ async def run_task_object(
                     worktree=sandbox,
                     grader_env=grader_env,
                     landability_gate=landability_gate,
+                    checkpoint_nudge_seconds=checkpoint_nudge_seconds,
+                    checkpoint_progress_probe=checkpoint_progress_probe,
                     **budget_overrides,
                 ),
                 invoke=invoker,

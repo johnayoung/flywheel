@@ -1255,3 +1255,107 @@ def test_mid_run_claim_loss_relinquishes_without_landing(
         assert store.load_claim("solo") is None
     finally:
         store.close()
+
+
+# --- checkpoint-nudge threading (checkpoint-nudge wiring) --------------------
+
+
+def test_checkpoint_nudge_seconds_threads_from_policy_into_run_task_object(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The ``[worker] checkpoint_nudge_seconds`` threshold and the per-run git
+    progress probe reach ``run_task_object`` (the harness seam). Asserted via
+    the threading, NOT by running an agent: a ``0`` (disabled) value in the
+    policy is what reaches the harness verbatim, and the probe factory is bound
+    per-run over that run's own sandbox."""
+    import flywheel_orchestrator._orchestrate as orch
+    from flywheel_orchestrator._policy import load_policy
+
+    captured: list[dict] = []
+    # ``getattr`` (not ``orch.run_task_object``) reads the re-exported core
+    # entry point without tripping pyright's reportPrivateImportUsage; the spy
+    # captures the harness kwargs then delegates to the real driver.
+    real = getattr(orch, "run_task_object")
+
+    async def _spy(task, **kwargs):
+        captured.append(kwargs)
+        return await real(task, **kwargs)
+
+    monkeypatch.setattr(orch, "run_task_object", _spy)
+
+    bound_sandboxes: list[Path] = []
+
+    def _factory(sandbox: Path):
+        bound_sandboxes.append(sandbox)
+
+        def _probe() -> object:
+            return "sentinel-token"
+
+        return _probe
+
+    policy_file = tmp_path / "flywheel.toml"
+    policy_file.write_text(
+        '[source]\nkind = "directory"\n'
+        "[worker]\ncheckpoint_nudge_seconds = 0\n",
+        encoding="utf-8",
+    )
+    policy = load_policy(policy_file)
+
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+
+    report = asyncio.run(
+        orchestrate(
+            tasks_dir=tmp_path / "tasks",
+            policy=policy,
+            db_path=tmp_path / "flywheel.sqlite",
+            sandbox_root=tmp_path / "sandboxes",
+            invoke=_always_verify(),
+            max_retries=0,
+            max_turns=4,
+            stream=io.StringIO(),
+            progress_probe_factory=_factory,
+        )
+    )
+
+    assert [r.status for r in report.runs] == [Status.DONE]
+    assert len(captured) == 1
+    # The disabled threshold (0) flows through verbatim -- the harness, not the
+    # orchestrator, decides the nudge is off.
+    assert captured[0]["checkpoint_nudge_seconds"] == 0.0
+    # The factory was bound per-run over the run's own sandbox path...
+    assert bound_sandboxes == [tmp_path / "sandboxes" / "solo"]
+    # ...and its bound closure is the probe threaded onto the harness config.
+    probe = captured[0]["checkpoint_progress_probe"]
+    assert probe is not None and probe() == "sentinel-token"
+
+
+def test_checkpoint_nudge_defaults_on_and_probe_dormant_without_factory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A library caller (no policy, no probe factory) still threads the
+    default-on 300.0 threshold, but the probe stays ``None`` so the nudge is
+    dormant -- byte-for-byte today's behavior."""
+    import flywheel_orchestrator._orchestrate as orch
+
+    captured: list[dict] = []
+    # ``getattr`` (not ``orch.run_task_object``) reads the re-exported core
+    # entry point without tripping pyright's reportPrivateImportUsage; the spy
+    # captures the harness kwargs then delegates to the real driver.
+    real = getattr(orch, "run_task_object")
+
+    async def _spy(task, **kwargs):
+        captured.append(kwargs)
+        return await real(task, **kwargs)
+
+    monkeypatch.setattr(orch, "run_task_object", _spy)
+
+    phase = tmp_path / "tasks" / "active" / "01-phase"
+    _write_task(phase, "solo")
+
+    report = _orchestrate(tmp_path, _always_verify())
+
+    assert [r.status for r in report.runs] == [Status.DONE]
+    assert len(captured) == 1
+    assert captured[0]["checkpoint_nudge_seconds"] == 300.0
+    assert captured[0]["checkpoint_progress_probe"] is None

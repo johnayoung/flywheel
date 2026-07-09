@@ -1421,6 +1421,116 @@ def test_worker_concurrency_carries_on_github_policy(tmp_path: Path) -> None:
     assert policy.worker_concurrency == 3
 
 
+# --- [worker] checkpoint_nudge_seconds (checkpoint-nudge wiring) -------------
+
+
+def test_worker_checkpoint_nudge_defaults_when_table_absent(
+    tmp_path: Path,
+) -> None:
+    """No [worker] table yields the default-on 300.0 threshold (the retro loss
+    came from this nudge not existing, so it stays on by default)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.worker_checkpoint_nudge_seconds == 300.0
+
+
+def test_worker_checkpoint_nudge_defaults_when_key_absent(
+    tmp_path: Path,
+) -> None:
+    """A [worker] table present but no checkpoint_nudge_seconds key yields the
+    default 300.0."""
+    policy = load_policy(
+        _write(tmp_path, '[source]\nkind = "directory"\n[worker]\n')
+    )
+    assert policy.worker_checkpoint_nudge_seconds == 300.0
+
+
+def test_worker_checkpoint_nudge_parses_float(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\ncheckpoint_nudge_seconds = 120.5\n",
+        )
+    )
+    assert policy.worker_checkpoint_nudge_seconds == 120.5
+
+
+def test_worker_checkpoint_nudge_accepts_integer(tmp_path: Path) -> None:
+    """A TOML integer coerces to float (900 -> 900.0), like other float keys."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\ncheckpoint_nudge_seconds = 900\n",
+        )
+    )
+    assert policy.worker_checkpoint_nudge_seconds == 900.0
+
+
+def test_worker_checkpoint_nudge_zero_disables(tmp_path: Path) -> None:
+    """``0`` is a valid disable value that flows through as 0.0 (not the
+    default): the disabled threshold is what the worker threads to the harness.
+    """
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n'
+            "[worker]\ncheckpoint_nudge_seconds = 0\n",
+        )
+    )
+    assert policy.worker_checkpoint_nudge_seconds == 0.0
+
+
+def test_worker_checkpoint_nudge_rejects_non_number(tmp_path: Path) -> None:
+    with pytest.raises(
+        PolicyError, match="worker.checkpoint_nudge_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[worker]\ncheckpoint_nudge_seconds = "soon"\n',
+            )
+        )
+
+
+def test_worker_checkpoint_nudge_rejects_boolean(tmp_path: Path) -> None:
+    """A TOML boolean is rejected (bool is an int subclass; ``= true`` is a
+    typo, never 1.0)."""
+    with pytest.raises(
+        PolicyError, match="worker.checkpoint_nudge_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                "[worker]\ncheckpoint_nudge_seconds = true\n",
+            )
+        )
+
+
+def test_worker_checkpoint_nudge_carries_on_github_policy(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "github"',
+                    'repo = "octo/widgets"',
+                    'label = "flywheel"',
+                    "[worker]",
+                    "checkpoint_nudge_seconds = 42.0",
+                ]
+            ),
+        )
+    )
+    assert policy.source_kind == "github"
+    assert policy.worker_checkpoint_nudge_seconds == 42.0
+
+
 # --- attempt budgets: [deadlines] + rubric_judge_max_turns (spec 00066) ------
 
 

@@ -21,7 +21,7 @@ One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (
 | `[[defaults.graders]]` | no | default graders for tracker work items | [task-schema.md](task-schema.md) |
 | `[store]` | no | persistence backend (sqlite/postgres) | this doc |
 | `[execution]` | no | mode (local/distributed) + advertised capabilities | [orchestration.md](orchestration.md) |
-| `[worker]` | no | worker pool size (concurrency) | this doc |
+| `[worker]` | no | worker pool size (concurrency), checkpoint-nudge threshold | this doc |
 | `[submit]` | no | how DONE work lands (strategy, protected paths) | [strategy.md](strategy.md) |
 | `[phase]` | no | phase-exit verify gate | this doc |
 | `[held_out]` | no | execute-time held-out landing gate | [held-out-gate.md](held-out-gate.md) |
@@ -129,13 +129,16 @@ Distribution and capability matching. See [orchestration.md](orchestration.md).
 
 ## `[worker]` (optional)
 
-Worker pool size for a single `flywheel worker` invocation.
+Worker pool size and checkpoint-nudge threshold for a single `flywheel worker` invocation.
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `concurrency` | int (>=1 once resolved) | `1` | how many tasks one `flywheel worker` invocation drives concurrently |
+| `checkpoint_nudge_seconds` | float (>= 0) | `300.0` | remaining wall time to a task's `AGENT_ITERATION` deadline at which the harness nudges the agent to commit work-in-progress, when its branch has gained no new commit; `0` disables |
 
 `--concurrency` overrides this value per-run (flag wins). An absent `[worker]` table means `concurrency = 1` — single serial worker, today's behavior byte-for-byte. A resolved value below `1` (e.g. `--concurrency 0`, a negative, or a non-integer flag) is a hard error: the worker exits non-zero naming the setting and claims no task (`_resolve_concurrency`, `worker.py`). The `< 1` range is *not* checked at load time because the flag can override the config, so a config of `0` with `--concurrency 3` is valid.
+
+`checkpoint_nudge_seconds` is **default-on**: an absent `[worker]` table still nudges (300s), because the retro loss came from this behavior not existing. The worktree worker binds a git progress probe per run — the nudge fires at most once, only when the sandbox branch has no new commit as the deadline nears, and never moves the deadline (the iteration is still cancelled at its ceiling). The threshold is measured against the resolved `AGENT_ITERATION` ceiling, so `[deadlines]` operator overrides flow through automatically. `0` disables the nudge. The container backend does not wire the probe (nudge dormant there).
 
 ## `[submit]` (optional)
 

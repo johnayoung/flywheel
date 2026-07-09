@@ -126,6 +126,7 @@ from flywheel_orchestrator._held_out_gate import (
     evaluate_held_out_gate,
 )
 from flywheel_orchestrator._policy import (
+    DEFAULT_CHECKPOINT_NUDGE_SECONDS,
     SandboxPolicy,
     WorkPolicy,
     resolve_grader_env,
@@ -2089,6 +2090,29 @@ def _attempt_budget_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     )
 
 
+def _checkpoint_nudge_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
+    """Decompose the ``[worker] checkpoint_nudge_seconds`` threshold into the
+    primitive the worker threads into ``run_task_object`` (checkpoint-nudge
+    wiring).
+
+    The nudge mirror of :func:`_attempt_budget_primitives`: only the plain
+    ``float`` threshold crosses into core, keeping the git progress probe (a
+    separate ``orchestrate`` parameter, supplied by the worker) and the
+    optional-SDK boundary intact. A ``None`` policy (library callers) or an
+    absent ``[worker] checkpoint_nudge_seconds`` decomposes the default-on
+    :data:`~flywheel_orchestrator._policy.DEFAULT_CHECKPOINT_NUDGE_SECONDS`
+    (``300.0``), matching the harness default; a policy ``0`` disables the
+    nudge and that disabled value is what reaches the harness.
+    """
+    if policy is None:
+        return dict(
+            checkpoint_nudge_seconds=DEFAULT_CHECKPOINT_NUDGE_SECONDS
+        )
+    return dict(
+        checkpoint_nudge_seconds=policy.worker_checkpoint_nudge_seconds
+    )
+
+
 def _apply_handle(
     handle: SandboxHandle,
     sandbox_primitives: dict[str, Any],
@@ -2148,6 +2172,8 @@ async def orchestrate(
     prereq_redrive_bound: int = DEFAULT_PREREQ_REDRIVE_BOUND,
     repo_root: Path | None = None,
     held_out_source: HeldOutGraderSource | None = None,
+    progress_probe_factory: Callable[[Path], Callable[[], object]]
+    | None = None,
 ) -> OrchestratorReport:
     """Drive every eligible task from the work source to quiescence.
 
@@ -2246,6 +2272,18 @@ async def orchestrate(
     created path no longer blocks.) ``None`` (the default for library callers)
     disables the gate, preserving prior behavior.
 
+    ``progress_probe_factory`` wires the checkpoint-nudge git progress probe
+    (checkpoint-nudge wiring). It is the git-aware consumer's factory: given a
+    run's sandbox path it returns the opaque, git-free progress-probe closure
+    (an equal token across two calls means "no new commit since the iteration
+    began") the harness's nudge consults. The orchestrator binds it PER RUN
+    over that run's sandbox -- exactly as it binds ``landability_gate`` -- so
+    two concurrent pool members' probes never observe each other's sandboxes,
+    and stays git-unaware: the closure is opaque here. ``None`` (the default,
+    every library caller and the container backend) leaves the nudge dormant.
+    The threshold itself rides ``policy`` (``[worker]
+    checkpoint_nudge_seconds``), not this parameter.
+
     ``held_out_source`` enables the execute-time held-out landing gate (spec
     00050): after a task's run finalizes with the landing status (``DONE``) and
     while its lease is still held, the orchestrator loads that task's
@@ -2290,6 +2328,7 @@ async def orchestrate(
     sandbox_primitives = _sandbox_agent_primitives(policy)
     limit_primitives = _sandbox_limit_primitives(policy)
     budget_primitives = _attempt_budget_primitives(policy)
+    nudge_primitives = _checkpoint_nudge_primitives(policy)
 
     def resolve_sandbox(
         row: TaskStatusRow,
@@ -2636,6 +2675,8 @@ async def orchestrate(
                         **drive_primitives,
                         **limit_primitives,
                         **budget_primitives,
+                        **nudge_primitives,
+                        progress_probe_factory=progress_probe_factory,
                         stream=stream,
                         now=clock,
                     )
@@ -2959,6 +3000,8 @@ async def orchestrate(
                     **drive_primitives,
                     **limit_primitives,
                     **budget_primitives,
+                    **nudge_primitives,
+                    progress_probe_factory=progress_probe_factory,
                     stream=stream,
                     now=clock,
                 )
@@ -3286,6 +3329,7 @@ async def _drive_under_lease(
     sandbox: Path,
     submit: Submitter | None,
     landability_probe: object | None,
+    progress_probe_factory: Callable[[Path], Callable[[], object]] | None,
     teardown: Callable[[], None] | None,
     work_source: WorkSource,
     held_out_source: HeldOutGraderSource | None,
@@ -3313,6 +3357,7 @@ async def _drive_under_lease(
     wall_clock_seconds: int,
     deadlines: DeadlineConfig | None,
     rubric_judge_max_turns: int | None,
+    checkpoint_nudge_seconds: float,
     stream: TextIO | None,
     now: Callable[[], datetime],
 ) -> RunRecord:
@@ -3384,6 +3429,20 @@ async def _drive_under_lease(
             return None
         return verdict.reason or "no landable change"
 
+    # Checkpoint-nudge progress probe (checkpoint-nudge wiring): bind the
+    # consumer's git-free probe factory over THIS run's sandbox, exactly as
+    # ``_landability_gate`` binds over it above. The per-run binding is the
+    # isolation guarantee -- two concurrent pool members' probes each read
+    # their own sandbox's HEAD, never a peer's. ``None`` factory (library
+    # callers, the container backend) leaves the probe unset so the harness
+    # nudge stays dormant. The orchestrator stays git-unaware: the returned
+    # closure is opaque here and simply forwarded onto the harness config.
+    checkpoint_progress_probe = (
+        progress_probe_factory(sandbox)
+        if progress_probe_factory is not None
+        else None
+    )
+
     heartbeat = _ClaimHeartbeat(
         claims=claims,
         claim=claim,
@@ -3423,6 +3482,8 @@ async def _drive_under_lease(
             landability_gate=(
                 _landability_gate if landability_probe is not None else None
             ),
+            checkpoint_nudge_seconds=checkpoint_nudge_seconds,
+            checkpoint_progress_probe=checkpoint_progress_probe,
         )
         # A sustained heartbeat stall can let a peer's lease sweep steal this
         # claim and finalize the lifecycle out from under us while the run was

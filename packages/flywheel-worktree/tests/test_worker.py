@@ -1533,3 +1533,75 @@ def test_prepare_setup_failure_raises(tmp_path: Path) -> None:
         raised = True
         assert "broken-env" in str(exc)
     assert raised
+
+
+# --- checkpoint-nudge git progress probe (checkpoint-nudge wiring) ----------
+
+
+def test_checkpoint_nudge_probe_token_stable_without_new_commit(
+    tmp_path: Path,
+) -> None:
+    """A sandbox whose branch gains no new commit yields a STABLE token, so the
+    harness reads "no new progress since the iteration began" -> nudge-eligible.
+    The token is the resolved HEAD revision."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    probe = worker._git_progress_probe(repo)
+
+    first = probe()
+    second = probe()
+
+    assert first == second
+    assert first == _rev(repo, "HEAD")
+
+
+def test_checkpoint_nudge_probe_token_changes_after_commit(
+    tmp_path: Path,
+) -> None:
+    """A new commit moves HEAD, so the token changes -> the harness reads
+    "new progress" and the nudge is NOT eligible."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    probe = worker._git_progress_probe(repo)
+
+    before = probe()
+    _commit(repo, "wip.txt", "work", "checkpoint")
+    after = probe()
+
+    assert before != after
+    assert after == _rev(repo, "HEAD")
+
+
+def test_checkpoint_nudge_probe_contained_on_missing_worktree(
+    tmp_path: Path,
+) -> None:
+    """A git failure (a non-repo / deleted worktree) makes the probe RAISE, so
+    the harness's ``_safe_probe`` contains it and simply skips the nudge -- a
+    broken probe never fires on a false "no progress" signal and never unwinds
+    the run. (Returning a stable sentinel would wrongly read as "no progress".)
+    """
+    missing = tmp_path / "not-a-repo"
+    missing.mkdir()
+    probe = worker._git_progress_probe(missing)
+
+    with pytest.raises(worker.GitError):
+        probe()
+
+
+def test_checkpoint_nudge_probe_binds_per_sandbox(tmp_path: Path) -> None:
+    """The factory binds one probe per sandbox: two probes read only their own
+    sandbox's HEAD, never each other's -- the isolation guarantee for two
+    concurrent pool members."""
+    repo_a = tmp_path / "a"
+    repo_b = tmp_path / "b"
+    _init_repo(repo_a)
+    _init_repo(repo_b)
+    # Advance b so the two sandboxes hold distinct HEADs.
+    _commit(repo_b, "b.txt", "b", "b-work")
+
+    probe_a = worker._git_progress_probe(repo_a)
+    probe_b = worker._git_progress_probe(repo_b)
+
+    assert probe_a() == _rev(repo_a, "HEAD")
+    assert probe_b() == _rev(repo_b, "HEAD")
+    assert probe_a() != probe_b()

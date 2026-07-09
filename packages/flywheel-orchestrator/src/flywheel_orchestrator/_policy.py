@@ -172,6 +172,12 @@ _EXECUTION_MODES: tuple[str, ...] = ("local", "distributed")
 #: serial worker — today's behavior byte-for-byte; spec 00060, D-1).
 DEFAULT_WORKER_CONCURRENCY: int = 1
 
+#: Default checkpoint-nudge threshold (seconds) when [worker] omits
+#: ``checkpoint_nudge_seconds``. Default-on (300.0) so an iteration nearing its
+#: AGENT_ITERATION deadline with no new commits is nudged to checkpoint; ``0``
+#: disables the nudge. Mirrors :attr:`flywheel_core.harness.HarnessConfig.checkpoint_nudge_seconds`.
+DEFAULT_CHECKPOINT_NUDGE_SECONDS: float = 300.0
+
 #: Default turn ceiling for the merge strategy's bounded conflict-resolution
 #: session when [submit] omits ``recovery_agent_max_turns``. ``0`` disables the
 #: rung entirely (a merge conflict parks exactly as merge-fallback does).
@@ -442,6 +448,14 @@ class WorkPolicy:
     the flag overrides the config, a sub-1 value is only an error once it
     is the *resolved* pool size (D-4), so the worker validates the resolved
     value, not this field.
+    ``worker_checkpoint_nudge_seconds`` mirrors the optional ``[worker]
+    checkpoint_nudge_seconds`` key -- the remaining-wall-time threshold the
+    worker threads into the harness's checkpoint-nudge seam (the
+    :class:`~flywheel_core.harness.HarnessConfig` knob of the same name). It
+    defaults to ``300.0`` (default-on: an absent ``[worker]`` table still
+    nudges an iteration nearing its ``AGENT_ITERATION`` deadline on a branch
+    with no new commits); ``0`` disables the nudge. The concrete git progress
+    probe is supplied by the worker, not this policy.
     ``submit_base`` is the explicit
     landing/phase-base branch; ``None`` falls back to the checked-out
     branch (back-compat), mirroring ``submit_pr_base``. ``sandbox_setup``
@@ -481,6 +495,7 @@ class WorkPolicy:
     execution_mode: str = "local"
     execution_capabilities: frozenset[str] = frozenset()
     worker_concurrency: int = DEFAULT_WORKER_CONCURRENCY
+    worker_checkpoint_nudge_seconds: float = DEFAULT_CHECKPOINT_NUDGE_SECONDS
     protected_paths: tuple[str, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
@@ -611,7 +626,9 @@ def load_policy(path: Path) -> WorkPolicy:
     worker = data.get("worker") or {}
     if not isinstance(worker, dict):
         raise PolicyError(f"{path}: [worker] must be a table")
-    worker_concurrency = _optional_worker(worker, policy_file=path)
+    worker_concurrency, worker_checkpoint_nudge_seconds = _optional_worker(
+        worker, policy_file=path
+    )
 
     if kind == "directory":
         raw_dir = source.get("tasks_dir")
@@ -633,6 +650,7 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
+            worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -678,6 +696,7 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
+            worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -717,6 +736,7 @@ def load_policy(path: Path) -> WorkPolicy:
             execution_mode=execution_mode,
             execution_capabilities=execution_capabilities,
             worker_concurrency=worker_concurrency,
+            worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
             protected_paths=protected_paths,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
@@ -768,6 +788,7 @@ def load_policy(path: Path) -> WorkPolicy:
         execution_mode=execution_mode,
         execution_capabilities=execution_capabilities,
         worker_concurrency=worker_concurrency,
+        worker_checkpoint_nudge_seconds=worker_checkpoint_nudge_seconds,
         protected_paths=protected_paths,
         submit_strategy=submit_strategy,
         submit_remote=submit_remote,
@@ -1016,28 +1037,44 @@ def _optional_execution_capabilities(
     return frozenset(value)
 
 
-def _optional_worker(table: dict, *, policy_file: Path) -> int:
-    """Validate and return the optional ``[worker] concurrency`` value.
+def _optional_worker(table: dict, *, policy_file: Path) -> tuple[int, float]:
+    """Validate the optional ``[worker]`` table, returning
+    ``(concurrency, checkpoint_nudge_seconds)``.
 
-    Returns ``1`` (the :data:`DEFAULT_WORKER_CONCURRENCY` single-serial-worker
-    default) when the section (or the ``concurrency`` key) is absent so every
-    pre-existing policy file keeps today's behavior byte-for-byte. A non-integer
-    value (including a TOML boolean) raises :class:`PolicyError` naming
-    ``worker.concurrency`` so a typo never silently degrades the pool size.
+    ``concurrency`` returns ``1`` (the :data:`DEFAULT_WORKER_CONCURRENCY`
+    single-serial-worker default) when the section (or the ``concurrency`` key)
+    is absent so every pre-existing policy file keeps today's behavior
+    byte-for-byte. A non-integer value (including a TOML boolean) raises
+    :class:`PolicyError` naming ``worker.concurrency`` so a typo never silently
+    degrades the pool size.
 
     The ``< 1`` range check is deliberately NOT enforced here: ``--concurrency``
     overrides this config value (spec 00060, D-1), so a sub-1 config is only an
     error once it is the *resolved* pool size (decision D-4, validated by the
     worker). A config of ``0`` with ``--concurrency 3`` is valid, so rejecting
     ``0`` at load time would be wrong.
+
+    ``checkpoint_nudge_seconds`` returns :data:`DEFAULT_CHECKPOINT_NUDGE_SECONDS`
+    (``300.0``, default-on) when the section or the key is absent -- the retro
+    loss came from this nudge not existing, so it stays on by default. ``0``
+    disables the nudge; a non-number raises :class:`PolicyError` naming
+    ``worker.checkpoint_nudge_seconds``.
     """
-    return _override_int(
+    concurrency = _override_int(
         table,
         "concurrency",
         DEFAULT_WORKER_CONCURRENCY,
         path="worker.concurrency",
         policy_file=policy_file,
     )
+    checkpoint_nudge_seconds = _override_float(
+        table,
+        "checkpoint_nudge_seconds",
+        DEFAULT_CHECKPOINT_NUDGE_SECONDS,
+        path="worker.checkpoint_nudge_seconds",
+        policy_file=policy_file,
+    )
+    return concurrency, checkpoint_nudge_seconds
 
 
 def _optional_protected_paths(
@@ -1829,6 +1866,7 @@ def build_work_source(
 
 
 __all__ = [
+    "DEFAULT_CHECKPOINT_NUDGE_SECONDS",
     "DEFAULT_POLICY_FILENAME",
     "DEFAULT_WORKER_CONCURRENCY",
     "PolicyError",

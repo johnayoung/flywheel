@@ -349,6 +349,34 @@ def _git(
     return proc
 
 
+def _git_progress_probe(sandbox: Path) -> Callable[[], object]:
+    """Build the checkpoint-nudge progress probe bound to ``sandbox``.
+
+    Git awareness lives ONLY here (the landability-probe discipline, spec
+    00061): the orchestrator and core treat the returned closure as an opaque
+    token source. The token is the sandbox branch's resolved HEAD revision, so
+    it changes IFF a new commit lands -- the harness captures it at iteration
+    start and an equal token at nudge-check time means "no new commit since the
+    iteration began" (nudge-eligible). A fresh worktree with zero commits past
+    its base holds a stable HEAD, so it stays nudge-eligible until the agent
+    commits.
+
+    The probe RAISES on any git failure (a deleted/missing worktree, a non-repo
+    dir): the harness's ``_safe_probe`` contains that raise and simply skips the
+    nudge, so a broken probe never fires on a false "no progress" signal and
+    never unwinds the run. Returning a stable sentinel instead would read as
+    "no progress" and wrongly arm the nudge -- so failure must raise.
+
+    Bound per-run over one sandbox, so two concurrent pool members' probes read
+    only their own sandbox's HEAD, never a peer's.
+    """
+
+    def _probe() -> object:
+        return _git(sandbox, "rev-parse", "HEAD", check=True).stdout.strip()
+
+    return _probe
+
+
 @contextlib.contextmanager
 def merge_lock(lock_path: Path) -> Iterator[None]:
     """Exclusive cross-process lock around base-branch mutations. Per-task
@@ -2328,6 +2356,12 @@ def run_once(
     times before its strand is routed to the human-review queue. It defaults to
     ``DEFAULT_LANDING_REDRIVE_BOUND`` because the worker always drives a
     landability-probing git strategy; pass ``None``/``0`` to disable.
+
+    The git checkpoint-nudge probe factory (:func:`_git_progress_probe`) is
+    always handed to ``orchestrate``, which binds it per-run over each task's
+    sandbox; the harness nudges an iteration nearing its ``AGENT_ITERATION``
+    deadline on a branch with no new commits (threshold from ``[worker]
+    checkpoint_nudge_seconds``, default-on at 300s).
     """
     log = log or submitter.log
     record_phase_bases(
@@ -2352,6 +2386,7 @@ def run_once(
             stream=stream,
             repo_root=submitter.repo_root,
             held_out_source=held_out_source,
+            progress_probe_factory=_git_progress_probe,
         )
     )
     # Under the same merge_lock record_phase_bases and the FF-merge path use:

@@ -33,6 +33,7 @@ from flywheel_core.workflow import main as _core_main
 from flywheel_orchestrator import (
     PolicyError,
     load_effective_policy,
+    open_sqlite_bound_store,
     resolve_db_path,
 )
 from flywheel_orchestrator._autopilot_run import main as _autopilot_main
@@ -133,6 +134,51 @@ def _delegate_audit(rest: list[str]) -> int:
     return _audit_main(["--db", str(db_path), *rest])
 
 
+def _delegate_producer(core_argv: list[str]) -> int:
+    """Forward a producer verb to core, injecting the policy-selected store.
+
+    The core producer verbs (interrupt/steer/set-model/approve/reject)
+    enqueue a control command. Core opens a :class:`SqliteStore` at the
+    resolved ``--db`` by default; under a postgres ``[store]`` policy that
+    would persist the command to the wrong backend and dual-write a stray
+    sqlite file. So when the effective policy selects a non-sqlite backend,
+    build that store here -- the layer that owns policy and the DSN
+    environment -- and inject it through core's ``store`` seam (spec
+    00075), so the command lands in postgres.
+
+    A sqlite policy (or no policy) forwards untouched: the default path
+    stays byte-identical, ``--db`` semantics and all. A bare ``--help``
+    forwards untouched too so help never requires a store (or a database
+    connection). Postgres fail-fast configuration errors -- no DSN, a
+    missing extra -- surface as the factory's :class:`StoreConfigError`
+    (a :class:`PolicyError` subclass): printed to stderr, exit 2, never a
+    silent sqlite fallback.
+    """
+    if any(a in ("-h", "--help") for a in core_argv[1:]):
+        return _core_main(core_argv)
+    try:
+        policy = load_effective_policy(None)
+    except PolicyError as exc:
+        print(f"{_PROG}: policy error: {exc}", file=sys.stderr)
+        return 2
+    backend = policy.store_backend if policy is not None else "sqlite"
+    if backend == "sqlite":
+        # Byte-identical default: core resolves --db and opens its own
+        # SqliteStore exactly as before.
+        return _core_main(core_argv)
+    db_path = resolve_db_path(None, policy=policy)
+    try:
+        store = open_sqlite_bound_store(policy, db_path=db_path)
+    except PolicyError as exc:
+        # StoreConfigError (no DSN / missing extra) subclasses PolicyError.
+        print(f"{_PROG}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return _core_main(core_argv, store=store)
+    finally:
+        store.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Route ``flywheel <verb> ...`` (or ``fw <verb> ...``) to the
     pre-existing implementation.
@@ -165,10 +211,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if verb in _ORCHESTRATOR_VERBS:
         return _orchestrator_main([verb, *rest])
     if verb in _CORE_VERBS:
-        return _core_main([verb, *rest])
+        # Producer verbs enqueue a control command; route through the
+        # store-injecting delegate so a postgres [store] policy lands the
+        # command in postgres instead of a stray sqlite file.
+        return _delegate_producer([verb, *rest])
     if verb == _SAY_VERB:
         # Surface name rename: the shell's 'say' is core's 'steer' verb.
-        return _core_main([_CORE_STEER_VERB, *rest])
+        return _delegate_producer([_CORE_STEER_VERB, *rest])
     if verb == _WORKER_VERB:
         # In-process delegation to the git-worktree daemon loop in
         # :mod:`flywheel_worktree.worker` (spec constraint: no shell-out).

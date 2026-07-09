@@ -1183,16 +1183,28 @@ def _enqueue_control_command(
     run_id: str,
     kind: str,
     payload: Mapping[str, Any],
+    *,
+    store: RunStore | None = None,
 ) -> int:
-    """Persist one control command into ``db_path`` and report the id.
+    """Persist one control command into the store and report the id.
 
     Returns ``0`` after printing the enqueue receipt (``<id> kind=...``)
     plus, when the lifecycle is not currently in-flight, a stderr note
     explaining the row stays pending per claim semantics. An unknown
-    ``run_id`` is a producer-side error: the SQLite backend enforces the
-    foreign key on ``lifecycles(run_id)``, so we surface that as exit
-    code ``2`` with a clear message rather than crash on the
-    :class:`sqlite3.IntegrityError`.
+    ``run_id`` is a producer-side error: ``load_lifecycle`` returns
+    ``None`` for it on every backend, so we surface that as exit code
+    ``2`` with a clear message and enqueue nothing.
+
+    ``store`` injects the persistence backend the command lands in (the
+    same seam :func:`run_task_object` uses for spec 00075). ``None`` (the
+    default) opens the byte-for-byte-unchanged :class:`SqliteStore` at
+    ``db_path`` -- creating ``db_path.parent`` and closing the store on
+    exit -- so ``python -m flywheel_core.workflow`` stays sqlite-pinned.
+    When a store is supplied (the product shell resolves it from the
+    ``[store]`` policy so a postgres backend lands the command in
+    postgres) this call opens no SqliteStore and creates no sqlite file at
+    ``db_path`` at all: the enqueue lands in the injected object and the
+    caller owns its lifetime (this function never closes it).
 
     ``approve`` / ``reject`` are out-of-band verbs that target a
     correctly-parked ``AWAITING_APPROVAL`` lifecycle (the
@@ -1202,10 +1214,21 @@ def _enqueue_control_command(
     operator who runs ``flywheel approve`` against a parked run does not
     see the stale-pending warning.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(db_path)
+    # Store injection (spec 00075): a caller-supplied store owns the
+    # enqueue and this call opens no SqliteStore and creates no sqlite file
+    # at db_path. With no store the sqlite default is byte-for-byte as
+    # before -- creating db_path.parent and closing the store on exit. Only
+    # a store we opened here is ours to close in the finally.
+    owned: SqliteStore | None = None
+    backend: RunStore
+    if store is None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        owned = SqliteStore(db_path)
+        backend = owned
+    else:
+        backend = store
     try:
-        lifecycle = store.load_lifecycle(run_id)
+        lifecycle = backend.load_lifecycle(run_id)
         if lifecycle is None:
             print(
                 f"error: run {run_id!r} is unknown to this store; "
@@ -1218,11 +1241,12 @@ def _enqueue_control_command(
         else:
             in_flight_statuses = (Status.RUNNING, Status.VALIDATING)
         in_flight = lifecycle.status in in_flight_statuses
-        record = store.enqueue_command(
+        record = backend.enqueue_command(
             run_id, kind, payload, now=datetime.now(timezone.utc)
         )
     finally:
-        store.close()
+        if owned is not None:
+            owned.close()
     print(f"enqueued #{record.id} kind={kind} run_id={run_id}")
     if not in_flight:
         status_value = lifecycle.status.value
@@ -1245,7 +1269,11 @@ def _cmd_interrupt(args: argparse.Namespace) -> int:
     store-triggered origin in the audit stream.
     """
     return _enqueue_control_command(
-        _resolve_db(args.db), args.run_id, "interrupt", {}
+        _resolve_db(args.db),
+        args.run_id,
+        "interrupt",
+        {},
+        store=getattr(args, "injected_store", None),
     )
 
 
@@ -1261,7 +1289,11 @@ def _cmd_steer(args: argparse.Namespace) -> int:
         print("error: steer message must be non-empty", file=sys.stderr)
         return 2
     return _enqueue_control_command(
-        _resolve_db(args.db), args.run_id, "say", {"text": text}
+        _resolve_db(args.db),
+        args.run_id,
+        "say",
+        {"text": text},
+        store=getattr(args, "injected_store", None),
     )
 
 
@@ -1277,6 +1309,7 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
         args.run_id,
         "set_model",
         {"model": args.model},
+        store=getattr(args, "injected_store", None),
     )
 
 
@@ -1293,7 +1326,11 @@ def _cmd_approve(args: argparse.Namespace) -> int:
     correctly-parked run.
     """
     return _enqueue_control_command(
-        _resolve_db(args.db), args.run_id, "approve", {}
+        _resolve_db(args.db),
+        args.run_id,
+        "approve",
+        {},
+        store=getattr(args, "injected_store", None),
     )
 
 
@@ -1312,7 +1349,11 @@ def _cmd_reject(args: argparse.Namespace) -> int:
     if args.feedback is not None:
         payload["feedback"] = args.feedback
     return _enqueue_control_command(
-        _resolve_db(args.db), args.run_id, "reject", payload
+        _resolve_db(args.db),
+        args.run_id,
+        "reject",
+        payload,
+        store=getattr(args, "injected_store", None),
     )
 
 
@@ -1531,9 +1572,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(
+    argv: Iterable[str] | None = None,
+    *,
+    store: RunStore | None = None,
+) -> int:
+    """Parse ``argv`` and dispatch one core verb.
+
+    ``store`` injects the persistence backend the producer verbs
+    (interrupt/steer/set-model/approve/reject) enqueue their control
+    command into. It rides onto the parsed namespace as
+    ``injected_store`` so the verb handlers reach it without a wider
+    signature. ``None`` (the default, and the only value
+    ``python -m flywheel_core.workflow`` ever passes) keeps every verb
+    sqlite-pinned and byte-for-byte unchanged; the product shell passes a
+    policy-selected store so a postgres ``[store]`` backend lands the
+    command in postgres rather than a stray sqlite file.
+    """
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    args.injected_store = store
     try:
         return int(args.func(args))
     except TaskLoadError as exc:

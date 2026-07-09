@@ -1310,6 +1310,314 @@ class TestTransientRateLimitRetry:
         assert exhausted[0].payload["invocations"] == transient_budget + 1
 
 
+# --- Session-limit fast-abort --------------------------------------------
+
+
+def _rejected_event_with_reset(reset_epoch: int) -> RateLimitEvent:
+    """A ``rejected`` rate-limit event carrying a specific ``resets_at``."""
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="rejected",
+            resets_at=reset_epoch,
+            rate_limit_type="five_hour",
+            utilization=1.0,
+        ),
+        uuid="evt-reject",
+        session_id="sess-1",
+    )
+
+
+class TestSessionLimitFastAbort:
+    """A session-limit refusal whose reset is derivable AND still in the
+    future finalizes the attempt after exactly ONE invocation through the
+    TRANSIENT INTERNAL_ERROR route, surfaces the reset structurally on the
+    HarnessOutcome, and emits ``harness.session_limit`` -- while a None or
+    already-past reset preserves today's transient-retry behavior.
+    """
+
+    _NOW = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+    _FUTURE_RESET = datetime(2026, 7, 9, 18, 0, tzinfo=timezone.utc)
+
+    def _passing_task(self) -> Task:
+        return Task(
+            goal="g",
+            graders=[
+                CommandGrader(
+                    run=f"{sys.executable} -c 'raise SystemExit(0)'",
+                    name="ok",
+                )
+            ],
+        )
+
+    def _session_events(
+        self, sink: _ListSink, run_id: str
+    ) -> list[TelemetryRecord]:
+        return [
+            e
+            for e in sink.events(run_id)
+            if e.kind == "harness.session_limit"
+        ]
+
+    def test_session_limit_rejected_event_future_reset_fast_aborts(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-session-reject")
+        reset_epoch = int(self._FUTURE_RESET.timestamp())
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=MissingEnvelope(),
+                    transcript="rate limited",
+                    signals=_make_signals(
+                        api_error_status=None,
+                        rate_limit_events=(
+                            _rejected_event_with_reset(reset_epoch),
+                        ),
+                    ),
+                )
+            ]
+        )
+        delays: list[float] = []
+
+        async def _sleep(delay: float) -> None:
+            delays.append(delay)
+
+        config = HarnessConfig(
+            max_retries=0, max_transient_retries=3, transient_sleep=_sleep
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+                now=lambda: self._NOW,
+            )
+        )
+
+        # Exactly ONE invocation -- no transient re-invocation, no backoff.
+        assert len(invoke.calls) == 1  # type: ignore[attr-defined]
+        assert delays == []
+        # Finalized through the TRANSIENT-classified INTERNAL_ERROR route.
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        assert outcome.lifecycle.status == Status.FAILED
+        # The reset crosses the seam structurally on the outcome.
+        assert outcome.session_limit_reset == self._FUTURE_RESET
+        # A distinct event; no transient-retry / -exhausted churn.
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
+        assert "harness.transient_retry" not in kinds
+        assert "harness.transient_exhausted" not in kinds
+        session = self._session_events(sink, lifecycle.run_id)
+        assert len(session) == 1
+        payload = session[0].payload
+        assert payload["reset_at"] == self._FUTURE_RESET.isoformat()
+        assert payload["source"] == "rate_limit_event"
+        assert payload["classification"] == "transient"
+
+    def test_session_limit_pipe_epoch_transcript_fast_aborts(self) -> None:
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-session-pipe")
+        reset_epoch = int(self._FUTURE_RESET.timestamp())
+        transcript = f"Claude AI usage limit reached|{reset_epoch}"
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=MissingEnvelope(),
+                    transcript=transcript,
+                    # A 429 status makes it a transient-rate-limit iteration;
+                    # the reset is derived from the transcript, not the event.
+                    signals=_make_signals(api_error_status=429),
+                )
+            ]
+        )
+        delays: list[float] = []
+
+        async def _sleep(delay: float) -> None:
+            delays.append(delay)
+
+        config = HarnessConfig(
+            max_retries=0, max_transient_retries=3, transient_sleep=_sleep
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+                now=lambda: self._NOW,
+            )
+        )
+
+        assert len(invoke.calls) == 1  # type: ignore[attr-defined]
+        assert delays == []
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        assert outcome.session_limit_reset == self._FUTURE_RESET
+        # Forensics: the fast-abort still records the iteration transcript.
+        assert outcome.lifecycle.agent_output == transcript
+        session = self._session_events(sink, lifecycle.run_id)
+        assert len(session) == 1
+        assert session[0].payload["source"] == "refusal_pipe_epoch"
+        assert session[0].payload["reset_at"] == self._FUTURE_RESET.isoformat()
+
+    def test_session_limit_human_clock_time_fast_aborts(self) -> None:
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-session-clock")
+        now = datetime(2026, 7, 9, 17, 0, tzinfo=timezone.utc)  # 5pm UTC
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=MissingEnvelope(),
+                    transcript="Claude AI usage limit reached, resets 6pm",
+                    signals=_make_signals(api_error_status=429),
+                )
+            ]
+        )
+
+        async def _sleep(_delay: float) -> None:
+            return None
+
+        config = HarnessConfig(
+            max_retries=0, max_transient_retries=3, transient_sleep=_sleep
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+                now=lambda: now,
+            )
+        )
+
+        assert len(invoke.calls) == 1  # type: ignore[attr-defined]
+        assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+        # 6pm is still ahead at 5pm -> today 6pm UTC.
+        assert outcome.session_limit_reset == datetime(
+            2026, 7, 9, 18, 0, tzinfo=timezone.utc
+        )
+        session = self._session_events(sink, lifecycle.run_id)
+        assert len(session) == 1
+        assert session[0].payload["source"] == "refusal_clock_time"
+
+    def test_session_limit_past_reset_falls_through_to_transient_retry(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-session-past")
+        # A rejected event whose reset is long past (2023): NOT a fast-abort.
+        past = _iteration(
+            envelope=MissingEnvelope(),
+            transcript="",
+            signals=_make_signals(
+                rate_limit_events=(
+                    _rejected_event_with_reset(1_700_000_000),
+                ),
+            ),
+        )
+        valid = _iteration(
+            envelope=ValidEnvelope(intent=Intent.VERIFY),
+            messages=(_assistant(), _result_msg()),
+        )
+        invoke = _scripted_invoker([past, valid])
+        delays: list[float] = []
+
+        async def _sleep(delay: float) -> None:
+            delays.append(delay)
+
+        config = HarnessConfig(
+            max_retries=0, max_transient_retries=3, transient_sleep=_sleep
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+                now=lambda: self._NOW,
+            )
+        )
+
+        # Fell through to the transient loop: re-invoked once, then the valid
+        # iteration cleared it -> DONE. The reset is NOT surfaced.
+        assert len(invoke.calls) == 2  # type: ignore[attr-defined]
+        assert len(delays) == 1
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.session_limit_reset is None
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
+        assert "harness.session_limit" not in kinds
+        assert kinds.count("harness.transient_retry") == 1
+
+    def test_session_limit_valid_envelope_with_future_reset_not_aborted(
+        self,
+    ) -> None:
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = self._passing_task()
+        lifecycle = Lifecycle(task_id="t1", run_id="run-session-valid")
+        reset_epoch = int(self._FUTURE_RESET.timestamp())
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                    signals=_make_signals(
+                        rate_limit_events=(
+                            _rejected_event_with_reset(reset_epoch),
+                        ),
+                    ),
+                )
+            ]
+        )
+
+        async def _sleep(_delay: float) -> None:
+            return None
+
+        config = HarnessConfig(
+            max_retries=0, max_transient_retries=3, transient_sleep=_sleep
+        )
+
+        outcome = _run(
+            run_task(
+                task,
+                lifecycle,
+                store,
+                sink=sink,
+                config=config,
+                invoke=invoke,
+                now=lambda: self._NOW,
+            )
+        )
+
+        # A valid envelope is actionable output -- never session-limited,
+        # even alongside a rejected future-reset rate-limit event.
+        assert len(invoke.calls) == 1  # type: ignore[attr-defined]
+        assert outcome.lifecycle.status == Status.DONE
+        assert outcome.session_limit_reset is None
+        kinds = [e.kind for e in sink.events(lifecycle.run_id)]
+        assert "harness.session_limit" not in kinds
+
+
 # --- Context-pressure telemetry ------------------------------------------
 
 

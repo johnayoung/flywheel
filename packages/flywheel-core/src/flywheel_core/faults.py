@@ -23,10 +23,12 @@ never requires the optional ``postgres`` extra.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from flywheel_core.store_protocols import (
@@ -171,6 +173,145 @@ def wait_backoff(
     return delay
 
 
+@dataclass(frozen=True)
+class SessionLimitReset:
+    """A derived session-limit reset instant and the ladder rung it came from.
+
+    ``reset_at`` is an aware UTC :class:`~datetime.datetime`; ``source`` names
+    the derivation rung so telemetry can record which surface answered:
+    ``"rate_limit_event"`` (a rejected rate-limit event's ``resets_at``),
+    ``"refusal_pipe_epoch"`` (the ``...usage limit reached|<epoch>`` refusal),
+    or ``"refusal_clock_time"`` (a ``resets 6pm`` human refusal).
+    """
+
+    reset_at: datetime
+    source: str
+
+
+# The Claude CLI session-limit refusal carries the reset epoch after a pipe:
+# ``Claude AI usage limit reached|1751990400`` (epoch seconds, UTC).
+_PIPE_EPOCH_RE = re.compile(r"usage limit reached\s*\|\s*(\d+)", re.IGNORECASE)
+
+# The human-readable refusal names a wall-clock reset time, e.g. ``resets 6pm``
+# or ``resets 6:30 am``. Interpreted in ``now``'s timezone with
+# next-occurrence semantics (a clock time already past today rolls to
+# tomorrow, never a negative interval).
+_CLOCK_TIME_RE = re.compile(
+    r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)", re.IGNORECASE
+)
+
+
+def derive_session_limit_reset(
+    *,
+    rate_limit_events: Sequence[object] = (),
+    transcript: str = "",
+    now: datetime,
+) -> SessionLimitReset | None:
+    """Derive a session-limit reset instant, strongest source first.
+
+    The ladder, in order:
+
+    1. A ``rejected`` rate-limit event's ``rate_limit_info.resets_at`` (epoch
+       seconds, UTC). Attributes are read via ``getattr`` so the optional
+       agent SDK is never imported here; an ``allowed_warning`` event is
+       ignored on purpose.
+    2. A parseable refusal in ``transcript``: the pipe-epoch form
+       (``...usage limit reached|<epoch>``) or the human clock-time form
+       (``resets 6pm``). The clock time is read in ``now``'s timezone with
+       next-occurrence semantics, so a time already past today resolves to
+       tomorrow rather than a negative interval.
+    3. Neither derivable -> ``None``.
+
+    The returned ``reset_at`` is always aware UTC. The function is total: a
+    malformed, garbage, or unrecognized refusal yields ``None``, never a
+    raised exception. Whether a derived reset is actually in the future is
+    the caller's policy decision -- a past epoch is returned verbatim, not
+    filtered here (so the caller can preserve its existing behavior when the
+    reset is at-or-before ``now``).
+    """
+    from_event = _reset_from_rate_limit_events(rate_limit_events)
+    if from_event is not None:
+        return from_event
+    return _reset_from_refusal_text(transcript, now=now)
+
+
+def _reset_from_rate_limit_events(
+    events: Sequence[object],
+) -> SessionLimitReset | None:
+    for event in events:
+        info = getattr(event, "rate_limit_info", None)
+        # Only a hard ``rejected`` block names a reset worth acting on; an
+        # ``allowed_warning`` must never drive the fast-abort.
+        if getattr(info, "status", None) != "rejected":
+            continue
+        resets_at = getattr(info, "resets_at", None)
+        # ``bool`` is an ``int`` subclass; reject a stray flag before the
+        # numeric path.
+        if isinstance(resets_at, bool) or not isinstance(
+            resets_at, (int, float)
+        ):
+            continue
+        reset_at = _epoch_to_utc(resets_at)
+        if reset_at is not None:
+            return SessionLimitReset(
+                reset_at=reset_at, source="rate_limit_event"
+            )
+    return None
+
+
+def _reset_from_refusal_text(
+    transcript: str, *, now: datetime
+) -> SessionLimitReset | None:
+    if not transcript:
+        return None
+    pipe = _PIPE_EPOCH_RE.search(transcript)
+    if pipe is not None:
+        reset_at = _epoch_to_utc(int(pipe.group(1)))
+        if reset_at is not None:
+            return SessionLimitReset(
+                reset_at=reset_at, source="refusal_pipe_epoch"
+            )
+    clock = _CLOCK_TIME_RE.search(transcript)
+    if clock is not None:
+        reset_at = _next_clock_occurrence(clock, now=now)
+        if reset_at is not None:
+            return SessionLimitReset(
+                reset_at=reset_at, source="refusal_clock_time"
+            )
+    return None
+
+
+def _epoch_to_utc(epoch: float) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        # An out-of-range epoch is unusable; the parser stays total.
+        return None
+
+
+def _next_clock_occurrence(
+    match: re.Match[str], *, now: datetime
+) -> datetime | None:
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) is not None else 0
+    if not (1 <= hour <= 12) or not (0 <= minute <= 59):
+        return None
+    hour24 = hour % 12
+    if match.group(3).lower() == "pm":
+        hour24 += 12
+    # A naive ``now`` is treated as UTC so the parser never raises on a
+    # caller that forgot to attach a timezone; production passes aware UTC.
+    local_now = (
+        now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    )
+    candidate = local_now.replace(
+        hour=hour24, minute=minute, second=0, microsecond=0
+    )
+    if candidate <= local_now:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
 __all__ = [
     "BackoffPolicy",
     "DEFAULT_BACKOFF",
@@ -178,6 +319,8 @@ __all__ = [
     "DEFAULT_CAP_SECONDS",
     "DEFAULT_FACTOR",
     "FaultClass",
+    "SessionLimitReset",
     "classify_fault",
+    "derive_session_limit_reset",
     "wait_backoff",
 ]

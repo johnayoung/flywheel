@@ -114,6 +114,7 @@ from flywheel_core.faults import (
     BackoffPolicy,
     FaultClass,
     classify_fault,
+    derive_session_limit_reset,
 )
 from flywheel_core.events import (
     AttemptFinalized,
@@ -579,10 +580,18 @@ class HarnessOutcome:
     state. ``attempts`` is a read-only snapshot of every Attempt
     persisted during the run, in ``number`` order; callers can also
     reload it from ``store.list_attempts`` and the two agree.
+
+    ``session_limit_reset`` carries the derived session-limit reset instant
+    (aware UTC) when the run hit a session-limit refusal whose reset time was
+    derivable and still in the future -- the fast-abort surfaces it here
+    structurally so a consumer (e.g. a claim-loop pool pause) never has to
+    regex it back out of a lifecycle error string. ``None`` on every run that
+    did not fast-abort on a future session-limit reset.
     """
 
     lifecycle: Lifecycle
     attempts: tuple[Attempt, ...]
+    session_limit_reset: datetime | None = None
 
 
 def _utcnow() -> datetime:
@@ -757,6 +766,21 @@ class _RecoveryState:
 
     recoveries_used: int = 0
     pending_handoff: RecoveryHandoff | None = None
+
+
+@dataclass
+class _SessionLimitState:
+    """Mutable per-``run_task`` holder for a derived session-limit reset.
+
+    The session-limit fast-abort finalizes an attempt deep in
+    :func:`_run_attempt_body`, but the derived reset must survive up to the
+    :class:`HarnessOutcome` that :func:`run_task` builds after the retry
+    loop. ``reset_at`` holds the most recently derived future reset (aware
+    UTC); it stays ``None`` on any run that never fast-aborted on a future
+    session-limit reset.
+    """
+
+    reset_at: datetime | None = None
 
 
 class _HangDetected(Exception):
@@ -1934,6 +1958,11 @@ async def run_task(
     # handoff so the next ``_run_attempt`` renders ``# Recovery handoff``
     # on its first iteration prompt.
     recovery_state = _RecoveryState()
+    # Cross-attempt holder for a derived session-limit reset (spec: session
+    # limit classification). A future-reset fast-abort finalizes an attempt
+    # inside _run_attempt_body; this carries the derived reset up to the
+    # HarnessOutcome built below.
+    session_state = _SessionLimitState()
 
     # Telemetry session for the run (spec 00025): SDK messages and
     # harness telemetry stream to the sink; the store keeps only ledger
@@ -2021,6 +2050,7 @@ async def run_task(
                     clock=clock,
                     mclock=mclock,
                     recovery_state=recovery_state,
+                    session_state=session_state,
                 )
                 continue
 
@@ -2076,7 +2106,11 @@ async def run_task(
         raise
 
     attempts = tuple(store.list_attempts(lifecycle.run_id))
-    return HarnessOutcome(lifecycle=lifecycle, attempts=attempts)
+    return HarnessOutcome(
+        lifecycle=lifecycle,
+        attempts=attempts,
+        session_limit_reset=session_state.reset_at,
+    )
 
 
 async def _run_attempt(
@@ -2090,6 +2124,7 @@ async def _run_attempt(
     clock: Callable[[], datetime],
     mclock: Callable[[], float],
     recovery_state: _RecoveryState,
+    session_state: _SessionLimitState,
 ) -> None:
     """Run one Attempt: invoke -> envelope -> intent -> graders -> finalize."""
     _transition(lifecycle, Status.RUNNING, store=store, now=clock)
@@ -2143,6 +2178,7 @@ async def _run_attempt(
             attempt_dir=attempt_dir,
             transcript_graders=transcript_graders,
             recovery_state=recovery_state,
+            session_state=session_state,
         )
     except _HangDetected as exc:
         # Hang watchdog tripped: route to the FR-3 internal_error path
@@ -2239,6 +2275,7 @@ async def _run_attempt_body(
     attempt_dir: Path | None,
     transcript_graders: tuple[TranscriptGrader, ...],
     recovery_state: _RecoveryState,
+    session_state: _SessionLimitState,
 ) -> None:
     """Inner body of :func:`_run_attempt`, split out so the hang /
     interrupt sentinel exceptions can be caught at one boundary.
@@ -2259,6 +2296,7 @@ async def _run_attempt_body(
         loop_guard_verdict,
         recovery_trigger,
         transient_exhausted,
+        session_limit_reset,
     ) = await _drive_iterations(
         task=task,
         lifecycle=lifecycle,
@@ -2324,19 +2362,31 @@ async def _run_attempt_body(
 
     lifecycle.agent_output = iteration_result.transcript
 
-    # Transient rate-limit exhaustion: the iteration was re-invoked the full
-    # separate transient budget and still returned a rate-limit fault. This
-    # is an infrastructure fault, not an agent protocol error, so it routes
-    # to the retryable, TRANSIENT-classified INTERNAL_ERROR class (the same
-    # class the hang watchdog and store faults use) rather than the
-    # AGENT_ERROR / FAILED_VALIDATION path a genuine missing envelope takes.
-    # The per-retry / exhaustion telemetry already emitted inside
-    # _drive_iterations; this finalizes the attempt and transitions.
+    # Transient rate-limit exhaustion / session-limit fast-abort: the
+    # iteration returned a rate-limit fault that will not clear by re-invoking
+    # now. Either the separate transient budget was spent (exhaustion) or the
+    # refusal named a future reset that made retrying pointless (fast-abort,
+    # exactly one invocation). Both are infrastructure faults, not agent
+    # protocol errors, so they route to the retryable, TRANSIENT-classified
+    # INTERNAL_ERROR class (the same class the hang watchdog and store faults
+    # use) rather than the AGENT_ERROR / FAILED_VALIDATION path a genuine
+    # missing envelope takes. The per-retry / exhaustion / session-limit
+    # telemetry already emitted inside _drive_iterations; this finalizes the
+    # attempt and transitions. A derived future reset is surfaced
+    # structurally on the run's HarnessOutcome via ``session_state`` -- never
+    # as something a consumer must regex back out of ``error``.
     if transient_exhausted:
-        error = (
-            "transient rate-limit retries exhausted after "
-            f"{config.max_transient_retries + 1} invocations"
-        )
+        if session_limit_reset is not None:
+            session_state.reset_at = session_limit_reset
+            error = (
+                "session-limit refusal; reset at "
+                f"{session_limit_reset.isoformat()}"
+            )
+        else:
+            error = (
+                "transient rate-limit retries exhausted after "
+                f"{config.max_transient_retries + 1} invocations"
+            )
         _finalize_attempt(
             store=store,
             telemetry=telemetry,
@@ -3236,6 +3286,7 @@ async def _drive_iterations(
     LoopGuardVerdict | None,
     _RecoveryTrigger | None,
     bool,
+    datetime | None,
 ]:
     """Run iterations until a non-``continue`` envelope, crash, or cap.
 
@@ -3255,12 +3306,23 @@ async def _drive_iterations(
     see the same elapsed time regardless of which iteration sets the
     envelope.
 
-    The final tuple element is ``transient_exhausted``: ``True`` when a
-    rate-limited iteration was re-invoked ``config.max_transient_retries``
-    times (on the separate transient budget, backing off between tries) and
-    still returned a transient fault, so the caller finalizes the attempt as
-    a TRANSIENT-classified ``INTERNAL_ERROR`` rather than an agent protocol
-    error. It is ``False`` on every other path.
+    The ``transient_exhausted`` tuple element is ``True`` when a rate-limited
+    iteration was re-invoked ``config.max_transient_retries`` times (on the
+    separate transient budget, backing off between tries) and still returned a
+    transient fault, OR when the session-limit fast-abort fired (see below).
+    Either way the caller finalizes the attempt as a TRANSIENT-classified
+    ``INTERNAL_ERROR`` rather than an agent protocol error. It is ``False`` on
+    every other path.
+
+    The final tuple element is ``session_limit_reset``: an aware-UTC
+    :class:`~datetime.datetime` when a rate-limit refusal named a reset that is
+    derivable AND still in the future -- the fast-abort. In that case the
+    iteration is NOT re-invoked on the transient budget (exactly one
+    invocation happened); ``transient_exhausted`` is set so the same
+    INTERNAL_ERROR route finalizes the attempt, and a ``harness.session_limit``
+    event carries the reset and its derivation source. It is ``None`` when no
+    future reset was derivable (a ``None`` or already-past reset preserves the
+    existing transient-retry behavior exactly).
     """
     iteration_result: IterationResult | None = None
     iteration_number = 0
@@ -3269,6 +3331,7 @@ async def _drive_iterations(
     loop_guard_verdict: LoopGuardVerdict | None = None
     recovery_trigger: _RecoveryTrigger | None = None
     transient_exhausted = False
+    session_limit_reset: datetime | None = None
     attempt_number = attempt.number
 
     def _record_steering(command: ControlCommandRecord) -> None:
@@ -3641,6 +3704,45 @@ async def _drive_iterations(
             transient_reason = _iteration_is_transient_rate_limit(
                 iteration_result
             )
+            # Session-limit fast-abort: a rate-limit refusal whose reset time
+            # is derivable AND still in the future. The reset comes from a
+            # rejected rate-limit event or a parseable refusal in the
+            # transcript; either way it is a hard block until that instant, so
+            # re-invoking on the transient budget would only burn invocations.
+            # Finalize after THIS one invocation through the same TRANSIENT
+            # INTERNAL_ERROR route, carrying the reset up structurally. A
+            # ValidEnvelope is never session-limited (the agent produced
+            # actionable output), mirroring _iteration_is_transient_rate_limit's
+            # guard. A ``None`` reset OR one at-or-before now falls through to
+            # today's transient-retry behavior unchanged. Checked BEFORE the
+            # ``transient_reason is None`` break so a pure refusal-text block
+            # with no structural rate-limit signal still fast-aborts.
+            session_now = clock()
+            derived = (
+                None
+                if isinstance(iteration_result.envelope, ValidEnvelope)
+                else derive_session_limit_reset(
+                    rate_limit_events=iteration_result.signals.rate_limit_events,
+                    transcript=iteration_result.transcript,
+                    now=session_now,
+                )
+            )
+            if derived is not None and derived.reset_at > session_now:
+                session_limit_reset = derived.reset_at
+                transient_exhausted = True
+                telemetry.emit(
+                    kind="harness.session_limit",
+                    payload={
+                        "iteration": iteration_number,
+                        "reason": transient_reason or "session_limit_refusal",
+                        "reset_at": derived.reset_at.isoformat(),
+                        "source": derived.source,
+                        "classification": FaultClass.TRANSIENT.value,
+                    },
+                    attempt_number=attempt_number,
+                    iteration_number=iteration_number,
+                )
+                break
             if transient_reason is None:
                 break
             if transient_retries >= config.max_transient_retries:
@@ -3821,6 +3923,7 @@ async def _drive_iterations(
         loop_guard_verdict,
         recovery_trigger,
         transient_exhausted,
+        session_limit_reset,
     )
 
 

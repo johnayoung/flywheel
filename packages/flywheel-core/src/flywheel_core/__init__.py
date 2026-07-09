@@ -63,7 +63,9 @@ from flywheel_core.faults import (
     BackoffPolicy,
     DEFAULT_BACKOFF,
     FaultClass,
+    SessionLimitReset,
     classify_fault,
+    derive_session_limit_reset,
     wait_backoff,
 )
 from flywheel_core.grader_command import (
@@ -283,6 +285,7 @@ __all__ = [
     "RunNotifier",
     "SchemaMismatchError",
     "SdkMessageRecord",
+    "SessionLimitReset",
     "SessionRecorded",
     "SpendSummary",
     "SqliteStore",
@@ -316,6 +319,7 @@ __all__ = [
     "build_iteration_prompt",
     "classify_fault",
     "deadline_config_from_mapping",
+    "derive_session_limit_reset",
     "derive_slug",
     "enforce_transcript_limits",
     "first_breach",

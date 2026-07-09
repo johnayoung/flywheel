@@ -10,6 +10,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
@@ -42,7 +43,9 @@ from flywheel_core.envelope import (
 from flywheel_core.faults import (
     BackoffPolicy,
     FaultClass,
+    SessionLimitReset,
     classify_fault,
+    derive_session_limit_reset,
     wait_backoff,
 )
 from flywheel_core.invoker import (
@@ -680,6 +683,196 @@ class TestTransientClassificationMatrix:
         self, fault: object, expected: FaultClass | None
     ) -> None:
         assert classify_fault(fault) is expected
+
+
+# --- Session-limit reset derivation --------------------------------------
+
+
+def _rejected_event(*, resets_at: int | None) -> RateLimitEvent:
+    """A hard ``rejected`` rate-limit event carrying ``resets_at``."""
+    return RateLimitEvent(
+        rate_limit_info=RateLimitInfo(
+            status="rejected",
+            resets_at=resets_at,
+            rate_limit_type="five_hour",
+            utilization=1.0,
+        ),
+        uuid="evt-reject",
+        session_id="sess-1",
+    )
+
+
+class TestSessionResetDerivation:
+    """The :func:`derive_session_limit_reset` ladder (spec: session-limit
+    classification). Rung 1 is a rejected rate-limit event's ``resets_at``;
+    rung 2 parses a refusal in the transcript (pipe-epoch or human clock
+    time); rung 3 is ``None``. The parser is total -- garbage never raises.
+    """
+
+    # A fixed ``now`` used where the rung under test does not depend on it.
+    _NOW = datetime(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
+
+    # Rung 1: a rejected event's resets_at (epoch seconds, UTC).
+    def test_session_reset_from_rejected_rate_limit_event(self) -> None:
+        epoch = 1_800_000_000
+        event = _rejected_event(resets_at=epoch)
+        result = derive_session_limit_reset(
+            rate_limit_events=(event,), transcript="", now=self._NOW
+        )
+        assert result == SessionLimitReset(
+            reset_at=datetime.fromtimestamp(epoch, tz=timezone.utc),
+            source="rate_limit_event",
+        )
+
+    # Rung 1 precedence: the event wins even when the transcript also parses.
+    def test_session_reset_event_precedes_transcript(self) -> None:
+        event = _rejected_event(resets_at=1_800_000_000)
+        result = derive_session_limit_reset(
+            rate_limit_events=(event,),
+            transcript="Claude AI usage limit reached|1751990400",
+            now=self._NOW,
+        )
+        assert result is not None
+        assert result.source == "rate_limit_event"
+        assert int(result.reset_at.timestamp()) == 1_800_000_000
+
+    # An allowed_warning event is never a session-limit block.
+    def test_session_reset_allowed_warning_event_ignored(self) -> None:
+        event = RateLimitEvent(
+            rate_limit_info=RateLimitInfo(
+                status="allowed_warning",
+                resets_at=1_800_000_000,
+                rate_limit_type="five_hour",
+                utilization=0.5,
+            ),
+            uuid="evt-warn",
+            session_id="sess-1",
+        )
+        result = derive_session_limit_reset(
+            rate_limit_events=(event,), transcript="", now=self._NOW
+        )
+        assert result is None
+
+    # A rejected event with a non-numeric resets_at falls through to None
+    # (nothing else derivable), never raising.
+    def test_session_reset_event_without_numeric_resets_at(self) -> None:
+        event = _rejected_event(resets_at=None)
+        result = derive_session_limit_reset(
+            rate_limit_events=(event,), transcript="", now=self._NOW
+        )
+        assert result is None
+
+    # Rung 2a: the pipe-epoch refusal form the CLI emits.
+    def test_session_reset_from_pipe_epoch_refusal(self) -> None:
+        result = derive_session_limit_reset(
+            transcript="Claude AI usage limit reached|1751990400",
+            now=self._NOW,
+        )
+        assert result is not None
+        assert result.source == "refusal_pipe_epoch"
+        assert result.reset_at.tzinfo is timezone.utc
+        assert int(result.reset_at.timestamp()) == 1751990400
+
+    # Rung 2b: the human clock-time form, resolved to today when still ahead.
+    def test_session_reset_human_clock_time_today_when_ahead(self) -> None:
+        now = datetime(2026, 7, 9, 17, 0, tzinfo=timezone.utc)  # 5pm UTC
+        result = derive_session_limit_reset(
+            transcript="Claude AI usage limit reached, resets 6pm",
+            now=now,
+        )
+        assert result is not None
+        assert result.source == "refusal_clock_time"
+        assert result.reset_at == datetime(
+            2026, 7, 9, 18, 0, tzinfo=timezone.utc
+        )
+
+    # Rung 2b edge: 'resets 6pm' parsed at 7pm -> tomorrow 6pm, never a
+    # negative interval.
+    def test_session_reset_human_clock_time_rolls_to_tomorrow(self) -> None:
+        now = datetime(2026, 7, 9, 19, 0, tzinfo=timezone.utc)  # 7pm UTC
+        result = derive_session_limit_reset(
+            transcript="resets 6pm", now=now
+        )
+        assert result is not None
+        assert result.source == "refusal_clock_time"
+        assert result.reset_at == datetime(
+            2026, 7, 10, 18, 0, tzinfo=timezone.utc
+        )
+
+    # The clock time is read in the injected timezone, then returned as UTC.
+    def test_session_reset_human_clock_time_injected_timezone(self) -> None:
+        tz = timezone(timedelta(hours=-5))
+        now = datetime(2026, 7, 9, 19, 0, tzinfo=tz)  # 7pm at UTC-5
+        result = derive_session_limit_reset(
+            transcript="resets 6pm", now=now
+        )
+        assert result is not None
+        # 6pm today at UTC-5 already passed (it is 7pm), so tomorrow 6pm
+        # UTC-5 == 2026-07-10 23:00 UTC.
+        assert result.reset_at == datetime(
+            2026, 7, 10, 23, 0, tzinfo=timezone.utc
+        )
+
+    # Minutes and the 12am/12pm boundaries convert correctly.
+    def test_session_reset_human_clock_time_with_minutes(self) -> None:
+        now = datetime(2026, 7, 9, 5, 0, tzinfo=timezone.utc)
+        result = derive_session_limit_reset(
+            transcript="resets 6:30 am", now=now
+        )
+        assert result is not None
+        assert result.reset_at == datetime(
+            2026, 7, 9, 6, 30, tzinfo=timezone.utc
+        )
+
+    def test_session_reset_human_clock_time_noon_and_midnight(self) -> None:
+        now = datetime(2026, 7, 9, 11, 0, tzinfo=timezone.utc)
+        noon = derive_session_limit_reset(transcript="resets 12pm", now=now)
+        assert noon is not None
+        assert noon.reset_at == datetime(
+            2026, 7, 9, 12, 0, tzinfo=timezone.utc
+        )
+        midnight = derive_session_limit_reset(
+            transcript="resets 12am", now=now
+        )
+        assert midnight is not None
+        # Midnight today already passed at 11am, so it rolls to tomorrow.
+        assert midnight.reset_at == datetime(
+            2026, 7, 10, 0, 0, tzinfo=timezone.utc
+        )
+
+    # Rung 3 / totality: garbage after 'resets' yields None, never raises.
+    def test_session_reset_garbage_after_resets_is_none(self) -> None:
+        assert (
+            derive_session_limit_reset(
+                transcript="the limit resets whenever it feels like it",
+                now=self._NOW,
+            )
+            is None
+        )
+
+    def test_session_reset_unrecognized_transcript_is_none(self) -> None:
+        assert (
+            derive_session_limit_reset(
+                transcript="ordinary agent output with no refusal",
+                now=self._NOW,
+            )
+            is None
+        )
+
+    def test_session_reset_empty_inputs_is_none(self) -> None:
+        assert (
+            derive_session_limit_reset(transcript="", now=self._NOW) is None
+        )
+
+    # A garbage (non-numeric) pipe payload does not match and falls through.
+    def test_session_reset_pipe_without_digits_is_none(self) -> None:
+        assert (
+            derive_session_limit_reset(
+                transcript="Claude AI usage limit reached|soon",
+                now=self._NOW,
+            )
+            is None
+        )
 
 
 class TestBackoffBounded:

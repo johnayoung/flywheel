@@ -54,7 +54,7 @@ import threading
 from collections.abc import Awaitable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, TextIO
 from uuid import uuid4
@@ -247,6 +247,20 @@ DEFAULT_PREREQ_REDRIVE_BOUND: int = 3
 # progress is never backed off. Three tolerates a couple of genuinely-slow cycles
 # yet is finite, so a never-progressing unit cannot burn agent cost forever.
 DEFAULT_NO_PROGRESS_BOUND: int = 3
+
+# How long the reactive approval sweep (section 1b) suppresses a re-resolve of a
+# parked AWAITING_APPROVAL run whose sweep found NO pending command. After an
+# empty sweep the run_id is marked with a deadline this many seconds in the
+# future (measured against the injected clock, never wall time), so the same
+# session does not re-run the no-op resolve on every pass. The mark EXPIRES: an
+# approve / reject enqueued mid-session -- after the empty sweep -- is re-swept
+# and consumed by this same still-running session once the deadline passes,
+# instead of being skipped until the session ends. The mark re-arms (an expired
+# mark that re-sweeps empty is marked again), so a genuinely idle gate never
+# tight-loops. Deliberately a code constant, not a flywheel.toml key -- it only
+# bounds a no-op re-sweep cadence, and passes are already gated by real task
+# drives, so the value trades pickup latency against redundant sweeps.
+APPROVAL_SWEEP_MARK_TTL_SECONDS: float = 30.0
 
 
 def _utcnow() -> datetime:
@@ -2348,7 +2362,13 @@ async def orchestrate(
         runs: list[RunRecord] = []
         attempted_fresh: set[str] = set()
         attempted_resume: set[str] = set()
-        attempted_approve: set[str] = set()
+        # run_id -> the injected-clock deadline until which an empty approval
+        # sweep is suppressed. Unlike ``attempted_fresh``/``attempted_resume``
+        # (session-permanent skip sets), this mark EXPIRES so an approve /
+        # reject enqueued mid-session is re-swept and consumed by this same
+        # session once the deadline passes (see
+        # ``APPROVAL_SWEEP_MARK_TTL_SECONDS``).
+        attempted_approve: dict[str, datetime] = {}
 
         while True:
             # Source-listing containment (mirrors _source_reconcile_loop and
@@ -2588,14 +2608,23 @@ async def orchestrate(
             #     lifecycle ``READY`` for the fresh-selection pass below,
             #     and ``approved_done`` / ``rejected_failed`` are terminal.
             #     With no pending command the lifecycle stays parked and
-            #     the run_id is marked so we do not tight-loop on the
-            #     no-op for the rest of this session.
+            #     the run_id is marked with an EXPIRING deadline so we do
+            #     not re-run the no-op resolve every pass -- but once the
+            #     mark expires the run is re-swept, so an approve / reject
+            #     enqueued mid-session (after the empty sweep) is consumed
+            #     by this same still-running session rather than skipped
+            #     until it ends. The mark re-arms: an expired mark that
+            #     re-sweeps empty is marked again, so an idle gate still
+            #     quiesces without tight-looping.
             for row in rows:
                 if not _is_awaiting_approval(row):
                     continue
                 run_id = row.latest_run_id
-                if run_id is None or run_id in attempted_approve:
+                if run_id is None:
                     continue
+                marked_until = attempted_approve.get(run_id)
+                if marked_until is not None and clock() < marked_until:
+                    continue  # within the sweep-mark TTL: skip the no-op
                 claim = claims.acquire_claim(
                     row.task.id,
                     wid,
@@ -2607,7 +2636,9 @@ async def orchestrate(
                 try:
                     lifecycle = control.load_lifecycle(run_id)
                     if lifecycle is None:
-                        attempted_approve.add(run_id)
+                        attempted_approve[run_id] = clock() + timedelta(
+                            seconds=APPROVAL_SWEEP_MARK_TTL_SECONDS
+                        )
                         continue
                     try:
                         approval_outcome = resolve_manual_approval(
@@ -2622,7 +2653,9 @@ async def orchestrate(
                         # Another worker resolved it first; let go.
                         continue
                     if not approval_outcome.applied:
-                        attempted_approve.add(run_id)
+                        attempted_approve[run_id] = clock() + timedelta(
+                            seconds=APPROVAL_SWEEP_MARK_TTL_SECONDS
+                        )
                         continue
                     # Lifecycle advanced in place; restart so the
                     # changed state is re-read on the next pass.

@@ -4486,7 +4486,7 @@ class TestHarnessConfigDefaults:
     def test_default_rubric_config_fields(self) -> None:
         cfg = HarnessConfig()
         assert cfg.rubric_judge_model is None
-        assert cfg.rubric_judge_max_turns == 8
+        assert cfg.rubric_judge_max_turns == 32
         assert cfg.worktree is None
         assert cfg.rubric_judge_invoke is None
 

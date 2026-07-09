@@ -2654,12 +2654,16 @@ async def orchestrate(
 
             # 1b. Reactive resolve of AWAITING_APPROVAL gates, claim-gated
             #     so only one worker drives a given parked run. The
-            #     resolver advances the lifecycle in place — no follow-on
-            #     drive is needed: ``approved_next_gate`` re-parks on the
-            #     next ordinal (the next loop iteration picks up any
-            #     further pending approve), ``rejected_retry`` leaves the
-            #     lifecycle ``READY`` for the fresh-selection pass below,
-            #     and ``approved_done`` / ``rejected_failed`` are terminal.
+            #     resolver advances the lifecycle in place: ``approved_done``
+            #     reaches DONE and lands the parked branch inline (below)
+            #     through the standard held-out-gate + strategy.submit ladder
+            #     -- the run parked its verified worktree at gate entry, so the
+            #     consumed approval is what triggers the land (spec 00076,
+            #     criterion 5); ``approved_next_gate`` re-parks on the next
+            #     ordinal (the next loop iteration picks up any further pending
+            #     approve), ``rejected_retry`` leaves the lifecycle ``READY``
+            #     for the fresh-selection pass below, and ``rejected_failed``
+            #     is terminal.
             #     With no pending command the lifecycle stays parked and
             #     the run_id is marked with an EXPIRING deadline so we do
             #     not re-run the no-op resolve every pass -- but once the
@@ -2710,6 +2714,43 @@ async def orchestrate(
                             seconds=APPROVAL_SWEEP_MARK_TTL_SECONDS
                         )
                         continue
+                    # A final-gate approve drove the lifecycle to DONE in place
+                    # (reason ``approved_done``), but the run's verified branch
+                    # is still sitting on the worktree preserved when it parked
+                    # -- nothing has landed it. Land it now, under the claim we
+                    # already hold, through the SAME held-out-gate +
+                    # verdict-record + strategy.submit ladder a first-attempt
+                    # DONE lands through (spec 00076, criterion 5; D-2): the gate
+                    # re-evaluates against the parked tree and fails closed
+                    # identically, and a pass runs the strategy's full ladder
+                    # (FF, rebase + re-verify, any recovery rungs), which is what
+                    # advances the base to include the branch. Only
+                    # ``approved_done`` lands; ``approved_next_gate`` re-parks on
+                    # the next ordinal and the ``rejected_*`` reasons leave a
+                    # non-DONE lifecycle, so each of those is byte-for-byte
+                    # unchanged. Skipped for a bare library caller with no submit
+                    # seam wired -- there is nothing to land.
+                    if (
+                        approval_outcome.reason == "approved_done"
+                        and submit is not None
+                    ):
+                        land_request = SubmitRequest(
+                            task_id=row.task.id,
+                            task_file=row.task_file,
+                            task=row.task,
+                            run_id=run_id,
+                            status=Status.DONE,
+                            sandbox=sandbox_root / row.task.id,
+                            source_ref=row.source_ref,
+                        )
+                        if _reevaluate_landing_gate(
+                            control,
+                            held_out_source,
+                            land_request,
+                            grader_env=sandbox_primitives["grader_env"],
+                            stream=stream,
+                        ):
+                            submit(land_request)
                     # Lifecycle advanced in place; restart so the
                     # changed state is re-read on the next pass.
                     progressed = True

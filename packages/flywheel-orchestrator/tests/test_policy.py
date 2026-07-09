@@ -995,6 +995,164 @@ def test_submit_verify_rejects_non_string(tmp_path: Path) -> None:
         )
 
 
+# --- [submit] recovery_agent bounds -------------------------------------------
+
+
+def test_submit_recovery_agent_defaults_when_table_absent(
+    tmp_path: Path,
+) -> None:
+    """No [submit] table yields the shipped agent-rung bounds (rung armed)."""
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.submit_recovery_agent_max_turns == 30
+    assert policy.submit_recovery_agent_max_wall_seconds == 900.0
+
+
+def test_submit_recovery_agent_defaults_when_keys_absent(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\nstrategy = "merge"\n',
+        )
+    )
+    assert policy.submit_recovery_agent_max_turns == 30
+    assert policy.submit_recovery_agent_max_wall_seconds == 900.0
+
+
+def test_submit_recovery_agent_parses(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\n'
+            "recovery_agent_max_turns = 12\n"
+            "recovery_agent_max_wall_seconds = 120.5\n",
+        )
+    )
+    assert policy.submit_recovery_agent_max_turns == 12
+    assert policy.submit_recovery_agent_max_wall_seconds == 120.5
+
+
+def test_submit_recovery_agent_zero_turns_disables_rung(
+    tmp_path: Path,
+) -> None:
+    """Zero is a valid non-negative integer that parks a merge conflict
+    exactly as merge-fallback does (the rung stays disarmed)."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\n'
+            "recovery_agent_max_turns = 0\n",
+        )
+    )
+    assert policy.submit_recovery_agent_max_turns == 0
+
+
+def test_submit_recovery_agent_max_turns_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_turns = -1\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_turns_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_turns = true\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_turns_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_turns"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_turns = 1.5\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_wall_seconds_rejects_zero(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_wall_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_wall_seconds = 0\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_wall_seconds_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_wall_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_wall_seconds = -5.0\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_wall_seconds_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        PolicyError, match="submit.recovery_agent_max_wall_seconds"
+    ):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\n'
+                "recovery_agent_max_wall_seconds = true\n",
+            )
+        )
+
+
+def test_submit_recovery_agent_max_wall_seconds_accepts_int(
+    tmp_path: Path,
+) -> None:
+    """An integer wall bound is coerced to float (TOML ints are valid)."""
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\n'
+            "recovery_agent_max_wall_seconds = 60\n",
+        )
+    )
+    assert policy.submit_recovery_agent_max_wall_seconds == 60.0
+    assert isinstance(policy.submit_recovery_agent_max_wall_seconds, float)
+
+
 # --- [phase] verify -----------------------------------------------------------
 
 

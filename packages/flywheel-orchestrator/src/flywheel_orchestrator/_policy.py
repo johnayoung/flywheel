@@ -172,6 +172,15 @@ _EXECUTION_MODES: tuple[str, ...] = ("local", "distributed")
 #: serial worker — today's behavior byte-for-byte; spec 00060, D-1).
 DEFAULT_WORKER_CONCURRENCY: int = 1
 
+#: Default turn ceiling for the merge strategy's bounded conflict-resolution
+#: session when [submit] omits ``recovery_agent_max_turns``. ``0`` disables the
+#: rung entirely (a merge conflict parks exactly as merge-fallback does).
+DEFAULT_RECOVERY_AGENT_MAX_TURNS: int = 30
+
+#: Default wall-clock ceiling (seconds) for that session when [submit] omits
+#: ``recovery_agent_max_wall_seconds``.
+DEFAULT_RECOVERY_AGENT_MAX_WALL_SECONDS: float = 900.0
+
 
 class PolicyError(ValueError):
     """Raised when a policy file is missing, unparseable, or invalid.
@@ -478,6 +487,10 @@ class WorkPolicy:
     submit_pr_base: str | None = None
     submit_base: str | None = None
     submit_verify: str | None = None
+    submit_recovery_agent_max_turns: int = DEFAULT_RECOVERY_AGENT_MAX_TURNS
+    submit_recovery_agent_max_wall_seconds: float = (
+        DEFAULT_RECOVERY_AGENT_MAX_WALL_SECONDS
+    )
     sandbox_setup: str | None = None
     phase_verify: str | None = None
     held_out_root: Path | None = None
@@ -562,6 +575,10 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_base,
     ) = _optional_submit_strategy(submit, policy_file=path)
     submit_verify = _optional_submit_verify(submit, policy_file=path)
+    (
+        submit_recovery_agent_max_turns,
+        submit_recovery_agent_max_wall_seconds,
+    ) = _optional_submit_recovery_agent(submit, policy_file=path)
 
     sandbox = data.get("sandbox") or {}
     if not isinstance(sandbox, dict):
@@ -622,6 +639,10 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
             submit_verify=submit_verify,
+            submit_recovery_agent_max_turns=submit_recovery_agent_max_turns,
+            submit_recovery_agent_max_wall_seconds=(
+                submit_recovery_agent_max_wall_seconds
+            ),
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -663,6 +684,10 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
             submit_verify=submit_verify,
+            submit_recovery_agent_max_turns=submit_recovery_agent_max_turns,
+            submit_recovery_agent_max_wall_seconds=(
+                submit_recovery_agent_max_wall_seconds
+            ),
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -698,6 +723,10 @@ def load_policy(path: Path) -> WorkPolicy:
             submit_pr_base=submit_pr_base,
             submit_base=submit_base,
             submit_verify=submit_verify,
+            submit_recovery_agent_max_turns=submit_recovery_agent_max_turns,
+            submit_recovery_agent_max_wall_seconds=(
+                submit_recovery_agent_max_wall_seconds
+            ),
             sandbox_setup=sandbox_setup,
             phase_verify=phase_verify,
             held_out_root=held_out_root,
@@ -745,6 +774,10 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_pr_base=submit_pr_base,
         submit_base=submit_base,
         submit_verify=submit_verify,
+        submit_recovery_agent_max_turns=submit_recovery_agent_max_turns,
+        submit_recovery_agent_max_wall_seconds=(
+            submit_recovery_agent_max_wall_seconds
+        ),
         sandbox_setup=sandbox_setup,
         phase_verify=phase_verify,
         held_out_root=held_out_root,
@@ -1093,6 +1126,49 @@ def _optional_submit_verify(
             f"{policy_file}: submit.verify must be a non-empty string"
         )
     return value
+
+
+def _optional_submit_recovery_agent(
+    table: dict, *, policy_file: Path
+) -> tuple[int, float]:
+    """Validate the merge strategy's bounded conflict-resolution session bounds.
+
+    ``submit.recovery_agent_max_turns`` bounds the session's turns (``0``
+    disables the rung, parking a merge conflict exactly as merge-fallback does);
+    ``submit.recovery_agent_max_wall_seconds`` bounds its wall clock. Both fall
+    back to their :data:`DEFAULT_RECOVERY_AGENT_MAX_TURNS` /
+    :data:`DEFAULT_RECOVERY_AGENT_MAX_WALL_SECONDS` defaults when absent. A
+    wrong-typed value (``bool`` counts as wrong here, as elsewhere) raises
+    :class:`PolicyError` naming the offending key, and a negative value is
+    rejected the same way so a typo never silently disables or unbounds the rung.
+    """
+    turns = table.get("recovery_agent_max_turns")
+    if turns is None:
+        max_turns = DEFAULT_RECOVERY_AGENT_MAX_TURNS
+    elif isinstance(turns, bool) or not isinstance(turns, int) or turns < 0:
+        raise PolicyError(
+            f"{policy_file}: submit.recovery_agent_max_turns must be a "
+            f"non-negative integer"
+        )
+    else:
+        max_turns = turns
+
+    wall = table.get("recovery_agent_max_wall_seconds")
+    if wall is None:
+        max_wall = DEFAULT_RECOVERY_AGENT_MAX_WALL_SECONDS
+    elif (
+        isinstance(wall, bool)
+        or not isinstance(wall, (int, float))
+        or wall <= 0
+    ):
+        raise PolicyError(
+            f"{policy_file}: submit.recovery_agent_max_wall_seconds must be a "
+            f"positive number"
+        )
+    else:
+        max_wall = float(wall)
+
+    return max_turns, max_wall
 
 
 def _optional_sandbox_setup(

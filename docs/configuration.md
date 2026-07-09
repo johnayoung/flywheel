@@ -149,10 +149,14 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 | `pr_base` | str | unset (worker base branch) | `pr` strategy PR base branch |
 | `base` | str | unset (checked-out branch) | explicit landing/phase-base branch |
 | `verify` | str (shell) | unset (no gate) | standing build invariant re-run under the merge lock against the exact tree about to become the base, on every land path; a non-zero exit refuses landing and parks the work (`park_kind="standing-verify"`) |
+| `recovery_agent_max_turns` | int (>= 0) | `30` | turn ceiling for the bounded conflict-resolution session on the `merge` strategy's fallback rung; `0` disables the rung (a merge conflict parks exactly as before) |
+| `recovery_agent_max_wall_seconds` | float (> 0) | `900.0` | wall-clock ceiling for that same session; the session is cancelled and the run parks preserved when it is exceeded |
 
 `protected_paths` is honored by both strategies (`worker.py:772`); it protects the verification surface — grader configs, CI, harness state — from being rewritten by the work it judges.
 
 `verify` is the "trunk must always build" gate (spec 00064): repo-wide and independent of the task's own (often crate-scoped) command graders, it catches a *semantic merge skew* where two independently-valid changes union into a tree that does not build. It runs serialized under the merge lock — a slow command bottlenecks landings — and inherits the resolved `[sandbox.env]`. Example: `verify = "cargo build --workspace --tests"` or `verify = "uv run pytest"`.
+
+`recovery_agent_max_turns` / `recovery_agent_max_wall_seconds` arm the `merge` strategy's last recovery rung (spec 00077): when FF, rebase, and the merge-fallback all hit a textual conflict, a single bounded agent session resolves the conflict markers and stages the result. The resolved tree lands only after re-running the task's command graders, `[submit] verify`, and the declared held-out gate — the same out-of-band bar every other land clears; any failure parks the run preserved with the session's turn/wall usage recorded on the ledger. A land from this rung records `rung="agent-resolved"`. Both bounds are wrong-type / out-of-range validated at load (a bad value raises `PolicyError` naming the key) so a typo never silently disables or unbounds the rung. Setting `recovery_agent_max_turns = 0` keeps the historical merge-conflict park.
 
 ## `[phase]` (optional)
 

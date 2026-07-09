@@ -282,6 +282,14 @@ class LandingParked(_DomainEventBase):
     reusing the 00073 excerpt shape (a raw tail capped at
     :data:`GATE_EXCERPT_MAX_BYTES`, redacted at render time). Empty for every
     other park kind, whose cause is fully carried by ``park_kind`` / ``detail``.
+
+    ``agent_turns`` / ``agent_wall_seconds`` record the bounded conflict-resolution
+    session's usage when a park followed an agent-resolution attempt (the
+    ``"merge-conflict"`` rung's escalation: a session ran but did not produce a
+    landable tree, whether it exhausted its turn/wall bound, crashed, or resolved
+    a tree that failed re-verification). Both default to ``None`` -- absent for
+    every park that ran no session -- so a record written before the rung existed,
+    or by any non-agent park path, round-trips unchanged.
     """
 
     KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDING_PARKED
@@ -289,6 +297,8 @@ class LandingParked(_DomainEventBase):
     park_kind: str
     detail: str = ""
     receipts: tuple[GateGraderReceipt, ...] = ()
+    agent_turns: int | None = None
+    agent_wall_seconds: float | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -314,11 +324,18 @@ class Landed(_DomainEventBase):
 
     ``rung`` discriminates *which* rung of the merge strategy's recovery ladder
     landed the work (see :data:`LANDING_RUNGS`): ``"fast-forward"`` for a clean
-    fast-forward, ``"rebase"`` for a branch rebased onto an advanced base, or
+    fast-forward, ``"rebase"`` for a branch rebased onto an advanced base,
     ``"merge-fallback"`` for a rebase-conflicting branch recovered by a
-    re-verified ``--no-ff`` merge. It defaults to empty so a PR land (where the
-    rung concept does not apply) and any record written before this field was
-    added stay valid.
+    re-verified ``--no-ff`` merge, or ``"agent-resolved"`` for a merge-conflicting
+    branch whose conflict a bounded agent session resolved into a re-verified
+    tree. It defaults to empty so a PR land (where the rung concept does not
+    apply) and any record written before this field was added stay valid.
+
+    ``agent_turns`` / ``agent_wall_seconds`` record the resolution session's
+    turn/wall usage on an ``"agent-resolved"`` land, so the cost of a bounded
+    session is queryable from the landed record alone. Both default to ``None``
+    -- absent for every rung that ran no session and for any record written
+    before the fields existed -- so those round-trip unchanged.
     """
 
     KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDED
@@ -326,6 +343,8 @@ class Landed(_DomainEventBase):
     strategy: str
     landed_ref: str
     rung: str = ""
+    agent_turns: int | None = None
+    agent_wall_seconds: float | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -439,21 +458,25 @@ LANDING_STRATEGIES: frozenset[str] = frozenset(
 
 # Landing-rung vocabulary carried on a :class:`Landed` record's ``rung`` field:
 # which rung of the merge strategy's recovery ladder (fast-forward -> rebase ->
-# merge-fallback) actually landed the work. A clean fast-forward lands at
-# ``"fast-forward"``; a branch rebased onto an advanced base lands at
-# ``"rebase"``; a branch whose rebase conflicts, recovered by a re-verified
-# ``--no-ff`` merge, lands at ``"merge-fallback"``. Empty is the default so a PR
-# land (whose rung concept does not apply) and any pre-existing record stay
-# valid, queryable via ``list_domain_events(run_id)``.
+# merge-fallback -> agent-resolved) actually landed the work. A clean
+# fast-forward lands at ``"fast-forward"``; a branch rebased onto an advanced
+# base lands at ``"rebase"``; a branch whose rebase conflicts, recovered by a
+# re-verified ``--no-ff`` merge, lands at ``"merge-fallback"``; a branch whose
+# merge itself conflicts, recovered by a bounded agent session that resolved the
+# conflict into a re-verified tree, lands at ``"agent-resolved"``. Empty is the
+# default so a PR land (whose rung concept does not apply) and any pre-existing
+# record stay valid, queryable via ``list_domain_events(run_id)``.
 RUNG_FAST_FORWARD = "fast-forward"
 RUNG_REBASE = "rebase"
 RUNG_MERGE_FALLBACK = "merge-fallback"
+RUNG_AGENT_RESOLVED = "agent-resolved"
 
 LANDING_RUNGS: frozenset[str] = frozenset(
     {
         RUNG_FAST_FORWARD,
         RUNG_REBASE,
         RUNG_MERGE_FALLBACK,
+        RUNG_AGENT_RESOLVED,
     }
 )
 

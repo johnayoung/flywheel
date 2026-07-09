@@ -62,8 +62,10 @@ from flywheel_core import (
     Lifecycle,
     Status,
     classify_fault,
+    invoke_iteration,
     run_command_graders,
 )
+from flywheel_core.deadline import DeadlineExceeded, run_with_deadline
 from flywheel_core.events import (
     GATE_EXCERPT_MAX_BYTES,
     LANDING_STRATEGY_MERGE,
@@ -73,6 +75,7 @@ from flywheel_core.events import (
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_STANDING_VERIFY,
     PARK_KIND_SUBMIT_ERROR,
+    RUNG_AGENT_RESOLVED,
     RUNG_FAST_FORWARD,
     RUNG_MERGE_FALLBACK,
     RUNG_REBASE,
@@ -172,6 +175,133 @@ Logger = Callable[[str], None]
 # itself; this only lets the agent's commit succeed.
 WORKTREE_COMMIT_IDENTITY_NAME = "Flywheel Worker"
 WORKTREE_COMMIT_IDENTITY_EMAIL = "worker@flywheel.invalid"
+
+
+@dataclass(frozen=True)
+class ConflictResolutionRequest:
+    """Inputs a bounded conflict-resolution session runs against (spec 00076,
+    criterion 4).
+
+    ``prompt`` scopes the agent to resolving the in-progress merge's conflict
+    markers; ``worktree`` is the conflicted tree it works in (the session's
+    cwd); ``max_turns`` / ``max_wall_seconds`` are the session's hard bounds
+    (``[submit] recovery_agent_max_turns`` / ``recovery_agent_max_wall_seconds``);
+    ``model`` is the SDK model id (``None`` => the SDK default).
+    """
+
+    prompt: str
+    worktree: Path
+    max_turns: int
+    max_wall_seconds: float
+    model: str | None = None
+
+
+@dataclass(frozen=True)
+class ConflictResolutionReport:
+    """Usage a bounded conflict-resolution session recorded (spec 00076, D-4).
+
+    ``turns`` is the number of agent turns spent (bounded by
+    ``max_turns``); ``wall_seconds`` is the wall-clock elapsed (bounded by
+    ``max_wall_seconds``). The driver reports usage only -- never a resolution
+    verdict, since the agent's claim is untrusted and the worker decides
+    whether the tree is resolved from git state alone.
+    """
+
+    turns: int
+    wall_seconds: float
+
+
+#: The injectable conflict-resolution seam: given a request it drives one
+#: bounded agent session inside the conflicted worktree and returns the recorded
+#: usage. The default is :func:`_default_resolve_conflict` (a real SDK run behind
+#: the lazy ``flywheel_core._sdk`` boundary); tests inject a synchronous stub so
+#: the rung is exercised offline without touching the SDK, mirroring
+#: ``build_repo_invoker``'s seam.
+ConflictResolver = Callable[
+    [ConflictResolutionRequest], ConflictResolutionReport
+]
+
+
+def _default_resolve_conflict(
+    request: ConflictResolutionRequest,
+) -> ConflictResolutionReport:
+    """Production conflict-resolution session: a bounded Claude run rooted in the
+    conflicted worktree (SDK behind the lazy ``flywheel_core._sdk`` boundary).
+
+    Drives exactly one bounded agent iteration inside ``request.worktree`` -- an
+    in-progress merge with conflict markers in place -- under both a turn budget
+    (``ClaudeAgentOptions.max_turns``) and a wall-clock ceiling
+    (:func:`~flywheel_core.deadline.run_with_deadline`). Returns the recorded
+    usage; it never inspects or reports whether the tree was resolved (the
+    worker owns that). Synchronous by design so the ``submit`` call chain (itself
+    synchronous) drives it via :func:`asyncio.run`, exactly one session per
+    re-driver pass.
+    """
+    return asyncio.run(_drive_conflict_resolution(request))
+
+
+async def _drive_conflict_resolution(
+    request: ConflictResolutionRequest,
+) -> ConflictResolutionReport:
+    """Run one bounded agent iteration for :func:`_default_resolve_conflict`.
+
+    The SDK is imported lazily here so importing this module never requires the
+    ``claude`` extra -- the seam is only exercised when the merge-fallback rung
+    actually escalates. On a wall-clock timeout the call is cancelled and the
+    usage is reported at the bound (the true turn count is unavailable after
+    cancellation), so a slow session parks within its bounds rather than raising.
+    """
+    from flywheel_core._sdk import ClaudeAgentOptions
+
+    options = ClaudeAgentOptions(
+        cwd=str(request.worktree),
+        add_dirs=[str(request.worktree)],
+        permission_mode="bypassPermissions",
+        max_turns=request.max_turns,
+        model=request.model,
+    )
+    started = time.monotonic()
+    call = invoke_iteration(prompt=request.prompt, options=options)
+    try:
+        result = await run_with_deadline(call, request.max_wall_seconds)
+    except DeadlineExceeded:
+        return ConflictResolutionReport(
+            turns=request.max_turns,
+            wall_seconds=request.max_wall_seconds,
+        )
+    turns = result.signals.num_turns or 0
+    wall = min(time.monotonic() - started, request.max_wall_seconds)
+    return ConflictResolutionReport(turns=turns, wall_seconds=wall)
+
+
+def _render_conflict_resolution_prompt(
+    req: SubmitRequest, *, branch: str, base: str
+) -> str:
+    """The instruction a bounded conflict-resolution session runs under.
+
+    Names the in-progress merge, scopes the agent strictly to resolving the
+    conflict markers (never re-doing the task or editing beyond the conflict),
+    and asks it to stage the resolutions. The worker authors the merge commit
+    and owns every landing gate afterwards, so the prompt does not ask the agent
+    to commit, verify, or judge -- its claim is untrusted.
+    """
+    return (
+        f"You are resolving a git merge conflict, nothing more.\n\n"
+        f"The branch `{branch}` implements this already-completed and verified "
+        f"task:\n\n{req.task.goal}\n\n"
+        f"A merge of the base branch `{base}` into `{branch}` is in progress in "
+        f"this worktree and has left conflict markers. Your ONLY job is to "
+        f"resolve every conflicted file so the merged result preserves the "
+        f"task's completed work and the base's changes together, then stage the "
+        f"resolved files with `git add`.\n\n"
+        f"Strict rules:\n"
+        f"- Resolve only the merge conflicts. Do NOT re-implement the task, add "
+        f"features, or edit anything unrelated to a conflict.\n"
+        f"- Leave no conflict markers (<<<<<<<, =======, >>>>>>>).\n"
+        f"- Do NOT run `git commit`, `git merge --abort`, or `git reset`; the "
+        f"harness commits and verifies the result.\n"
+        f"- Do NOT touch verification config, graders, or CI.\n"
+    )
 
 
 class LandingLedger(Protocol):
@@ -336,6 +466,10 @@ class GitWorktreeSubmitter:
         verify_command: str | None = None,
         held_out_source: HeldOutGraderSource | None = None,
         disk_preflight: DiskPreflight | None = None,
+        recovery_agent_max_turns: int = 0,
+        recovery_agent_max_wall_seconds: float = 900.0,
+        recovery_agent_model: str | None = None,
+        resolve_conflict: ConflictResolver | None = None,
     ) -> None:
         self.repo_root = repo_root
         self.tasks_dir = tasks_dir
@@ -388,6 +522,20 @@ class GitWorktreeSubmitter:
             if disk_preflight is not None
             else DiskPreflight(log=log)
         )
+        # Bounded agentic conflict-resolution rung ([submit]
+        # recovery_agent_max_turns / recovery_agent_max_wall_seconds, spec 00076
+        # criterion 4). When the merge-fallback merge itself conflicts and
+        # max_turns > 0, a single bounded agent session (the injected resolver,
+        # defaulting to a real SDK run behind the lazy flywheel_core._sdk
+        # boundary) resolves the conflict; the resolved tree lands only after the
+        # SAME merged-tree re-verification bar the merge-fallback rung enforces.
+        # max_turns == 0 (the default for a bare construction) disables the rung
+        # entirely -- a merge conflict parks exactly as merge-fallback does. The
+        # resolver is injectable so tests never touch the real SDK (D-4).
+        self.recovery_agent_max_turns = recovery_agent_max_turns
+        self.recovery_agent_max_wall_seconds = recovery_agent_max_wall_seconds
+        self.recovery_agent_model = recovery_agent_model
+        self._resolve_conflict = resolve_conflict or _default_resolve_conflict
 
     def _branch(self, task_id: str, phase: str) -> str:
         return f"flywheel/{phase}/{task_id}"
@@ -911,9 +1059,12 @@ class GitWorktreeSubmitter:
 
         Runs entirely under the merge lock the caller holds, so the base cannot
         move between the merge and the fast-forward. Never raises: like every
-        other landing leaf it records its own outcome. When the merge conflicts
-        this parks rather than escalating -- the bounded agentic resolution rung
-        is a later task.
+        other landing leaf it records its own outcome. When the merge itself
+        conflicts and the bounded agentic resolution rung is armed ([submit]
+        ``recovery_agent_max_turns`` > 0), this escalates to :meth:`_agent_resolve`
+        with the conflicted worktree left in place (spec 00076, criterion 4);
+        with the rung disabled (``max_turns`` == 0, the default) it parks under
+        ``merge-conflict`` exactly as before.
         """
         self.log(
             f"rebase failed for {branch}; attempting merge-fallback of "
@@ -934,9 +1085,16 @@ class GitWorktreeSubmitter:
         )
         if merge.returncode != 0:
             # The merge itself conflicts: there is no clean candidate tree to
-            # re-verify. Abort back to the pre-merge tip (no in-progress merge
-            # state remains) and park; the agentic rung that resolves this is a
-            # later task.
+            # re-verify. When the bounded agentic resolution rung is armed
+            # ([submit] recovery_agent_max_turns > 0), escalate to it with the
+            # conflicted, in-progress merge left in the worktree for the session
+            # to resolve (spec 00076, criterion 4). Otherwise abort back to the
+            # pre-merge tip (no in-progress merge state remains) and park.
+            if self.recovery_agent_max_turns > 0:
+                self._agent_resolve(
+                    req, worktree, branch, commit_count, pre_merge
+                )
+                return
             _git(worktree, "merge", "--abort")
             self.log(
                 f"merge-fallback of {self.phase_base} into {branch} "
@@ -1043,6 +1201,285 @@ class GitWorktreeSubmitter:
             strategy=LANDING_STRATEGY_MERGE,
             landed_ref=landed_ref,
             rung=RUNG_MERGE_FALLBACK,
+        )
+        self._teardown_on_done(worktree, branch)
+
+    def _agent_resolve(
+        self,
+        req: SubmitRequest,
+        worktree: Path,
+        branch: str,
+        commit_count: int,
+        pre_merge: str,
+    ) -> None:
+        """Bounded agentic conflict-resolution rung (spec 00076, criterion 4).
+
+        Reached only when [submit] ``recovery_agent_max_turns`` > 0 and the
+        merge-fallback merge itself conflicted, leaving an in-progress merge with
+        conflict markers in ``worktree``. Drives exactly one bounded agent
+        session (the injected resolver, defaulting to a real SDK run behind the
+        lazy ``flywheel_core._sdk`` boundary) to resolve the conflict, then treats
+        the result exactly like the merge-fallback rung: the worker authors the
+        merge commit (its own landing bookkeeping -- D-1) and the resolved tree
+        re-runs the task command graders, the standing build invariant, and the
+        declared held-out gate before the base fast-forwards.
+
+        Any non-landing outcome -- the session crashes or errors, the bound is
+        exhausted without a resolved tree, or a re-verification check fails --
+        resets the branch to its pre-merge tip (leaving the base ref
+        byte-identical, no ``Landed`` record) and parks the branch+worktree,
+        recording the session's turn/wall usage on the park. On success the base
+        fast-forwards to the resolved merge commit (whose first parent is the
+        original branch tip, so the branch's commits become ancestors of the
+        advanced base -- criterion 1) and a ``Landed`` event names the
+        ``agent-resolved`` rung with the same usage.
+
+        Never raises: a session crash or SDK error is contained here so submit
+        parks preserved rather than unwinding (criterion 7). At most one session
+        per re-driver pass (D-4).
+        """
+        self.log(
+            f"merge-fallback of {self.phase_base} into {branch} conflicted; "
+            f"escalating to a bounded agent session "
+            f"(max_turns={self.recovery_agent_max_turns}, "
+            f"max_wall_seconds={self.recovery_agent_max_wall_seconds})"
+        )
+        prompt = _render_conflict_resolution_prompt(
+            req, branch=branch, base=self.phase_base
+        )
+        started = time.monotonic()
+        try:
+            report = self._resolve_conflict(
+                ConflictResolutionRequest(
+                    prompt=prompt,
+                    worktree=worktree,
+                    max_turns=self.recovery_agent_max_turns,
+                    max_wall_seconds=self.recovery_agent_max_wall_seconds,
+                    model=self.recovery_agent_model,
+                )
+            )
+            turns, wall = report.turns, report.wall_seconds
+        except Exception as exc:  # noqa: BLE001 - a session crash must not
+            # unwind submit (criterion 7): abort the in-progress merge, reset to
+            # the pre-merge tip (base ref untouched), and park preserved with the
+            # wall we observed. The turn count is unavailable after a crash.
+            wall = min(
+                time.monotonic() - started,
+                self.recovery_agent_max_wall_seconds,
+            )
+            _git(worktree, "merge", "--abort")
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"conflict-resolution session for {branch} crashed "
+                f"({type(exc).__name__}: {exc}); parking worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_MERGE_CONFLICT,
+                detail=(
+                    f"{branch} merge-fallback conflicted and the bounded "
+                    f"conflict-resolution session crashed "
+                    f"({type(exc).__name__}: {exc}); worktree preserved at "
+                    f"{worktree}"
+                ),
+                agent_turns=0,
+                agent_wall_seconds=wall,
+            )
+            return
+
+        # The agent's claim is untrusted: decide from git state whether the merge
+        # is resolved and, if so, author the merge commit ourselves.
+        if not self._complete_agent_merge(worktree):
+            _git(worktree, "merge", "--abort")
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"bounded agent session did not resolve the merge conflict on "
+                f"{branch} within its bounds ({turns} turn(s)/{wall:.1f}s); "
+                f"parking worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_MERGE_CONFLICT,
+                detail=(
+                    f"{branch} merge-fallback conflicted and the bounded "
+                    f"conflict-resolution session did not produce a resolved "
+                    f"tree within {turns} turn(s)/{wall:.1f}s; worktree preserved "
+                    f"at {worktree}"
+                ),
+                agent_turns=turns,
+                agent_wall_seconds=wall,
+            )
+            return
+
+        # A resolved, committed merge tree: run the SAME merged-tree landing bar
+        # the merge-fallback rung enforces before the base moves, recording the
+        # session usage on whichever outcome (land or park) results.
+        self._reverify_gate_and_land(
+            req,
+            worktree,
+            branch,
+            commit_count,
+            pre_merge,
+            turns=turns,
+            wall=wall,
+        )
+
+    def _complete_agent_merge(self, worktree: Path) -> bool:
+        """Decide from git state alone whether the bounded session resolved the
+        in-progress merge -- and, if so, author the merge commit.
+
+        The agent's claim is untrusted, so resolution is judged mechanically: a
+        resolved merge has no unmerged index entries left (every conflicted file
+        was resolved *and* staged with ``git add``). Any remaining unmerged path
+        -- the session gave up, ran out of turns, or left a conflict unstaged --
+        means unresolved and returns ``False``. When the merge is still in
+        progress (``MERGE_HEAD`` present) the worker authors the merge commit now
+        that the conflicts are staged (its own landing bookkeeping -- D-1); a
+        session that committed the merge itself is accepted as-is. A leftover
+        dirty working tree after the commit is rejected too, so the tree that is
+        re-verified is byte-identical to the tree that lands.
+        """
+        if _git(worktree, "ls-files", "--unmerged").stdout.strip():
+            return False
+        merge_in_progress = (
+            _git(
+                worktree, "rev-parse", "-q", "--verify", "MERGE_HEAD"
+            ).returncode
+            == 0
+        )
+        if merge_in_progress:
+            commit = _git(
+                worktree,
+                "commit",
+                "--no-edit",
+            )
+            if commit.returncode != 0:
+                return False
+        # The verified tree must equal the landed tree: reject any leftover
+        # working-tree change (a stray edit or untracked file the session left).
+        if _git(worktree, "status", "--porcelain").stdout.strip():
+            return False
+        return True
+
+    def _reverify_gate_and_land(
+        self,
+        req: SubmitRequest,
+        worktree: Path,
+        branch: str,
+        commit_count: int,
+        pre_merge: str,
+        *,
+        turns: int,
+        wall: float,
+    ) -> None:
+        """Run the merged-tree landing bar for the agent-resolved rung and land
+        or park.
+
+        Applies the same checks the merge-fallback rung runs against a merged
+        tree -- task command graders, then the standing build invariant, then the
+        declared held-out gate, then a fast-forward-only advance of the base --
+        but records the resolution session's ``turns``/``wall`` usage on whichever
+        outcome results. Any failure resets the branch to ``pre_merge`` (base ref
+        untouched, no ``Landed`` record) and parks with the deciding check's
+        receipts; a clean pass fast-forwards the base to the resolved merge
+        commit and records a ``Landed`` at the ``agent-resolved`` rung.
+        """
+        reverify_passed, reverify_receipts = self._reverify(req, worktree)
+        if not reverify_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"agent-resolved re-verification failed for {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_DIVERGENT_BASE,
+                detail=(
+                    f"{branch} was resolved by a bounded agent session but "
+                    f"failed post-merge re-verification against the merged "
+                    f"{self.phase_base}; its command graders no longer pass on "
+                    f"the resolved tree; worktree preserved at {worktree}"
+                ),
+                receipts=reverify_receipts,
+                agent_turns=turns,
+                agent_wall_seconds=wall,
+            )
+            return
+        verify_passed, verify_receipts = self._standing_verify(req, worktree)
+        if not verify_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"agent-resolved standing verify failed for {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_STANDING_VERIFY,
+                detail=(
+                    f"{branch} was resolved by a bounded agent session but "
+                    f"failed the standing build invariant ([submit] verify) "
+                    f"against the resolved tree it would land; worktree preserved "
+                    f"at {worktree}"
+                ),
+                receipts=verify_receipts,
+                agent_turns=turns,
+                agent_wall_seconds=wall,
+            )
+            return
+        gate_passed, gate_receipts = self._held_out_gate(req, worktree)
+        if not gate_passed:
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"agent-resolved held-out gate blocked {branch}; parking "
+                f"worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_HELD_OUT_GATE,
+                detail=(
+                    f"{branch} was resolved by a bounded agent session but was "
+                    f"blocked by the declared held-out landing gate on the "
+                    f"resolved tree it would land; worktree preserved at "
+                    f"{worktree}"
+                ),
+                receipts=gate_receipts,
+                agent_turns=turns,
+                agent_wall_seconds=wall,
+            )
+            return
+        if not self._ff_merge(branch):
+            _git(worktree, "reset", "--hard", pre_merge)
+            self.log(
+                f"agent-resolved FF of {branch} onto {self.phase_base} was "
+                f"refused; parking worktree at {worktree}"
+            )
+            self._record_landing_park(
+                req.run_id,
+                park_kind=PARK_KIND_DIVERGENT_BASE,
+                detail=(
+                    f"{branch} passed agent-resolved re-verification but the "
+                    f"fast-forward onto {self.phase_base} was refused; worktree "
+                    f"preserved at {worktree}"
+                ),
+                agent_turns=turns,
+                agent_wall_seconds=wall,
+            )
+            return
+        landed_ref = _git(
+            self.repo_root, "rev-parse", self.phase_base
+        ).stdout.strip()
+        self.log(
+            f"Merged {branch} into {self.phase_base} via agent-resolved "
+            f"conflict resolution ({commit_count} commit(s); {turns} "
+            f"turn(s)/{wall:.1f}s)"
+        )
+        self._record_landing(
+            req.run_id,
+            strategy=LANDING_STRATEGY_MERGE,
+            landed_ref=landed_ref,
+            rung=RUNG_AGENT_RESOLVED,
+            agent_turns=turns,
+            agent_wall_seconds=wall,
         )
         self._teardown_on_done(worktree, branch)
 
@@ -1342,6 +1779,8 @@ class GitWorktreeSubmitter:
         park_kind: str,
         detail: str,
         receipts: tuple[GateGraderReceipt, ...] = (),
+        agent_turns: int | None = None,
+        agent_wall_seconds: float | None = None,
     ) -> None:
         """Append a queryable ``LANDING_PARKED`` audit-witness event for a
         parked DONE run (``park_kind`` is one of
@@ -1362,6 +1801,11 @@ class GitWorktreeSubmitter:
         whose reason ``park_kind`` / ``detail`` already carry. Shared by both
         the merge strategy and the PR subclass that inherits this method, so a
         grader-decided park carries the same output on either land path.
+
+        ``agent_turns`` / ``agent_wall_seconds`` record a bounded
+        conflict-resolution session's usage when the park followed an
+        agent-resolution attempt (spec 00076, criterion 4); both are ``None`` for
+        every park that ran no session, so those records round-trip unchanged.
 
         The append is an authoritative ledger write, so it is gated by the
         disk/inode preflight first: when free space or inodes are below
@@ -1390,6 +1834,8 @@ class GitWorktreeSubmitter:
                     park_kind=park_kind,
                     detail=detail,
                     receipts=receipts,
+                    agent_turns=agent_turns,
+                    agent_wall_seconds=agent_wall_seconds,
                 ),
                 expected_version=lifecycle.version,
             )
@@ -1405,7 +1851,14 @@ class GitWorktreeSubmitter:
             )
 
     def _record_landing(
-        self, run_id: str, *, strategy: str, landed_ref: str, rung: str = ""
+        self,
+        run_id: str,
+        *,
+        strategy: str,
+        landed_ref: str,
+        rung: str = "",
+        agent_turns: int | None = None,
+        agent_wall_seconds: float | None = None,
     ) -> None:
         """Append a queryable ``LANDED`` audit-witness event for a run whose
         branch actually landed, carrying the landed reference (``strategy`` is
@@ -1414,6 +1867,10 @@ class GitWorktreeSubmitter:
         land; ``rung`` names which recovery rung landed the work, one of
         :data:`~flywheel_core.events.LANDING_RUNGS`, and defaults to empty for a
         PR land where the rung concept does not apply).
+
+        ``agent_turns`` / ``agent_wall_seconds`` record the resolution session's
+        usage on an ``agent-resolved`` land (spec 00076, criterion 4); both are
+        ``None`` for every other rung, so those records round-trip unchanged.
 
         The success counterpart to :meth:`_record_landing_park`: the caller
         invokes it only *after* the land completed, so an incomplete land leaves
@@ -1444,6 +1901,8 @@ class GitWorktreeSubmitter:
                     strategy=strategy,
                     landed_ref=landed_ref,
                     rung=rung,
+                    agent_turns=agent_turns,
+                    agent_wall_seconds=agent_wall_seconds,
                 ),
                 expected_version=lifecycle.version,
             )
@@ -2595,6 +3054,14 @@ def build_merge_submitter(
     the declared held-out landing gate (spec 00051) the merge-fallback recovery
     rung re-runs against the merged candidate tree (spec 00076, D-2); ``None``
     when no gate is configured.
+
+    Reads the bounded conflict-resolution rung's bounds from ``policy`` too
+    ([submit] ``recovery_agent_max_turns`` / ``recovery_agent_max_wall_seconds``,
+    spec 00076 criterion 4): when the merge-fallback merge itself conflicts and
+    ``recovery_agent_max_turns`` > 0, a single bounded agent session resolves it
+    before the same re-verification bar. ``policy is None`` (a bare construction)
+    leaves the rung disabled, byte-identical to today's merge-conflict park. The
+    session's SDK model is the policy's resolved agent model.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -2611,6 +3078,15 @@ def build_merge_submitter(
         grader_env=grader_env,
         verify_command=policy.submit_verify if policy is not None else None,
         held_out_source=held_out_source,
+        recovery_agent_max_turns=(
+            policy.submit_recovery_agent_max_turns if policy is not None else 0
+        ),
+        recovery_agent_max_wall_seconds=(
+            policy.submit_recovery_agent_max_wall_seconds
+            if policy is not None
+            else 900.0
+        ),
+        recovery_agent_model=policy.model if policy is not None else None,
     )
 
 

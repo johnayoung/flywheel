@@ -123,6 +123,13 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
                 }
                 for receipt in event.receipts
             ]
+        # Emitted only when a bounded resolution session ran, so a park with no
+        # session round-trips without these keys (and pre-existing rows stay
+        # byte-identical).
+        if event.agent_turns is not None:
+            parked["agent_turns"] = event.agent_turns
+        if event.agent_wall_seconds is not None:
+            parked["agent_wall_seconds"] = event.agent_wall_seconds
         return parked
     if isinstance(event, Landed):
         landed: dict[str, Any] = {
@@ -134,6 +141,12 @@ def event_payload(event: DomainEvent) -> dict[str, Any]:
         # round-trips to the original two-key payload unchanged.
         if event.rung:
             landed["rung"] = event.rung
+        # Emitted only for an agent-resolved land, so every other rung (and any
+        # pre-existing row) round-trips without these session-usage keys.
+        if event.agent_turns is not None:
+            landed["agent_turns"] = event.agent_turns
+        if event.agent_wall_seconds is not None:
+            landed["agent_wall_seconds"] = event.agent_wall_seconds
         return landed
     if isinstance(event, LandingRedriven):
         return {"result": event.result, "park_kind": event.park_kind}
@@ -254,6 +267,8 @@ def event_from_record(
                 )
                 for receipt in payload.get("receipts", [])
             ),
+            agent_turns=payload.get("agent_turns"),
+            agent_wall_seconds=payload.get("agent_wall_seconds"),
             **common,
         )
     if event_kind_enum is DomainEventKind.LANDED:
@@ -261,6 +276,8 @@ def event_from_record(
             strategy=payload["strategy"],
             landed_ref=payload["landed_ref"],
             rung=payload.get("rung", ""),
+            agent_turns=payload.get("agent_turns"),
+            agent_wall_seconds=payload.get("agent_wall_seconds"),
             **common,
         )
     if event_kind_enum is DomainEventKind.LANDING_REDRIVEN:

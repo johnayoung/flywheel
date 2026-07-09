@@ -26,6 +26,7 @@ One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (
 | `[phase]` | no | phase-exit verify gate | this doc |
 | `[held_out]` | no | execute-time held-out landing gate | [held-out-gate.md](held-out-gate.md) |
 | `[autopilot]` | no | intake-daemon cadence + scoring weights | [autopilot.md](autopilot.md) |
+| `[deadlines]` | no | default-on wall-clock ceilings for the five external-call classes | this doc |
 | `[sandbox.*]` | no | provisioning + the agent's execution environment | [sandbox.md](sandbox.md) |
 
 The main axes and what each selects — the "how config changes the path" view:
@@ -194,6 +195,20 @@ Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.m
 
 The autopilot CLI flags `--target-depth`/`--interval`/`--model` override the corresponding `[autopilot]` keys (`_autopilot_run.py:65`).
 
+## `[deadlines]` (optional)
+
+Default-on, per-class wall-clock ceilings (seconds) for the five external-call classes flywheel issues (spec 00066, `deadline_config.py`). **Every class ships a finite default; set a key to `0` to opt that class out (unbounded).** TOML cannot express `None`, so `0` is the on-disk spelling of the unbounded opt-out — an omitted key keeps its default, leaving a pre-existing file byte-identical.
+
+| Key | Type | Default | Controls |
+|-----|------|---------|----------|
+| `agent_iteration_seconds` | float (`0` = unbounded) | `3600` | working-agent iteration ceiling (worker harness) |
+| `rubric_judge_seconds` | float (`0` = unbounded) | `600` | rubric-judge stream ceiling (worker harness) |
+| `command_grader_seconds` | float (`0` = unbounded) | `900` | command-grader ceiling (worker harness) |
+| `docker_management_seconds` | float (`0` = unbounded) | `120` | docker management-call ceiling (container backend) |
+| `autopilot_agent_seconds` | float (`0` = unbounded) | `1800` | discovery/authoring agent ceiling (autopilot daemon) |
+
+Consumed only by those three layers; a negative value resolves to the same unbounded opt-out as `0`.
+
 ## `[sandbox.*]`
 
 The `[sandbox]` table configures provisioning and the agent's execution environment. The top-level flat keys are below; the full per-subtable reference (`exec`, `capabilities`, `network`, `env`, `limits`, `retention`, `container`) and the named presets live in [sandbox.md](sandbox.md).
@@ -206,6 +221,12 @@ The `[sandbox]` table configures provisioning and the agent's execution environm
 | `permission_mode` | str | `bypassPermissions` | SDK permission mode |
 
 `setup` is consumed at `worker.py:2394`; `backend` selects the container wrap in `maybe_wrap_for_backend` (`worker.py:2166`). Several subtable behaviors are enforced only under `backend = "container"` — see [sandbox.md](sandbox.md) for which.
+
+`[sandbox.limits]` carries one attempt-budget key (full table in [sandbox.md](sandbox.md)):
+
+| Key | Type | Default | Controls |
+|-----|------|---------|----------|
+| `rubric_judge_max_turns` | int (>0) | `32` | per-judge-call turn budget for the rubric judge; an absent key keeps the harness default of 32 |
 
 ## Environment variables
 
@@ -230,6 +251,6 @@ Rendered:
 - `[submit]` — `base = "<current branch>"` when a branch is detected, else a commented placeholder.
 - Commented placeholders for `[[defaults.graders]]`, `[agent] model`, `[sandbox] setup`, and `[phase] verify`.
 
-**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
+**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, `[deadlines]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
 
 The commented `[agent] model` placeholder shows one example model id; do not treat any printed id as canonical — the value is opaque and projects vary.

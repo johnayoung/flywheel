@@ -749,6 +749,7 @@ def load_policy(path: Path) -> WorkPolicy:
         phase_verify=phase_verify,
         held_out_root=held_out_root,
         sandbox=sandbox_policy,
+        deadlines=deadlines,
         autopilot_target_depth=autopilot_target_depth,
         autopilot_landing=autopilot_landing,
         autopilot_interval_seconds=autopilot_interval_seconds,

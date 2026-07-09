@@ -33,7 +33,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import IntEnum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from flywheel_core.deadline import run_with_deadline
@@ -52,6 +52,14 @@ from flywheel_core.loaders import TaskLoadError, load_task_data, serialize_task
 from flywheel_core.task import CommandGrader, Task
 
 from flywheel_orchestrator._claims import STOP_NO_OP_CYCLE
+
+# The path-to-key normalization lives with the surface-overlap lint (its other
+# consumer); autopilot re-imports the one true copy rather than forking it. The
+# redundant alias marks it as an explicit re-export (test_autopilot_conflict_keys
+# imports it from here).
+from flywheel_orchestrator._surface_lint import (
+    _conflict_key_for_path as _conflict_key_for_path,
+)
 
 if TYPE_CHECKING:
     from flywheel_core._sdk import AgentDefinition, ClaudeAgentOptions
@@ -1490,54 +1498,6 @@ class AutopilotPassResult:
     @property
     def emitted_count(self) -> int:
         return len(self.emitted_paths)
-
-
-#: Build-manifest / lockfile basenames that make poor conflict keys: many
-#: legitimately-distinct tasks land against the same manifest, so serializing on
-#: it would collapse unrelated work into one lane. Conflict keys want the
-#: specific source file a task contends for, not the shared package manifest.
-_MANIFEST_BASENAMES: frozenset[str] = frozenset(
-    {
-        "Cargo.toml",
-        "Cargo.lock",
-        "package.json",
-        "package-lock.json",
-        "yarn.lock",
-        "pnpm-lock.yaml",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "requirements.txt",
-        "go.mod",
-        "go.sum",
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-    }
-)
-
-
-def _conflict_key_for_path(raw: str) -> str | None:
-    """Normalize a repo-relative path into a stable conflict-key token, or
-    ``None`` when it is too coarse to be a useful claim-time conflict resource.
-
-    Returns ``None`` for a path that is empty, absolute, parent-escaping,
-    directory-like (no file suffix -- e.g. ``crates/``), or a shared build
-    manifest / lockfile (see :data:`_MANIFEST_BASENAMES`). A specific source
-    file (``crates/infrared-feed/src/tycho.rs``) returns its normalized posix
-    form so two tasks scoped to it serialize.
-    """
-    s = raw.strip()
-    if not s:
-        return None
-    p = PurePosixPath(s)
-    if p.is_absolute() or any(part == ".." for part in p.parts):
-        return None
-    if p.suffix == "":  # directory-like (or extensionless): too coarse
-        return None
-    if p.name in _MANIFEST_BASENAMES:
-        return None
-    return p.as_posix()
 
 
 def _conflict_keys_for(emitted: EmittedTask) -> list[str]:

@@ -178,6 +178,24 @@ def _read_prerequisites(path: Path) -> tuple[str, ...]:
     return tuple(str(p) for p in raw) if isinstance(raw, list) else ()
 
 
+def _read_overlap_ok(path: Path) -> tuple[str, ...]:
+    """Read a task file's ``overlap_ok`` allow-list (validate-time only).
+
+    ``overlap_ok`` is a top-level orchestration key core ``flywheel`` ignores,
+    consumed solely by the authoring-time surface-overlap lint: each entry is a
+    repo-relative path that is exempt from that pairwise check. Parsed straight
+    from the task source like :func:`_read_prerequisites`; an absent or
+    malformed key yields the empty tuple. The file is already known valid JSON
+    by the time this runs (the task loaded through it first).
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ()
+    raw = data.get("overlap_ok") if isinstance(data, dict) else None
+    return tuple(str(p) for p in raw) if isinstance(raw, list) else ()
+
+
 def _read_str_set(raw: object) -> frozenset[str]:
     """Coerce a JSON list-of-strings into a ``frozenset``; else empty."""
     return (

@@ -53,6 +53,8 @@ Two scheduling dimensions ride on each task, both read off the `WorkItem`:
 
 For a directory source, both are read from the task file's top-level JSON keys (`priority`, `required_capabilities`, `conflict_keys`) by `DirectoryWorkSource`; GitHub-derived sources do not yet populate them. A task with empty `required_capabilities` runs on any worker, including a worker advertising no capabilities.
 
+`overlap_ok` is a fourth top-level key, but **validate-time only** -- it is not scheduling metadata and never rides on a `WorkItem`. It is a JSON list of repo-relative paths that exempt this task from the authoring-time surface-overlap lint (`flywheel validate`, see [cli.md](cli.md)); the lint is its only consumer. It sits beside `conflict_keys` in the task file but plays no role at claim time.
+
 The worker's advertised set is `WorkPolicy.execution_capabilities`, configured under `[execution] capabilities` in `flywheel.toml` (`_policy.py:458`), defaulting to empty. **`[execution] capabilities` (worker work-classes) is distinct from `[sandbox.capabilities]` (agent tools/skills/MCP)** — see [configuration.md](configuration.md). Priority and capability filtering apply in both execution modes.
 
 ## Claims and leases (multi-worker mutual exclusion)
@@ -80,6 +82,8 @@ The default lease is `DEFAULT_LEASE_SECONDS = 300.0` (`_orchestrate.py:142`), ov
 ### Conflict keys
 
 `acquire_claim` refuses a claim whose `conflict_keys` overlap a **different live claim's** keys, so two tasks that touch the same resource never run concurrently. The task's own row is excluded and lapsed claims do not block, so the refusal clears once the conflicting claim is released or lapses. Empty `conflict_keys` (the default) is never refused on that basis. Keys are supplied at acquire time and persisted on the claim row (`conflict_keys_json`).
+
+`conflict_keys` is declared by the operator (or derived by autopilot) at authoring time; the authoring-time counterpart to this claim-time enforcement is `flywheel validate`'s surface-overlap lint, which flags two active tasks that write the same file surface but declare **disjoint** `conflict_keys` (so claim-time mutual exclusion would never fire) with no `overlap_ok` marker and no prerequisite chain -- the shape behind the infrared 2026-07-09 concurrent-write data loss. See [cli.md](cli.md).
 
 The loop passes keys wherever a claim gates repo work: the fresh-dispatch and blocked-resume acquires carry the `WorkItem`'s `conflict_keys`, and the claim is held through verify and landing, so two overlapping items never have concurrent edit-to-land windows. Bookkeeping acquires (stranded finalize, retry escalation, approval resolve, landing re-drive) deliberately pass none — record-keeping on one task must not queue behind an unrelated task that merely shares a file key, and a parked branch's textual conflicts are already baked in by re-land time. A conflict-refused task is skipped for the pass, not consumed: it stays eligible and is retried once the overlapping claim releases.
 

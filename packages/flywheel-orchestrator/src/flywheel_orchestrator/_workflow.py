@@ -104,6 +104,10 @@ from flywheel_orchestrator._sources import (
     iter_active_phase_dirs,
     load_active_tasks,
 )
+from flywheel_orchestrator._surface_lint import (
+    build_surface,
+    surface_overlap_defects,
+)
 from flywheel_orchestrator._store_factory import (
     PG_DSN_ENV,
     PG_DSN_FALLBACK_ENV,
@@ -1848,12 +1852,20 @@ def _repo_root_for_tasks_dir(tasks_dir: Path) -> Path:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    """Statically validate every active task's graders (spec 00034).
+    """Statically validate every active task (spec 00034 + surface-overlap lint).
 
-    Runs :func:`flywheel_core.validate_task` over each active task and exits
-    non-zero, naming each invalid task and its defects, when any task is
-    statically broken; exit 0 when all are valid. Same defect shape the
-    schedule-time dispatch consult surfaces.
+    Two static, pre-dispatch checks over the active listing:
+
+    * per-task: :func:`flywheel_core.validate_task` flags an un-runnable command
+      grader;
+    * pairwise: :func:`surface_overlap_defects` flags two tasks whose derived
+      file surfaces overlap with no shared ``conflict_keys`` entry, no
+      ``overlap_ok`` allow marker, and no prerequisite chain between them (the
+      concurrent-write / rebase-collision trap).
+
+    Exits non-zero, naming each offending task and its defects, when anything is
+    flagged; exit 0 when all are valid. Neither check runs a grader, reads the
+    store, or tests whether a derived path exists on disk.
     """
     policy = _load_effective_policy(args)
     if args.tasks_dir:
@@ -1870,14 +1882,16 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     else:
         tasks_dir = DEFAULT_TASKS_DIR
     repo_root = _repo_root_for_tasks_dir(tasks_dir)
+    loaded = load_active_tasks(tasks_dir)
     invalid: dict[str, list[TaskDefect]] = {}
-    valid_count = 0
-    for _path, task in load_active_tasks(tasks_dir):
+    for path, task in loaded:
         defects = validate_task(task, repo_root=repo_root)
         if defects:
             invalid.setdefault(task.id, []).extend(defects)
-        else:
-            valid_count += 1
+    surfaces = [build_surface(path, task) for path, task in loaded]
+    for defect in surface_overlap_defects(surfaces):
+        invalid.setdefault(defect.task_id, []).append(defect)
+    valid_count = len(loaded) - len(invalid)
     if not invalid:
         print(f"All {valid_count} active task(s) valid.")
         return 0

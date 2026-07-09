@@ -310,6 +310,7 @@ def select_next_task(
     *,
     exclude_ids: frozenset[str] = frozenset(),
     worker_capabilities: frozenset[str] = frozenset(),
+    satisfied_prerequisites: frozenset[str] = frozenset(),
 ) -> TaskStatusRow | None:
     """Pick the highest-priority eligible task from ``rows``.
 
@@ -318,8 +319,9 @@ def select_next_task(
     * its ``id`` is not in ``exclude_ids``, AND
     * its state is :attr:`TaskState.FRESH`, :attr:`TaskState.RETRYABLE`,
       or :attr:`TaskState.INTERRUPTED`, AND
-    * every prerequisite task (by ``id``) has state :attr:`TaskState.DONE`,
-      AND
+    * every prerequisite is satisfied — either a listed task (by ``id``)
+      with state :attr:`TaskState.DONE`, or an id present in
+      ``satisfied_prerequisites``, AND
     * its ``required_capabilities`` is a subset of ``worker_capabilities``.
 
     Among the eligible candidates the offer order is descending ``priority``,
@@ -329,7 +331,17 @@ def select_next_task(
     all-default set is byte-identical to the pre-feature behavior.
 
     Tasks whose prerequisites are missing from the workspace are treated
-    as ineligible so a dangling reference never silently runs.
+    as ineligible so a dangling reference never silently runs — unless the
+    missing id is named in ``satisfied_prerequisites``.
+
+    ``satisfied_prerequisites`` is a caller-supplied set of prerequisite ids
+    the store already resolves to DONE even though no listed row provides
+    them — a prerequisite whose defining task has left the work-source
+    listing (e.g. its phase archived) while its DONE lifecycle remains in the
+    authoritative store. The caller performs the store read (only for ids not
+    present among ``rows``, so no per-listed-task read is added) and hands the
+    result in as data, mirroring ``exclude_ids``'s caller-supplied precedent.
+    The default empty set keeps a fully-listed graph byte-identical.
 
     ``exclude_ids`` removes tasks from *candidacy* without removing them
     from the prerequisite-resolution map, so a caller (e.g. the
@@ -363,8 +375,11 @@ def select_next_task(
         if not row.required_capabilities <= worker_capabilities:
             continue
         if not all(
-            (dep := by_id.get(prereq_id)) is not None
-            and dep.state == TaskState.DONE
+            (
+                (dep := by_id.get(prereq_id)) is not None
+                and dep.state == TaskState.DONE
+            )
+            or prereq_id in satisfied_prerequisites
             for prereq_id in row.prerequisites
         ):
             continue
@@ -376,6 +391,43 @@ def select_next_task(
     # eligible candidate exactly as before.
     candidates.sort(key=lambda row: row.priority, reverse=True)
     return candidates[0]
+
+def satisfied_prerequisites_from_store(
+    rows: Iterable[TaskStatusRow],
+    store: SqliteStore | PostgresStore,
+) -> frozenset[str]:
+    """Prerequisite ids absent from ``rows`` yet DONE in ``store``.
+
+    The store is the authoritative record of completion (docs/data-taxonomy);
+    the source listing is an input surface, not the record. A prerequisite
+    whose defining task has left the listing — e.g. its phase archived, moving
+    the task JSON out of ``active/`` — is still satisfied when its lifecycle
+    reached :attr:`Status.DONE`.
+
+    Only ids that no listed row provides are consulted: a listed
+    prerequisite's DONE-ness is already folded into its row state by
+    :func:`task_state` (which classifies DONE through the same
+    ``_has_done_lifecycle`` authority), so this extends that authority to
+    unlisted ids without adding a per-listed-task store read to the pass. A
+    DONE lifecycle is the sole satisfier — a FAILED / RUNNING / INTERRUPTED /
+    absent id is never returned — so the result is exactly the set a caller
+    may hand to :func:`select_next_task` /
+    :meth:`WorkGraph.ready_set` as ``satisfied_prerequisites`` and use to drop
+    a store-DONE edge from the dangling-prerequisite re-driver's issues.
+    """
+    materialized = list(rows)
+    listed_ids = {row.task.id for row in materialized}
+    candidates = {
+        prereq_id
+        for row in materialized
+        for prereq_id in row.prerequisites
+        if prereq_id not in listed_ids
+    }
+    return frozenset(
+        prereq_id
+        for prereq_id in candidates
+        if _has_done_lifecycle(store, prereq_id)
+    )
 
 IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
 
@@ -895,7 +947,16 @@ def _cmd_next(args: argparse.Namespace) -> int:
     )
     try:
         rows = status_rows_for_items(source.list_work(), store)
-        pick = select_next_task(rows, worker_capabilities=worker_capabilities)
+        # A prerequisite absent from the listing but DONE in the store (e.g.
+        # its phase archived) is satisfied off the authoritative record, so a
+        # dependent whose only unlisted prerequisite already completed is not
+        # withheld. Only unlisted ids are consulted -- no per-listed-task read.
+        satisfied = satisfied_prerequisites_from_store(rows, store)
+        pick = select_next_task(
+            rows,
+            worker_capabilities=worker_capabilities,
+            satisfied_prerequisites=satisfied,
+        )
     finally:
         store.close()
     if pick is None:

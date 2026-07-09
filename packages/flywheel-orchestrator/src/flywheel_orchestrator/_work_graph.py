@@ -360,6 +360,7 @@ class WorkGraph:
         excluded: Iterable[str] = frozenset(),
         *,
         worker_capabilities: frozenset[str] = frozenset(),
+        satisfied_prerequisites: frozenset[str] = frozenset(),
     ) -> tuple[WorkItem, ...]:
         """Every currently-runnable item — and only those.
 
@@ -368,7 +369,8 @@ class WorkGraph:
         * its id is not in ``excluded``, AND
         * its own state (``states[id]``) is eligible — fresh, retryable, or
           interrupted (mirrors ``select_next_task``), AND
-        * every prerequisite resolves to a node whose state is DONE, AND
+        * every prerequisite either resolves to a node whose state is DONE or
+          is listed in ``satisfied_prerequisites``, AND
         * its ``required_capabilities`` is a subset of
           ``worker_capabilities``.
 
@@ -377,6 +379,15 @@ class WorkGraph:
         own state, or an excluded id is omitted. Unlike ``select_next_task``,
         this returns *all* matches (no early return) so parallel children all
         surface.
+
+        ``satisfied_prerequisites`` is a caller-supplied set of prerequisite
+        ids the store's authoritative lifecycle record already resolves to
+        DONE even though no listed node provides them (e.g. a prerequisite
+        whose defining task's phase archived). This module stays
+        store-agnostic: the caller performs the store read and hands the
+        result in as data. A prerequisite id is satisfied when it maps to a
+        DONE node in ``states`` OR is present here; the default empty set
+        keeps behavior byte-identical for a fully-listed graph.
 
         The returned items are ordered by descending ``priority``, ties
         broken by construction (walk) order via a *stable* sort (spec 00049,
@@ -399,8 +410,12 @@ class WorkGraph:
             if not item.required_capabilities <= worker_capabilities:
                 continue
             prereqs_satisfied = all(
-                prereq_id in self._by_id
-                and _state_value(states.get(prereq_id)) == _DONE_STATE_VALUE
+                (
+                    prereq_id in self._by_id
+                    and _state_value(states.get(prereq_id))
+                    == _DONE_STATE_VALUE
+                )
+                or prereq_id in satisfied_prerequisites
                 for prereq_id in self._declared.get(task_id, ())
             )
             if prereqs_satisfied:

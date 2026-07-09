@@ -160,6 +160,7 @@ from flywheel_orchestrator._workflow import (
     TaskState,
     TaskStatusRow,
     _latest_lifecycle_row,
+    satisfied_prerequisites_from_store,
     status_rows_for_items,
     task_state,
 )
@@ -459,6 +460,7 @@ def _assemble_graph_snapshot_items(
     *,
     worker_capabilities: frozenset[str],
     claims: SqliteClaimStore | PostgresClaimStore,
+    satisfied_prerequisites: frozenset[str] = frozenset(),
 ) -> list[GraphSnapshotItem]:
     """Materialize each pass work item's full cross-section for one snapshot.
 
@@ -473,7 +475,9 @@ def _assemble_graph_snapshot_items(
     ready_ids = {
         item.task.id
         for item in graph.ready_set(
-            states, worker_capabilities=worker_capabilities
+            states,
+            worker_capabilities=worker_capabilities,
+            satisfied_prerequisites=satisfied_prerequisites,
         )
     }
     holders = {
@@ -2193,7 +2197,13 @@ async def orchestrate(
     (see :func:`redrive_missing_prerequisites`). If the prerequisite instead
     appears, the per-pass graph rebuild resolves the edge and the task becomes
     eligible and is driven, so the bound is only reached by a genuinely absent
-    prerequisite. Always on (the dangling-prerequisite witnesses were recorded
+    prerequisite. A prerequisite absent from the listing but carrying a DONE
+    lifecycle in the authoritative store (e.g. its defining task's phase
+    archived) is likewise resolved -- off the store rather than the listing --
+    so the dependent is dispatched and no dangling witness or
+    ``prerequisite-missing`` queue entry is recorded for that edge (see
+    :func:`~flywheel_orchestrator._workflow.satisfied_prerequisites_from_store`).
+    Always on (the dangling-prerequisite witnesses were recorded
     unconditionally before this too); the default bound is generous enough to
     tolerate a sibling source listing its half of a cross-source dependency a
     pass or two late.
@@ -2401,6 +2411,19 @@ async def orchestrate(
             # set exactly as today (spec 00047, decision D-1).
             validation = WorkGraph.build(items)
             graph = validation.graph
+            # Cross-phase prerequisite resolution: a prerequisite absent from
+            # this pass's listing but carrying a DONE lifecycle in the
+            # authoritative store (e.g. its phase archived, moving its task
+            # JSON out of active/) is satisfied off the store, not treated as
+            # dangling. Consulted only for ids no listed row provides -- no
+            # per-listed-task store read is added. This one set feeds every
+            # eligibility decision this pass identically: the snapshot and
+            # fresh-selection ready_set calls below, the post-claim readiness
+            # recheck, AND the issue filter that keeps a store-DONE edge out of
+            # the dangling-prerequisite re-driver.
+            satisfied_prereqs = satisfied_prerequisites_from_store(
+                rows, control
+            )
             # Bounded dangling-prerequisite re-drive (spec 00069, criteria
             # #7/#8/#13). A task whose declared prerequisite resolves to no work
             # item stays out of the ready set exactly as before -- never
@@ -2416,7 +2439,11 @@ async def orchestrate(
             # driven (criterion #7).
             redrive_missing_prerequisites(
                 claims,
-                issues=validation.issues,
+                issues=[
+                    issue
+                    for issue in validation.issues
+                    if issue.missing_id not in satisfied_prereqs
+                ],
                 bound=prereq_redrive_bound,
                 now=clock,
                 stream=stream,
@@ -2484,6 +2511,7 @@ async def orchestrate(
                     states,
                     worker_capabilities=worker_capabilities,
                     claims=claims,
+                    satisfied_prerequisites=satisfied_prereqs,
                 ),
                 captured_at=clock(),
             )
@@ -2739,6 +2767,7 @@ async def orchestrate(
                     states,
                     excluded=exclude,
                     worker_capabilities=worker_capabilities,
+                    satisfied_prerequisites=satisfied_prereqs,
                 )
                 pick = row_by_id[ready[0].task.id] if ready else None
                 if pick is None:
@@ -2795,6 +2824,7 @@ async def orchestrate(
                         states,
                         excluded=exclude,
                         worker_capabilities=worker_capabilities,
+                        satisfied_prerequisites=satisfied_prereqs,
                     )
                 ):
                     claims.release_claim(claim)

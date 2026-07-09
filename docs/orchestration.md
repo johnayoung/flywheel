@@ -21,15 +21,17 @@ Construction validates eagerly. Defects split into two buckets:
 | Cycle (multi-node) | Raises `WorkGraphValidationError`, naming every member | `_work_graph.py:165` |
 | Missing prerequisite (dangling edge) | Non-fatal `GraphValidationIssue` on `.issues` | `_work_graph.py:155` |
 
-Structural corruption raises `WorkGraphValidationError` (`_work_graph.py:64`) with a message naming the offending id(s); a cycle names every participating member (detected via iterative Tarjan SCC, so long chains do not hit a recursion limit). A **missing prerequisite does not raise**: under multi-source aggregation a referenced item may simply not be loaded by a sibling source this pass, so it is recorded as a `GraphValidationIssue` and the referencing task stays permanently out of the ready set (it never runs) rather than aborting the whole graph.
+Structural corruption raises `WorkGraphValidationError` (`_work_graph.py:64`) with a message naming the offending id(s); a cycle names every participating member (detected via iterative Tarjan SCC, so long chains do not hit a recursion limit). A **missing prerequisite does not raise**: under multi-source aggregation a referenced item may simply not be loaded by a sibling source this pass, so it is recorded as a `GraphValidationIssue` and the referencing task stays out of the ready set rather than aborting the whole graph.
+
+A prerequisite that is absent from the listing is **satisfied by a `done` lifecycle in the store**. The store is the authoritative record of completion; the source listing is an input surface, not the record ([data-taxonomy.md](data-taxonomy.md)). When a prerequisite's defining task leaves the listing (e.g. its phase archived, moving the task JSON out of `active/`) while its lifecycle already reached `done`, the scheduler resolves the edge off the store — the dependent is dispatched, and **no** dangling witness or `prerequisite-missing` review entry is recorded for that edge. The caller consults the store only for ids no listed row provides (`satisfied_prerequisites_from_store`, `_workflow.py`) and hands the resulting set in as data, so `_work_graph.py` stays store-agnostic and no per-listed-task read is added. Only a `done` lifecycle satisfies — a `failed` / `running` / absent id still dangles and the bounded re-driver applies.
 
 ### Eligibility (the scheduling query)
 
-`WorkGraph.ready_set(states, excluded=frozenset(), *, worker_capabilities=frozenset())` (`_work_graph.py:257`) returns **every** runnable item this pass. An item is runnable iff all hold:
+`WorkGraph.ready_set(states, excluded=frozenset(), *, worker_capabilities=frozenset(), satisfied_prerequisites=frozenset())` (`_work_graph.py:257`) returns **every** runnable item this pass. An item is runnable iff all hold:
 
 1. its id is not in `excluded`;
 2. its own state is one of `fresh` / `retryable` / `interrupted` (`_ELIGIBLE_STATE_VALUES`, `_work_graph.py:47`);
-3. every **declared** prerequisite resolves to a node whose state is `done` — a dangling prerequisite fails this gate;
+3. every **declared** prerequisite is satisfied — either it resolves to a listed node whose state is `done`, or its id is in `satisfied_prerequisites` (absent from this pass's listing but `done` in the authoritative store); a prerequisite that is neither fails this gate;
 4. its `required_capabilities` is a subset of `worker_capabilities`.
 
 Results are ordered by **descending `priority`**, ties broken by construction/walk order via a stable sort (`_work_graph.py:308`); an all-default (priority 0) set is byte-identical to pure walk order. The loop takes `ready[0]` (`_orchestrate.py:1050`). The `select_next_task` CLI path (`_workflow.py:302`, used by `flywheel next`) applies the identical predicates but returns only the single highest-priority match.

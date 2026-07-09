@@ -1,0 +1,44 @@
+{
+  "id": "session-limit-classification",
+  "goal": "A session-limit refusal whose reset time is derivable (a rejected rate-limit event's resets_at, or a parseable refusal text) finalizes the attempt as a TRANSIENT INTERNAL_ERROR after a single invocation with the reset surfaced structurally, while an underivable or already-past reset preserves today's transient retry behavior byte-for-byte.",
+  "conflict_keys": ["core-harness", "packages/flywheel-core/src/flywheel_core/harness.py"],
+  "tags": ["reliability", "session-limit", "phase-17"],
+  "graders": [
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py -k session_limit", "name": "behavior" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_invoker.py -k session_reset", "name": "parser" },
+    { "type": "command", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py packages/flywheel-core/tests/test_invoker.py -k 'rate_limit or transient'", "name": "transient-regression" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/faults.py -- the shared TRANSIENT/PERMANENT taxonomy (spec 00067); the session-limit reset derivation helper lives here so no second taxonomy forks",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- _transient_rate_limit_reason (~line 1354) and the transient retry loop (~3520-3622) are the decision points; the transient_exhausted finalize (~2296) is the INTERNAL_ERROR route to reuse; HarnessOutcome (~534) gains the structural reset field",
+      "packages/flywheel-core/src/flywheel_core/invoker.py -- InvocationSignals.rate_limit_events / api_error_status and IterationResult.transcript are the only inputs; consume them, never re-derive from raw messages",
+      "packages/flywheel-core/tests/test_harness.py -- _rate_limited_iteration / _scripted_invoker / injected transient_sleep (~1163-1256) are the committed injection patterns; add the session_limit tests beside them",
+      "packages/flywheel-core/tests/test_invoker.py -- transient_classification_matrix lives here; add the session_reset parser fixture tests beside it"
+    ],
+    "references": [
+      ".flywheel/specs/00067-FEATURE-transient-fault-resilience.md -- D-1 (separate transient budget) and the classification observability requirement this extends"
+    ],
+    "constraints": [
+      "The reset crosses the core seam structurally: HarnessOutcome gains an additive optional field carrying the derived reset as an aware UTC datetime (default None), and flywheel_core.faults exports the derivation helper -- no consumer may regex a lifecycle error string to recover it.",
+      "Derivation ladder, strongest first: (1) a rejected RateLimitEvent's rate_limit_info.resets_at (epoch seconds, UTC); (2) a parseable refusal text from the iteration transcript/result -- fixtures MUST cover the pipe-epoch form ('Claude AI usage limit reached|1751990400') and the human form containing 'resets 6pm' with next-occurrence semantics for clock times, with now/timezone injected in tests; (3) neither derivable -> None.",
+      "Fail safe: a None reset OR a reset at-or-before now preserves today's transient behavior exactly -- the committed test_rate_limit_retry injects resets_at=1_700_000_000 (long past) and must stay green UNMODIFIED.",
+      "A derivable future reset finalizes the attempt after exactly ONE invocation through the existing TRANSIENT-classified INTERNAL_ERROR route, emits a distinct telemetry event (harness.session_limit) whose payload carries the ISO reset and the derivation source, and leaves the validation max_retries budget untouched.",
+      "SDK stays optional: read rate-limit event attributes via getattr as _transient_rate_limit_reason already does; no top-level SDK import; flywheel_core.task and flywheel_core.lifecycle purity untouched.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "No orchestrator or claim-loop changes -- the pool pause is session-limit-claim-pause's outcome.",
+      "No new flywheel.toml keys in this task.",
+      "An allowed_warning rate-limit event must never trigger the fast abort -- only status='rejected' or a refusal text.",
+      "Do not modify or weaken any existing test; add new tests only."
+    ],
+    "edge_cases": [
+      "resets_at in the past -> generic transient path (this is what keeps test_rate_limit_retry green unmodified).",
+      "'resets 6pm' parsed at 7pm local -> tomorrow 6pm, not a negative interval.",
+      "Garbage after 'resets' -> None, never a raised exception (the parser is total).",
+      "The fast-abort path still records the iteration transcript on the attempt for forensics.",
+      "A valid envelope alongside a rate-limit warning is never treated as session-limited (mirrors _iteration_is_transient_rate_limit's ValidEnvelope guard)."
+    ]
+  }
+}

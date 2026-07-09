@@ -1,0 +1,56 @@
+{
+  "id": "agentic-conflict-resolution",
+  "goal": "When the merge-fallback rung hits a merge conflict, a bounded agent session resolves it and the resolved tree lands only after the same out-of-band re-verification bar, or the run parks preserved with the session's recorded turn/wall usage within its configured bounds.",
+  "prerequisites": ["landing-merge-fallback"],
+  "tags": ["spec-00076", "unattended-landing-recovery"],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+    "docs/configuration.md"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_landing_agent_resolution.py -q" },
+    { "type": "command", "name": "recovery-ladder-unchanged", "run": "uv run pytest packages/flywheel-worktree/tests/test_landing_merge_fallback.py packages/flywheel-worktree/tests/test_worker.py -q" },
+    { "type": "command", "name": "config-policy", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py -q" },
+    { "type": "command", "name": "sdk-boundary", "run": "! grep -rn \"claude_agent_sdk\" packages/flywheel-worktree/src/" },
+    { "type": "command", "name": "sdk-optional", "run": "uv run pytest packages/flywheel-core/tests/test_sdk_optional.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-worktree packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- the merge-fallback rung's conflict outcome (from landing-merge-fallback) is the escalation point; build_merge_submitter threads the new config; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- [submit] table parsing gains the two bound keys, strict-on-values validation; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- build_repo_invoker and _drive_agent_iteration: the bounded-session pattern to mirror (lazy SDK via flywheel_core._sdk, injectable invoker, turn budget, wall-clock deadline)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_init_agent.py -- second example of the lazy SDK boundary",
+      "docs/configuration.md -- the [submit] table reference; document the two new keys in this same change",
+      "packages/flywheel-worktree/tests/test_landing_merge_fallback.py -- keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_worker.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_policy.py -- extend with the new keys' parse/validation coverage; do not weaken existing assertions"
+    ],
+    "references": [
+      ".flywheel/specs/00076-FEATURE-unattended-landing-recovery.md -- criterion 4; decisions D-1, D-2, D-4"
+    ],
+    "constraints": [
+      "Bounds are config (D-4): [submit] recovery_agent_max_turns (int, default 30; 0 disables the rung) and [submit] recovery_agent_max_wall_seconds (float, default 900.0); at most one resolution attempt per re-driver pass; wrong-typed values raise PolicyError naming the key",
+      "Every SDK touch goes through the lazy flywheel_core._sdk boundary inside the session-driving function; importing flywheel_worktree.worker must succeed without claude-agent-sdk installed and no flywheel-worktree module may reference claude_agent_sdk",
+      "The session driver is injectable so tests never invoke the real SDK -- mirror build_repo_invoker's seam",
+      "The resolved tree is a landing candidate like any other: task command graders, [submit] verify, and the declared held-out gate re-run against it before the base ref moves; failure parks preserved per criterion 3 and counts toward the existing redrive bound per criterion 7",
+      "A land from this rung records the agent-resolved rung value on the landing-rung discriminator introduced by landing-merge-fallback; the session's turn/wall usage is persisted queryably on the run's ledger",
+      "A session crash or SDK error must not unwind submit -- the run parks preserved (submit MUST NOT raise)",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change the FF, rebase, or merge-fallback rung semantics, the redrive bound, or the human-review queue mechanics",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "No changes to held-out gate internals",
+      "The session resolves textual merge conflicts of already-verified DONE work only -- it never edits task source beyond the conflict resolution, never approves gates, never writes lifecycle state",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "recovery_agent_max_turns = 0: no session spawns and the conflict parks exactly as landing-merge-fallback parks it (the criterion-3 disabled leg)",
+      "Bound exhaustion without a resolved tree: park preserved (branch ref resolves, worktree exists), usage recorded at or below the configured bound, and the failure counts toward the redrive bound",
+      "A resolved tree that fails re-verify must leave the base ref byte-identical with no Landed record -- agent output never lands on its own claim",
+      "Recorded usage exceeding the configured bound must fail the behavior test (the bound is enforced, not advisory)"
+    ]
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "id": "fw-plan-conflict-surface-checklist",
+  "goal": "The fw-plan directory-delivery checklist (template source and its committed rendered copy, kept in lockstep) instructs planners to derive each task's file surface from context.relevant plus grader run paths and to declare a shared conflict_keys entry or overlap_ok marker for any concurrent overlap, naming flywheel validate as the enforcement gate.",
+  "prerequisites": ["validate-surface-overlap-lint"],
+  "tags": ["conflict-surface-lint", "authoring"],
+  "conflict_keys": [
+    ".claude/skills/fw-plan/SKILL.md",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md"
+  ],
+  "graders": [
+    {
+      "type": "command",
+      "run": "grep -q 'overlap_ok' packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md && grep -q 'conflict_keys' packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md && grep -q 'flywheel validate' packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md",
+      "name": "template-tokens"
+    },
+    {
+      "type": "command",
+      "run": "grep -q 'overlap_ok' .claude/skills/fw-plan/SKILL.md && grep -q 'conflict_keys' .claude/skills/fw-plan/SKILL.md && grep -q 'flywheel validate' .claude/skills/fw-plan/SKILL.md",
+      "name": "rendered-tokens"
+    },
+    {
+      "type": "command",
+      "run": "uv run python -c 'from flywheel_orchestrator._skills import render_skill, SkillRenderSettings; import pathlib, sys; sys.exit(0 if render_skill(\"fw-plan\", SkillRenderSettings()) == pathlib.Path(\".claude/skills/fw-plan/SKILL.md\").read_text(encoding=\"utf-8\") else 1)'",
+      "name": "render-lockstep"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_skills.py -q",
+      "name": "skills-suite"
+    },
+    {
+      "type": "rubric",
+      "assertions": [
+        "The directory-delivery checklist instructs the planner to derive each task's file surface from context.relevant entries (with ' -- ' annotation suffixes stripped) plus command-grader run paths.",
+        "The checklist states that two tasks with overlapping surfaces and no prerequisite chain must either share a conflict_keys entry or list the reviewed-safe path in overlap_ok, and names flywheel validate as the gate that enforces this after files are written."
+      ],
+      "name": "checklist-substance"
+    }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md -- the template SOURCE flywheel init renders: add the conflict-surface checklist to STEP 4 (draft task JSON) and a 'run flywheel validate' step to STEP 6 (after writing files).",
+      ".claude/skills/fw-plan/SKILL.md -- the committed rendered copy (managed-by flywheel init), currently byte-equal to render_skill('fw-plan', SkillRenderSettings()); it must receive the SAME edit by regeneration, not hand-editing, so both files land in this one change.",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skills.py -- render_skill/SkillRenderSettings and the __FW_DELIVERY__/__FW_TASKS_DIR__ binding; use this renderer to regenerate the committed copy.",
+      "packages/flywheel-orchestrator/tests/test_skills.py -- the rendering suite; keep green.",
+      "docs/orchestration.md -- the shipped description of conflict_keys and overlap_ok the checklist wording must agree with (updated by the prerequisite task)."
+    ],
+    "constraints": [
+      "Edit the template source, then regenerate .claude/skills/fw-plan/SKILL.md through the real renderer; the render-lockstep grader fails any divergence between the two, and both files must be committed in this same change.",
+      "The checklist must state: derive each task's file surface as context.relevant paths (strip ' -- ' annotations) plus command-grader run paths; any two tasks whose surfaces overlap and that are not chained via prerequisites must share a conflict_keys entry or list the reviewed-safe path in the top-level overlap_ok array; flywheel validate enforces this, and STEP 6 must run it after writing task files.",
+      "Present conflict_keys and overlap_ok as top-level task-JSON keys of the directory work source (the delivery block's concern), not as core Task or context fields -- the main template's schema table and its 'do not invent fields' rule stay untouched and remain true.",
+      "Keep all __FW_*__ placeholders intact; concise checklist prose, no emojis.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not change lint or validate behavior (the prerequisite task owns all code); this task touches markdown templates and the rendered skill only.",
+      "Do not edit fw-plan.md's core schema table and do not edit fw-plan-delivery-github.md (GitHub sources do not carry conflict_keys).",
+      "Do not hand-edit the rendered SKILL.md out of lockstep with the template source.",
+      "Do not modify or weaken test_skills.py."
+    ],
+    "edge_cases": [
+      "Adding the guidance tokens to only one of the two files passes the greps for that file but fails render-lockstep -- the pair of graders is deliberate.",
+      "The delivery template renders into other repos via flywheel init, so the wording must not assume this repo's paths beyond the __FW_TASKS_DIR__ placeholder."
+    ]
+  }
+}

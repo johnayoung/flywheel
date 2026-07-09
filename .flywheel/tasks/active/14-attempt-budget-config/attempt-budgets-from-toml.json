@@ -1,0 +1,50 @@
+{
+  "id": "attempt-budgets-from-toml",
+  "goal": "Attempt-budget keys declared in flywheel.toml -- the top-level [deadlines] per-class wall-clock table and [sandbox.limits] rubric_judge_max_turns -- take effect on the worker run path's HarnessConfig instead of the code defaults.",
+  "tags": ["config", "budgets", "spec-00066"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+    "packages/flywheel-core/src/flywheel_core/workflow.py",
+    "packages/flywheel-core/src/flywheel_core/harness.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "policy-parse-oracle", "run": "uv run python -c '\nimport tempfile, pathlib\nfrom flywheel_orchestrator._policy import load_policy\nfrom flywheel_core.deadline_config import DeadlineConfig\nbody = \"\"\"[source]\nkind = \"directory\"\n\n[deadlines]\nagent_iteration_seconds = 5400\nrubric_judge_seconds = 0\n\n[sandbox.limits]\nrubric_judge_max_turns = 48\n\"\"\"\nbare_body = \"\"\"[source]\nkind = \"directory\"\n\"\"\"\nwith tempfile.TemporaryDirectory() as d:\n    p = pathlib.Path(d) / \"flywheel.toml\"\n    p.write_text(body, encoding=\"utf-8\")\n    pol = load_policy(p)\n    p.write_text(bare_body, encoding=\"utf-8\")\n    bare = load_policy(p)\nassert pol.deadlines.agent_iteration_seconds == 5400.0, pol.deadlines\nassert pol.deadlines.rubric_judge_seconds is None, pol.deadlines\nassert pol.deadlines.command_grader_seconds == 900.0, pol.deadlines\nassert pol.sandbox.limits.rubric_judge_max_turns == 48, pol.sandbox.limits\nassert bare.deadlines == DeadlineConfig(), bare.deadlines\nassert bare.sandbox.limits.rubric_judge_max_turns is None, bare.sandbox.limits\nprint(\"policy-parse-oracle ok\")\n'" },
+    { "type": "command", "name": "worker-path-behavior", "run": "uv run pytest packages/flywheel-core/tests/test_workflow_deadline_override.py packages/flywheel-core/tests/test_deadline_config_defaults.py" },
+    { "type": "command", "name": "policy-and-threading-tests", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_deadline_policy_threading.py packages/flywheel-orchestrator/tests/test_policy.py packages/flywheel-orchestrator/tests/test_sandbox_limit_threading.py" },
+    { "type": "command", "name": "harness-defaults-suite", "run": "uv run pytest packages/flywheel-core/tests/test_harness.py -k TestHarnessConfigDefaults" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- WorkPolicy, SandboxLimits, load_policy: parse both new keys here (WorkPolicy.deadlines, SandboxLimits.rubric_judge_max_turns)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- _sandbox_limit_primitives (~line 2031) is the decomposition seam; the claimed-run driver threads the primitives into run_task_object (~line 3263). LARGE FILE: use serena find_symbol, do not read whole",
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- run_task_object (line 733) constructs HarnessConfig (~line 949); add the forwarding params here",
+      "packages/flywheel-core/src/flywheel_core/deadline_config.py -- deadline_config_from_mapping is the spec-00066 resolver to consume as-is; do not modify this file",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- HarnessConfig.rubric_judge_max_turns (line 496, default 32) and .deadlines (line 499) are the targets. LARGE FILE: use serena find_symbol, do not read whole",
+      "packages/flywheel-orchestrator/tests/test_sandbox_limit_threading.py -- the committed threading-test pattern to mirror; keep green",
+      "packages/flywheel-core/tests/test_harness.py -- TestHarnessConfigDefaults already asserts the current defaults (rubric_judge_max_turns == 32, repaired on main at 8afc9c0); keep the whole suite green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00066-FEATURE-universal-deadlines.md -- D-1 (default-on, overridable, 0 = opt-out) and the [deadlines] key names the resolver already fixes"
+    ],
+    "constraints": [
+      "New TOML surface exactly: a top-level [deadlines] table parsed with flywheel_core.deadline_config.deadline_config_from_mapping into a new WorkPolicy.deadlines: DeadlineConfig field (absent table -> DeadlineConfig(), byte-identical defaults); and [sandbox.limits] rubric_judge_max_turns parsed into SandboxLimits.rubric_judge_max_turns: int | None (absent -> None -> HarnessConfig keeps its default 32).",
+      "Strict on values per load_policy convention: a non-numeric [deadlines] value (wrap the resolver's ValueError) or a non-int/bool/non-positive rubric_judge_max_turns raises PolicyError naming the file and key; unknown keys stay ignored. Cover these error cases in the new threading test file or test_policy.py.",
+      "run_task_object gains kw-only params deadlines: DeadlineConfig | None = None and rubric_judge_max_turns: int | None = None, forwarded into HarnessConfig only when not None, so every existing caller is byte-identical.",
+      "packages/flywheel-core/tests/test_workflow_deadline_override.py (create at exactly this path) must prove behavior end-to-end at the worker's seam: run_task_object with a deadlines config carrying a tiny agent_iteration ceiling (e.g. 0.05s) and an injected invoke that never returns yields a timeout-classified outcome in bounded wall time, and rubric_judge_max_turns forwarding into the harness config is asserted.",
+      "packages/flywheel-orchestrator/tests/test_deadline_policy_threading.py (create at exactly this path) must prove policy-to-run_task_object threading for both knobs, mirroring test_sandbox_limit_threading.py, including the None-policy default.",
+      "flywheel.toml only -- add no CLI flags; precedence stays file-over-built-in-default.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify packages/flywheel-core/src/flywheel_core/deadline_config.py -- consume the resolver, never fork its key mapping.",
+      "Do not modify existing tests; do not weaken or delete any assertion.",
+      "No autopilot or container-backend plumbing (sibling tasks autopilot-deadline-from-toml / docker-management-deadline-from-toml) and no docs/configuration.md edit (sibling task document-attempt-budget-keys).",
+      "Do not change any HarnessConfig or DeadlineConfig default value."
+    ],
+    "edge_cases": [
+      "A [deadlines] key set to 0 must resolve to None (unbounded opt-out) -- resolving it to 0.0 or snapping back to the class default must fail the parse oracle.",
+      "A [deadlines] table present with SOME keys keeps the defaults for absent classes (the oracle asserts command_grader_seconds stays 900.0).",
+      "TOML true is a bool, not a number: [deadlines] agent_iteration_seconds = true must raise PolicyError, not pass as 1.0."
+    ]
+  }
+}

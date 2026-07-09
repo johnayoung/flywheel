@@ -1,0 +1,46 @@
+{
+  "id": "approval-sweep-mark-expiry",
+  "goal": "An approve or reject enqueued after an orchestrate session's approval sweep found no pending command for a parked run is consumed by that same still-running session once the sweep mark expires, instead of being skipped until the session ends.",
+  "tags": ["postgres-control-plane"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_approval_expiry.py -q" },
+    { "type": "command", "name": "approval-sweep-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" },
+    { "type": "rubric", "name": "in-session-screen", "assertions": [
+      "The new expiry test enqueues the approve only after the same orchestrate call has already swept the parked run and found no pending command, and it asserts the approval was applied (lifecycle advanced) before that single orchestrate call returns -- no second orchestrate call sits between the empty sweep and the consumption assertion.",
+      "The new expiry test controls time exclusively through orchestrate's injected now clock; it contains no real sleeps to wait out the expiry."
+    ]}
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- attempted_approve: set[str] created at line 2351, skip at 2597, marked at 2610 (missing lifecycle) and 2625 (resolve applied=False); orchestrate already accepts an injected now clock; 3500+ lines, use serena symbols",
+      "packages/flywheel-orchestrator/tests/test_orchestrator.py -- _write_task_with_manual_gate (line 844) and the two FR-9 pins: test_awaiting_approval_pending_approve_resolves_on_next_tick (line 870) and test_awaiting_approval_with_no_pending_command_stays_parked (line 919): keep green, assertions unmodified",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- resolve_manual_approval (line 4793), read-only reference: returns applied=False when no pending command; use serena symbols"
+    ],
+    "references": [
+      ".flywheel/proposals/overnight-2026-07-08.md -- P1, root cause (b): the mark must expire, not persist for the session"
+    ],
+    "constraints": [
+      "Expiry is measured against orchestrate's injected now clock (the existing now parameter) so the behavior is deterministic under a fake clock; no wall-clock sleeps in production code or tests",
+      "The new test lives at packages/flywheel-orchestrator/tests/test_orchestrator_approval_expiry.py and must fail against the current session-permanent set",
+      "Keep the anti-tight-loop property: a session whose only remaining work is a parked run with no pending command must still quiesce and return its report",
+      "No new flywheel.toml keys: the expiry bound is a code-level constant (an injectable seam for tests is fine)",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change resolve_manual_approval, claim/lease semantics, or scheduling order",
+      "Do not touch the producer CLI path (a sibling task owns it)",
+      "Do not modify, weaken, or delete assertions in test_orchestrator.py",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "The expiry re-arms: after an expired mark is re-swept and again finds no pending command, the run is re-marked and expires again -- not a one-shot",
+      "The missing-lifecycle mark (load_lifecycle returned None, line 2610) must not create a tight re-claim loop whichever expiry treatment it gets",
+      "Mutation check: a mark that never expires must fail the new test; deleting the mark outright must not make any test hang -- the stays-parked test's session still ends"
+    ],
+    "notes": "The scenario the new test must witness, all inside one orchestrate call: a gated task parks AWAITING_APPROVAL; the sweep passes it empty and marks it; a second task keeps the session alive; the approve is enqueued mid-session (direct store enqueue is fine at this layer -- the CLI path is a sibling task); the fake clock advances past the expiry; a later pass of the same call consumes the approve and the lifecycle reaches DONE."
+  }
+}

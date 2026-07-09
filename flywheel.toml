@@ -18,6 +18,12 @@ model = "claude-opus-4-8"
 [worker]
 concurrency = 3
 
+# Phase-exit integration gate (spec 00035): the full repo gate runs against
+# the merged phase base before a completed phase archives; non-zero exit
+# leaves the phase active.
+[phase]
+verify = "scripts/check.sh"
+
 # Execute-time held-out landing gate (specs 00050/00051/00057). The committed
 # pointer activates the gate for the orchestrator; the payload it names
 # (per-task registrations + oracles) lives under the already git-ignored

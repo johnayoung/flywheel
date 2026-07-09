@@ -116,7 +116,7 @@ _ORCH_EVENT_SELECT = """
 
 
 _ORCH_STOP_EVENT_SELECT = """
-    SELECT id, kind, subject, detail, occurred_at, run_id
+    SELECT id, kind, subject, detail, occurred_at, run_id, attribution
     FROM orchestrator_stop_events
 """
 
@@ -200,6 +200,7 @@ def _row_to_orchestrator_stop_event_record(
         detail=row["detail"],
         occurred_at=row["occurred_at"],
         run_id=row["run_id"],
+        attribution=row["attribution"],
     )
 
 
@@ -492,7 +493,8 @@ class PostgresClaimStore:
                       subject     TEXT NOT NULL,
                       detail      TEXT NOT NULL,
                       occurred_at TIMESTAMPTZ NOT NULL,
-                      run_id      TEXT NOT NULL DEFAULT ''
+                      run_id      TEXT NOT NULL DEFAULT '',
+                      attribution TEXT NOT NULL DEFAULT ''
                     )
                     """
                 )
@@ -504,6 +506,17 @@ class PostgresClaimStore:
                     """
                     ALTER TABLE orchestrator_stop_events ADD COLUMN IF NOT
                       EXISTS run_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                # Additive v9 migration: a pre-existing v6..v8 store predates the
+                # attribution column (spec 00077). ADD COLUMN IF NOT EXISTS adds
+                # it in place (default '', so every existing stop row -- and any
+                # unattributed archival-supersession marker -- survives); new
+                # stores already have it from the CREATE TABLE above.
+                cur.execute(
+                    """
+                    ALTER TABLE orchestrator_stop_events ADD COLUMN IF NOT
+                      EXISTS attribution TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cur.execute(
@@ -889,17 +902,19 @@ class PostgresClaimStore:
         detail: str,
         occurred_at: datetime,
         run_id: str = "",
+        attribution: str = "",
     ) -> None:
         # Append one stop row using the caller's cursor, so a prepare-skip stop
         # commits atomically with the claim release it accompanies (D-3). Never
-        # dedupes -- recurrence is the signal.
+        # dedupes -- recurrence is the signal. ``attribution`` names the actor
+        # that stamped a resolution (probe/operator); archival is never one.
         cur.execute(
             """
             INSERT INTO orchestrator_stop_events
-                (kind, subject, detail, occurred_at, run_id)
-            VALUES (%s, %s, %s, %s, %s)
+                (kind, subject, detail, occurred_at, run_id, attribution)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (kind, subject, detail, occurred_at, run_id),
+            (kind, subject, detail, occurred_at, run_id, attribution),
         )
 
     def record_stop_event(
@@ -909,6 +924,7 @@ class PostgresClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        attribution: str = "",
     ) -> None:
         # Audit-witness only: append one row naming the stop and its cause.
         with self._pool.connection() as conn:
@@ -919,6 +935,7 @@ class PostgresClaimStore:
                     subject=subject,
                     detail=detail,
                     occurred_at=occurred_at,
+                    attribution=attribution,
                 )
 
     def record_prepare_skip(

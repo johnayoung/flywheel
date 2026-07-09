@@ -100,7 +100,17 @@ if TYPE_CHECKING:
 # NOT EXISTS`` materializes the table on open, so a pre-existing v1..v7 store
 # keeps every existing row and simply gains an empty pause ledger; the sentinel
 # converges forward, no drop-and-recreate, no hard mismatch.
-CURRENT_ORCH_SCHEMA_VERSION: int = 8
+#
+# v9 adds the additive ``orchestrator_stop_events.attribution`` column (spec
+# 00077, criteria 3/4): a :data:`STOP_RESOLVED` marker that clears a landing
+# strand records WHO cleared it -- :data:`RESOLUTION_ATTRIBUTION_PROBE`
+# (git-truth) or :data:`RESOLUTION_ATTRIBUTION_OPERATOR` -- as a machine-readable
+# token queried directly off the row, never parsed out of ``detail``. The bump is
+# additive -- a pre-existing v1..v8 store gains the column via ``ALTER TABLE ADD
+# COLUMN`` (default ``''``, so every surviving stop row keeps its data, and an
+# unattributed archival-supersession marker reads ``''``) and converges its
+# sentinel forward; no drop-and-recreate, no hard mismatch.
+CURRENT_ORCH_SCHEMA_VERSION: int = 9
 
 # The five event types the ledger records, one per committed ``task_claims``
 # insert/update/delete (spec 00054 D-2). ``stolen`` is deliberately distinct from
@@ -215,6 +225,29 @@ STOP_RESOLVED: str = "stop-resolved"
 # by subject regardless of kind, and a later :data:`STOP_RESOLVED` (the phase
 # archived once the task landed) supersedes it.
 STOP_INDETERMINATE_LANDING: str = "indeterminate-landing"
+
+
+# The resolution-marker attribution vocabulary (spec 00077, criteria 3/4;
+# D-2/D-3). A :data:`STOP_RESOLVED` marker that clears a *landing strand* (one of
+# :data:`flywheel_core.events.LANDING_STRAND_KINDS`, or a fail-closed
+# :data:`STOP_INDETERMINATE_LANDING`) carries a machine-readable ``attribution``
+# naming WHO cleared it -- the sweep's landability probe (git-truth) or a
+# deliberate operator decision. The token lives in the stop-event row's
+# ``attribution`` column, so a reader queries it directly and never parses it out
+# of the free-text ``detail``; that is what keeps a machine resolution from
+# masquerading as an operator decision in the audit trail. Archival is NEVER an
+# attributor: the plain phase-archival supersession marker for a non-landing stop
+# leaves ``attribution`` empty (``''``). Exported here so the sweep, the status
+# surface, and the operator CLI resolution verb share ONE definition.
+RESOLUTION_ATTRIBUTION_PROBE: str = "probe"
+RESOLUTION_ATTRIBUTION_OPERATOR: str = "operator"
+
+RESOLUTION_ATTRIBUTIONS: frozenset[str] = frozenset(
+    {
+        RESOLUTION_ATTRIBUTION_PROBE,
+        RESOLUTION_ATTRIBUTION_OPERATOR,
+    }
+)
 
 
 # The human-review queue vocabulary (spec 00069-work-redriver, queue-surface).
@@ -420,6 +453,15 @@ class OrchestratorStopEventRecord:
     (spec 00069): a landing park / retry exhaustion / abort / budget stop carries
     the run whose lifecycle produced it. Pre-run dead-ends have no run and leave
     it ``''``.
+
+    ``attribution`` (schema v9) names WHO cleared a landing strand on a
+    :data:`STOP_RESOLVED` marker -- :data:`RESOLUTION_ATTRIBUTION_PROBE` when the
+    archive sweep's landability probe confirmed the work landed, or
+    :data:`RESOLUTION_ATTRIBUTION_OPERATOR` when the CLI resolution verb abandoned
+    it (spec 00077, criteria 3/4; D-2/D-3). Every other row -- pre-run dead-ends,
+    landing parks, human-review routings, and the plain archival-supersession
+    marker (archival is never an attributor) -- leaves it ``''``, so a reader
+    distinguishes a machine resolution from an operator one by this field alone.
     """
 
     id: int
@@ -428,6 +470,7 @@ class OrchestratorStopEventRecord:
     detail: str
     occurred_at: datetime
     run_id: str = ""
+    attribution: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -500,6 +543,7 @@ class StopEventStore(Protocol):
         subject: str,
         detail: str,
         occurred_at: datetime,
+        attribution: str = "",
     ) -> None: ...
 
 
@@ -742,6 +786,7 @@ def _row_to_orchestrator_stop_event_record(
         detail=row["detail"],
         occurred_at=_parse_iso(row["occurred_at"]),
         run_id=row["run_id"],
+        attribution=row["attribution"],
     )
 
 
@@ -877,6 +922,7 @@ class InMemoryClaimStore:
         detail: str,
         occurred_at: datetime,
         run_id: str = "",
+        attribution: str = "",
     ) -> None:
         # Append-only, never deduped: a fresh monotonic id (1-based) per
         # recorded stop, stored in insertion order so both read accessors
@@ -889,6 +935,7 @@ class InMemoryClaimStore:
                 detail=detail,
                 occurred_at=occurred_at,
                 run_id=run_id,
+                attribution=attribution,
             )
         )
 
@@ -1063,11 +1110,18 @@ class InMemoryClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        attribution: str = "",
     ) -> None:
         # Audit-witness only: append one row naming the stop and its cause.
-        # Never dedupes -- recurrence is the signal.
+        # Never dedupes -- recurrence is the signal. ``attribution`` is empty for
+        # every non-resolution stop; a landing-strand resolution names its
+        # attributor (probe / operator) per spec 00077.
         self._append_stop_event(
-            kind=kind, subject=subject, detail=detail, occurred_at=occurred_at
+            kind=kind,
+            subject=subject,
+            detail=detail,
+            occurred_at=occurred_at,
+            attribution=attribution,
         )
 
     def record_prepare_skip(
@@ -1317,7 +1371,8 @@ CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
   subject     TEXT NOT NULL,
   detail      TEXT NOT NULL,
   occurred_at TEXT NOT NULL,
-  run_id      TEXT NOT NULL DEFAULT ''
+  run_id      TEXT NOT NULL DEFAULT '',
+  attribution TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_subject
@@ -1428,6 +1483,16 @@ class SqliteClaimStore:
                 "ALTER TABLE orchestrator_stop_events "
                 "ADD COLUMN run_id TEXT NOT NULL DEFAULT ''"
             )
+        # Additive v9 migration: a pre-existing v6..v8 store has an
+        # orchestrator_stop_events table predating the attribution column. Add
+        # it in place (defaulting to '', so every existing stop row -- and any
+        # unattributed archival-supersession marker -- keeps its data); new
+        # stores already have it from the CREATE TABLE above.
+        if "attribution" not in stop_columns:
+            conn.execute(
+                "ALTER TABLE orchestrator_stop_events "
+                "ADD COLUMN attribution TEXT NOT NULL DEFAULT ''"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO orchestrator_schema_version (id, version) "
             "VALUES (1, ?)",
@@ -1437,17 +1502,17 @@ class SqliteClaimStore:
             "SELECT version FROM orchestrator_schema_version WHERE id = 1"
         ).fetchone()
         observed = int(row["version"]) if row is not None else None
-        # Additive forward migration v1..v7 -> v8: the WorkGraph tables (v2),
+        # Additive forward migration v1..v8 -> v9: the WorkGraph tables (v2),
         # the conflict-keys column (v3), the orchestrator_events ledger (v4),
         # the graph_snapshots/graph_snapshot_items tables (v5), the
-        # orchestrator_stop_events ledger (v6), its run_id column (v7), and the
-        # orchestrator_session_pauses ledger (v8) were all materialized above
-        # (CREATE TABLE IF NOT EXISTS plus the additive ALTERs), so a
-        # pre-existing store keeps its
+        # orchestrator_stop_events ledger (v6), its run_id column (v7), the
+        # orchestrator_session_pauses ledger (v8), and its attribution column
+        # (v9) were all materialized above (CREATE TABLE IF NOT EXISTS plus the
+        # additive ALTERs), so a pre-existing store keeps its
         # task_claims/work_items/source_syncs/orchestrator_events/snapshot/stop
-        # rows intact and simply gains the empty pause ledger. Converge the
-        # sentinel forward rather than refusing the store; a newer-than-current
-        # version still trips the mismatch guard below.
+        # rows intact and simply gains the new column. Converge the sentinel
+        # forward rather than refusing the store; a newer-than-current version
+        # still trips the mismatch guard below.
         if observed is not None and observed < CURRENT_ORCH_SCHEMA_VERSION:
             conn.execute(
                 "UPDATE orchestrator_schema_version SET version = ? "
@@ -1779,14 +1844,15 @@ class SqliteClaimStore:
         detail: str,
         occurred_at: datetime,
         run_id: str = "",
+        attribution: str = "",
     ) -> None:
         # Append one stop row. MUST be called inside an open ``_transaction`` so
         # a prepare-skip stop commits atomically with the claim release it
         # accompanies (D-3). Never dedupes -- recurrence is the signal.
         self._connection.execute(
             "INSERT INTO orchestrator_stop_events (kind, subject, detail, "
-            "occurred_at, run_id) VALUES (?, ?, ?, ?, ?)",
-            (kind, subject, detail, _iso(occurred_at), run_id),
+            "occurred_at, run_id, attribution) VALUES (?, ?, ?, ?, ?, ?)",
+            (kind, subject, detail, _iso(occurred_at), run_id, attribution),
         )
 
     def record_stop_event(
@@ -1796,14 +1862,18 @@ class SqliteClaimStore:
         subject: str,
         detail: str,
         occurred_at: datetime,
+        attribution: str = "",
     ) -> None:
         # Audit-witness only: append one row naming the stop and its cause.
+        # ``attribution`` is empty for every non-resolution stop; a
+        # landing-strand resolution names its attributor (probe / operator).
         with self._transaction():
             self._insert_stop_event(
                 kind=kind,
                 subject=subject,
                 detail=detail,
                 occurred_at=occurred_at,
+                attribution=attribution,
             )
 
     def record_prepare_skip(
@@ -1843,8 +1913,8 @@ class SqliteClaimStore:
     def list_stop_events(self) -> list[OrchestratorStopEventRecord]:
         # Global stream: every recorded stop in id (insertion) order.
         rows = self._connection.execute(
-            "SELECT id, kind, subject, detail, occurred_at, run_id "
-            "FROM orchestrator_stop_events ORDER BY id"
+            "SELECT id, kind, subject, detail, occurred_at, run_id, "
+            "attribution FROM orchestrator_stop_events ORDER BY id"
         ).fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
 
@@ -1853,8 +1923,9 @@ class SqliteClaimStore:
     ) -> list[OrchestratorStopEventRecord]:
         # Per-subject timeline: one subject's stops in id order.
         rows = self._connection.execute(
-            "SELECT id, kind, subject, detail, occurred_at, run_id "
-            "FROM orchestrator_stop_events WHERE subject = ? ORDER BY id",
+            "SELECT id, kind, subject, detail, occurred_at, run_id, "
+            "attribution FROM orchestrator_stop_events "
+            "WHERE subject = ? ORDER BY id",
             (subject,),
         ).fetchall()
         return [_row_to_orchestrator_stop_event_record(row) for row in rows]
@@ -2262,6 +2333,9 @@ __all__ = [
     "REASON_NO_PROGRESS",
     "REASON_PREREQUISITE_MISSING",
     "REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION",
+    "RESOLUTION_ATTRIBUTIONS",
+    "RESOLUTION_ATTRIBUTION_OPERATOR",
+    "RESOLUTION_ATTRIBUTION_PROBE",
     "STOP_DANGLING_PREREQUISITE",
     "STOP_INDETERMINATE_LANDING",
     "STOP_NO_OP_CYCLE",

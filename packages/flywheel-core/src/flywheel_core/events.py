@@ -441,6 +441,28 @@ LANDING_PARK_KINDS: frozenset[str] = frozenset(
 )
 
 
+# The landing-strand subset the archive sweep treats as resolvable ONLY by
+# git-truth or a deliberate operator, never by the act of archiving (spec 00077,
+# criteria 3/4; D-2/D-3). A DONE task parked under one of these kinds is a
+# *landing strand*: whether its verified work is reachable from the landing base
+# is a git fact the sweep must prove, so archival must never stamp such a strand
+# ``stop-resolved`` on its own. The sweep clears a landing strand only when its
+# landability probe confirms the work landed (a probe-attributed resolution) or
+# an operator abandons it (an operator-attributed resolution). The remaining
+# :data:`LANDING_PARK_KINDS` members (``held-out-gate``, ``push-failed``,
+# ``submit-error``, ``merge-conflict``) are outside this spec's scope and keep
+# the plain archival-supersession contract, so a single reader tells the two
+# apart by membership alone.
+LANDING_STRAND_KINDS: frozenset[str] = frozenset(
+    {
+        PARK_KIND_UNCOMMITTED_WORK,
+        PARK_KIND_DIVERGENT_BASE,
+        PARK_KIND_STANDING_VERIFY,
+        PARK_KIND_PROTECTED_PATHS,
+    }
+)
+
+
 # Landing-strategy vocabulary carried on a :class:`Landed` record's ``strategy``
 # field. Each successful land site names itself with one of these stable
 # spellings, kept identical across the merge worker and the PR strategy so a

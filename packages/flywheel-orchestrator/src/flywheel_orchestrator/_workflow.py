@@ -41,7 +41,12 @@ from flywheel_core.harness import (
     recheck_blocked_lifecycle,
 )
 from flywheel_core.event_serde import event_kind, event_payload
-from flywheel_core.events import DomainEvent, Landed, LandingParked
+from flywheel_core.events import (
+    LANDING_STRAND_KINDS,
+    DomainEvent,
+    Landed,
+    LandingParked,
+)
 from flywheel_core.lifecycle import Attempt, Lifecycle, Status
 from flywheel_core.loaders import TaskLoadError, load_task_file
 from flywheel_core.loop_path_marker import LoopPathSignal, detect_loop_path_signals
@@ -68,6 +73,7 @@ from flywheel_core.workflow import (
     recover_stranded_lifecycles,
 )
 from flywheel_orchestrator._claims import (
+    RESOLUTION_ATTRIBUTION_PROBE,
     STOP_INDETERMINATE_LANDING,
     STOP_RESOLVED,
     OrchestratorStopEventRecord,
@@ -656,15 +662,26 @@ def archive_completed_phases(
     gate.
 
     ``claims`` threads the orchestrator stop-event ledger through the sweep.
-    Archival is the verified resolution act -- a phase moves only when every
-    task is done and the gates above passed against the landed result -- so
-    each archived task whose ledger still surfaces a stop (a queue-routed
-    strand serviced by hand, a dangling prerequisite that later resolved)
-    gets one appended :data:`STOP_RESOLVED` marker, clearing it from the
-    ``status`` stranded view without deleting ledger history. ``None`` (the
-    default) skips the markers, preserving the legacy contract. ``now`` is
-    the marker's injected clock; ``None`` falls back to wall-clock UTC, the
-    same convention as the work-source stop sink.
+    Archival is the verified resolution act for a *non-landing* stop -- a
+    queue-routed strand serviced by hand, a dangling prerequisite that later
+    resolved -- so each such archived task gets one appended
+    :data:`STOP_RESOLVED` marker (no ``attribution``; archival is never an
+    attributor), clearing it from the ``status`` stranded view without
+    deleting ledger history. A *landing strand* (spec 00077, criteria 3/4,
+    D-2 -- the kinds in
+    :data:`~flywheel_core.events.LANDING_STRAND_KINDS` plus
+    :data:`STOP_INDETERMINATE_LANDING`) is not resolvable by the act of
+    archiving: it survives every sweep unresolved until git-truth or an
+    operator clears it. This sweep stamps a resolution on a landing strand
+    only when its own landed predicate confirmed the task reachable from
+    ``landing_base`` (``_LandingState.LANDED``); that marker is attributed to
+    the probe (:data:`~flywheel_orchestrator._claims.RESOLUTION_ATTRIBUTION_PROBE`),
+    queryable from the stop-event record's ``attribution`` column and never
+    parsed from the detail prose. An unarmed sweep proves nothing and leaves
+    every landing strand surfaced. ``None`` (the default) skips the markers,
+    preserving the legacy contract. ``now`` is the marker's injected clock;
+    ``None`` falls back to wall-clock UTC, the same convention as the
+    work-source stop sink.
     """
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
@@ -698,12 +715,19 @@ def archive_completed_phases(
         # head) blocks AND fails closed as a surfaced indeterminate-landing
         # strand. Armed only when both ``repo_root`` and ``landing_base`` are
         # threaded, so legacy callers keep the DONE-only contract.
+        # Per-task landing verdict from this sweep's probe, keyed by task id.
+        # Empty when the predicate is unarmed (legacy callers), so the tail
+        # resolution block can tell a git-truth-confirmed landing (LANDED)
+        # apart from an unproven one and never machine-resolves a strand it
+        # did not confirm landed.
+        landing_states: dict[str, _LandingState] = {}
         if repo_root is not None and landing_base is not None:
             blocking = False
             for task in loaded_tasks:
                 state = _probe_task_landing(
                     store, repo_root, phase_dir, task.id, landing_base
                 )
+                landing_states[task.id] = state
                 if state is _LandingState.LANDED:
                     continue
                 blocking = True
@@ -767,13 +791,48 @@ def archive_completed_phases(
                 events = claims.list_subject_stop_events(task.id)
                 if not events or events[-1].kind == STOP_RESOLVED:
                     continue
+                latest_kind = events[-1].kind
+                if (
+                    latest_kind in LANDING_STRAND_KINDS
+                    or latest_kind == STOP_INDETERMINATE_LANDING
+                ):
+                    # Landing strands (spec 00077, criteria 3/4, D-2) are not
+                    # resolvable by the act of archiving -- only git-truth or
+                    # an operator clears them. This sweep may stamp a
+                    # resolution only when its own probe confirmed the task
+                    # landed (``_LandingState.LANDED``); the marker is then
+                    # attributed to the probe, never to archival. An unarmed
+                    # sweep (empty ``landing_states``) proves nothing and
+                    # leaves the strand surfaced.
+                    if (
+                        landing_states.get(task.id)
+                        is _LandingState.LANDED
+                    ):
+                        claims.record_stop_event(
+                            kind=STOP_RESOLVED,
+                            subject=task.id,
+                            detail=(
+                                f"phase {phase_dir.name!r} archived after the "
+                                f"landing probe confirmed this task's work "
+                                f"reachable from landing base "
+                                f"{landing_base!r}; supersedes the surfaced "
+                                f"landing strand ({latest_kind!r})"
+                            ),
+                            occurred_at=clock(),
+                            attribution=RESOLUTION_ATTRIBUTION_PROBE,
+                        )
+                    continue
+                # Non-landing stops (a hand-serviced queue strand, a dangling
+                # prerequisite that later resolved) keep the archival
+                # supersession marker: archival IS their verified resolution.
+                # No attribution -- archival is never an attributor.
                 claims.record_stop_event(
                     kind=STOP_RESOLVED,
                     subject=task.id,
                     detail=(
                         f"phase {phase_dir.name!r} archived with every task "
                         f"done and its exit gates passed; supersedes the "
-                        f"surfaced stop ({events[-1].kind!r})"
+                        f"surfaced stop ({latest_kind!r})"
                     ),
                     occurred_at=clock(),
                 )
@@ -1699,8 +1758,10 @@ def _stop_events_by_subject(
     on several passes surfaces once here with its latest reason -- ``list_stop_events``
     returns id (insertion) order, so the last row for a subject wins. A
     :data:`STOP_RESOLVED` marker (appended when the subject's phase archived
-    after landing, or an operator serviced the strand by hand) clears the
-    subject: only a stop appended AFTER the marker -- a fresh recurrence --
+    after a non-landing stop, when the landing probe confirmed a strand's work
+    landed, or when an operator serviced the strand by hand) clears the
+    subject -- regardless of its ``attribution`` (probe or operator both
+    clear): only a stop appended AFTER the marker -- a fresh recurrence --
     surfaces again. An empty ledger yields an empty map, keeping the
     omit-when-absent convention intact for a healthy store. The claim store is
     built through the policy-driven :func:`build_claim_store` factory -- so a
@@ -1712,6 +1773,9 @@ def _stop_events_by_subject(
     try:
         latest: dict[str, OrchestratorStopEventRecord] = {}
         for event in claims.list_stop_events():
+            # A resolution clears its subject on kind alone; the attribution
+            # (probe vs operator) is an audit fact, not a gate -- both a
+            # git-truth-confirmed landing and an operator abandonment clear.
             if event.kind == STOP_RESOLVED:
                 latest.pop(event.subject, None)
                 continue

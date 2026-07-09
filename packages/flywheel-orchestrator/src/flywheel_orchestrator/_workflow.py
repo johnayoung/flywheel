@@ -75,6 +75,7 @@ from flywheel_core.workflow import (
 from flywheel_orchestrator._claims import (
     RESOLUTION_ATTRIBUTION_OPERATOR,
     RESOLUTION_ATTRIBUTION_PROBE,
+    RESOLUTION_ATTRIBUTIONS,
     STOP_INDETERMINATE_LANDING,
     STOP_RESOLVED,
     OrchestratorStopEventRecord,
@@ -1827,6 +1828,75 @@ def _stop_events_by_subject(
         claims.close()
 
 
+def _landing_strands_by_subject(
+    store: SqliteStore | PostgresStore,
+) -> dict[str, LandingParked]:
+    """The latest landing strand per task id, read across every DONE run.
+
+    A *landing strand* is a DONE run whose most recent
+    :class:`~flywheel_core.events.LandingParked` names a park kind in
+    :data:`~flywheel_core.events.LANDING_STRAND_KINDS` -- verified work the
+    strategy could not land (uncommitted tree, divergent base, a failed
+    ``[submit] verify`` invariant, or a protected-path refusal). Unlike
+    :func:`_landing_park_for_run`, which the active-listing surface consults
+    only for a task still on disk, this reads the strand from the store keyed by
+    task id, so it outlives the task file: a strand whose phase archived or
+    whose task file an operator moved stays surfaced (spec 00077, criterion 6),
+    making visibility independent of the accident of phase composition. The
+    store's ``list_lifecycles`` returns ``(updated_at DESC, run_id DESC)``, so
+    the first DONE lifecycle seen for a task is its latest run; a later clean
+    land (no park, or a non-strand park) on that latest run means the task is
+    not a strand. Non-strand park kinds (``held-out-gate`` / ``push-failed`` /
+    ``submit-error`` / ``merge-conflict``) keep the active-listing-only
+    behavior and are deliberately not surfaced here.
+    """
+    strands: dict[str, LandingParked] = {}
+    seen: set[str] = set()
+    for lifecycle in store.list_lifecycles(statuses={Status.DONE}):
+        if lifecycle.task_id in seen:
+            continue
+        seen.add(lifecycle.task_id)
+        park = _landing_park_for_run(store, lifecycle.run_id)
+        if park is not None and park.park_kind in LANDING_STRAND_KINDS:
+            strands[lifecycle.task_id] = park
+    return strands
+
+
+def _attributed_resolutions_by_subject(
+    policy: WorkPolicy | None,
+    db_path: Path,
+) -> dict[str, datetime]:
+    """The latest attributed-resolution ``occurred_at`` per subject.
+
+    A landing strand clears ONLY on a resolution marker whose ``attribution``
+    names WHO cleared it -- the archive sweep's landability probe
+    (:data:`RESOLUTION_ATTRIBUTION_PROBE`) or a deliberate operator
+    (:data:`RESOLUTION_ATTRIBUTION_OPERATOR`) via the ``resolve`` verb (spec
+    00077, criteria 3/4; D-2/D-3). The plain archival-supersession marker (a
+    :data:`STOP_RESOLVED` row with empty ``attribution``, written when a phase
+    archives over a *non-landing* stop) is deliberately excluded, so the act of
+    archiving -- like moving or deleting the task file -- never clears a landing
+    strand; only git-truth or an operator does. ``list_stop_events`` returns id
+    (insertion) order, so the last attributed marker for a subject wins; a park
+    appended after it -- a fresh recurrence -- surfaces again because its
+    ``ts`` post-dates the marker. Read through :func:`build_claim_store` so a
+    postgres ``[store]`` backend consults the shared ledger rather than a stale
+    local sqlite file (the d63cf3e read-path contract).
+    """
+    claims = build_claim_store(policy, db_path=db_path)
+    try:
+        latest: dict[str, datetime] = {}
+        for event in claims.list_stop_events():
+            if (
+                event.kind == STOP_RESOLVED
+                and event.attribution in RESOLUTION_ATTRIBUTIONS
+            ):
+                latest[event.subject] = event.occurred_at
+        return latest
+    finally:
+        claims.close()
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     if getattr(args, "rollup", False):
         return _cmd_status_rollup(args)
@@ -1857,6 +1927,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 park = _landing_park_for_run(store, row.latest_run_id)
                 if park is not None:
                     parked_landings[row.latest_run_id] = park
+        # The store-backed landing-strand surface (spec 00077, criterion 6):
+        # every DONE run whose latest park is a landing strand, keyed by task
+        # id, read from the store so it outlives the active listing. Rows still
+        # on disk render their strand via ``parked_landings`` above; the tail
+        # unions in the ones whose task file is gone.
+        landing_strands = _landing_strands_by_subject(store)
     finally:
         store.close()
     # The second stranded record surface: pre-run stops (dangling prerequisite,
@@ -1867,6 +1943,19 @@ def _cmd_status(args: argparse.Namespace) -> int:
     # for the per-task kinds, a source name for the source-level kinds).
     stops_by_subject = _stop_events_by_subject(policy, db_path)
     stopped_task_ids = {row.task.id for row in rows}
+    # A landing strand whose task file left the active listing (its phase
+    # archived, or an operator moved/deleted it) has no row above, so surface it
+    # keyed by subject here -- unless an attributed resolution marker cleared it.
+    # A strand for a task still in the listing is rendered on its row above; a
+    # park whose ``ts`` post-dates the latest resolution is a fresh recurrence
+    # and surfaces again (spec 00077, criterion 6).
+    resolved_at = _attributed_resolutions_by_subject(policy, db_path)
+    rowless_strands = {
+        subject: park
+        for subject, park in landing_strands.items()
+        if subject not in stopped_task_ids
+        and (subject not in resolved_at or park.ts > resolved_at[subject])
+    }
     if args.json:
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -1940,9 +2029,24 @@ def _cmd_status(args: argparse.Namespace) -> int:
                     "stopped": {"kind": stop.kind, "detail": stop.detail},
                 }
             )
+        # Store-backed landing strands whose task file left the active listing
+        # have no row above; enumerate each as its own entry so an unlanded
+        # strand stays visible after its phase archived (spec 00077, criterion
+        # 6), keyed by subject like the source-level stops.
+        for subject in sorted(rowless_strands):
+            park = rowless_strands[subject]
+            out.append(
+                {
+                    "subject": subject,
+                    "stranded": {
+                        "park_kind": park.park_kind,
+                        "detail": park.detail,
+                    },
+                }
+            )
         print(json.dumps(out, indent=2))
         return 0
-    if not rows and not stops_by_subject:
+    if not rows and not stops_by_subject and not rowless_strands:
         print("(no active tasks)")
         return 0
     width = max((len(row.task.id) for row in rows), default=0)
@@ -1996,6 +2100,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
         stop = stops_by_subject[subject]
         detail = f" -- {stop.detail}" if stop.detail else ""
         print(f"  {subject}  stopped: {stop.kind}{detail}")
+    # Landing strands whose task file left the active listing have no row above;
+    # enumerate each as its own line so an unlanded strand stays visible after
+    # its phase archived, mirroring the source-level stopped: convention.
+    for subject in sorted(rowless_strands):
+        park = rowless_strands[subject]
+        detail = f" -- {park.detail}" if park.detail else ""
+        print(f"  {subject}  stranded: {park.park_kind}{detail}")
     return 0
 
 def _list_blocked_lifecycles(store: SqliteStore | PostgresStore) -> list[tuple[str, str]]:

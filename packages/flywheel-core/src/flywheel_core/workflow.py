@@ -911,7 +911,23 @@ async def run_task_object(
         # demonstrated in-loop.
         from flywheel_core.agents_invoke import make_agents_invoke
 
-        adapter_options: dict[str, object] = {}
+        # The [sandbox.capabilities] primitives ride adapter_options; each
+        # transport consumes what it supports (the SDK transport maps them
+        # onto ClaudeAgentOptions, the CLI transport has no flag surface for
+        # them — the same host-SDK-only scoping docs/sandbox.md documents).
+        adapter_options: dict[str, object] = {
+            "skills": skills,
+            "allowed_tools": allowed_tools,
+            "disallowed_tools": denied_tools,
+            "setting_sources": setting_sources,
+            "mcp_servers": mcp_servers,
+            "mcp_strict": mcp_strict,
+        }
+        if exec_enabled:
+            adapter_options["sandbox_exec"] = {
+                "enabled": True,
+                "autoAllowBashIfSandboxed": exec_auto_allow,
+            }
         if agent_transport is not None:
             adapter_options["transport"] = agent_transport
         invoker = make_agents_invoke(

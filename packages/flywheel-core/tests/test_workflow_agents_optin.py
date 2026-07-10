@@ -66,14 +66,29 @@ def test_agent_id_routes_through_make_agents_invoke(
             agent_id="claude-code",
             agent_transport="cli",
             model="claude-sonnet-4-5",
+            skills="all",
+            allowed_tools=("Bash", "Edit"),
+            mcp_servers=("serena",),
+            mcp_strict=True,
+            exec_enabled=True,
+            exec_auto_allow=False,
         )
     )
     assert outcome.lifecycle.status.value == "done"
     assert captured["agent_id"] == "claude-code"
-    assert captured["adapter_options"] == {"transport": "cli"}
     assert captured["model"] == "claude-sonnet-4-5"
     assert captured["permission_policy"] == "auto"
     assert captured["working_directory"] == tmp_path / "sandbox"
+    options = captured["adapter_options"]
+    assert options["transport"] == "cli"
+    assert options["skills"] == "all"
+    assert options["allowed_tools"] == ("Bash", "Edit")
+    assert options["mcp_servers"] == ("serena",)
+    assert options["mcp_strict"] is True
+    assert options["sandbox_exec"] == {
+        "enabled": True,
+        "autoAllowBashIfSandboxed": False,
+    }
 
 
 def test_permission_vocabulary_mapping_never_defaults_to_bypass() -> None:

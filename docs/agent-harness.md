@@ -363,22 +363,21 @@ class EventSink(Protocol):
     def on_event(self, event: AgentEvent) -> None: ...
 ```
 
-Raw events are delivered to the sink before normalization. The package ships a null sink and an in-memory sink for tests; flywheel bridges to its `FileTelemetrySink` (one JSONL per run under `.flywheel/logs/runs/`), preserving the existing raw-message telemetry lines with a normalized layer added.
+Raw events are delivered to the sink before normalization; raw and normalized events share one runtime-assigned monotonic sequence. The package ships a null sink and an in-memory sink for tests. **Status:** flywheel's bridge (§ 15.1) forwards *normalized* events into the run telemetry via the harness `on_message` observer; raw envelopes reach telemetry only when a caller wires a dedicated sink — double-recording every CLI line was deliberately skipped in v1.
 
 ## 10. Process management
 
-- Full process-tree termination is a correctness requirement: cancel child tasks, close the transport, signal the group, wait for graceful exit, kill survivors, flush sinks.
-- All per-run tasks (readers, normalizer, watchdog) live in one `asyncio.TaskGroup`; no detached tasks survive a run.
+- Full process-tree termination is a correctness requirement: signal the group (SIGTERM, then SIGKILL after grace), await the reader/stdin tasks in `wait()`, fold the exit. No detached tasks survive a run — reader tasks are owned by the process handle and always awaited, rather than by a literal `TaskGroup`.
 - WSL2: the runtime runs in the same environment as the agents; cross-boundary execution is a later execution-host variant.
-- Executable resolution: installed executable from `PATH` first, managed (`npx`-pinned) fallback second, `command_override` wins over both.
+- Executable resolution: `command_override` wins; otherwise the installed executable from `PATH`. A managed (`npx`-pinned) fallback is future work, not implemented.
 
 ## 11. Transports
 
 Transports solve protocol mechanics and contain no product behavior. They consume `RunningProcess` streams from a host rather than owning spawns (SDK transports excepted).
 
-- **`JsonLinesTransport`** — NDJSON over stdin/stdout. Claude CLI stream mode, Amp. Tolerates interleaved non-JSON lines and malformed JSON (skipped, preserved as RAW).
-- **`JsonRpcTransport`** — request ids, notifications, dispatch, timeouts, cancellation. Codex app server.
-- **`AcpTransport`** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it; per-agent subclasses supply command, flags, config paths, and login probes only.
+- **JSONL (shipped, inline)** — NDJSON line handling lives in the claude-code CLI normalizer (`claude_code/_cli.py`): tolerates interleaved non-JSON lines and malformed/deeply-nested JSON (preserved as RAW, never dropped). It gets extracted into a standalone `JsonLinesTransport` class when a second stream-JSON agent (e.g. Amp) needs it — one consumer does not justify the layer.
+- **`JsonRpcTransport` (phase 5, not built)** — request ids, notifications, dispatch, timeouts, cancellation. Codex app server.
+- **`AcpTransport` (phase 5, not built)** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it; per-agent subclasses supply command, flags, config paths, and login probes only.
 
 ## 12. Approvals (narrowed)
 
@@ -389,6 +388,8 @@ ApprovalResolver = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 ```
 
 Defaults: timeout, disconnect, and shutdown all resolve to **deny**. flywheel supplies an auto-resolver consistent with its permission policy (under `AUTO`, adapters launch in the agent's native bypass mode, so approval traffic is not expected). No approval queue, UI, or persistence.
+
+**Status:** the event types are reserved in `EventType`; the `ApprovalResolver` callback is not built. It arrives with the first transport that actually surfaces approvals (ACP's `request_permission`, phase 5) — under today's AUTO-only flywheel usage there is nothing to resolve.
 
 ## 13. Authentication, environment, and MCP
 
@@ -420,21 +421,27 @@ Generalizes `flywheel_container.ClaudeAuth` — the taxonomy is already agent-ge
 | `api-key` | raw API key env var | `ANTHROPIC_API_KEY` |
 | `none` | environment pre-authenticated | pre-baked image |
 
-Adapters declare their env-var names and config dirs; the guard against a subscription mode being silently shadowed by a present API key (today `ClaudeAuth.resolve`) becomes generic. `ACCOUNT_ONLY` strips the adapter's declared API-key vars before launch and requires positive account evidence, else `AuthenticationPolicyError`.
+Adapters declare their env-var names and config dirs; the guard against a subscription mode being silently shadowed by a present API key (today `ClaudeAuth.resolve`) becomes generic.
+
+**Status:** shipped for claude-code specifically — `ACCOUNT_ONLY` strips `ANTHROPIC_API_KEY` on the CLI transport (`denied_environment`) and raises `AuthenticationPolicyError` on the SDK transport (whose subprocess inherits the parent env); the probe reports the mixed-credentials strand warning. The *generalized* per-adapter declaration and the `ClaudeAuth` replacement in flywheel-container are future work (§ 16 Later).
 
 ### 13.3 Environment policy
 
-Child environments are constructed, not inherited: base safe set (`HOME`, `PATH`, `SHELL`, `TMPDIR`, locale, XDG, `SSH_AUTH_SOCK`, `GIT_SSH_COMMAND`) + adapter-declared credential vars + request vars − denied vars.
+Target: child environments constructed, not inherited — base safe set (`HOME`, `PATH`, `SHELL`, `TMPDIR`, locale, XDG, `SSH_AUTH_SOCK`, `GIT_SSH_COMMAND`) + adapter-declared credential vars + request vars − denied vars.
+
+**Status: not built; deliberate.** v1 matches current flywheel behavior for parity: `LocalHost` inherits `os.environ` merged with request extras minus `denied_environment` (exactly how the agent SDK behaves today), and `DockerExecHost` leaves the base env to the image. The constructed-env hardening is a standalone future change because it alters what every existing run inherits.
 
 ### 13.4 MCP
 
 One canonical `McpServerConfig` (name, command, args, environment, url, transport) that adapters translate into their native launch configuration (`mcpServers`, `mcp_servers`, ...). Config-**file** writing is out of scope for v1; flywheel's committed repo `.mcp.json` remains the operative mechanism.
 
+**Status: not built** (arrives with the second agent, where translation becomes real). Today `mcp_servers`/`mcp_strict` pass through claude-code `adapter_options` onto the SDK transport verbatim.
+
 ## 14. Errors, registry, versioning
 
 - Error hierarchy: `AgentNotInstalledError`, `AgentAuthenticationError`, `AuthenticationPolicyError`, `UnsupportedCapabilityError`, `AgentStartupError`, `AgentProtocolError`, `AgentProcessExitedError`, `ApprovalTimeoutError` — each with `code` and `retryable`. Never include secrets or environment dumps in error payloads.
 - Registry discovers third-party adapters via the `flywheel_agents.adapters` entry-point group; a failing plugin is reported (`load-failed` + error) and never prevents the runtime from loading.
-- Each adapter exposes `AdapterCompatibility` (minimum / maximum-tested / pinned versions); startup warns outside the tested range.
+- Each adapter exposes `AdapterCompatibility` (minimum / maximum-tested / pinned versions). The startup warning outside the tested range is not wired yet — the claude adapter declares no bounds today (§ 16 Later).
 
 ## 15. Flywheel integration
 
@@ -459,16 +466,18 @@ A `flywheel_core` module (the successor to `_sdk.py` as the optional-dependency 
 | `context_observer` | `CONTEXT_USAGE` events |
 | `recovery_interrupt_event`, `set_model`, `say` | mid-turn capabilities (gated) |
 
+**v1 deviations from this table** (each documented on the bridge itself): `rate_limit_events` is left empty (the signals field is typed with SDK event objects; session-limit refusals still surface via `CompletedRun.fault` and the transcript regexes in `flywheel_core.faults`); `context_observer` is not forwarded, so mid-turn occupancy tracking degrades exactly as it does on the container path today; the mid-turn control rows are inert because the shipped claude adapter declares those capabilities `False`; `transcript_graders` are not enforced mid-run (grade-time enforcement unchanged).
+
 ### 15.2 Invocation sites routed through the runtime
 
-All seven independent `ClaudeAgentOptions` construction sites converge: the worker invoker (`workflow.py`), the rubric judge (`grader_rubric.py`), the recovery summarizer (`recovery_summarizer.py`), the merge-conflict recovery agent (`worker.py`), and autopilot's repo invoker (`_autopilot.py`). Autopilot's SDK subagent definitions have no cross-agent equivalent and stay Claude-only behind the `subagents` capability.
+Target: all seven independent `ClaudeAgentOptions` construction sites converge — the worker invoker (`workflow.py`), the rubric judge (`grader_rubric.py`), the recovery summarizer (`recovery_summarizer.py`), the merge-conflict recovery agent (`worker.py`), and autopilot's repo invoker (`_autopilot.py`). Autopilot's SDK subagent definitions have no cross-agent equivalent and stay Claude-only behind the `subagents` capability. **Status: the worker invoker (and the container backend) are routed; the other four are not (§ 16, phase 3 note).**
 
 ### 15.3 Config surface
 
-- `[agent] id = "claude-code"` (new, default preserves behavior); `model` stays an opaque per-agent string.
-- `permission_mode` generalizes to `PermissionPolicy`; each adapter translates (`AUTO` -> `bypassPermissions` for claude-code).
-- `[sandbox.capabilities]` becomes claude-code `adapter_options` (it is SDK vocabulary).
-- `[sandbox.container] auth` / `auth_env` generalize to the per-agent auth modes of § 13.2.
+- `[agent] id = "claude-code"` (new, default preserves behavior); `model` stays an opaque per-agent string. Shipped, plus `[agent] transport`.
+- `permission_mode` maps to `PermissionPolicy` at the workflow boundary (never silently to bypass); the `[sandbox]` key itself keeps Claude vocabulary for back-compat. Shipped.
+- `[sandbox.capabilities]` rides claude-code `adapter_options` (it is SDK vocabulary); the SDK transport consumes it, the CLI transport has no flag surface for it — the same host-SDK-only scoping `docs/sandbox.md` documents. Shipped.
+- `[sandbox.container] auth` / `auth_env` generalizing to the per-agent auth modes of § 13.2: future (`ClaudeAuth` unchanged today).
 
 ### 15.4 Container backend rebase
 
@@ -476,9 +485,9 @@ All seven independent `ClaudeAgentOptions` construction sites converge: the work
 
 ### 15.5 Other retrofits
 
-- `faults.py` session-limit regexes move to the claude-code adapter's `classify_fault`.
-- `CompletedRun.native_session_id` finally populates the dead `lifecycles.session_id` column (telemetry only; resume stays out of scope).
-- `docs/loop.md`'s detection table is re-expressed in normalized events with per-capability degradation; `docs/container-backend.md` limitations are updated.
+- `faults.py` session-limit regexes are ported into the claude-code adapter's `classify_fault` (shipped). They are duplicated, not moved: `flywheel_core.faults` still owns the legacy path and the clock-time reset derivation; deleting them there comes with the default flip.
+- `CompletedRun.native_session_id` populating the dead `lifecycles.session_id` column: **not done** — the harness never persists it on any path; needs a harness-side change (§ 16 Later).
+- `docs/container-backend.md` limitations updated (shipped). Re-expressing `docs/loop.md`'s detection table in normalized events with per-capability degradation: **not done**, deferred to the default flip (§ 16 Later).
 
 ## 16. Delivery phases
 
@@ -490,22 +499,22 @@ Old paths stay default until in-loop parity is proven; the in-loop verification 
 4. **Container rebase — SHIPPED.** `DockerExecHost` + the claude-code CLI transport replaced `ClaudeCliAgent`/`_stream.py`; the hang watchdog and per-event telemetry are live in containers; exec timeout and nonzero exits fold to structured failures.
 5. **Second agent.** Gemini or Qwen via the shared ACP transport (cheapest abstraction proof) or Codex via JSON-RPC (highest value); capability-gated guard degradation exercised for real.
 
-Later: routing the remaining four invocation sites (phase 3 note), auth-policy wiring into `init`, option discovery surfaces, additional agents, and a service layer via the interactivity program.
+Later (consolidated backlog, each item cross-referenced where it is specified): routing the remaining four invocation sites (§ 15.2); the default flip away from the legacy SDK closure after in-loop parity, with the `faults.py` regex removal and the `loop.md` detection-table rewrite (§ 15.5); persisting `native_session_id` onto `lifecycles.session_id` (§ 15.5); generalized auth propagation replacing `ClaudeAuth` and auth-policy wiring into `init` (§ 13.2); constructed-environment hardening (§ 13.3); the canonical MCP schema (§ 13.4); the `ApprovalResolver` callback (§ 12); standalone JSON-RPC/ACP transport classes (§ 11); managed-executable (`npx`) fallback and compatibility-range warnings (§ 10, § 14); rate-limit and context-usage forwarding through the bridge (§ 15.1); option discovery surfaces; additional agents; a service layer via the interactivity program.
 
 ## 17. Testing strategy
 
 - **Contract tests** every adapter must pass: probe does not crash; start emits `session.started`; a prompt produces events; completion emits `session.finished`; cancel kills the tree; unknown native events surface as RAW; stderr is captured; cwd and environment policy are respected; unsupported capabilities fail explicitly.
 - **Fake agent** — a deterministic test executable emulating JSONL output, delays, malformed JSON, partial messages, native session ids, crashes, hangs, child spawning, and cancellation refusal. CI never depends on real vendor CLIs.
-- **Recorded fixtures** — sanitized native transcripts per adapter; normalizers and the fold are testable entirely offline. Phase-2 parity fixtures are recorded from real current-code runs.
-- **Real integration tests** — conditional on installed, authenticated agents; never mandatory in CI.
+- **Fixtures** — normalizers and the fold are testable entirely offline. Shipped as authored stream-json/SDK-object fixtures plus the cross-transport parity test; recording sanitized transcripts from real runs is the stronger future form and lands with the default flip's parity evidence.
+- **Real integration tests** — conditional on installed infrastructure; never mandatory in CI. Shipped for docker (the container package's live tests); a conditional real-`claude` run is future work.
 
 ## 18. Acceptance criteria
 
-An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` or `"gemini-cli"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance.
+An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` or `"gemini-cli"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance. (Evaluable once a second adapter exists — phase 5.)
 
-Flywheel-specific:
+Flywheel-specific (all four hold as of phases 1-4):
 
-1. `import flywheel_core` works with no agent extras installed.
+1. `import flywheel_core` works with no agent extras installed (`agents_invoke` imports `flywheel_agents` lazily, mirroring `_sdk`).
 2. The container backend runs through the same claude-code adapter as the worktree backend, with a live hang watchdog; `flywheel_container._stream` and `ClaudeCliAgent` are deleted.
-3. Loop-guard behavior on the SDK path is unchanged under fixture replay (stuck, thrash, hang, rate-limit, context-recovery).
+3. Loop-guard behavior on the default SDK path is unchanged — that path is byte-identical (untouched); the agents path is opt-in.
 4. The LOOP_STATUS envelope contract and its parser are untouched.

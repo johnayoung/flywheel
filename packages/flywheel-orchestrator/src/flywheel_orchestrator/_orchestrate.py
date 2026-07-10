@@ -2031,6 +2031,10 @@ def _sandbox_agent_primitives(policy: WorkPolicy | None) -> dict[str, Any]:
     }
     agent_env.update(env.set_values)
     return dict(
+        # The multi-agent opt-in ([agent] id / transport, docs/agent-harness.md
+        # section 15.3): None (the default) keeps the legacy SDK invoker.
+        agent_id=policy.agent_id if policy is not None else None,
+        agent_transport=policy.agent_transport if policy is not None else None,
         permission_mode=sandbox.permission_mode,
         skills=cap.skills,
         allowed_tools=cap.allowed_tools,
@@ -3429,6 +3433,8 @@ async def _drive_under_lease(
     heartbeat_interval: float,
     invoke: InvokeFunc | None,
     model: str | None,
+    agent_id: str | None,
+    agent_transport: str | None,
     max_turns: int,
     max_retries: int,
     permission_mode: str,
@@ -3548,6 +3554,8 @@ async def _drive_under_lease(
             store=_datapath_store(control),
             sandbox=sandbox,
             model=model,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
             max_turns=max_turns,
             max_retries=max_retries,
             permission_mode=permission_mode,

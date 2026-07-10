@@ -530,6 +530,8 @@ class WorkPolicy:
     db_path: Path | None = None
     sandbox_root: Path | None = None
     model: str | None = None
+    agent_id: str | None = None
+    agent_transport: str | None = None
     store_backend: str = "sqlite"
     store_schema: str | None = None
     execution_mode: str = "local"
@@ -603,6 +605,13 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(agent, dict):
         raise PolicyError(f"{path}: [agent] must be a table")
     model = _optional_agent_model(agent, policy_file=path)
+    agent_id = _optional_agent_str(agent, "id", policy_file=path)
+    agent_transport = _optional_agent_str(agent, "transport", policy_file=path)
+    if agent_transport is not None and agent_id is None:
+        raise PolicyError(
+            f"{path}: agent.transport requires agent.id (the multi-agent "
+            f"opt-in; see docs/agent-harness.md)"
+        )
 
     store = data.get("store") or {}
     if not isinstance(store, dict):
@@ -721,6 +730,8 @@ def load_policy(path: Path) -> WorkPolicy:
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=model,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
             store_backend=store_backend,
             store_schema=store_schema,
             execution_mode=execution_mode,
@@ -771,6 +782,8 @@ def load_policy(path: Path) -> WorkPolicy:
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=model,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
             store_backend=store_backend,
             store_schema=store_schema,
             execution_mode=execution_mode,
@@ -815,6 +828,8 @@ def load_policy(path: Path) -> WorkPolicy:
             db_path=db_path,
             sandbox_root=sandbox_root,
             model=model,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
             store_backend=store_backend,
             store_schema=store_schema,
             execution_mode=execution_mode,
@@ -871,6 +886,8 @@ def load_policy(path: Path) -> WorkPolicy:
         db_path=db_path,
         sandbox_root=sandbox_root,
         model=model,
+        agent_id=agent_id,
+        agent_transport=agent_transport,
         store_backend=store_backend,
         store_schema=store_schema,
         execution_mode=execution_mode,
@@ -1048,6 +1065,27 @@ def _optional_agent_model(
     if not isinstance(value, str) or not value.strip():
         raise PolicyError(
             f"{policy_file}: agent.model must be a non-empty string"
+        )
+    return value
+
+
+def _optional_agent_str(
+    table: dict, key: str, *, policy_file: Path
+) -> str | None:
+    """Validate an optional ``[agent]`` string key (``id``, ``transport``).
+
+    Same contract as :func:`_optional_agent_model`: absent means ``None``
+    (the legacy single-agent path); a present-but-invalid value raises so a
+    typo never silently reverts to the default agent. Values are opaque —
+    the flywheel-agents registry rejects unknown agent ids at run time with
+    the registered set in the message.
+    """
+    value = table.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PolicyError(
+            f"{policy_file}: agent.{key} must be a non-empty string"
         )
     return value
 

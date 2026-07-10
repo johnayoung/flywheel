@@ -208,6 +208,65 @@ def test_agent_model_rejects_non_string(tmp_path: Path) -> None:
     assert str(policy_file) in message
 
 
+def test_agent_id_and_transport_default_to_none(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.agent_id is None
+    assert policy.agent_transport is None
+
+
+def test_agent_id_and_transport_parse_strings(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[agent]",
+                    'id = "claude-code"',
+                    'transport = "cli"',
+                ]
+            ),
+        )
+    )
+    assert policy.agent_id == "claude-code"
+    assert policy.agent_transport == "cli"
+
+
+def test_agent_transport_requires_agent_id(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[agent]",
+                'transport = "cli"',
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    assert "agent.transport requires agent.id" in str(exc_info.value)
+
+
+def test_agent_id_rejects_empty_string(tmp_path: Path) -> None:
+    policy_file = _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[agent]",
+                'id = ""',
+            ]
+        ),
+    )
+    with pytest.raises(PolicyError) as exc_info:
+        load_policy(policy_file)
+    assert "agent.id" in str(exc_info.value)
+
+
 def test_agent_model_rejects_empty_string(tmp_path: Path) -> None:
     policy_file = _write(
         tmp_path,

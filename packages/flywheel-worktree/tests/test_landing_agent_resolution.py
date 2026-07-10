@@ -25,6 +25,9 @@ tree is resolved from git state alone, since the agent's claim is untrusted.
 from __future__ import annotations
 
 import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -40,7 +43,7 @@ from flywheel_core.events import (
     Landed,
     LandingParked,
 )
-from flywheel_orchestrator import SandboxRequest, SubmitRequest
+from flywheel_orchestrator import SandboxRequest, SubmitRequest, WorkPolicy
 
 from flywheel_worktree import worker
 
@@ -486,6 +489,199 @@ def test_module_imports_without_agent_sdk() -> None:
     assert worker.ConflictResolutionRequest is not None
     assert worker.ConflictResolutionReport is not None
     assert callable(worker._default_resolve_conflict)
+
+
+# --- the agents-runtime resolver ([agent] id opt-in) ---------------------------
+#
+# The factory builds its AgentConfiguration internally, so the tests drive the
+# REAL flywheel-agents runtime (AgentRuntime + LocalHost + the claude-code CLI
+# transport) against a scripted stream-json executable substituted through the
+# factory's test-only command_override -- no live model, no claude binary.
+
+# Mirrors flywheel-core's test_agents_invoke._SCRIPT: read the prompt from
+# stdin, then emit a well-formed stream-json exchange and exit 0.
+_AGENTS_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    sys.stdin.read()
+    def emit(obj):
+        print(json.dumps(obj), flush=True)
+
+    emit({"type": "system", "subtype": "init", "session_id": "sess-resolve"})
+    emit(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "conflicts staged"}],
+                "stop_reason": "end_turn",
+            },
+        }
+    )
+    emit(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 4,
+            "total_cost_usd": 0.01,
+        }
+    )
+    """
+)
+
+# A session that never finishes inside the wall bound: emit the init line, then
+# sleep far past max_wall_seconds without ever producing a result envelope.
+_SLEEPING_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import sys
+    import time
+
+    sys.stdin.read()
+    print(
+        json.dumps(
+            {"type": "system", "subtype": "init", "session_id": "sess-slow"}
+        ),
+        flush=True,
+    )
+    time.sleep(60)
+    """
+)
+
+
+def test_agents_resolver_reports_real_usage(tmp_path: Path) -> None:
+    # The factory drives one real runtime run and maps the folded CompletedRun
+    # onto the seam's report: turns from num_turns, wall measured and bounded.
+    script = tmp_path / "scripted_agent.py"
+    script.write_text(_AGENTS_SCRIPT)
+    resolver = worker._make_agents_resolve_conflict(
+        "claude-code",
+        None,
+        command_override=(sys.executable, str(script)),
+    )
+    report = resolver(
+        worker.ConflictResolutionRequest(
+            prompt="resolve the conflict markers",
+            worktree=tmp_path,
+            max_turns=_MAX_TURNS,
+            max_wall_seconds=_MAX_WALL,
+        )
+    )
+    assert report.turns == 4
+    assert 0.0 <= report.wall_seconds <= _MAX_WALL
+    # A completed scripted run finishes in seconds, nowhere near the bound.
+    assert report.wall_seconds < 30.0
+
+
+def test_agents_resolver_timeout_reports_at_bounds_promptly(
+    tmp_path: Path,
+) -> None:
+    # Deadline-park parity with _drive_conflict_resolution: a session that
+    # outlives max_wall_seconds is cancelled by the runtime's wall ceiling and
+    # the usage is reported AT the bounds (the true turn count is unavailable
+    # after cancellation) -- promptly, not after the script's 60s sleep.
+    script = tmp_path / "sleeping_agent.py"
+    script.write_text(_SLEEPING_SCRIPT)
+    resolver = worker._make_agents_resolve_conflict(
+        "claude-code",
+        None,
+        command_override=(sys.executable, str(script)),
+    )
+    started = time.monotonic()
+    report = resolver(
+        worker.ConflictResolutionRequest(
+            prompt="resolve the conflict markers",
+            worktree=tmp_path,
+            max_turns=7,
+            max_wall_seconds=1.0,
+        )
+    )
+    elapsed = time.monotonic() - started
+    assert report.turns == 7
+    assert report.wall_seconds == 1.0
+    assert elapsed < 10.0
+
+
+# --- builder wiring: the resolver is agents-backed iff [agent] id is set ------
+
+
+def _build_submitter_kwargs(tmp_path: Path) -> dict[str, object]:
+    return dict(
+        repo_root=tmp_path,
+        tasks_dir=tmp_path / ".flywheel" / "tasks",
+        worktrees_dir=tmp_path / ".flywheel" / "worktrees",
+        phase_base="main",
+        lock_path=tmp_path / ".flywheel" / ".merge.lock",
+        log=lambda _m: None,
+        protected_paths=(),
+        setup_command=None,
+    )
+
+
+def test_builders_select_agents_resolver_when_agent_id_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With [agent] id set on the policy, both the merge and phase builders
+    # thread agent_id/agent_transport into the agents resolver factory and
+    # wire its resolver in place of the default SDK driver.
+    def _sentinel_resolver(
+        request: worker.ConflictResolutionRequest,
+    ) -> worker.ConflictResolutionReport:
+        raise AssertionError("never driven in this test")
+
+    calls: list[tuple[str, str | None]] = []
+
+    def _factory(
+        agent_id: str,
+        transport: str | None,
+        *,
+        command_override: tuple[str, ...] | None = None,
+    ) -> worker.ConflictResolver:
+        calls.append((agent_id, transport))
+        return _sentinel_resolver
+
+    monkeypatch.setattr(worker, "_make_agents_resolve_conflict", _factory)
+    policy = WorkPolicy(
+        source_kind="directory",
+        agent_id="claude-code",
+        agent_transport="cli",
+    )
+    merge = worker.build_merge_submitter(
+        policy, **_build_submitter_kwargs(tmp_path)  # type: ignore[arg-type]
+    )
+    phase = worker.build_phase_submitter(
+        policy, **_build_submitter_kwargs(tmp_path)  # type: ignore[arg-type]
+    )
+    assert merge._resolve_conflict is _sentinel_resolver
+    assert phase._resolve_conflict is _sentinel_resolver
+    assert calls == [("claude-code", "cli"), ("claude-code", "cli")]
+
+
+def test_builders_keep_default_resolver_when_agent_id_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # [agent] id unset: the legacy claude-SDK driver stays wired and the agents
+    # factory is never consulted -- the opt-in leaves the default path alone.
+    def _factory(
+        agent_id: str,
+        transport: str | None,
+        *,
+        command_override: tuple[str, ...] | None = None,
+    ) -> worker.ConflictResolver:
+        raise AssertionError("factory must not run when [agent] id is unset")
+
+    monkeypatch.setattr(worker, "_make_agents_resolve_conflict", _factory)
+    policy = WorkPolicy(source_kind="directory")
+    merge = worker.build_merge_submitter(
+        policy, **_build_submitter_kwargs(tmp_path)  # type: ignore[arg-type]
+    )
+    phase = worker.build_phase_submitter(
+        policy, **_build_submitter_kwargs(tmp_path)  # type: ignore[arg-type]
+    )
+    assert merge._resolve_conflict is worker._default_resolve_conflict
+    assert phase._resolve_conflict is worker._default_resolve_conflict
 
 
 if __name__ == "__main__":  # pragma: no cover

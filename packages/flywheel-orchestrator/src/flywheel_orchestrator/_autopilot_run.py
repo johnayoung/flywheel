@@ -156,6 +156,8 @@ def run_single_pass(
     model: str | None,
     queue_depth: Callable[[Path], int] | None = None,
     deadlines: DeadlineConfig | None = None,
+    agent_id: str | None = None,
+    agent_transport: str | None = None,
 ) -> AutopilotPassResult:
     """Drive exactly one refill pass with the real SDK-backed invokers.
 
@@ -170,6 +172,10 @@ def run_single_pass(
     :func:`run_refill_pass` falls back to a default :class:`DeadlineConfig`
     (byte-identical to the built-in ceilings); a library/``None``-policy caller
     thus keeps today's defaults.
+
+    ``agent_id``/``agent_transport`` are the policy's ``[agent]`` multi-agent
+    opt-in, forwarded to the pass's default invoker constructions; ``None``
+    keeps the legacy claude-SDK invokers byte-identical.
     """
     return asyncio.run(
         run_refill_pass(
@@ -181,6 +187,8 @@ def run_single_pass(
             model=model,
             queue_depth=queue_depth,
             deadlines=deadlines,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
         )
     )
 
@@ -718,6 +726,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # reaches run_refill_pass. A None policy forwards None, which run_refill_pass
     # maps to the byte-identical default ceilings.
     deadlines = policy.deadlines if policy is not None else None
+    # The [agent] multi-agent opt-in (docs/agent-harness.md section 15.2):
+    # unset keeps the legacy claude-SDK invokers byte-identical.
+    agent_id = policy.agent_id if policy is not None else None
+    agent_transport = policy.agent_transport if policy is not None else None
 
     def run_cycle() -> AutopilotPassResult:
         return run_single_pass(
@@ -729,6 +741,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=model,
             queue_depth=queue_depth,
             deadlines=deadlines,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
         )
 
     if args.once:

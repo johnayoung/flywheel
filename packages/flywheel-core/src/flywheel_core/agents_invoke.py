@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from flywheel_core.envelope import parse_envelope
+from flywheel_core.grader_rubric import JudgeInvoke
 from flywheel_core.harness import InvocationRequest, InvokeFunc
 from flywheel_core.invoker import (
     InvocationFailure,
@@ -38,6 +39,8 @@ from flywheel_core.invoker import (
     ToolInteraction,
     ToolResultObservation,
 )
+from flywheel_core.recovery_summarizer import SummarizerInvoke
+from flywheel_core.task import RubricGrader
 
 if TYPE_CHECKING:
     from flywheel_agents import AgentRuntime, CompletedRun, EventSink, ExecutionHost
@@ -189,8 +192,103 @@ def make_agents_invoke(
     return _invoke
 
 
+def make_agents_judge_invoke(
+    *,
+    agent_id: str,
+    transport: str | None = None,
+    judge_max_turns: int,
+    judge_model: str | None,
+    command_override: tuple[str, ...] | None = None,
+    runtime: AgentRuntime | None = None,
+) -> JudgeInvoke:
+    """Build a rubric ``judge_invoke`` backed by the flywheel-agents runtime.
+
+    Replicates :func:`flywheel_core.grader_rubric._make_default_judge_invoke`
+    semantics on the multi-agent path: every judge call starts a cold session
+    (a fresh per-call configuration, no session inheritance) with cwd set to
+    the supplied worktree, the full skill surface, auto (bypass-equivalent)
+    permissions, a ``judge_max_turns`` cap, and the model resolved as
+    ``grader.judge_model or judge_model``. One runtime is built per factory
+    call and reused across judge calls. Raises
+    :class:`MissingAgentsRuntimeError` when flywheel-agents is not installed.
+    """
+    agents = _require_agents()
+    runtime_obj = runtime if runtime is not None else agents.AgentRuntime()
+    adapter_options: dict[str, object] = {"skills": "all"}
+    if transport is not None:
+        adapter_options["transport"] = transport
+
+    async def _judge_invoke(
+        prompt: str, grader: RubricGrader, worktree: Path | str
+    ) -> str:
+        configuration = agents.AgentConfiguration(
+            agent_id=agent_id,
+            model_id=grader.judge_model or judge_model,
+            permission_policy=agents.PermissionPolicy("auto"),
+            max_turns=judge_max_turns,
+            command_override=command_override,
+            adapter_options=dict(adapter_options),
+        )
+        completed = await runtime_obj.run(
+            agents.RunRequest(
+                prompt=prompt,
+                working_directory=Path(worktree),
+                configuration=configuration,
+            )
+        )
+        return completed.final_text
+
+    return _judge_invoke
+
+
+def make_agents_summarizer_invoke(
+    *,
+    agent_id: str,
+    transport: str | None = None,
+    summarizer_max_turns: int,
+    summarizer_model: str | None,
+    command_override: tuple[str, ...] | None = None,
+    runtime: AgentRuntime | None = None,
+) -> SummarizerInvoke:
+    """Build a recovery ``summarizer_invoke`` on the flywheel-agents runtime.
+
+    Mirrors :func:`make_agents_judge_invoke` for
+    :func:`flywheel_core.recovery_summarizer._make_default_summarizer_invoke`:
+    a cold per-call session in the supplied worktree, full skill surface,
+    auto permissions, capped at ``summarizer_max_turns``, model
+    ``summarizer_model`` (``None`` falls through to the agent's default).
+    """
+    agents = _require_agents()
+    runtime_obj = runtime if runtime is not None else agents.AgentRuntime()
+    adapter_options: dict[str, object] = {"skills": "all"}
+    if transport is not None:
+        adapter_options["transport"] = transport
+
+    async def _summarizer_invoke(prompt: str, worktree: Path | str) -> str:
+        configuration = agents.AgentConfiguration(
+            agent_id=agent_id,
+            model_id=summarizer_model,
+            permission_policy=agents.PermissionPolicy("auto"),
+            max_turns=summarizer_max_turns,
+            command_override=command_override,
+            adapter_options=dict(adapter_options),
+        )
+        completed = await runtime_obj.run(
+            agents.RunRequest(
+                prompt=prompt,
+                working_directory=Path(worktree),
+                configuration=configuration,
+            )
+        )
+        return completed.final_text
+
+    return _summarizer_invoke
+
+
 __all__ = [
     "MissingAgentsRuntimeError",
     "completed_run_to_iteration_result",
     "make_agents_invoke",
+    "make_agents_judge_invoke",
+    "make_agents_summarizer_invoke",
 ]

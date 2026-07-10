@@ -16,6 +16,8 @@ is real elapsed event-loop time, not a fake-clock comparison.
 from __future__ import annotations
 
 import asyncio
+import sys
+import textwrap
 import time
 from collections.abc import Awaitable
 from math import isfinite
@@ -34,6 +36,8 @@ from flywheel_core.invoker import InvocationSignals, IterationResult
 from flywheel_orchestrator._autopilot import (
     Finding,
     Tier,
+    _routes_via_agents_runtime,
+    _subagent_session_routes_via_runtime,
     author_findings,
     build_repo_invoker,
     build_single_session_runner,
@@ -199,3 +203,121 @@ class TestAutopilotAgentDeadline:
         invoker = build_repo_invoker(Path("/repo"), invoke=_completing_invoke)
         transcript = asyncio.run(_await(invoker("prompt")))
         assert transcript == "all done"
+
+
+# --- the agents-runtime repo invoker ([agent] id opt-in) ----------------------
+#
+# With agent_id set, build_repo_invoker routes through the REAL flywheel-agents
+# runtime (AgentRuntime + LocalHost + the claude-code CLI transport) against a
+# scripted stream-json executable substituted via the factory's test-only
+# command_override -- no live model, no claude binary, no legacy invoke seam.
+
+# Mirrors flywheel-core's test_agents_invoke._SCRIPT: read the prompt from
+# stdin, then emit a well-formed stream-json exchange and exit 0.
+_AGENTS_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import sys
+
+    sys.stdin.read()
+    def emit(obj):
+        print(json.dumps(obj), flush=True)
+
+    emit({"type": "system", "subtype": "init", "session_id": "sess-auto"})
+    emit(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "text", "text": "scripted agent text"}],
+                "stop_reason": "end_turn",
+            },
+        }
+    )
+    emit(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 2,
+            "total_cost_usd": 0.01,
+        }
+    )
+    """
+)
+
+# A run that outlives the deadline: emit the init line, then sleep far past
+# deadline_seconds without ever producing a result envelope.
+_SLEEPING_SCRIPT = textwrap.dedent(
+    """
+    import json
+    import sys
+    import time
+
+    sys.stdin.read()
+    print(
+        json.dumps(
+            {"type": "system", "subtype": "init", "session_id": "sess-slow"}
+        ),
+        flush=True,
+    )
+    time.sleep(60)
+    """
+)
+
+
+class TestAgentsRuntimeRepoInvoker:
+    """The [agent] id opt-in on build_repo_invoker (docs/agent-harness.md 15.2)."""
+
+    def test_agents_invoker_returns_agent_text(self, tmp_path: Path) -> None:
+        # agent_id set: the invoker drives the runtime end to end and returns
+        # the folded run's final text -- the script's agent text, not the
+        # legacy invoke seam's output (the default invoke would need a live
+        # claude and is never touched here).
+        script = tmp_path / "scripted_agent.py"
+        script.write_text(_AGENTS_SCRIPT)
+        invoker = build_repo_invoker(
+            tmp_path,
+            agent_id="claude-code",
+            command_override=(sys.executable, str(script)),
+        )
+        transcript = asyncio.run(_await(invoker("prompt")))
+        assert transcript == "scripted agent text"
+
+    def test_agents_invoker_deadline_exceeded_propagates(
+        self, tmp_path: Path
+    ) -> None:
+        # The agents path runs under the SAME run_with_deadline discipline as
+        # the legacy body: a run that sleeps past deadline_seconds surfaces
+        # DeadlineExceeded (never a park, never the script's 60s sleep).
+        script = tmp_path / "sleeping_agent.py"
+        script.write_text(_SLEEPING_SCRIPT)
+        invoker = build_repo_invoker(
+            tmp_path,
+            agent_id="claude-code",
+            deadline_seconds=0.5,
+            command_override=(sys.executable, str(script)),
+        )
+        started = time.monotonic()
+        raised = False
+        try:
+            asyncio.run(_await(invoker("prompt")))
+        except DeadlineExceeded as exc:
+            raised = True
+            assert exc.ceiling_seconds == 0.5
+        elapsed = time.monotonic() - started
+
+        assert raised, "the agents path must propagate DeadlineExceeded"
+        assert elapsed < _WALL_BUDGET
+
+    def test_route_choice_is_pure_and_opt_in(self) -> None:
+        # The route decision is a pure function: [agent] id unset keeps the
+        # legacy claude-SDK path; any set id routes through the runtime. The
+        # subagent-bearing discovery session is stricter -- claude-only, since
+        # SDK AgentDefinition subagents have no cross-agent equivalent.
+        assert _routes_via_agents_runtime(None) is False
+        assert _routes_via_agents_runtime("claude-code") is True
+        assert _routes_via_agents_runtime("codex") is True
+
+        assert _subagent_session_routes_via_runtime(None) is False
+        assert _subagent_session_routes_via_runtime("codex") is False
+        assert _subagent_session_routes_via_runtime("claude-code") is True

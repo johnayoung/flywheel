@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions, Message
 
     from flywheel_core.deadline_config import DeadlineConfig
+    from flywheel_core.grader_rubric import JudgeInvoke
+    from flywheel_core.recovery_summarizer import SummarizerInvoke
 
     # Optional postgres backend: imported for typing only so this module
     # never hard-depends on the psycopg extra at runtime. The store factory
@@ -800,7 +802,10 @@ async def run_task_object(
     through the ``flywheel-agents`` runtime (requires the
     ``flywheel-core[agents]`` extra) instead of the legacy SDK closure.
     ``permission_mode`` still arrives in Claude vocabulary and is mapped to
-    the generic policy per adapter.
+    the generic policy per adapter. On this path the rubric judge and the
+    recovery summarizer ride the same runtime (their knobs sourced as the
+    harness default path sources them); with ``agent_id`` unset both keep
+    their legacy fresh-``query`` invokers.
 
     ``events`` selects the live stdout stream: :data:`EVENTS_NONE` (silent),
     :data:`EVENTS_PLAIN` (readable lines), or :data:`EVENTS_JSON` (NDJSON).
@@ -901,6 +906,12 @@ async def run_task_object(
     # ControlCommandStore the watcher claims from; ``run_sink`` is the
     # telemetry destination so control-plane records flow through the same
     # live-stream path as harness.* records.
+    # The two internal LLM calls (rubric judge, recovery summarizer) ride
+    # the agents runtime only on the multi-agent opt-in; ``None`` keeps the
+    # HarnessConfig field defaults, i.e. the legacy fresh-``query`` invokers
+    # built inside the runners, so the legacy path is unchanged.
+    rubric_judge_invoke: JudgeInvoke | None = None
+    recovery_summarizer_invoke: SummarizerInvoke | None = None
     if invoke is not None:
         invoker = invoke
     elif agent_id is not None:
@@ -909,7 +920,11 @@ async def run_task_object(
         # rides adapter_options (e.g. claude-code's "cli" vs "sdk"). The
         # legacy SDK closure below stays the default until parity is
         # demonstrated in-loop.
-        from flywheel_core.agents_invoke import make_agents_invoke
+        from flywheel_core.agents_invoke import (
+            make_agents_invoke,
+            make_agents_judge_invoke,
+            make_agents_summarizer_invoke,
+        )
 
         # The [sandbox.capabilities] primitives ride adapter_options; each
         # transport consumes what it supports (the SDK transport maps them
@@ -940,6 +955,29 @@ async def run_task_object(
             max_turns=max_turns,
             environment=agent_env,
             adapter_options=adapter_options,
+        )
+        # Route the rubric judge and recovery summarizer through the same
+        # runtime, sourcing each knob exactly as the harness default path
+        # does: the judge from ``HarnessConfig.rubric_judge_model`` (never
+        # set here, so ``None``) and ``HarnessConfig.rubric_judge_max_turns``
+        # (the repo knob when supplied, else the field default); the
+        # summarizer from ``run_recovery_summarizer``'s own defaults (model
+        # ``None``, 8 turns) -- the harness passes neither knob.
+        rubric_judge_invoke = make_agents_judge_invoke(
+            agent_id=agent_id,
+            transport=agent_transport,
+            judge_max_turns=(
+                rubric_judge_max_turns
+                if rubric_judge_max_turns is not None
+                else HarnessConfig.rubric_judge_max_turns
+            ),
+            judge_model=None,
+        )
+        recovery_summarizer_invoke = make_agents_summarizer_invoke(
+            agent_id=agent_id,
+            transport=agent_transport,
+            summarizer_max_turns=8,
+            summarizer_model=None,
         )
     else:
         invoker = _make_claude_code_invoke(
@@ -1050,6 +1088,8 @@ async def run_task_object(
                     agent_context=agent_context,
                     worktree=sandbox,
                     grader_env=grader_env,
+                    rubric_judge_invoke=rubric_judge_invoke,
+                    recovery_summarizer_invoke=recovery_summarizer_invoke,
                     landability_gate=landability_gate,
                     checkpoint_nudge_seconds=checkpoint_nudge_seconds,
                     checkpoint_progress_probe=checkpoint_progress_probe,

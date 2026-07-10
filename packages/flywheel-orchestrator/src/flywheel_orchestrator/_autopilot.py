@@ -36,6 +36,10 @@ from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from flywheel_core.agents_invoke import (
+    MissingAgentsRuntimeError,
+    completed_run_to_iteration_result,
+)
 from flywheel_core.deadline import run_with_deadline
 from flywheel_core.deadline_config import (
     DEFAULT_AUTOPILOT_AGENT_SECONDS,
@@ -459,6 +463,83 @@ async def _drive_agent_iteration(
     return await run_with_deadline(call, deadline_seconds)
 
 
+def _routes_via_agents_runtime(agent_id: str | None) -> bool:
+    """The invoker route choice (docs/agent-harness.md section 15.2).
+
+    ``[agent] id`` unset (``None``) keeps the legacy claude-SDK closure
+    byte-identical; any set id routes through the flywheel-agents runtime.
+    Pure so the opt-in rule is unit-testable in isolation.
+    """
+    return agent_id is not None
+
+
+def _subagent_session_routes_via_runtime(agent_id: str | None) -> bool:
+    """The subagent-bearing discovery session's route choice.
+
+    SDK ``AgentDefinition`` subagents have no cross-agent equivalent, so the
+    subagent stage stays claude-only (docs/agent-harness.md section 15.2):
+    only ``agent_id == "claude-code"`` routes through the runtime (on the SDK
+    transport); unset or any other agent keeps the legacy claude path for
+    this invoker unchanged. Pure so the rule is unit-testable in isolation.
+    """
+    return agent_id == "claude-code"
+
+
+def _build_agents_repo_invoker(
+    repo_root: Path,
+    *,
+    agent_id: str,
+    agent_transport: str | None,
+    model: str | None,
+    max_turns: int,
+    deadline_seconds: float | None,
+    command_override: tuple[str, ...] | None,
+) -> AutopilotInvoker:
+    """The agents-runtime leg of :func:`build_repo_invoker` (the ``[agent] id``
+    opt-in): one :class:`flywheel_agents.AgentRuntime` per factory, each call
+    one run rooted in ``repo_root`` under the SAME ``run_with_deadline``
+    discipline as the legacy path, so :class:`~flywheel_core.deadline.DeadlineExceeded`
+    propagates identically. ``flywheel_agents`` is imported lazily so importing
+    this module never requires it."""
+    try:
+        import flywheel_agents
+    except ModuleNotFoundError as exc:
+        raise MissingAgentsRuntimeError(
+            "the multi-agent path requires the flywheel-agents package: "
+            "install flywheel-core[agents]"
+        ) from exc
+
+    runtime = flywheel_agents.AgentRuntime()
+    adapter_options: dict[str, object] = {}
+    if agent_transport is not None:
+        adapter_options["transport"] = agent_transport
+    configuration = flywheel_agents.AgentConfiguration(
+        agent_id=agent_id,
+        model_id=model,
+        max_turns=max_turns,
+        permission_policy=flywheel_agents.PermissionPolicy.AUTO,
+        command_override=command_override,
+        adapter_options=adapter_options,
+    )
+
+    async def _invoke(prompt: str) -> str:
+        call = runtime.run(
+            flywheel_agents.RunRequest(
+                prompt=prompt,
+                working_directory=repo_root,
+                configuration=configuration,
+                timeout_seconds=None,
+            )
+        )
+        if deadline_seconds is None:
+            completed = await call
+        else:
+            completed = await run_with_deadline(call, deadline_seconds)
+        return completed.final_text
+
+    return _invoke
+
+
 def build_repo_invoker(
     repo_root: Path,
     *,
@@ -466,6 +547,9 @@ def build_repo_invoker(
     max_turns: int = DEFAULT_DISCOVERY_MAX_TURNS,
     deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
     invoke: InvokeIterationFn = invoke_iteration,
+    agent_id: str | None = None,
+    agent_transport: str | None = None,
+    command_override: tuple[str, ...] | None = None,
 ) -> AutopilotInvoker:
     """Build the production agent seam: a Claude session rooted in ``repo_root``.
 
@@ -478,7 +562,25 @@ def build_repo_invoker(
     (spec 00066 criterion #6); it defaults to the resolved-config autopilot
     ceiling so the call is bounded by default. ``invoke`` is the injectable
     invoke-iteration seam (tests substitute a never-terminating stub).
+
+    ``agent_id`` is the ``[agent] id`` multi-agent opt-in (docs/agent-harness.md
+    section 15.2): ``None`` (the default) keeps the legacy claude-SDK body
+    byte-identical; set, the invoker routes through the flywheel-agents runtime
+    (``agent_transport`` rides ``adapter_options`` when set) under the same
+    deadline discipline. ``command_override`` is a test-only escape hatch for
+    the agents path, substituting the agent executable.
     """
+    if _routes_via_agents_runtime(agent_id):
+        assert agent_id is not None
+        return _build_agents_repo_invoker(
+            repo_root,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
+            model=model,
+            max_turns=max_turns,
+            deadline_seconds=deadline_seconds,
+            command_override=command_override,
+        )
 
     async def _invoke(prompt: str) -> str:
         from flywheel_core._sdk import ClaudeAgentOptions
@@ -703,6 +805,7 @@ async def run_discovery(
     session_runner: DiscoverySessionRunner | None = None,
     model: str | None = None,
     deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
+    agent_id: str | None = None,
 ) -> list[TierVerdict]:
     """Run discovery and return all 11 verdicts, in tier order.
 
@@ -728,6 +831,7 @@ async def run_discovery(
             session_runner=session_runner,
             model=model,
             deadline_seconds=deadline_seconds,
+            agent_id=agent_id,
         )
     verdicts = await asyncio.gather(
         *(discover_tier(tier, repo_root=repo_root, invoker=invoker) for tier in Tier)
@@ -892,6 +996,75 @@ def build_single_session_options(
     )
 
 
+def _build_agents_single_session_runner(
+    repo_root: Path,
+    *,
+    agent_id: str,
+    model: str | None,
+    max_turns: int,
+    subagent_max_turns: int,
+    subagent_effort: DiscoveryEffort,
+    deadline_seconds: float | None,
+) -> DiscoverySessionRunner:
+    """The agents-runtime leg of :func:`build_single_session_runner`.
+
+    Reached only for ``agent_id == "claude-code"`` (SDK ``AgentDefinition``
+    subagents have no cross-agent equivalent -- the subagent stage stays
+    claude-only, docs/agent-harness.md section 15.2): the 11 built tier
+    definitions ride ``adapter_options["agents"]`` verbatim onto the SDK
+    transport, under the SAME ``run_with_deadline`` discipline as the legacy
+    path, and the folded :class:`~flywheel_agents.CompletedRun` maps onto the
+    :class:`IterationResult` the collector reads via the section-15.1 bridge
+    fold. ``flywheel_agents`` is imported lazily so importing this module
+    never requires it.
+    """
+    try:
+        import flywheel_agents
+    except ModuleNotFoundError as exc:
+        raise MissingAgentsRuntimeError(
+            "the multi-agent path requires the flywheel-agents package: "
+            "install flywheel-core[agents]"
+        ) from exc
+
+    runtime = flywheel_agents.AgentRuntime()
+
+    async def _run(prompt: str) -> IterationResult:
+        configuration = flywheel_agents.AgentConfiguration(
+            agent_id=agent_id,
+            model_id=model,
+            max_turns=max_turns,
+            permission_policy=flywheel_agents.PermissionPolicy.AUTO,
+            adapter_options={
+                "transport": "sdk",
+                "agents": build_tier_agents(
+                    repo_root,
+                    model=model,
+                    max_turns=subagent_max_turns,
+                    effort=subagent_effort,
+                ),
+                "allowed_tools": [
+                    *sorted(SUBAGENT_TOOL_NAMES),
+                    *SUBAGENT_READONLY_TOOLS,
+                ],
+            },
+        )
+        call = runtime.run(
+            flywheel_agents.RunRequest(
+                prompt=prompt,
+                working_directory=repo_root,
+                configuration=configuration,
+                timeout_seconds=None,
+            )
+        )
+        if deadline_seconds is None:
+            completed = await call
+        else:
+            completed = await run_with_deadline(call, deadline_seconds)
+        return completed_run_to_iteration_result(completed)
+
+    return _run
+
+
 def build_single_session_runner(
     repo_root: Path,
     *,
@@ -901,6 +1074,7 @@ def build_single_session_runner(
     subagent_effort: DiscoveryEffort = DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
     deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
     invoke: InvokeIterationFn = invoke_iteration,
+    agent_id: str | None = None,
 ) -> DiscoverySessionRunner:
     """Build the production single-session runner rooted at ``repo_root``.
 
@@ -915,7 +1089,25 @@ def build_single_session_runner(
     autopilot ceiling so the session is bounded by default. ``invoke`` is the
     injectable invoke-iteration seam (tests substitute a never-terminating
     stub).
+
+    ``agent_id`` is the ``[agent] id`` multi-agent opt-in. SDK
+    ``AgentDefinition`` subagents have no cross-agent equivalent, so this
+    invoker routes through the flywheel-agents runtime only for
+    ``agent_id == "claude-code"`` (on the SDK transport); ``None`` or any
+    other agent keeps the legacy claude path unchanged
+    (docs/agent-harness.md section 15.2).
     """
+    if _subagent_session_routes_via_runtime(agent_id):
+        assert agent_id is not None
+        return _build_agents_single_session_runner(
+            repo_root,
+            agent_id=agent_id,
+            model=model,
+            max_turns=max_turns,
+            subagent_max_turns=subagent_max_turns,
+            subagent_effort=subagent_effort,
+            deadline_seconds=deadline_seconds,
+        )
 
     async def _run(prompt: str) -> IterationResult:
         options = build_single_session_options(
@@ -1096,6 +1288,7 @@ async def run_single_session_discovery(
     session_runner: DiscoverySessionRunner | None = None,
     model: str | None = None,
     deadline_seconds: float | None = DEFAULT_AUTOPILOT_AGENT_SECONDS,
+    agent_id: str | None = None,
 ) -> list[TierVerdict]:
     """Run discovery as ONE session of tier subagents; return all 11 verdicts.
 
@@ -1110,7 +1303,10 @@ async def run_single_session_discovery(
         session_runner
         if session_runner is not None
         else build_single_session_runner(
-            repo_root, model=model, deadline_seconds=deadline_seconds
+            repo_root,
+            model=model,
+            deadline_seconds=deadline_seconds,
+            agent_id=agent_id,
         )
     )
     result = await runner(orchestrator_prompt(repo_root))
@@ -1604,6 +1800,8 @@ async def run_refill_pass(
     deadlines: DeadlineConfig | None = None,
     control: StopEventStore | None = None,
     now: Callable[[], datetime] | None = None,
+    agent_id: str | None = None,
+    agent_transport: str | None = None,
 ) -> AutopilotPassResult:
     """Run one refill pass: discovery -> score/select -> author -> emit.
 
@@ -1617,6 +1815,11 @@ async def run_refill_pass(
     ``queue_depth`` measures the current work-source depth; it defaults to the
     directory adapter's listing count. The agent seams default to the real
     SDK-backed invokers rooted at ``repo_root``; tests inject scripted ones.
+
+    ``agent_id``/``agent_transport`` are the policy's ``[agent]`` multi-agent
+    opt-in, forwarded to the default invoker constructions (an injected
+    ``discovery_invoker``/``authoring_invoker`` is unaffected); ``None``
+    keeps the legacy claude-SDK invokers byte-identical.
     """
     # Default-on, operator-overridable wall-clock ceiling for the discovery and
     # authoring agent calls (spec 00066 criterion #6, D-1/D-3): resolve it once
@@ -1670,6 +1873,8 @@ async def run_refill_pass(
             model=model,
             max_turns=DEFAULT_AUTHORING_MAX_TURNS,
             deadline_seconds=autopilot_ceiling,
+            agent_id=agent_id,
+            agent_transport=agent_transport,
         )
     )
 
@@ -1682,6 +1887,7 @@ async def run_refill_pass(
         invoker=discovery_invoker,
         model=model,
         deadline_seconds=autopilot_ceiling,
+        agent_id=agent_id,
     )
     relevant_tiers = tuple(v.tier for v in verdicts if v.relevant)
     not_relevant_tiers = tuple(v.tier for v in verdicts if not v.relevant)

@@ -66,6 +66,7 @@ from flywheel_core import (
     invoke_iteration,
     run_command_graders,
 )
+from flywheel_core.agents_invoke import MissingAgentsRuntimeError
 from flywheel_core.deadline import DeadlineExceeded, run_with_deadline
 from flywheel_core.events import (
     GATE_EXCERPT_MAX_BYTES,
@@ -279,6 +280,77 @@ async def _drive_conflict_resolution(
     turns = result.signals.num_turns or 0
     wall = min(time.monotonic() - started, request.max_wall_seconds)
     return ConflictResolutionReport(turns=turns, wall_seconds=wall)
+
+
+def _make_agents_resolve_conflict(
+    agent_id: str,
+    transport: str | None,
+    *,
+    command_override: tuple[str, ...] | None = None,
+) -> ConflictResolver:
+    """Build the agents-runtime conflict resolver: the ``[agent] id`` opt-in
+    counterpart of :func:`_default_resolve_conflict` (docs/agent-harness.md
+    section 15.2).
+
+    Same contract as the default driver: a synchronous callable that drives one
+    bounded session rooted in the conflicted worktree -- a turn budget via the
+    configuration's ``max_turns`` and a wall-clock ceiling via the runtime's
+    ``timeout_seconds`` (its analog of ``run_with_deadline``) -- and reports
+    usage only. A wall-clock timeout folds into a ``RunFailure`` with
+    ``error_type == "timeout"`` and is reported at the bounds, exactly like the
+    deadline-park in :func:`_drive_conflict_resolution` (the true turn count is
+    unavailable after cancellation). ``flywheel_agents`` is imported lazily so
+    this module keeps importing without it; the factory only runs when the
+    policy set ``[agent] id``. ``command_override`` is a test-only escape hatch
+    substituting the agent executable (a scripted stream-json binary).
+    """
+    try:
+        import flywheel_agents
+    except ModuleNotFoundError as exc:
+        raise MissingAgentsRuntimeError(
+            "the multi-agent path requires the flywheel-agents package: "
+            "install flywheel-core[agents]"
+        ) from exc
+
+    # One runtime per factory, mirroring make_agents_invoke: the submitter
+    # builds the resolver once and every escalation reuses it.
+    runtime = flywheel_agents.AgentRuntime()
+    adapter_options: dict[str, object] = {}
+    if transport is not None:
+        adapter_options["transport"] = transport
+
+    def _resolve(
+        request: ConflictResolutionRequest,
+    ) -> ConflictResolutionReport:
+        configuration = flywheel_agents.AgentConfiguration(
+            agent_id=agent_id,
+            model_id=request.model,
+            max_turns=request.max_turns,
+            permission_policy=flywheel_agents.PermissionPolicy.AUTO,
+            command_override=command_override,
+            adapter_options=adapter_options,
+        )
+        run_request = flywheel_agents.RunRequest(
+            prompt=request.prompt,
+            working_directory=request.worktree,
+            configuration=configuration,
+            timeout_seconds=request.max_wall_seconds,
+        )
+        started = time.monotonic()
+        completed = asyncio.run(runtime.run(run_request))
+        failure = completed.failure
+        if failure is not None and failure.error_type == "timeout":
+            # Deadline-park parity with the default driver: report usage at
+            # the bounds rather than raising, so a slow session parks.
+            return ConflictResolutionReport(
+                turns=request.max_turns,
+                wall_seconds=request.max_wall_seconds,
+            )
+        turns = completed.num_turns or 0
+        wall = min(time.monotonic() - started, request.max_wall_seconds)
+        return ConflictResolutionReport(turns=turns, wall_seconds=wall)
+
+    return _resolve
 
 
 def _render_conflict_resolution_prompt(
@@ -3377,6 +3449,11 @@ def build_merge_submitter(
     before the same re-verification bar. ``policy is None`` (a bare construction)
     leaves the rung disabled, byte-identical to today's merge-conflict park. The
     session's SDK model is the policy's resolved agent model.
+
+    When the policy sets ``[agent] id`` (the multi-agent opt-in), the rung's
+    session driver is the agents-runtime resolver
+    (:func:`_make_agents_resolve_conflict`) instead of the legacy claude-SDK
+    driver; unset keeps :func:`_default_resolve_conflict` byte-identical.
     """
     return GitWorktreeSubmitter(
         repo_root=repo_root,
@@ -3402,6 +3479,13 @@ def build_merge_submitter(
             else 900.0
         ),
         recovery_agent_model=policy.model if policy is not None else None,
+        resolve_conflict=(
+            _make_agents_resolve_conflict(
+                policy.agent_id, policy.agent_transport
+            )
+            if policy is not None and policy.agent_id is not None
+            else None
+        ),
     )
 
 
@@ -3459,6 +3543,13 @@ def build_phase_submitter(
             else 900.0
         ),
         recovery_agent_model=policy.model if policy is not None else None,
+        resolve_conflict=(
+            _make_agents_resolve_conflict(
+                policy.agent_id, policy.agent_transport
+            )
+            if policy is not None and policy.agent_id is not None
+            else None
+        ),
     )
     log(
         f"landing strategy: phase (integration branch flywheel/phase/<phase> "

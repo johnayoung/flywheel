@@ -451,6 +451,140 @@ def satisfied_prerequisites_from_store(
         if _has_done_lifecycle(store, prereq_id)
     )
 
+
+@dataclass(frozen=True, kw_only=True)
+class PrerequisiteReachabilityHold:
+    """A dependent held because a DONE prerequisite's landed work is not yet
+    reachable from the base the dependent would branch from (spec 00079, #7).
+
+    ``blocking_phase`` names the prerequisite's phase whose integration branch
+    has not merged into the true base -- the phase whose PR must merge before
+    the dependent becomes claimable. ``held_by`` lists the DONE-but-unreachable
+    prerequisite ids driving the hold, in the dependent's prerequisite order.
+    The hold is a scheduling verdict only: it never parks, fails, or consumes
+    the task, which is re-offered the first pass after reachability holds.
+    """
+
+    task_id: str
+    blocking_phase: str
+    held_by: tuple[str, ...]
+
+
+def _phase_of_row(row: TaskStatusRow) -> str:
+    """The phase directory name a file-backed row belongs to, or ``""``.
+
+    Mirrors the phase key the archive sweep derives from ``active/<phase>``:
+    for a file-backed row it is the parent directory name; a pathless row
+    (external source) has no phase directory, so no ``flywheel/phase/<phase>``
+    branch exists to resolve against and the reachability hold does not apply.
+    """
+    return row.task_file.parent.name if row.task_file != Path() else ""
+
+
+def _phase_branches_present(repo_root: Path) -> bool:
+    """True when any ``flywheel/phase/<phase>`` integration branch exists.
+
+    The phase strategy is the only landing strategy that creates these refs
+    (spec 00079); under merge/pr none is ever created, so one cheap
+    ``git for-each-ref`` short-circuits the reachability hold to a no-op for
+    those repos -- keeping their scheduling byte-identical to pre-feature
+    behavior.
+    """
+    rc, out = _git_capture(
+        repo_root,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/flywheel/phase/",
+    )
+    return rc == 0 and bool(out.strip())
+
+
+def reachability_held_prerequisites(
+    rows: Iterable[TaskStatusRow],
+    *,
+    repo_root: Path | None,
+    true_base: str | None,
+) -> dict[str, PrerequisiteReachabilityHold]:
+    """Dependents to withhold because a DONE cross-phase prerequisite's landed
+    work is not yet reachable from the base they would branch from.
+
+    The subtractive complement of :func:`satisfied_prerequisites_from_store`:
+    that function *extends* prerequisite satisfaction to unlisted store-DONE
+    ids; this one *removes* satisfaction from a listed prerequisite that is
+    DONE but whose phase has not merged. Under the phase strategy (spec 00079)
+    each phase lands its tasks onto ``flywheel/phase/<phase>`` and phases are
+    independent in v1 -- a dependent in phase B branches from the true base,
+    which does not include phase A's work until A's PR merges. Claiming the
+    dependent then would branch it from a base that cannot see the
+    prerequisite's landed commit, so it is held (never parked/failed) until
+    reachability holds, at which point the next pass claims it with no operator
+    action.
+
+    Returns ``{}`` -- a total no-op preserving merge/pr and pre-feature
+    scheduling byte-for-byte -- when ``repo_root``/``true_base`` is absent or no
+    ``flywheel/phase/*`` branch exists. A hold is recorded only for a listed
+    prerequisite that is (a) in a *different* phase than the dependent
+    (same-phase chains share one integration branch and are unaffected), (b)
+    classified :attr:`TaskState.DONE`, and (c) whose phase integration branch
+    tip is not an ancestor of ``true_base``. A prerequisite whose phase branch
+    no longer resolves (merged and deleted, or never phase-landed) is reachable
+    and never holds; an unlisted prerequisite (e.g. its phase archived) is
+    likewise reachable off the true base and never holds.
+    """
+    if repo_root is None or true_base is None:
+        return {}
+    root: Path = repo_root
+    base: str = true_base
+    materialized = list(rows)
+    if not materialized or not _phase_branches_present(root):
+        return {}
+    phase_by_id = {row.task.id: _phase_of_row(row) for row in materialized}
+    state_by_id = {row.task.id: row.state for row in materialized}
+    tip_cache: dict[str, str | None] = {}
+    ancestor_cache: dict[str, bool] = {}
+
+    def _phase_tip(phase: str) -> str | None:
+        if phase not in tip_cache:
+            tip_cache[phase] = _resolve_phase_branch_tip(
+                root, f"flywheel/phase/{phase}"
+            )
+        return tip_cache[phase]
+
+    def _reachable(tip: str) -> bool:
+        if tip not in ancestor_cache:
+            ancestor_cache[tip] = _is_ancestor(root, tip, base)
+        return ancestor_cache[tip]
+
+    holds: dict[str, PrerequisiteReachabilityHold] = {}
+    for row in materialized:
+        dep_phase = phase_by_id[row.task.id]
+        if not dep_phase:
+            continue
+        held_by: list[str] = []
+        blocking_phase = ""
+        for prereq_id in row.prerequisites:
+            prereq_phase = phase_by_id.get(prereq_id)
+            if not prereq_phase or prereq_phase == dep_phase:
+                continue
+            if state_by_id.get(prereq_id) is not TaskState.DONE:
+                continue
+            tip = _phase_tip(prereq_phase)
+            if tip is None:
+                continue
+            if _reachable(tip):
+                continue
+            held_by.append(prereq_id)
+            if not blocking_phase:
+                blocking_phase = prereq_phase
+        if held_by:
+            holds[row.task.id] = PrerequisiteReachabilityHold(
+                task_id=row.task.id,
+                blocking_phase=blocking_phase,
+                held_by=tuple(held_by),
+            )
+    return holds
+
+
 IN_LOOP_VERIFICATION_TAG = "in-loop-verification"
 
 class _LandingState(Enum):
@@ -1431,8 +1565,18 @@ def _cmd_next(args: argparse.Namespace) -> int:
         # dependent whose only unlisted prerequisite already completed is not
         # withheld. Only unlisted ids are consulted -- no per-listed-task read.
         satisfied = satisfied_prerequisites_from_store(rows, store)
+        # Phase-prerequisite reachability hold (spec 00079, #7): the pull
+        # surface must not hand out a dependent whose DONE prerequisite landed
+        # on an unmerged sibling phase -- the worker would refuse to claim it.
+        # No-op for non-phase (merge/pr, tracker) repos, so selection is
+        # otherwise unchanged.
+        repo_root, true_base = _reachability_context(args, policy)
+        held = reachability_held_prerequisites(
+            rows, repo_root=repo_root, true_base=true_base
+        )
         pick = select_next_task(
             rows,
+            exclude_ids=frozenset(held),
             worker_capabilities=worker_capabilities,
             satisfied_prerequisites=satisfied,
         )
@@ -1911,9 +2055,19 @@ def _cmd_status_rollup(args: argparse.Namespace) -> int:
     source = _resolve_work_source(args, policy)
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Thread repo_root + true_base so the rollup surfaces the phase-prerequisite
+    # reachability hold (spec 00079, #7): a not-started dependent whose DONE
+    # prerequisite landed on an unmerged sibling phase reads blocked_by_prereq
+    # naming that phase, not idle not_started. A no-op for non-phase repos.
+    repo_root, true_base = _reachability_context(args, policy)
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
-        rollup = build_rollup(status_rows_for_items(source.list_work(), store), store)
+        rollup = build_rollup(
+            status_rows_for_items(source.list_work(), store),
+            store,
+            repo_root=repo_root,
+            true_base=true_base,
+        )
     finally:
         store.close()
     if args.json:
@@ -2529,6 +2683,30 @@ def repo_root_for_tasks_dir(tasks_dir: Path) -> Path:
         if parent.name == ".flywheel":
             return parent.parent
     return Path.cwd()
+
+
+def _reachability_context(
+    args: argparse.Namespace, policy: WorkPolicy | None
+) -> tuple[Path, str]:
+    """Resolve ``(repo_root, true_base)`` for the phase-prerequisite
+    reachability hold from a read verb's args and effective policy.
+
+    The base is the configured submit base, else the checked-out branch
+    (``HEAD``); the repo root is the ``.flywheel`` ancestor of the resolved
+    tasks dir (falling back to cwd). Both feed
+    :func:`reachability_held_prerequisites`, a no-op for non-phase repos, so a
+    tracker source or a merge/pr repo is unaffected by the resolution.
+    """
+    tasks_dir_arg = getattr(args, "tasks_dir", None)
+    if tasks_dir_arg:
+        tasks_dir = Path(tasks_dir_arg)
+    elif policy is not None and policy.tasks_dir is not None:
+        tasks_dir = policy.tasks_dir
+    else:
+        tasks_dir = DEFAULT_TASKS_DIR
+    repo_root = repo_root_for_tasks_dir(tasks_dir)
+    true_base = (policy.submit_base if policy is not None else None) or "HEAD"
+    return repo_root, true_base
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:

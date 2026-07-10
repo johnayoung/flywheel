@@ -162,6 +162,7 @@ from flywheel_orchestrator._workflow import (
     TaskState,
     TaskStatusRow,
     _latest_lifecycle_row,
+    reachability_held_prerequisites,
     satisfied_prerequisites_from_store,
     status_rows_for_items,
     task_state,
@@ -2457,6 +2458,19 @@ async def orchestrate(
         # session once the deadline passes (see
         # ``APPROVAL_SWEEP_MARK_TTL_SECONDS``).
         attempted_approve: dict[str, datetime] = {}
+        # Base for the phase-prerequisite reachability hold (spec 00079, #7):
+        # the configured submit base, else the checked-out branch (HEAD). Under
+        # the phase strategy a dependent whose DONE prerequisite landed on an
+        # unmerged sibling phase branches from this base, which cannot see that
+        # work until the sibling phase merges -- so the dependent is withheld
+        # (never parked/failed) until reachability holds. Resolved once (stable
+        # across passes); ``None`` when no repo_root is threaded (no git probe
+        # available), which leaves the hold a no-op and scheduling unchanged.
+        scheduling_true_base = (
+            ((policy.submit_base if policy is not None else None) or "HEAD")
+            if repo_root is not None
+            else None
+        )
 
         while True:
             # Source-listing containment (mirrors _source_reconcile_loop and
@@ -2501,6 +2515,21 @@ async def orchestrate(
             # the dangling-prerequisite re-driver.
             satisfied_prereqs = satisfied_prerequisites_from_store(
                 rows, control
+            )
+            # Phase-prerequisite reachability hold (spec 00079, #7): a listed
+            # dependent whose remaining constraint is a DONE prerequisite that
+            # landed on an unmerged sibling phase is withheld this pass -- added
+            # to the fresh-selection exclude set below, never parked, failed, or
+            # consumed -- and re-offered automatically once the blocking phase
+            # merges (git ancestry advances, the hold clears). Empty under
+            # merge/pr (no ``flywheel/phase/*`` branch arms it) and when no
+            # repo_root is threaded, so those paths schedule byte-identically.
+            reachability_held_ids = frozenset(
+                reachability_held_prerequisites(
+                    rows,
+                    repo_root=repo_root,
+                    true_base=scheduling_true_base,
+                )
             )
             # Bounded dangling-prerequisite re-drive (spec 00069, criteria
             # #7/#8/#13). A task whose declared prerequisite resolves to no work
@@ -2910,7 +2939,12 @@ async def orchestrate(
                 # re-reads the horizon and resumes once it passes.
                 if claim_pause_until is not None:
                     break
-                exclude = attempted_fresh | blocked_ids | held
+                exclude = (
+                    attempted_fresh
+                    | blocked_ids
+                    | held
+                    | reachability_held_ids
+                )
                 # Highest-priority-first over the validated graph: ready_set
                 # returns every runnable item (own state eligible, all
                 # prerequisites DONE, required_capabilities a subset of this

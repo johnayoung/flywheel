@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from flywheel_core.lifecycle import Status
@@ -26,6 +27,7 @@ from flywheel_core.store_sqlite import SqliteStore
 from flywheel_orchestrator._workflow import (
     TaskState,
     TaskStatusRow,
+    reachability_held_prerequisites,
     satisfied_prerequisites_from_store,
 )
 
@@ -156,9 +158,23 @@ def _classify(
 
 
 def build_rollup(
-    rows: list[TaskStatusRow], store: SqliteStore | PostgresStore
+    rows: list[TaskStatusRow],
+    store: SqliteStore | PostgresStore,
+    *,
+    repo_root: Path | None = None,
+    true_base: str | None = None,
 ) -> Rollup:
-    """Project status rows into a phase-grouped, evidence-derived rollup."""
+    """Project status rows into a phase-grouped, evidence-derived rollup.
+
+    ``repo_root`` and ``true_base`` arm the phase-prerequisite reachability
+    surface (spec 00079, #7): under the phase strategy a not-started dependent
+    whose DONE prerequisite landed on an *unmerged* sibling phase is reported
+    ``blocked_by_prereq`` naming the blocking phase, not idle ``not_started`` --
+    the same visible-hold verdict the scheduler withholds it on. Both default
+    ``None``, so a caller that omits them (and the pinned two-arg call sites)
+    gets the pre-feature projection unchanged; merge/pr repos are likewise
+    unchanged because no ``flywheel/phase/*`` branch exists to arm the hold.
+    """
     # First pass: classify each task in isolation, recording its status so the
     # prerequisite pass can resolve dependencies by id.
     classified: list[tuple[TaskStatusRow, RollupStatus, int, int, str]] = []
@@ -180,6 +196,15 @@ def build_rollup(
     # (satisfied_prerequisites_from_store), which reads the store only for ids
     # absent from ``rows`` -- a fully-listed graph classifies with no extra read.
     store_done_prereqs = satisfied_prerequisites_from_store(rows, store)
+    # A prerequisite that reached DONE but whose phase's landed work is not yet
+    # reachable from the base a dependent would branch from is a *visible* hold,
+    # not idle not-started: under the phase strategy phases are independent, so
+    # a DONE prerequisite on an unmerged sibling phase leaves the dependent
+    # unclaimable until that phase's PR merges. Empty under merge/pr and when no
+    # repo/true-base is threaded, so the projection is otherwise unchanged.
+    reachability_holds = reachability_held_prerequisites(
+        rows, repo_root=repo_root, true_base=true_base
+    )
     phases: dict[str, list[TaskRollup]] = {}
     for row, status, passed, total, detail in classified:
         unsatisfied: tuple[str, ...] = ()
@@ -193,6 +218,21 @@ def build_rollup(
             if unsatisfied:
                 status = RollupStatus.BLOCKED_BY_PREREQ
                 detail = "waiting on: " + ", ".join(unsatisfied)
+        # A dependent whose prerequisites are all DONE but not yet reachable is
+        # blocked by phase merge order, not by an incomplete prerequisite. Gated
+        # on NOT_STARTED so a genuinely incomplete prerequisite (handled above)
+        # keeps precedence; the reachability detail surfaces once that clears.
+        if (
+            status is RollupStatus.NOT_STARTED
+            and row.task.id in reachability_holds
+        ):
+            hold = reachability_holds[row.task.id]
+            status = RollupStatus.BLOCKED_BY_PREREQ
+            unsatisfied = hold.held_by
+            detail = (
+                "prerequisite landed but not reachable; waiting on phase "
+                f"{hold.blocking_phase} to merge: " + ", ".join(hold.held_by)
+            )
         phase = _phase_of(row)
         phases.setdefault(phase, []).append(
             TaskRollup(

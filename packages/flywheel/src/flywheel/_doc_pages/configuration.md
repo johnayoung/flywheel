@@ -90,8 +90,10 @@ Both `flywheel worker` and `flywheel orchestrate` honor the key; `--sandbox-root
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `model` | str (opaque) | unset | the model id passed verbatim to the SDK |
+| `id` | str (opaque) | unset | the multi-agent opt-in: routes runs through the `flywheel-agents` runtime (e.g. `"claude-code"`); unset keeps the legacy SDK invoker |
+| `transport` | str | unset | adapter transport selection (claude-code: `"cli"` or `"sdk"`); requires `id` |
 
-The value is opaque: flywheel maintains no allowlist. Model resolution precedence is `--model` flag > `[agent] model` > SDK/Claude Code default (`worker.py:2060`). An empty or whitespace-only string raises `PolicyError`.
+Values are opaque: flywheel maintains no allowlist. Model resolution precedence is `--model` flag > `[agent] model` > SDK/Claude Code default (`worker.py:2060`). An empty or whitespace-only string raises `PolicyError`, as does `transport` without `id`. An unknown `id` fails at run time with the registered adapter set in the message. See [agent-harness.md](agent-harness.md) for the multi-agent architecture.
 
 ## `[[defaults.graders]]` (optional)
 

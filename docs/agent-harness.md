@@ -67,58 +67,36 @@ Named `flywheel-agents`, not `flywheel-harness`: "harness" is already the loop h
 
 ## 4. Package structure
 
+Flat private-module layout, matching sibling-package idiom (`flywheel_container`'s `_docker.py`/`_submit.py`):
+
 ```text
 packages/flywheel-agents/
 ├── pyproject.toml
 ├── src/flywheel_agents/
-│   ├── __init__.py
-│   ├── core/
-│   │   ├── capabilities.py
-│   │   ├── config.py
-│   │   ├── errors.py
-│   │   ├── events.py
-│   │   ├── fold.py            # event stream -> CompletedRun
-│   │   ├── models.py
-│   │   ├── registry.py
-│   │   └── runtime.py
-│   ├── adapters/
-│   │   ├── base.py
-│   │   └── claude_code/
-│   │       ├── adapter.py
-│   │       ├── cli_stream.py  # stream-json transport (any host)
-│   │       ├── sdk_transport.py
-│   │       ├── normalizer.py
-│   │       ├── probe.py
-│   │       └── faults.py      # session-limit / auth fault classification
-│   ├── transports/
-│   │   ├── base.py
-│   │   ├── acp.py
-│   │   ├── jsonl.py
-│   │   └── jsonrpc.py
-│   ├── hosts/
-│   │   ├── base.py
-│   │   ├── local.py
-│   │   └── docker_exec.py
-│   ├── processes/
-│   │   ├── environment.py
-│   │   ├── launcher.py
-│   │   ├── process_tree.py
-│   │   └── resolver.py
-│   ├── auth/
-│   │   ├── policy.py
-│   │   └── probe.py
-│   └── mcp/
-│       └── schema.py          # canonical model + per-agent read/translate
-└── tests/
-    ├── adapters/
-    ├── contract/
-    ├── fake_agent/
-    ├── fixtures/
-    ├── transports/
-    └── unit/
+│   ├── __init__.py            # the public surface (re-exports)
+│   ├── adapter.py             # AgentAdapter / RunningAgent / AdapterServices
+│   ├── capabilities.py
+│   ├── config.py
+│   ├── errors.py
+│   ├── events.py              # EventType / AgentEvent / RawAgentEvent / sinks
+│   ├── fold.py                # event stream -> CompletedRun
+│   ├── hosts.py               # ProcessPlan / LocalHost / DockerExecHost
+│   ├── models.py
+│   ├── registry.py            # entry-point plugins: flywheel_agents.adapters
+│   ├── runtime.py             # AgentRuntime.run()
+│   └── claude_code/
+│       ├── adapter.py         # transport routing (cli | sdk)
+│       ├── _cli.py            # stream-json plan + normalizer (any host)
+│       ├── _sdk.py            # claude-agent-sdk transport (local only)
+│       ├── _common.py         # shared usage/stop normalization
+│       ├── _probe.py
+│       └── _faults.py         # session-limit fault classification
+└── tests/                     # unit + contract suite + fake_agent.py
 ```
 
-Additional adapters (`codex/`, `gemini/`, `qwen/`, ...) follow in later phases.
+ACP / JSON-RPC transport modules, the auth-policy subsystem, and the MCP
+canonical schema arrive with their phases (section 16), as do additional
+adapters (`codex/`, `gemini/`, `qwen/`, ...).
 
 ## 5. Domain model
 
@@ -301,23 +279,21 @@ Native stop strings are preserved alongside the normalized enum. This fold repla
 The seam the original spec deferred and flywheel needs on day one. Adapters build a `ProcessPlan`; hosts spawn it.
 
 ```python
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ProcessPlan:
     argv: tuple[str, ...]
-    cwd: Path
-    environment: Mapping[str, str]
+    cwd: Path | None = None
+    environment: Mapping[str, str] = field(default_factory=dict)  # extras
     stdin_payload: str | None = None      # prompt piped on stdin (ARG_MAX safety)
-    startup_timeout_seconds: float = 120
-    shutdown_timeout_seconds: float = 10
+    denied_environment: tuple[str, ...] = ()  # account-only auth stripping
 
 
-class ExecutionHost(ABC):
-    @abstractmethod
+class ExecutionHost(Protocol):
     async def spawn(self, plan: ProcessPlan) -> RunningProcess: ...
 ```
 
-- **`LocalHost`** — POSIX: `start_new_session=True`, terminate the process group with SIGINT then SIGTERM then SIGKILL. Windows Job Objects come with Windows-native support, later.
-- **`DockerExecHost`** — `docker exec -i` against a named, already-running container. Container provisioning, teardown, networking, and auth mounts stay owned by the caller (`flywheel-container`); the host only executes plans inside it.
+- **`LocalHost`** — POSIX: `start_new_session=True`; the child env is `os.environ` merged with `plan.environment` minus `plan.denied_environment`; terminates the process group with SIGTERM, then SIGKILL after a grace period. Windows Job Objects come with Windows-native support, later.
+- **`DockerExecHost`** — `docker exec -i` against a named, already-running container; `plan.environment` becomes `-e` flags. Container provisioning, teardown, networking, and auth mounts stay owned by the caller (`flywheel-container`); the host only executes plans inside it. It cannot unset image-baked env (`denied_environment` is a no-op there) — in-container auth hygiene stays with the container lifecycle owner's auth guard. Run-level wall-clock ceilings live on `RunRequest.timeout_seconds`, enforced by the runtime.
 
 Commands are always argv arrays; no shell strings unless the plan explicitly opts in.
 
@@ -508,13 +484,13 @@ All seven independent `ClaudeAgentOptions` construction sites converge: the work
 
 Old paths stay default until in-loop parity is proven; the in-loop verification gate (`docs/loop.md`) applies to every phase that touches the loop.
 
-1. **Foundation.** Models, events, fold, adapter contract, hosts, fake-agent executable, contract test suite. No flywheel wiring, no real adapters.
-2. **claude-code adapter.** Both transports (SDK, CLI stream-json). Parity proven against recorded fixtures from the current `invoker.py` and `_stream.py` folds.
-3. **Core bridge.** Opt-in `[agent]`-selected path behind `InvokeFunc`; rubric judge and summarizer routed through it; existing path remains default until parity is demonstrated in-loop.
-4. **Container rebase.** `DockerExecHost` replaces `ClaudeCliAgent`/`_stream.py`; watchdog and telemetry live in containers.
+1. **Foundation — SHIPPED.** Models, events, fold, adapter contract, hosts, fake-agent executable, contract test suite. No real-agent dependence in CI.
+2. **claude-code adapter — SHIPPED.** Both transports (SDK, CLI stream-json); cross-transport fold parity proven by test (the same logical exchange normalized via both transports folds to agreeing `CompletedRun`s).
+3. **Core bridge — SHIPPED (opt-in).** `[agent] id` / `[agent] transport` route the worker invoke through the runtime; the legacy SDK closure remains the default. Not yet routed: rubric judge, recovery summarizer, conflict-resolution agent, autopilot (each still constructs `ClaudeAgentOptions` directly).
+4. **Container rebase — SHIPPED.** `DockerExecHost` + the claude-code CLI transport replaced `ClaudeCliAgent`/`_stream.py`; the hang watchdog and per-event telemetry are live in containers; exec timeout and nonzero exits fold to structured failures.
 5. **Second agent.** Gemini or Qwen via the shared ACP transport (cheapest abstraction proof) or Codex via JSON-RPC (highest value); capability-gated guard degradation exercised for real.
 
-Later: auth-policy wiring into `init`, option discovery surfaces, additional agents, and a service layer via the interactivity program.
+Later: routing the remaining four invocation sites (phase 3 note), auth-policy wiring into `init`, option discovery surfaces, additional agents, and a service layer via the interactivity program.
 
 ## 17. Testing strategy
 

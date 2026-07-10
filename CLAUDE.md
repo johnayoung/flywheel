@@ -6,12 +6,13 @@ Flywheel is a Python orchestration loop for AI coding agents — it owns the exe
 
 ## Workspace layout (the hard line)
 
-A uv workspace of five packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
+A uv workspace of six packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
 
+- **`flywheel-agents`** (import `flywheel_agents`) — bottom of the stack, below core: the multi-agent execution layer (adapters, normalized events, execution hosts; Claude Code first). Imports nothing from any flywheel package; stdlib-only at runtime, vendor SDKs are optional extras. Consumed by core via the `flywheel-core[agents]` extra. Design doc: `docs/agent-harness.md`.
 - **`flywheel-core`** (import `flywheel_core`) — the lifecycle of a **single task**. Knows nothing about who calls it. No console script; invoke via `python -m flywheel_core.workflow`. This is the only package most contributors touch.
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only; no console script.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
-- **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree). SDK-free, a sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `[sandbox] backend = "container"`.
+- **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree, driven through the `flywheel-agents` claude-code adapter under `DockerExecHost`). SDK-free, a sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `[sandbox] backend = "container"`.
 - **`flywheel`** (import `flywheel`) — top of stack: the unified product shell. Console scripts `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console. Bundles the Claude agent SDK and the container backend.
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.

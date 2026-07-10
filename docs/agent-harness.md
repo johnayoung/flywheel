@@ -1,6 +1,6 @@
 # flywheel-agents — the multi-agent execution layer
 
-**Status: design document.** Target architecture for the `flywheel-agents` package; not yet shipped behavior. Execution is phased through `.flywheel/specs/` (see § 16). Where this doc and shipped code disagree, the code's own spec set (`docs/README.md`) wins until the corresponding phase lands.
+**Status: shipped through phase 5, opt-in.** Architecture and status record for the `flywheel-agents` package: delivery phases 1-5 are on main (see § 16 for per-phase status and the consolidated backlog), activated per-repo via `[agent] id`; the legacy SDK path remains the default. Sections carry explicit **Status** markers wherever the built code deviates from or defers the text; where an unmarked claim and shipped code disagree, the code's own spec set (`docs/README.md`) wins.
 
 ## 1. Objective
 
@@ -15,7 +15,7 @@ flywheel loop (InvokeFunc seam)
 flywheel_agents runtime  ── normalized events + CompletedRun fold
     │
     ├── claude-code adapter ── SDK transport (local) / CLI stream-json (any host)
-    ├── codex adapter ──────── app-server JSON-RPC
+    ├── codex adapter ──────── headless exec JSONL (app-server JSON-RPC later)
     ├── gemini adapter ─────── ACP
     ├── qwen adapter ────────── ACP
     └── other adapters ─────── best available structured interface
@@ -39,7 +39,7 @@ Named `flywheel-agents`, not `flywheel-harness`: "harness" is already the loop h
 4. Preserve every raw native event before normalization.
 5. Report per-adapter capabilities honestly.
 6. Probe installation and authentication status.
-7. Select working directory; construct the child environment per policy.
+7. Select working directory; shape the child environment per policy (extras + denials; constructed-env hardening later, § 13.3).
 8. Drive the same adapter under a local subprocess **or** `docker exec` (execution-host seam, § 7).
 9. Run sessions concurrently; Linux, macOS, WSL2 (Windows-native later).
 10. Prefer the agent's account-plan authentication wherever supported.
@@ -84,23 +84,27 @@ packages/flywheel-agents/
 │   ├── models.py
 │   ├── registry.py            # entry-point plugins: flywheel_agents.adapters
 │   ├── runtime.py             # AgentRuntime.run()
-│   └── claude_code/
-│       ├── adapter.py         # transport routing (cli | sdk)
-│       ├── _cli.py            # stream-json plan + normalizer (any host)
-│       ├── _sdk.py            # claude-agent-sdk transport (local only)
-│       ├── _common.py         # shared usage/stop normalization
-│       ├── _probe.py
-│       └── _faults.py         # session-limit fault classification
-└── tests/                     # unit + contract suite + fake_agent.py
+│   ├── claude_code/
+│   │   ├── adapter.py         # transport routing (cli | sdk)
+│   │   ├── _cli.py            # stream-json plan + normalizer (any host)
+│   │   ├── _sdk.py            # claude-agent-sdk transport (local only)
+│   │   ├── _common.py         # shared usage/stop normalization
+│   │   ├── _probe.py
+│   │   └── _faults.py         # session-limit fault classification
+│   └── codex/
+│       ├── adapter.py         # cli transport only (JSON-RPC later)
+│       ├── _cli.py            # codex exec --json plan + normalizer
+│       └── _probe.py
+└── tests/                     # unit + contract suites + fake_agent.py / fake_codex.py
 ```
 
 ACP / JSON-RPC transport modules, the auth-policy subsystem, and the MCP
-canonical schema arrive with their phases (section 16), as do additional
-adapters (`codex/`, `gemini/`, `qwen/`, ...).
+canonical schema arrive with their backlog items (section 16), as do
+additional adapters (`gemini/`, `qwen/`, ...).
 
 ## 5. Domain model
 
-Python 3.13. Frozen dataclasses with `slots=True`, pyright strict — matching flywheel-core idiom. No Pydantic: the package sits at the bottom of the dependency graph and must not introduce a second modeling stack.
+Python 3.13. Frozen dataclasses with `slots=True`, pyright-clean under the workspace gate — matching flywheel-core idiom. No Pydantic: the package sits at the bottom of the dependency graph and must not introduce a second modeling stack.
 
 ### 5.1 Agent identity
 
@@ -113,6 +117,7 @@ class AgentDescriptor:
     vendor: str | None = None
     executable_names: tuple[str, ...] = ()
     capabilities: AgentCapabilities = AgentCapabilities()
+    compatibility: AdapterCompatibility = AdapterCompatibility()
 ```
 
 Agent ids are open strings, never a closed enum — third-party adapters register via entry points (§ 14).
@@ -236,7 +241,7 @@ class RunningAgent(ABC):
     async def wait(self) -> AgentExit: ...
 ```
 
-Mid-turn control (`interrupt`, `set_model`, `inject_prompt`) is exposed through optional mixin methods gated by the corresponding capability; calling one on an adapter without the capability raises `UnsupportedCapabilityError`.
+Mid-turn control (`interrupt`, `set_model`, `inject_prompt`) is designed as optional capability-gated methods raising `UnsupportedCapabilityError` when undeclared. **Status: not built** — no shipped adapter declares the mid-turn capabilities, so the surface does not exist yet (backlog, with the default flip).
 
 ### 6.2 The fold: `CompletedRun`
 
@@ -260,6 +265,7 @@ class CompletedRun:
     fault: AgentFault | None
     failure: RunFailure | None            # transport/process failure, not agent output
     exit: AgentExit
+    event_count: int
 ```
 
 ```python
@@ -376,8 +382,8 @@ Raw events are delivered to the sink before normalization; raw and normalized ev
 Transports solve protocol mechanics and contain no product behavior. They consume `RunningProcess` streams from a host rather than owning spawns (SDK transports excepted).
 
 - **JSONL (shipped, inline)** — NDJSON line handling lives in the claude-code CLI normalizer (`claude_code/_cli.py`): tolerates interleaved non-JSON lines and malformed/deeply-nested JSON (preserved as RAW, never dropped). It gets extracted into a standalone `JsonLinesTransport` class when a second stream-JSON agent (e.g. Amp) needs it — one consumer does not justify the layer.
-- **`JsonRpcTransport` (phase 5, not built)** — request ids, notifications, dispatch, timeouts, cancellation. Codex app server.
-- **`AcpTransport` (phase 5, not built)** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it; per-agent subclasses supply command, flags, config paths, and login probes only.
+- **`JsonRpcTransport` (backlog, not built)** — request ids, notifications, dispatch, timeouts, cancellation. The codex app server (the shipped codex adapter uses headless exec JSONL instead).
+- **`AcpTransport` (backlog, not built)** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it; per-agent subclasses supply command, flags, config paths, and login probes only.
 
 ## 12. Approvals (narrowed)
 
@@ -389,7 +395,7 @@ ApprovalResolver = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 
 Defaults: timeout, disconnect, and shutdown all resolve to **deny**. flywheel supplies an auto-resolver consistent with its permission policy (under `AUTO`, adapters launch in the agent's native bypass mode, so approval traffic is not expected). No approval queue, UI, or persistence.
 
-**Status:** the event types are reserved in `EventType`; the `ApprovalResolver` callback is not built. It arrives with the first transport that actually surfaces approvals (ACP's `request_permission`, phase 5) — under today's AUTO-only flywheel usage there is nothing to resolve.
+**Status:** the event types are reserved in `EventType`; the `ApprovalResolver` callback is not built. It arrives with the first transport that actually surfaces approvals (ACP's `request_permission`, backlog) — under today's AUTO-only flywheel usage there is nothing to resolve.
 
 ## 13. Authentication, environment, and MCP
 
@@ -408,7 +414,7 @@ class AgentProbeResult:
     warnings: tuple[str, ...]
 ```
 
-Never claim subscription billing is guaranteed when it cannot be verified. `flywheel init`'s auth report (`_report_agent_auth`) becomes a `probe()` call.
+Never claim subscription billing is guaranteed when it cannot be verified. `flywheel init`'s auth report (`_report_agent_auth`) becoming a `probe()` call is future work (§ 16 Later). Shipped probes: claude-code and codex, both validated against live binaries.
 
 ### 13.2 Auth material propagation
 
@@ -435,7 +441,7 @@ Target: child environments constructed, not inherited — base safe set (`HOME`,
 
 One canonical `McpServerConfig` (name, command, args, environment, url, transport) that adapters translate into their native launch configuration (`mcpServers`, `mcp_servers`, ...). Config-**file** writing is out of scope for v1; flywheel's committed repo `.mcp.json` remains the operative mechanism.
 
-**Status: not built** (arrives with the second agent, where translation becomes real). Today `mcp_servers`/`mcp_strict` pass through claude-code `adapter_options` onto the SDK transport verbatim.
+**Status: not built** (backlog; the second agent shipped without needing it — codex MCP config stays in `~/.codex/config.toml`, untouched by the adapter). Today `mcp_servers`/`mcp_strict` pass through claude-code `adapter_options` onto the SDK transport verbatim.
 
 ## 14. Errors, registry, versioning
 
@@ -445,7 +451,7 @@ One canonical `McpServerConfig` (name, command, args, environment, url, transpor
 
 ## 15. Flywheel integration
 
-The retrofit surface. The seam already exists: `InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]` (`flywheel_core.harness`), with two production implementations today — the SDK closure (`workflow._make_claude_code_invoke`) and the container stream path (`flywheel_container`). Both are replaced by one bridge.
+The retrofit surface. The seam is `InvokeFunc = Callable[[InvocationRequest], Awaitable[IterationResult]]` (`flywheel_core.harness`). Before this program it had two production implementations — the SDK closure (`workflow._make_claude_code_invoke`, still the default) and the container stream path (deleted, § 15.4); the agents bridge is the single converged implementation behind the opt-in.
 
 ### 15.1 The bridge
 
@@ -470,7 +476,7 @@ A `flywheel_core` module (the successor to `_sdk.py` as the optional-dependency 
 
 ### 15.2 Invocation sites routed through the runtime
 
-All seven independent `ClaudeAgentOptions` construction sites converge — the worker invoker (`workflow.py`), the rubric judge (`grader_rubric.py`), the recovery summarizer (`recovery_summarizer.py`), the merge-conflict recovery agent (`worker.py`), and autopilot's invokers (`_autopilot.py`). **Status: shipped, opt-in.** When `[agent] id` is set, every site routes through the runtime (`make_agents_invoke`, `make_agents_judge_invoke`, `make_agents_summarizer_invoke`, the worker's agents-backed `ConflictResolver`, autopilot's runtime-backed invokers); unset keeps each site's legacy SDK default byte-identical. Autopilot's subagent-bearing session has no cross-agent equivalent and routes through the runtime (SDK transport, `agents` adapter option) only for `agent_id = "claude-code"` — any other agent id keeps that one stage on the legacy Claude path, by design.
+Every independent `ClaudeAgentOptions` construction site converges — the worker invoker (`workflow.py`), the rubric judge (`grader_rubric.py`), the recovery summarizer (`recovery_summarizer.py`), the merge-conflict recovery agent (`worker.py`), autopilot's invokers (`_autopilot.py`: repo invoker and the subagent session), plus the container backend's former CLI command builder (§ 15.4). **Status: shipped, opt-in.** When `[agent] id` is set, every site routes through the runtime (`make_agents_invoke`, `make_agents_judge_invoke`, `make_agents_summarizer_invoke`, the worker's agents-backed `ConflictResolver`, autopilot's runtime-backed invokers); unset keeps each site's legacy SDK default byte-identical. Autopilot's subagent-bearing session has no cross-agent equivalent and routes through the runtime (SDK transport, `agents` adapter option) only for `agent_id = "claude-code"` — any other agent id keeps that one stage on the legacy Claude path, by design.
 
 ### 15.3 Config surface
 
@@ -510,9 +516,9 @@ Later (consolidated backlog, each item cross-referenced where it is specified): 
 
 ## 18. Acceptance criteria
 
-An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` or `"gemini-cli"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance. (Evaluable once a second adapter exists — phase 5.)
+An application (flywheel's loop) changes `agent_id` from `"claude-code"` to `"codex"` without changing orchestration logic. Differences appear only through capabilities, option discovery, event availability, and authentication assurance. **Holds:** proven by the branch-free agent-swap test (`tests/test_agent_swap.py`) and by live worker-stack dogfood runs of both agents landing verified tasks (2026-07-10).
 
-Flywheel-specific (all four hold as of phases 1-4):
+Flywheel-specific (all four hold as of phases 1-5):
 
 1. `import flywheel_core` works with no agent extras installed (`agents_invoke` imports `flywheel_agents` lazily, mirroring `_sdk`).
 2. The container backend runs through the same claude-code adapter as the worktree backend, with a live hang watchdog; `flywheel_container._stream` and `ClaudeCliAgent` are deleted.

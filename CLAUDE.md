@@ -8,7 +8,7 @@ Flywheel is a Python orchestration loop for AI coding agents — it owns the exe
 
 A uv workspace of six packages under `packages/`. Every dist name matches its import name (dashes to underscores) — `packages/<dist>/src/<import>`. The dependency arrow points one way only — core imports nothing downstream:
 
-- **`flywheel-agents`** (import `flywheel_agents`) — bottom of the stack, below core: the multi-agent execution layer (adapters, normalized events, execution hosts; Claude Code first). Imports nothing from any flywheel package; stdlib-only at runtime, vendor SDKs are optional extras. Consumed by core via the `flywheel-core[agents]` extra. Design doc: `docs/agent-harness.md`.
+- **`flywheel-agents`** (import `flywheel_agents`) — bottom of the stack, below core: the multi-agent execution layer (adapters, normalized events, execution hosts; Claude Code and Codex adapters shipped). Imports nothing from any flywheel package; stdlib-only at runtime, vendor SDKs are optional extras. Consumed by core via the `flywheel-core[agents]` extra. Design doc: `docs/agent-harness.md`.
 - **`flywheel-core`** (import `flywheel_core`) — the lifecycle of a **single task**. Knows nothing about who calls it. No console script; invoke via `python -m flywheel_core.workflow`. This is the only package most contributors touch.
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only; no console script.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.

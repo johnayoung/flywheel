@@ -197,6 +197,28 @@ def test_environment_passthrough() -> None:
     assert build_sdk_options(_request()).env == {}
 
 
+def test_agents_subagent_definitions_passthrough() -> None:
+    # The subagent escape hatch (docs/agent-harness.md section 15.2): SDK
+    # AgentDefinition values under adapter_options["agents"] land verbatim on
+    # ClaudeAgentOptions.agents -- no coercion, the exact objects.
+    from claude_agent_sdk import AgentDefinition
+
+    tier = AgentDefinition(
+        description="Autopilot relevance triage for tier 1.",
+        prompt="You are the tier-1 relevance agent.",
+        tools=["Read", "Grep", "Glob"],
+        maxTurns=8,
+        permissionMode="bypassPermissions",
+    )
+    options = build_sdk_options(
+        _request(adapter_options={"agents": {"tier-1": tier}})
+    )
+    assert options.agents == {"tier-1": tier}
+    assert options.agents is not None
+    assert options.agents["tier-1"] is tier
+    assert build_sdk_options(_request()).agents is None
+
+
 def test_account_only_raises_when_api_key_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

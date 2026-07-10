@@ -120,6 +120,12 @@ def build_sdk_options(request: RunRequest) -> ClaudeAgentOptions:
     sandbox_exec = cfg.adapter_options.get("sandbox_exec")
     if isinstance(sandbox_exec, Mapping) and sandbox_exec:
         kwargs["sandbox"] = dict(sandbox_exec)
+    # SDK subagent definitions (``ClaudeAgentOptions.agents``): SDK vocabulary
+    # with no cross-agent equivalent, passed through verbatim (the caller
+    # builds real ``claude_agent_sdk.AgentDefinition`` values keyed by name).
+    agents = cfg.adapter_options.get("agents")
+    if agents:
+        kwargs["agents"] = agents
     if cfg.environment:
         kwargs["env"] = dict(cfg.environment)
     return ClaudeAgentOptions(**kwargs)

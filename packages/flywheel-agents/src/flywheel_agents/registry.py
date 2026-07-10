@@ -58,8 +58,10 @@ class AdapterRegistry:
 def default_registry() -> AdapterRegistry:
     """First-party adapters plus any installed plugins."""
     from flywheel_agents.claude_code import ClaudeCodeAdapter
+    from flywheel_agents.codex import CodexAdapter
 
     registry = AdapterRegistry()
     registry.register(ClaudeCodeAdapter())
+    registry.register(CodexAdapter())
     registry.discover_plugins()
     return registry

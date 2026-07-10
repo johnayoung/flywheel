@@ -18,11 +18,9 @@ from pathlib import Path
 import pytest
 
 from flywheel_container import (
-    ClaudeCliAgent,
     ContainerRuntime,
     ContainerSubmitStrategy,
     DEFAULT_INTERNAL_NETWORK,
-    ExecResult,
     ResolvedNetwork,
     resolve_network,
 )
@@ -74,9 +72,6 @@ class _Recorder:
     def runtime(self) -> ContainerRuntime:
         return ContainerRuntime(
             start=self.start,
-            exec_command=lambda *a, **k: ExecResult(
-                stdout="", stderr="", exit_code=0
-            ),  # unused here
             remove=lambda name: None,
             register_cleanup=lambda name: (lambda: None),
             ensure_internal_network=self.internal_created.append,
@@ -95,7 +90,7 @@ def _make(rec: _Recorder, **kwargs) -> ContainerSubmitStrategy:
     return ContainerSubmitStrategy(
         _Inner(),
         image="img",
-        agent=ClaudeCliAgent(model="m"),
+        model="m",
         container_uid=1000,
         container_gid=1000,
         preflight=False,

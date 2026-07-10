@@ -51,7 +51,7 @@ import os
 import sys
 from pathlib import Path
 
-from flywheel_container import ClaudeAuth, ClaudeCliAgent, ContainerSubmitStrategy
+from flywheel_container import ClaudeAuth, ContainerSubmitStrategy
 from flywheel_orchestrator import SandboxRequest, SubmitRequest, orchestrate
 
 IMAGE = os.environ.get("FW_IMAGE", "flywheel-agent:latest")
@@ -112,10 +112,9 @@ def main() -> int:
     strategy = ContainerSubmitStrategy(
         PlainInner(BASE / "work"),
         image=IMAGE,
-        agent=ClaudeCliAgent(model=MODEL),
+        model=MODEL,
         auth=_auth(),
-        exec_timeout=600,  # bound the in-container agent (host hang-watchdog
-        # cannot see container liveness; this is the bound)
+        exec_timeout=600,  # hard wall-clock ceiling for the in-container run
     )
     report = asyncio.run(
         orchestrate(

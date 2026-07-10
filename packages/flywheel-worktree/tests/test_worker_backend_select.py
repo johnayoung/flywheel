@@ -70,7 +70,7 @@ def test_container_backend_wraps_with_resolved_config(tmp_path: Path) -> None:
         submitter, pol, model="ignored", env={}, log=_log  # type: ignore[arg-type]
     )
     assert isinstance(out, ContainerSubmitStrategy)
-    assert out._agent.model == "claude-sonnet-4-6"  # type: ignore[attr-defined]
+    assert out._model == "claude-sonnet-4-6"  # type: ignore[attr-defined]
 
 
 def test_container_falls_back_to_worker_model(tmp_path: Path) -> None:
@@ -88,7 +88,7 @@ def test_container_falls_back_to_worker_model(tmp_path: Path) -> None:
         _FakeSubmitter(), pol, model="claude-from-worker", env={},  # type: ignore[arg-type]
         log=_log,
     )
-    assert out._agent.model == "claude-from-worker"  # type: ignore[attr-defined]
+    assert out._model == "claude-from-worker"  # type: ignore[attr-defined]
 
 
 def test_container_without_any_model_raises(tmp_path: Path) -> None:

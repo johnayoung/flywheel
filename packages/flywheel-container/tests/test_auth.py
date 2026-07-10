@@ -17,11 +17,9 @@ import pytest
 from flywheel_container import (
     API_KEY_ENV,
     ClaudeAuth,
-    ClaudeCliAgent,
     ContainerRuntime,
     ContainerSubmitStrategy,
     DEFAULT_AGENT_HOME,
-    ExecResult,
     OAUTH_TOKEN_ENV,
 )
 from flywheel_orchestrator import SandboxRequest
@@ -91,9 +89,6 @@ class _Recorder:
     def runtime(self) -> ContainerRuntime:
         return ContainerRuntime(
             start=self.start,
-            exec_command=lambda *a, **k: ExecResult(
-                stdout="", stderr="", exit_code=0
-            ),
             remove=lambda name: None,
             register_cleanup=lambda name: (lambda: None),
             ensure_internal_network=lambda name: None,
@@ -117,7 +112,7 @@ def test_strategy_oauth_auth_reaches_container_start_env() -> None:
     ContainerSubmitStrategy(
         _Inner(),
         image="img",
-        agent=ClaudeCliAgent(model="m"),
+        model="m",
         auth=ClaudeAuth.oauth_token("tok-xyz"),
         container_uid=1000,
         container_gid=1000,
@@ -133,7 +128,7 @@ def test_strategy_session_auth_adds_credentials_mount() -> None:
     ContainerSubmitStrategy(
         _Inner(),
         image="img",
-        agent=ClaudeCliAgent(model="m"),
+        model="m",
         auth=ClaudeAuth.session(),
         container_uid=1000,
         container_gid=1000,
@@ -152,7 +147,7 @@ def test_strategy_rejects_subscription_auth_with_api_key_env() -> None:
         ContainerSubmitStrategy(
             _Inner(),
             image="img",
-            agent=ClaudeCliAgent(model="m"),
+            model="m",
             env={API_KEY_ENV: "sk-ant-x"},
             auth=ClaudeAuth.oauth_token("tok"),
             preflight=False,

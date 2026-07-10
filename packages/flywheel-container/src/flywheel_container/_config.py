@@ -13,7 +13,7 @@ from flywheel_orchestrator import SubmitStrategy
 
 from flywheel_container._auth import API_KEY_ENV, OAUTH_TOKEN_ENV, ClaudeAuth
 from flywheel_container._docker import DEFAULT_MANAGEMENT_TIMEOUT
-from flywheel_container._submit import ClaudeCliAgent, ContainerSubmitStrategy
+from flywheel_container._submit import ContainerSubmitStrategy
 
 _DEFAULT_TOKEN_ENV: dict[str, str] = {
     "oauth": OAUTH_TOKEN_ENV,
@@ -79,7 +79,7 @@ def build_container_strategy(
     return ContainerSubmitStrategy(
         inner,
         image=image,
-        agent=ClaudeCliAgent(model=model),
+        model=model,
         auth=auth,
         env=env,
         network_policy=network_policy,

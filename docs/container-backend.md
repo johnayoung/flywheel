@@ -4,7 +4,7 @@ With `[sandbox] backend = "container"`, the agent's own CLI runs **inside a Dock
 
 Status: SHIPPED and live-verified (spec 00044 increment G, config switch 00045). See [sandbox.md](sandbox.md) for the full `[sandbox.*]` model and [strategy.md](strategy.md) for the `SandboxHandle` seam this backend hangs on.
 
-**The `flywheel-container` package is SDK-free.** Importing `flywheel_container` never needs `claude-agent-sdk` — the agent runs as its own CLI in the image; the package only shells out to `docker` (`flywheel_container/__init__.py`). The host worker lazy-imports it only when `backend="container"` (`flywheel_worktree.worker.maybe_wrap_for_backend`, `worker.py:2166`); a missing package raises a clear install hint.
+**The `flywheel-container` package is SDK-free.** Importing `flywheel_container` never needs `claude-agent-sdk` — the agent runs as its own CLI in the image; the package only shells out to `docker` (`flywheel_container/__init__.py`). The invocation itself rides the flywheel-agents claude-code CLI transport: the agent command is executed as direct argv via `docker exec` (`flywheel_agents.DockerExecHost`, no `sh -c`), including the same `--settings '{"includeCoAuthoredBy": false}'` layer the host SDK path injects, and its stream-json stdout is normalized into events and folded into the `IterationResult` by `flywheel_core.agents_invoke.make_agents_invoke` ([agent-harness.md](agent-harness.md) section 15.4). The host worker lazy-imports it only when `backend="container"` (`flywheel_worktree.worker.maybe_wrap_for_backend`, `worker.py:2166`); a missing package raises a clear install hint.
 
 `ContainerSubmitStrategy` (`_submit.py:95`) does not replace landing — it **composes an inner landing strategy** (the git-worktree merge/PR submitter). The inner strategy provisions and lands the worktree host-side; this layer starts the container, runs the agent CLI in it, and tears the container down.
 
@@ -88,20 +88,20 @@ policy = "deny"
 
 ## exec_timeout watchdog
 
-`[sandbox.container] exec_timeout` (default `1800` seconds) bounds the **whole `docker exec`** via a kill-timer (`_docker.py`, `exec_in_container`). A child holding stdout open and silent would otherwise block the read loop forever; the `threading.Timer` kills the process on expiry and raises `DockerError`. `0` means unbounded (not recommended). `build_container_strategy` maps `0` to `None` (`_config.py:81`).
+`[sandbox.container] exec_timeout` (default `1800` seconds) is the hard wall-clock ceiling for the **whole in-container run**: it becomes the flywheel-agents run ceiling (`RunRequest.timeout_seconds`), so on expiry the runtime kills the `docker exec` client and the run surfaces as a structured `IterationResult.failure` with `error_type = "timeout"` (no exception; a nonzero agent exit surfaces as `error_type = "agent_exit"`). `0` means unbounded (not recommended). `build_container_strategy` maps `0` to `None` (`_config.py`).
+
+The harness hang-watchdog is also live on this path: every stream-json line the agent emits is normalized into events forwarded to `InvocationRequest.on_message`, so `hang_timeout_seconds` sees container liveness and can be used alongside `exec_timeout`.
 
 ```toml
 [sandbox.container]
 exec_timeout = 1800   # seconds; 0 = unbounded (not recommended)
 ```
 
-## v1 limitations operators must know
+## Limitations operators must know
 
-1. **The harness hang-watchdog cannot see container liveness.** The watchdog reads its heartbeat from SDK `Message` objects via `InvocationRequest.on_message`; a message-less container invoker cannot call it. `hang_timeout_seconds` would false-trip a healthy long run, and unset it bounds nothing. **Use `exec_timeout` instead of `hang_timeout_seconds`** — the kill-timer bounds the whole exec even when the agent holds stdout open silently.
+1. **Policy-declared `[sandbox.env]` does not reach the in-container agent.** `[sandbox.env]` (`passthrough`/`set_values`) is threaded into the **host** SDK options, which the container path bypasses entirely (the agent runs in the container CLI). Only operator-set `ContainerSubmitStrategy(env=...)` reaches the container. Closing this is a follow-on, not shipped.
 
-2. **Policy-declared `[sandbox.env]` does not reach the in-container agent.** `[sandbox.env]` (`passthrough`/`set_values`) is threaded into the **host** SDK options, which the container path bypasses entirely (the agent runs in the container CLI). Only operator-set `ContainerSubmitStrategy(env=...)` reaches the container. Closing this is a follow-on, not shipped.
-
-3. **Setup and command graders run host-side.** The agent runs in the container, but `[sandbox] setup` and command graders run in-process against the **bind-mounted worktree on the host**. Running them inside the container is the known "grade-outside-container" gap, out of scope for v1.
+2. **Setup and command graders run host-side.** The agent runs in the container, but `[sandbox] setup` and command graders run in-process against the **bind-mounted worktree on the host**. Running them inside the container is the known "grade-outside-container" gap, out of scope for v1.
 
 ## Config reference
 

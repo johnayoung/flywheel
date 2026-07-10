@@ -31,7 +31,6 @@ from flywheel_core.deadline_config import DEFAULT_DOCKER_MANAGEMENT_SECONDS
 
 from flywheel_container import (
     DEFAULT_MANAGEMENT_TIMEOUT,
-    ClaudeCliAgent,
     ContainerSubmitStrategy,
     DockerTimeoutError,
     build_container_strategy,
@@ -81,7 +80,7 @@ def _strategy(
     return ContainerSubmitStrategy(
         _FakeInner(tmp_path),
         image="img",
-        agent=ClaudeCliAgent(model="m"),
+        model="m",
         container_uid=1000,
         container_gid=1000,
         network_policy=network_policy,

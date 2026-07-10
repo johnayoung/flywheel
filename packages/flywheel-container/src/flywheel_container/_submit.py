@@ -1,33 +1,38 @@
-"""The container submit strategy (spec 00044 G5).
+"""The container submit strategy (spec 00044 G5, rebased on flywheel-agents).
 
-Assembles the G3 lifecycle primitives and the G4 stream adapter onto the
-``SandboxHandle`` seam. ``ContainerSubmitStrategy`` *composes* an inner landing
-strategy (e.g. the git-worktree merge submitter) rather than depending on it:
-the inner strategy provisions the worktree and lands the result host-side
-(unchanged — the worktree is bind-mounted, so the agent's edits are already on
-the host), while this layer starts the container, runs the agent CLI inside it,
-and tears the container down.
+Assembles the G3 lifecycle primitives onto the ``SandboxHandle`` seam.
+``ContainerSubmitStrategy`` *composes* an inner landing strategy (e.g. the
+git-worktree merge submitter) rather than depending on it: the inner strategy
+provisions the worktree and lands the result host-side (unchanged — the
+worktree is bind-mounted, so the agent's edits are already on the host), while
+this layer starts the container, runs the agent CLI inside it, and tears the
+container down.
 
-SDK-free: the agent runs as its own CLI inside the image; this module imports
-only plain ``flywheel_core`` types and the orchestrator seam.
+The agent invocation rides the flywheel-agents claude-code CLI transport
+(``docs/agent-harness.md`` section 15.4): the per-run invoke is built by
+:func:`flywheel_core.agents_invoke.make_agents_invoke` over a
+:class:`flywheel_agents.DockerExecHost`, replacing the historical local
+stream-json fold. Every normalized event reaches
+``InvocationRequest.on_message``, so the harness hang watchdog and per-message
+telemetry are live on this path.
+
+SDK-free: the agent runs as its own CLI inside the image; this module never
+imports ``claude_agent_sdk`` (the flywheel-agents CLI transport shells out to
+the vendor executable).
 """
 
 from __future__ import annotations
 
-import asyncio
 import functools
 import os
-import shlex
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
-from flywheel_core import (
-    InvocationFailure,
-    InvocationRequest,
-    InvokeFunc,
-    IterationResult,
-)
+from flywheel_agents import DockerExecHost
+from flywheel_core import InvokeFunc
+from flywheel_core.agents_invoke import make_agents_invoke
 from flywheel_orchestrator import (
     SandboxHandle,
     SandboxRequest,
@@ -45,39 +50,6 @@ from flywheel_container._docker import (
     VolumeMount,
 )
 from flywheel_container._network import DEFAULT_INTERNAL_NETWORK, resolve_network
-from flywheel_container._stream import iteration_result_from_stream, parse_stream_json
-
-
-@dataclass(frozen=True)
-class ClaudeCliAgent:
-    """Builds the in-container Claude CLI invocation for one iteration.
-
-    ``--print --output-format stream-json`` drives the headless JSONL stream the
-    G4 adapter parses; the prompt is delivered on stdin (``-p -``) to dodge the
-    Linux per-arg ``ARG_MAX`` limit. The model is deployment config — the host
-    SDK invoker is bypassed entirely, so it cannot be inferred from there.
-
-    ``dangerously_skip_permissions`` defaults ``True`` (mirroring the SDK path's
-    ``permission_mode="bypassPermissions"``): a headless ``--print`` run has no
-    TTY to approve tool use, so without it the CLI blocks forever the first time
-    the agent writes a file or runs a command.
-    """
-
-    model: str
-    dangerously_skip_permissions: bool = True
-    extra_flags: tuple[str, ...] = ()
-
-    def build_command(self, prompt: str) -> tuple[str, str]:
-        parts: list[str] = []
-        if self.dangerously_skip_permissions:
-            parts.append("--dangerously-skip-permissions")
-        parts.extend(self.extra_flags)
-        flags = "".join(f" {flag}" for flag in parts)
-        command = (
-            "claude --print --verbose --output-format stream-json "
-            f"--model {shlex.quote(self.model)}{flags} -p -"
-        )
-        return command, prompt
 
 
 @dataclass(frozen=True)
@@ -107,7 +79,8 @@ class ContainerSubmitStrategy:
         inner: SubmitStrategy,
         *,
         image: str,
-        agent: ClaudeCliAgent,
+        model: str,
+        dangerously_skip_permissions: bool = True,
         container_uid: int | None = None,
         container_gid: int | None = None,
         network: str | Sequence[str] | None = None,
@@ -124,10 +97,22 @@ class ContainerSubmitStrategy:
         management_timeout: float | None = DEFAULT_MANAGEMENT_TIMEOUT,
         preflight: bool = True,
         runtime: ContainerRuntime | None = None,
+        invoke_factory: Callable[[str], InvokeFunc] | None = None,
     ) -> None:
         self._inner = inner
         self._image = image
-        self._agent = agent
+        # The model is deployment config — the host SDK invoker is bypassed
+        # entirely, so it cannot be inferred from there.
+        # ``dangerously_skip_permissions`` defaults True (mirroring the SDK
+        # path's ``permission_mode="bypassPermissions"``): a headless --print
+        # run has no TTY to approve tool use, so without it the CLI blocks
+        # forever the first time the agent writes a file or runs a command.
+        self._model = model
+        self._dangerously_skip_permissions = dangerously_skip_permissions
+        # Injectable per-run invoke builder (container name -> InvokeFunc), so
+        # tests can swap the docker hop for a LocalHost while exercising the
+        # real flywheel-agents bridge. Defaults to the DockerExecHost builder.
+        self._invoke_factory = invoke_factory
         self._uid = container_uid if container_uid is not None else os.getuid()
         self._gid = container_gid if container_gid is not None else os.getgid()
         self._network = network
@@ -240,41 +225,41 @@ class ContainerSubmitStrategy:
         # already on it. Delegate the merge/park unchanged.
         self._inner.submit(request)
 
+    def _default_invoke_factory(self, container_name: str) -> InvokeFunc:
+        """The per-run invoke: the claude-code CLI transport executed inside
+        the container via ``DockerExecHost``.
+
+        ``docker exec`` runs the agent as direct argv (no ``sh -c``) with the
+        prompt piped on stdin, in the same in-container workdir the exec always
+        targeted. ``exec_timeout`` becomes the runtime's wall-clock ceiling: a
+        run that exceeds it folds into a structured failure with
+        ``error_type="timeout"``; a nonzero agent exit folds into
+        ``error_type="agent_exit"``.
+        """
+        return make_agents_invoke(
+            agent_id="claude-code",
+            working_directory=Path(self._workdir),
+            model=self._model,
+            permission_policy=(
+                "auto" if self._dangerously_skip_permissions else "supervised"
+            ),
+            timeout_seconds=self._exec_timeout,
+            host=DockerExecHost(container_name=container_name),
+        )
+
     def _make_invoke_wrapper(
         self, container_name: str
     ) -> Callable[[InvokeFunc | None], InvokeFunc]:
-        agent = self._agent
-        runtime = self._runtime
-        workdir = self._workdir
-        exec_timeout = self._exec_timeout
+        invoke_factory = (
+            self._invoke_factory
+            if self._invoke_factory is not None
+            else self._default_invoke_factory
+        )
 
         def wrapper(_base_invoke: InvokeFunc | None) -> InvokeFunc:
             # The host SDK invoker is replaced wholesale: the agent runs in the
             # container, not the worker process. The base invoke (``None`` in
             # normal operation) is intentionally ignored.
-            async def _invoke(request: InvocationRequest) -> IterationResult:
-                command, stdin = agent.build_command(request.prompt)
-                lines: list[str] = []
-                result = await asyncio.to_thread(
-                    runtime.exec_command,
-                    container_name,
-                    command,
-                    stdin=stdin,
-                    on_line=lines.append,
-                    cwd=workdir,
-                    timeout=exec_timeout,
-                )
-                outcome = parse_stream_json(lines)
-                failure = None
-                if result.exit_code != 0:
-                    failure = InvocationFailure(
-                        error_type="container_exec_error",
-                        message=f"agent CLI exited {result.exit_code} in container",
-                        exit_code=result.exit_code,
-                        stderr=result.stderr,
-                    )
-                return iteration_result_from_stream(outcome, failure=failure)
-
-            return _invoke
+            return invoke_factory(container_name)
 
         return wrapper

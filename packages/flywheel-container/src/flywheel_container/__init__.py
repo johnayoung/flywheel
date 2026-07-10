@@ -2,12 +2,14 @@
 
 Runs the task agent inside a Docker container against a bind-mounted worktree
 (spec 00044). SDK-free: the agent runs as its own CLI inside the image, so this
-package shells out to ``docker`` and never imports ``claude_agent_sdk``.
+package shells out to ``docker`` and never imports ``claude_agent_sdk``. The
+invocation itself rides the flywheel-agents claude-code CLI transport under
+``DockerExecHost`` (``docs/agent-harness.md`` section 15.4).
 
 Public surface: the Docker lifecycle primitives, the ``ClaudeAuth`` auth-mode
 passthrough, ``ContainerSubmitStrategy`` (which composes an inner landing
-strategy), the ``[sandbox.network]`` policy resolver, and the stream-json ->
-``IterationResult`` adapter. Activated via ``[sandbox] backend = "container"``.
+strategy), and the ``[sandbox.network]`` policy resolver. Activated via
+``[sandbox] backend = "container"``.
 """
 
 from __future__ import annotations
@@ -50,13 +52,7 @@ from flywheel_container._network import (
     ResolvedNetwork,
     resolve_network,
 )
-from flywheel_container._stream import (
-    StreamOutcome,
-    iteration_result_from_stream,
-    parse_stream_json,
-)
 from flywheel_container._submit import (
-    ClaudeCliAgent,
     ContainerRuntime,
     ContainerSubmitStrategy,
 )
@@ -64,7 +60,6 @@ from flywheel_container._submit import (
 __all__ = [
     "API_KEY_ENV",
     "ClaudeAuth",
-    "ClaudeCliAgent",
     "ContainerRuntime",
     "ContainerSubmitStrategy",
     "DEFAULT_AGENT_HOME",
@@ -80,7 +75,6 @@ __all__ = [
     "OWNER_LABEL_SELECTOR",
     "OWNER_LABEL_VALUE",
     "ResolvedNetwork",
-    "StreamOutcome",
     "VolumeMount",
     "active_container_names",
     "build_container_strategy",
@@ -91,10 +85,8 @@ __all__ = [
     "exec_in_container",
     "force_remove_container_sync",
     "image_exists",
-    "iteration_result_from_stream",
     "list_owned_containers",
     "network_exists",
-    "parse_stream_json",
     "reap_orphan_containers",
     "register_container_cleanup",
     "remove_container",

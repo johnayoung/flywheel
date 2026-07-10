@@ -12,9 +12,11 @@ authors = [
 # SDK-free by design (00036 / spec 00044): the agent runs as its CLI inside the
 # container image, so this package shells out to `docker` and never imports
 # claude-agent-sdk. It is a sibling consumer of the orchestrator, like
-# flywheel-worktree.
+# flywheel-worktree. The agent invocation rides the flywheel-agents claude-code
+# CLI transport under DockerExecHost (docs/agent-harness.md section 15.4).
 dependencies = [
     "flywheel-orchestrator>=0.1.0",
+    "flywheel-agents>=0.1.0",
 ]
 
 [build-system]

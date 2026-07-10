@@ -39,6 +39,7 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 
 ## Design rationale
 
+- [agent-harness.md](agent-harness.md) — target architecture for the `flywheel-agents` multi-agent execution layer. Design document, not yet shipped behavior.
 - [research/](research/) — cited design rationale for the `fw-*` authoring skills and the adoption-readiness audits. Not part of the normative spec set.
 
 ---

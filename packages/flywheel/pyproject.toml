@@ -10,8 +10,9 @@ authors = [
 ]
 dependencies = [
     # The product shell drives real agents, so it pins the claude extra:
-    # installing `flywheel` yields a working out-of-box agent loop.
-    "flywheel-core[claude]>=0.1.0",
+    # installing `flywheel` yields a working out-of-box agent loop. The
+    # agents extra makes the [agent] id multi-agent opt-in work turnkey.
+    "flywheel-core[claude,agents]>=0.1.0",
     "flywheel-orchestrator>=0.1.0",
     "flywheel-worktree>=0.1.0",
     # The container backend ([sandbox] backend = "container") ships turnkey in

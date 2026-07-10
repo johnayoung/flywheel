@@ -442,6 +442,16 @@ def _compose_message_observers(
 #: overrides the user/project ``includeCoAuthoredBy`` default.
 _NO_COAUTHOR_SETTINGS = json.dumps({"includeCoAuthoredBy": False})
 
+#: Claude permission-mode vocabulary -> the generic PermissionPolicy value
+#: the flywheel-agents runtime takes (docs/agent-harness.md section 15.3).
+#: Unknown modes fall back to "supervised" (never silently to bypass).
+_PERMISSION_POLICIES = {
+    "bypassPermissions": "auto",
+    "acceptEdits": "supervised",
+    "default": "supervised",
+    "plan": "plan",
+}
+
 
 def build_agent_options(
     sandbox: Path,
@@ -743,6 +753,8 @@ async def run_task_object(
     *,
     db_path: Path,
     sandbox: Path,
+    agent_id: str | None = None,
+    agent_transport: str | None = None,
     model: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     max_retries: int = DEFAULT_MAX_RETRIES,
@@ -782,6 +794,13 @@ async def run_task_object(
 
     ``invoke`` defaults to a real Claude Code invoker. Tests inject a fake
     callable instead — same seam, different transport.
+
+    ``agent_id`` (with optional ``agent_transport``) is the multi-agent
+    opt-in: when set and ``invoke`` is not injected, the run is driven
+    through the ``flywheel-agents`` runtime (requires the
+    ``flywheel-core[agents]`` extra) instead of the legacy SDK closure.
+    ``permission_mode`` still arrives in Claude vocabulary and is mapped to
+    the generic policy per adapter.
 
     ``events`` selects the live stdout stream: :data:`EVENTS_NONE` (silent),
     :data:`EVENTS_PLAIN` (readable lines), or :data:`EVENTS_JSON` (NDJSON).
@@ -884,6 +903,28 @@ async def run_task_object(
     # live-stream path as harness.* records.
     if invoke is not None:
         invoker = invoke
+    elif agent_id is not None:
+        # The multi-agent opt-in (docs/agent-harness.md section 15): route
+        # the run through the flywheel-agents runtime. ``agent_transport``
+        # rides adapter_options (e.g. claude-code's "cli" vs "sdk"). The
+        # legacy SDK closure below stays the default until parity is
+        # demonstrated in-loop.
+        from flywheel_core.agents_invoke import make_agents_invoke
+
+        adapter_options: dict[str, object] = {}
+        if agent_transport is not None:
+            adapter_options["transport"] = agent_transport
+        invoker = make_agents_invoke(
+            agent_id=agent_id,
+            working_directory=sandbox,
+            model=model,
+            permission_policy=_PERMISSION_POLICIES.get(
+                permission_mode, "supervised"
+            ),
+            max_turns=max_turns,
+            environment=agent_env,
+            adapter_options=adapter_options,
+        )
     else:
         invoker = _make_claude_code_invoke(
             sandbox,

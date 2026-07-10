@@ -218,7 +218,12 @@ class SqliteStore:
             isolation_level=None,
         )
         self._connection.row_factory = sqlite3.Row
-        self._bootstrap()
+        # Bootstrap under the same transient-retry envelope as every other
+        # write: N pool members opening one fresh store race the schema DDL,
+        # and a loser that stays locked past busy_timeout must back off and
+        # re-run (the script is idempotent -- it already re-runs on every
+        # open of an existing file) rather than crash the member.
+        self._run_with_locked_retry(self._bootstrap)
 
     def _run_with_locked_retry(self, op: Callable[[], _R]) -> _R:
         """Run ``op``, retrying a locked-past-``busy_timeout`` write.
@@ -258,6 +263,18 @@ class SqliteStore:
 
     def _bootstrap(self) -> None:
         conn = self._connection
+        # Multi-worker contention: when two workers write the same file
+        # (each its own connection, e.g. competing for task claims), make a
+        # blocked writer wait for the lock instead of erroring immediately
+        # with "database is locked". Per-connection, so set on every open --
+        # and set FIRST, because the schema script below is this connection's
+        # very first contended write: N pool members bootstrapping one fresh
+        # store concurrently would otherwise hand every loser an instant lock
+        # error. busy_timeout alone cannot cover a dropped connection or a
+        # lock held past the wait -- the retry-with-backoff wrapper handles
+        # those -- so the default is unchanged and only the
+        # wait-before-first-retry.
+        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)};")
         # The canonical schema script applies the pragmas (WAL +
         # foreign_keys) and creates every table. Executed verbatim so
         # the DDL is not re-derived here.
@@ -265,14 +282,6 @@ class SqliteStore:
         # foreign_keys is per-connection; reaffirm it so a later schema
         # edit cannot silently drop the per-connection guarantee.
         conn.execute("PRAGMA foreign_keys = ON;")
-        # Multi-worker contention: when two workers write the same file
-        # (each its own connection, e.g. competing for task claims), make a
-        # blocked writer wait for the lock instead of erroring immediately
-        # with "database is locked". Per-connection, so set on every open.
-        # busy_timeout alone cannot cover a dropped connection or a lock held
-        # past the wait -- the retry-with-backoff wrapper handles those -- so
-        # the default is unchanged and only the wait-before-first-retry.
-        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)};")
         # Append-only triggers on grader_results.
         conn.executescript(_APPEND_ONLY_TRIGGERS)
         # Version pin: a database whose schema_version row does not match is

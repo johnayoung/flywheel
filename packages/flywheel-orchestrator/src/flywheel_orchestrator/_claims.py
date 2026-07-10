@@ -1450,9 +1450,13 @@ class SqliteClaimStore:
 
     def _bootstrap(self) -> None:
         conn = self._connection
+        # busy_timeout FIRST: the schema script is this connection's first
+        # contended write, and N pool members bootstrapping one fresh store
+        # concurrently would otherwise hand every loser an instant
+        # "database is locked" instead of a wait.
+        conn.execute("PRAGMA busy_timeout = 5000;")
         conn.executescript(_SCHEMA_SQL)
         conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
         # Additive v3 migration: a pre-existing v1/v2 store has a task_claims
         # table that predates the conflict-keys column. CREATE TABLE IF NOT
         # EXISTS leaves that older table untouched, so add the column in place

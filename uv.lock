@@ -5,6 +5,7 @@ requires-python = ">=3.13"
 [manifest]
 members = [
     "flywheel",
+    "flywheel-agents",
     "flywheel-container",
     "flywheel-core",
     "flywheel-orchestrator",
@@ -14,6 +15,7 @@ members = [
 [manifest.dependency-groups]
 dev = [
     { name = "flywheel", editable = "packages/flywheel" },
+    { name = "flywheel-agents", extras = ["claude"], editable = "packages/flywheel-agents" },
     { name = "flywheel-container", editable = "packages/flywheel-container" },
     { name = "flywheel-core", extras = ["postgres", "claude"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
@@ -287,7 +289,7 @@ version = "0.1.0"
 source = { editable = "packages/flywheel" }
 dependencies = [
     { name = "flywheel-container" },
-    { name = "flywheel-core", extra = ["claude"] },
+    { name = "flywheel-core", extra = ["agents", "claude"] },
     { name = "flywheel-orchestrator" },
     { name = "flywheel-worktree" },
     { name = "textual" },
@@ -296,22 +298,40 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "flywheel-container", editable = "packages/flywheel-container" },
-    { name = "flywheel-core", extras = ["claude"], editable = "packages/flywheel-core" },
+    { name = "flywheel-core", extras = ["claude", "agents"], editable = "packages/flywheel-core" },
     { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
     { name = "flywheel-worktree", editable = "packages/flywheel-worktree" },
     { name = "textual", specifier = ">=0.85" },
 ]
 
 [[package]]
+name = "flywheel-agents"
+version = "0.1.0"
+source = { editable = "packages/flywheel-agents" }
+
+[package.optional-dependencies]
+claude = [
+    { name = "claude-agent-sdk" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.83" }]
+provides-extras = ["claude"]
+
+[[package]]
 name = "flywheel-container"
 version = "0.1.0"
 source = { editable = "packages/flywheel-container" }
 dependencies = [
+    { name = "flywheel-agents" },
     { name = "flywheel-orchestrator" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" }]
+requires-dist = [
+    { name = "flywheel-agents", editable = "packages/flywheel-agents" },
+    { name = "flywheel-orchestrator", editable = "packages/flywheel-orchestrator" },
+]
 
 [[package]]
 name = "flywheel-core"
@@ -319,6 +339,9 @@ version = "0.1.0"
 source = { editable = "packages/flywheel-core" }
 
 [package.optional-dependencies]
+agents = [
+    { name = "flywheel-agents" },
+]
 claude = [
     { name = "claude-agent-sdk" },
 ]
@@ -330,10 +353,11 @@ postgres = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.83" },
+    { name = "flywheel-agents", marker = "extra == 'agents'", editable = "packages/flywheel-agents" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.2" },
     { name = "psycopg-pool", marker = "extra == 'postgres'", specifier = ">=3.2" },
 ]
-provides-extras = ["claude", "postgres"]
+provides-extras = ["agents", "claude", "postgres"]
 
 [[package]]
 name = "flywheel-orchestrator"

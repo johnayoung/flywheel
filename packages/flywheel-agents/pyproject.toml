@@ -1,0 +1,24 @@
+[project]
+name = "flywheel-agents"
+version = "0.1.0"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+description = "Multi-agent execution layer: one consistent way to run coding-agent harnesses (Claude Code first) with normalized events and honest capabilities."
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name = "John Young", email = "john.anto.young@gmail.com" }
+]
+# Bottom of the workspace stack: imports nothing from any flywheel package and
+# has zero hard runtime dependencies (stdlib only). Vendor SDKs are optional
+# extras; the CLI-stream transports shell out to the vendor executable.
+dependencies = []
+
+[project.optional-dependencies]
+claude = [
+    "claude-agent-sdk>=0.2.83",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"

@@ -23,6 +23,7 @@
 [tool.pytest.ini_options]
 # Each package keeps its own tests/; shared fixtures live in the root conftest.
 testpaths = [
+    "packages/flywheel-agents/tests",
     "packages/flywheel-core/tests",
     "packages/flywheel-orchestrator/tests",
     "packages/flywheel-worktree/tests",
@@ -34,6 +35,7 @@ testpaths = [
 members = ["packages/*"]
 
 [tool.uv.sources]
+flywheel-agents = { workspace = true }
 flywheel-core = { workspace = true }
 flywheel-orchestrator = { workspace = true }
 flywheel-worktree = { workspace = true }
@@ -42,6 +44,7 @@ flywheel = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "flywheel-agents[claude]",
     "flywheel-core[postgres,claude]",
     "flywheel-orchestrator",
     "flywheel-worktree",

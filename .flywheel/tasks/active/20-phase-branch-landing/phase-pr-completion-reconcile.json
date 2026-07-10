@@ -1,0 +1,46 @@
+{
+  "id": "phase-pr-completion-reconcile",
+  "goal": "The aggregate phase-PR completion seam works on the current composed base: sweeping a complete phase under [submit] strategy=\"phase\" opens exactly one aggregate PR (create, then edit on later sweeps, never a duplicate) whose body carries every task id, receipt name, and held-out outcome token, with [phase] verify evaluated against the phase-branch tree and a red verify opening no PR.",
+  "tags": ["spec-00079", "phase-branch-landing", "reconciliation"],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_phase_pr_completion.py -q" },
+    { "type": "command", "name": "composed-base-keep-green", "run": "uv run pytest packages/flywheel-worktree/tests/test_phase_strategy_landing.py packages/flywheel-orchestrator/tests/test_phase_reachability_hold.py packages/flywheel-orchestrator/tests/test_workflow.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-worktree packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "The parked branch flywheel/20-phase-branch-landing/phase-pr-at-completion -- already rebased onto current main; contains the prior implementation (pr.py PhasePrPublisher, worker.py publisher wiring, _workflow.py phase_completion seam, and the 475-line test file). Salvage it: cherry-pick or re-derive, then reconcile with the composed base",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- archive_completed_phases now composes THREE landed features the prior implementation predates: the spec-00077 landed predicate (landing_base arms receipt-or-ancestry), the phase-merge archival gate (bcf3bb5), and the reachability holds (2bf4e34); the phase_completion seam must fire for a complete phase whose PR has not yet merged. Large module: use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- archive_phases builds PhasePrPublisher only under policy.submit_strategy == \"phase\" with a resolved pr_base (policy.submit_pr_base or landing_base). Large module: use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- PhasePrPublisher and the gh runner seam",
+      "packages/flywheel-worktree/tests/test_phase_strategy_landing.py -- keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_phase_reachability_hold.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs -- spec 00079 criterion 3 is the contract; the prior task phase-pr-at-completion went DONE but its landing parked on the held-out gate and its suite fails on the composed base (4 of 7 tests)",
+      ".flywheel/audits/00079-phase-branch-landing-verify.md -- unit P2's discrimination proofs and bridging notes"
+    ],
+    "constraints": [
+      "Salvage packages/flywheel-worktree/tests/test_phase_pr_completion.py from the parked branch; fixtures may be adapted to the composed base's seams, but the five PR-behavior assertions are the spec and must not weaken: exactly-one-create, edit-never-duplicate, body carries ids + receipt names + held-out tokens, [phase] verify runs against the phase-branch tree, red verify opens no PR",
+      "Reconcile against the composed archive semantics -- do not regress the landed predicate, the phase-merge archival gate, or the reachability holds; their suites are pinned graders",
+      "The phase stays in active/ when its aggregate PR is open and unmerged; the sweep never archives a phase the completion seam handled",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify the landed P1/P3/P4 behavior or their test files",
+      "Do not read or write under .flywheel/verification/",
+      "Do not change the merge or pr strategies' archival behavior"
+    ],
+    "edge_cases": [
+      "A complete phase whose tasks are DONE with receipts but whose phase branch has not merged into the true base must reach the completion seam (PR path), not archive and not block silently",
+      "A second sweep over the same complete phase edits the existing PR body, never creates a duplicate",
+      "Red [phase] verify against the phase-branch tree: no PR operation at all and the phase stays active"
+    ],
+    "notes": "The prior attempt's strand (held-out-gate park on phase-pr-at-completion) stays visible until this task lands equivalent content; the operator then resolves it as superseded via flywheel resolve."
+  }
+}

@@ -291,6 +291,22 @@ def test_init_is_idempotent_and_never_clobbers(repo: Path, capsys) -> None:
     assert load_policy(repo / "flywheel.toml").tasks_dir == Path("custom")
 
 
+def test_init_scaffolds_active_hardened_submit_block(repo: Path) -> None:
+    """Spec 00081, criterion 1: the rendered policy carries an ACTIVE
+    [submit] protected_paths floor covering the CI directory and the policy
+    file itself -- live config, not a commented placeholder -- and a re-run
+    leaves the file byte-identical."""
+    main(["init"])
+
+    policy = load_policy(repo / "flywheel.toml")
+    assert ".github/**" in policy.protected_paths
+    assert "flywheel.toml" in policy.protected_paths
+
+    before = (repo / "flywheel.toml").read_bytes()
+    assert main(["init"]) == 0
+    assert (repo / "flywheel.toml").read_bytes() == before
+
+
 # --- the initialized layout drives the CLI end-to-end ------------------------
 
 

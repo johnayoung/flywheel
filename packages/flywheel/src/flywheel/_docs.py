@@ -1,6 +1,6 @@
 """The ``flywheel docs`` / ``fw docs`` verb: serve the curated operator docs.
 
-The nine curated topics ship as package data under
+The curated topics ship as package data under
 :mod:`flywheel._doc_pages` -- byte-identical copies embedded from the
 canonical ``docs/*.md`` at build time. Serving reads them through
 :func:`importlib.resources.files`, so a topic prints identically from any
@@ -40,6 +40,7 @@ TOPICS: Mapping[str, str] = {
     "sandbox": "the sandbox-as-deploy model and the complete [sandbox.*] reference.",
     "held-out-gate": "the execute-time held-out landing gate that defends against reward-hacking.",
     "autopilot": "the autopilot intake daemon: tier model, scoring, CLI, and console activation.",
+    "team-mode": "the multi-operator runbook: GitHub App identity, rulesets, and the merge queue as the distributed merge lock.",
 }
 
 # The package-data directory holding the embedded ``<topic>.md`` pages. A

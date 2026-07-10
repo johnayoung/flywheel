@@ -640,6 +640,35 @@ def load_policy(path: Path) -> WorkPolicy:
         submit_recovery_agent_max_wall_seconds,
     ) = _optional_submit_recovery_agent(submit, policy_file=path)
 
+    # Team-mode guard (spec 00081, criterion 2): the merge lock is an
+    # fcntl.flock on a local path -- advisory, kernel-local, single-machine
+    # by construction. Distributed execution with a landing that serializes
+    # through it (merge or phase directly, or [[submit.tiers]] whose tiers
+    # 0/1 route through them) would let two machines silently race the base
+    # branch, so it is a load-time configuration error. The distributed
+    # landing route is 'pr': GitHub's merge queue and branch protection are
+    # the distributed merge lock (docs/team-mode.md).
+    if execution_mode == "distributed":
+        if submit_strategy in LOCAL_LOCK_STRATEGIES:
+            raise PolicyError(
+                f"{path}: execution.mode = 'distributed' cannot use "
+                f"submit.strategy = {submit_strategy!r}: the "
+                f"{submit_strategy} strategy serializes landings through "
+                f"the single-machine merge lock (.flywheel/.merge.lock), "
+                f"which cannot span machines. Use submit.strategy = 'pr' "
+                f"with a merge queue (docs/team-mode.md), or "
+                f"execution.mode = 'local'"
+            )
+        if submit_tiers:
+            raise PolicyError(
+                f"{path}: execution.mode = 'distributed' cannot use "
+                f"[[submit.tiers]]: tier routing lands tiers 0 and 1 "
+                f"through the single-machine merge lock "
+                f"(.flywheel/.merge.lock), which cannot span machines. Use "
+                f"submit.strategy = 'pr' with a merge queue "
+                f"(docs/team-mode.md), or execution.mode = 'local'"
+            )
+
     sandbox = data.get("sandbox") or {}
     if not isinstance(sandbox, dict):
         raise PolicyError(f"{path}: [sandbox] must be a table")
@@ -1239,6 +1268,14 @@ def _optional_submit_tiers(
 
 
 _SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr", "phase")
+
+#: The strategies that serialize landings through the single-machine merge
+#: lock (``fcntl.flock`` on ``.flywheel/.merge.lock`` -- advisory, kernel-
+#: local, single-machine by construction). The shared invariant of the
+#: distributed-mode guard in :func:`load_policy` and the
+#: ``docs/team-mode.md`` strategy table (spec 00081): a future strategy
+#: addition must update both together.
+LOCAL_LOCK_STRATEGIES: tuple[str, ...] = ("merge", "phase")
 
 
 def _optional_submit_strategy(

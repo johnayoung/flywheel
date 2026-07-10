@@ -33,6 +33,7 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 
 - [cli.md](cli.md) — every verb, the interactive operator console, slash commands, and `init`.
 - [configuration.md](configuration.md) — the complete `flywheel.toml` reference.
+- [team-mode.md](team-mode.md) — the multi-operator runbook: GitHub App worker identity, ruleset requirements, and the merge queue as the distributed merge lock.
 - [autopilot.md](autopilot.md) — the autopilot intake daemon: tier model, scoring, CLI, and console activation.
 - [workflow.md](workflow.md) — how flywheel develops itself: the spec-driven authoring pipeline (the `fw-*` skills) and the runtime loop.
 

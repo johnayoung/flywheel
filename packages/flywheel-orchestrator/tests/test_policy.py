@@ -1867,3 +1867,82 @@ def test_rubric_judge_max_turns_non_int_raises(tmp_path: Path) -> None:
                 '[sandbox.limits]\nrubric_judge_max_turns = "lots"\n',
             )
         )
+
+
+# --- distributed mode vs the local merge lock (spec 00081) ---------------------
+
+
+def _distributed_policy(tmp_path: Path, submit_lines: str) -> Path:
+    return _write(
+        tmp_path,
+        "\n".join(
+            [
+                "[source]",
+                'kind = "directory"',
+                "[store]",
+                'backend = "postgres"',
+                "[execution]",
+                'mode = "distributed"',
+                submit_lines,
+            ]
+        ),
+    )
+
+
+def test_distributed_mode_rejects_merge_strategy(tmp_path: Path) -> None:
+    # The merge lock is a single-machine flock; two machines would race the
+    # base silently. The error names both settings.
+    with pytest.raises(PolicyError, match="distributed") as exc:
+        load_policy(
+            _distributed_policy(tmp_path, '[submit]\nstrategy = "merge"')
+        )
+    message = str(exc.value)
+    assert "submit.strategy" in message
+    assert "merge" in message
+
+
+def test_distributed_mode_rejects_default_merge_strategy(
+    tmp_path: Path,
+) -> None:
+    # An absent [submit] table means the merge landing; distribution makes
+    # that default a config error too, never a silent race.
+    with pytest.raises(PolicyError, match="submit.strategy"):
+        load_policy(_distributed_policy(tmp_path, ""))
+
+
+def test_distributed_mode_rejects_phase_strategy(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="phase"):
+        load_policy(
+            _distributed_policy(tmp_path, '[submit]\nstrategy = "phase"')
+        )
+
+
+def test_distributed_mode_rejects_submit_tiers(tmp_path: Path) -> None:
+    # Tier routing lands tiers 0/1 through the same local lock.
+    with pytest.raises(PolicyError, match=r"submit\.tiers"):
+        load_policy(
+            _distributed_policy(
+                tmp_path,
+                '[submit]\nstrategy = "pr"\n'
+                '[[submit.tiers]]\ntier = 0\npaths = ["docs/**"]',
+            )
+        )
+
+
+def test_distributed_mode_allows_pr_strategy(tmp_path: Path) -> None:
+    policy = load_policy(
+        _distributed_policy(tmp_path, '[submit]\nstrategy = "pr"')
+    )
+    assert policy.execution_mode == "distributed"
+    assert policy.submit_strategy == "pr"
+
+
+def test_local_mode_keeps_merge_strategy_loading(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            '[source]\nkind = "directory"\n[submit]\nstrategy = "merge"\n',
+        )
+    )
+    assert policy.execution_mode == "local"
+    assert policy.submit_strategy == "merge"

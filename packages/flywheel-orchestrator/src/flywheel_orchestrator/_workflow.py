@@ -3399,10 +3399,22 @@ _INIT_POLICY_TAIL_FOOT = """\
 """
 
 
+#: The hardened ``protected_paths`` floor ``init`` scaffolds as LIVE config
+#: (spec 00081, criterion 1): the CI directory and the policy file itself.
+#: Rendered active -- not a commented placeholder -- because the open-by-
+#: default posture is the bug: a new consumer repo's verification surface
+#: must be protected before the first agent lands anything.
+INIT_PROTECTED_PATHS: tuple[str, ...] = (".github/**", "flywheel.toml")
+
+
 def _render_submit_block(submit_base: str | None) -> str:
     """Render the ``[submit]`` section.
 
-    The detected current branch is recorded as a COMMENTED ``base`` suggestion,
+    ``protected_paths`` is rendered ACTIVE with the hardened floor
+    (:data:`INIT_PROTECTED_PATHS` -- the CI directory and the policy file), so
+    every new consumer repo starts with its verification surface refused to
+    the loop; the operator extends the list rather than discovering it. The
+    detected current branch is recorded as a COMMENTED ``base`` suggestion,
     never an active key. An active ``base`` equal to the checked-out branch is
     refused by the landing guard (:func:`resolve_landing_base`) — so pinning the
     just-detected branch (the universal single-branch case right after init)
@@ -3417,12 +3429,14 @@ def _render_submit_block(submit_base: str | None) -> str:
     detected_note = (
         f" (detected current branch: {submit_base})" if submit_base else ""
     )
+    protected = ", ".join(json.dumps(p) for p in INIT_PROTECTED_PATHS)
     return (
         "# --- Landing --------------------------------------------------------"
         "------\n"
         "# How finished work reaches your branch. `strategy` is \"merge\" (FF-merge"
-        "\n# in-tree, default) or \"pr\" (push + open a pull request; uses `remote`"
-        "\n# and optional `pr_base`).\n"
+        "\n# in-tree, default), \"phase\" (land on a per-phase integration branch,"
+        "\n# reviewed as one PR), or \"pr\" (push + open a pull request; uses"
+        "\n# `remote` and optional `pr_base`).\n"
         "#\n"
         "# `base` pins the branch finished work lands on and the worker resolves\n"
         "# its phase base from. Leave it UNSET to FF-merge onto your checked-out\n"
@@ -3439,13 +3453,15 @@ def _render_submit_block(submit_base: str | None) -> str:
         "# landings, so a slow command bottlenecks throughput.\n"
         "#\n"
         "# `protected_paths` are globs a finished branch may not touch; a match\n"
-        "# refuses the land. Use it to stop authored work from rewriting the\n"
-        "# verification surface (policy, CI, .flywheel state).\n"
+        "# refuses the land. The scaffolded floor (your CI directory and this\n"
+        "# policy file) is ACTIVE on purpose — it stops authored work from\n"
+        "# rewriting the verification surface that judges it. Extend it with\n"
+        "# grader configs and .flywheel state as your surface grows.\n"
         "[submit]\n"
         f"# base = {suggestion}\n"
         '# verify = "uv run pytest"\n'
-        '# protected_paths = ["flywheel.toml", ".flywheel/**"]\n'
-        '# strategy = "merge"          # merge | pr\n'
+        f"protected_paths = [{protected}]\n"
+        '# strategy = "merge"          # merge | phase | pr\n'
         '# remote = "origin"           # pr strategy push target\n'
         '# pr_base = "main"            # pr strategy base branch\n'
     )

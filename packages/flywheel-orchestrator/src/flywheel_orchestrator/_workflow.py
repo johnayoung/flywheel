@@ -892,6 +892,7 @@ def archive_completed_phases(
     landing_base: str | None = None,
     true_base: str | None = None,
     claims: SqliteClaimStore | PostgresClaimStore | None = None,
+    phase_completion: Callable[[Path, list[Task]], None] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> list[Path]:
     """Move ``active/<phase>`` dirs to ``archive/`` when every task is done.
@@ -975,6 +976,25 @@ def archive_completed_phases(
     preserving the legacy contract. ``now`` is the marker's injected clock;
     ``None`` falls back to wall-clock UTC, the same convention as the
     work-source stop sink.
+
+    ``phase_completion`` is the phase-branch-landing completion seam (spec
+    00079, criterion 3). ``None`` (every ``merge``/``pr`` caller, the
+    ``flywheel archive`` CLI, and the synthetic archive tests) leaves archival
+    byte-identical to today. When supplied -- the worker injects it only under
+    ``[submit] strategy = "phase"`` -- it composes with the phase-branch merge
+    predicate above: a completed, landed phase whose integration branch has NOT
+    merged into the true base (an open phase PR) is handed to the callable
+    ``(phase_dir, loaded_tasks)`` instead of being blocked with the open-PR
+    refusal. The injected publisher evaluates ``[phase] verify`` against the
+    phase-branch tree (D-6, not this checkout), pushes the phase branch, and
+    opens or refreshes exactly one aggregate PR onto the true base; a red
+    ``[phase]`` verify opens no PR. The phase deliberately stays in ``active/``
+    on this path -- it archives only once that PR merges (the merge predicate's
+    ``MERGED`` verdict then falls through to the move below, and the seam does
+    NOT re-fire) -- so this sweep never moves a phase the ``phase_completion``
+    seam handled. Because the seam runs the phase gate against the phase-branch
+    tree itself, a phase-strategy caller passes its verify command to the
+    publisher, not as the repo-root ``phase_verify`` here.
     """
     moved: list[Path] = []
     archive_root = tasks_dir / "archive"
@@ -1072,7 +1092,21 @@ def archive_completed_phases(
                     repo_root, phase_tip, true_base
                 )
                 if merge_state is not _PhaseMergeState.MERGED:
-                    if log is not None:
+                    # The phase integration branch has not merged into the true
+                    # base -- an open (or squash/rebase-broken) phase PR. This
+                    # is the phase-completion seam's moment (spec 00079,
+                    # criterion 3): under the phase strategy the worker injects
+                    # a publisher that evaluates ``[phase] verify`` against the
+                    # phase-branch tree (D-6, not this checkout), pushes the
+                    # phase branch, and opens or refreshes exactly one aggregate
+                    # PR onto the true base -- the phase stays ``active/`` until
+                    # that PR merges, so it is never archived on this path. The
+                    # merge/pr callers, the ``flywheel archive`` CLI, and the
+                    # synthetic archive tests inject no seam and keep the
+                    # byte-identical open-PR/merge-method-mismatch refusal.
+                    if phase_completion is not None:
+                        phase_completion(phase_dir, loaded_tasks)
+                    elif log is not None:
                         log(
                             _format_phase_merge_refusal(
                                 phase_dir, phase_branch, merge_state

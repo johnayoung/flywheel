@@ -26,18 +26,23 @@ inject a fake.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
-from flywheel_core import Status
+from flywheel_core import Status, Task
 from flywheel_core.events import (
     LANDING_STRATEGY_PR,
     PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_PUSH_FAILED,
+    HeldOutGateEvaluated,
 )
 from flywheel_orchestrator import (
     GhRunner,
+    GraderReceipt,
     HeldOutGraderSource,
     SubmitRequest,
     WorkPolicy,
@@ -50,6 +55,10 @@ from flywheel_worktree.worker import (
     _git,
     phase_of_task_file,
 )
+
+if TYPE_CHECKING:
+    from flywheel_core.store_postgres import PostgresStore
+    from flywheel_core.store_sqlite import SqliteStore
 
 _TITLE_MAX = 90
 
@@ -330,6 +339,353 @@ class GitPullRequestSubmitter(GitWorktreeSubmitter):
         if len(title) > _TITLE_MAX:
             title = title[: _TITLE_MAX - 1] + "…"
         body = render_pr_body(req)
+        existing = self._gh(
+            [
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--base",
+                self.pr_base,
+                "--state",
+                "open",
+                "--json",
+                "url",
+                "--jq",
+                ".[0].url",
+            ]
+        ).strip()
+        if existing:
+            self._gh(["pr", "edit", existing, "--body", body])
+            return existing
+        return self._gh(
+            [
+                "pr",
+                "create",
+                "--head",
+                branch,
+                "--base",
+                self.pr_base,
+                "--title",
+                title,
+                "--body",
+                body,
+            ]
+        ).strip()
+
+
+# --- phase-branch completion (spec 00079, criterion 3) ------------------------
+#
+# The per-task PR strategy above lands one task per PR. Under ``[submit]
+# strategy = "phase"`` tasks instead land continuously onto a per-phase
+# integration branch, and the review unit becomes the whole phase: at phase
+# completion the worker pushes that branch and opens exactly one PR whose body
+# aggregates every task's receipts and held-out verdict. That completion layer
+# lives here (it reuses this module's ``gh`` runner seam and receipt rendering)
+# and is injected into the archive sweep as its ``phase_completion`` callable.
+
+
+def _phase_branch(phase: str) -> str:
+    """The integration branch a phase's tasks land on (``flywheel/phase/<p>``)."""
+    return f"flywheel/phase/{phase}"
+
+
+# Held-out verdict wire values (``HeldOutGateEvaluated.outcome``) mapped to
+# distinct, human-readable labels for the PR body. ``NO_GATE`` is deliberately
+# kept visually apart from ``PASS`` -- a task that registered no held-out grader
+# is not the same as one that passed a gate (docs/held-out-gate.md).
+_HELD_OUT_LABELS: Mapping[str, str] = {
+    "no_gate": "NO_GATE",
+    "pass": "PASS",
+    "fail": "FAIL",
+}
+
+
+@dataclass(frozen=True)
+class PhaseTaskSection:
+    """One task's aggregated, store-backed evidence for the phase PR body.
+
+    ``receipts`` is the harness's verdict from the run's final attempt (empty
+    when the run never reached grading); ``held_out_outcome`` is the run's
+    ``HeldOutGateEvaluated`` wire value (``None`` when no gate evaluation was
+    recorded). Both are read from the store, never re-derived from agent output.
+    """
+
+    task_id: str
+    goal: str
+    receipts: tuple[GraderReceipt, ...]
+    held_out_outcome: str | None
+
+
+def _final_receipts(
+    store: SqliteStore | PostgresStore, run_id: str
+) -> tuple[GraderReceipt, ...]:
+    """Project the run's final-attempt grader receipts (the harness's verdicts).
+
+    Mirrors the orchestrator's own work-report projection: the last attempt's
+    ``grader_results`` rows flattened into :class:`GraderReceipt` values. A run
+    that never reached grading yields an empty tuple.
+    """
+    attempts = store.list_attempts(run_id)
+    if not attempts:
+        return ()
+    final_number = attempts[-1].number
+    return tuple(
+        GraderReceipt(
+            ordinal=record.ordinal,
+            grader_type=str(record.grader_type),
+            name=record.grader_name,
+            passed=record.passed,
+        )
+        for record in store.list_grader_results(run_id, final_number)
+    )
+
+
+def _latest_held_out_outcome(
+    store: SqliteStore | PostgresStore, run_id: str
+) -> str | None:
+    """The run's most recent held-out gate outcome wire value, or ``None``.
+
+    Reads the ``HeldOutGateEvaluated`` witnesses off the run's domain-event log
+    and returns the last one's ``outcome`` -- the terminal verdict. ``None``
+    when the gate recorded no evaluation for the run (distinct from a recorded
+    ``no_gate``).
+    """
+    outcome: str | None = None
+    for event in store.list_domain_events(run_id):
+        if isinstance(event, HeldOutGateEvaluated):
+            outcome = event.outcome
+    return outcome
+
+
+def collect_phase_task_receipts(
+    store: SqliteStore | PostgresStore, task: Task
+) -> PhaseTaskSection:
+    """Aggregate one task's store-backed evidence for the phase PR body.
+
+    Resolves the task's most recent run (``list_lifecycles(task_id=...)`` is
+    ordered newest-first) and projects its final receipts and held-out verdict.
+    A task with no recorded run yields an empty section -- rendered as the
+    receipt-projection-unavailable line rather than omitted.
+    """
+    lifecycles = store.list_lifecycles(task_id=task.id)
+    if not lifecycles:
+        return PhaseTaskSection(
+            task_id=task.id,
+            goal=task.goal,
+            receipts=(),
+            held_out_outcome=None,
+        )
+    run_id = lifecycles[0].run_id
+    return PhaseTaskSection(
+        task_id=task.id,
+        goal=task.goal,
+        receipts=_final_receipts(store, run_id),
+        held_out_outcome=_latest_held_out_outcome(store, run_id),
+    )
+
+
+def _render_phase_task_section(section: PhaseTaskSection) -> list[str]:
+    """Render one task's section: goal, held-out verdict, receipts table."""
+    if section.held_out_outcome is None:
+        label = "not recorded"
+    else:
+        label = _HELD_OUT_LABELS.get(
+            section.held_out_outcome, section.held_out_outcome
+        )
+    lines = [
+        f"## Task `{section.task_id}`",
+        "",
+        section.goal,
+        "",
+        f"- held-out gate: `{label}`",
+        "",
+        "### Grader receipts",
+        "",
+    ]
+    if section.receipts:
+        lines += [
+            "| # | type | name | verdict |",
+            "| - | ---- | ---- | ------- |",
+        ]
+        lines += [
+            f"| {r.ordinal} | {r.grader_type} | {r.name or '-'} | "
+            f"{'pass' if r.passed else 'FAIL'} |"
+            for r in section.receipts
+        ]
+    else:
+        lines.append("(receipt projection unavailable for this run)")
+    lines.append("")
+    return lines
+
+
+def render_phase_pr_body(
+    phase: str, sections: Sequence[PhaseTaskSection]
+) -> str:
+    """The phase PR body: one section per task, receipts + held-out verdict.
+
+    The receipts are the harness's verdicts (never the agent's claim) and the
+    held-out outcome is rendered faithfully -- ``NO_GATE`` distinct from
+    ``PASS`` -- so a reviewer sees, per task, exactly how "done" was decided
+    before trusting the aggregate.
+    """
+    lines = [
+        f"## Phase `{phase}`",
+        "",
+        f"Lands the phase integration branch `{_phase_branch(phase)}` onto the "
+        f"true base. Every task's grader receipts and held-out gate verdict are "
+        f"aggregated below; receipts are the harness's verdicts from each run's "
+        f"final attempt, never re-derived from agent output.",
+        "",
+    ]
+    for section in sections:
+        lines += _render_phase_task_section(section)
+    lines += [
+        "---",
+        "Opened by flywheel. Receipts are the harness's verdicts; agent claims "
+        "are never authoritative. Merge is review/CI's call -- the loop opened "
+        "and refreshes this PR but never merges it.",
+    ]
+    return "\n".join(lines)
+
+
+class PhasePrPublisher:
+    """Push a completed phase's branch and ensure exactly one aggregate PR.
+
+    Injected by the worker as the ``phase_completion`` seam of
+    :func:`~flywheel_orchestrator.archive_completed_phases` under ``[submit]
+    strategy = "phase"``. When the sweep hands over a phase whose tasks are all
+    DONE and landed and whose loop-path gate passed, this:
+
+    1. evaluates ``[phase] verify`` against a checkout of the phase-branch tree
+       (spec 00079, D-6) -- never the operator's checkout, which does not hold
+       the phase's work -- opening no PR on a non-zero exit;
+    2. pushes the phase branch to the remote (``--force-with-lease``);
+    3. opens exactly one PR onto the true base -- or refreshes the body of the
+       one already open for the branch -- with every task's grader receipts and
+       held-out verdict aggregated in the body.
+
+    The worker pushes and opens/refreshes only; it never merges the phase PR
+    (the phase archives later, once the PR merges -- the dependent task's
+    surface). Every failure is logged and surfaced, never raised: a
+    phase-completion attempt must never unwind the archive sweep.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: SqliteStore | PostgresStore,
+        repo_root: Path,
+        tasks_dir: Path,
+        remote: str,
+        pr_base: str,
+        phase_verify: str | None,
+        log: Logger,
+        gh: GhRunner | None = None,
+    ) -> None:
+        self.store = store
+        self.repo_root = repo_root
+        self.tasks_dir = tasks_dir
+        self.remote = remote
+        self.pr_base = pr_base
+        self.phase_verify = phase_verify
+        self.log = log
+        self._gh = gh or _default_gh
+
+    def __call__(self, phase_dir: Path, tasks: list[Task]) -> None:
+        phase = phase_dir.name
+        branch = _phase_branch(phase)
+        try:
+            self._publish(phase, branch, tasks)
+        except Exception as exc:  # never unwind the sweep (submit discipline)
+            self.log(
+                f"phase completion for {phase!r} raised ({exc}); the phase is "
+                f"left active and its PR not (re)opened"
+            )
+
+    def _publish(self, phase: str, branch: str, tasks: list[Task]) -> None:
+        if self.phase_verify is not None:
+            ok, detail = self._verify_phase_tree(branch)
+            if not ok:
+                self.log(
+                    f"[phase] verify failed against the {branch} tree "
+                    f"({detail}); opening no PR, phase {phase!r} left active"
+                )
+                return
+        push = _git(
+            self.repo_root,
+            "push",
+            "--force-with-lease",
+            self.remote,
+            f"{branch}:{branch}",
+        )
+        if push.returncode != 0:
+            self.log(
+                f"push of {branch} to {self.remote} failed "
+                f"({push.stderr.strip()}); opening no PR, phase {phase!r} "
+                f"left active"
+            )
+            return
+        sections = [collect_phase_task_receipts(self.store, t) for t in tasks]
+        body = render_phase_pr_body(phase, sections)
+        title = f"Phase {phase}: {len(sections)} task(s)"
+        if len(title) > _TITLE_MAX:
+            title = title[: _TITLE_MAX - 1] + "…"
+        try:
+            url = self._ensure_phase_pr(branch, title, body)
+        except GhError as exc:
+            self.log(
+                f"opening/refreshing the phase PR for {branch} failed ({exc}); "
+                f"the branch is pushed but no PR is open, phase {phase!r} "
+                f"left active"
+            )
+            return
+        self.log(
+            f"Phase {phase!r}: pushed {branch} and ensured PR {url} "
+            f"({len(sections)} task(s)); merge is review/CI's call"
+        )
+
+    def _verify_phase_tree(self, branch: str) -> tuple[bool, str]:
+        """Run ``[phase] verify`` against a detached checkout of ``branch``.
+
+        A dedicated worktree of the phase branch is the tree the gate must
+        judge (D-6): the operator's checkout does not contain the phase's
+        landed work. The worktree is always removed afterwards, pass or fail.
+        """
+        assert self.phase_verify is not None
+        parent = Path(tempfile.mkdtemp(prefix="flywheel-phase-verify-"))
+        checkout = parent / "tree"
+        try:
+            add = _git(
+                self.repo_root,
+                "worktree",
+                "add",
+                "--detach",
+                str(checkout),
+                branch,
+            )
+            if add.returncode != 0:
+                return False, (
+                    add.stderr.strip() or f"could not check out {branch}"
+                )
+            result = subprocess.run(
+                self.phase_verify, shell=True, cwd=str(checkout)
+            )
+            if result.returncode != 0:
+                return False, f"exit {result.returncode}"
+            return True, ""
+        finally:
+            _git(
+                self.repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(checkout),
+            )
+            shutil.rmtree(parent, ignore_errors=True)
+
+    def _ensure_phase_pr(self, branch: str, title: str, body: str) -> str:
+        """Open a PR for the phase branch, or refresh the open one's body."""
         existing = self._gh(
             [
                 "pr",

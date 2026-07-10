@@ -61,6 +61,7 @@ from flywheel_core import (
     InvokeFunc,
     Lifecycle,
     Status,
+    Task,
     classify_fault,
     invoke_iteration,
     run_command_graders,
@@ -90,6 +91,7 @@ from flywheel_orchestrator import (
     DEFAULT_SWEEP_SECONDS,
     DEFAULT_WORKER_CONCURRENCY,
     FilesystemHeldOutGraderSource,
+    GhRunner,
     HeldOutGraderSource,
     LandabilityVerdict,
     OrchestratorReport,
@@ -2165,6 +2167,7 @@ def archive_phases(
     landing_base: str | None = None,
     true_base: str | None = None,
     policy: WorkPolicy | None = None,
+    gh: GhRunner | None = None,
 ) -> None:
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
 
@@ -2207,6 +2210,16 @@ def archive_phases(
     task with a still-surfaced stop row gets a ``stop-resolved`` marker --
     archival is the verified resolution act, so the stranded/stopped status
     surface clears with the phase instead of rendering the stale stop forever.
+
+    Under ``[submit] strategy = "phase"`` (spec 00079) the sweep does not
+    archive a completed phase; it hands it to a :class:`~flywheel_worktree.pr.
+    PhasePrPublisher` injected as the ``phase_completion`` seam, which evaluates
+    ``[phase] verify`` against the phase-branch tree, pushes the phase branch,
+    and opens or refreshes exactly one aggregate PR onto the true base. The
+    phase stays ``active/`` until that PR merges. ``gh`` overrides the ``gh``
+    CLI runner the publisher shells to (tests inject a fake); ``None`` uses the
+    real CLI. The publisher is built only for the phase strategy, so ``merge``
+    and ``pr`` callers keep today's archival behavior byte-for-byte.
     """
     resolved_true_base = true_base
     if resolved_true_base is None and policy is not None:
@@ -2216,18 +2229,50 @@ def archive_phases(
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         claims = build_claim_store(policy, db_path=db_path)
+        # Phase-strategy completion seam (spec 00079, criterion 3): the true
+        # base for the phase PR is the operator's base (``submit_pr_base`` or
+        # the worker's resolved ``landing_base``), never the phase branch. The
+        # publisher is imported lazily here -- ``pr`` imports ``worker`` -- so
+        # the module cycle stays broken exactly as the submit-strategy registry
+        # does it.
+        phase_completion: Callable[[Path, list[Task]], None] | None = None
+        if (
+            policy is not None
+            and policy.submit_strategy == "phase"
+            and repo_root is not None
+        ):
+            pr_base = policy.submit_pr_base or landing_base
+            if pr_base is not None:
+                from flywheel_worktree.pr import PhasePrPublisher
+
+                phase_completion = PhasePrPublisher(
+                    store=store,
+                    repo_root=repo_root,
+                    tasks_dir=tasks_dir,
+                    remote=policy.submit_remote,
+                    pr_base=pr_base,
+                    phase_verify=policy.phase_verify,
+                    log=log,
+                    gh=gh,
+                )
         try:
             moved = archive_completed_phases(
                 tasks_dir,
                 store,
                 repo_root=repo_root,
                 log=log,
+                # The phase publisher runs ``[phase] verify`` against the
+                # phase-branch tree itself, so the repo-root phase-verify gate
+                # is suppressed on the phase path (it would gate the wrong tree).
                 phase_verify=(
-                    policy.phase_verify if policy is not None else None
+                    None
+                    if phase_completion is not None
+                    else (policy.phase_verify if policy is not None else None)
                 ),
                 landing_base=landing_base,
                 true_base=resolved_true_base,
                 claims=claims,
+                phase_completion=phase_completion,
             )
         finally:
             claims.close()

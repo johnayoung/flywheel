@@ -585,6 +585,108 @@ def _format_landing_refusal(
     )
 
 
+class _PhaseMergeState(Enum):
+    """The archive sweep's phase-branch merge verdict (spec 00079, D-2/D-3).
+
+    ``MERGED`` -- the phase integration branch tip is an ancestor of the true
+    base: the phase PR merged as a merge commit, so ``git revert -m 1`` reverts
+    the whole phase and the review unit is real. ``UNMERGED`` -- the branch
+    exists, its tip is not an ancestor, and it still carries changes the true
+    base lacks (an open phase PR). ``MERGE_METHOD_MISMATCH`` -- the branch's
+    content is already applied to the true base but its tip is not an ancestor
+    (a squash or rebase merge discarded the branch commit); a DISTINCT, visible
+    reason so a squash-merged phase is never a silent forever-block, never the
+    generic open-PR reason.
+    """
+
+    MERGED = "merged"
+    UNMERGED = "unmerged"
+    MERGE_METHOD_MISMATCH = "merge-method-mismatch"
+
+
+def _resolve_phase_branch_tip(
+    repo_root: Path, phase_branch: str
+) -> str | None:
+    """Resolve the phase integration branch tip commit, or ``None``.
+
+    The phase strategy lands each task onto ``flywheel/phase/<phase>`` (spec
+    00079); that ref's existence is the git-truth signal the phase is under
+    phase-branch landing. Resolved via ``git rev-parse --verify --quiet`` the
+    same way :func:`_resolve_task_head` resolves a task branch, so the sweep
+    reads merge state offline without importing the worktree package. ``None``
+    when the ref does not exist -- under the merge/pr strategies no such branch
+    is ever created (criterion 9), and a phase branch deleted after a clean
+    merge is likewise gone -- so the merge gate simply never arms and the
+    spec-00077 per-task landed predicate (receipt or ancestry) remains the
+    fail-closed backstop for genuinely lost work.
+    """
+    rc, out = _git_capture(
+        repo_root,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{phase_branch}",
+    )
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _probe_phase_merge(
+    repo_root: Path, phase_tip: str, true_base: str
+) -> _PhaseMergeState:
+    """Decide whether a phase branch has merged into the true base (D-2/D-3).
+
+    Merged-ness is git ancestry, never a remote PR state string (D-3): only a
+    merge-commit merge keeps ``phase_tip`` reachable from ``true_base`` and
+    gives ``git revert -m 1`` of the whole phase. When the tip is not an
+    ancestor the sweep distinguishes a genuinely open PR from a squash/rebase
+    merge by comparing the two commits' trees (``git diff --quiet``): a
+    squash/rebase merge applies the phase's content to the true base while
+    discarding the branch commit, so the trees match though ancestry is broken
+    -- surfaced as a distinct mismatch rather than the generic open-PR block so
+    it is never a silent forever-loop. Both signals are git-truth, checkable
+    offline; neither trusts the remote's ``merged`` claim.
+    """
+    if _is_ancestor(repo_root, phase_tip, true_base):
+        return _PhaseMergeState.MERGED
+    rc, _ = _git_capture(repo_root, "diff", "--quiet", true_base, phase_tip)
+    if rc == 0:
+        return _PhaseMergeState.MERGE_METHOD_MISMATCH
+    return _PhaseMergeState.UNMERGED
+
+
+def _format_phase_merge_refusal(
+    phase_dir: Path, phase_branch: str, state: _PhaseMergeState
+) -> str:
+    """Render the refusal for a phase whose integration branch has not merged.
+
+    The unmerged (open PR) and squash/rebase mismatch causes read differently
+    -- the first waits on a human (or the merge queue) to merge the phase PR,
+    the second needs the phase re-merged with a merge commit or the strand
+    resolved -- so the operator's next step is unambiguous and neither state is
+    a silent non-archival. Uses the same ``Callable[[str], None]`` log seam the
+    landing/loop-path/phase-verify refusals use.
+    """
+    if state is _PhaseMergeState.MERGE_METHOD_MISMATCH:
+        cause = (
+            f"its integration branch {phase_branch} is not an ancestor of the "
+            f"true base but its content is already applied there -- a squash or "
+            f"rebase merge discarded the branch commit (merge-method mismatch); "
+            f"re-merge the phase PR with a merge commit or resolve the strand"
+        )
+    else:
+        cause = (
+            f"its integration branch {phase_branch} is not an ancestor of the "
+            f"true base -- the phase PR is still open; archival waits for it to "
+            f"merge (the worker performs no local merge of the phase branch)"
+        )
+    return (
+        f"Refusing to archive phase {phase_dir.name}: the phase PR is not "
+        f"merged -- {cause}"
+    )
+
+
 def _record_indeterminate_landing(
     claims: SqliteClaimStore | PostgresClaimStore,
     task_id: str,
@@ -654,6 +756,7 @@ def archive_completed_phases(
     log: Callable[[str], None] | None = None,
     phase_verify: str | None = None,
     landing_base: str | None = None,
+    true_base: str | None = None,
     claims: SqliteClaimStore | PostgresClaimStore | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> list[Path]:
@@ -678,6 +781,23 @@ def archive_completed_phases(
     ``None`` for either preserves the legacy DONE-only archival contract, so
     callers that pass neither (and the synthetic archive/loop-path tests) keep
     their previous behavior.
+
+    ``true_base`` arms the phase-branch merge predicate (spec 00079, criteria
+    4/5/6/8, D-2/D-3): under the phase strategy each task lands on the phase
+    integration branch ``flywheel/phase/<phase>``, and the completed phase is a
+    review unit that archives only once that branch tip is an ancestor of the
+    true base -- i.e. the phase PR merged as a merge commit (git ancestry, never
+    a remote ``merged`` claim). The gate arms per-phase on the existence of that
+    branch (never created under the merge/pr strategies, so those repos are
+    byte-identical -- criterion 9) with the resolved ``true_base`` ref every
+    archival caller threads (criterion 8). An unmerged branch keeps the phase in
+    ``active/`` with the open PR surfaced via ``log`` and never advances the
+    true base itself (the worker performs no local merge); a squash/rebase merge
+    (content applied, ancestry broken) surfaces a distinct merge-method-mismatch
+    reason rather than a silent forever-block. It runs AFTER the spec-00077
+    per-task landed predicate, so a DONE-but-parked strand still blocks first and
+    independently. ``None`` (or a phase with no integration branch) leaves the
+    gate disarmed.
 
     When ``repo_root`` is supplied, the phase's cumulative diff vs its
     recorded ``.loop-base`` is inspected for the watched loop-path signals
@@ -794,6 +914,37 @@ def archive_completed_phases(
                     )
             if blocking:
                 continue
+
+        # Phase-branch merge predicate (spec 00079, criteria 4/5/6/8, D-2/D-3).
+        # Under the phase strategy each task lands on the phase integration
+        # branch ``flywheel/phase/<phase>``; the completed phase archives only
+        # once that branch tip is an ancestor of the true base -- the phase PR
+        # merged as a merge commit, which alone preserves ``git revert -m 1`` of
+        # the whole phase (D-3, merged-ness is git ancestry, never a remote PR
+        # state string). Armed per-phase on the existence of that branch (never
+        # created under merge/pr -- criterion 9) plus a threaded ``true_base``
+        # (criterion 8: every archival surface passes it). An unmerged branch
+        # (open PR) keeps the phase active with the PR surfaced and never
+        # advances the true base itself; a squash/rebase merge (content applied,
+        # ancestry broken) surfaces a DISTINCT merge-method-mismatch reason so it
+        # is never a silent forever-block. A branch deleted after a clean merge
+        # simply disarms the gate -- the spec-00077 per-task predicate above,
+        # which ran first, is the fail-closed backstop for genuinely lost work.
+        if repo_root is not None and true_base is not None:
+            phase_branch = f"flywheel/phase/{phase_dir.name}"
+            phase_tip = _resolve_phase_branch_tip(repo_root, phase_branch)
+            if phase_tip is not None:
+                merge_state = _probe_phase_merge(
+                    repo_root, phase_tip, true_base
+                )
+                if merge_state is not _PhaseMergeState.MERGED:
+                    if log is not None:
+                        log(
+                            _format_phase_merge_refusal(
+                                phase_dir, phase_branch, merge_state
+                            )
+                        )
+                    continue
 
         # Loop-path archive gate (FR-2): a non-empty marker requires either
         # a DONE in-loop-verification task or a recorded opt-out artifact.
@@ -2326,12 +2477,16 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         tasks_dir = DEFAULT_TASKS_DIR
     db_path = _resolve_db_path(args, policy)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    # Thread repo_root + landing_base so the CLI verb applies the same gates
-    # the worker's sweep does: the landed predicate (a phase archives only when
-    # every DONE task's work is landed), the loop-path gate, and any configured
-    # phase-verify. The landing base is the configured submit base, else the
-    # operator's checked-out branch (HEAD). Refusals print to stderr so the
-    # moved-dest stdout stays machine-parseable.
+    # Thread repo_root + landing_base + true_base so the CLI verb applies the
+    # same gates the worker's sweep does: the landed predicate (a phase archives
+    # only when every DONE task's work is landed), the phase-branch merge
+    # predicate (under the phase strategy a phase archives only when its
+    # integration branch merged into the true base -- criterion 8 forecloses the
+    # gateless CLI bypass), the loop-path gate, and any configured phase-verify.
+    # The landing/true base is the configured submit base, else the operator's
+    # checked-out branch (HEAD); the phase-merge gate arms only when a
+    # ``flywheel/phase/<phase>`` branch exists, so merge/pr repos are unchanged.
+    # Refusals print to stderr so the moved-dest stdout stays machine-parseable.
     repo_root = repo_root_for_tasks_dir(tasks_dir)
     landing_base = (
         policy.submit_base if policy is not None else None
@@ -2348,6 +2503,7 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                 log=lambda msg: print(msg, file=sys.stderr),
                 phase_verify=phase_verify,
                 landing_base=landing_base,
+                true_base=landing_base,
                 claims=claims,
             )
         finally:

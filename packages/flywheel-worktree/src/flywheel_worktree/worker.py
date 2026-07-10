@@ -2028,6 +2028,7 @@ def archive_phases(
     *,
     repo_root: Path | None = None,
     landing_base: str | None = None,
+    true_base: str | None = None,
     policy: WorkPolicy | None = None,
 ) -> None:
     """Move ``active/<phase>`` dirs whose tasks are all done into ``archive/``.
@@ -2050,6 +2051,16 @@ def archive_phases(
     seam tests that call this helper without a repo/base still archive on
     all-DONE.
 
+    ``true_base`` arms the phase-branch merge predicate (spec 00079, criteria
+    4/5/6/8): under the phase strategy a completed phase archives only when its
+    ``flywheel/phase/<phase>`` integration branch tip is an ancestor of the true
+    base (the phase PR merged as a merge commit). When not passed it is resolved
+    from the policy -- ``policy.submit_base``, else the operator's
+    currently-checked-out branch -- so the daemon's own sweep and a bare
+    ``archive_phases`` caller arm it identically. The predicate arms per-phase on
+    the existence of the integration branch, so ``merge``/``pr`` repos (which
+    never create one) are unaffected.
+
     ``policy`` selects the store backend through the orchestrator's store
     factory; ``None`` keeps the historical sqlite-on-``db_path`` behavior.
     A configured ``policy.phase_verify`` runs as the phase-exit integration
@@ -2062,6 +2073,11 @@ def archive_phases(
     archival is the verified resolution act, so the stranded/stopped status
     surface clears with the phase instead of rendering the stale stop forever.
     """
+    resolved_true_base = true_base
+    if resolved_true_base is None and policy is not None:
+        resolved_true_base = policy.submit_base
+    if resolved_true_base is None and repo_root is not None:
+        resolved_true_base = _checked_out_branch(repo_root)
     store = open_sqlite_bound_store(policy, db_path=db_path)
     try:
         claims = build_claim_store(policy, db_path=db_path)
@@ -2075,6 +2091,7 @@ def archive_phases(
                     policy.phase_verify if policy is not None else None
                 ),
                 landing_base=landing_base,
+                true_base=resolved_true_base,
                 claims=claims,
             )
         finally:

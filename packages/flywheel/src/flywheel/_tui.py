@@ -451,11 +451,17 @@ def _run_dashboard(
         Threads the same gates the worker/CLI sweeps apply so a manual
         console archive is not a weaker path: ``repo_root`` +
         ``landing_base`` arm the landed predicate (a phase archives only
-        when every DONE task's work is landed), ``phase_verify`` runs the
-        configured phase-exit gate, and the claim store carries the
-        stop-event ledger (stop-resolved markers on archive, and the
-        fail-closed indeterminate-landing strand surfaced in ``status``).
-        The landing base is the configured submit base, else ``HEAD``.
+        when every DONE task's work is landed), ``true_base`` arms the
+        phase-branch merge predicate (under the phase strategy a phase
+        archives only when its integration branch merged into the true
+        base -- criterion 8 keeps the console from being a gate-skip),
+        ``phase_verify`` runs the configured phase-exit gate, and the claim
+        store carries the stop-event ledger (stop-resolved markers on
+        archive, and the fail-closed indeterminate-landing strand surfaced
+        in ``status``). The landing/true base is the configured submit
+        base, else ``HEAD``; the phase-merge gate arms only when a
+        ``flywheel/phase/<phase>`` branch exists, so merge/pr repos are
+        unchanged.
         """
 
         if archive_tasks_dir is None:
@@ -473,6 +479,7 @@ def _run_dashboard(
                 repo_root=repo_root,
                 phase_verify=phase_verify,
                 landing_base=landing_base,
+                true_base=landing_base,
                 claims=claims,
             )
         finally:

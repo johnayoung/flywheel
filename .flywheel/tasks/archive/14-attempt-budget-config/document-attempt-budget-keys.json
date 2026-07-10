@@ -1,0 +1,37 @@
+{
+  "id": "document-attempt-budget-keys",
+  "goal": "docs/configuration.md documents the [deadlines] table and [sandbox.limits] rubric_judge_max_turns accurately enough that an operator can configure attempt budgets from the reference alone.",
+  "tags": ["docs", "config", "budgets"],
+  "prerequisites": ["attempt-budgets-from-toml", "autopilot-deadline-from-toml", "docker-management-deadline-from-toml"],
+  "conflict_keys": [
+    "docs/configuration.md"
+  ],
+  "graders": [
+    { "type": "command", "name": "keys-documented", "run": "grep -qF \"[deadlines]\" docs/configuration.md && grep -qF agent_iteration_seconds docs/configuration.md && grep -qF rubric_judge_seconds docs/configuration.md && grep -qF command_grader_seconds docs/configuration.md && grep -qF docker_management_seconds docs/configuration.md && grep -qF autopilot_agent_seconds docs/configuration.md && grep -qF rubric_judge_max_turns docs/configuration.md" },
+    { "type": "command", "name": "seam-holdout", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_policy.py packages/flywheel-orchestrator/tests/test_deadline_policy_threading.py packages/flywheel-orchestrator/tests/test_autopilot_deadline_policy.py packages/flywheel-container/tests/test_docker_management_policy_override.py packages/flywheel-core/tests/test_workflow_deadline_override.py" },
+    { "type": "rubric", "name": "doc-accuracy-screen", "assertions": [
+      "docs/configuration.md documents each [deadlines] key's default equal to the corresponding constant in packages/flywheel-core/src/flywheel_core/deadline_config.py (agent_iteration 3600, rubric_judge 600, command_grader 900, docker_management 120, autopilot_agent 1800 seconds) and states that 0 opts the class out (unbounded).",
+      "rubric_judge_max_turns is documented under [sandbox.limits] as the per-judge-call turn budget with default 32.",
+      "The additions follow the file's existing Key/Type/Default/Controls table format, add [deadlines] to the sections-at-a-glance table and to the not-rendered-by-init list, and contain no multi-paragraph prose."
+    ] }
+  ],
+  "context": {
+    "relevant": [
+      "docs/configuration.md -- the complete flywheel.toml reference; add a [deadlines] section and the [sandbox.limits] key row following the existing table conventions",
+      "packages/flywheel-core/src/flywheel_core/deadline_config.py -- authoritative key names, defaults, and the 0-as-opt-out spelling to document"
+    ],
+    "constraints": [
+      "Extremely concise house style: tables over prose, 1-2 sentence explanations, front-load the 0-opt-out semantics.",
+      "Document consumers honestly: [deadlines] governs the worker harness classes, the autopilot daemon, and the container backend's management calls as landed by the prerequisite tasks -- claim nothing the code does not do.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "No Python source or test changes -- a red seam-holdout means a prerequisite regressed and must be reported, not patched here.",
+      "Do not create any new documentation file; edit docs/configuration.md only.",
+      "Do not document CLI flags for these keys (none exist)."
+    ],
+    "edge_cases": [
+      "TOML cannot express None: the doc must give 0 as the on-disk opt-out spelling, not null/None."
+    ]
+  }
+}

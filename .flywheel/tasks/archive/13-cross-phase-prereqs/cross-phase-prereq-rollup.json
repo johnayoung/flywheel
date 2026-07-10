@@ -1,0 +1,58 @@
+{
+  "id": "cross-phase-prereq-rollup",
+  "goal": "status --rollup no longer reports a never-started dependent as blocked_by_prereq when its unlisted prerequisite has a DONE lifecycle in the store: unsatisfied_prerequisites (and the waiting-on detail) list only prerequisite ids without a DONE lifecycle.",
+  "prerequisites": ["cross-phase-prereq-scheduling"],
+  "tags": ["orchestrator", "status", "cross-phase-prereqs"],
+  "graders": [
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_rollup_store_prereqs.py",
+      "name": "behavior"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_rollup.py",
+      "name": "rollup-keep-green"
+    },
+    {
+      "type": "command",
+      "run": "uv run pytest packages/flywheel-orchestrator/tests/test_cross_phase_prereqs.py packages/flywheel-orchestrator/tests/test_rollup_store_prereqs.py",
+      "name": "seam-holdout"
+    },
+    {
+      "type": "rubric",
+      "name": "discrimination-screen",
+      "assertions": [
+        "test_rollup_store_prereqs.py contains a case where the unlisted prerequisite id has only a non-DONE lifecycle in the store and asserts the dependent still reports blocked_by_prereq with that id in unsatisfied_prerequisites",
+        "The rollup resolves prerequisite satisfaction through the same store-DONE predicate the scheduler uses (the seam landed by cross-phase-prereq-scheduling), not a re-implementation with different status semantics"
+      ]
+    }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_rollup.py -- build_rollup's second pass (~lines 167-194) and _DONE_STATUSES (~lines 47-52); build_rollup already receives the store handle",
+      "packages/flywheel-orchestrator/tests/test_rollup.py -- keep green unmodified",
+      "packages/flywheel-orchestrator/tests/test_cross_phase_prereqs.py -- the scheduler-side suite the seam-holdout composes with; keep green unmodified"
+    ],
+    "references": [
+      "The store-DONE satisfaction seam landed by cross-phase-prereq-scheduling in packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- consume it; docs/data-taxonomy.md is the authority rationale"
+    ],
+    "constraints": [
+      "A prerequisite is satisfied only by a DONE lifecycle; any other lifecycle status leaves it unsatisfied",
+      "Consult the store only for prerequisite ids absent from the classified row set -- fully-listed graphs must classify with no extra store reads",
+      "The rollup_to_json shape and RollupStatus vocabulary are stable consumer surfaces -- classification changes only, no schema changes",
+      "Commit the change with a clear message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify files under packages/flywheel-orchestrator/tests/ except to ADD the new test_rollup_store_prereqs.py; do not weaken or delete existing assertions",
+      "No scheduler or re-driver changes -- cross-phase-prereq-scheduling owns those",
+      "No renderer/format changes beyond the classification itself"
+    ],
+    "edge_cases": [
+      "A dependent with two unlisted prerequisites, one store-DONE and one with no lifecycle, reports blocked_by_prereq listing ONLY the genuinely missing id in unsatisfied_prerequisites and the waiting-on detail",
+      "An unlisted prerequisite with only a FAILED lifecycle keeps the dependent blocked_by_prereq",
+      "A dependent whose every prerequisite is store-DONE (all unlisted) reports not_started, exactly as if the prerequisites were listed and DONE"
+    ],
+    "notes": "docs/orchestration.md's rollup legend ('blocked_by_prereq: not started, and a prerequisite is not yet done') already reads correctly under store-lifecycle semantics -- verify, and only touch it if the surrounding text contradicts the new behavior."
+  }
+}

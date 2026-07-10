@@ -1,0 +1,42 @@
+{
+  "id": "fw-show-commit-lookup",
+  "goal": "fw show given a landed commit SHA renders that commit's producing run detail by reading its Flywheel-Run trailer, and exits non-zero naming the commit un-attributed when no such trailer is present.",
+  "tags": ["spec-00078", "commit-provenance-trailers"],
+  "prerequisites": ["merge-landing-trailer-stamp"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_show_commit_lookup.py -q" },
+    { "type": "command", "name": "show-surface-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_show_decisions.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- _cmd_show and its run-or-task-id resolution; module is over 800 lines, use serena symbols",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_history.py -- collect_run_detail / RunDetail, the renderer the lookup reuses unchanged",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- read-only: the shared trailer key constants the prerequisite task exported; resolve the value via git, do not re-derive the vocabulary",
+      "packages/flywheel-orchestrator/tests/test_show_decisions.py -- keep green, assertions unmodified"
+    ],
+    "references": [
+      ".flywheel/specs/00078-FEATURE-commit-provenance-trailers.md -- criteria 5, 6; decision D-3"
+    ],
+    "constraints": [
+      "Resolution is git-truth: read the Flywheel-Run trailer from the commit object in the repository; no new store columns, tables, or indexes",
+      "Existing fw show behavior for run ids and task ids is byte-identical; SHA handling only engages when the argument resolves to a commit object and not to a known run or task",
+      "An un-attributed commit (no Flywheel-Run trailer) is a hard non-zero exit naming the commit -- never a fuzzy fallback to a nearby run",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not add a new CLI verb; this extends the argument resolution of the existing show verb",
+      "Do not modify the stamping engine or either submit strategy",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A commit whose Flywheel-Run trailer names a run absent from the store exits non-zero naming the missing run id -- distinct from the un-attributed message",
+      "An argument that is neither a known run id, task id, nor resolvable commit keeps today's error behavior",
+      "The rendered detail for a SHA is the same run-detail view fw show renders for the run id itself, including the landed line"
+    ]
+  }
+}

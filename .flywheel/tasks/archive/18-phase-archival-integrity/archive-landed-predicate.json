@@ -1,0 +1,51 @@
+{
+  "id": "archive-landed-predicate",
+  "goal": "The archive sweep archives a phase only when every DONE task's work is landed -- a Landed receipt on its latest run or an ancestry probe confirming its recorded work is reachable from the landing base -- otherwise leaving the phase active with the blocking task id reported, and a task whose landing state cannot be determined fails closed as a surfaced indeterminate-landing strand instead of counting as landed.",
+  "tags": ["spec-00077", "phase-archival-integrity"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+    "packages/flywheel/src/flywheel/_tui.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "bash -c 's=$(uv run pytest packages/flywheel-orchestrator/tests/test_archive_landed_predicate.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "sweep-and-status-pins", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py -q" },
+    { "type": "command", "name": "worker-archive-seam", "run": "uv run pytest packages/flywheel-worktree/tests/test_worker.py -k archive -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator packages/flywheel-worktree packages/flywheel" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- archive_completed_phases (~382-511) is the predicate to change; it already threads repo_root, phase_verify, claims, and a log callable; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- archive_phases (~1228) is the worktree caller to keep threading; GitWorktreeSubmitter._is_ancestor (~928) shows the ancestry-probe primitive (git merge-base --is-ancestor); branch naming flywheel/<phase>/<task-id> lives in _branch (~375); module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/src/flywheel_core/events.py -- Landed (~293, strategy + landed_ref) is the landing receipt; LandingParked (~255) marks the strand",
+      "packages/flywheel/src/flywheel/_tui.py -- the /archive action calls archive_completed_phases(archive_tasks_dir, store) (~452); third call site, update it in this change",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- archive, loop-path-gate, loop-base, and status suites: keep green, assertions unmodified",
+      "packages/flywheel-worktree/tests/test_worker.py -- the -k archive tests: keep green, assertions unmodified",
+      "packages/flywheel-orchestrator/tests/test_archive_landed_predicate.py -- new test file this task must add; the behavior grader runs exactly this path"
+    ],
+    "references": [
+      ".flywheel/specs/00077-FEATURE-phase-archival-integrity.md -- criteria 1, 2, 7; decisions D-1 and D-4"
+    ],
+    "constraints": [
+      "D-1: a DONE task counts landed when a Landed domain event exists on its latest run (fast path) OR the ancestry probe confirms its recorded work is an ancestor of the landing base at sweep time (git merge-base --is-ancestor); hand-landed receipt-less work must archive via ancestry alone",
+      "D-4: no receipt and no resolvable branch/recorded head fails closed -- the phase stays active and the sweep records a stop event with the stable kind token \"indeterminate-landing\" keyed to the task id so flywheel status surfaces it; cannot-check never counts as landed",
+      "A blocked phase's refusal names the blocking task id through the existing log callable, the same seam the loop-path and phase-verify refusals use",
+      "Must not regress: a phase with any non-DONE task stays active; the loop-path archive gate; the phase_verify exit gate; .loop-base materialization on archive; the dest.exists() no-clobber guard",
+      "Layering: flywheel-orchestrator must not import flywheel_worktree -- run the probe via a git subprocess against the already-threaded repo_root (the module already shells out for phase_verify and phase-diff) or accept a probe callable threaded from callers",
+      "Update every archive_completed_phases call site in this same change: worker.archive_phases (worktree ~1262), _cmd_archive (_workflow.py ~1763, thread repo_root so the CLI verb can probe), and the TUI /archive action (_tui.py ~452)",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change stop-event resolution stamping or add attribution -- that is strand-resolution-attribution's slice",
+      "Do not recover, rebase, or land stranded branches (spec 00076 owns recovery)",
+      "Do not modify or weaken assertions in the pinned test files",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "A probe that always answers landed must fail: the criterion-1 harness has a divergent-base strand whose head is NOT an ancestor of the base, and the phase must stay active",
+      "Over-blocking must fail: an all-landed phase with receipts for some tasks and ancestry-only evidence (hand-landed, no receipt, branch may be gone) for another archives in one sweep",
+      "Repeated sweeps over a blocked phase stay idempotent -- no unbounded indeterminate-marker flood (cf. test_status_surfaces_recurring_stop_once_without_crashing)",
+      "A deleted branch after a clean receipted land still counts landed via the receipt fast path"
+    ]
+  }
+}

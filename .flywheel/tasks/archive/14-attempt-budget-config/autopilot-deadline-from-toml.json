@@ -1,0 +1,31 @@
+{
+  "id": "autopilot-deadline-from-toml",
+  "goal": "The autopilot daemon's discovery and authoring agent calls run under the [deadlines] autopilot_agent_seconds ceiling resolved from flywheel.toml rather than the built-in default.",
+  "tags": ["config", "budgets", "autopilot", "spec-00066"],
+  "prerequisites": ["attempt-budgets-from-toml"],
+  "graders": [
+    { "type": "command", "name": "policy-override-behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_deadline_policy.py" },
+    { "type": "command", "name": "existing-deadline-surface", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_autopilot_agent_deadline.py packages/flywheel-orchestrator/tests/test_autopilot_daemon.py" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- run_single_pass and the daemon loop call run_refill_pass without deadlines (line ~166); thread the policy-resolved WorkPolicy.deadlines through here",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- run_refill_pass already accepts deadlines: DeadlineConfig | None (line 1644) and applies the AUTOPILOT_AGENT class; the seam exists, consume it. LARGE FILE: use serena find_symbol",
+      "packages/flywheel-orchestrator/tests/test_autopilot_agent_deadline.py -- existing ceiling-to-timeout behavior tests; keep green",
+      "packages/flywheel-orchestrator/tests/test_autopilot_daemon.py -- daemon wiring surface; keep green"
+    ],
+    "constraints": [
+      "Thread WorkPolicy.deadlines (field created by the prerequisite task) from the policy through run_single_pass and the daemon cycle into run_refill_pass(deadlines=...); a None policy keeps DeadlineConfig() defaults byte-identical.",
+      "packages/flywheel-orchestrator/tests/test_autopilot_deadline_policy.py (create at exactly this path) must prove a flywheel.toml override takes effect: either a tiny autopilot_agent_seconds (e.g. 0.05) with a stalling scripted invoker yields a timeout-classified outcome in bounded wall time, or the DeadlineConfig captured at the run_refill_pass seam equals the policy-resolved one -- including the 0-opt-out case.",
+      "Commit the change with a clear message before reporting done."
+    ],
+    "non_goals": [
+      "Do not modify _autopilot.py's deadline application (spec 00066 already shipped it) beyond consuming the existing parameter.",
+      "Do not modify existing tests; do not weaken or delete assertions.",
+      "No new CLI flags; no docs edits (sibling task)."
+    ],
+    "edge_cases": [
+      "autopilot_agent_seconds = 0 opts the class out: run_refill_pass must receive the resolved None ceiling, not the 1800s default."
+    ]
+  }
+}

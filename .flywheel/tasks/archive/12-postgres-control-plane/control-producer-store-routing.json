@@ -1,0 +1,55 @@
+{
+  "id": "control-producer-store-routing",
+  "goal": "An fw approve, reject, say, or interrupt issued while [store] backend = postgres persists its control command into the configured postgres database and prints the standard enqueue receipt, instead of failing with 'unknown to this store' against a sqlite file.",
+  "tags": ["postgres-control-plane"],
+  "conflict_keys": [
+    "packages/flywheel-core/src/flywheel_core/workflow.py",
+    "packages/flywheel/src/flywheel/_cli.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior-postgres", "run": "bash -c 's=$(uv run pytest packages/flywheel/tests/test_fw_producer_postgres.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "sqlite-producer-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_workflow.py -q -k \"cmd_interrupt or cmd_steer or cmd_set_model or cmd_approve or cmd_reject\"" },
+    { "type": "command", "name": "fw-router-unchanged", "run": "uv run pytest packages/flywheel/tests/test_fw_router.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator packages/flywheel" },
+    { "type": "rubric", "name": "producer-path-screen", "assertions": [
+      "The new postgres producer test drives the product CLI entrypoint (flywheel._cli.main with verb argv) for every verb it covers; it never enqueues by calling a store object's enqueue_command directly.",
+      "The new postgres producer test asserts that no sqlite database file exists at the resolved db path after a postgres-backed enqueue."
+    ]}
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-core/src/flywheel_core/workflow.py -- _enqueue_control_command (~line 1181) opens SqliteStore(db_path) unconditionally; its five callers _cmd_interrupt/_cmd_steer/_cmd_set_model/_cmd_approve/_cmd_reject share it; run_task_object (~lines 824-836) shows the spec-00075 owned_backend/injected-store seam to mirror; large module, use serena symbols",
+      "packages/flywheel/src/flywheel/_cli.py -- the fw router: _CORE_VERBS (approve/reject/interrupt, plus say->steer) currently forward to flywheel_core.workflow.main; _delegate_audit already demonstrates load_effective_policy(None) + resolve_db_path inside the router",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_store_factory.py -- build_store / open_sqlite_bound_store: the policy-driven construction point every backend-aware verb routes through",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py -- load_effective_policy (line 816), resolve_db_path (line 859), and the sibling verbs' store = open_sqlite_bound_store(policy, db_path=db_path) pattern; very large module, use serena symbols",
+      "packages/flywheel-orchestrator/tests/test_workflow.py -- the test_cmd_* producer tests (~lines 3019-3400): keep green, assertions unmodified",
+      "packages/flywheel/tests/test_fw_router.py -- sqlite behavior pins for fw interrupt/say/approve/reject: keep green, assertions unmodified",
+      "conftest.py -- root session-scoped postgres_dsn/require_postgres fixtures backing every postgres-parametrized test",
+      "packages/flywheel-orchestrator/tests/test_postgres_data_plane.py -- the pattern for postgres-backed tests: unique [store] schema per test, FLYWHEEL_PG_DSN, skip only when no database is reachable"
+    ],
+    "references": [
+      ".flywheel/specs/00075-FEATURE-distributed-store-unification.md -- the data-plane store injection this task extends to the control-command queue",
+      ".flywheel/proposals/overnight-2026-07-08.md -- P1, root cause (a)"
+    ],
+    "constraints": [
+      "Layering is non-negotiable: flywheel_core must not import flywheel_orchestrator and must not read flywheel.toml; backend/policy resolution happens in the layer that already owns it (the fw router or the orchestrator verbs), reaching core through a store-injection seam like run_task_object's store parameter",
+      "Default-sqlite behavior stays byte-identical for both python -m flywheel_core.workflow and fw: same receipts, same exit codes, same --db semantics -- the two pinned suites prove it",
+      "All five producer verbs (interrupt, steer/say, set_model, approve, reject) route through the same seam; fixing approve alone fails this task",
+      "An unknown run_id under postgres still exits 2 with the producer-side 'unknown to this store' error and persists nothing",
+      "The new test file is packages/flywheel/tests/test_fw_producer_postgres.py; it must exercise at least approve (AWAITING_APPROVAL in-flight branch), say or interrupt (RUNNING/VALIDATING branch), and the unknown-run exit-2 path, all against postgres",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not touch the console/TUI enqueue wiring: _tui.py already builds its store through open_sqlite_bound_store (line 402), so the fw console session screen is backend-correct today -- leave it alone",
+      "Do not touch the consumer side: the control watcher, resolve_manual_approval, or the orchestrate approval sweep (a sibling task owns the sweep)",
+      "Do not modify, weaken, or delete assertions in packages/flywheel-orchestrator/tests/test_workflow.py or packages/flywheel/tests/test_fw_router.py",
+      "Do not add new flywheel.toml keys or CLI flags",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Dual-write must fail: under backend = postgres the producer must not create a sqlite file at the resolved db path (the old code's db_path.parent.mkdir + SqliteStore(db_path) would) -- assert file absence",
+      "The not-in-flight stderr note must survive the port: approve/reject treat AWAITING_APPROVAL as in-flight, everything else RUNNING/VALIDATING",
+      "FLYWHEEL_PG_DSN wins over DATABASE_URL; backend = postgres with neither set fails loud with the factory's StoreConfigError (exit 2), never a silent sqlite fallback"
+    ]
+  }
+}

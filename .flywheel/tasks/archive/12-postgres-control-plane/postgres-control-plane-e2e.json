@@ -1,0 +1,49 @@
+{
+  "id": "postgres-control-plane-e2e",
+  "goal": "Under [store] backend = postgres, an fw approve issued against a parked awaiting-approval run is consumed by an already-running orchestrate session and the lifecycle reaches DONE, with no session recycling and no sqlite artifact.",
+  "prerequisites": ["control-producer-store-routing", "approval-sweep-mark-expiry"],
+  "tags": ["postgres-control-plane"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py",
+    "packages/flywheel-core/src/flywheel_core/workflow.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior-e2e", "run": "bash -c 's=$(uv run pytest packages/flywheel/tests/test_postgres_control_plane_e2e.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "producer-suite", "run": "bash -c 's=$(uv run pytest packages/flywheel/tests/test_fw_producer_postgres.py -q 2>&1); r=$?; echo \"$s\"; [ \"$r\" -eq 0 ] || exit 1; echo \"$s\" | grep -qi skipped && exit 1; echo \"$s\" | grep -q \" passed\"'" },
+    { "type": "command", "name": "expiry-suite", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_orchestrator_approval_expiry.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-core packages/flywheel-orchestrator packages/flywheel" },
+    { "type": "rubric", "name": "e2e-shape-screen", "assertions": [
+      "The e2e test issues the approve through the product CLI entrypoint (flywheel._cli.main) while a single orchestrate session is still running, and only after that session has already swept the parked run once with no pending command; the DONE assertion is made before any second orchestrate call.",
+      "The e2e test selects the postgres backend through policy ([store] backend = postgres with a unique schema) for both the orchestrate session and the CLI invocation, and asserts no sqlite file exists at the resolved db path."
+    ]}
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/tests/test_postgres_data_plane.py -- the pattern to mirror: postgres policy with unique schema, FLYWHEEL_PG_DSN, fake invoke driving orchestrate, sqlite-absence assertions",
+      "packages/flywheel/tests/test_fw_producer_postgres.py -- prerequisite producer test (read-only): the CLI-under-postgres harness in this package",
+      "packages/flywheel-orchestrator/tests/test_orchestrator_approval_expiry.py -- prerequisite in-session consumption scenario (read-only): the sqlite twin of this test",
+      "packages/flywheel/src/flywheel/_cli.py -- the entrypoint the test drives; policy auto-detection is flywheel.toml in the working directory (load_effective_policy)",
+      "conftest.py -- root session-scoped postgres fixtures"
+    ],
+    "references": [
+      ".flywheel/proposals/overnight-2026-07-08.md -- P1's stated outcome; this test is its proof"
+    ],
+    "constraints": [
+      "This is the phase's composition holdout: it adds product code only where the composed scenario exposes a residual wiring gap, and it must pass by fixing product code, never by weakening the scenario below the rubric's shape",
+      "The CLI invocation and the orchestrate session must resolve the same postgres schema through the same policy surface (a flywheel.toml written to the test's working directory, or an equivalent explicit policy given to both)",
+      "The session is kept alive by scheduled work (e.g. a second task whose fake invoke performs the CLI enqueue and advances the injected clock), never by sleeps or polling threads",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify the prerequisite tasks' test files or any existing test assertions",
+      "Do not extend scope to reject/say/interrupt consumption; producer coverage for those verbs lives in the prerequisite task",
+      "Do not touch the console/TUI wiring (verified backend-correct via open_sqlite_bound_store at _tui.py line 402)",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Enqueue timing is the discriminator: an approve enqueued before the session's first empty sweep of the parked run would pass on pre-expiry code and prove nothing -- the test must enqueue strictly after that sweep",
+      "Assert sqlite absence at the resolved db path both mid-session and after the session returns",
+      "A pg-unavailable skip must not vacuously pass: the wrapped grader command already fails on 'skipped' output"
+    ]
+  }
+}

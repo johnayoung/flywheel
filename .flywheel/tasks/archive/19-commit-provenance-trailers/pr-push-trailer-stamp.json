@@ -1,0 +1,42 @@
+{
+  "id": "pr-push-trailer-stamp",
+  "goal": "Every commit the pr strategy pushes beyond the PR base carries the harness-derived Flywheel trailers before the pull request is opened or refreshed.",
+  "tags": ["spec-00078", "commit-provenance-trailers"],
+  "prerequisites": ["merge-landing-trailer-stamp"],
+  "conflict_keys": [
+    "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+    "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_pr_trailers.py -q" },
+    { "type": "command", "name": "pr-paths-unchanged", "run": "uv run pytest packages/flywheel-worktree/tests/test_pr_strategy.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-worktree" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-worktree/src/flywheel_worktree/pr.py -- GitPullRequestSubmitter._submit (stamp between the protected-paths check and the push), _ensure_pr, the injectable GhRunner seam for tests",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- reuse the stamping engine and trailer constants the prerequisite task exported; module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/tests/test_pr_strategy.py -- keep green, assertions unmodified; also the stub-gh harness pattern to mirror"
+    ],
+    "references": [
+      ".flywheel/specs/00078-FEATURE-commit-provenance-trailers.md -- criterion 2; decisions D-1, D-2"
+    ],
+    "constraints": [
+      "Stamp the pushed range (pr_base..branch) with the same shared trailer constants and value derivation as the merge path -- no second vocabulary",
+      "Stamping precedes the push, and the push precedes PR create/edit; the branch on the remote never lacks trailers while a PR references it",
+      "Message-only rewrite with trees byte-identical, same as the merge path",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change the PR body rendering (render_pr_body) or PR title format",
+      "Do not change park semantics (protected-paths, push-failed) on the pr path",
+      "Do not weaken, delete, or modify existing assertions in test_pr_strategy.py",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "The refresh path (an open PR already exists, gh pr edit) also pushes stamped commits -- both create and refresh flows covered",
+      "The push already uses --force-with-lease; the stamp's history rewrite must not turn a first push into a failure",
+      "A forged Flywheel-Run trailer on a pushed commit is replaced, same as the merge path"
+    ]
+  }
+}

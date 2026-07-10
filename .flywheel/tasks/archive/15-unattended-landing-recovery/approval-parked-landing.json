@@ -1,0 +1,47 @@
+{
+  "id": "approval-parked-landing",
+  "goal": "A run parked AWAITING_APPROVAL lands its branch through the standard landing ladder on the pass that consumes its approve command, with no operator-issued git commands.",
+  "tags": ["spec-00076", "unattended-landing-recovery"],
+  "conflict_keys": [
+    "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+  ],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-worktree/tests/test_approval_landing.py -q" },
+    { "type": "command", "name": "approval-resolution-unchanged", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_redriver_human_gates.py packages/flywheel-orchestrator/tests/test_steering_bridge.py packages/flywheel-core/tests/test_grader_manual.py -q" },
+    { "type": "command", "name": "gate-seam-holdout", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_held_out_gate_landing.py packages/flywheel-orchestrator/tests/test_gate_verdict_record.py packages/flywheel-orchestrator/tests/test_orchestrator_submit_seam.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator packages/flywheel-worktree" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py -- the reactive approval-resolve block (resolve_manual_approval call, ~lines 2582-2634) and _drive_under_lease's gate-evaluate + verdict-record + submit sequence (~lines 3320-3400) it must reuse; module is over 800 lines, use serena symbols",
+      "packages/flywheel-core/src/flywheel_core/harness.py -- resolve_manual_approval / ResolveApprovalOutcome (reasons incl. approved_done); read-only, module is over 800 lines, use serena symbols",
+      "packages/flywheel-worktree/src/flywheel_worktree/worker.py -- run_once wiring and GitWorktreeSubmitter._submit/_teardown_on_failure (where the AWAITING_APPROVAL worktree parks today); read-only reference, use serena symbols",
+      "packages/flywheel-orchestrator/tests/test_steering_bridge.py -- the approve-command enqueue/consume harness pattern to mirror; keep green",
+      "packages/flywheel-orchestrator/tests/test_redriver_human_gates.py -- keep green, assertions unmodified (the sweep must still never auto-approve)",
+      "packages/flywheel-worktree/tests/test_landing_record.py -- the real-git harness + recording-ledger pattern to mirror"
+    ],
+    "references": [
+      ".flywheel/specs/00076-FEATURE-unattended-landing-recovery.md -- criterion 5; decision D-2",
+      "docs/held-out-gate.md -- the gate runs between finalize and submit; the post-approval land must clear the same bar"
+    ],
+    "constraints": [
+      "The post-approval land reuses the existing held-out gate evaluation + verdict-record + strategy.submit path -- do not fork a second landing path; gate evaluation fails closed identically (D-2)",
+      "Only a resolution with reason approved_done lands; approved_next_gate, rejected_retry, rejected_failed, and no_pending_command behave byte-for-byte as today",
+      "The landing uses the branch/worktree preserved at park time and flows through the strategy's full ladder (FF, rebase + re-verify, and any recovery rungs present) -- never a blind FF and never a raw ref write",
+      "The behavior test drives the approve command through the sqlite store so this task stays independent of phase 12-postgres-control-plane",
+      "Commit the change (Conventional Commits) before reporting done"
+    ],
+    "non_goals": [
+      "Do not change resolve_manual_approval's lifecycle semantics in flywheel_core -- the harness owns transitions",
+      "Do not weaken, delete, or modify existing assertions in the pinned test files",
+      "No changes to approve/reject command consumption under the postgres store (phase 12 owns that)",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Criterion 5: the base ref advances to include the branch (git merge-base --is-ancestor exits 0) with grader/verify receipts recorded by the machinery, and the test issues no git commands of its own after enqueueing the approve",
+      "A base that advanced while the run awaited approval must route through the rebase/recovery rungs, not fail silently",
+      "Approval consumed but the parked worktree or branch is gone (retention destroyed it): the pass must not crash and must leave a queryable park/strand surface -- never a silent DONE-without-landing",
+      "A held-out gate that fails against the parked content suppresses the land and parks with the held-out-gate kind, exactly as on first-attempt landing"
+    ]
+  }
+}

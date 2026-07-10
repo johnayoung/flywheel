@@ -145,11 +145,11 @@ Worker pool size, checkpoint-nudge threshold, and session-pause ceiling for a si
 
 ## `[submit]` (optional)
 
-How DONE work leaves the loop. An absent table means historical merge landing. See [strategy.md](strategy.md) for the two shipped strategies and the protected-paths contract.
+How DONE work leaves the loop. An absent table means historical merge landing. See [strategy.md](strategy.md) for the shipped strategies and the protected-paths contract.
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
-| `strategy` | enum `merge`/`pr` | `merge` | how DONE work lands; routed via the `SUBMIT_STRATEGIES` registry |
+| `strategy` | enum `merge`/`pr`/`phase` | `merge` | how DONE work lands; routed via the `SUBMIT_STRATEGIES` registry; ignored for routing when `[[submit.tiers]]` is configured |
 | `protected_paths` | list of glob | `[]` | repo-relative globs (`PurePath.full_match`, `**` crosses dirs) a finished branch may not touch; a match refuses landing and parks the work |
 | `remote` | str | `origin` | `pr` strategy push target |
 | `pr_base` | str | unset (worker base branch) | `pr` strategy PR base branch |
@@ -163,6 +163,27 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 `verify` is the "trunk must always build" gate (spec 00064): repo-wide and independent of the task's own (often crate-scoped) command graders, it catches a *semantic merge skew* where two independently-valid changes union into a tree that does not build. It runs serialized under the merge lock — a slow command bottlenecks landings — and inherits the resolved `[sandbox.env]`. Example: `verify = "cargo build --workspace --tests"` or `verify = "uv run pytest"`.
 
 `recovery_agent_max_turns` / `recovery_agent_max_wall_seconds` arm the `merge` strategy's last recovery rung (spec 00077): when FF, rebase, and the merge-fallback all hit a textual conflict, a single bounded agent session resolves the conflict markers and stages the result. The resolved tree lands only after re-running the task's command graders, `[submit] verify`, and the declared held-out gate — the same out-of-band bar every other land clears; any failure parks the run preserved with the session's turn/wall usage recorded on the ledger. A land from this rung records `rung="agent-resolved"`. Both bounds are wrong-type / out-of-range validated at load (a bad value raises `PolicyError` naming the key) so a typo never silently disables or unbounds the rung. Setting `recovery_agent_max_turns = 0` keeps the historical merge-conflict park.
+
+### `[[submit.tiers]]` (optional, spec 00080)
+
+Risk-tiered landing: route each DONE task by the highest tier its changed files classify at, instead of one repo-global strategy. Array of tables, each with exactly `tier` and `paths`:
+
+```toml
+[[submit.tiers]]
+tier = 0                      # lands via merge, direct
+paths = ["docs/**", "*.md"]
+
+[[submit.tiers]]
+tier = 2                      # lands via pr, human approval
+paths = ["scripts/**"]
+```
+
+- Tiers: `0` = merge (direct), `1` = phase integration branch, `2` = PR. Highest tier of any touched file wins; a file matching no rule defaults to tier `1`.
+- `paths` use `protected_paths` glob semantics (`PurePath.full_match`, `**` crosses dirs) over the branch's merge-base-scoped diff.
+- Classification is worker-side only; the policy file itself always classifies tier `2`, so a branch editing these rules cannot cheapen its own route.
+- `protected_paths` outranks every tier (a protected file parks; tier 2 is a landing route, protection is a refusal).
+- Each decision is recorded on the run's ledger (`LandingRouted`: per-file tiers, winning tier, strategy).
+- Absent: landing is byte-identical to `[submit] strategy`.
 
 ## `[phase]` (optional)
 

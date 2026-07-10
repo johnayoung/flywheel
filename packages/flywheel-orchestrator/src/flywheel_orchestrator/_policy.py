@@ -410,6 +410,33 @@ _CONTAINER_AUTH_MODES: tuple[str, ...] = ("oauth", "session", "api_key", "none")
 _RETENTION_ON_DONE: tuple[str, ...] = ("destroy", "preserve")
 _RETENTION_ON_FAILURE: tuple[str, ...] = ("park", "destroy")
 
+#: The closed risk-tier vocabulary of ``[[submit.tiers]]`` (spec 00080):
+#: tier 0 lands direct (merge), tier 1 lands on the phase integration branch
+#: (phase), tier 2 goes to a PR requiring human approval (pr). A file matching
+#: no rule defaults to tier 1 (D-3) so a newly invented path is never a silent
+#: direct-merge lane; the tier-to-strategy routing itself is worker-side.
+SUBMIT_TIER_LEVELS: tuple[int, ...] = (0, 1, 2)
+SUBMIT_TIER_DEFAULT: int = 1
+
+
+@dataclass(frozen=True, kw_only=True)
+class SubmitTierRule:
+    """One ``[[submit.tiers]]`` path rule (spec 00080).
+
+    ``paths`` are glob patterns over a DONE branch's changed files
+    (``PurePath.full_match`` semantics, ``**`` crosses directories -- the same
+    vocabulary as ``[submit] protected_paths``); ``tier`` is the risk tier a
+    matching file classifies at, one of :data:`SUBMIT_TIER_LEVELS`. The
+    classifier is worker-side and highest-wins: a file takes the highest tier
+    of any matching rule, the highest file tier wins the diff, and an unmatched
+    file classifies at :data:`SUBMIT_TIER_DEFAULT` (D-3). Tiers choose among
+    legitimate landing routes; ``protected_paths`` remains the distinct,
+    absolute refuse-list evaluated independently and first (D-1).
+    """
+
+    tier: int
+    paths: tuple[str, ...]
+
 
 @dataclass(frozen=True, kw_only=True)
 class WorkPolicy:
@@ -432,7 +459,12 @@ class WorkPolicy:
     with no schema, so every pre-existing policy file keeps loading
     unchanged. ``protected_paths`` mirrors the optional
     ``[submit] protected_paths`` list; empty when unset (no merge-time
-    path gate).
+    path gate). ``submit_tiers`` mirrors the optional ``[[submit.tiers]]``
+    array of path rules (spec 00080); empty when unset, which keeps landing
+    identical to the configured ``submit_strategy`` with no classifier in
+    the path. When non-empty the worker routes each DONE task's landing by
+    the highest tier its changed files classify at (0 merge / 1 phase /
+    2 pr), and ``submit_strategy`` no longer selects the route.
     ``submit_strategy``/``submit_remote``/``submit_pr_base``/``submit_base``
     mirror the rest of the optional ``[submit]`` table; an absent table
     means the historical merge landing. ``execution_mode`` mirrors the
@@ -508,6 +540,7 @@ class WorkPolicy:
         DEFAULT_SESSION_PAUSE_CEILING_SECONDS
     )
     protected_paths: tuple[str, ...] = ()
+    submit_tiers: tuple[SubmitTierRule, ...] = ()
     submit_strategy: str = "merge"
     submit_remote: str = "origin"
     submit_pr_base: str | None = None
@@ -594,6 +627,7 @@ def load_policy(path: Path) -> WorkPolicy:
     if not isinstance(submit, dict):
         raise PolicyError(f"{path}: [submit] must be a table")
     protected_paths = _optional_protected_paths(submit, policy_file=path)
+    submit_tiers = _optional_submit_tiers(submit, policy_file=path)
     (
         submit_strategy,
         submit_remote,
@@ -668,6 +702,7 @@ def load_policy(path: Path) -> WorkPolicy:
                 worker_session_pause_ceiling_seconds
             ),
             protected_paths=protected_paths,
+            submit_tiers=submit_tiers,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
@@ -717,6 +752,7 @@ def load_policy(path: Path) -> WorkPolicy:
                 worker_session_pause_ceiling_seconds
             ),
             protected_paths=protected_paths,
+            submit_tiers=submit_tiers,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
@@ -760,6 +796,7 @@ def load_policy(path: Path) -> WorkPolicy:
                 worker_session_pause_ceiling_seconds
             ),
             protected_paths=protected_paths,
+            submit_tiers=submit_tiers,
             submit_strategy=submit_strategy,
             submit_remote=submit_remote,
             submit_pr_base=submit_pr_base,
@@ -1140,6 +1177,65 @@ def _optional_protected_paths(
             f"non-empty strings"
         )
     return tuple(value)
+
+
+def _optional_submit_tiers(
+    table: dict, *, policy_file: Path
+) -> tuple[SubmitTierRule, ...]:
+    """Validate and return the optional ``[[submit.tiers]]`` rules (spec 00080).
+
+    Returns ``()`` when the key is absent (or an explicit empty array) so an
+    unconfigured policy keeps the single ``submit.strategy`` landing with no
+    classifier in the path. Each rule must be a table carrying exactly ``tier``
+    (an integer in :data:`SUBMIT_TIER_LEVELS`) and ``paths`` (a non-empty list
+    of non-empty glob strings, ``protected_paths`` vocabulary). Anything else
+    -- a non-array value, a stray key, a bool-typed or out-of-range tier, a
+    malformed paths list -- raises :class:`PolicyError` naming the offense, so
+    a typo never silently reclassifies a route.
+    """
+    value = table.get("tiers")
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(
+        isinstance(item, dict) for item in value
+    ):
+        raise PolicyError(
+            f"{policy_file}: submit.tiers must be an array of tables "
+            f"([[submit.tiers]] entries with 'tier' and 'paths' keys)"
+        )
+    rules: list[SubmitTierRule] = []
+    for index, item in enumerate(value):
+        unknown = set(item) - {"tier", "paths"}
+        if unknown:
+            raise PolicyError(
+                f"{policy_file}: submit.tiers[{index}] has unknown "
+                f"key(s) {sorted(unknown)}; each rule takes exactly "
+                f"'tier' and 'paths'"
+            )
+        tier = item.get("tier")
+        if (
+            isinstance(tier, bool)
+            or not isinstance(tier, int)
+            or tier not in SUBMIT_TIER_LEVELS
+        ):
+            raise PolicyError(
+                f"{policy_file}: submit.tiers[{index}].tier must be one "
+                f"of {SUBMIT_TIER_LEVELS}, got {tier!r}"
+            )
+        paths = item.get("paths")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or not all(
+                isinstance(entry, str) and entry.strip() for entry in paths
+            )
+        ):
+            raise PolicyError(
+                f"{policy_file}: submit.tiers[{index}].paths must be a "
+                f"non-empty list of non-empty strings"
+            )
+        rules.append(SubmitTierRule(tier=tier, paths=tuple(paths)))
+    return tuple(rules)
 
 
 _SUBMIT_STRATEGIES: tuple[str, ...] = ("merge", "pr", "phase")

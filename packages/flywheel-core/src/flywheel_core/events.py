@@ -51,6 +51,7 @@ class DomainEventKind(str, Enum):
     LANDED = "landed"
     HELD_OUT_GATE_EVALUATED = "held_out_gate_evaluated"
     LANDING_REDRIVEN = "landing_redriven"
+    LANDING_ROUTED = "landing_routed"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -407,6 +408,31 @@ class HeldOutGateEvaluated(_DomainEventBase):
     receipts: tuple[GateGraderReceipt, ...] = ()
 
 
+@dataclass(frozen=True, kw_only=True)
+class LandingRouted(_DomainEventBase):
+    """Records a risk-tier routing decision on the run's ledger (spec 00080).
+
+    Appended by the tier-routing submitter at classification time -- before the
+    routed strategy runs -- so the decision is diagnosable from the store alone
+    even when the routed landing subsequently parks. A misclassification is
+    reconstructable without re-running: ``per_file_tiers`` maps every changed
+    file (the same merge-base-scoped diff the protected-path gate reads) to its
+    computed tier, ``winning_tier`` is the highest of those, and ``strategy``
+    names the submit-strategy registry entry the decision routed to (``"merge"``
+    / ``"phase"`` / ``"pr"`` -- the route vocabulary, distinct from the landing
+    mechanism a later :class:`Landed` record names). An audit-witness event like
+    :class:`LandingParked`: routing happens after the run already finalized
+    ``DONE`` and the harness owns lifecycle transitions, so this event's fold is
+    the identity (it advances ``version`` only and performs no state change).
+    """
+
+    KIND: ClassVar[DomainEventKind] = DomainEventKind.LANDING_ROUTED
+
+    winning_tier: int
+    strategy: str
+    per_file_tiers: Mapping[str, int] = field(default_factory=dict)
+
+
 # Landing-park cause vocabulary. Every site that suppresses a land -- the merge
 # and PR protected-path refusals, a failed push / PR open, a swallowed submit
 # error, and the held-out landing gate -- names its cause with one of these
@@ -538,6 +564,7 @@ DomainEvent = (
     | Landed
     | HeldOutGateEvaluated
     | LandingRedriven
+    | LandingRouted
 )
 
 
@@ -654,6 +681,7 @@ def apply(state: Lifecycle | None, event: DomainEvent) -> Lifecycle:
             Landed,
             HeldOutGateEvaluated,
             LandingRedriven,
+            LandingRouted,
         ),
     ):
         # Identity fold: these carry audit intent or project a separate table.

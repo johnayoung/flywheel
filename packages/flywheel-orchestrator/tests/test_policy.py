@@ -17,6 +17,7 @@ from flywheel_orchestrator import (
     GithubWorkSource,
     InMemoryClaimStore,
     PolicyError,
+    SubmitTierRule,
     build_work_source,
     load_policy,
 )
@@ -791,6 +792,102 @@ def test_protected_paths_rejects_empty_entry(tmp_path: Path) -> None:
                 tmp_path,
                 '[source]\nkind = "directory"\n[submit]\n'
                 'protected_paths = [".github/**", " "]\n',
+            )
+        )
+
+
+# --- [[submit.tiers]] (spec 00080) --------------------------------------------
+
+
+def test_submit_tiers_default_empty(tmp_path: Path) -> None:
+    policy = load_policy(_write(tmp_path, '[source]\nkind = "directory"\n'))
+    assert policy.submit_tiers == ()
+
+
+def test_submit_tiers_parse(tmp_path: Path) -> None:
+    policy = load_policy(
+        _write(
+            tmp_path,
+            "\n".join(
+                [
+                    "[source]",
+                    'kind = "directory"',
+                    "[[submit.tiers]]",
+                    "tier = 0",
+                    'paths = ["docs/**", "*.md"]',
+                    "[[submit.tiers]]",
+                    "tier = 2",
+                    'paths = ["scripts/**"]',
+                ]
+            ),
+        )
+    )
+    assert policy.submit_tiers == (
+        SubmitTierRule(tier=0, paths=("docs/**", "*.md")),
+        SubmitTierRule(tier=2, paths=("scripts/**",)),
+    )
+
+
+def test_submit_tiers_rejects_non_array(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match="submit.tiers"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[submit]\ntiers = "docs/**"\n',
+            )
+        )
+
+
+def test_submit_tiers_rejects_out_of_range_tier(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match=r"submit\.tiers\[0\]\.tier"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[[submit.tiers]]\ntier = 3\npaths = ["docs/**"]\n',
+            )
+        )
+
+
+def test_submit_tiers_rejects_bool_tier(tmp_path: Path) -> None:
+    # TOML `true` is a bool; bool must not pass as the int 1.
+    with pytest.raises(PolicyError, match=r"submit\.tiers\[0\]\.tier"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[[submit.tiers]]\ntier = true\npaths = ["docs/**"]\n',
+            )
+        )
+
+
+def test_submit_tiers_rejects_missing_or_empty_paths(tmp_path: Path) -> None:
+    with pytest.raises(PolicyError, match=r"submit\.tiers\[0\]\.paths"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n[[submit.tiers]]\ntier = 0\n',
+            )
+        )
+    with pytest.raises(PolicyError, match=r"submit\.tiers\[1\]\.paths"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[[submit.tiers]]\ntier = 0\npaths = ["docs/**"]\n'
+                "[[submit.tiers]]\ntier = 1\npaths = []\n",
+            )
+        )
+
+
+def test_submit_tiers_rejects_unknown_rule_key(tmp_path: Path) -> None:
+    # A misspelled key must fail loudly, never silently reclassify a route.
+    with pytest.raises(PolicyError, match=r"submit\.tiers\[0\].*pathz"):
+        load_policy(
+            _write(
+                tmp_path,
+                '[source]\nkind = "directory"\n'
+                '[[submit.tiers]]\ntier = 0\npathz = ["docs/**"]\n',
             )
         )
 

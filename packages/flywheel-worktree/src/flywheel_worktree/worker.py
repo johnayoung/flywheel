@@ -2218,8 +2218,12 @@ def archive_phases(
     and opens or refreshes exactly one aggregate PR onto the true base. The
     phase stays ``active/`` until that PR merges. ``gh`` overrides the ``gh``
     CLI runner the publisher shells to (tests inject a fake); ``None`` uses the
-    real CLI. The publisher is built only for the phase strategy, so ``merge``
-    and ``pr`` callers keep today's archival behavior byte-for-byte.
+    real CLI. The publisher is built only for the phase strategy and for tier
+    routing (spec 00080, whose tier-1 landings stack on phase integration
+    branches), so ``merge`` and ``pr`` callers keep today's archival behavior
+    byte-for-byte; under tier routing the repo-root ``[phase] verify`` gate
+    additionally stays armed, because an all-tier-0 phase can archive without
+    the publisher's phase-branch gate ever running.
     """
     resolved_true_base = true_base
     if resolved_true_base is None and policy is not None:
@@ -2236,9 +2240,10 @@ def archive_phases(
         # the module cycle stays broken exactly as the submit-strategy registry
         # does it.
         phase_completion: Callable[[Path, list[Task]], None] | None = None
+        publisher_owns_phase_verify = False
         if (
             policy is not None
-            and policy.submit_strategy == "phase"
+            and (policy.submit_strategy == "phase" or policy.submit_tiers)
             and repo_root is not None
         ):
             pr_base = policy.submit_pr_base or landing_base
@@ -2255,6 +2260,18 @@ def archive_phases(
                     log=log,
                     gh=gh,
                 )
+                # Under the pure phase strategy every landing reaches the
+                # phase branch, so the publisher's phase-branch-tree gate
+                # covers every archival and the repo-root gate would judge
+                # the wrong tree. Under tier routing (spec 00080) a phase may
+                # archive without ever growing an integration branch (all
+                # tier-0 landings), so the repo-root gate stays armed for
+                # that path; a phase the publisher handled stays active until
+                # its PR merges and then re-verifies against the merged base.
+                publisher_owns_phase_verify = (
+                    policy.submit_strategy == "phase"
+                    and not policy.submit_tiers
+                )
         try:
             moved = archive_completed_phases(
                 tasks_dir,
@@ -2266,7 +2283,7 @@ def archive_phases(
                 # is suppressed on the phase path (it would gate the wrong tree).
                 phase_verify=(
                     None
-                    if phase_completion is not None
+                    if publisher_owns_phase_verify
                     else (policy.phase_verify if policy is not None else None)
                 ),
                 landing_base=landing_base,
@@ -3711,24 +3728,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         log(f"held-out gate active root={repo_root / policy.held_out_root}")
     # The registry owns name -> builder dispatch (and lazily imports pr.py
     # for the "pr" strategy, which is what keeps that import out of this
-    # module's top level). The builders share one signature.
+    # module's top level). The builders share one signature. With
+    # [[submit.tiers]] configured (spec 00080) the route is per-diff, not
+    # repo-global: the tier router provisions like merge and delegates each
+    # landing to the winning tier's registry-built strategy. Imported lazily
+    # (tiering imports worker) exactly like the registry's pr target.
     strategy = policy.submit_strategy if policy is not None else "merge"
-    submitter: GitWorktreeSubmitter = SUBMIT_STRATEGIES.resolve(strategy)(
-        policy,
-        repo_root=repo_root,
-        tasks_dir=tasks_dir,
-        worktrees_dir=worktrees_dir,
-        phase_base=phase_base,
-        lock_path=lock_path,
-        log=log,
-        protected_paths=protected_paths,
-        setup_command=setup_command,
-        on_done=on_done,
-        on_failure=on_failure,
-        store=submit_store,
-        grader_env=grader_env,
-        held_out_source=held_out_source,
-    )
+    submitter: GitWorktreeSubmitter
+    if policy is not None and policy.submit_tiers:
+        from flywheel_worktree.tiering import build_tiered_submitter
+
+        submitter = build_tiered_submitter(
+            policy,
+            repo_root=repo_root,
+            tasks_dir=tasks_dir,
+            worktrees_dir=worktrees_dir,
+            phase_base=phase_base,
+            lock_path=lock_path,
+            log=log,
+            protected_paths=protected_paths,
+            setup_command=setup_command,
+            on_done=on_done,
+            on_failure=on_failure,
+            store=submit_store,
+            grader_env=grader_env,
+            held_out_source=held_out_source,
+        )
+    else:
+        submitter = SUBMIT_STRATEGIES.resolve(strategy)(
+            policy,
+            repo_root=repo_root,
+            tasks_dir=tasks_dir,
+            worktrees_dir=worktrees_dir,
+            phase_base=phase_base,
+            lock_path=lock_path,
+            log=log,
+            protected_paths=protected_paths,
+            setup_command=setup_command,
+            on_done=on_done,
+            on_failure=on_failure,
+            store=submit_store,
+            grader_env=grader_env,
+            held_out_source=held_out_source,
+        )
     # Select the run's submit strategy from [sandbox] backend: worktree
     # (submitter unchanged) or container (wrap it) — spec 00045.
     run_strategy = maybe_wrap_for_backend(

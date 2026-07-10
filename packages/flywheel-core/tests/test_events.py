@@ -15,6 +15,7 @@ from flywheel_core.events import (
     Landed,
     LandingParked,
     LandingRedriven,
+    LandingRouted,
     LifecycleInitialized,
     REDRIVE_RESULT_LANDED,
     REDRIVE_RESULT_REPARKED,
@@ -244,6 +245,13 @@ def test_identity_fold_events_only_advance_version() -> None:
             ts=_ts(2),
             park_kind="uncommitted-work",
             detail="DONE with an uncommitted tree on flywheel/01/t1",
+        ),
+        LandingRouted(
+            run_id="run-1",
+            ts=_ts(2),
+            winning_tier=1,
+            strategy="phase",
+            per_file_tiers={"src/x.py": 1},
         ),
     ):
         after = apply(before, identity_event)
@@ -676,4 +684,91 @@ def test_landing_redriven_default_park_kind_round_trips() -> None:
         id=None,
     )
     assert isinstance(restored, LandingRedriven)
+    assert restored == event
+
+def test_landing_routed_kind_discriminator_is_stable() -> None:
+    assert LandingRouted.KIND is DomainEventKind.LANDING_ROUTED
+    # Wire tag is the stable persisted discriminator.
+    assert DomainEventKind.LANDING_ROUTED.value == "landing_routed"
+
+
+def test_landing_routed_folds_to_identity_leaving_terminal_done() -> None:
+    # Routing happens after the run finalized DONE; recording the tier decision
+    # is an audit witness that advances version only and never moves off DONE.
+    done = replay(
+        [
+            _init(0),
+            TransitionedTo(run_id="run-1", ts=_ts(1), target=Status.READY),
+            TransitionedTo(run_id="run-1", ts=_ts(2), target=Status.RUNNING),
+            TransitionedTo(run_id="run-1", ts=_ts(3), target=Status.VALIDATING),
+            TransitionedTo(run_id="run-1", ts=_ts(4), target=Status.DONE),
+        ]
+    )
+    assert done.status is Status.DONE
+
+    routed = apply(
+        done,
+        LandingRouted(
+            run_id="run-1",
+            ts=_ts(5),
+            winning_tier=2,
+            strategy="pr",
+            per_file_tiers={"docs/a.md": 0, ".github/ci.yml": 2},
+        ),
+    )
+    assert routed.status is Status.DONE
+    assert routed.version == done.version + 1
+
+
+def test_landing_routed_round_trips_through_serde() -> None:
+    event = LandingRouted(
+        run_id="run-9",
+        ts=_ts(5),
+        attempt_number=None,
+        winning_tier=1,
+        strategy="phase",
+        per_file_tiers={"src/x.py": 1, "docs/a.md": 0},
+    )
+    assert event_kind(event) == "landing_routed"
+    payload = event_payload(event)
+    assert payload == {
+        "winning_tier": 1,
+        "strategy": "phase",
+        "per_file_tiers": {"src/x.py": 1, "docs/a.md": 0},
+    }
+    restored = event_from_record(
+        kind=event_kind(event),
+        payload=payload,
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=event.attempt_number,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, LandingRouted)
+    assert restored == event
+
+
+def test_landing_routed_default_per_file_tiers_round_trips() -> None:
+    # ``per_file_tiers`` is optional on the record; a stored row missing it
+    # restores to the empty-mapping default rather than raising.
+    event = LandingRouted(
+        run_id="run-9", ts=_ts(6), winning_tier=0, strategy="merge"
+    )
+    payload = event_payload(event)
+    assert payload == {
+        "winning_tier": 0,
+        "strategy": "merge",
+        "per_file_tiers": {},
+    }
+    restored = event_from_record(
+        kind="landing_routed",
+        payload={"winning_tier": 0, "strategy": "merge"},
+        run_id=event.run_id,
+        ts=event.ts,
+        attempt_number=None,
+        sequence=None,
+        id=None,
+    )
+    assert isinstance(restored, LandingRouted)
     assert restored == event

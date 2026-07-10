@@ -6,7 +6,7 @@ Strategy is the work between "agent finished" and "result committed / merged / s
 
 ## The seam
 
-The named seam is `flywheel_orchestrator.SubmitStrategy` (`_strategy.py`): a structural protocol bundling the two hooks `orchestrate` calls around every run. No base class — any object with conforming methods satisfies the protocol, passed as `orchestrate(strategy=...)` (or as the standalone `prepare_sandbox`/`submit` callables). Selecting a built-in strategy by name (the `flywheel.toml` `[submit] strategy` key) routes through the `SUBMIT_STRATEGIES` plugin registry (`flywheel_worktree._submit_registry`), which maps `merge`/`pr` to their submitters.
+The named seam is `flywheel_orchestrator.SubmitStrategy` (`_strategy.py`): a structural protocol bundling the two hooks `orchestrate` calls around every run. No base class — any object with conforming methods satisfies the protocol, passed as `orchestrate(strategy=...)` (or as the standalone `prepare_sandbox`/`submit` callables). Selecting a built-in strategy by name (the `flywheel.toml` `[submit] strategy` key) routes through the `SUBMIT_STRATEGIES` plugin registry (`flywheel_worktree._submit_registry`), which maps `merge`/`pr`/`phase` to their submitters.
 
 | Hook              | When                                | Contract                                                                                       |
 | ----------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -34,9 +34,22 @@ One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb 
 
 - **`merge`** (default) — `flywheel_worktree.worker.GitWorktreeSubmitter`, full autonomy. Each task runs in its own git worktree on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree before the merge — nothing lands that was not verified against the exact base it lands on.
 - **`pr`** — `flywheel_worktree.pr.GitPullRequestSubmitter`, review-gated. Same provisioning; on `done` the branch is pushed to the remote and a PR opened (or refreshed) with the run's grader receipts rendered in the body, so reviewers see how "done" was decided. Nothing merges locally — review/CI own the merge. Park semantics are identical.
+- **`phase`** — `flywheel_worktree.worker.PhaseBranchSubmitter` (spec 00079), phase-scoped review. The merge strategy's full verify ladder, but each task fast-forwards onto a per-phase integration branch `flywheel/phase/<phase>` (forked from the true base on the phase's first landing) instead of the base itself; the true base never advances locally. A completed phase is published as one aggregate PR (`PhasePrPublisher`) and archives only once that PR merges.
 - **`ContainerSubmitStrategy`** (`flywheel_container._submit`) — container isolation. *Composes* an inner landing strategy (`merge` or `pr`) rather than replacing one: the agent runs in a Docker container against the bind-mounted worktree while landing stays host-side. Selected via `[sandbox] backend = "container"` (not `[submit] strategy`); the worker wraps the inner submitter in it via `maybe_wrap_for_backend`. `prepare_sandbox` returns a `SandboxHandle` whose `invoke_wrapper` `docker exec`s the agent CLI in the container and whose `teardown` disposes it; `submit` delegates to the inner strategy unchanged. See [container-backend.md](container-backend.md) and [sandbox.md](sandbox.md).
 
-The `merge`/`pr` strategies both honor `[submit] protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
+All shipped strategies honor `[submit] protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
+
+## Risk-tiered routing (`[[submit.tiers]]`)
+
+With `[[submit.tiers]]` configured (spec 00080), the strategy applied to each DONE task is a function of its diff, not a repo-global constant. `TierRoutingSubmitter` (`flywheel_worktree.tiering`) provisions like `merge` (worktrees fork from the true base) and classifies the branch's merge-base-scoped changed files at submit time against the operator's path rules:
+
+- tier 0 routes to `merge` (direct land), tier 1 to `phase`, tier 2 to `pr` — delegates built through the same registry; the highest tier of any touched file wins.
+- A file matching no rule defaults to **tier 1** — a newly invented path is never a silent direct-merge lane.
+- Classification reads only the policy the **worker process** loaded; the policy file itself always classifies at the highest tier, so a branch editing the rules cannot cheapen its own route.
+- `protected_paths` outranks every tier: the routed strategy still runs its own protected-path refusal first. Protection is refusal, not routing.
+- Each decision (per-file tiers, winning tier, strategy) is recorded on the run's ledger as a `LandingRouted` event before the routed strategy runs.
+
+Absent `[[submit.tiers]]`, landing is byte-identical to the configured `[submit] strategy` with no classifier in the path.
 
 ## How a finished task lands
 

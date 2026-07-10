@@ -27,6 +27,12 @@ def _git(cwd: Path, *args: str) -> None:
 def _git_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git(path, "init", "-q", "-b", "main")
+    # Commit identity per-repo, matching the other suites' repo helpers: a
+    # bare CI runner has no global git config, and `git commit` exits 128
+    # ("Author identity unknown") without it.
+    _git(path, "config", "user.email", "sandbox-root-test@example.com")
+    _git(path, "config", "user.name", "sandbox root test")
+    _git(path, "config", "commit.gpgsign", "false")
     return path
 
 

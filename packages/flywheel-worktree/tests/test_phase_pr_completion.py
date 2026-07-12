@@ -473,3 +473,148 @@ def test_merge_strategy_archives_without_phase_pr(tmp_path: Path) -> None:
     assert gh.calls == []
     assert (tasks_dir / "archive" / "01-foo").is_dir()
     assert not (tasks_dir / "active" / "01-foo").exists()
+
+
+# --- pre-PR phase-branch sync ------------------------------------------------
+
+
+def _branch_head(repo: Path, branch: str) -> str:
+    return _git(repo, "rev-parse", branch).strip()
+
+
+def test_sync_merges_advanced_base_into_phase_branch_before_pr(
+    tmp_path: Path,
+) -> None:
+    """The base advanced after the phase branch forked: the publisher merges
+    it into the phase branch once, so the PR opens mergeable (a conflicting
+    PR runs zero GitHub CI and stalls silently)."""
+    repo, remote, db_path = _complete_phase_fixture(tmp_path)
+    tasks_dir = repo / ".flywheel" / "tasks"
+    branch = _phase_branch("01-foo")
+    # Non-conflicting base advance, visible on the remote (the ref the PR
+    # actually merges into).
+    (repo / "extra.txt").write_text("mainline\n")
+    _git(repo, "add", "extra.txt")
+    _git(repo, "commit", "-m", "feat: base advanced")
+    _git(repo, "push", "origin", "main:main")
+    gh = _FakeGh()
+
+    archive_phases(
+        tasks_dir,
+        db_path,
+        lambda _m: None,
+        repo_root=repo,
+        landing_base=None,
+        policy=_policy(db_path, tasks_dir),
+        gh=gh,
+    )
+
+    assert gh.commands() == ["pr list", "pr create"]
+    # The phase branch now contains the advanced base -- locally and as
+    # pushed -- via a single sync merge commit.
+    tree = _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert "extra.txt" in tree
+    subject = _git(repo, "log", "-1", "--format=%s", branch)
+    assert subject.startswith(f"merge: sync {branch}")
+    remote_tree = subprocess.run(
+        ["git", "-C", str(remote), "ls-tree", "-r", "--name-only", branch],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "extra.txt" in remote_tree
+
+
+def test_sync_prefers_the_remote_base_over_a_stale_local_one(
+    tmp_path: Path,
+) -> None:
+    """The PR merges into the REMOTE base: a base advance that exists only on
+    the remote (the local ref is stale) must still be synced in."""
+    repo, _remote, db_path = _complete_phase_fixture(tmp_path)
+    tasks_dir = repo / ".flywheel" / "tasks"
+    branch = _phase_branch("01-foo")
+    (repo / "remote-only.txt").write_text("remote\n")
+    # Targeted add: -A would sweep the untracked sqlite store into the
+    # commit, and the reset below would then delete it.
+    _git(repo, "add", "remote-only.txt")
+    _git(repo, "commit", "-m", "feat: remote-only advance")
+    _git(repo, "push", "origin", "main:main")
+    _git(repo, "reset", "--hard", "HEAD~1")  # local main goes stale
+    gh = _FakeGh()
+    logged: list[str] = []
+
+    archive_phases(
+        tasks_dir,
+        db_path,
+        logged.append,
+        repo_root=repo,
+        landing_base=None,
+        policy=_policy(db_path, tasks_dir),
+        gh=gh,
+    )
+
+    assert gh.commands() == ["pr list", "pr create"]
+    tree = _git(repo, "ls-tree", "-r", "--name-only", branch)
+    assert "remote-only.txt" in tree
+
+
+def test_conflicting_base_aborts_sync_loudly_and_opens_no_pr(
+    tmp_path: Path,
+) -> None:
+    """A base advance that CONFLICTS with the phase work must not produce a
+    PR (it would run zero CI and stall silently): the sync merge aborts, the
+    branch is left untouched, and the refusal names the conflicted path."""
+    repo, remote, db_path = _complete_phase_fixture(
+        tmp_path, phase_files={"a.txt": "phase version\n"}
+    )
+    tasks_dir = repo / ".flywheel" / "tasks"
+    branch = _phase_branch("01-foo")
+    (repo / "a.txt").write_text("conflicting mainline version\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "feat: conflicting base advance")
+    _git(repo, "push", "origin", "main:main")
+    head_before = _branch_head(repo, branch)
+    gh = _FakeGh()
+    logged: list[str] = []
+
+    archive_phases(
+        tasks_dir,
+        db_path,
+        logged.append,
+        repo_root=repo,
+        landing_base=None,
+        policy=_policy(db_path, tasks_dir),
+        gh=gh,
+    )
+
+    assert gh.calls == []  # no PR opened, not even listed
+    assert not _remote_branch_exists(remote, branch)  # nothing pushed
+    assert _branch_head(repo, branch) == head_before  # no half-merge
+    assert (tasks_dir / "active" / "01-foo").is_dir()  # phase left active
+    assert any(
+        "pre-PR sync" in line and "a.txt" in line and branch in line
+        for line in logged
+    ), logged
+
+
+def test_contained_base_syncs_as_a_no_op(tmp_path: Path) -> None:
+    """A base already contained in the phase branch adds no merge commit --
+    repeated sweep passes stay idempotent, with no forced CI re-runs."""
+    repo, _remote, db_path = _complete_phase_fixture(tmp_path)
+    tasks_dir = repo / ".flywheel" / "tasks"
+    branch = _phase_branch("01-foo")
+    head_before = _branch_head(repo, branch)
+    gh = _FakeGh()
+
+    archive_phases(
+        tasks_dir,
+        db_path,
+        lambda _m: None,
+        repo_root=repo,
+        landing_base=None,
+        policy=_policy(db_path, tasks_dir),
+        gh=gh,
+    )
+
+    assert gh.commands() == ["pr list", "pr create"]
+    assert _branch_head(repo, branch) == head_before

@@ -557,11 +557,17 @@ class PhasePrPublisher:
     strategy = "phase"``. When the sweep hands over a phase whose tasks are all
     DONE and landed and whose loop-path gate passed, this:
 
-    1. evaluates ``[phase] verify`` against a checkout of the phase-branch tree
+    1. syncs the phase branch with the true base -- one merge of the base
+       INTO the phase branch, because a phase PR that conflicts with its base
+       runs ZERO GitHub CI (GitHub cannot build the test merge) and stalls
+       silently; a base already contained is a no-op, and a conflicting merge
+       aborts loudly and opens no PR;
+    2. evaluates ``[phase] verify`` against a checkout of the phase-branch tree
        (spec 00079, D-6) -- never the operator's checkout, which does not hold
-       the phase's work -- opening no PR on a non-zero exit;
-    2. pushes the phase branch to the remote (``--force-with-lease``);
-    3. opens exactly one PR onto the true base -- or refreshes the body of the
+       the phase's work; after the sync this is the exact merged tree the PR's
+       CI will test -- opening no PR on a non-zero exit;
+    3. pushes the phase branch to the remote (``--force-with-lease``);
+    4. opens exactly one PR onto the true base -- or refreshes the body of the
        one already open for the branch -- with every task's grader receipts and
        held-out verdict aggregated in the body.
 
@@ -604,6 +610,16 @@ class PhasePrPublisher:
             )
 
     def _publish(self, phase: str, branch: str, tasks: list[Task]) -> None:
+        synced, detail = self._sync_with_true_base(branch)
+        if not synced:
+            self.log(
+                f"pre-PR sync of {branch} with {self.remote}/{self.pr_base} "
+                f"failed ({detail}); opening no PR -- a conflicting phase PR "
+                f"runs zero CI and stalls silently -- phase {phase!r} left "
+                f"active; merge {self.pr_base} into {branch} by hand to "
+                f"unblock"
+            )
+            return
         if self.phase_verify is not None:
             ok, detail = self._verify_phase_tree(branch)
             if not ok:
@@ -644,6 +660,91 @@ class PhasePrPublisher:
             f"Phase {phase!r}: pushed {branch} and ensured PR {url} "
             f"({len(sections)} task(s)); merge is review/CI's call"
         )
+
+    def _sync_with_true_base(self, branch: str) -> tuple[bool, str]:
+        """Merge the true base into ``branch`` once, before any PR opens.
+
+        GitHub builds a PR's check runs against the test merge of head and
+        base; when they conflict there is no test merge, so a conflicting
+        phase PR runs ZERO CI and sits silently un-mergeable -- the stall is
+        invisible unless someone opens the PR page. Syncing here makes the
+        PR mergeable up front (and lets ``[phase] verify`` judge the exact
+        merged tree CI will test) or fails LOUD at the seam where the
+        operator is already watching.
+
+        The base is the ref the PR actually merges into: ``pr_base`` fetched
+        from ``remote``, falling back to the local ``pr_base`` ref when the
+        fetch cannot resolve it (offline runs, local-only bases). A base
+        already contained in the branch is a no-op -- no merge commit churn,
+        no forced CI re-run -- so repeated sweep passes stay idempotent. The
+        merge itself runs in a disposable worktree ON the branch (phase
+        branches are never checked out, so the branch ref is free); a
+        conflict aborts the merge, leaves the branch exactly as it was, and
+        reports the conflicted paths.
+        """
+        fetch = _git(self.repo_root, "fetch", self.remote, self.pr_base)
+        if fetch.returncode == 0:
+            base_ref = "FETCH_HEAD"
+        else:
+            probe = _git(
+                self.repo_root,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                self.pr_base,
+            )
+            if probe.returncode != 0:
+                return False, (
+                    f"cannot resolve the true base {self.pr_base!r} locally "
+                    f"or on {self.remote!r} ({fetch.stderr.strip()})"
+                )
+            base_ref = self.pr_base
+        base_sha = _git(self.repo_root, "rev-parse", base_ref).stdout.strip()
+        contained = _git(
+            self.repo_root, "merge-base", "--is-ancestor", base_sha, branch
+        )
+        if contained.returncode == 0:
+            return True, ""
+        parent = Path(tempfile.mkdtemp(prefix="flywheel-phase-sync-"))
+        checkout = parent / "tree"
+        try:
+            add = _git(
+                self.repo_root, "worktree", "add", str(checkout), branch
+            )
+            if add.returncode != 0:
+                return False, (
+                    add.stderr.strip() or f"could not check out {branch}"
+                )
+            merge = _git(
+                checkout,
+                "merge",
+                "--no-edit",
+                "-m",
+                f"merge: sync {branch} with {self.pr_base} before the "
+                f"phase PR",
+                base_sha,
+            )
+            if merge.returncode != 0:
+                conflicted = _git(
+                    checkout, "diff", "--name-only", "--diff-filter=U"
+                ).stdout.split()
+                _git(checkout, "merge", "--abort")
+                what = (
+                    f"conflicts in {', '.join(conflicted)}"
+                    if conflicted
+                    else (merge.stderr.strip() or merge.stdout.strip())
+                )
+                return False, f"merging {self.pr_base} ({base_sha[:12]}): {what}"
+            return True, ""
+        finally:
+            _git(
+                self.repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(checkout),
+            )
+            shutil.rmtree(parent, ignore_errors=True)
 
     def _verify_phase_tree(self, branch: str) -> tuple[bool, str]:
         """Run ``[phase] verify`` against a detached checkout of ``branch``.

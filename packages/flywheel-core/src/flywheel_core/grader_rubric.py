@@ -412,6 +412,60 @@ def _verdict_failure_reason(verdict: VerdictResult) -> str:
     )
 
 
+async def _judge_once(
+    invoker: JudgeInvoke,
+    prompt: str,
+    grader: RubricGrader,
+    worktree: Path | str,
+    *,
+    judge_ceiling_seconds: float | None,
+) -> ValidVerdict:
+    """One judge invocation + verdict parse; every failure mode is a
+    :class:`RubricJudgeError`.
+
+    Wall-clock judge deadline (spec 00066 criterion #3, D-2): a
+    never-terminating judge stream -- even one steadily yielding output -- is
+    cancelled once the ceiling passes. The bound wraps the whole invocation
+    (not the SDK stream inside the default invoker) so an injected
+    ``judge_invoke`` is bounded too. A ``None`` ceiling is the operator's
+    unbounded opt-out. A deadline timeout, a raised transport error, and a
+    non-``valid`` verdict envelope are all judge-INFRASTRUCTURE failures,
+    distinguishable from a real verdict; the caller's retry envelope decides
+    how many it absorbs before escalating.
+    """
+    try:
+        if judge_ceiling_seconds is None:
+            response = await invoker(prompt, grader, worktree)
+        else:
+            response = await run_with_deadline(
+                invoker(prompt, grader, worktree),
+                judge_ceiling_seconds,
+            )
+    except RubricJudgeError:
+        raise
+    except DeadlineExceeded as exc:
+        raise RubricJudgeError(
+            grader_name=grader.name or "<unnamed>",
+            reason=(
+                "judge invocation exceeded wall-clock deadline of "
+                f"{exc.ceiling_seconds}s"
+            ),
+        ) from exc
+    except Exception as exc:
+        raise RubricJudgeError(
+            grader_name=grader.name or "<unnamed>",
+            reason=str(exc),
+        ) from exc
+
+    verdict = parse_verdict(response)
+    if not isinstance(verdict, ValidVerdict):
+        raise RubricJudgeError(
+            grader_name=grader.name or "<unnamed>",
+            reason=_verdict_failure_reason(verdict),
+        )
+    return verdict
+
+
 def _first_rubric_grader_name(task: Task) -> str:
     for grader in task.graders:
         if isinstance(grader, RubricGrader):
@@ -433,6 +487,8 @@ async def run_rubric_graders(
     judge_model: str | None = None,
     judge_max_turns: int = 8,
     judge_ceiling_seconds: float | None = None,
+    judge_retries: int = 2,
+    on_judge_retry: Callable[[str, int, str], None] | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> list[GraderResultRecord]:
     """Run every ``RubricGrader`` on ``task.graders`` in list order.
@@ -450,9 +506,14 @@ async def run_rubric_graders(
        surfaced as a :class:`RubricJudgeError` (judge-infra timeout, spec
        00066 criterion #3); ``None`` leaves the call unbounded.
     3. Parse the response with :func:`parse_verdict`. Any non-``valid``
-       variant raises :class:`RubricJudgeError` without persisting a row
-       (judge-infrastructure failure — routed through ``INTERNAL_ERROR``
-       by the harness).
+       variant is a judge-infrastructure failure. Infra failures (timeout,
+       transport error, malformed envelope) are retried in place up to
+       ``judge_retries`` times -- the judge alone re-runs, never the
+       implementation attempt -- with ``on_judge_retry(grader_name,
+       judge_attempt, reason)`` fired per absorbed failure; only after the
+       envelope is exhausted does :class:`RubricJudgeError` escape (routed
+       through ``INTERNAL_ERROR`` by the harness). A real verdict is never
+       retried.
     4. Persist one :class:`GraderResultRecord` whose payload matches the
        documented rubric shape (``judge_model``, ``summary``,
        ``unknown``, empty ``per_assertion``/``artifacts``).
@@ -503,46 +564,30 @@ async def run_rubric_graders(
         start_ns = time.monotonic_ns()
 
         prompt = _build_judge_prompt(task, grader, transcript)
-        try:
-            # Wall-clock judge deadline (spec 00066 criterion #3, D-2): a
-            # never-terminating judge stream -- even one steadily yielding
-            # output -- is cancelled once the ceiling passes. The bound wraps
-            # the whole invocation (not the SDK stream inside the default
-            # invoker) so an injected ``judge_invoke`` is bounded too. A
-            # ``None`` ceiling is the operator's unbounded opt-out.
-            if judge_ceiling_seconds is None:
-                response = await invoker(prompt, grader, worktree)
-            else:
-                response = await run_with_deadline(
-                    invoker(prompt, grader, worktree),
-                    judge_ceiling_seconds,
+        # Judge-infra retry envelope: a judge dying on its OWN turn/time
+        # budget (or any transport blip / malformed envelope) is an
+        # infrastructure failure, not a verdict -- and surfacing it burns a
+        # full task attempt that re-drives the whole implementation. Retry
+        # the judge alone, bounded, before escalating; a real verdict (pass,
+        # fail, or unknown) is never retried.
+        attempts_total = 1 + max(0, judge_retries)
+        verdict: ValidVerdict | None = None
+        for judge_attempt in range(1, attempts_total + 1):
+            try:
+                verdict = await _judge_once(
+                    invoker,
+                    prompt,
+                    grader,
+                    worktree,
+                    judge_ceiling_seconds=judge_ceiling_seconds,
                 )
-        except RubricJudgeError:
-            raise
-        except DeadlineExceeded as exc:
-            # A deadline timeout is a judge-infrastructure failure,
-            # distinguishable from a normal verdict: route it through the
-            # same RubricJudgeError path the harness classifies as
-            # ``rubric_judge_error``.
-            raise RubricJudgeError(
-                grader_name=grader.name or "<unnamed>",
-                reason=(
-                    "judge invocation exceeded wall-clock deadline of "
-                    f"{exc.ceiling_seconds}s"
-                ),
-            ) from exc
-        except Exception as exc:
-            raise RubricJudgeError(
-                grader_name=grader.name or "<unnamed>",
-                reason=str(exc),
-            ) from exc
-
-        verdict = parse_verdict(response)
-        if not isinstance(verdict, ValidVerdict):
-            raise RubricJudgeError(
-                grader_name=grader.name or "<unnamed>",
-                reason=_verdict_failure_reason(verdict),
-            )
+                break
+            except RubricJudgeError as exc:
+                if judge_attempt >= attempts_total:
+                    raise
+                if on_judge_retry is not None:
+                    on_judge_retry(exc.grader_name, judge_attempt, exc.reason)
+        assert verdict is not None  # loop either broke with one or raised
 
         end_ns = time.monotonic_ns()
         duration_ms = (end_ns - start_ns) // 1_000_000

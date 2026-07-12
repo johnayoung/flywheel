@@ -3597,6 +3597,71 @@ class TestRubricIntegration:
         assert verdicts[0].payload["summary"] == "great"
         assert verdicts[0].payload["unknown"] is False
 
+    def test_judge_infra_recovers_in_place_without_burning_the_attempt(
+        self,
+    ) -> None:
+        """A judge dying on its own budget/transport re-runs ALONE: the
+        implementation attempt survives, the task reaches DONE, and the
+        absorbed failure is queryable as harness.rubric_judge_retry -- it
+        never reaches the INTERNAL_ERROR path that re-drives a $20-40
+        implementation."""
+        store = InMemoryStore()
+        sink = _ListSink()
+        task = Task(
+            goal="g",
+            graders=[
+                _ok_command(),
+                RubricGrader(assertions=["a"], name="rflaky"),
+            ],
+        )
+        lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-flaky")
+        judge = _ScriptedJudge(
+            [
+                RubricJudgeError(
+                    grader_name="rflaky", reason="judge hit its turn budget"
+                ),
+                _rubric_wrap('{"passed": true, "summary": "ok"}'),
+            ]
+        )
+        invoke = _scripted_invoker(
+            [
+                _iteration(
+                    envelope=ValidEnvelope(intent=Intent.VERIFY),
+                    messages=(_assistant(), _result_msg()),
+                )
+            ]
+        )
+        config = HarnessConfig(
+            max_retries=0,
+            worktree=self._wt,
+            rubric_judge_invoke=judge,
+        )
+
+        outcome = _run(
+            run_task(
+                task, lifecycle, store, sink=sink, config=config, invoke=invoke
+            )
+        )
+
+        assert outcome.lifecycle.status == Status.DONE
+        assert len(outcome.attempts) == 1
+        assert len(judge.calls) == 2
+        retry_events = [
+            e
+            for e in sink.events(lifecycle.run_id)
+            if e.kind == "harness.rubric_judge_retry"
+        ]
+        assert len(retry_events) == 1
+        assert retry_events[0].payload["grader_name"] == "rflaky"
+        assert retry_events[0].payload["judge_attempt"] == 1
+        assert "turn budget" in retry_events[0].payload["reason"]
+        crash_events = [
+            e
+            for e in sink.events(lifecycle.run_id)
+            if e.kind == "harness.crash"
+        ]
+        assert crash_events == []
+
     def test_judge_crash_routes_to_internal_error(self) -> None:
         store = InMemoryStore()
         sink = _ListSink()
@@ -3608,10 +3673,14 @@ class TestRubricIntegration:
             ],
         )
         lifecycle = Lifecycle(task_id="t1", run_id="run-rubric-crash")
+        # One crash per attempt of the in-place judge-retry envelope
+        # (default rubric_judge_retries=2 -> 3 judge attempts): the judge
+        # alone re-runs first, and only a PERSISTENT infra failure reaches
+        # the INTERNAL_ERROR routing this test pins.
         crash = RubricJudgeError(
             grader_name="rcrash", reason="network down"
         )
-        judge = _ScriptedJudge([crash])
+        judge = _ScriptedJudge([crash, crash, crash])
         invoke = _scripted_invoker(
             [
                 _iteration(

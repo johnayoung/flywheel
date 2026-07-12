@@ -240,7 +240,7 @@ Default-on, per-class wall-clock ceilings (seconds) for the five external-call c
 | `docker_management_seconds` | float (`0` = unbounded) | `120` | docker management-call ceiling (container backend) |
 | `autopilot_agent_seconds` | float (`0` = unbounded) | `1800` | discovery/authoring agent ceiling (autopilot daemon) |
 
-Consumed only by those three layers; a negative value resolves to the same unbounded opt-out as `0`.
+Consumed only by those three layers; a negative value resolves to the same unbounded opt-out as `0`. A task's own `budgets` object (see [task-schema.md](task-schema.md)) overrides `agent_iteration_seconds` and `rubric_judge_seconds` for that task alone — the heavyweight tail declares its ceiling per task instead of the repo loosening a class-wide one.
 
 ## `[sandbox.*]`
 

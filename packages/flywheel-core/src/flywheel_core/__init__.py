@@ -164,6 +164,7 @@ from flywheel_core.task import (
     ManualGrader,
     RubricGrader,
     Task,
+    TaskBudgets,
     TranscriptGrader,
     ValidationError,
 )
@@ -297,6 +298,7 @@ __all__ = [
     "StrategyResult",
     "Subscription",
     "Task",
+    "TaskBudgets",
     "TaskDefect",
     "TaskLoadError",
     "TaskStore",

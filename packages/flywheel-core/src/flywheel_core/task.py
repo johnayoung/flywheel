@@ -129,6 +129,52 @@ class Context:
     notes: str = ""
 
 
+@dataclass
+class TaskBudgets:
+    """Optional per-task execution-budget overrides for the heavyweight tail.
+
+    Every field defaults to ``None`` -- inherit the harness/policy value --
+    so a default-constructed instance changes nothing. The seconds fields
+    mirror the ``[deadlines]`` semantics: a positive number is the ceiling,
+    ``0`` is the explicit unbounded opt-out for THIS task. These are harness
+    knobs, not agent-facing context: a golden-record task that legitimately
+    needs more than the repo-wide iteration ceiling declares it here instead
+    of the operator loosening the ceiling for every task.
+
+    ``agent_iteration_seconds`` overrides the ``AGENT_ITERATION`` wall-clock
+    ceiling; ``rubric_judge_seconds`` overrides the ``RUBRIC_JUDGE`` ceiling;
+    ``rubric_judge_max_turns`` overrides the judge session's turn budget.
+    """
+
+    agent_iteration_seconds: float | None = None
+    rubric_judge_seconds: float | None = None
+    rubric_judge_max_turns: int | None = None
+
+    def validate(self) -> None:
+        for name in ("agent_iteration_seconds", "rubric_judge_seconds"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(
+                value, (int, float)
+            ):
+                raise ValidationError(
+                    f"budgets.{name} must be a number of seconds"
+                )
+            if value < 0:
+                raise ValidationError(
+                    f"budgets.{name} must be >= 0 (0 opts this task out of "
+                    f"the ceiling entirely)"
+                )
+        turns = self.rubric_judge_max_turns
+        if turns is not None and (
+            isinstance(turns, bool) or not isinstance(turns, int) or turns < 1
+        ):
+            raise ValidationError(
+                "budgets.rubric_judge_max_turns must be a positive integer"
+            )
+
+
 def _default_id() -> str:
     return f"task-{uuid4().hex}"
 
@@ -140,6 +186,7 @@ class Task:
     id: str = field(default_factory=_default_id)
     tags: list[str] = field(default_factory=list)
     context: Context = field(default_factory=Context)
+    budgets: TaskBudgets = field(default_factory=TaskBudgets)
 
     def validate(self) -> None:
         if not isinstance(self.id, str) or not self.id:
@@ -153,3 +200,7 @@ class Task:
 
         if not isinstance(self.graders, list):
             raise ValidationError("graders must be a list")
+
+        if not isinstance(self.budgets, TaskBudgets):
+            raise ValidationError("budgets must be a TaskBudgets")
+        self.budgets.validate()

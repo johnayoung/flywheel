@@ -430,7 +430,12 @@ class HarnessConfig:
     through to the SDK's own default. ``rubric_judge_max_turns`` caps
     the per-judge-call turn budget (default 32; judges get the full tool
     surface and multi-assertion rubrics routinely need more than 8 turns
-    to verify against the worktree before emitting a verdict).
+    to verify against the worktree before emitting a verdict); a task's
+    ``budgets.rubric_judge_max_turns`` overrides it for that task alone.
+    ``rubric_judge_retries`` bounds the in-place judge-infra retry envelope
+    (default 2): a judge dying on its own turn/time budget or transport
+    re-runs alone instead of burning the task attempt and re-driving the
+    whole implementation; ``0`` restores the old fail-immediately behavior.
 
     ``rubric_judge_invoke`` is a test seam: when set, the harness passes
     it to ``run_rubric_graders`` instead of the runner's default fresh
@@ -532,6 +537,7 @@ class HarnessConfig:
     grader_env: Mapping[str, str] | None = None
     rubric_judge_model: str | None = None
     rubric_judge_max_turns: int = 32
+    rubric_judge_retries: int = 2
     rubric_judge_invoke: JudgeInvoke | None = None
     loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     deadlines: DeadlineConfig = field(default_factory=DeadlineConfig)
@@ -3265,6 +3271,20 @@ async def _invoke_with_watchdog(
                 pass
 
 
+def _override_ceiling(
+    task_override: float | None, resolved_default: float | None
+) -> float | None:
+    """Per-task budget precedence over a policy-resolved deadline class.
+
+    ``None`` inherits the resolved class ceiling; ``0`` is the task's
+    explicit unbounded opt-out (mirroring the ``[deadlines]`` semantics);
+    any positive value replaces the ceiling for this task only.
+    """
+    if task_override is None:
+        return resolved_default
+    return float(task_override) if task_override > 0 else None
+
+
 async def _drive_iterations(
     *,
     task: Task,
@@ -3577,9 +3597,14 @@ async def _drive_iterations(
         # BOTH the checkpoint-nudge seam on the request below AND the
         # ``run_with_deadline`` wrapper further down. Reading it via
         # ``deadlines.for_class`` keeps operator ``[deadlines]`` overrides
-        # (phase 14) flowing through; ``None`` is the opted-out unbounded case.
-        agent_ceiling = config.deadlines.for_class(
-            DeadlineClass.AGENT_ITERATION
+        # (phase 14) flowing through; ``None`` is the opted-out unbounded
+        # case. The task's own ``budgets.agent_iteration_seconds`` takes
+        # precedence over the class ceiling -- the heavyweight tail (a legit
+        # golden-record run longer than the repo-wide default) declares its
+        # budget per task instead of the operator unbounding every task.
+        agent_ceiling = _override_ceiling(
+            task.budgets.agent_iteration_seconds,
+            config.deadlines.for_class(DeadlineClass.AGENT_ITERATION),
         )
         request = InvocationRequest(
             prompt=prompt,
@@ -3997,6 +4022,24 @@ async def _validate(
     rubric_results: list[GraderResultRecord] = []
     rubric_passed = True
     if command_passed and transcript_passed:
+
+        def _on_judge_retry(
+            grader_name: str, judge_attempt: int, reason: str
+        ) -> None:
+            # A judge-infra failure absorbed by the in-place retry envelope:
+            # the judge alone re-runs, the implementation attempt survives.
+            # Emitted per absorbed failure so a flaky judge is diagnosable
+            # from telemetry without ever reaching the INTERNAL_ERROR path.
+            telemetry.emit(
+                kind="harness.rubric_judge_retry",
+                payload={
+                    "grader_name": grader_name,
+                    "judge_attempt": judge_attempt,
+                    "reason": reason,
+                },
+                attempt_number=attempt.number,
+            )
+
         try:
             rubric_results = await run_rubric_graders(
                 task,
@@ -4013,10 +4056,19 @@ async def _validate(
                 transcript_passed=transcript_passed,
                 judge_invoke=config.rubric_judge_invoke,
                 judge_model=config.rubric_judge_model,
-                judge_max_turns=config.rubric_judge_max_turns,
-                judge_ceiling_seconds=config.deadlines.for_class(
-                    DeadlineClass.RUBRIC_JUDGE
+                # Per-task budget overrides (the heavyweight tail) beat the
+                # config/policy values; None inherits, 0 seconds = unbounded.
+                judge_max_turns=(
+                    task.budgets.rubric_judge_max_turns
+                    if task.budgets.rubric_judge_max_turns is not None
+                    else config.rubric_judge_max_turns
                 ),
+                judge_ceiling_seconds=_override_ceiling(
+                    task.budgets.rubric_judge_seconds,
+                    config.deadlines.for_class(DeadlineClass.RUBRIC_JUDGE),
+                ),
+                judge_retries=config.rubric_judge_retries,
+                on_judge_retry=_on_judge_retry,
                 now=clock,
             )
         except RubricJudgeError as exc:

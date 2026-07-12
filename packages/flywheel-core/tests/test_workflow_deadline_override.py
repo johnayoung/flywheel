@@ -177,3 +177,54 @@ def test_budgets_default_preserved_when_knobs_absent(
     config = captured["config"]
     assert config.rubric_judge_max_turns == 32
     assert config.deadlines == DeadlineConfig()
+
+
+def test_task_budget_overrides_the_iteration_ceiling_per_task(
+    tmp_path: Path,
+) -> None:
+    """Per-task budgets beat the class ceiling: a task declaring a tiny
+    ``budgets.agent_iteration_seconds`` is cancelled by ITS ceiling even
+    though the resolved [deadlines] class ceiling is the finite default
+    (3600s). The heavyweight-tail inverse (a task RAISING its ceiling above
+    the class value) rides the same _override_ceiling precedence, unit-pinned
+    below."""
+    from flywheel_core import TaskBudgets
+
+    store = InMemoryStore()
+    task = Task(
+        goal="hang forever",
+        graders=[],
+        budgets=TaskBudgets(agent_iteration_seconds=0.05),
+    )
+
+    started = time.monotonic()
+    outcome = asyncio.run(
+        run_task_object(
+            task,
+            db_path=tmp_path / "db" / "flywheel.sqlite",
+            sandbox=tmp_path / "sandbox",
+            max_retries=0,
+            invoke=_never_returns,
+            store=store,
+            sink=_ListSink(),
+            stream=io.StringIO(),
+        )
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 10.0, "the task's own ceiling must govern the run"
+    assert outcome.lifecycle.status == Status.FAILED
+    assert outcome.attempts[0].outcome == Outcome.INTERNAL_ERROR
+    assert "deadline" in (outcome.attempts[0].error or "")
+
+
+def test_override_ceiling_precedence() -> None:
+    """None inherits; 0 is the per-task unbounded opt-out; positive replaces
+    -- in BOTH directions (a heavyweight task may raise the ceiling)."""
+    from flywheel_core.harness import _override_ceiling
+
+    assert _override_ceiling(None, 600.0) == 600.0
+    assert _override_ceiling(None, None) is None
+    assert _override_ceiling(0, 600.0) is None
+    assert _override_ceiling(120.0, 600.0) == 120.0
+    assert _override_ceiling(7200.0, 3600.0) == 7200.0

@@ -18,6 +18,7 @@ The schema is intentionally minimal: one required field (`goal`), the rest optio
 | `id`            | string   | `task-<uuid4 hex>` | Unique identifier, no whitespace           |
 | `tags`          | []string | `[]`      | Free-form labels for filtering and grouping |
 | `context`       | Context  | (empty)   | Briefing material the agent reads upfront  |
+| `budgets`       | Budgets  | (inherit) | Per-task execution-budget overrides for the heavyweight tail |
 
 Flywheel core owns the lifecycle of a *single* task, so the schema describes one task in isolation. Cross-task scheduling — the dependency DAG (`prerequisites`), phases, and queueing — is an **orchestration-layer** concern owned by consumers built on flywheel (e.g. `flywheel-orchestrator`), not part of the core `Task`. A consumer's task source may carry a `prerequisites` key; core ignores it, and the orchestrator parses it to schedule. Git workflow concerns (commit messages, branch naming) and loading concerns (files, queues, APIs) likewise live outside the schema.
 
@@ -35,6 +36,22 @@ A bundle of optional briefing fields. Provide none, one, or all. Use these to gi
 | `notes`       | string   | Free-form markdown for anything that doesn't fit above            |
 
 `relevant` is the single biggest lever for cutting context burn — pointing the agent at the right files saves it from reading the wrong ones.
+
+## Budgets
+
+Harness knobs, not agent-facing context: a task that legitimately outgrows a repo-wide ceiling (e.g. a golden-record run longer than the default 3600s iteration deadline) declares its own budget instead of the operator loosening the ceiling for every task. Every field is optional; unset inherits the `[deadlines]`/harness value. Seconds fields follow the `[deadlines]` convention: positive = ceiling, `0` = unbounded opt-out for this task.
+
+| Field                     | Type   | Overrides                                             |
+| ------------------------- | ------ | ----------------------------------------------------- |
+| `agent_iteration_seconds` | number | the `agent_iteration` wall-clock ceiling              |
+| `rubric_judge_seconds`    | number | the `rubric_judge` wall-clock ceiling                 |
+| `rubric_judge_max_turns`  | int    | the judge session's turn budget (`>= 1`)              |
+
+```json
+"budgets": {"agent_iteration_seconds": 7200, "rubric_judge_max_turns": 64}
+```
+
+Judge-infrastructure failures (a judge dying on its own turn/time budget, a transport error, a malformed verdict envelope) are retried in place — the judge alone re-runs, never the implementation attempt — before any escalation to the `INTERNAL_ERROR` path.
 
 ## Graders
 

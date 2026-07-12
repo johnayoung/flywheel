@@ -94,6 +94,11 @@ def _run(
     transcript_passed: bool = True,
     judge_model: str | None = None,
     judge_max_turns: int = 8,
+    # Single-shot by default: these tests pin the per-invocation failure
+    # shapes (what one exhausted envelope surfaces); the retry envelope has
+    # its own test class below.
+    judge_retries: int = 0,
+    on_judge_retry: Any = None,
 ) -> Any:
     return _run_sync(
         run_rubric_graders(
@@ -108,6 +113,8 @@ def _run(
             judge_invoke=judge_invoke,
             judge_model=judge_model,
             judge_max_turns=judge_max_turns,
+            judge_retries=judge_retries,
+            on_judge_retry=on_judge_retry,
         )
     )
 
@@ -900,3 +907,122 @@ class TestDefaultJudgeInvoker:
         grader = RubricGrader(assertions=["a"], name="r0")
         response = _run_sync(invoker("prompt", grader, "/tmp/wt"))
         assert response == "part-A part-B tail"
+
+
+# ---------------------------------------------------------------------------
+# judge-infra retry envelope: the judge alone re-runs, never the attempt
+# ---------------------------------------------------------------------------
+
+
+class _FlakyJudge:
+    """Fails with judge-infra shapes N times, then returns ``response``."""
+
+    def __init__(self, failures: list[Any], response: str) -> None:
+        self._failures = list(failures)
+        self._response = response
+        self.calls = 0
+
+    async def __call__(
+        self, prompt: str, grader: RubricGrader, worktree: Path | str
+    ) -> str:
+        self.calls += 1
+        if self._failures:
+            failure = self._failures.pop(0)
+            if isinstance(failure, BaseException):
+                raise failure
+            return failure  # a malformed response body
+        return self._response
+
+
+class TestJudgeInfraRetryEnvelope:
+    def test_infra_failure_retried_in_place_then_passes(self) -> None:
+        """A transport blip on the judge's own call must not surface: the
+        judge re-runs alone and the rubric passes -- the $20-40
+        implementation attempt is never re-driven for judge weather."""
+        judge = _FlakyJudge(
+            [RuntimeError("transport reset")],
+            _wrap('{"passed": true, "summary": "ok"}'),
+        )
+        store = InMemoryStore()
+        _bootstrap(store)
+        task = _task("goal", RubricGrader(assertions=["a"], name="r"))
+        retries: list[tuple[str, int, str]] = []
+
+        results = _run(
+            task,
+            store,
+            judge_invoke=judge,
+            judge_retries=2,
+            on_judge_retry=lambda name, attempt, reason: retries.append(
+                (name, attempt, reason)
+            ),
+        )
+
+        assert judge.calls == 2
+        assert [r.passed for r in results] == [True]
+        assert retries == [("r", 1, "transport reset")]
+
+    def test_malformed_envelope_retried_then_passes(self) -> None:
+        # A malformed verdict envelope is judge infrastructure, not a
+        # verdict: one clean re-ask absorbs it.
+        judge = _FlakyJudge(
+            ["not a verdict at all"],
+            _wrap('{"passed": true, "summary": "ok"}'),
+        )
+        store = InMemoryStore()
+        _bootstrap(store)
+        task = _task("goal", RubricGrader(assertions=["a"], name="r"))
+
+        results = _run(task, store, judge_invoke=judge, judge_retries=1)
+
+        assert judge.calls == 2
+        assert [r.passed for r in results] == [True]
+
+    def test_exhausted_envelope_raises_the_last_infra_error(self) -> None:
+        judge = _FlakyJudge(
+            [RuntimeError("boom 1"), RuntimeError("boom 2"), RuntimeError("boom 3")],
+            _wrap('{"passed": true, "summary": "never reached"}'),
+        )
+        store = InMemoryStore()
+        _bootstrap(store)
+        task = _task("goal", RubricGrader(assertions=["a"], name="r"))
+        retries: list[tuple[str, int, str]] = []
+
+        with pytest.raises(RubricJudgeError, match="boom 3"):
+            _run(
+                task,
+                store,
+                judge_invoke=judge,
+                judge_retries=2,
+                on_judge_retry=lambda name, attempt, reason: retries.append(
+                    (name, attempt, reason)
+                ),
+            )
+
+        assert judge.calls == 3
+        assert [r[1] for r in retries] == [1, 2]
+
+    def test_real_fail_verdict_is_never_retried(self) -> None:
+        """A FAIL verdict is a verdict, not infrastructure: exactly one
+        judge call, no retry, normal failed-rubric handling."""
+        judge = _FlakyJudge(
+            [], _wrap('{"passed": false, "summary": "wrong file"}')
+        )
+        store = InMemoryStore()
+        _bootstrap(store)
+        task = _task("goal", RubricGrader(assertions=["a"], name="r"))
+
+        results = _run(task, store, judge_invoke=judge, judge_retries=2)
+
+        assert judge.calls == 1
+        assert [r.passed for r in results] == [False]
+
+    def test_zero_retries_restores_single_shot_behavior(self) -> None:
+        judge = _FlakyJudge([RuntimeError("boom")], "unused")
+        store = InMemoryStore()
+        _bootstrap(store)
+        task = _task("goal", RubricGrader(assertions=["a"], name="r"))
+
+        with pytest.raises(RubricJudgeError, match="boom"):
+            _run(task, store, judge_invoke=judge, judge_retries=0)
+        assert judge.calls == 1

@@ -16,7 +16,12 @@ from flywheel_core import (
     load_task_file,
     load_tasks_jsonl,
 )
-from flywheel_core.loaders import deserialize_task, serialize_task, task_digest
+from flywheel_core.loaders import (
+    deserialize_task,
+    load_task_data,
+    serialize_task,
+    task_digest,
+)
 
 
 def _well_formed() -> dict:
@@ -567,3 +572,67 @@ def test_list_notes_is_joined_into_a_string() -> None:
     )
     assert task.context.notes == "first para\n\nsecond para"
     assert isinstance(task.context.notes, str)
+
+
+# --- per-task budgets (execution overrides) -----------------------------------
+
+
+def test_budgets_parse_and_round_trip() -> None:
+    data = {
+        "id": "heavy",
+        "goal": "Golden-record run that legitimately needs 2h.",
+        "graders": [{"type": "command", "run": "true"}],
+        "budgets": {
+            "agent_iteration_seconds": 7200,
+            "rubric_judge_max_turns": 64,
+        },
+    }
+    task = load_task_data(data)
+    assert task.budgets.agent_iteration_seconds == 7200
+    assert task.budgets.rubric_judge_max_turns == 64
+    assert task.budgets.rubric_judge_seconds is None
+
+    # serialize -> deserialize round-trips to an equal Task, and the budgets
+    # key survives.
+    reloaded = deserialize_task(serialize_task(task))
+    assert reloaded == task
+    assert "budgets" in serialize_task(task)
+
+
+def test_budgets_unknown_key_rejected_loud() -> None:
+    data = {
+        "id": "t",
+        "goal": "g.",
+        "graders": [{"type": "command", "run": "true"}],
+        "budgets": {"iteration_seconds": 7200},
+    }
+    with pytest.raises(TaskLoadError, match="iteration_seconds"):
+        load_task_data(data)
+
+
+def test_budgets_out_of_range_rejected_via_validate() -> None:
+    data = {
+        "id": "t",
+        "goal": "g.",
+        "graders": [{"type": "command", "run": "true"}],
+        "budgets": {"rubric_judge_max_turns": 0},
+    }
+    with pytest.raises(TaskLoadError, match="rubric_judge_max_turns"):
+        load_task_data(data)
+
+
+def test_budgets_absent_keeps_digest_and_serialization_stable() -> None:
+    data = {
+        "id": "t",
+        "goal": "g.",
+        "graders": [{"type": "command", "run": "true"}],
+    }
+    task = load_task_data(data)
+    # Default budgets serialize to NO budgets key and the same digest a
+    # pre-budgets task carried: existing task_versions pins stay valid.
+    assert "budgets" not in serialize_task(task)
+    with_budgets = load_task_data(
+        {**data, "budgets": {"agent_iteration_seconds": 7200}}
+    )
+    assert task_digest(task) != task_digest(with_budgets)
+    assert task_digest(task) == task_digest(load_task_data(dict(data)))

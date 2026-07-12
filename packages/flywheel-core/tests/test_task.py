@@ -8,6 +8,7 @@ from flywheel_core import (
     ManualGrader,
     RubricGrader,
     Task,
+    TaskBudgets,
     TranscriptGrader,
     ValidationError,
 )
@@ -195,3 +196,55 @@ def test_grader_variants_carry_correct_type_tag() -> None:
 
 def test_known_grader_types_match_schema() -> None:
     assert set(KNOWN_GRADER_TYPES) == {"command", "rubric", "manual", "transcript"}
+
+
+# --- TaskBudgets (per-task execution overrides) -------------------------------
+
+
+class TestTaskBudgets:
+    def test_default_budgets_validate_and_change_nothing(self) -> None:
+        task = Task(goal="g", graders=[])
+        task.validate()
+        assert task.budgets == TaskBudgets()
+
+    def test_valid_overrides_validate(self) -> None:
+        Task(
+            goal="g",
+            graders=[],
+            budgets=TaskBudgets(
+                agent_iteration_seconds=7200.0,
+                rubric_judge_seconds=0,
+                rubric_judge_max_turns=64,
+            ),
+        ).validate()
+
+    def test_negative_seconds_rejected(self) -> None:
+        task = Task(
+            goal="g",
+            graders=[],
+            budgets=TaskBudgets(agent_iteration_seconds=-1),
+        )
+        with pytest.raises(ValidationError, match="agent_iteration_seconds"):
+            task.validate()
+
+    def test_bool_seconds_rejected(self) -> None:
+        task = Task(
+            goal="g", graders=[], budgets=TaskBudgets(rubric_judge_seconds=True)
+        )
+        with pytest.raises(ValidationError, match="rubric_judge_seconds"):
+            task.validate()
+
+    def test_non_positive_turns_rejected(self) -> None:
+        task = Task(
+            goal="g",
+            graders=[],
+            budgets=TaskBudgets(rubric_judge_max_turns=0),
+        )
+        with pytest.raises(ValidationError, match="rubric_judge_max_turns"):
+            task.validate()
+
+    def test_non_budgets_object_rejected(self) -> None:
+        task = Task(goal="g", graders=[])
+        task.budgets = {"agent_iteration_seconds": 10}  # type: ignore[assignment]
+        with pytest.raises(ValidationError, match="TaskBudgets"):
+            task.validate()

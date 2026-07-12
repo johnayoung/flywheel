@@ -14,6 +14,7 @@ from flywheel_core.task import (
     ManualGrader,
     RubricGrader,
     Task,
+    TaskBudgets,
     TranscriptGrader,
     ValidationError,
 )
@@ -208,6 +209,36 @@ def _notes_field(value: Any, source: str) -> str:
     )
 
 
+_BUDGET_KEYS = (
+    "agent_iteration_seconds",
+    "rubric_judge_seconds",
+    "rubric_judge_max_turns",
+)
+
+
+def _budgets_field(value: Any, source: str) -> TaskBudgets:
+    """Parse the optional per-task ``budgets`` object (execution overrides).
+
+    Exactly the :class:`TaskBudgets` keys are accepted; an unknown key is
+    rejected loudly so a typo (``iteration_seconds``) never silently leaves a
+    heavyweight task on the repo-wide ceiling it declared itself out of.
+    Range/type validation is :meth:`TaskBudgets.validate`'s job, reached via
+    ``task.validate()``.
+    """
+    if not isinstance(value, dict):
+        raise TaskLoadError(
+            f"{source}: 'budgets' must be an object, "
+            f"got {type(value).__name__}"
+        )
+    unknown = set(value) - set(_BUDGET_KEYS)
+    if unknown:
+        raise TaskLoadError(
+            f"{source}: 'budgets' has unknown key(s) {sorted(unknown)}; "
+            f"valid keys: {list(_BUDGET_KEYS)}"
+        )
+    return TaskBudgets(**{key: value[key] for key in _BUDGET_KEYS if key in value})
+
+
 def _task_from_dict(data: Any, source: str) -> Task:
     if not isinstance(data, dict):
         raise TaskLoadError(
@@ -261,6 +292,8 @@ def _task_from_dict(data: Any, source: str) -> Task:
         kwargs["id"] = data["id"]
     if "tags" in data:
         kwargs["tags"] = _str_list_field(data["tags"], "tags", source)
+    if "budgets" in data:
+        kwargs["budgets"] = _budgets_field(data["budgets"], source)
     # ``prerequisites`` is an orchestration-layer concept (the inter-task DAG),
     # not part of a single task's definition — flywheel core ignores it here.
     # Consumers that schedule across tasks parse it from the task source
@@ -341,19 +374,37 @@ def _context_to_dict(context: Context) -> dict[str, Any]:
     }
 
 
+def _budgets_to_dict(budgets: TaskBudgets) -> dict[str, Any]:
+    """The set fields of ``budgets``, omitting the inherit-``None`` defaults.
+
+    Empty for a default-constructed instance, so tasks that declare no
+    overrides serialize (and digest) byte-identically to before the field
+    existed.
+    """
+    return {
+        key: getattr(budgets, key)
+        for key in _BUDGET_KEYS
+        if getattr(budgets, key) is not None
+    }
+
+
 def serialize_task(task: Task) -> dict[str, Any]:
     """Return the JSON-compatible dict form of ``task``.
 
     Exact inverse of :func:`_task_from_dict`: feeding the result to
     :func:`deserialize_task` reconstructs an equal :class:`Task`.
     """
-    return {
+    payload = {
         "id": task.id,
         "goal": task.goal,
         "graders": [_grader_to_dict(g) for g in task.graders],
         "tags": list(task.tags),
         "context": _context_to_dict(task.context),
     }
+    budgets = _budgets_to_dict(task.budgets)
+    if budgets:
+        payload["budgets"] = budgets
+    return payload
 
 
 def deserialize_task(data: Mapping[str, Any]) -> Task:
@@ -380,5 +431,11 @@ def task_digest(task: Task) -> str:
         "tags": list(task.tags),
         "context": _context_to_dict(task.context),
     }
+    # Budgets participate only when set: an edited override IS a new
+    # definition a run must pin, while every pre-existing task (no budgets
+    # key) keeps its digest byte-identical.
+    budgets = _budgets_to_dict(task.budgets)
+    if budgets:
+        definition["budgets"] = budgets
     canonical = json.dumps(definition, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

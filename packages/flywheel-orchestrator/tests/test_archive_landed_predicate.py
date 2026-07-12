@@ -482,3 +482,209 @@ def test_non_done_task_keeps_phase_active_even_with_predicate_armed(
     assert not any("not landed" in line for line in logged), (
         f"predicate must not run for an ineligible phase, got {logged!r}"
     )
+
+
+def test_absorbed_rebased_copy_counts_landed_by_patch_identity(
+    tmp_path: Path,
+) -> None:
+    """A task whose own landing crashed but whose commits a sibling's
+    submit-time rebase carried onto the base as patch-identical copies (new
+    SHAs, same patches) is landed: ancestry fails, patch identity (``git
+    cherry``) recognizes the absorbed work, and the phase archives instead of
+    blocking the phase PR forever."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = _tasks_dir(repo)
+    phase_dir = tasks_dir / "active" / "01-landed"
+
+    head = _branch_off_main(repo, "flywheel/01-landed/feat-a", "feat_a.txt")
+    # The base advanced (the sibling's own work landed first), THEN the
+    # sibling's submit-time rebase absorbed this branch's commit onto main as
+    # a rebased copy: identical patch, different parent, different SHA.
+    _git_commit_file(repo, "sibling.txt", "sibling\n", "feat: sibling landed")
+    _git(repo, "cherry-pick", head)
+    ancestry = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", head, "main"],
+        capture_output=True,
+    )
+    assert ancestry.returncode != 0, "precondition: ancestry must NOT hold"
+    _write_task(phase_dir, "feat-a")
+
+    logged: list[str] = []
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    claims = SqliteClaimStore(db)
+    try:
+        _seed_done(store, "feat-a")
+        moved = archive_completed_phases(
+            tasks_dir,
+            store,
+            repo_root=repo,
+            log=logged.append,
+            landing_base="main",
+            claims=claims,
+        )
+    finally:
+        claims.close()
+        store.close()
+
+    assert [m.name for m in moved] == [phase_dir.name]
+    assert not phase_dir.exists()
+    assert (tasks_dir / "archive" / phase_dir.name).is_dir()
+
+
+def test_partially_absorbed_branch_still_blocks(tmp_path: Path) -> None:
+    """Patch identity must not over-bless: a branch with one absorbed commit
+    and one commit the base never received stays a determinate strand."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = _tasks_dir(repo)
+    phase_dir = tasks_dir / "active" / "01-landed"
+
+    base = _git_head(repo)
+    _git(repo, "checkout", "-b", "flywheel/01-landed/feat-a", base)
+    _git_commit_file(repo, "feat_a.txt", "absorbed\n", "feat: absorbed half")
+    absorbed = _git_head(repo)
+    _git_commit_file(repo, "feat_b.txt", "stranded\n", "feat: stranded half")
+    _git(repo, "checkout", "main")
+    # Only the first commit was absorbed by the sibling's rebase.
+    _git(repo, "cherry-pick", absorbed)
+    _write_task(phase_dir, "feat-a")
+
+    logged: list[str] = []
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    claims = SqliteClaimStore(db)
+    try:
+        _seed_done(store, "feat-a")
+        moved = archive_completed_phases(
+            tasks_dir,
+            store,
+            repo_root=repo,
+            log=logged.append,
+            landing_base="main",
+            claims=claims,
+        )
+    finally:
+        claims.close()
+        store.close()
+
+    assert moved == []
+    assert phase_dir.is_dir(), "half-absorbed work must remain a strand"
+    assert any(
+        "Refusing to archive" in line and "feat-a" in line for line in logged
+    )
+
+
+def test_archival_move_of_tracked_queue_is_committed(tmp_path: Path) -> None:
+    """Bug 7 regression: the sweep used to leave its active->archive moves
+    uncommitted in the operator's checkout, racing pulls -- and a later
+    landing that committed only the archive/ copies resurrected duplicate
+    active/ phases the same-named-archive guard then skipped silently. A
+    TRACKED queue's move is now committed, scoped to the two moved paths."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = _tasks_dir(repo)
+    phase_dir = tasks_dir / "active" / "01-landed"
+
+    _branch_on_main(repo, "flywheel/01-landed/feat-a", "feat_a.txt")
+    _write_task(phase_dir, "feat-a")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "chore: queue phase 01-landed")
+    # Unrelated operator state must survive the sweep's scoped commit.
+    (repo / "scratch.txt").write_text("operator wip\n")
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "feat-a")
+        moved = archive_completed_phases(
+            tasks_dir,
+            store,
+            repo_root=repo,
+            log=None,
+            landing_base="main",
+        )
+    finally:
+        store.close()
+
+    assert [m.name for m in moved] == ["01-landed"]
+    subject = _git(repo, "log", "-1", "--format=%s").stdout.strip()
+    assert subject == "chore: archive completed phase 01-landed"
+    # The move is fully committed: no dirty tracked state remains, and the
+    # operator's unrelated untracked file was not swept into the commit.
+    porcelain = _git(repo, "status", "--porcelain").stdout.splitlines()
+    assert porcelain == ["?? scratch.txt"], porcelain
+    committed = _git(
+        repo, "show", "--stat", "--name-status", "--format=", "HEAD"
+    ).stdout
+    assert "archive/01-landed" in committed
+    assert "scratch.txt" not in committed
+
+
+def test_archival_move_of_untracked_queue_stays_uncommitted(
+    tmp_path: Path,
+) -> None:
+    """A queue the repo never tracked keeps the legacy no-commit behavior:
+    the sweep moves the directory and touches git not at all."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = _tasks_dir(repo)
+    phase_dir = tasks_dir / "active" / "01-landed"
+
+    _branch_on_main(repo, "flywheel/01-landed/feat-a", "feat_a.txt")
+    head_before = _git_head(repo)
+    _write_task(phase_dir, "feat-a")
+
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "feat-a")
+        moved = archive_completed_phases(
+            tasks_dir,
+            store,
+            repo_root=repo,
+            log=None,
+            landing_base="main",
+        )
+    finally:
+        store.close()
+
+    assert [m.name for m in moved] == ["01-landed"]
+    assert _git_head(repo) == head_before, "untracked queue must not commit"
+
+
+def test_same_named_archive_skip_is_loud(tmp_path: Path) -> None:
+    """The dest.exists() guard must name the duplicate instead of silently
+    re-running the phase gate forever."""
+    repo = tmp_path / "repo"
+    _git_init_repo(repo)
+    tasks_dir = _tasks_dir(repo)
+    phase_dir = tasks_dir / "active" / "01-landed"
+
+    _branch_on_main(repo, "flywheel/01-landed/feat-a", "feat_a.txt")
+    _write_task(phase_dir, "feat-a")
+    # A resurrected duplicate: the archive copy already exists.
+    (tasks_dir / "archive" / "01-landed").mkdir(parents=True)
+
+    logged: list[str] = []
+    db = tmp_path / "db.sqlite"
+    store = SqliteStore(db)
+    try:
+        _seed_done(store, "feat-a")
+        moved = archive_completed_phases(
+            tasks_dir,
+            store,
+            repo_root=repo,
+            log=logged.append,
+            landing_base="main",
+        )
+    finally:
+        store.close()
+
+    assert moved == []
+    assert phase_dir.is_dir()
+    assert any(
+        "Refusing to archive" in line and "already exists" in line
+        for line in logged
+    ), logged

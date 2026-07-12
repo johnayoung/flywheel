@@ -461,3 +461,89 @@ def test_queued_dependent_self_heals_when_store_resolves_prereq(
     finally:
         control.close()
         claims.close()
+
+
+# --- cross-store continuity: archived task files satisfy (bug 3) ------------
+
+
+def test_archived_task_file_satisfies_prereq_absent_from_store(
+    tmp_path: Path,
+) -> None:
+    """A prerequisite completed under an earlier store backend (pre-flip
+    sqlite) has no lifecycle row in the policy-selected store -- but its
+    ARCHIVED task file is durable proof of verified completion (a phase
+    archives only past the landed predicate and exit gates), so the
+    dependent must schedule instead of dead-ending at prerequisite-missing.
+    """
+    tasks_dir = tmp_path / "tasks"
+    _write_task(
+        tasks_dir / "active" / "02-next",
+        "dependent",
+        prerequisites=["shipped-under-sqlite"],
+    )
+    # The prerequisite's phase archived under the OLD store regime; only the
+    # archived task JSON survives the store cutover.
+    _write_task(tasks_dir / "archive" / "01-shipped", "shipped-under-sqlite")
+
+    fresh_store = SqliteStore(tmp_path / "post-flip.sqlite")
+    try:
+        rows = build_status_rows(tasks_dir, fresh_store)
+        satisfied = satisfied_prerequisites_from_store(rows, fresh_store)
+    finally:
+        fresh_store.close()
+
+    assert satisfied == frozenset({"shipped-under-sqlite"})
+
+
+def test_prereq_absent_from_store_and_archive_stays_unsatisfied(
+    tmp_path: Path,
+) -> None:
+    """Fail closed: no lifecycle row AND no archived task file means the
+    prerequisite is genuinely missing, never blessed."""
+    tasks_dir = tmp_path / "tasks"
+    _write_task(
+        tasks_dir / "active" / "02-next",
+        "dependent",
+        prerequisites=["never-ran"],
+    )
+    (tasks_dir / "archive").mkdir(parents=True)
+
+    fresh_store = SqliteStore(tmp_path / "post-flip.sqlite")
+    try:
+        rows = build_status_rows(tasks_dir, fresh_store)
+        satisfied = satisfied_prerequisites_from_store(rows, fresh_store)
+    finally:
+        fresh_store.close()
+
+    assert satisfied == frozenset()
+
+
+def test_dependent_dispatches_when_prereq_only_in_archive(
+    tmp_path: Path,
+) -> None:
+    """End to end: the loop runs the dependent to DONE off the archived-file
+    satisfaction alone -- no lifecycle row for the prerequisite exists in the
+    (fresh, post-cutover) store the loop opens."""
+    tasks_dir = tmp_path / "tasks"
+    _write_task(
+        tasks_dir / "active" / "02-next",
+        "dependent",
+        prerequisites=["shipped-under-sqlite"],
+    )
+    _write_task(tasks_dir / "archive" / "01-shipped", "shipped-under-sqlite")
+
+    report = _orchestrate(tmp_path)
+    assert [r.task_id for r in report.runs] == ["dependent"]
+    assert all(r.status is Status.DONE for r in report.runs)
+
+    store = SqliteStore(tmp_path / "flywheel.sqlite")
+    claims = SqliteClaimStore(tmp_path / "flywheel.sqlite")
+    try:
+        rows = build_status_rows(tasks_dir, store)
+        assert [(r.task.id, r.state) for r in rows] == [
+            ("dependent", TaskState.DONE)
+        ]
+        assert _prereq_missing_queue_entries(claims, "dependent") == []
+    finally:
+        claims.close()
+        store.close()

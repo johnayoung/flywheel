@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import fcntl
 import os
@@ -50,8 +51,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from collections.abc import Mapping
-from typing import IO, Callable, Iterator, Protocol, Sequence, TextIO
+from collections.abc import Coroutine, Mapping
+from typing import IO, Callable, Iterator, Protocol, Sequence, TextIO, TypeVar
 from uuid import uuid4
 
 from flywheel_core import (
@@ -242,10 +243,33 @@ def _default_resolve_conflict(
     (:func:`~flywheel_core.deadline.run_with_deadline`). Returns the recorded
     usage; it never inspects or reports whether the tree was resolved (the
     worker owns that). Synchronous by design so the ``submit`` call chain (itself
-    synchronous) drives it via :func:`asyncio.run`, exactly one session per
+    synchronous) can drive it -- but that chain executes ON orchestrate's event
+    loop thread, where a bare ``asyncio.run`` raises ``RuntimeError: cannot be
+    called from a running event loop`` (P8: the whole recovery tier was dead
+    code and every conflicted landing parked). The coroutine therefore runs on
+    a dedicated thread with its own fresh loop, exactly one session per
     re-driver pass.
     """
-    return asyncio.run(_drive_conflict_resolution(request))
+    return _run_session_coroutine(_drive_conflict_resolution(request))
+
+
+_T = TypeVar("_T")
+
+
+def _run_session_coroutine(coro: Coroutine[object, object, _T]) -> _T:
+    """Drive ``coro`` to completion from synchronous code, loop or no loop.
+
+    The submit chain is synchronous by contract but is invoked inside
+    ``orchestrate``'s running event loop, so ``asyncio.run`` on the caller's
+    thread is a ``RuntimeError`` there while working fine in bare-synchronous
+    tests. One dedicated thread with its own event loop behaves identically in
+    both contexts; the caller blocks for the result exactly as the rest of the
+    landing ladder blocks on graders and git.
+    """
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="flywheel-resolver"
+    ) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 async def _drive_conflict_resolution(
@@ -337,7 +361,9 @@ def _make_agents_resolve_conflict(
             timeout_seconds=request.max_wall_seconds,
         )
         started = time.monotonic()
-        completed = asyncio.run(runtime.run(run_request))
+        # Same running-loop hazard as _default_resolve_conflict (P8): the
+        # submit chain executes on orchestrate's loop thread.
+        completed = _run_session_coroutine(runtime.run(run_request))
         failure = completed.failure
         if failure is not None and failure.error_type == "timeout":
             # Deadline-park parity with the default driver: report usage at
@@ -2557,10 +2583,12 @@ def _format_heartbeat(row: LiveRunRow, now: datetime) -> str:
         # No iteration has completed yet, so the per-iteration rollup
         # (tokens/cost/turns come from harness.iteration_completed events)
         # has no data. The agent is still working its first iteration --
-        # render that honestly. "tokens=0 turns=0" reads as a frozen run
-        # when it is in fact mid-flight; the `age` field shows how long the
-        # in-progress iteration has been running.
-        totals = "working (first-iteration metrics pending)"
+        # render that honestly, and say WHEN numbers will appear: a single
+        # long iteration keeps this placeholder for its whole duration
+        # because the rollup lands only at iteration boundaries, which reads
+        # as a stall unless the line says so. The `age` field shows how long
+        # the in-progress iteration has been running.
+        totals = "working (iteration 1 in progress; totals land at iteration boundaries)"
     else:
         totals = (
             f"tokens={row.tokens_total} "
@@ -2626,8 +2654,18 @@ class Heartbeat:
 
 
 def make_logger(prefix: str) -> Logger:
+    """Build the stderr logger every worker/pool/heartbeat line goes through.
+
+    One centralized format: ``<UTC timestamp> <prefix> <message>``. The
+    timestamp is stamped here -- the single construction seam -- so pool
+    member logs, supervisor lines, and heartbeats are all correlatable
+    against each other and against store timestamps without any call site
+    opting in.
+    """
+
     def log(message: str) -> None:
-        print(f"{prefix} {message}", file=sys.stderr, flush=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"{stamp} {prefix} {message}", file=sys.stderr, flush=True)
 
     return log
 

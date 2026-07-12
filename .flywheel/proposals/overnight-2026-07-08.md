@@ -135,3 +135,27 @@ Operator pre-selected "fix all" in the originating request; the STEP-7 selection
 
 - Recovery of the lost commit itself (`b45412e1`) -- no flywheel proposal: it is an adopting-repo action (re-drive as a next-batch infrared task so graders re-prove the scenario against the current tree; branch + worktree preserved).
 - `fw status --rollup` doc drift, `fw live` zero-token telemetry on streaming runs, `fw history` empty despite finished runs, cwd-sensitive source resolution ("no active tasks" from a subdirectory) -- observed repeatedly but diagnosis-grade only; no RCA performed this scope. Recorded here as retro seeds, not proposals.
+
+## P8 (2026-07-11, infrared drain): conflict-resolution agent session crashes — asyncio.run() inside running loop
+
+`_drive_conflict_resolution` (flywheel-worktree worker.py ~1466) is invoked via `asyncio.run()` from a context that already holds a running event loop; the session crashes with `RuntimeError: asyncio.run() cannot be called from a running event loop` and `RuntimeWarning: coroutine '_drive_conflict_resolution' was never awaited`. Every merge-conflict landing that escalates past FF/rebase/merge-fallback therefore parks instead of self-resolving — the designed recovery tier is dead code. Observed on `stableplain-lp-decompose-golden` (run parked after 3 re-attempts, reason merge-conflict; operator hand-landed: cassette JSONs deep-merged cleanly, all graders green). Fix: await the coroutine on the existing loop (or run in a fresh thread with its own loop).
+
+RESOLVED 2026-07-12: both resolver drivers (default SDK and agents-runtime) now
+run their session coroutine on a dedicated thread with its own event loop
+(`_run_session_coroutine`), safe under orchestrate's running loop and in bare
+synchronous callers. Regression-pinned in test_landing_agent_resolution.
+
+## Weekend batch resolution (2026-07-12)
+
+The retro seeds above plus the drain findings were verified and dispatched in
+one batch: absorbed rebased copies now count landed by patch identity
+(`git cherry`); prerequisites completed under a pre-cutover store are satisfied
+by their archived task files; fw invoked from a subdirectory walks up to
+flywheel.toml (and fails loud outside any repo); the archive sweep commits its
+active->archive moves for tracked queues and names same-named-archive skips;
+resolved strands stop rendering on active rows; rowless status lines carry a
+`[no active row]` marker; worker/pool/heartbeat logs carry UTC timestamps; the
+first-iteration heartbeat placeholder states that totals land at iteration
+boundaries. `fw approve/say/interrupt` postgres routing and `fw live` counters
+were verified already fixed on main (ad377d1, 2610b92) — the live-counter
+observation is the iteration-boundary granularity, not a store split.

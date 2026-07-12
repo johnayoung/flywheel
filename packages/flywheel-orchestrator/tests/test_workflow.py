@@ -3848,3 +3848,60 @@ def test_archive_materializes_loop_base_ref_into_dotfile(
         check=False,
     )
     assert ref_check.returncode != 0
+
+
+# --- cwd-independent invocation (bug 6) --------------------------------------
+
+
+def test_status_from_subdirectory_walks_up_to_the_policy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fw invoked from a subdirectory used to resolve every cwd-relative
+    default against the subdirectory and silently print an empty queue.
+    Auto-detection now walks parents to flywheel.toml and re-anchors the
+    process at the repo root, so the queue renders identically."""
+    root = tmp_path / "repo"
+    phase = root / ".flywheel" / "tasks" / "active" / "01-phase"
+    phase.mkdir(parents=True)
+    (phase / "t1.json").write_text(
+        json.dumps(
+            {
+                "id": "t1",
+                "goal": "Goal for t1.",
+                "graders": [{"type": "command", "run": "true"}],
+            }
+        )
+    )
+    (root / "flywheel.toml").write_text(
+        '[source]\nkind = "directory"\ntasks_dir = ".flywheel/tasks"\n'
+    )
+    sub = root / "src" / "deep"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+
+    rc = orch_main(["status"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "01-phase/t1" in out
+    assert "(no active tasks)" not in out
+
+
+def test_status_outside_any_flywheel_repo_fails_loud(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No policy up the tree and no .flywheel/tasks here: the verb must fail
+    loud (exit 2, named search) instead of printing an empty queue
+    indistinguishable from a caught-up repo."""
+    bare = tmp_path / "not-a-repo"
+    bare.mkdir()
+    monkeypatch.chdir(bare)
+
+    rc = orch_main(["status"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "not a flywheel repo" in captured.err
+    assert "(no active tasks)" not in captured.out

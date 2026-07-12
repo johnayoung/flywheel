@@ -686,3 +686,31 @@ def test_builders_keep_default_resolver_when_agent_id_unset(
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_session_coroutine_completes_under_a_running_event_loop() -> None:
+    """P8 regression: ``strategy.submit`` executes synchronously ON
+    orchestrate's event-loop thread, so the resolver drivers' former bare
+    ``asyncio.run`` raised ``RuntimeError: asyncio.run() cannot be called
+    from a running event loop`` -- the entire conflict-resolution tier was
+    dead code and every conflicted landing parked for a human. The drivers
+    now run their session coroutine on a dedicated thread with its own loop,
+    which must work both under a running loop and without one."""
+    import asyncio
+
+    from flywheel_worktree.worker import _run_session_coroutine
+
+    async def _session() -> str:
+        await asyncio.sleep(0)
+        return "resolved"
+
+    # No running loop (bare synchronous callers, e.g. unit tests).
+    assert _run_session_coroutine(_session()) == "resolved"
+
+    async def _submit_chain() -> str:
+        # The production shape: a synchronous call made from a coroutine
+        # running on the loop thread, exactly like orchestrate -> submit ->
+        # _agent_resolve -> the resolver driver.
+        return _run_session_coroutine(_session())
+
+    assert asyncio.run(_submit_chain()) == "resolved"

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -431,9 +432,16 @@ def satisfied_prerequisites_from_store(
     :func:`task_state` (which classifies DONE through the same
     ``_has_done_lifecycle`` authority), so this extends that authority to
     unlisted ids without adding a per-listed-task store read to the pass. A
-    DONE lifecycle is the sole satisfier — a FAILED / RUNNING / INTERRUPTED /
-    absent id is never returned — so the result is exactly the set a caller
-    may hand to :func:`select_next_task` /
+    DONE lifecycle satisfies; so does an ARCHIVED task file (cross-store
+    continuity): a task completed under an earlier store backend -- e.g. the
+    pre-flip sqlite file after a ``[store] backend = "postgres"`` cutover --
+    has no lifecycle row in the policy-selected store, but its task JSON
+    sitting under ``archive/`` is durable proof of verified completion,
+    because a phase archives only after every task passed the landed
+    predicate and the phase-exit gates. An id absent from BOTH the store and
+    the archive stays unsatisfied (fail closed): a FAILED / RUNNING /
+    INTERRUPTED / never-run id is never returned. The result is exactly the
+    set a caller may hand to :func:`select_next_task` /
     :meth:`WorkGraph.ready_set` as ``satisfied_prerequisites`` and use to drop
     a store-DONE edge from the dangling-prerequisite re-driver's issues.
     """
@@ -445,11 +453,41 @@ def satisfied_prerequisites_from_store(
         for prereq_id in row.prerequisites
         if prereq_id not in listed_ids
     }
+    if not candidates:
+        return frozenset()
+    archive_root = _archive_root_for_rows(materialized)
+
+    def _satisfied(prereq_id: str) -> bool:
+        if _has_done_lifecycle(store, prereq_id):
+            return True
+        if archive_root is None:
+            return False
+        return any(
+            match.is_file()
+            for match in archive_root.glob(f"*/{prereq_id}.json")
+        )
+
     return frozenset(
-        prereq_id
-        for prereq_id in candidates
-        if _has_done_lifecycle(store, prereq_id)
+        prereq_id for prereq_id in candidates if _satisfied(prereq_id)
     )
+
+
+def _archive_root_for_rows(rows: list[TaskStatusRow]) -> Path | None:
+    """The ``archive/`` sibling of the rows' ``active/`` tasks tree, if any.
+
+    Derived from the listed rows' own task-file paths so
+    :func:`satisfied_prerequisites_from_store` needs no new plumbing: a
+    directory-source row lives at ``<tasks>/active/<phase>/<id>.json``, so the
+    first path with an ``active`` ancestor names the tasks root. Non-directory
+    sources (github work items) have no such shape and return ``None``, which
+    keeps the store as the sole authority exactly as before.
+    """
+    for row in rows:
+        for parent in Path(row.task_file).parents:
+            if parent.name == "active":
+                archive = parent.parent / "archive"
+                return archive if archive.is_dir() else None
+    return None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -660,6 +698,83 @@ def _is_ancestor(repo_root: Path, ancestor: str, rev: str) -> bool:
     return rc == 0
 
 
+def _commit_archive_move(
+    repo_root: Path,
+    active_dir: Path,
+    dest: Path,
+    *,
+    log: Callable[[str], None] | None,
+) -> None:
+    """Commit an archival move so the queue's git truth matches the disk.
+
+    The sweep runs in the operator's checkout; leaving the ``active/``
+    deletions uncommitted races operator pulls, and a later landing that
+    commits only the ``archive/`` copies resurrects duplicate ``active/``
+    phases that every subsequent sweep skips on the same-named-archive guard.
+    This is queue bookkeeping, not landing (the worker still never commits
+    task WORK to the operator's branch): the commit is scoped strictly to the
+    two moved paths via pathspec, so unrelated staged operator state is left
+    untouched. Fires only when the active phase was git-tracked before the
+    move -- an untracked or gitignored queue stages nothing and keeps the
+    legacy no-commit behavior. Best-effort: any failure (mid-merge checkout,
+    missing identity) is logged with a commit-by-hand pointer, never raised,
+    and leaves the move on disk exactly as before this step existed.
+    """
+    rc, tracked = _git_capture(repo_root, "ls-files", "--", str(active_dir))
+    if rc != 0 or not tracked.strip():
+        return
+    rc, out = _git_capture(
+        repo_root, "add", "-A", "--", str(active_dir), str(dest)
+    )
+    if rc == 0:
+        rc, out = _git_capture(
+            repo_root,
+            "commit",
+            "-m",
+            f"chore: archive completed phase {dest.name}",
+            "--",
+            str(active_dir),
+            str(dest),
+        )
+    if rc != 0:
+        if log is not None:
+            log(
+                f"archival move of {dest.name} left uncommitted "
+                f"({out.strip().splitlines()[-1] if out.strip() else 'git failed'}); "
+                f"commit .flywheel/tasks by hand to keep the queue's git "
+                f"truth in step"
+            )
+        return
+    if log is not None:
+        log(f"Committed archival of phase {dest.name}")
+
+
+def _all_patches_absorbed(
+    repo_root: Path, head: str, landing_base: str
+) -> bool:
+    """True when every commit unique to ``head`` has a patch-identical
+    equivalent already reachable from ``landing_base``.
+
+    The absorbed-landing case: a task's own landing crashed after a sibling's
+    submit-time rebase carried its commits onto the base as REBASED COPIES --
+    new SHAs, identical patches -- so the ancestry probe reads the task as
+    unlanded forever even though its content shipped. ``git cherry`` compares
+    by ``git patch-id``: a ``-`` line marks a commit whose change exists
+    upstream, a ``+`` line one that does not. All-``-`` (and at least one
+    line: an empty comparison means an empty branch, which ancestry already
+    classified) is patch-identity proof of landing. Any ``+`` line or a
+    failed comparison reads as not absorbed, so a genuinely divergent branch
+    stays a determinate strand.
+    """
+    rc, out = _git_capture(repo_root, "cherry", landing_base, head)
+    if rc != 0:
+        return False
+    lines = [line for line in out.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(line.startswith("-") for line in lines)
+
+
 def _probe_task_landing(
     store: SqliteStore | PostgresStore,
     repo_root: Path,
@@ -672,12 +787,16 @@ def _probe_task_landing(
     Receipt first (fast path): a ``Landed`` event on the task's latest run is
     authoritative even if the branch is gone. Otherwise probe ancestry: resolve
     the task's recorded work to a commit and ask whether it is an ancestor of
-    ``landing_base`` at sweep time. A resolvable head that is NOT an ancestor is
-    a determinate strand (``NOT_LANDED``); an unresolvable head with no receipt
-    is ``INDETERMINATE`` -- landing state cannot be determined, so it fails
-    closed. A probe that always answered ``LANDED`` would archive the
-    divergent-base strand criterion 1 forbids; keying the truthy answer on real
-    ancestry is what forecloses that.
+    ``landing_base`` at sweep time; when it is not, fall back to patch
+    identity (:func:`_all_patches_absorbed`) so work a sibling's rebase
+    absorbed onto the base as patch-identical copies still reads landed
+    instead of blocking the phase forever. A resolvable head that is neither
+    an ancestor nor fully absorbed is a determinate strand (``NOT_LANDED``);
+    an unresolvable head with no receipt is ``INDETERMINATE`` -- landing state
+    cannot be determined, so it fails closed. A probe that always answered
+    ``LANDED`` would archive the divergent-base strand criterion 1 forbids;
+    keying the truthy answer on real ancestry or exact patch equivalence is
+    what forecloses that.
     """
     row = _latest_lifecycle_row(store, task_id)
     if row is not None and _run_has_landed_receipt(store, row[0]):
@@ -686,6 +805,8 @@ def _probe_task_landing(
     if head is None:
         return _LandingState.INDETERMINATE
     if _is_ancestor(repo_root, head, landing_base):
+        return _LandingState.LANDED
+    if _all_patches_absorbed(repo_root, head, landing_base):
         return _LandingState.LANDED
     return _LandingState.NOT_LANDED
 
@@ -1151,12 +1272,23 @@ def archive_completed_phases(
 
         dest = archive_root / phase_dir.name
         # If a same-named archive exists, leave the active dir alone rather
-        # than clobber prior history — operator can resolve manually.
+        # than clobber prior history — operator can resolve manually. Loudly:
+        # the silent form of this skip is how resurrected duplicates (an
+        # earlier archive whose active/ deletion was never committed) hid for
+        # whole sweeps while re-running the phase gate each pass.
         if dest.exists():
+            if log is not None:
+                log(
+                    f"Refusing to archive phase {phase_dir.name}: "
+                    f"{dest} already exists; resolve the duplicate by hand "
+                    f"(an earlier archive whose active/ deletion was never "
+                    f"committed resurrects on the next checkout)"
+                )
             continue
         shutil.move(str(phase_dir), str(dest))
         if repo_root is not None:
             _materialize_loop_base(repo_root, dest)
+            _commit_archive_move(repo_root, phase_dir, dest, log=log)
         if claims is not None:
             for task in loaded_tasks:
                 events = claims.list_subject_stop_events(task.id)
@@ -1523,6 +1655,12 @@ def load_effective_policy(
     * an explicit ``policy_path`` is loaded (and a missing/invalid file is
       an error -- propagated as :class:`PolicyError`);
     * otherwise ``flywheel.toml`` in the working directory is auto-detected;
+    * otherwise the parents of the working directory are searched toward the
+      filesystem root, and a hit RE-ANCHORS the process there (``os.chdir``)
+      before loading -- ``fw`` invoked from a subdirectory used to resolve
+      every cwd-relative default (``.flywheel/tasks``, the sqlite path)
+      against the subdirectory and silently report an empty queue, so the
+      whole invocation must behave exactly like a repo-root one;
     * otherwise there is no policy and every default falls back to the
       built-in ``.flywheel/`` layout.
 
@@ -1534,6 +1672,11 @@ def load_effective_policy(
     candidate = Path(DEFAULT_POLICY_FILENAME)
     if candidate.is_file():
         return load_policy(candidate)
+    for parent in Path.cwd().parents:
+        found = parent / DEFAULT_POLICY_FILENAME
+        if found.is_file():
+            os.chdir(parent)
+            return load_policy(Path(DEFAULT_POLICY_FILENAME))
     return None
 
 def _load_effective_policy(args: argparse.Namespace) -> WorkPolicy | None:
@@ -1547,12 +1690,21 @@ def _resolve_work_source(
 
     Precedence: an explicit ``--tasks-dir`` always selects the directory
     source (the historical behavior); otherwise the policy decides;
-    otherwise the default directory layout applies.
+    otherwise the default directory layout applies -- and when even that is
+    absent the invocation fails LOUD instead of rendering an empty queue
+    indistinguishable from a caught-up repo: no policy up the directory tree
+    plus no ``.flywheel/tasks`` here means this is not a flywheel repo.
     """
     if args.tasks_dir:
         return DirectoryWorkSource(Path(args.tasks_dir))
     if policy is not None:
         return build_work_source(policy)
+    if not DEFAULT_TASKS_DIR.is_dir():
+        raise PolicyError(
+            f"no {DEFAULT_POLICY_FILENAME} found in {Path.cwd()} or any "
+            f"parent directory, and no {DEFAULT_TASKS_DIR} here: not a "
+            f"flywheel repo (run from one, or pass --policy / --tasks-dir)"
+        )
     return DirectoryWorkSource(DEFAULT_TASKS_DIR)
 
 def resolve_db_path(
@@ -2304,6 +2456,20 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if subject not in stopped_task_ids
         and (subject not in resolved_at or park.ts > resolved_at[subject])
     }
+    # The per-row ``stranded:`` annotation clears on the SAME attributed
+    # resolutions as the rowless surface above: a strand the operator (or the
+    # sweep's landing probe) resolved must stop rendering on its still-active
+    # row too, while a park appended after the resolution -- a fresh
+    # recurrence -- surfaces again.
+    for row in rows:
+        if row.latest_run_id is None:
+            continue
+        park = parked_landings.get(row.latest_run_id)
+        if park is None:
+            continue
+        resolution = resolved_at.get(row.task.id)
+        if resolution is not None and park.ts <= resolution:
+            del parked_landings[row.latest_run_id]
     if args.json:
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -2440,21 +2606,28 @@ def _cmd_status(args: argparse.Namespace) -> int:
             # as a follow-up line, mirroring the stranded: convention.
             detail = f" -- {stop.detail}" if stop.detail else ""
             print(f"    stopped: {stop.kind}{detail}")
-    # Source-level stops have no task row above; enumerate each as its own line
-    # so every stopped unit is visible with its reason.
+    # Source-level stops have no task row above; enumerate each as its own
+    # line so every stopped unit is visible with its reason. The
+    # ``[no active row]`` marker disambiguates these from the task rows they
+    # would otherwise be indistinguishable from: without it, a reader cannot
+    # tell whether a trailing subject line is a fresh top-level record or a
+    # continuation of the row printed immediately above it.
     for subject in sorted(stops_by_subject):
         if subject in stopped_task_ids:
             continue
         stop = stops_by_subject[subject]
         detail = f" -- {stop.detail}" if stop.detail else ""
-        print(f"  {subject}  stopped: {stop.kind}{detail}")
+        print(f"  {subject} [no active row]  stopped: {stop.kind}{detail}")
     # Landing strands whose task file left the active listing have no row above;
     # enumerate each as its own line so an unlanded strand stays visible after
     # its phase archived, mirroring the source-level stopped: convention.
     for subject in sorted(rowless_strands):
         park = rowless_strands[subject]
         detail = f" -- {park.detail}" if park.detail else ""
-        print(f"  {subject}  stranded: {park.park_kind}{detail}")
+        print(
+            f"  {subject} [no active row]  stranded: "
+            f"{park.park_kind}{detail}"
+        )
     return 0
 
 def _list_blocked_lifecycles(store: SqliteStore | PostgresStore) -> list[tuple[str, str]]:

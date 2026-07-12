@@ -695,7 +695,11 @@ def test_heartbeat_renders_dashes_when_no_iteration_event_yet() -> None:
     # The line must read as "working" rather than the misleading
     # "tokens=0 turns=0", which looks like a frozen run mid-flight.
     assert "working" in line
-    assert "metrics pending" in line
+    # Equal-or-stronger replacement for the old "metrics pending" pin: the
+    # line must also say WHEN totals appear, so a long first iteration reads
+    # as in-progress rather than stalled.
+    assert "iteration 1 in progress" in line
+    assert "totals land at iteration boundaries" in line
     assert "tokens=0 cost=-- turns=0" not in line
 
 

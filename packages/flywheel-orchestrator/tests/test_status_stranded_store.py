@@ -355,3 +355,67 @@ def test_clean_done_run_yields_no_strand(tmp_path: Path) -> None:
     assert all(e.get("subject") != "a" for e in payload)
     text = _status_text(tmp_path, db)
     assert text.strip() == "(no active tasks)"
+
+
+# --------------------------------------------------------------------------- #
+# The per-row annotation honors resolutions too (weekend bug 8, item A)       #
+# --------------------------------------------------------------------------- #
+
+
+def test_attributed_resolution_clears_row_level_strand_annotation(
+    tmp_path: Path,
+) -> None:
+    """A strand the operator resolved must stop rendering on its still-ACTIVE
+    row exactly as it stops rendering on the rowless surface: the per-row
+    ``stranded:`` annotation used to ignore resolutions entirely and render
+    the strand forever."""
+    db = _seed_strand(tmp_path, with_task_file=True)
+    _record_resolution(
+        db,
+        subject="a",
+        attribution=RESOLUTION_ATTRIBUTION_OPERATOR,
+        occurred_at=_T0 + timedelta(minutes=1),
+    )
+
+    text = _status_text(tmp_path, db)
+    assert "01/a" in text, text
+    assert "stranded:" not in text, text
+
+    rows = _status_json(tmp_path, db)
+    assert [row["task_id"] for row in rows] == ["a"]
+    assert "stranded" not in rows[0]
+
+
+def test_fresh_park_after_resolution_surfaces_on_the_row_again(
+    tmp_path: Path,
+) -> None:
+    """A park appended AFTER the resolution is a fresh recurrence and must
+    surface again on the row -- the same newer-park-wins rule the rowless
+    surface applies."""
+    db = _seed_strand(tmp_path, with_task_file=True)
+    _record_resolution(
+        db,
+        subject="a",
+        attribution=RESOLUTION_ATTRIBUTION_OPERATOR,
+        occurred_at=_T0 + timedelta(minutes=1),
+    )
+    _park(
+        db,
+        "run-a",
+        park_kind=PARK_KIND_STANDING_VERIFY,
+        detail="fresh recurrence",
+        ts=_T0 + timedelta(minutes=2),
+    )
+
+    text = _status_text(tmp_path, db)
+    assert "stranded: standing-verify" in text, text
+
+
+def test_rowless_lines_carry_the_no_active_row_marker(tmp_path: Path) -> None:
+    """Item B: a subject with no active row renders at the same indent as a
+    task row, so it must carry the ``[no active row]`` marker -- otherwise a
+    reader cannot tell a trailing subject line from a continuation of the
+    row printed above it."""
+    db = _seed_strand(tmp_path)
+    text = _status_text(tmp_path, db)
+    assert "a [no active row]  stranded:" in text, text

@@ -1,0 +1,38 @@
+{
+  "id": "triage-pass-hygiene",
+  "goal": "A triage pass writes to GitHub only where issue state demands it: a ready issue whose content hash drifted from its receipt is re-triaged within the pass, an immediate second pass over unchanged state issues zero GitHub writes, and each pass processes at most a configured cap of issues while surfacing the deferred count.",
+  "prerequisites": ["triage-compile-pass"],
+  "tags": ["github", "triage"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_triage_pass_hygiene.py -q" },
+    { "type": "command", "name": "regression-compile-pass", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_triage_pass.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage.py -- extend the pass loop's selection and write discipline",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage_receipt.py -- the hash-match predicate; import, do not redefine",
+      "packages/flywheel-orchestrator/tests/test_triage_pass_hygiene.py -- NEW test file"
+    ],
+    "references": [
+      ".flywheel/specs/00082-FEATURE-github-issue-triage.md -- criteria 7, 9, 12 and Decision D-5"
+    ],
+    "constraints": [
+      "Re-triage of a drifted ready issue may land ready (new block and receipt) or needs-detail, but never leaves the stale receipt in place",
+      "Idempotency is asserted on the captured write-set of the fake gh runner: a second pass over unchanged state records zero write calls",
+      "The per-pass cap arrives as a constructor argument (policy binding is the next task); deferred intake candidates are counted and surfaced through the log seam",
+      "Commit the change with a Conventional Commit message before reporting done"
+    ],
+    "non_goals": [
+      "No CLI verb, no daemon loop, no [triage] policy table",
+      "Do not modify test_triage_pass.py or any existing test; do not weaken or delete assertions",
+      "Do not change the receipt schema or content-hash definition",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Cap smaller than the intake backlog: exactly cap issues processed, deferral count surfaced, remainder untouched this pass",
+      "A needs-detail issue with unchanged content is not re-commented on subsequent passes",
+      "Drift detected on a ready issue mid-backlog still counts against the per-pass cap"
+    ]
+  }
+}

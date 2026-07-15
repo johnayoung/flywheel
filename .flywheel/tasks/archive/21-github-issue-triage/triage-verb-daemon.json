@@ -1,0 +1,45 @@
+{
+  "id": "triage-verb-daemon",
+  "goal": "flywheel triage runs as a label-polling daemon by default and with --once executes exactly one triage pass and exits 0, while a malformed [triage] policy exits 2 before any GitHub write and an idle pass writes nothing and continues the loop.",
+  "prerequisites": ["triage-pass-hygiene"],
+  "tags": ["github", "triage", "cli"],
+  "graders": [
+    { "type": "command", "name": "daemon-behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_triage_daemon.py -q" },
+    { "type": "command", "name": "cli-routing", "run": "uv run pytest packages/flywheel/tests/test_triage_cli.py -q" },
+    { "type": "command", "name": "regression-engine", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_triage_pass.py packages/flywheel-orchestrator/tests/test_triage_pass_hygiene.py -q" },
+    { "type": "command", "name": "docs-parity", "run": "uv run pytest packages/flywheel/tests/test_docs_parity.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator packages/flywheel" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage_run.py -- NEW: CLI shell and daemon loop for the triage engine",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- bind the [triage] table (intake_label, ready_label, needs_detail_label, interval_seconds, max_per_pass)",
+      "packages/flywheel/src/flywheel/_cli.py -- route the triage verb",
+      "packages/flywheel-orchestrator/tests/test_triage_daemon.py -- NEW test file",
+      "packages/flywheel/tests/test_triage_cli.py -- NEW test file"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot_run.py -- mirror the daemon shell: run_daemon_loop, make_logger, flag precedence, exit codes, signal handling",
+      "packages/flywheel/tests/test_autopilot_cli.py -- mirror the verb-routing test pattern",
+      ".flywheel/specs/00082-FEATURE-github-issue-triage.md -- criteria 10, 11 and Decision D-6"
+    ],
+    "constraints": [
+      "[triage] defaults: intake_label 'flywheel', ready_label 'flywheel:ready', needs_detail_label 'flywheel:needs-detail', interval_seconds 300.0; a malformed value raises PolicyError and the verb exits 2 before constructing the engine or issuing any GitHub call",
+      "Wire max_per_pass from policy into the engine's cap argument",
+      "Daemon semantics mirror autopilot: never terminates on an idle cycle, finishes the current pass on SIGTERM/SIGINT, --once runs one pass and exits 0",
+      "Update the operator docs that test_docs_parity.py checks so the new verb passes the existing parity gate",
+      "Commit the change with a Conventional Commit message before reporting done"
+    ],
+    "non_goals": [
+      "No console supervisor integration (/triage start) -- explicitly out of spec scope",
+      "Do not modify the triage engine's pass logic or the receipt schema",
+      "Do not modify existing tests; do not weaken or delete assertions",
+      "Autopilot code paths stay untouched",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Idle pass (no intake, no drifted ready issues): zero GitHub writes and the loop schedules the next cycle",
+      "Policy error must exit 2 with zero captured gh calls -- the write-free guarantee is the assertion, not just the exit code"
+    ]
+  }
+}

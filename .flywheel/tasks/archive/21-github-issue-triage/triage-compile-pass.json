@@ -1,0 +1,48 @@
+{
+  "id": "triage-compile-pass",
+  "goal": "A triage pass ends each open intake-labeled issue either ready -- carrying an appended spec block whose authoritative grader was executed against the current base and observed to fail, with the receipt recorded -- or needs-detail with one comment naming the specific missing information.",
+  "prerequisites": ["github-drain-trust"],
+  "tags": ["github", "triage", "agentic"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_triage_pass.py -q" },
+    { "type": "command", "name": "regression-drain-trust", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_drain_trust.py packages/flywheel-orchestrator/tests/test_github_source.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" },
+    { "type": "rubric", "name": "authoring-intent-screen", "assertions": [
+      "The prompt handed to the triage authoring agent instructs it to derive the authoritative grader from the intent stated in the issue's human content, not merely any check that fails on the base",
+      "The needs-detail path produces a comment that names the specific missing information for that issue rather than a generic template sentence"
+    ] }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage.py -- NEW: the triage engine (pass over intake issues, agentic compile, fail-first execution, GitHub write-back)",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage_receipt.py -- import the receipt schema and content-hash from here; do not redefine",
+      "packages/flywheel-orchestrator/tests/test_triage_pass.py -- NEW test file"
+    ],
+    "references": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py -- mirror build_repo_invoker and the lazy flywheel_core._sdk boundary for the authoring agent; mirror the self-attestation guard idea",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- reuse the GhRunner seam pattern for all GitHub reads and writes",
+      ".flywheel/specs/00082-FEATURE-github-issue-triage.md -- criteria 1-4, 13 and Decisions D-4/D-7"
+    ],
+    "constraints": [
+      "Every external effect goes through an injectable seam (gh runner, authoring-agent invoker, grader-command executor) so the behavior tests run hermetically with no network, no SDK, and no real subprocess",
+      "The ready flip may happen only after the grader-command executor reports a non-zero exit for the authored authoritative command against the current base; the receipt records command, exit_code, base_sha, content_hash exactly per _triage_receipt.py",
+      "A candidate authoritative grader that exits 0 against the base routes the issue to needs-detail with a comment stating the check was vacuous -- never ready",
+      "The spec block is appended to the issue body preserving the human text verbatim; the content hash covers title plus body with the block stripped",
+      "An issue already carrying a human-authored spec block still requires the fail-first proof before it may become ready",
+      "claude-agent-sdk remains an optional extra: no top-level SDK import; route through the lazy boundary as _autopilot.py does",
+      "Commit the change with a Conventional Commit message before reporting done"
+    ],
+    "non_goals": [
+      "No CLI verb, no daemon loop, no [triage] policy binding -- labels and settings arrive as explicit constructor arguments",
+      "Do not modify test_github_drain_trust.py, test_github_source.py, or any other existing test; do not weaken or delete assertions",
+      "Do not change GithubWorkSource behavior",
+      "Idempotency, re-triage of drifted ready issues, and per-pass caps are the next task -- do not implement them here",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Vacuous check (exit 0 on base): needs-detail with vacuity comment, no ready flip, no receipt",
+      "Authoring agent returns cannot-compile: needs-detail label plus exactly one comment naming the gaps; the issue must yield zero WorkItems from the drain source",
+      "The receipt must be unforgeable by construction in tests: assert the ready flip is ordered after the executor call and carries the executor's observed exit code, not an agent-reported one"
+    ]
+  }
+}

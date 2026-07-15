@@ -1,0 +1,43 @@
+{
+  "id": "github-drain-trust",
+  "goal": "With its opt-in triage trust rule enabled, the github work source schedules a ready-labeled issue only when its spec block carries a triage receipt matching the issue's current human content, and skips every other ready issue loudly without falling back to defaults graders.",
+  "tags": ["github", "triage", "work-sources"],
+  "graders": [
+    { "type": "command", "name": "behavior", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_drain_trust.py -q" },
+    { "type": "command", "name": "regression-github-source", "run": "uv run pytest packages/flywheel-orchestrator/tests/test_github_source.py packages/flywheel-orchestrator/tests/test_github_source_skip_bad_item.py -q" },
+    { "type": "command", "name": "lint", "run": "uv run ruff check packages/flywheel-orchestrator" }
+  ],
+  "context": {
+    "relevant": [
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_github.py -- the source gaining the trust rule",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_triage_receipt.py -- NEW shared module: receipt schema and content-hash definition",
+      "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py -- bind the [source] opt-in key",
+      "packages/flywheel-orchestrator/tests/test_github_source.py -- keep green; mirror its _FakeGh scripted-runner pattern",
+      "packages/flywheel-orchestrator/tests/test_github_drain_trust.py -- NEW test file for the trust behavior"
+    ],
+    "references": [
+      "docs/work-sources.md -- the github source contract (present-but-invalid block raises; zero graders skips)",
+      ".flywheel/specs/00082-FEATURE-github-issue-triage.md -- criteria 5, 6, 8 and Decisions D-4/D-5"
+    ],
+    "constraints": [
+      "The receipt schema (command, exit_code, base_sha, content_hash) and the content-hash definition (issue title + body with the ```flywheel block stripped) live only in the new _triage_receipt.py module; the triage engine imports it later -- do not duplicate either definition inside _github.py",
+      "The trust rule is an opt-in [source] key require_triage_receipt (default false); with it false or absent, source behavior is byte-identical to today",
+      "With the rule enabled: valid block + receipt matching current content hash yields a WorkItem; missing block, missing receipt, or hash mismatch yields no WorkItem plus one surfaced skip line through the existing log seam, even when [[defaults.graders]] is configured",
+      "A DONE WorkReport under done_action=close must close the issue with the grader-receipt body (pin this end-to-end in the new test file alongside the trust rule)",
+      "Commit the change with a Conventional Commit message before reporting done"
+    ],
+    "non_goals": [
+      "Do not modify existing test files; do not weaken or delete assertions",
+      "Do not touch _github_ci.py, _github_review.py, or the directory source",
+      "No triage engine, no CLI verb, no [triage] policy table -- this task is drain-side only",
+      "Do not change present-but-invalid spec-block semantics (it still raises WorkSourceError)",
+      "Do not read or write under .flywheel/verification/"
+    ],
+    "edge_cases": [
+      "Ready label with no spec block: skipped and surfaced even with [[defaults.graders]] configured -- the fallback must not fire in trust mode",
+      "Ready label, valid block, receipt hash stale after a body edit: no WorkItem",
+      "A receipt whose fields parse but whose exit_code is 0 is not a valid fail-first receipt",
+      "Trust rule off: an issue with no block still falls back to defaults graders exactly as today"
+    ]
+  }
+}

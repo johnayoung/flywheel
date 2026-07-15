@@ -10,7 +10,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | JSON snapshot | `fw --json` (or any non-TTY stdout) | One machine-readable frame for scripts |
 | Read verbs | `fw status` / `live` / `history` / `show` / `validate` | Inspect state, runs, and task definitions |
 | Steering verbs | `fw say` / `interrupt` / `approve` / `reject` | Enqueue one control command against a live run |
-| Daemons | `fw worker` / `autopilot` | Drain the queue (worker) or keep it full (autopilot) |
+| Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
 
@@ -107,6 +107,18 @@ Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to 
 | `--interval SECONDS` | daemon cycle interval (overrides config; default 300.0) |
 
 Landing strategy and scoring weights come from policy (`autopilot_landing` default `merge`, `autopilot_weights`). See [autopilot.md](autopilot.md) for the tier and scoring model.
+
+### `triage [--once]`
+
+Triages the GitHub intake board: authors a fail-first spec+grader for each candidate issue, then labels well-specified issues ready and under-specified ones needs-detail, each with a receipt. Delegated to `flywheel_orchestrator._triage_run.main`. **Neverending label-polling daemon by default**; `--once` runs one triage pass and exits 0. The daemon loop never terminates on an idle cycle — an empty board writes nothing and the next cycle is scheduled; it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
+
+The policy is resolved and validated **before** the repo root or any `gh` call: a malformed `[triage]` value prints to stderr and exits 2 having issued no GitHub write. Triage requires `[source] kind = "github"` with a `repo`; any other source exits 2. The board labels and cadence come from the optional `[triage]` table (`intake_label` default `flywheel`, `ready_label` default `flywheel:ready`, `needs_detail_label` default `flywheel:needs-detail`, `interval_seconds` default `300.0`, `max_per_pass` uncapped); see [configuration.md](configuration.md).
+
+| Flag | Controls |
+|---|---|
+| `--once` | one triage pass then exit |
+| `--interval SECONDS` | daemon cycle interval (overrides `[triage] interval_seconds`; default 300.0) |
+| `--model` | agent model for the authoring session (overrides `[agent] model`) |
 
 ### `audit RUN_ID`
 

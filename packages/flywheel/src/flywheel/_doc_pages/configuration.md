@@ -26,6 +26,7 @@ One module owns the whole surface: `flywheel_orchestrator._policy.load_policy` (
 | `[phase]` | no | phase-exit verify gate | this doc |
 | `[held_out]` | no | execute-time held-out landing gate | [held-out-gate.md](held-out-gate.md) |
 | `[autopilot]` | no | intake-daemon cadence + scoring weights | [autopilot.md](autopilot.md) |
+| `[triage]` | no | triage-daemon board labels + cadence + per-pass cap | this doc |
 | `[deadlines]` | no | default-on wall-clock ceilings for the five external-call classes | this doc |
 | `[sandbox.*]` | no | provisioning + the agent's execution environment | [sandbox.md](sandbox.md) |
 
@@ -228,6 +229,20 @@ Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.m
 
 The autopilot CLI flags `--target-depth`/`--interval`/`--model` override the corresponding `[autopilot]` keys (`_autopilot_run.py:65`).
 
+## `[triage]` (optional)
+
+Board labels and cadence for the `flywheel triage` intake daemon (`fw triage`). The intake label defaults to the github source's own default label (`flywheel`), so the board triage reads is the board the worker drains. A malformed value exits 2 before the engine is built or any `gh` call is issued.
+
+| Key | Type | Default | Controls |
+|-----|------|---------|----------|
+| `intake_label` | string | `flywheel` | label whose issues are triage candidates |
+| `ready_label` | string | `flywheel:ready` | label applied to a well-specified (fail-first) issue |
+| `needs_detail_label` | string | `flywheel:needs-detail` | label applied to an under-specified issue |
+| `interval_seconds` | float (>0) | `300.0` | seconds between daemon cycles |
+| `max_per_pass` | int (>0) | unset (uncapped) | candidates processed per pass; the remainder defers to a later pass |
+
+The triage CLI flags `--interval`/`--model` override the corresponding `[triage]`/`[agent]` keys.
+
 ## `[deadlines]` (optional)
 
 Default-on, per-class wall-clock ceilings (seconds) for the five external-call classes flywheel issues (spec 00066, `deadline_config.py`). **Every class ships a finite default; set a key to `0` to opt that class out (unbounded).** TOML cannot express `None`, so `0` is the on-disk spelling of the unbounded opt-out — an omitted key keeps its default, leaving a pre-existing file byte-identical.
@@ -284,6 +299,6 @@ Rendered:
 - `[submit]` — `base = "<current branch>"` when a branch is detected, else a commented placeholder.
 - Commented placeholders for `[[defaults.graders]]`, `[agent] model`, `[sandbox] setup`, and `[phase] verify`.
 
-**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, `[deadlines]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
+**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, `[triage]`, `[deadlines]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
 
 The commented `[agent] model` placeholder shows one example model id; do not treat any printed id as canonical — the value is opaque and projects vary.

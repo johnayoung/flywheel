@@ -37,6 +37,7 @@ from flywheel_orchestrator import (
     resolve_db_path,
 )
 from flywheel_orchestrator._autopilot_run import main as _autopilot_main
+from flywheel_orchestrator._triage_run import main as _triage_main
 from flywheel_orchestrator._workflow import main as _orchestrator_main
 from flywheel_worktree.worker import main as _worker_main
 
@@ -75,6 +76,7 @@ _CORE_STEER_VERB = "steer"
 
 _WORKER_VERB = "worker"
 _AUTOPILOT_VERB = "autopilot"
+_TRIAGE_VERB = "triage"
 _AUDIT_VERB = "audit"
 _DOCS_VERB = "docs"
 
@@ -91,6 +93,7 @@ Verbs:
   init             scaffold .flywheel/ and a flywheel.toml work policy
   worker [--once]  run the git-worktree daemon loop (or a single drain)
   autopilot        keep the queue full (neverending; --once for one pass)
+  triage           triage the intake board (neverending; --once for one pass)
   status [--json]  print every active task's state
   live [--watch N] print one line per in-flight run (optionally tailing)
   history [--json] list finished runs, one line per task, newest first
@@ -229,6 +232,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # verifiable, tier-prioritized tasks. Neverending by default;
         # --once runs a single refill pass.
         return _autopilot_main(rest)
+    if verb == _TRIAGE_VERB:
+        # The triage intake daemon: promotes well-specified issues to the
+        # ready label and routes under-specified ones to needs-detail, each
+        # with a fail-first receipt. Neverending by default; --once runs a
+        # single triage pass.
+        return _triage_main(rest)
     if verb == _AUDIT_VERB:
         return _delegate_audit(rest)
     if verb == _DOCS_VERB:

@@ -171,6 +171,14 @@ DEFAULT_AUTOPILOT_INTERVAL_SECONDS: float = 300.0
 #: Landing postures autopilot work can take; FF-merge is the shipped default.
 _AUTOPILOT_LANDINGS: tuple[str, ...] = ("merge", "pr")
 
+#: Default triage board labels + cadence when [triage] omits them. The intake
+#: label matches the github source's default label ('flywheel'), so the board
+#: the drain reads is the board triage writes.
+DEFAULT_TRIAGE_INTAKE_LABEL: str = "flywheel"
+DEFAULT_TRIAGE_READY_LABEL: str = "flywheel:ready"
+DEFAULT_TRIAGE_NEEDS_DETAIL_LABEL: str = "flywheel:needs-detail"
+DEFAULT_TRIAGE_INTERVAL_SECONDS: float = 300.0
+
 _STORE_BACKENDS: tuple[str, ...] = ("sqlite", "postgres")
 
 _EXECUTION_MODES: tuple[str, ...] = ("local", "distributed")
@@ -570,6 +578,11 @@ class WorkPolicy:
     autopilot_landing: str = DEFAULT_LANDING
     autopilot_interval_seconds: float = DEFAULT_AUTOPILOT_INTERVAL_SECONDS
     autopilot_weights: ScoreWeights | None = None
+    triage_intake_label: str = DEFAULT_TRIAGE_INTAKE_LABEL
+    triage_ready_label: str = DEFAULT_TRIAGE_READY_LABEL
+    triage_needs_detail_label: str = DEFAULT_TRIAGE_NEEDS_DETAIL_LABEL
+    triage_interval_seconds: float = DEFAULT_TRIAGE_INTERVAL_SECONDS
+    triage_max_per_pass: int | None = None
 
 
 def load_policy(path: Path) -> WorkPolicy:
@@ -715,6 +728,17 @@ def load_policy(path: Path) -> WorkPolicy:
         autopilot_weights,
     ) = _optional_autopilot(autopilot, policy_file=path)
 
+    triage = data.get("triage") or {}
+    if not isinstance(triage, dict):
+        raise PolicyError(f"{path}: [triage] must be a table")
+    (
+        triage_intake_label,
+        triage_ready_label,
+        triage_needs_detail_label,
+        triage_interval_seconds,
+        triage_max_per_pass,
+    ) = _optional_triage(triage, policy_file=path)
+
     worker = data.get("worker") or {}
     if not isinstance(worker, dict):
         raise PolicyError(f"{path}: [worker] must be a table")
@@ -770,6 +794,11 @@ def load_policy(path: Path) -> WorkPolicy:
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
             autopilot_weights=autopilot_weights,
+            triage_intake_label=triage_intake_label,
+            triage_ready_label=triage_ready_label,
+            triage_needs_detail_label=triage_needs_detail_label,
+            triage_interval_seconds=triage_interval_seconds,
+            triage_max_per_pass=triage_max_per_pass,
         )
 
     if kind == "github_ci":
@@ -822,6 +851,11 @@ def load_policy(path: Path) -> WorkPolicy:
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
             autopilot_weights=autopilot_weights,
+            triage_intake_label=triage_intake_label,
+            triage_ready_label=triage_ready_label,
+            triage_needs_detail_label=triage_needs_detail_label,
+            triage_interval_seconds=triage_interval_seconds,
+            triage_max_per_pass=triage_max_per_pass,
         )
 
     if kind == "github_review":
@@ -868,6 +902,11 @@ def load_policy(path: Path) -> WorkPolicy:
             autopilot_landing=autopilot_landing,
             autopilot_interval_seconds=autopilot_interval_seconds,
             autopilot_weights=autopilot_weights,
+            triage_intake_label=triage_intake_label,
+            triage_ready_label=triage_ready_label,
+            triage_needs_detail_label=triage_needs_detail_label,
+            triage_interval_seconds=triage_interval_seconds,
+            triage_max_per_pass=triage_max_per_pass,
         )
 
     repo = source.get("repo")
@@ -933,6 +972,11 @@ def load_policy(path: Path) -> WorkPolicy:
         autopilot_landing=autopilot_landing,
         autopilot_interval_seconds=autopilot_interval_seconds,
         autopilot_weights=autopilot_weights,
+        triage_intake_label=triage_intake_label,
+        triage_ready_label=triage_ready_label,
+        triage_needs_detail_label=triage_needs_detail_label,
+        triage_interval_seconds=triage_interval_seconds,
+        triage_max_per_pass=triage_max_per_pass,
     )
 
 
@@ -1615,6 +1659,58 @@ def _optional_autopilot(
         ),
     )
     return target_depth, landing, interval, weights
+
+
+def _optional_triage(
+    table: dict, *, policy_file: Path
+) -> tuple[str, str, str, float, int | None]:
+    """Validate the optional ``[triage]`` table.
+
+    Returns ``(intake_label, ready_label, needs_detail_label, interval_seconds,
+    max_per_pass)``. Absent keys take the code defaults -- the intake label
+    matches the github source's default label (``flywheel``) so the board the
+    drain reads is the board triage writes, the two board labels
+    (``flywheel:ready``/``flywheel:needs-detail``), the default daemon cadence
+    (:data:`DEFAULT_TRIAGE_INTERVAL_SECONDS`), and ``None`` (uncapped) per-pass
+    volume. A malformed value raises :class:`PolicyError` so a typo never
+    silently degrades triage's behavior -- the label routing or the cadence.
+
+    ``max_per_pass`` is absent-means-uncapped: an omitted key returns ``None``
+    (the engine's uncapped ``per_pass_cap``); a present value must be a positive
+    integer (a TOML boolean is rejected, mirroring :func:`_override_int`), since
+    a cap of zero or below would wire an engine that triages nothing.
+    """
+    intake_label = _override_str(
+        table, "intake_label", DEFAULT_TRIAGE_INTAKE_LABEL,
+        path="triage.intake_label", policy_file=policy_file,
+    )
+    ready_label = _override_str(
+        table, "ready_label", DEFAULT_TRIAGE_READY_LABEL,
+        path="triage.ready_label", policy_file=policy_file,
+    )
+    needs_detail_label = _override_str(
+        table, "needs_detail_label", DEFAULT_TRIAGE_NEEDS_DETAIL_LABEL,
+        path="triage.needs_detail_label", policy_file=policy_file,
+    )
+    interval = _override_float(
+        table, "interval_seconds", DEFAULT_TRIAGE_INTERVAL_SECONDS,
+        path="triage.interval_seconds", policy_file=policy_file,
+    )
+    if interval <= 0:
+        raise PolicyError(
+            f"{policy_file}: triage.interval_seconds must be positive"
+        )
+    if "max_per_pass" not in table:
+        return intake_label, ready_label, needs_detail_label, interval, None
+    max_per_pass = _override_int(
+        table, "max_per_pass", 0,
+        path="triage.max_per_pass", policy_file=policy_file,
+    )
+    if max_per_pass < 1:
+        raise PolicyError(
+            f"{policy_file}: triage.max_per_pass must be a positive integer"
+        )
+    return intake_label, ready_label, needs_detail_label, interval, max_per_pass
 
 
 def _sandbox_subtable(

@@ -62,6 +62,12 @@ from flywheel_orchestrator._sources import (
     WorkReport,
     WorkSourceError,
 )
+from flywheel_orchestrator._triage_receipt import (
+    RECEIPT_KEY,
+    content_hash,
+    is_fail_first,
+    parse_receipt,
+)
 
 # argv after the ``gh`` executable -> stdout. The seam tests inject.
 GhRunner = Callable[[Sequence[str]], str]
@@ -160,6 +166,47 @@ def _extract_spec_block(body: str, *, source: str) -> dict[str, Any] | None:
     )
 
 
+def _triage_skip_reason(
+    spec: dict[str, Any] | None, *, title: str, body: str
+) -> str | None:
+    """Why the trust rule skips this issue, or ``None`` when it may schedule.
+
+    Encapsulates the drain-side triage-trust gate (the *policy*; the receipt
+    schema and content-hash *definition* live in
+    :mod:`flywheel_orchestrator._triage_receipt`). Returns a human-readable
+    reason string for every failure mode -- no spec block, no receipt in the
+    block, a malformed or passing (not fail-first) receipt, or a receipt whose
+    ``content_hash`` no longer matches the issue's current human content -- and
+    ``None`` only when the block carries a fail-first receipt matching the
+    current content hash.
+    """
+    if spec is None:
+        return (
+            "trust mode requires a flywheel spec block carrying a triage "
+            "receipt, but the issue has none"
+        )
+    raw = spec.get(RECEIPT_KEY)
+    if raw is None:
+        return (
+            "trust mode requires a triage receipt in the flywheel spec "
+            "block, but none is present"
+        )
+    receipt = parse_receipt(raw)
+    if receipt is None:
+        return "the flywheel spec block's triage receipt is malformed"
+    if not is_fail_first(receipt):
+        return (
+            "the triage receipt is not fail-first (exit_code 0); it records "
+            "a command that already passed, so there is nothing to schedule"
+        )
+    if receipt.content_hash != content_hash(title, body):
+        return (
+            "the triage receipt is stale -- its content_hash no longer "
+            "matches the issue's current title/body (edited after triage)"
+        )
+    return None
+
+
 def _issue_sort_key(issue: dict[str, Any]) -> int:
     """Sort key by issue number, tolerant of malformed payloads.
 
@@ -227,6 +274,17 @@ class GithubWorkSource:
     CLI, tests inject a callable returning canned stdout. ``log`` (when
     provided) receives one line per skipped issue so non-runnable tickets
     are visible rather than silently absent.
+
+    ``require_triage_receipt`` is the opt-in trust rule (default off, so the
+    source is byte-identical to today when absent). When on, an issue is
+    scheduled only when its ``flywheel`` spec block carries a triage receipt
+    (see :mod:`flywheel_orchestrator._triage_receipt`) whose ``content_hash``
+    matches the issue's current human content and whose ``exit_code`` is
+    fail-first (non-zero). Every issue that fails that gate — no block, no
+    receipt, a malformed or passing receipt, or a hash gone stale after a
+    title/body edit — is skipped loudly through ``log`` and produces no
+    ``WorkItem``, and the ``[[defaults.graders]]`` fallback deliberately does
+    NOT rescue it.
     """
 
     #: Provenance ``source_kind`` for emitted items and ``source_syncs`` rows.
@@ -239,6 +297,7 @@ class GithubWorkSource:
         label: str,
         default_graders: Sequence[Grader] = (),
         done_action: str = "comment",
+        require_triage_receipt: bool = False,
         runner: GhRunner | None = None,
         log: Callable[[str], None] | None = None,
         stop_sink: StopEventSink | None = None,
@@ -252,6 +311,7 @@ class GithubWorkSource:
         self.label = label
         self.default_graders = tuple(default_graders)
         self.done_action = done_action
+        self.require_triage_receipt = require_triage_receipt
         self._run = runner if runner is not None else _default_runner
         self._log = log
         self._stop_sink = stop_sink
@@ -336,7 +396,20 @@ class GithubWorkSource:
         body = str(issue.get("body") or "")
         url = str(issue.get("url") or "")
 
-        spec = _extract_spec_block(body, source=source_ref) or {}
+        # A present-but-invalid block still raises here (unchanged), even in
+        # trust mode -- an author who wrote a block meant it.
+        spec_block = _extract_spec_block(body, source=source_ref)
+
+        if self.require_triage_receipt:
+            reason = _triage_skip_reason(spec_block, title=title, body=body)
+            if reason is not None:
+                # Loud skip: surfaced through the log seam, no WorkItem, and
+                # the [[defaults.graders]] fallback deliberately does not fire.
+                if self._log is not None:
+                    self._log(f"[github] skipping {source_ref}: {reason}")
+                return None
+
+        spec = spec_block or {}
 
         raw_graders = spec.get("graders")
         if raw_graders is not None:

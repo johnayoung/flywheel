@@ -15,6 +15,13 @@ Format (TOML, stdlib ``tomllib``)::
     # repo = "owner/name"           # required
     # label = "flywheel"            # required: only issues with this label
     # done_action = "comment"       # or "close" (default "comment")
+    # require_triage_receipt = false # opt-in trust rule (default false): when
+    #                               # true, schedule an issue only when its
+    #                               # flywheel block carries a triage receipt
+    #                               # matching the issue's current human
+    #                               # content; skip every other ready issue
+    #                               # loudly without the defaults-graders
+    #                               # fallback
 
     # github_ci kind:
     # repo = "owner/name"           # required
@@ -443,7 +450,8 @@ class WorkPolicy:
     """Parsed, validated ``flywheel.toml`` contents.
 
     ``tasks_dir`` is populated for ``kind = "directory"``;
-    ``github_repo``/``github_label``/``github_done_action`` for
+    ``github_repo``/``github_label``/``github_done_action``/
+    ``github_require_triage_receipt`` for
     ``kind = "github"``; ``github_ci_repo``/``github_ci_failure_filter`` for
     ``kind = "github_ci"``; ``github_review_repo`` for
     ``kind = "github_review"``. ``default_graders`` is empty when the file
@@ -523,6 +531,7 @@ class WorkPolicy:
     github_repo: str | None = None
     github_label: str | None = None
     github_done_action: str = "comment"
+    github_require_triage_receipt: bool = False
     github_ci_repo: str | None = None
     github_ci_failure_filter: str = "failure"
     github_review_repo: str | None = None
@@ -877,11 +886,19 @@ def load_policy(path: Path) -> WorkPolicy:
             f"{path}: source.done_action must be one of {_DONE_ACTIONS}, "
             f"got {done_action!r}"
         )
+    require_triage_receipt = _override_bool(
+        source,
+        "require_triage_receipt",
+        False,
+        path="source.require_triage_receipt",
+        policy_file=path,
+    )
     return WorkPolicy(
         source_kind="github",
         github_repo=repo,
         github_label=label,
         github_done_action=done_action,
+        github_require_triage_receipt=require_triage_receipt,
         default_graders=default_graders,
         db_path=db_path,
         sandbox_root=sandbox_root,
@@ -2020,6 +2037,7 @@ def build_github_source(
         label=policy.github_label,
         default_graders=policy.default_graders,
         done_action=policy.github_done_action,
+        require_triage_receipt=policy.github_require_triage_receipt,
         stop_sink=_make_stop_sink(control, now),
     )
 

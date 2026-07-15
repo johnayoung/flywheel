@@ -36,9 +36,20 @@ in tests -- no network, no SDK, no real subprocess:
   records the exit code the executor observed, never one the agent reported --
   agent claims are untrusted, so the receipt is unforgeable by construction.
 
-Non-goals (the next task): idempotency, re-triage of drifted ready issues, and
-per-pass caps. There is no CLI verb, no daemon loop, and no policy binding here
--- the repo, labels, and base SHA arrive as explicit constructor arguments.
+The pass writes only where issue state demands it. Its backlog is the intake
+issues (always first-time candidates) merged with the *ready* issues whose
+receipt drifted from their current content (:func:`_ready_needs_retriage`); a
+settled ready issue -- one still carrying a fail-first receipt matching its
+content -- is not a candidate, so a pass over unchanged state records zero
+GitHub writes. Re-triage of a drifted ready issue rewrites its body so no stale
+receipt survives -- refreshed in place when it stays ready, block-stripped when
+it demotes to needs-detail. Each pass processes at most ``per_pass_cap``
+candidates in issue-number order and surfaces the deferred remainder through the
+``log`` seam and :attr:`TriagePassResult.deferred`.
+
+Non-goals: there is no CLI verb, no daemon loop, and no ``[triage]`` policy
+binding here -- the repo, labels, base SHA, and per-pass cap arrive as explicit
+constructor arguments.
 """
 
 from __future__ import annotations
@@ -56,6 +67,8 @@ from flywheel_orchestrator._triage_receipt import (
     RECEIPT_KEY,
     TriageReceipt,
     content_hash,
+    is_fail_first,
+    parse_receipt,
     strip_spec_block,
 )
 
@@ -74,6 +87,11 @@ TriageGraderExecutor = Callable[[str], int]
 #: Terminal triage decisions.
 DECISION_READY = "ready"
 DECISION_NEEDS_DETAIL = "needs_detail"
+
+#: Backlog-item kinds: a first-time intake issue vs. a drifted ready issue that
+#: must be re-triaged. Both consume a per-pass cap slot.
+_KIND_INTAKE = "intake"
+_KIND_READY_DRIFT = "ready_drift"
 
 #: Default turn budget for the real SDK-backed authoring invoker (mirrors
 #: :data:`~flywheel_orchestrator._autopilot.DEFAULT_AUTHORING_MAX_TURNS`).
@@ -134,9 +152,14 @@ class TriageOutcome:
 
 @dataclass(frozen=True, kw_only=True)
 class TriagePassResult:
-    """The outcomes of one triage pass, in board order."""
+    """The outcomes of one triage pass, in board order.
+
+    ``deferred`` counts the work candidates cut past this pass's ``per_pass_cap``
+    -- issues left untouched this pass (0 when uncapped or within the cap).
+    """
 
     outcomes: tuple[TriageOutcome, ...] = ()
+    deferred: int = 0
 
     @property
     def ready(self) -> tuple[TriageOutcome, ...]:
@@ -391,6 +414,53 @@ def _issue_sort_key(issue: dict[str, Any]) -> int:
     return number if isinstance(number, int) else 0
 
 
+def _spec_block_of(body: str) -> dict[str, Any] | None:
+    """The issue body's ``flywheel`` spec block as a dict, or ``None``.
+
+    A tolerant reader for the triage side: unlike the drain's strict
+    ``_extract_spec_block`` (which raises on a malformed block an author meant),
+    a missing, unterminated, non-JSON, or non-object block all yield ``None``.
+    The re-triage caller treats every "no trustworthy block" case uniformly as
+    drift, so a raise here would be wrong -- the point is to *fix* such an issue.
+    """
+    lines = body.splitlines()
+    open_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if line.strip() == _SPEC_FENCE_OPEN:
+            open_idx = idx
+            break
+    if open_idx is None:
+        return None
+    block: list[str] = []
+    for line in lines[open_idx + 1 :]:
+        if line.strip() == _SPEC_FENCE_CLOSE:
+            try:
+                data = json.loads("\n".join(block))
+            except (json.JSONDecodeError, RecursionError):
+                return None
+            return data if isinstance(data, dict) else None
+        block.append(line)
+    return None
+
+
+def _ready_needs_retriage(title: str, body: str) -> bool:
+    """Whether a ready-labeled issue must be re-triaged this pass.
+
+    A ready issue is *settled* -- left untouched, so an idempotent pass writes
+    nothing -- exactly when its spec block carries a fail-first triage receipt
+    whose ``content_hash`` still matches the issue's current human content. Drift
+    (a human edited the title/body after triage), a missing or malformed
+    receipt, or a non-fail-first receipt all mean the receipt no longer attests
+    the current content, so the issue is re-triaged. The receipt schema and the
+    content-hash definition are imported from
+    :mod:`flywheel_orchestrator._triage_receipt`, never redefined here.
+    """
+    receipt = parse_receipt((_spec_block_of(body) or {}).get(RECEIPT_KEY))
+    if receipt is None or not is_fail_first(receipt):
+        return True
+    return receipt.content_hash != content_hash(title, body)
+
+
 class TriagePass:
     """One triage pass over a repo's open intake-labeled issues.
 
@@ -399,7 +469,9 @@ class TriagePass:
     (``base_sha``). All three are injected so a pass runs hermetically in tests.
     ``intake_label``/``ready_label``/``needs_detail_label`` are the board labels
     the pass reads and transitions between -- no policy binding, they arrive as
-    explicit arguments.
+    explicit arguments. ``per_pass_cap`` bounds how many work candidates a single
+    pass processes (``None`` is unbounded); the remainder is deferred untouched
+    and surfaced through ``log`` and :attr:`TriagePassResult.deferred`.
     """
 
     def __init__(
@@ -413,10 +485,13 @@ class TriagePass:
         invoker: TriageAuthoringInvoker,
         executor: TriageGraderExecutor,
         runner: GhRunner,
+        per_pass_cap: int | None = None,
         log: Callable[[str], None] | None = None,
     ) -> None:
         if not base_sha:
             raise ValueError("base_sha must be a non-empty commit SHA")
+        if per_pass_cap is not None and per_pass_cap < 1:
+            raise ValueError("per_pass_cap must be a positive integer or None")
         self.repo = repo
         self.intake_label = intake_label
         self.ready_label = ready_label
@@ -425,18 +500,88 @@ class TriagePass:
         self._invoke = invoker
         self._execute = executor
         self._run = runner
+        self._per_pass_cap = per_pass_cap
         self._log = log
 
     async def run(self) -> TriagePassResult:
-        """Triage every open intake-labeled issue; return the terminal outcomes."""
+        """Triage the board with write discipline; return the terminal outcomes.
+
+        The backlog is the intake issues (first-time candidates) merged with the
+        drifted ready issues, deduplicated and ordered by issue number. Settled
+        ready issues are not candidates, so a pass over unchanged state writes
+        nothing. Candidates are processed up to ``per_pass_cap``; the remainder
+        is deferred untouched, counted, and logged.
+        """
+        backlog = self._backlog(
+            self._list_issues(self.intake_label),
+            self._list_issues(self.ready_label),
+        )
+        selected = backlog
+        deferred = 0
+        cap = self._per_pass_cap
+        if cap is not None and len(backlog) > cap:
+            selected = backlog[:cap]
+            deferred = len(backlog) - cap
+            self._log_line(
+                f"[triage] per-pass cap {cap} reached: processing {cap} of "
+                f"{len(backlog)} candidates, deferring {deferred} to a later "
+                f"pass"
+            )
         outcomes: list[TriageOutcome] = []
-        for issue in self._list_intake_issues():
-            outcome = await self._triage_issue(issue)
+        for kind, issue in selected:
+            if kind == _KIND_READY_DRIFT:
+                outcome = await self._retriage_ready(issue)
+            else:
+                outcome = await self._triage_issue(issue)
             if outcome is not None:
                 outcomes.append(outcome)
-        return TriagePassResult(outcomes=tuple(outcomes))
+        return TriagePassResult(outcomes=tuple(outcomes), deferred=deferred)
 
-    def _list_intake_issues(self) -> list[dict[str, Any]]:
+    def _backlog(
+        self,
+        intake: list[dict[str, Any]],
+        ready: list[dict[str, Any]],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """The ordered work backlog: intake issues plus drifted ready issues.
+
+        Every intake issue is a first-time candidate; a ready issue enters only
+        when :func:`_ready_needs_retriage` holds. A number is added at most once
+        -- intake and ready are disjoint labels in reality, and the guard also
+        keeps a runner that conflates the two (the test fakes) honest. The
+        backlog is sorted by issue number so a drifted ready issue mid-board
+        still consumes a per-pass cap slot.
+        """
+        items: list[tuple[str, dict[str, Any]]] = []
+        seen: set[int] = set()
+        for issue in intake:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                self._log_line(
+                    f"[triage] skipping issue with non-integer number: {issue!r}"
+                )
+                continue
+            if number in seen:
+                continue
+            seen.add(number)
+            items.append((_KIND_INTAKE, issue))
+        for issue in ready:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                self._log_line(
+                    f"[triage] skipping issue with non-integer number: {issue!r}"
+                )
+                continue
+            if number in seen:
+                continue
+            seen.add(number)
+            title = str(issue.get("title") or "")
+            body = str(issue.get("body") or "")
+            if _ready_needs_retriage(title, body):
+                items.append((_KIND_READY_DRIFT, issue))
+        items.sort(key=lambda item: _issue_sort_key(item[1]))
+        return items
+
+    def _list_issues(self, label: str) -> list[dict[str, Any]]:
         stdout = self._run(
             [
                 "issue",
@@ -444,7 +589,7 @@ class TriagePass:
                 "--repo",
                 self.repo,
                 "--label",
-                self.intake_label,
+                label,
                 "--state",
                 "open",
                 "--json",
@@ -531,6 +676,76 @@ class TriagePass:
             receipt=receipt,
         )
 
+    async def _retriage_ready(
+        self, issue: dict[str, Any]
+    ) -> TriageOutcome | None:
+        """Re-triage a ready issue whose receipt drifted from its content.
+
+        Mirrors :meth:`_triage_issue`, but its writes guarantee no stale receipt
+        survives (the invariant a drifted issue would otherwise violate): a
+        still-fail-first re-triage refreshes the spec block in place
+        (:meth:`_refresh_ready`, which strips the old block before appending the
+        new one); a vacuous or uncompilable re-triage strips the stale block and
+        demotes the issue to needs-detail (:meth:`_demote_to_needs_detail`). The
+        exit code is the executor's, never the agent's -- the receipt stays
+        unforgeable.
+        """
+        number = issue.get("number")
+        if not isinstance(number, int):
+            self._log_line(
+                f"[triage] skipping issue with non-integer number: {issue!r}"
+            )
+            return None
+        source_ref = f"{self.repo}#{number}"
+        title = str(issue.get("title") or "")
+        body = str(issue.get("body") or "")
+
+        response = await self._invoke(
+            triage_authoring_prompt(title=title, body=body)
+        )
+        plan = parse_authoring_response(response)
+
+        if isinstance(plan, CannotCompile):
+            comment = _needs_detail_comment(plan.missing_information)
+            self._demote_to_needs_detail(number, body, comment)
+            return TriageOutcome(
+                number=number,
+                source_ref=source_ref,
+                decision=DECISION_NEEDS_DETAIL,
+                comment=comment,
+                missing_information=plan.missing_information,
+            )
+
+        exit_code = self._execute(plan.authoritative_grader)
+        if exit_code == 0:
+            comment = _vacuity_comment(plan.authoritative_grader)
+            self._demote_to_needs_detail(number, body, comment)
+            return TriageOutcome(
+                number=number,
+                source_ref=source_ref,
+                decision=DECISION_NEEDS_DETAIL,
+                authoritative_command=plan.authoritative_grader,
+                exit_code=0,
+                comment=comment,
+            )
+
+        receipt = TriageReceipt(
+            command=plan.authoritative_grader,
+            exit_code=exit_code,
+            base_sha=self.base_sha,
+            content_hash=content_hash(title, body),
+        )
+        new_body = _embed_spec_block(body, plan, receipt)
+        self._refresh_ready(number, new_body)
+        return TriageOutcome(
+            number=number,
+            source_ref=source_ref,
+            decision=DECISION_READY,
+            authoritative_command=plan.authoritative_grader,
+            exit_code=exit_code,
+            receipt=receipt,
+        )
+
     def _apply_ready(self, number: int, new_body: str) -> None:
         self._run(
             [
@@ -545,6 +760,64 @@ class TriagePass:
                 self.ready_label,
                 "--remove-label",
                 self.intake_label,
+            ]
+        )
+
+    def _refresh_ready(self, number: int, new_body: str) -> None:
+        """Refresh a still-ready issue's body with the fresh spec block/receipt.
+
+        ``_embed_spec_block`` strips the drifted block before appending the new
+        one, so no stale receipt survives. The issue is already ready-labeled;
+        re-adding the label keeps the write idempotent and touches no other
+        label (unlike :meth:`_apply_ready`, there is no intake label to remove).
+        """
+        self._run(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                self.repo,
+                "--body",
+                new_body,
+                "--add-label",
+                self.ready_label,
+            ]
+        )
+
+    def _demote_to_needs_detail(
+        self, number: int, body: str, comment: str
+    ) -> None:
+        """Demote a drifted ready issue to needs-detail, stripping the stale block.
+
+        The body is rewritten with its ``flywheel`` spec block removed so the
+        stale receipt does not survive the demotion; the ready label is dropped,
+        the needs-detail label added, and exactly one comment left.
+        """
+        self._run(
+            [
+                "issue",
+                "edit",
+                str(number),
+                "--repo",
+                self.repo,
+                "--body",
+                strip_spec_block(body),
+                "--add-label",
+                self.needs_detail_label,
+                "--remove-label",
+                self.ready_label,
+            ]
+        )
+        self._run(
+            [
+                "issue",
+                "comment",
+                str(number),
+                "--repo",
+                self.repo,
+                "--body",
+                comment,
             ]
         )
 

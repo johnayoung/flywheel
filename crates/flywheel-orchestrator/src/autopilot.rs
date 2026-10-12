@@ -2496,3 +2496,2163 @@ pub fn actionable_queue_depth(
         .filter(|(_, task)| !terminal.contains(&task.id))
         .count())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claims::InMemoryClaimStore;
+    use flywheel_core::envelope::parse_envelope;
+    use flywheel_core::invoker::{InvocationSignals, ToolInteraction};
+    use flywheel_core::lifecycle::Lifecycle;
+    use flywheel_core::store::StoreError;
+    use flywheel_core::store_memory::InMemoryStore;
+    use flywheel_core::task::CommandGrader;
+    use sha2::{Digest, Sha256};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use tempfile::TempDir;
+
+    // --- helpers -------------------------------------------------------------------
+
+    struct Axes {
+        urgency: u32,
+        importance: u32,
+        blocks: u32,
+        effort: u32,
+        ready: bool,
+    }
+
+    impl Default for Axes {
+        fn default() -> Self {
+            Self {
+                urgency: 0,
+                importance: 0,
+                blocks: 0,
+                effort: 0,
+                ready: true,
+            }
+        }
+    }
+
+    fn finding(id: &str, tier: Tier, axes: Axes) -> Finding {
+        Finding {
+            urgency: axes.urgency,
+            importance: axes.importance,
+            blocks: axes.blocks,
+            effort: axes.effort,
+            ready: axes.ready,
+            ..Finding::new(id, tier, format!("finding {id}"))
+        }
+    }
+
+    fn weights() -> ScoreWeights {
+        default_weights()
+    }
+
+    fn ids(seq: &[ScoredFinding]) -> Vec<&str> {
+        seq.iter().map(|s| s.finding.id.as_str()).collect()
+    }
+
+    fn sha256(text: &str) -> String {
+        hex::encode(Sha256::digest(text.as_bytes()))
+    }
+
+    fn repo() -> PathBuf {
+        PathBuf::from("/repo")
+    }
+
+    /// A scripted invoker returning `response` for every prompt.
+    fn scripted(response: impl Into<String>) -> impl AutopilotInvoker {
+        let response = response.into();
+        move |_prompt: String| {
+            let response = response.clone();
+            async move { Ok(response) }
+        }
+    }
+
+    fn fenced(body: &Value) -> String {
+        format!("```json\n{body}\n```")
+    }
+
+    /// The `TIER: N` marker a tier prompt carries.
+    fn tier_in_prompt(prompt: &str) -> u8 {
+        let rest = &prompt[prompt.find("TIER: ").expect("prompt names its tier") + 6..];
+        rest.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap()
+    }
+
+    const NOT_RELEVANT_TIERS: [u8; 4] = [1, 2, 3, 4];
+
+    /// Canned per-tier JSON for a pure-library repo: tiers 1-4 not relevant,
+    /// the rest surface one finding.
+    fn library_response(tier_value: u8) -> String {
+        let body = if NOT_RELEVANT_TIERS.contains(&tier_value) {
+            json!({
+                "relevant": false,
+                "reason": format!("tier {tier_value} does not apply to a pure library"),
+                "findings": [],
+            })
+        } else {
+            json!({
+                "relevant": true,
+                "reason": format!("tier {tier_value} applies"),
+                "findings": [{
+                    "id": "f1",
+                    "title": format!("finding for tier {tier_value}"),
+                    "detail": "detail",
+                    "evidence": ["src/lib.py:10"],
+                    "urgency": 3,
+                    "importance": 4,
+                    "blocks": 0,
+                    "effort": 2,
+                    "ready": true,
+                }],
+            })
+        };
+        format!("Here is my assessment.\n{}\n", fenced(&body))
+    }
+
+    /// A scripted per-tier invoker routing on the prompt's tier marker,
+    /// recording every tier it saw.
+    fn library_invoker(seen: Arc<Mutex<Vec<u8>>>) -> impl AutopilotInvoker {
+        move |prompt: String| {
+            let seen = seen.clone();
+            async move {
+                let tier = tier_in_prompt(&prompt);
+                seen.lock().unwrap().push(tier);
+                Ok(library_response(tier))
+            }
+        }
+    }
+
+    fn by_tier(verdicts: &[TierVerdict]) -> BTreeMap<u8, &TierVerdict> {
+        verdicts.iter().map(|v| (v.tier.value(), v)).collect()
+    }
+
+    fn seed_repo(tmp: &TempDir) -> PathBuf {
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join("tests")).unwrap();
+        std::fs::write(
+            repo.join("tests/test_existing.py"),
+            "def test_ok():\n    pass\n",
+        )
+        .unwrap();
+        repo
+    }
+
+    fn coverage_finding() -> Finding {
+        Finding {
+            detail: "the parser module has no tests".to_owned(),
+            evidence: vec!["src/parser.py:1".to_owned()],
+            urgency: 3,
+            importance: 5,
+            effort: 2,
+            ..Finding::new("f1", Tier::TestCoverage, "add coverage for the parser")
+        }
+    }
+
+    fn authored_entry(id: &str, run: &str, target: &str) -> Value {
+        json!({
+            "task": {
+                "id": id,
+                "goal": "The parser module is covered by tests.",
+                "graders": [{"type": "command", "run": run}],
+            },
+            "authoritative_grader": run,
+            "grader_source": GRADER_SOURCE_REPO_COMMAND,
+            "grader_target": target,
+        })
+    }
+
+    fn command_task(id: &str, run: &str) -> Task {
+        Task::new(
+            format!("Goal for {id}."),
+            vec![Grader::Command(CommandGrader::new(run).unwrap())],
+        )
+        .with_id(id)
+    }
+
+    fn emitted(task_id: &str, grader_target: &str, creates_files: &[&str]) -> EmittedTask {
+        EmittedTask {
+            creates_files: creates_files.iter().map(|s| (*s).to_owned()).collect(),
+            ..EmittedTask::new(
+                Finding::new(format!("find-{task_id}"), Tier::TestCoverage, task_id),
+                command_task(task_id, "cargo test --workspace"),
+                "cargo test --workspace",
+                GraderSource::RepoCommand,
+                grader_target,
+            )
+        }
+    }
+
+    fn breakdown() -> ScoreBreakdown {
+        ScoreBreakdown {
+            tier: Tier::TestCoverage,
+            tier_weight: 1,
+            urgency: 1,
+            importance: 1,
+            blocks: 0,
+            effort: 1,
+            final_score: 10.0,
+            preemptive: false,
+        }
+    }
+
+    fn subagent_interaction(
+        tier_value: u8,
+        tool_name: &str,
+        content: Option<ToolResultContent>,
+        is_error: Option<bool>,
+    ) -> ToolInteraction {
+        let tool_use_id = format!("tu-{tier_value}");
+        let mut tool_input = Map::new();
+        tool_input.insert(
+            "subagent_type".into(),
+            json!(tier_agent_key(
+                Tier::from_value(i64::from(tier_value)).unwrap()
+            )),
+        );
+        tool_input.insert(
+            "prompt".into(),
+            json!(format!("evaluate tier {tier_value}")),
+        );
+        ToolInteraction {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: tool_name.to_owned(),
+            tool_input,
+            result: content.map(|content| ToolResultObservation {
+                tool_use_id,
+                is_error,
+                content: Some(content),
+            }),
+        }
+    }
+
+    fn verdict_json(tier_value: u8, relevant: bool) -> String {
+        let body = if relevant {
+            json!({
+                "relevant": true,
+                "reason": format!("tier {tier_value} applies"),
+                "findings": [{
+                    "id": "f1",
+                    "title": format!("finding for tier {tier_value}"),
+                    "evidence": ["src/lib.py:1"],
+                    "urgency": 3, "importance": 4, "blocks": 0, "effort": 2, "ready": true,
+                }],
+            })
+        } else {
+            json!({
+                "relevant": false,
+                "reason": format!("tier {tier_value} does not apply"),
+                "findings": [],
+            })
+        };
+        format!("Subagent summary.\n{}\n", fenced(&body))
+    }
+
+    fn agent_interaction(tier_value: u8) -> ToolInteraction {
+        subagent_interaction(
+            tier_value,
+            "Agent",
+            Some(ToolResultContent::Text(verdict_json(tier_value, true))),
+            None,
+        )
+    }
+
+    fn session_result(interactions: Vec<ToolInteraction>, transcript: &str) -> IterationResult {
+        IterationResult {
+            transcript: transcript.to_owned(),
+            messages: Vec::new(),
+            envelope: parse_envelope(transcript),
+            signals: InvocationSignals {
+                tool_interactions: interactions,
+                ..InvocationSignals::default()
+            },
+            failure: None,
+            usage: None,
+        }
+    }
+
+    fn all_tiers_result() -> IterationResult {
+        session_result(
+            Tier::ALL
+                .iter()
+                .map(|t| agent_interaction(t.value()))
+                .collect(),
+            "",
+        )
+    }
+
+    // --- tier model ----------------------------------------------------------------
+
+    #[test]
+    fn tier_preemptive_boundary() {
+        assert_eq!(
+            Tier::ALL.iter().map(|t| t.value()).collect::<Vec<_>>(),
+            (1..=11).collect::<Vec<u8>>()
+        );
+        for tier in Tier::ALL {
+            assert_eq!(tier.is_preemptive(), tier.value() <= 3, "{tier:?}");
+            assert_eq!(tier.weight(), 12 - u32::from(tier.value()));
+            assert_eq!(tier_weight(tier), tier.weight());
+            assert_eq!(Tier::from_value(i64::from(tier.value())), Some(tier));
+        }
+        assert_eq!(Tier::from_value(0), None);
+        assert_eq!(Tier::from_value(12), None);
+        assert_eq!(PREEMPTIVE_MAX_TIER, 3);
+    }
+
+    #[test]
+    fn tier_serializes_as_its_number() {
+        assert_eq!(serde_json::to_value(Tier::TechDebt).unwrap(), json!(8));
+        assert_eq!(
+            serde_json::from_value::<Tier>(json!(3)).unwrap(),
+            Tier::BrokenBuild
+        );
+        assert!(serde_json::from_value::<Tier>(json!(12)).is_err());
+    }
+
+    #[test]
+    fn default_weights_are_the_module_constants() {
+        let w = weights();
+        assert_eq!(
+            (
+                w.tier,
+                w.urgency,
+                w.importance,
+                w.unblock,
+                w.effort,
+                w.interrupt_base
+            ),
+            (
+                W_TIER,
+                W_URGENCY,
+                W_IMPORTANCE,
+                W_UNBLOCK,
+                W_EFFORT,
+                INTERRUPT_BASE
+            )
+        );
+    }
+
+    // --- criterion #3: legible, recomputable breakdown ------------------------------
+
+    #[test]
+    fn breakdown_records_all_five_components_and_recomputes() {
+        let f = finding(
+            "a",
+            Tier::TechDebt,
+            Axes {
+                urgency: 4,
+                importance: 5,
+                blocks: 2,
+                effort: 3,
+                ..Axes::default()
+            },
+        );
+        let bd = score_finding(&f, &weights());
+        assert_eq!(bd.tier_weight, Tier::TechDebt.weight());
+        assert_eq!(
+            (bd.urgency, bd.importance, bd.blocks, bd.effort),
+            (4, 5, 2, 3)
+        );
+        assert_eq!(recompute_final(&bd, &weights()), bd.final_score);
+        let w = weights();
+        let expected = f64::from(Tier::TechDebt.weight()) * w.tier
+            + 4.0 * w.urgency
+            + 5.0 * w.importance
+            + 2.0 * w.unblock
+            - 3.0 * w.effort;
+        assert_eq!(bd.final_score, expected);
+        assert!(!bd.preemptive);
+    }
+
+    #[test]
+    fn flipping_any_component_changes_the_final() {
+        let base = |urgency, importance, blocks, effort| {
+            score_finding(
+                &finding(
+                    "a",
+                    Tier::TechDebt,
+                    Axes {
+                        urgency,
+                        importance,
+                        blocks,
+                        effort,
+                        ready: true,
+                    },
+                ),
+                &weights(),
+            )
+            .final_score
+        };
+        let reference = base(1, 1, 1, 1);
+        assert_ne!(base(2, 1, 1, 1), reference);
+        assert_ne!(base(1, 2, 1, 1), reference);
+        assert_ne!(base(1, 1, 2, 1), reference);
+        assert_ne!(base(1, 1, 1, 2), reference);
+    }
+
+    #[test]
+    fn effort_lowers_the_score() {
+        let cheap = score_finding(
+            &finding("cheap", Tier::TechDebt, Axes::default()),
+            &weights(),
+        );
+        let pricey = score_finding(
+            &finding(
+                "pricey",
+                Tier::TechDebt,
+                Axes {
+                    effort: 5,
+                    ..Axes::default()
+                },
+            ),
+            &weights(),
+        );
+        assert!(cheap.final_score > pricey.final_score);
+    }
+
+    #[test]
+    fn preemptive_breakdown_recomputes_under_interrupt_branch() {
+        let bd = score_finding(
+            &finding(
+                "p",
+                Tier::BrokenBuild,
+                Axes {
+                    urgency: 7,
+                    ..Axes::default()
+                },
+            ),
+            &weights(),
+        );
+        assert!(bd.preemptive);
+        assert_eq!(bd.final_score, INTERRUPT_BASE + 7.0 * W_URGENCY);
+        assert_eq!(recompute_final(&bd, &weights()), bd.final_score);
+    }
+
+    #[test]
+    fn breakdown_serializes_final_under_the_python_key() {
+        let value = serde_json::to_value(breakdown()).unwrap();
+        assert_eq!(value["final"], json!(10.0));
+        assert_eq!(value["tier"], json!(6));
+    }
+
+    // --- criterion #4: absolute preemptive override ---------------------------------
+
+    #[test]
+    fn ready_tier_1_3_precede_all_scheduled_regardless_of_score() {
+        let findings = vec![
+            finding(
+                "debt",
+                Tier::TechDebt,
+                Axes {
+                    urgency: 10,
+                    importance: 10,
+                    blocks: 10,
+                    ..Axes::default()
+                },
+            ),
+            finding(
+                "feature",
+                Tier::CoreFeatureWork,
+                Axes {
+                    urgency: 10,
+                    importance: 10,
+                    ..Axes::default()
+                },
+            ),
+            finding("build", Tier::BrokenBuild, Axes::default()),
+        ];
+        let seq = sequence_findings(&findings, &weights());
+        assert_eq!(seq[0].finding.id, "build");
+        let first_scheduled = seq.iter().position(|s| !s.breakdown.preemptive).unwrap();
+        assert!(
+            seq[..first_scheduled]
+                .iter()
+                .all(|s| s.breakdown.preemptive)
+        );
+        assert!(
+            seq[first_scheduled..]
+                .iter()
+                .all(|s| !s.breakdown.preemptive)
+        );
+    }
+
+    #[test]
+    fn two_ready_preemptive_both_precede_scheduled_stable() {
+        let urgent = || Axes {
+            urgency: 1,
+            ..Axes::default()
+        };
+        let findings = vec![
+            finding("build-a", Tier::BrokenBuild, urgent()),
+            finding(
+                "feature",
+                Tier::CoreFeatureWork,
+                Axes {
+                    urgency: 10,
+                    importance: 10,
+                    ..Axes::default()
+                },
+            ),
+            finding("build-b", Tier::BrokenBuild, urgent()),
+        ];
+        assert_eq!(
+            ids(&sequence_findings(&findings, &weights())),
+            vec!["build-a", "build-b", "feature"]
+        );
+    }
+
+    #[test]
+    fn non_ready_preemptive_does_not_float() {
+        let findings = vec![
+            finding(
+                "risk",
+                Tier::ImminentSevereRisk,
+                Axes {
+                    ready: false,
+                    ..Axes::default()
+                },
+            ),
+            finding("build", Tier::BrokenBuild, Axes::default()),
+        ];
+        let seq = sequence_findings(&findings, &weights());
+        assert_eq!(seq[0].finding.id, "build");
+        let risk = seq.iter().find(|s| s.finding.id == "risk").unwrap();
+        assert!(!risk.breakdown.preemptive);
+    }
+
+    // --- criterion #5: weighted scheduling, not strict tier order -------------------
+
+    #[test]
+    fn higher_scoring_lower_tier_precedes_lower_scoring_higher_tier() {
+        let tier8 = finding(
+            "debt",
+            Tier::TechDebt,
+            Axes {
+                urgency: 10,
+                importance: 10,
+                blocks: 10,
+                ..Axes::default()
+            },
+        );
+        let tier5 = finding(
+            "feature",
+            Tier::CoreFeatureWork,
+            Axes {
+                effort: 10,
+                ..Axes::default()
+            },
+        );
+        assert!(
+            score_finding(&tier8, &weights()).final_score
+                > score_finding(&tier5, &weights()).final_score
+        );
+        assert_eq!(
+            ids(&sequence_findings(&[tier5, tier8], &weights())),
+            vec!["debt", "feature"]
+        );
+    }
+
+    // --- selection to depth ---------------------------------------------------------
+
+    #[test]
+    fn select_findings_fills_to_slots_in_sequence_order() {
+        let findings = vec![
+            finding(
+                "t5",
+                Tier::CoreFeatureWork,
+                Axes {
+                    urgency: 1,
+                    ..Axes::default()
+                },
+            ),
+            finding("build", Tier::BrokenBuild, Axes::default()),
+            finding(
+                "t8",
+                Tier::TechDebt,
+                Axes {
+                    urgency: 10,
+                    importance: 10,
+                    ..Axes::default()
+                },
+            ),
+        ];
+        assert_eq!(
+            ids(&select_findings(&findings, 2, &weights())),
+            vec!["build", "t8"]
+        );
+        assert_eq!(select_findings(&findings, 0, &weights()), Vec::new());
+        assert_eq!(select_findings(&findings, -3, &weights()), Vec::new());
+        assert_eq!(select_findings(&findings, 5, &weights()).len(), 3);
+    }
+
+    #[test]
+    fn empty_finding_set_yields_empty_sequence() {
+        assert!(sequence_findings(&[], &weights()).is_empty());
+        assert!(select_findings(&[], 4, &weights()).is_empty());
+    }
+
+    #[test]
+    fn weight_override_changes_ordering() {
+        let findings = vec![
+            finding(
+                "pricey",
+                Tier::TechDebt,
+                Axes {
+                    importance: 10,
+                    effort: 10,
+                    ..Axes::default()
+                },
+            ),
+            finding(
+                "cheap",
+                Tier::TechDebt,
+                Axes {
+                    importance: 6,
+                    ..Axes::default()
+                },
+            ),
+        ];
+        assert_eq!(
+            sequence_findings(&findings, &weights())[0].finding.id,
+            "pricey"
+        );
+        let heavy_effort = ScoreWeights {
+            effort: 5.0,
+            ..ScoreWeights::default()
+        };
+        assert_eq!(
+            sequence_findings(&findings, &heavy_effort)[0].finding.id,
+            "cheap"
+        );
+    }
+
+    // --- prompts: byte-identical to the Python ---------------------------------------
+
+    const PY_TIER1_PROMPT: &str = "You are the relevance agent for autopilot TIER: 1 (Production down / active harm).\n\nTier remit: Outages, in-progress data loss, active breach, payments failing. Nothing below advances while open.\n\nRead the repository at /repo and decide whether THIS tier is relevant to THIS codebase. Relevance is per-codebase: e.g. \"production down\" is meaningless for a pure library. If the tier does not apply, say so -- do not invent work to fill it.\n\nIf the tier is relevant, surface zero or more concrete findings, each backed by evidence you actually observed in the repo. For each finding estimate, on a 0-10 scale: urgency (how fast cost grows if untouched), importance (value/risk-reduction if done), blocks (how many other efforts it unblocks), effort (cost to do). Set ready=true when the work can start now.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"relevant\": true,\n  \"reason\": \"one sentence on why this tier does or does not apply\",\n  \"findings\": [\n    {\"id\": \"short-slug\", \"title\": \"...\", \"detail\": \"...\", \"evidence\": [\"path:line or observation\"], \"urgency\": 0, \"importance\": 0, \"blocks\": 0, \"effort\": 0, \"ready\": true}\n  ]\n}\n```\nA not-relevant verdict carries relevant=false, a reason, and an empty findings list.";
+
+    /// sha256 of `tier_prompt(tier, Path("/repo"))` for every tier, from
+    /// the Python module.
+    const PY_TIER_PROMPT_HASHES: [&str; 11] = [
+        "613b11fa0086476ab46f435c2ddb4f50ce28940e2770471df0b7f19501e48eeb",
+        "6ffaa4c9270c1a2f38f565dd621c71486613fe55a028dbc8745cd087a000e6ae",
+        "a6c4deff9b32f7752da15cc5a3d6146ea3f3605489aea1dc1a53dffbd8547174",
+        "be760d8b2e80cc878182092fdbb3e66c116acf8f38d1fb7fa8245eeb721c57df",
+        "7e59df016b7208d58b6dba2aa5419b265910b85f9c1349455359b0d946e5a287",
+        "50e5fd178fc018fa68b4aecde9d74969a10ba05ea6f00ba834457a349235e344",
+        "b005859d812429916fd703e06c41cf764bf9686026bc2c2aae14b5c9abe08040",
+        "58d0b9049409290773a0507703385f2726ab6068c9da59f4298050192b19881b",
+        "148f78d3e423b041fb16fc057bf3209fb49d6f2e46ac4d08d1579e16ed6e34a3",
+        "94986b3fc6629f3cdef65504364384d4aeb275c1066fcfb136122d474ea20964",
+        "62f860999d5372f675f12290f00fc55423d6f95499315c224f2169aa3a5bb15a",
+    ];
+
+    const PY_ORCHESTRATOR_PROMPT: &str = "You are autopilot's discovery dispatcher for the repository at /repo.\n\nEleven tier-relevance subagents are registered: tier-1, tier-2, tier-3, tier-4, tier-5, tier-6, tier-7, tier-8, tier-9, tier-10, tier-11.\n\nUse the Agent tool (a.k.a. Task) to dispatch EVERY one of these 11 subagents exactly once, each with subagent_type set to its key. Tell each subagent to read the repository, judge whether its tier is relevant to THIS codebase, and return its verdict as the fenced JSON block its own instructions define. Dispatch all 11 regardless of your own opinion -- do not skip, merge, or pre-judge any tier. The per-tier tool-results are read directly, so you need not restate them.\n\nAfter all 11 subagents return, emit exactly one final fenced JSON block aggregating every verdict as a safety net:\n```json\n{\"verdicts\": [{\"tier\": 1, \"relevant\": false, \"reason\": \"...\", \"findings\": []}]}\n```";
+
+    const PY_AUTHORING_PROMPT: &str = "You are autopilot's headless authoring agent. Compile the finding below into one or more flywheel tasks following the fw-spec and fw-plan contracts -- a one-sentence goal and the strongest out-of-band grader you can express.\n\nRepository: /repo\nFinding (Tier 6, Test coverage (shipped/in-flight)): add coverage for the parser\nDetail: the parser module has no tests\nEvidence:\n  - src/parser.py:1\n  - src/parser.py:40\n\nHARD INTEGRITY RULES:\n- Every emitted task must carry at least one grader.\n- The authoritative grader MUST be either (a) a command that invokes a check already committed in this repo (a test/lint/build command that exists BEFORE this task runs), or (b) a registered held-out oracle by absolute path. It must NEVER be a brand-new check this task's own diff creates -- that is self-attestation.\n- Resolve any ambiguity a human would be asked about as a recorded assumption; never emit a vaguer task to dodge a question.\n- If you cannot express an out-of-band grader for this finding, do not invent one: set \"dropped\" to a one-sentence reason and emit no task.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"tasks\": [\n    {\n      \"task\": {\"id\": \"kebab-id\", \"goal\": \"one sentence\", \"graders\": [{\"type\": \"command\", \"run\": \"<existing repo check>\"}], \"tags\": [], \"context\": {}},\n      \"authoritative_grader\": \"<run string matching a command grader above>\",\n      \"grader_source\": \"repo_command\",\n      \"grader_target\": \"<repo-relative path to the pre-existing check the grader runs>\",\n      \"creates_files\": [\"<paths this task's diff will create>\"],\n      \"assumptions\": [\"<ambiguity you resolved yourself>\"]\n    }\n  ],\n  \"dropped\": \"\"\n}\n```";
+
+    #[test]
+    fn tier_prompt_is_byte_identical_to_python() {
+        assert_eq!(tier_prompt(Tier::ProductionDown, &repo()), PY_TIER1_PROMPT);
+        for (tier, expected) in Tier::ALL.iter().zip(PY_TIER_PROMPT_HASHES) {
+            assert_eq!(sha256(&tier_prompt(*tier, &repo())), expected, "{tier:?}");
+        }
+    }
+
+    #[test]
+    fn orchestrator_prompt_is_byte_identical_to_python() {
+        assert_eq!(orchestrator_prompt(&repo()), PY_ORCHESTRATOR_PROMPT);
+    }
+
+    #[test]
+    fn authoring_prompt_is_byte_identical_to_python() {
+        let mut f = coverage_finding();
+        f.evidence.push("src/parser.py:40".to_owned());
+        assert_eq!(authoring_prompt(&f, &repo()), PY_AUTHORING_PROMPT);
+        let bare = Finding::new("t11-x", Tier::Polish, "tidy");
+        let prompt = authoring_prompt(&bare, &repo());
+        assert_eq!(
+            sha256(&prompt),
+            "8bd600c9e92e75f48b0b9edacab4204b53e257540bff9b3e4606d90abce5d347"
+        );
+        assert!(prompt.contains("Detail: \nEvidence:\n  (none)\n"));
+    }
+
+    // --- JSON extraction ------------------------------------------------------------
+
+    #[test]
+    fn extract_json_object_prefers_the_fence_then_falls_back_to_braces() {
+        let fenced_text = "prose {\"decoy\": 1}\n```json\n{\"a\": 1}\n```\ntrailing";
+        assert_eq!(extract_json_object(fenced_text).unwrap()["a"], json!(1));
+        assert_eq!(
+            extract_json_object("no fence {\"b\": [1, {\"c\": 2}]} tail").unwrap()["b"][1]["c"],
+            json!(2)
+        );
+        // An unclosed fence falls through to the brace span.
+        assert_eq!(
+            extract_json_object("```json\n{\"d\": 3}").unwrap()["d"],
+            json!(3)
+        );
+        assert!(extract_json_object("no json here at all").is_err());
+        assert!(
+            extract_json_object("```json\n[1, 2]\n```")
+                .unwrap_err()
+                .contains("not an object")
+        );
+        assert!(extract_json_object("} {").is_err());
+        // Malformed fenced JSON is a parse error, never silently re-tried.
+        assert!(extract_json_object("```json\n{bad}\n```\n{\"ok\": 1}").is_err());
+    }
+
+    #[test]
+    fn score_axes_coerce_defensively() {
+        assert_eq!(coerce_axis(Some(&json!(true))), 0);
+        assert_eq!(coerce_axis(Some(&json!(-4))), 0);
+        assert_eq!(coerce_axis(Some(&json!(3.9))), 3);
+        assert_eq!(coerce_axis(Some(&json!("7"))), 0);
+        assert_eq!(coerce_axis(None), 0);
+        assert_eq!(coerce_axis(Some(&json!(6))), 6);
+    }
+
+    // --- discovery: per-tier fan-out --------------------------------------------------
+
+    #[tokio::test]
+    async fn exactly_one_verdict_per_tier() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let invoker = library_invoker(seen.clone());
+        let verdicts = run_discovery(&repo(), DiscoveryDriver::PerTier(&invoker))
+            .await
+            .unwrap();
+        assert_eq!(
+            verdicts.iter().map(|v| v.tier).collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=11).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn not_relevant_tiers_contribute_zero_findings_with_reason() {
+        let invoker = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let verdicts = run_discovery(&repo(), DiscoveryDriver::PerTier(&invoker))
+            .await
+            .unwrap();
+        let by_tier = by_tier(&verdicts);
+        for tier_value in NOT_RELEVANT_TIERS {
+            let verdict = by_tier[&tier_value];
+            assert!(!verdict.relevant);
+            assert!(verdict.findings.is_empty());
+            assert!(!verdict.reason.is_empty());
+        }
+        for verdict in &verdicts {
+            if verdict.relevant {
+                assert_eq!(verdict.findings.len(), 1);
+                assert!(verdict.findings.iter().all(|f| f.tier == verdict.tier));
+            }
+        }
+    }
+
+    #[test]
+    fn not_relevant_verdict_drops_any_findings_the_agent_lists() {
+        let contradictory = json!({
+            "relevant": false,
+            "reason": "does not apply",
+            "findings": [{"id": "x", "title": "sneaky", "urgency": 9}],
+        });
+        let verdict = parse_tier_verdict(Tier::ProductionDown, &fenced(&contradictory));
+        assert!(!verdict.relevant);
+        assert!(verdict.findings.is_empty());
+        assert_eq!(verdict.reason, "does not apply");
+    }
+
+    #[test]
+    fn relevant_with_no_findings_is_distinct_from_not_relevant() {
+        let empty_relevant = json!({
+            "relevant": true,
+            "reason": "applies but nothing actionable now",
+            "findings": [],
+        });
+        let verdict = parse_tier_verdict(Tier::CoreFeatureWork, &fenced(&empty_relevant));
+        assert!(verdict.relevant);
+        assert!(verdict.findings.is_empty());
+    }
+
+    #[test]
+    fn verdict_reasons_default_when_absent() {
+        let relevant = parse_tier_verdict(Tier::Polish, &fenced(&json!({"relevant": 1})));
+        assert_eq!(relevant.reason, "tier judged relevant to this codebase");
+        let not = parse_tier_verdict(Tier::Polish, &fenced(&json!({"reason": "  "})));
+        assert_eq!(not.reason, "tier judged not relevant to this codebase");
+    }
+
+    #[tokio::test]
+    async fn one_failing_tier_does_not_abort_the_fan_out() {
+        let invoker = |prompt: String| async move {
+            let tier = tier_in_prompt(&prompt);
+            if tier == 5 {
+                return Err(InvokeError::Other("agent exploded on tier 5".to_owned()));
+            }
+            Ok(library_response(tier))
+        };
+        let verdicts = run_discovery(&repo(), DiscoveryDriver::PerTier(&invoker))
+            .await
+            .unwrap();
+        assert_eq!(verdicts.len(), 11);
+        let by_tier = by_tier(&verdicts);
+        assert!(!by_tier[&5].relevant);
+        assert_eq!(
+            by_tier[&5].reason,
+            "discovery agent error: agent exploded on tier 5"
+        );
+        assert!(by_tier[&6].relevant);
+    }
+
+    #[test]
+    fn unparseable_response_yields_not_relevant_error_verdict() {
+        let verdict = parse_tier_verdict(Tier::TechDebt, "no json here at all");
+        assert!(!verdict.relevant);
+        assert!(verdict.findings.is_empty());
+        assert!(verdict.reason.contains("unparseable"));
+    }
+
+    #[test]
+    fn findings_carry_the_full_score_axes_and_skip_malformed_entries() {
+        let body = json!({
+            "relevant": true,
+            "reason": "applies",
+            "findings": [
+                {"id": "slug", "title": "real finding", "urgency": 7, "importance": 8,
+                 "blocks": 2, "effort": 1, "ready": false, "evidence": ["a", 2]},
+                {"title": "   "},
+                "not an object",
+                {"title": "untitled slug", "detail": 5},
+            ],
+        });
+        let verdict = parse_tier_verdict(Tier::TestCoverage, &fenced(&body));
+        assert_eq!(verdict.findings.len(), 2);
+        let f = &verdict.findings[0];
+        assert_eq!((f.urgency, f.importance, f.blocks, f.effort), (7, 8, 2, 1));
+        assert!(!f.ready);
+        assert_eq!(f.id, "t6-slug");
+        assert_eq!(f.evidence, vec!["a".to_owned(), "2".to_owned()]);
+        // A missing id falls back to the entry's index; a non-string detail
+        // reads as empty.
+        assert_eq!(verdict.findings[1].id, "t6-3");
+        assert_eq!(verdict.findings[1].detail, "");
+    }
+
+    #[tokio::test]
+    async fn production_path_runs_one_session_and_returns_eleven() {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let sessions = sessions.clone();
+            move |prompt: String| {
+                let sessions = sessions.clone();
+                async move {
+                    sessions.lock().unwrap().push(prompt);
+                    Ok(all_tiers_result())
+                }
+            }
+        };
+        let verdicts = run_discovery(&repo(), DiscoveryDriver::SingleSession(&runner))
+            .await
+            .unwrap();
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0], orchestrator_prompt(&repo()));
+        assert_eq!(
+            verdicts.iter().map(|v| v.tier).collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+    }
+
+    // --- single-session collector ----------------------------------------------------
+
+    #[test]
+    fn collects_eleven_verdicts_from_tool_results_in_tier_order() {
+        let collection = collect_tier_verdicts(&all_tiers_result());
+        assert_eq!(
+            collection
+                .verdicts
+                .iter()
+                .map(|v| v.tier)
+                .collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+        assert_eq!(collection.source, CollectSource::ToolResult);
+        assert_eq!(collection.source.as_str(), COLLECT_SOURCE_TOOL_RESULT);
+        assert!(collection.verdicts.iter().all(|v| v.relevant));
+    }
+
+    #[test]
+    fn both_task_and_agent_tool_names_parse_identically() {
+        let via = |name: &str| {
+            collect_tier_verdicts(&session_result(
+                Tier::ALL
+                    .iter()
+                    .map(|t| {
+                        subagent_interaction(
+                            t.value(),
+                            name,
+                            Some(ToolResultContent::Text(verdict_json(t.value(), true))),
+                            None,
+                        )
+                    })
+                    .collect(),
+                "",
+            ))
+        };
+        assert_eq!(via("Agent"), via("Task"));
+        assert!(SUBAGENT_TOOL_NAMES.contains(&"Agent") && SUBAGENT_TOOL_NAMES.contains(&"Task"));
+    }
+
+    #[test]
+    fn tool_result_content_as_block_list_is_concatenated() {
+        let blocks = vec![
+            json!({"type": "text", "text": "intro "})
+                .as_object()
+                .unwrap()
+                .clone(),
+            json!({"type": "image"}).as_object().unwrap().clone(),
+            json!({"type": "text", "text": verdict_json(5, true)})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ];
+        let interaction =
+            subagent_interaction(5, "Agent", Some(ToolResultContent::Blocks(blocks)), None);
+        let collection = collect_tier_verdicts(&session_result(vec![interaction], ""));
+        let by_tier = by_tier(&collection.verdicts);
+        assert!(by_tier[&5].relevant);
+        assert_eq!(collection.source, CollectSource::Mixed);
+    }
+
+    #[test]
+    fn verdicts_come_from_tool_results_not_the_parents_prose() {
+        let interactions = Tier::ALL
+            .iter()
+            .map(|t| {
+                subagent_interaction(
+                    t.value(),
+                    "Agent",
+                    Some(ToolResultContent::Text(verdict_json(
+                        t.value(),
+                        t.value() % 2 == 0,
+                    ))),
+                    None,
+                )
+            })
+            .collect();
+        let lies = json!({
+            "verdicts": Tier::ALL.iter().map(|t| json!({
+                "tier": t.value(), "relevant": false, "reason": "lies", "findings": []
+            })).collect::<Vec<_>>()
+        });
+        let misleading_prose = format!("All tiers are irrelevant.\n{}\n", fenced(&lies));
+        let collection = collect_tier_verdicts(&session_result(interactions, &misleading_prose));
+        for verdict in &collection.verdicts {
+            assert_eq!(verdict.relevant, verdict.tier.value() % 2 == 0);
+        }
+        assert_eq!(collection.source, CollectSource::ToolResult);
+    }
+
+    #[test]
+    fn missing_errored_and_malformed_tool_results_yield_error_verdicts() {
+        let interactions = Tier::ALL
+            .iter()
+            .map(|t| match t {
+                Tier::TechDebt => subagent_interaction(t.value(), "Agent", None, None),
+                Tier::Polish => subagent_interaction(
+                    t.value(),
+                    "Agent",
+                    Some(ToolResultContent::Text("boom".to_owned())),
+                    Some(true),
+                ),
+                Tier::Documentation => subagent_interaction(
+                    t.value(),
+                    "Agent",
+                    Some(ToolResultContent::Text("no json here at all".to_owned())),
+                    None,
+                ),
+                Tier::NonCriticalBugs => subagent_interaction(
+                    t.value(),
+                    "Agent",
+                    Some(ToolResultContent::Text(String::new())),
+                    None,
+                ),
+                other => agent_interaction(other.value()),
+            })
+            .collect();
+        let collection = collect_tier_verdicts(&session_result(interactions, ""));
+        assert_eq!(collection.verdicts.len(), 11);
+        let by_tier = by_tier(&collection.verdicts);
+        for tier in [Tier::TechDebt, Tier::Polish, Tier::NonCriticalBugs] {
+            let verdict = by_tier[&tier.value()];
+            assert!(!verdict.relevant);
+            assert!(verdict.findings.is_empty());
+            assert_eq!(
+                verdict.reason,
+                "subagent tool-result missing, errored, or empty"
+            );
+        }
+        assert!(!by_tier[&10].relevant);
+        assert!(by_tier[&10].reason.contains("unparseable"));
+        // Present-but-bad results are still tool-result sourced.
+        assert_eq!(collection.source, CollectSource::ToolResult);
+    }
+
+    #[test]
+    fn each_tier_present_exactly_once_even_with_no_interactions() {
+        let collection = collect_tier_verdicts(&session_result(Vec::new(), ""));
+        assert_eq!(
+            collection
+                .verdicts
+                .iter()
+                .map(|v| v.tier)
+                .collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+        assert!(collection.verdicts.iter().all(|v| !v.relevant));
+        assert_eq!(collection.source, CollectSource::ErrorFallback);
+    }
+
+    #[test]
+    fn non_subagent_and_unkeyed_tool_calls_are_ignored() {
+        let mut stray_input = Map::new();
+        stray_input.insert("file_path".into(), json!("/repo/README.md"));
+        let stray = ToolInteraction {
+            tool_use_id: "x".to_owned(),
+            tool_name: "Read".to_owned(),
+            tool_input: stray_input,
+            result: Some(ToolResultObservation {
+                tool_use_id: "x".to_owned(),
+                is_error: None,
+                content: Some(ToolResultContent::Text("contents".to_owned())),
+            }),
+        };
+        let mut unkeyed = agent_interaction(3);
+        unkeyed
+            .tool_input
+            .insert("subagent_type".into(), json!("tier-99"));
+        let mut interactions = vec![stray, unkeyed];
+        interactions.extend(Tier::ALL.iter().map(|t| agent_interaction(t.value())));
+        let collection = collect_tier_verdicts(&session_result(interactions, ""));
+        assert_eq!(collection.verdicts.len(), 11);
+        assert_eq!(collection.source, CollectSource::ToolResult);
+    }
+
+    #[test]
+    fn aggregated_fallback_when_no_tool_results_key_to_tiers() {
+        let aggregate = json!({
+            "verdicts": Tier::ALL.iter().map(|t| json!({
+                "tier": t.value(),
+                "relevant": t.value() >= 5,
+                "reason": format!("tier {} aggregated", t.value()),
+                "findings": if t.value() >= 5 {
+                    json!([{"id": "g1", "title": format!("agg finding {}", t.value()), "urgency": 1}])
+                } else {
+                    json!([])
+                },
+            })).collect::<Vec<_>>()
+        });
+        let transcript = format!("Final summary.\n{}\n", fenced(&aggregate));
+        let collection = collect_tier_verdicts(&session_result(Vec::new(), &transcript));
+        assert_eq!(
+            collection
+                .verdicts
+                .iter()
+                .map(|v| v.tier)
+                .collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+        assert_eq!(collection.source, CollectSource::Aggregated);
+        let by_tier = by_tier(&collection.verdicts);
+        assert!(!by_tier[&1].relevant);
+        assert!(by_tier[&5].relevant);
+        assert_eq!(by_tier[&5].findings.len(), 1);
+        assert_eq!(by_tier[&5].findings[0].id, "t5-g1");
+    }
+
+    #[test]
+    fn partial_tool_results_filled_from_aggregate_is_mixed() {
+        let interactions = [1, 2, 3].into_iter().map(agent_interaction).collect();
+        let aggregate = json!({
+            "verdicts": Tier::ALL.iter().map(|t| json!({
+                "tier": t.value(), "relevant": false, "reason": "agg", "findings": []
+            })).chain([json!({"tier": true}), json!({"tier": 42}), json!("junk")]).collect::<Vec<_>>()
+        });
+        let collection = collect_tier_verdicts(&session_result(interactions, &fenced(&aggregate)));
+        assert_eq!(collection.verdicts.len(), 11);
+        assert_eq!(collection.source, CollectSource::Mixed);
+        let by_tier = by_tier(&collection.verdicts);
+        assert!(by_tier[&1].relevant);
+        assert!(!by_tier[&4].relevant);
+    }
+
+    #[tokio::test]
+    async fn run_single_session_discovery_returns_eleven_in_order() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let runner = {
+            let captured = captured.clone();
+            move |prompt: String| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().unwrap().push(prompt);
+                    Ok(all_tiers_result())
+                }
+            }
+        };
+        let verdicts =
+            run_single_session_discovery(&repo(), Some(&runner), &SingleSessionOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            verdicts.iter().map(|v| v.tier).collect::<Vec<_>>(),
+            Tier::ALL.to_vec()
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn single_session_runner_failure_propagates() {
+        let runner = |_prompt: String| async move {
+            Err::<IterationResult, _>(InvokeError::Other("session died".to_owned()))
+        };
+        let err =
+            run_single_session_discovery(&repo(), Some(&runner), &SingleSessionOptions::default())
+                .await
+                .unwrap_err();
+        assert_eq!(err, InvokeError::Other("session died".to_owned()));
+    }
+
+    // --- structural shape of the single session --------------------------------------
+
+    #[test]
+    fn tier_agents_declare_no_mcp_servers_and_a_turn_budget() {
+        let agents = build_tier_agents(
+            &repo(),
+            None,
+            DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
+            DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
+        );
+        let expected: BTreeSet<String> = Tier::ALL.iter().map(|t| tier_agent_key(*t)).collect();
+        assert_eq!(agents.keys().cloned().collect::<BTreeSet<_>>(), expected);
+        for (key, definition) in &agents {
+            assert!(definition.mcp_servers.is_empty(), "{key}");
+            assert!(definition.max_turns > 0);
+            assert_eq!(definition.tools, vec!["Read", "Grep", "Glob"]);
+            assert_eq!(definition.permission_mode, "bypassPermissions");
+        }
+        let value = serde_json::to_value(&agents["tier-3"]).unwrap();
+        assert_eq!(value["mcpServers"], json!([]));
+        assert_eq!(value["maxTurns"], json!(8));
+        assert_eq!(value["effort"], json!("low"));
+        assert_eq!(value["permissionMode"], json!("bypassPermissions"));
+        assert!(value.get("model").is_none());
+        assert_eq!(
+            value["description"],
+            json!("Autopilot relevance triage for tier 3 (Broken build / blocked pipeline).")
+        );
+        assert_eq!(
+            value["prompt"],
+            json!(tier_prompt(Tier::BrokenBuild, &repo()))
+        );
+    }
+
+    #[test]
+    fn single_session_configuration_carries_dispatch_tool_and_agents() {
+        let options = SingleSessionOptions {
+            model: Some("claude-fake-1".to_owned()),
+            ..SingleSessionOptions::default()
+        };
+        let configuration = build_single_session_configuration(&repo(), &options);
+        assert_eq!(configuration.agent_id, SUBAGENT_SESSION_AGENT_ID);
+        assert_eq!(configuration.model_id.as_deref(), Some("claude-fake-1"));
+        assert_eq!(configuration.max_turns, Some(DEFAULT_DISCOVERY_MAX_TURNS));
+        assert_eq!(configuration.permission_policy, PermissionPolicy::Auto);
+        let allowed = configuration.option_string_list("allowed_tools").unwrap();
+        for tool in SUBAGENT_TOOL_NAMES {
+            assert!(allowed.contains(&tool.to_owned()), "{tool}");
+        }
+        assert_eq!(allowed, vec!["Agent", "Task", "Read", "Grep", "Glob"]);
+        let agents = configuration.option("agents").unwrap().as_object().unwrap();
+        let expected: BTreeSet<String> = Tier::ALL.iter().map(|t| tier_agent_key(*t)).collect();
+        assert_eq!(agents.keys().cloned().collect::<BTreeSet<_>>(), expected);
+        assert_eq!(agents["tier-1"]["model"], json!("claude-fake-1"));
+        // The sdk transport does not exist in the Rust runtime: nothing is
+        // pinned so the adapter's cli default applies.
+        assert!(configuration.option("transport").is_none());
+    }
+
+    // --- authoring -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn emitted_task_loads_and_carries_grader() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["task"]["tags"] = json!(["autopilot"]);
+        entry["task"]["context"] = json!({});
+        entry["creates_files"] = json!(["src/parser_test_helpers.py"]);
+        entry["assumptions"] = json!(["assume pytest is the runner", 7]);
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(result.emitted.len(), 1);
+        assert!(result.dropped.is_empty());
+        let emitted = &result.emitted[0];
+        assert!(!emitted.task.graders.is_empty());
+        assert_eq!(emitted.assumptions, vec!["assume pytest is the runner"]);
+        assert_eq!(emitted.creates_files, vec!["src/parser_test_helpers.py"]);
+        assert_eq!(emitted.grader_source, GraderSource::RepoCommand);
+        assert_eq!(emitted.held_out_oracle_path, None);
+        assert_eq!(emitted.task.tags, vec!["autopilot"]);
+
+        // Round-trip through the authoritative validator.
+        let reloaded = load_task_data(&serialize_task(&emitted.task), "round-trip").unwrap();
+        assert!(!reloaded.graders.is_empty());
+        assert_eq!(reloaded.id, "test-parser");
+    }
+
+    #[tokio::test]
+    async fn emitted_task_carries_commit_before_done_constraint() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["task"]["context"] = json!({});
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        let constraints = &result.emitted[0].task.context.constraints;
+        assert!(constraints.contains(&COMMIT_BEFORE_DONE_CONSTRAINT.to_owned()));
+        let reloaded = load_task_data(&serialize_task(&result.emitted[0].task), "rt").unwrap();
+        assert!(
+            reloaded
+                .context
+                .constraints
+                .contains(&COMMIT_BEFORE_DONE_CONSTRAINT.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_commit_constraint_is_not_duplicated() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let agent_constraint = "Commit each change atomically before reporting done";
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["task"]["context"] = json!({"constraints": [agent_constraint]});
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(
+            result.emitted[0].task.context.constraints,
+            vec![agent_constraint]
+        );
+    }
+
+    #[tokio::test]
+    async fn grader_target_must_pre_exist_in_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_new.py",
+            "tests/test_new.py",
+        );
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert_eq!(result.dropped.len(), 1);
+        assert!(result.dropped[0].reason.contains("pre-exist"));
+        assert_eq!(result.dropped[0].finding, coverage_finding());
+    }
+
+    #[tokio::test]
+    async fn grader_naming_a_diff_created_file_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        std::fs::write(repo.join("tests/test_self.py"), "def test_x():\n    pass\n").unwrap();
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_self.py",
+            "tests/test_self.py",
+        );
+        entry["creates_files"] = json!(["tests/test_self.py"]);
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert!(result.dropped[0].reason.contains("self-attestation"));
+
+        // The target-equals-created guard, with a grader that does not name
+        // the file verbatim.
+        let mut entry = authored_entry("test-parser", "make check", "tests/test_self.py");
+        entry["creates_files"] = json!(["tests/test_self.py"]);
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(
+            result.dropped[0]
+                .reason
+                .contains("target is a file this task's own diff")
+        );
+    }
+
+    #[tokio::test]
+    async fn held_out_oracle_is_an_acceptable_authoritative_source() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let oracle = tmp.path().join("held-out").join("oracle.py");
+        std::fs::create_dir_all(oracle.parent().unwrap()).unwrap();
+        std::fs::write(&oracle, "import sys\nsys.exit(0)\n").unwrap();
+        let run = format!("python3 {}", oracle.display());
+        let mut entry = authored_entry("test-parser", &run, &oracle.to_string_lossy());
+        entry["grader_source"] = json!(GRADER_SOURCE_HELD_OUT);
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(result.emitted.len(), 1);
+        assert_eq!(result.emitted[0].grader_source, GraderSource::HeldOutOracle);
+        assert_eq!(result.emitted[0].held_out_oracle_path, Some(oracle.clone()));
+
+        // A relative or missing oracle path is rejected.
+        let mut entry = authored_entry("test-parser", "python3 oracle.py", "oracle.py");
+        entry["grader_source"] = json!(GRADER_SOURCE_HELD_OUT);
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.dropped[0].reason.contains("existing absolute path"));
+    }
+
+    #[tokio::test]
+    async fn grader_less_and_invalid_tasks_are_dropped_not_emitted() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let graderless = json!({
+            "task": {"id": "noop", "goal": "Do a thing.", "graders": []},
+            "authoritative_grader": "pytest tests/test_existing.py",
+            "grader_source": GRADER_SOURCE_REPO_COMMAND,
+            "grader_target": "tests/test_existing.py",
+        });
+        let response = fenced(&json!({"tasks": [graderless], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert_eq!(result.dropped.len(), 1);
+        assert!(result.dropped[0].reason.contains("no grader"));
+
+        let invalid = json!({"task": {"id": "x"}, "authoritative_grader": "y"});
+        let response = fenced(&json!({"tasks": [invalid, "junk", {"nope": 1}], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert!(result.dropped[0].reason.contains("failed validation"));
+    }
+
+    #[tokio::test]
+    async fn finding_with_no_expressible_grader_is_dropped_with_reason() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let response = fenced(&json!({
+            "tasks": [],
+            "dropped": "no out-of-band check exists for this cosmetic finding",
+        }));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert_eq!(result.dropped.len(), 1);
+        assert!(result.dropped[0].reason.contains("cosmetic"));
+
+        let response = fenced(&json!({"tasks": "not a list"}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(result.dropped[0].reason, "no grader-bearing task authored");
+    }
+
+    #[tokio::test]
+    async fn authoritative_grader_must_be_a_command_grader_on_the_task() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["authoritative_grader"] = json!("pytest tests/other.py");
+        let response = fenced(&json!({"tasks": [entry], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert!(result.emitted.is_empty());
+        assert!(
+            result.dropped[0]
+                .reason
+                .contains("authoritative grader is not a command grader")
+        );
+
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["authoritative_grader"] = json!("  ");
+        let response = fenced(&json!({"tasks": [entry]}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(
+            result.dropped[0].reason,
+            "authored task names no authoritative grader"
+        );
+
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["grader_source"] = json!("vibes");
+        let response = fenced(&json!({"tasks": [entry]}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(result.dropped[0].reason, "unknown grader_source 'vibes'");
+
+        let mut entry = authored_entry(
+            "test-parser",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        entry["grader_target"] = json!("");
+        let response = fenced(&json!({"tasks": [entry]}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(
+            result.dropped[0].reason,
+            "authoritative grader names no pre-existing target"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_or_failing_authoring_drops_the_finding() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let result = author_finding(&coverage_finding(), &repo, &scripted("no json here")).await;
+        assert!(result.emitted.is_empty());
+        assert!(result.dropped[0].reason.contains("unparseable"));
+
+        let failing = |_prompt: String| async move {
+            Err::<String, _>(InvokeError::Other("agent exploded".to_owned()))
+        };
+        let result = author_finding(&coverage_finding(), &repo, &failing).await;
+        assert_eq!(
+            result.dropped[0].reason,
+            "authoring agent error: agent exploded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_finding_may_compile_to_multiple_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        std::fs::write(
+            repo.join("tests/test_other.py"),
+            "def test_y():\n    pass\n",
+        )
+        .unwrap();
+        let entry_a = authored_entry(
+            "task-a",
+            "pytest tests/test_existing.py",
+            "tests/test_existing.py",
+        );
+        let mut entry_b = authored_entry(
+            "task-b",
+            "pytest tests/test_other.py",
+            "tests/test_other.py",
+        );
+        entry_b["task"]["prerequisites"] = json!(["task-a"]);
+        let response = fenced(&json!({"tasks": [entry_a, entry_b], "dropped": ""}));
+        let result = author_finding(&coverage_finding(), &repo, &scripted(response)).await;
+        assert_eq!(result.emitted.len(), 2);
+        assert!(result.emitted.iter().all(|e| !e.task.graders.is_empty()));
+        assert!(
+            result
+                .emitted
+                .iter()
+                .all(|e| repo.join(&e.grader_target).exists())
+        );
+        assert_eq!(result.emitted[1].prerequisites, vec!["task-a"]);
+        assert!(result.emitted[0].prerequisites.is_empty());
+    }
+
+    #[tokio::test]
+    async fn author_findings_aggregates_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let invoker = |prompt: String| async move {
+            if prompt.contains("Finding (Tier 6") {
+                Ok(fenced(&json!({"tasks": [authored_entry(
+                    "task-6", "pytest tests/test_existing.py", "tests/test_existing.py"
+                )]})))
+            } else {
+                Ok(fenced(&json!({"tasks": [], "dropped": "nothing to grade"})))
+            }
+        };
+        let findings = [
+            coverage_finding(),
+            Finding::new("t11-x", Tier::Polish, "tidy"),
+        ];
+        let result = author_findings(&findings, &repo, &invoker).await;
+        assert_eq!(result.emitted.len(), 1);
+        assert_eq!(result.emitted[0].task.id, "task-6");
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].reason, "nothing to grade");
+    }
+
+    // --- conflict keys ----------------------------------------------------------------
+
+    #[test]
+    fn keys_derive_from_grader_target_and_creates_files() {
+        assert_eq!(
+            conflict_keys_for(&emitted("t1", "crates/infrared-feed/src/tycho.rs", &[])),
+            vec!["crates/infrared-feed/src/tycho.rs"]
+        );
+        assert_eq!(
+            conflict_keys_for(&emitted(
+                "t1",
+                "crates/a/src/lib.rs",
+                &["crates/b/src/new.rs", "crates/a/src/lib.rs", "Cargo.toml"],
+            )),
+            vec!["crates/a/src/lib.rs", "crates/b/src/new.rs"]
+        );
+        assert!(conflict_keys_for(&emitted("t1", "Cargo.toml", &[])).is_empty());
+    }
+
+    #[test]
+    fn emitted_file_carries_conflict_keys_into_work_item() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let e = emitted("t1", "crates/infrared-feed/src/tycho.rs", &[]);
+        let path = emit_emitted_task(&e, &breakdown(), &tasks_dir, AUTOPILOT_PHASE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            path,
+            tasks_dir
+                .join("active")
+                .join(AUTOPILOT_PHASE)
+                .join("t1.json")
+        );
+        let items = DirectoryWorkSource::new(&tasks_dir).list_work().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].conflict_keys,
+            BTreeSet::from(["crates/infrared-feed/src/tycho.rs".to_owned()])
+        );
+        assert_eq!(items[0].task.id, "t1");
+    }
+
+    #[test]
+    fn coarse_target_emits_no_conflict_keys_field() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let e = emitted("t1", "Cargo.toml", &[]);
+        let path = emit_emitted_task(&e, &breakdown(), &tasks_dir, AUTOPILOT_PHASE)
+            .unwrap()
+            .unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.get("conflict_keys").is_none());
+        let items = DirectoryWorkSource::new(&tasks_dir).list_work().unwrap();
+        assert!(items[0].conflict_keys.is_empty());
+    }
+
+    #[test]
+    fn swarm_tasks_on_same_file_share_a_conflict_key() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let target = "crates/infrared-feed/src/tycho.rs";
+        for i in 0..3 {
+            emit_emitted_task(
+                &emitted(&format!("dedupe-{i}"), target, &[]),
+                &breakdown(),
+                &tasks_dir,
+                AUTOPILOT_PHASE,
+            )
+            .unwrap();
+        }
+        let items = DirectoryWorkSource::new(&tasks_dir).list_work().unwrap();
+        assert_eq!(items.len(), 3);
+        let keysets: BTreeSet<BTreeSet<String>> =
+            items.iter().map(|i| i.conflict_keys.clone()).collect();
+        assert_eq!(
+            keysets,
+            BTreeSet::from([BTreeSet::from([target.to_owned()])])
+        );
+    }
+
+    #[test]
+    fn emitted_file_records_priority_provenance_and_prerequisites_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let mut e = emitted("t1", "crates/a/src/lib.rs", &[]);
+        e.prerequisites = vec!["t0".to_owned()];
+        e.assumptions = vec!["assume x".to_owned()];
+        let bd = ScoreBreakdown {
+            final_score: 42.6,
+            ..breakdown()
+        };
+        let path = emit_emitted_task(&e, &bd, &tasks_dir, AUTOPILOT_PHASE)
+            .unwrap()
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with("}\n"));
+        let raw: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(raw["priority"], json!(43));
+        assert_eq!(raw["prerequisites"], json!(["t0"]));
+        assert_eq!(raw["autopilot"]["finding_id"], json!("find-t1"));
+        assert_eq!(raw["autopilot"]["tier"], json!(6));
+        assert_eq!(raw["autopilot"]["final"], json!(42.6));
+        assert_eq!(raw["autopilot"]["grader_source"], json!("repo_command"));
+        assert_eq!(raw["autopilot"]["assumptions"], json!(["assume x"]));
+        assert_eq!(raw["autopilot"]["preemptive"], json!(false));
+        // The core loader ignores the orchestration keys.
+        assert_eq!(load_task_data(&raw, "emitted").unwrap().id, "t1");
+        // Re-emitting the same task id never overwrites.
+        std::fs::write(&path, "sentinel").unwrap();
+        assert_eq!(
+            emit_emitted_task(&e, &bd, &tasks_dir, AUTOPILOT_PHASE).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sentinel");
+        let items = DirectoryWorkSource::new(&tasks_dir).list_work().unwrap();
+        assert_eq!(items.len(), 0, "the sentinel is not a loadable task");
+    }
+
+    // --- the refill pass ---------------------------------------------------------------
+
+    /// An authoring invoker that compiles every finding into one task named
+    /// after the finding's tier, graded by the seeded repo check.
+    fn tier_task_author() -> impl AutopilotInvoker {
+        |prompt: String| async move {
+            let start = prompt.find("Finding (Tier ").unwrap() + "Finding (Tier ".len();
+            let tier: String = prompt[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            Ok(fenced(&json!({"tasks": [authored_entry(
+                &format!("task-t{tier}"), "pytest tests/test_existing.py", "tests/test_existing.py"
+            )]})))
+        }
+    }
+
+    fn task_ids_in(tasks_dir: &Path) -> Vec<String> {
+        let mut ids: Vec<String> = DirectoryWorkSource::new(tasks_dir)
+            .list_work()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.task.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn refill_pass_emits_up_to_target_depth_from_actionable_findings() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let tasks_dir = tmp.path().join("tasks");
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let author = tier_task_author();
+        let control = InMemoryClaimStore::new();
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth: 3,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            control: Some(&control),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.emitted_count(), 3);
+        assert_eq!(result.emitted.len(), 3);
+        assert_eq!(result.queue_depth_before, 0);
+        assert_eq!(result.target_depth, 3);
+        assert_eq!(result.landing, DEFAULT_LANDING);
+        assert_eq!(
+            result.reason,
+            "emitted 3 task(s) to fill queue from 0 toward target 3"
+        );
+        assert_eq!(
+            result
+                .relevant_tiers
+                .iter()
+                .map(|t| t.value())
+                .collect::<Vec<_>>(),
+            vec![5, 6, 7, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            result
+                .not_relevant_tiers
+                .iter()
+                .map(|t| t.value())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        // The three highest-scoring findings (equal axes, so highest tier
+        // weight first) were authored, in sequence order.
+        assert_eq!(
+            task_ids_in(&tasks_dir),
+            vec!["task-t5", "task-t6", "task-t7"]
+        );
+        assert!(result.emitted_paths.iter().all(|p| p.is_file()));
+        assert!(control.list_stop_events().unwrap().is_empty());
+
+        // A second pass sees depth 3 at target 3 and short-circuits without
+        // touching the agents.
+        let panicking = |_prompt: String| async move { panic!("must not be invoked") };
+        let again = run_refill_pass(RefillPassOptions {
+            target_depth: 3,
+            discovery_invoker: Some(&panicking),
+            authoring_invoker: Some(&panicking),
+            control: Some(&control),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(again.emitted_count(), 0);
+        assert_eq!(again.queue_depth_before, 3);
+        assert_eq!(
+            again.reason,
+            "queue depth 3 already at or above target 3; nothing emitted"
+        );
+        assert!(control.list_stop_events().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refill_pass_idles_on_a_clean_repo_and_witnesses_the_no_op_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let tasks_dir = tmp.path().join("tasks");
+        let nothing = |_prompt: String| async move {
+            Ok(fenced(
+                &json!({"relevant": false, "reason": "clean", "findings": []}),
+            ))
+        };
+        let panicking = |_prompt: String| async move { panic!("nothing to author") };
+        let control = InMemoryClaimStore::new();
+        let at = DateTime::parse_from_rfc3339("2026-10-12T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let clock = move || at;
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth: 5,
+            discovery_invoker: Some(&nothing),
+            authoring_invoker: Some(&panicking),
+            control: Some(&control),
+            now: Some(&clock),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.emitted_count(), 0);
+        assert!(result.relevant_tiers.is_empty());
+        assert_eq!(result.not_relevant_tiers.len(), 11);
+        assert_eq!(
+            result.reason,
+            "no actionable findings this cycle; idling without emitting"
+        );
+        assert!(!tasks_dir.exists());
+        let events = control.list_stop_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, STOP_NO_OP_CYCLE);
+        assert_eq!(events[0].subject, tasks_dir.to_string_lossy());
+        assert_eq!(
+            events[0].detail,
+            "no actionable findings this cycle; idling without emitting (observed queue depth \
+             0, target 5)"
+        );
+        assert_eq!(events[0].occurred_at, at);
+    }
+
+    #[tokio::test]
+    async fn refill_pass_records_no_op_when_nothing_is_authorable() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let tasks_dir = tmp.path().join("tasks");
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let dropper = scripted(fenced(&json!({"tasks": [], "dropped": "ungradeable"})));
+        let control = InMemoryClaimStore::new();
+        let depth = |_: &Path| Ok(2usize);
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth: 4,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&dropper),
+            control: Some(&control),
+            queue_depth: Some(&depth),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.emitted_count(), 0);
+        assert_eq!(result.queue_depth_before, 2);
+        // Every actionable finding was tried (7 relevant tiers) and dropped.
+        assert_eq!(result.dropped.len(), 7);
+        assert!(result.dropped.iter().all(|d| d.reason == "ungradeable"));
+        assert_eq!(
+            result.reason,
+            "no grader-bearing task could be authored this cycle"
+        );
+        let events = control.list_stop_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0]
+                .detail
+                .ends_with("(observed queue depth 2, target 4)")
+        );
+    }
+
+    #[tokio::test]
+    async fn refill_pass_propagates_a_failed_discovery_session() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let runner = |_prompt: String| async move {
+            Err::<IterationResult, _>(InvokeError::DeadlineExceeded(DeadlineExceeded {
+                ceiling: Duration::from_millis(50),
+                elapsed: Duration::from_millis(51),
+            }))
+        };
+        let panicking = |_prompt: String| async move { panic!("nothing to author") };
+        let err = run_refill_pass(RefillPassOptions {
+            discovery_session_runner: Some(&runner),
+            authoring_invoker: Some(&panicking),
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RefillError::Discovery(InvokeError::DeadlineExceeded(d)) if d.ceiling_seconds() == 0.05
+        ));
+    }
+
+    // --- actionable queue depth ---------------------------------------------------------
+
+    fn write_task(phase: &Path, task_id: &str) {
+        std::fs::create_dir_all(phase).unwrap();
+        std::fs::write(
+            phase.join(format!("{task_id}.json")),
+            json!({
+                "id": task_id,
+                "goal": format!("Goal for {task_id}."),
+                "graders": [{"type": "command", "run": "true"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn seed(store: &InMemoryStore, task_id: &str, terminal: Option<Status>) {
+        let mut lc = Lifecycle::new(task_id);
+        lc.run_id = format!("run-{task_id}");
+        lc.transition_to(Status::Ready, "", None).unwrap();
+        lc.transition_to(Status::Running, "", None).unwrap();
+        match terminal {
+            Some(Status::Done) => {
+                lc.transition_to(Status::Validating, "", None).unwrap();
+                lc.transition_to(Status::Done, "", None).unwrap();
+            }
+            Some(Status::Failed) => lc.transition_to(Status::Failed, "boom", None).unwrap(),
+            Some(status) => lc.transition_to(status, "", None).unwrap(),
+            None => {}
+        }
+        store.create_lifecycle(&lc).unwrap();
+    }
+
+    #[test]
+    fn actionable_depth_excludes_terminal_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let phase = tmp.path().join("active").join("autopilot");
+        for tid in ["fresh", "done", "failed", "running", "interrupted"] {
+            write_task(&phase, tid);
+        }
+        let store = InMemoryStore::new();
+        seed(&store, "done", Some(Status::Done));
+        seed(&store, "failed", Some(Status::Failed));
+        seed(&store, "running", None);
+        seed(&store, "interrupted", Some(Status::Interrupted));
+        assert_eq!(directory_queue_depth(tmp.path()).unwrap(), 5);
+        assert_eq!(actionable_queue_depth(tmp.path(), &store).unwrap(), 3);
+    }
+
+    #[test]
+    fn actionable_depth_drops_to_zero_when_all_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let phase = tmp.path().join("active").join("autopilot");
+        write_task(&phase, "landed");
+        write_task(&phase, "dead");
+        let store = InMemoryStore::new();
+        seed(&store, "landed", Some(Status::Done));
+        seed(&store, "dead", Some(Status::Failed));
+        assert_eq!(directory_queue_depth(tmp.path()).unwrap(), 2);
+        assert_eq!(actionable_queue_depth(tmp.path(), &store).unwrap(), 0);
+    }
+
+    struct BrokenStore;
+
+    impl LifecycleStore for BrokenStore {
+        fn create_lifecycle(&self, _lifecycle: &Lifecycle) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn update_lifecycle(
+            &self,
+            _lifecycle: &Lifecycle,
+            _expected: u64,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn load_lifecycle(&self, _run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
+            Ok(None)
+        }
+        fn list_lifecycles(&self, _filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError> {
+            Err(StoreError::Io(std::io::Error::other("database is locked")))
+        }
+        fn summarize_spend(
+            &self,
+            _window: &flywheel_core::store::SpendWindow,
+        ) -> Result<flywheel_core::store::SpendSummary, StoreError> {
+            Ok(flywheel_core::store::SpendSummary::default())
+        }
+    }
+
+    #[test]
+    fn actionable_depth_survives_store_errors() {
+        let tmp = TempDir::new().unwrap();
+        let phase = tmp.path().join("active").join("autopilot");
+        write_task(&phase, "a");
+        write_task(&phase, "b");
+        assert_eq!(actionable_queue_depth(tmp.path(), &BrokenStore).unwrap(), 2);
+    }
+
+    // --- the agents-backed seams under the wall-clock deadline --------------------------
+
+    const FAKE_PRELUDE: &str = r#"#!/bin/sh
+IFS= read -r FIRST_LINE || true
+emit() { printf '%s\n' "$1"; }
+init() { emit '{"type":"system","subtype":"init","session_id":"sess-auto","model":"claude-fake-1"}'; }
+text() { emit '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$1"'"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":2}}}'; }
+result() { emit '{"type":"result","subtype":"success","is_error":false,"result":"'"$1"'","num_turns":'"$2"',"total_cost_usd":0.01,"usage":{"input_tokens":7,"output_tokens":2}}'; }
+"#;
+
+    /// A fake claude-code CLI: reads the prompt line, then runs `body`.
+    fn fake_agent(dir: &Path, name: &str, body: &str) -> Vec<String> {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("{FAKE_PRELUDE}{body}\n")).unwrap();
+        vec!["/bin/sh".to_owned(), path.to_string_lossy().into_owned()]
+    }
+
+    const TEXT_BODY: &str = r#"init
+text "scripted agent text"
+result "scripted agent text" 1"#;
+
+    const SLEEPING_BODY: &str = r#"init
+sleep 60"#;
+
+    const STREAMING_BODY: &str = r#"init
+while true; do text "still streaming"; sleep 0.01; done"#;
+
+    const WALL_BUDGET: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn autopilot_agent_deadline_default_ceiling_is_non_null() {
+        let ceiling = DeadlineConfig::default()
+            .for_class(DeadlineClass::AutopilotAgent)
+            .unwrap();
+        assert!(ceiling > 0.0 && ceiling.is_finite());
+        assert_eq!(ceiling, DEFAULT_AUTOPILOT_AGENT_SECONDS);
+        assert_eq!(
+            RepoInvokerOptions::default().deadline_seconds,
+            Some(DEFAULT_AUTOPILOT_AGENT_SECONDS)
+        );
+        assert_eq!(
+            SingleSessionOptions::default().deadline_seconds,
+            Some(DEFAULT_AUTOPILOT_AGENT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn repo_invoker_configuration_mirrors_the_policy_opt_in() {
+        let options = RepoInvokerOptions {
+            model: Some("m".to_owned()),
+            max_turns: 7,
+            command_override: Some(vec!["x".to_owned()]),
+            ..RepoInvokerOptions::from_policy(Some("codex"), Some("cli"))
+        };
+        let invoker = build_repo_invoker("/repo", options);
+        let configuration = invoker.configuration();
+        assert_eq!(configuration.agent_id, "codex");
+        assert_eq!(configuration.model_id.as_deref(), Some("m"));
+        assert_eq!(configuration.max_turns, Some(7));
+        assert_eq!(configuration.permission_policy, PermissionPolicy::Auto);
+        assert_eq!(configuration.option_str("transport"), Some("cli"));
+        assert_eq!(configuration.command_override, Some(vec!["x".to_owned()]));
+        assert_eq!(invoker.repo_root(), Path::new("/repo"));
+        assert_eq!(
+            invoker.deadline_seconds(),
+            Some(DEFAULT_AUTOPILOT_AGENT_SECONDS)
+        );
+        let default = build_repo_invoker("/repo", RepoInvokerOptions::from_policy(None, None));
+        assert_eq!(default.configuration().agent_id, DEFAULT_AGENT_ID);
+        assert!(default.configuration().option("transport").is_none());
+    }
+
+    #[tokio::test]
+    async fn agents_invoker_returns_agent_text() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = build_repo_invoker(
+            tmp.path(),
+            RepoInvokerOptions {
+                command_override: Some(fake_agent(tmp.path(), "text.sh", TEXT_BODY)),
+                ..RepoInvokerOptions::default()
+            },
+        );
+        assert_eq!(
+            invoker.invoke("prompt").await.unwrap(),
+            "scripted agent text"
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_invoker_start_failure_is_a_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = build_repo_invoker(
+            tmp.path(),
+            RepoInvokerOptions {
+                agent_id: "no-such-agent".to_owned(),
+                ..RepoInvokerOptions::default()
+            },
+        );
+        let err = invoker.invoke("prompt").await.unwrap_err();
+        assert!(
+            matches!(err, InvokeError::Start(AgentError::UnknownAgent(_))),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("AgentError: "));
+    }
+
+    #[tokio::test]
+    async fn autopilot_agent_deadline_cancels_authoring_stall() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = build_repo_invoker(
+            tmp.path(),
+            RepoInvokerOptions {
+                deadline_seconds: Some(0.2),
+                command_override: Some(fake_agent(tmp.path(), "sleep.sh", SLEEPING_BODY)),
+                ..RepoInvokerOptions::default()
+            },
+        );
+        let started = Instant::now();
+        let result = author_findings(&[coverage_finding()], tmp.path(), &invoker).await;
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert!(result.emitted.is_empty());
+        assert_eq!(result.dropped.len(), 1);
+        assert!(
+            result.dropped[0]
+                .reason
+                .starts_with("authoring agent error: DeadlineExceeded: deadline of 0.2s exceeded"),
+            "{}",
+            result.dropped[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn autopilot_agent_deadline_cancels_discovery_stall() {
+        let tmp = TempDir::new().unwrap();
+        let runner = build_single_session_runner(
+            tmp.path(),
+            &SingleSessionOptions {
+                deadline_seconds: Some(0.2),
+                command_override: Some(fake_agent(tmp.path(), "sleep.sh", SLEEPING_BODY)),
+                ..SingleSessionOptions::default()
+            },
+        );
+        let started = Instant::now();
+        let err = run_single_session_discovery(
+            tmp.path(),
+            Some(&runner),
+            &SingleSessionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        match err {
+            InvokeError::DeadlineExceeded(exceeded) => assert_eq!(exceeded.ceiling_seconds(), 0.2),
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn autopilot_agent_deadline_cuts_off_a_forever_streaming_session() {
+        let tmp = TempDir::new().unwrap();
+        let runner = build_single_session_runner(
+            tmp.path(),
+            &SingleSessionOptions {
+                deadline_seconds: Some(0.2),
+                command_override: Some(fake_agent(tmp.path(), "stream.sh", STREAMING_BODY)),
+                ..SingleSessionOptions::default()
+            },
+        );
+        let started = Instant::now();
+        let err = runner.run("prompt").await.unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert!(matches!(err, InvokeError::DeadlineExceeded(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn autopilot_agent_deadline_normal_completion_not_tripped() {
+        let tmp = TempDir::new().unwrap();
+        let script = fake_agent(tmp.path(), "text.sh", TEXT_BODY);
+        let runner = build_single_session_runner(
+            tmp.path(),
+            &SingleSessionOptions {
+                command_override: Some(script.clone()),
+                ..SingleSessionOptions::default()
+            },
+        );
+        let result = runner.run("prompt").await.unwrap();
+        assert_eq!(result.transcript, "scripted agent text");
+        assert_eq!(result.signals.session_id.as_deref(), Some("sess-auto"));
+        // Collected over a session with no subagent dispatch: 11 error
+        // verdicts, never a crash.
+        let verdicts = run_single_session_discovery(
+            tmp.path(),
+            Some(&runner),
+            &SingleSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(verdicts.len(), 11);
+
+        let invoker = build_repo_invoker(
+            tmp.path(),
+            RepoInvokerOptions {
+                command_override: Some(script),
+                ..RepoInvokerOptions::default()
+            },
+        );
+        assert_eq!(
+            invoker.invoke("prompt").await.unwrap(),
+            "scripted agent text"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbounded_deadline_is_a_plain_await() {
+        let value = bounded(async { 7 }, None).await.unwrap();
+        assert_eq!(value, 7);
+        let value = bounded(async { 8 }, Some(1.0)).await.unwrap();
+        assert_eq!(value, 8);
+        let err = bounded(std::future::pending::<()>(), Some(0.01))
+            .await
+            .unwrap_err();
+        assert_eq!(err.ceiling_seconds(), 0.01);
+    }
+}

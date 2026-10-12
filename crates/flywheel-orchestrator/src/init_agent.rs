@@ -451,3 +451,309 @@ pub async fn run_agent_init(
         gitignore_added,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::load_policy;
+    use flywheel_core::task::Grader;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn canned_proposal() -> Value {
+        json!({
+            "source_kind": "directory",
+            "default_graders": [
+                "cargo test --workspace",
+                "cargo clippy --workspace -- -D warnings",
+            ],
+            "sandbox_setup": "cargo fetch",
+            "autopilot": {"target_depth": 3, "interval_seconds": 600},
+            "gitignore_additions": ["/target"],
+            "notes": "Rust Cargo workspace; ~50 tests",
+        })
+    }
+
+    /// An injectable invoker returning `payload` as a fenced block.
+    fn scripted(payload: Value) -> impl AutopilotInvoker {
+        move |_prompt: String| {
+            let payload = payload.clone();
+            async move { Ok(format!("Here is my proposal.\n\n```json\n{payload}\n```\n")) }
+        }
+    }
+
+    fn canned() -> InitProposal {
+        InitProposal {
+            source_kind: "directory".to_owned(),
+            default_graders: vec![
+                "cargo test --workspace".to_owned(),
+                "cargo clippy --workspace -- -D warnings".to_owned(),
+            ],
+            sandbox_setup: Some("cargo fetch".to_owned()),
+            target_depth: Some(3),
+            interval_seconds: Some(600.0),
+            gitignore_additions: vec!["/target".to_owned()],
+            notes: "Rust Cargo workspace; ~50 tests".to_owned(),
+        }
+    }
+
+    const PY_INIT_PROMPT: &str = "You are the onboarding-assessment agent for `flywheel init`.\n\nInspect the repository at /repo: detect its toolchain (build system, test runner, linter), and propose the flywheel policy a maintainer would write by hand.\n\nDerive the default grader commands from checks that ALREADY exist in this repo (the test/lint/build commands a contributor runs today). Do not invent a command the repo cannot run. Propose a sandbox setup command that warms a fresh checkout (dependency install/fetch) when one applies, the autopilot intake cadence, and any build-output directories that belong in .gitignore.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"source_kind\": \"directory\",\n  \"default_graders\": [\"<existing test command>\", \"<existing lint command>\"],\n  \"sandbox_setup\": \"<dependency install/fetch command, or null>\",\n  \"autopilot\": {\"target_depth\": 3, \"interval_seconds\": 600},\n  \"gitignore_additions\": [\"<build-output dir>\"],\n  \"notes\": \"one sentence describing the detected toolchain\"\n}\n```";
+
+    const PY_POLICY_NONE: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Default graders for work items that declare none (the verification\n# commands the agent derived from this repo's existing checks).\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo test --workspace\"\n\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo clippy --workspace -- -D warnings\"\n\n# Sandbox provisioning: runs (shell) inside every newly created sandbox\n# before the agent enters.\n[sandbox]\nsetup = \"cargo fetch\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ntarget_depth = 3\ninterval_seconds = 600\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
+
+    const PY_POLICY_MINIMAL: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ninterval_seconds = 0.5\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
+
+    // --- prompt and render: byte-identical to the Python ------------------------------
+
+    #[test]
+    fn init_prompt_is_byte_identical_to_python() {
+        assert_eq!(init_prompt(Path::new("/repo")), PY_INIT_PROMPT);
+    }
+
+    #[test]
+    fn rendered_policy_is_byte_identical_to_python() {
+        assert_eq!(render_agent_policy(&canned(), None), PY_POLICY_NONE);
+        let with_base = render_agent_policy(&canned(), Some("main"));
+        assert_eq!(
+            with_base,
+            PY_POLICY_NONE.replace(
+                "# checked-out branch. Set base ONLY",
+                "# checked-out branch (detected current branch: main). Set base ONLY"
+            )
+        );
+        let minimal = InitProposal {
+            interval_seconds: Some(0.5),
+            ..InitProposal::default()
+        };
+        assert_eq!(render_agent_policy(&minimal, None), PY_POLICY_MINIMAL);
+        // An empty detected branch reads as none.
+        assert_eq!(render_agent_policy(&canned(), Some("")), PY_POLICY_NONE);
+    }
+
+    #[test]
+    fn rendered_strings_are_toml_safe() {
+        let proposal = InitProposal {
+            default_graders: vec!["echo \"quoted\" \\ back".to_owned()],
+            sandbox_setup: Some("sh -c 'a \"b\"'".to_owned()),
+            ..InitProposal::default()
+        };
+        let rendered = render_agent_policy(&proposal, Some("feat/\"x\""));
+        let policy = load_policy_str(&rendered, Path::new("flywheel.toml")).unwrap();
+        assert_eq!(policy.sandbox_setup.as_deref(), Some("sh -c 'a \"b\"'"));
+        match &policy.default_graders[0] {
+            Grader::Command(command) => assert_eq!(command.run, "echo \"quoted\" \\ back"),
+            other => panic!("expected a command grader, got {other:?}"),
+        }
+        assert!(rendered.contains("# base = \"feat/\\\"x\\\"\"\n"));
+    }
+
+    // --- proposal -> loadable policy ---------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_init_writes_loadable_policy_reflecting_proposal() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = scripted(canned_proposal());
+        let result = run_agent_init(tmp.path(), Some(&invoker), &InitAgentOptions::default())
+            .await
+            .unwrap();
+
+        let policy_path = tmp.path().join("flywheel.toml");
+        assert!(policy_path.is_file());
+        assert_eq!(result.policy_path, policy_path);
+        assert_eq!(result.proposal, canned());
+
+        let policy = load_policy(&policy_path).unwrap();
+        assert_eq!(policy.source_kind, "directory");
+        assert_eq!(policy.autopilot_target_depth, 3);
+        assert_eq!(policy.autopilot_interval_seconds, 600.0);
+        assert_eq!(policy.sandbox_setup.as_deref(), Some("cargo fetch"));
+        let runs: Vec<&str> = policy
+            .default_graders
+            .iter()
+            .map(|g| match g {
+                Grader::Command(c) => c.run.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                "cargo test --workspace",
+                "cargo clippy --workspace -- -D warnings"
+            ]
+        );
+        // The validated policy is also returned on the result.
+        assert_eq!(result.policy, policy);
+    }
+
+    #[tokio::test]
+    async fn agent_init_honors_an_explicit_policy_path_and_submit_base() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("conf").join("custom.toml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let invoker = scripted(canned_proposal());
+        let result = run_agent_init(
+            tmp.path(),
+            Some(&invoker),
+            &InitAgentOptions {
+                submit_base: Some("develop".to_owned()),
+                policy_path: Some(target.clone()),
+                ..InitAgentOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.policy_path, target);
+        assert!(!tmp.path().join("flywheel.toml").exists());
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("(detected current branch: develop)"));
+        assert!(text.contains("# base = \"develop\"\n"));
+        assert_eq!(result.policy.submit_base, None);
+    }
+
+    #[tokio::test]
+    async fn agent_init_appends_gitignore_without_duplicating() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = scripted(canned_proposal());
+        let first = run_agent_init(tmp.path(), Some(&invoker), &InitAgentOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(first.gitignore_added, vec!["/target"]);
+        let gitignore = tmp.path().join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "/target\n");
+
+        let second = run_agent_init(tmp.path(), Some(&invoker), &InitAgentOptions::default())
+            .await
+            .unwrap();
+        assert!(second.gitignore_added.is_empty());
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "/target\n");
+    }
+
+    #[tokio::test]
+    async fn agent_init_preserves_existing_gitignore_lines() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "/build").unwrap();
+        let invoker = scripted(canned_proposal());
+        run_agent_init(tmp.path(), Some(&invoker), &InitAgentOptions::default())
+            .await
+            .unwrap();
+        // A missing trailing newline is repaired before appending.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap(),
+            "/build\n/target\n"
+        );
+    }
+
+    // --- failure modes write nothing -------------------------------------------------------
+
+    #[tokio::test]
+    async fn agent_init_unparseable_response_fails_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let no_json = |_prompt: String| async move {
+            Ok("I could not figure out the toolchain. Sorry, no JSON here.".to_owned())
+        };
+        let err = run_agent_init(tmp.path(), Some(&no_json), &InitAgentOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InitAgentError::Parse(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("could not parse an init proposal from the agent response")
+        );
+        assert!(!tmp.path().join("flywheel.toml").exists());
+        assert!(!tmp.path().join(".gitignore").exists());
+    }
+
+    #[tokio::test]
+    async fn agent_init_agent_failure_fails_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let failing = |_prompt: String| async move {
+            Err::<String, _>(InvokeError::Other("agent exploded".to_owned()))
+        };
+        let err = run_agent_init(tmp.path(), Some(&failing), &InitAgentOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, InitAgentError::Agent(InvokeError::Other(_))),
+            "{err:?}"
+        );
+        assert_eq!(err.to_string(), "init agent error: agent exploded");
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_render_gate_maps_policy_errors_and_writes_nothing() {
+        // Every proposal coercion keeps the render loadable (blank/invalid
+        // values fall back to their defaults), so the gate is exercised on
+        // the loader's own rejection and its error mapping.
+        let tmp = TempDir::new().unwrap();
+        let mut payload = canned_proposal();
+        payload["sandbox_setup"] = json!("   ");
+        payload["autopilot"] = json!({"target_depth": 0, "interval_seconds": -1});
+        let proposal = parse_init_proposal(&format!("```json\n{payload}\n```")).unwrap();
+        assert_eq!(proposal.sandbox_setup, None);
+        assert_eq!(proposal.target_depth, None);
+        assert_eq!(proposal.interval_seconds, None);
+        let invalid = "[source]\nkind = \"directory\"\n[store]\nbackend = \"bogus\"\n";
+        let err = load_policy_str(invalid, &tmp.path().join("flywheel.toml")).unwrap_err();
+        let gate = InitAgentError::InvalidPolicy(err);
+        assert!(
+            gate.to_string()
+                .starts_with("the agent-proposed policy failed validation and was not written: ")
+        );
+        assert!(std::fs::read_dir(tmp.path()).unwrap().next().is_none());
+    }
+
+    // --- proposal parsing defensiveness ----------------------------------------------------
+
+    #[test]
+    fn parse_proposal_defaults_on_missing_fields() {
+        let proposal = parse_init_proposal("```json\n{}\n```").unwrap();
+        assert_eq!(proposal, InitProposal::default());
+        assert_eq!(proposal.source_kind, "directory");
+        assert!(proposal.default_graders.is_empty());
+        assert_eq!(proposal.sandbox_setup, None);
+        assert_eq!(proposal.target_depth, None);
+    }
+
+    #[test]
+    fn parse_proposal_coerces_off_contract_values() {
+        let payload = json!({
+            "source_kind": "jira",
+            "default_graders": ["  make test ", "", 7, "make lint"],
+            "sandbox_setup": null,
+            "autopilot": {"target_depth": 4.0, "interval_seconds": 90},
+            "gitignore_additions": "not-a-list",
+            "notes": 42,
+        });
+        let proposal = parse_init_proposal(&format!("prose\n{payload}")).unwrap();
+        assert_eq!(proposal.source_kind, "directory");
+        assert_eq!(proposal.default_graders, vec!["make test", "make lint"]);
+        assert_eq!(proposal.sandbox_setup, None);
+        assert_eq!(proposal.target_depth, Some(4));
+        assert_eq!(proposal.interval_seconds, Some(90.0));
+        assert!(proposal.gitignore_additions.is_empty());
+        assert_eq!(proposal.notes, "");
+
+        let github = parse_init_proposal("```json\n{\"source_kind\": \"github\"}\n```").unwrap();
+        assert_eq!(github.source_kind, "github");
+        let fractional = parse_init_proposal(
+            "```json\n{\"autopilot\": {\"target_depth\": 2.5, \"interval_seconds\": true}}\n```",
+        )
+        .unwrap();
+        assert_eq!(fractional.target_depth, None);
+        assert_eq!(fractional.interval_seconds, None);
+    }
+
+    #[test]
+    fn default_invoker_is_built_with_the_init_turn_budget() {
+        let invoker = build_repo_invoker(
+            "/repo",
+            RepoInvokerOptions {
+                max_turns: DEFAULT_INIT_MAX_TURNS,
+                ..RepoInvokerOptions::default()
+            },
+        );
+        assert_eq!(invoker.configuration().max_turns, Some(40));
+    }
+}

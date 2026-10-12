@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flywheel-agents = { path = "../flywheel-agents" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -15,6 +16,9 @@ chrono.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 hex.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

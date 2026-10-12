@@ -55,3 +55,7 @@ pub use task::{
     CommandGrader, Context, Grader, GraderType, ManualGrader, RubricGrader, Task, TaskBudgets,
     TranscriptGrader, ValidationError,
 };
+pub use workflow::{
+    AgentOptions, EventsMode, RunStore, RunTaskOptions, WorkflowError, build_inline_task,
+    recover_stranded_lifecycles, run_task_file, run_task_object,
+};

@@ -1,0 +1,24 @@
+[package]
+name = "flywheel-container"
+description = "flywheel container: the Docker sandbox execution backend (agent CLI via docker exec against a bind-mounted worktree)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flywheel-core = { path = "../flywheel-core" }
+flywheel-orchestrator = { path = "../flywheel-orchestrator" }
+flywheel-agents = { path = "../flywheel-agents" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+regex.workspace = true
+uuid.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

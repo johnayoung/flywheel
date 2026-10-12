@@ -274,6 +274,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flywheel-container"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flywheel-agents",
+ "flywheel-core",
+ "flywheel-orchestrator",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "flywheel-core"
 version = "0.1.0"
 dependencies = [

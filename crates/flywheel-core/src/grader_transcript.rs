@@ -24,8 +24,11 @@
 //! Messages are the opaque `serde_json::Value` shapes the invoker carries
 //! (`IterationResult::messages`): the serialized SDK message with its
 //! `message_type` discriminator (`"AssistantMessage"` / `"ResultMessage"`),
-//! or the agent CLI's stream-json form (`"type": "assistant"` / `"result"`,
-//! usage nested under `message`).
+//! the agent CLI's stream-json form (`"type": "assistant"` / `"result"`,
+//! usage nested under `message`), or the normalized `flywheel-agents` event
+//! the agents-backed invoker records (`"type": "message.assistant"` /
+//! `"tool.started"` / `"context.usage"` / `"session.finished"`, counters
+//! nested under `payload`).
 
 use crate::invoker::Usage;
 use crate::store::{GraderResultRecord, GraderResultStore, JsonObject, StoreError};
@@ -149,8 +152,15 @@ fn default_clock() -> MonotonicClock {
 }
 
 enum MessageKind {
+    /// One agent turn (an SDK `AssistantMessage`, a stream-json `assistant`
+    /// line, or a normalized `message.assistant` / `tool.started` event).
     Assistant,
+    /// The terminal envelope carrying cumulative totals.
     Result,
+    /// A usage-only reading (`context.usage`): the claude-code normalizer
+    /// reports each assistant line's token counters on this event rather
+    /// than on the block events, so it adds tokens without adding a turn.
+    Usage,
     Other,
 }
 
@@ -162,8 +172,9 @@ fn message_kind(msg: &Value) -> MessageKind {
         None => {}
     }
     match msg.get("type").and_then(Value::as_str) {
-        Some("assistant") => MessageKind::Assistant,
-        Some("result") => MessageKind::Result,
+        Some("assistant" | "message.assistant" | "tool.started") => MessageKind::Assistant,
+        Some("result" | "session.finished") => MessageKind::Result,
+        Some("context.usage") => MessageKind::Usage,
         _ => MessageKind::Other,
     }
 }
@@ -172,6 +183,14 @@ fn message_usage(msg: &Value) -> Option<&Value> {
     msg.get("usage")
         .filter(|u| u.is_object())
         .or_else(|| msg.get("message").and_then(|m| m.get("usage")))
+        .or_else(|| msg.get("payload").and_then(|p| p.get("usage")))
+        .filter(|u| u.is_object())
+}
+
+fn message_num_turns(msg: &Value) -> Option<u64> {
+    msg.get("num_turns")
+        .or_else(|| msg.get("payload").and_then(|p| p.get("num_turns")))
+        .and_then(Value::as_u64)
 }
 
 /// Stateful accumulator that observes agent messages as they stream.
@@ -239,9 +258,12 @@ impl TranscriptCounter {
                 if let Some(usage) = message_usage(msg) {
                     self.total_tokens = self.total_tokens.max(total_tokens_from_usage(Some(usage)));
                 }
-                if let Some(num_turns) = msg.get("num_turns").and_then(Value::as_u64) {
+                if let Some(num_turns) = message_num_turns(msg) {
                     self.turns = self.turns.max(num_turns);
                 }
+            }
+            MessageKind::Usage => {
+                self.total_tokens += total_tokens_from_usage(message_usage(msg));
             }
             MessageKind::Other => {}
         }
@@ -746,6 +768,26 @@ mod tests {
         assert_eq!(counter.total_tokens, 40);
     }
 
+    #[test]
+    fn observe_understands_normalized_agent_events() {
+        // The agents-backed invoker records normalized flywheel-agents
+        // events: text blocks and tool calls are turns, the claude-code
+        // normalizer's context.usage carries the line's counters, and the
+        // session.finished payload carries the cumulative totals.
+        let mut counter = TranscriptCounter::start_with_clock(Arc::new(|| 0.0));
+        counter.observe(&json!({"type": "message.assistant", "payload": {"text": "hi"}}));
+        counter.observe(&json!({"type": "context.usage", "payload": {"usage": {"input_tokens": 5, "output_tokens": 1}}}));
+        counter.observe(&json!({"type": "thought", "payload": {"thinking": "hm"}}));
+        counter.observe(
+            &json!({"type": "tool.started", "payload": {"tool_use_id": "t", "tool_name": "Bash"}}),
+        );
+        counter.observe(&json!({"type": "tool.finished", "payload": {"tool_use_id": "t"}}));
+        assert_eq!(counter.turns, 2);
+        assert_eq!(counter.total_tokens, 6);
+        counter.observe(&json!({"type": "session.finished", "payload": {"num_turns": 7, "usage": {"input_tokens": 40, "output_tokens": 2}}}));
+        assert_eq!(counter.turns, 7);
+        assert_eq!(counter.total_tokens, 42);
+    }
     #[test]
     fn snapshot_uses_monotonic_clock() {
         let clock = FakeClock::new(0.0, 0.0);

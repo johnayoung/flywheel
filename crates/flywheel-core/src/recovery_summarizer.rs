@@ -15,10 +15,12 @@
 //!   variant (missing / truncated / duplicate / malformed / valid).
 //! * [`build_summarizer_prompt`] renders the summarizer prompt; its text is
 //!   byte-identical to the Python original.
-//! * [`run_recovery_summarizer`] is the public async runner. The
-//!   production invoker (a cold agent session with cwd set to the worktree,
-//!   full tool surface, and no session inheritance) is supplied by the
-//!   agent-driving layer; tests inject a scripted one.
+//! * [`run_recovery_summarizer`] is the public async runner over the
+//!   [`SummarizerInvoke`] seam; [`AgentsSummarizerInvoke`] is the shipped
+//!   production invoker (a cold agent session through the `flywheel-agents`
+//!   runtime with cwd set to the worktree, the full skill surface, auto
+//!   permissions, and a turn cap -- no session inheritance). Tests inject a
+//!   scripted one.
 //!
 //! Error contract: any failure to produce a parseable handoff -- an invoke
 //! that fails, an empty/missing envelope, malformed JSON, missing fields --
@@ -31,6 +33,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use crate::agents_invoke::ColdSession;
 pub use crate::prompt::RecoveryHandoff;
 use crate::task::Task;
 
@@ -364,6 +367,57 @@ pub async fn run_recovery_summarizer(
                 .failure_reason()
                 .unwrap_or_else(|| "unexpected handoff variant".to_owned()),
         )),
+    }
+}
+
+/// The shipped summarizer: a cold session through the `flywheel-agents`
+/// runtime.
+///
+/// Every call starts fresh (no session inheritance from the working agent)
+/// in the supplied worktree with the full skill surface, auto permissions,
+/// and the session's turn cap; `summarizer_model` of `None` falls through to
+/// the agent's own default. A failed run (crash, timeout, policy) is a
+/// summarizer-infrastructure failure routed through
+/// [`RecoverySummarizerError`] by the runner.
+pub struct AgentsSummarizerInvoke {
+    session: ColdSession,
+}
+
+impl std::fmt::Debug for AgentsSummarizerInvoke {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentsSummarizerInvoke")
+            .field("session", &self.session)
+            .finish()
+    }
+}
+
+impl AgentsSummarizerInvoke {
+    /// A summarizer for `agent_id` on `summarizer_model`, capped at
+    /// `summarizer_max_turns`.
+    pub fn new(agent_id: &str, summarizer_model: Option<&str>, summarizer_max_turns: u32) -> Self {
+        Self::with_session(ColdSession::new(
+            agent_id,
+            summarizer_model,
+            summarizer_max_turns,
+        ))
+    }
+
+    /// A summarizer over an explicitly configured [`ColdSession`].
+    pub fn with_session(session: ColdSession) -> Self {
+        Self { session }
+    }
+
+    pub fn session(&self) -> &ColdSession {
+        &self.session
+    }
+}
+
+impl SummarizerInvoke for AgentsSummarizerInvoke {
+    fn invoke<'a>(&'a self, prompt: &'a str, worktree: &'a Path) -> SummarizerFuture<'a> {
+        Box::pin(async move {
+            let output = self.session.run(prompt, worktree, None).await?;
+            Ok(output.text)
+        })
     }
 }
 
@@ -771,6 +825,53 @@ and abort recovery.
                 .unwrap_err();
             assert!(err.reason.contains(expect), "{response:?}: {}", err.reason);
         }
+    }
+
+    // --- the shipped summarizer through the real runtime + fake CLI -------
+
+    fn agents_summarizer(
+        dir: &Path,
+        scenario: &str,
+        model: Option<&str>,
+    ) -> AgentsSummarizerInvoke {
+        use crate::agents_invoke::test_support::{fake_configuration, write_fake_claude};
+        let script = write_fake_claude(dir);
+        let mut configuration = fake_configuration(&script, scenario);
+        configuration.model_id = model.map(str::to_owned);
+        configuration.max_turns = Some(8);
+        AgentsSummarizerInvoke::with_session(
+            ColdSession::with_configuration(configuration).with_timeout_seconds(Some(30.0)),
+        )
+    }
+
+    #[tokio::test]
+    async fn agents_summarizer_runs_a_cold_session_on_the_configured_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let summarizer = agents_summarizer(dir.path(), "handoff", Some("summarizer-model"));
+        let handoff = run_recovery_summarizer(
+            &task("Implement widget foo."),
+            "tail",
+            "diff",
+            Some(dir.path()),
+            &summarizer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(handoff.work_done, "model=summarizer-model");
+        assert_eq!(handoff.work_remaining, "wire harness");
+        assert_eq!(handoff.suggested_next_step, "run tests");
+        assert_eq!(summarizer.session().configuration().max_turns, Some(8));
+    }
+
+    #[tokio::test]
+    async fn agents_summarizer_failures_route_through_the_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_envelope = agents_summarizer(dir.path(), "no_verdict", None);
+        let err = run(&no_envelope, Some(dir.path())).await.unwrap_err();
+        assert_eq!(err.reason, "missing handoff envelope");
+        let crash = agents_summarizer(dir.path(), "crash", None);
+        let err = run(&crash, Some(dir.path())).await.unwrap_err();
+        assert!(err.reason.contains("agent_exit"), "{}", err.reason);
     }
 
     #[tokio::test]

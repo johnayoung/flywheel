@@ -22,7 +22,7 @@
 //! deadline, the context-recovery policy (boundary and mid-turn), per-run
 //! budget ceilings, the manual-approval gate, and the landability gate.
 //!
-//! What `docs/loop.md` still flags as TODO is explicitly deferred (see
+//! What `docs/loop.md` still leaves open is explicitly deferred (see
 //! [`DEFERRED_LOOP_SUBSYSTEMS`]) and not papered over with heuristics.
 
 mod attempt;
@@ -80,7 +80,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-/// `docs/loop.md` subsystems still TODO after the safety-net work. They are
+/// `docs/loop.md` subsystems still open after the safety-net work. They are
 /// intentionally not implemented here so the "not silently faked" assertion
 /// holds; the mechanical detectors that did ship (repeated-failure STUCK,
 /// tuple-repetition THRASH, the hang watchdog mechanism) are deliberately

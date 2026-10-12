@@ -1,0 +1,35 @@
+[package]
+name = "flywheel"
+description = "flywheel: the unified product shell -- the `flywheel` / `fw` verbs and the operator console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "flywheel"
+path = "src/main.rs"
+
+[[bin]]
+name = "fw"
+path = "src/bin/fw.rs"
+
+[dependencies]
+flywheel-core = { path = "../flywheel-core" }
+flywheel-agents = { path = "../flywheel-agents" }
+flywheel-orchestrator = { path = "../flywheel-orchestrator" }
+flywheel-worktree = { path = "../flywheel-worktree" }
+flywheel-container = { path = "../flywheel-container" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+toml.workspace = true
+clap.workspace = true
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,161 @@
+//! The claim heartbeat: renew a task lease on a timer while its run is in
+//! flight.
+//!
+//! The heartbeat is the worker's liveness proof: as long as the process is
+//! alive the lease is renewed, so another worker never reclaims a task that
+//! is actually running. It runs on a plain OS thread (the Rust spelling of
+//! the Python daemon thread): if the process dies the thread dies with it,
+//! the lease lapses, and the task becomes reclaimable. A lost lease (the
+//! worker stalled past the window, or clock skew let a peer steal it) stops
+//! renewal and raises the `lost` flag so the driving future can stop before
+//! landing or reporting a run whose claim a peer now owns.
+
+use crate::claims::{ClaimStore, ClaimStoreError, TaskClaim};
+use flywheel_core::invoker_client::Clock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Renews one claim every `interval` seconds until stopped.
+pub struct ClaimHeartbeat {
+    claim: Arc<Mutex<TaskClaim>>,
+    lost: Arc<AtomicBool>,
+    finished: Arc<(Mutex<bool>, Condvar)>,
+    stop: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    interval: Duration,
+}
+
+impl std::fmt::Debug for ClaimHeartbeat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimHeartbeat")
+            .field(
+                "task_id",
+                &self.claim.lock().map(|c| c.task_id.clone()).ok(),
+            )
+            .field("lost", &self.lost.load(Ordering::SeqCst))
+            .field("interval", &self.interval)
+            .finish()
+    }
+}
+
+impl ClaimHeartbeat {
+    /// Start renewing `claim` against `claims` every `interval` seconds,
+    /// extending the lease by `lease_seconds` each time, stamping renewals
+    /// with the injected `now`.
+    pub fn start(
+        claims: Arc<dyn ClaimStore>,
+        claim: TaskClaim,
+        lease_seconds: f64,
+        interval: f64,
+        now: Clock,
+    ) -> Self {
+        let interval = Duration::from_secs_f64(interval.max(0.001));
+        let claim = Arc::new(Mutex::new(claim));
+        let lost = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let thread = {
+            let claim = Arc::clone(&claim);
+            let lost = Arc::clone(&lost);
+            let finished = Arc::clone(&finished);
+            let name = format!(
+                "flywheel-lease-{}",
+                claim.lock().map(|c| c.task_id.clone()).unwrap_or_default()
+            );
+            thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    loop {
+                        match stop_rx.recv_timeout(interval) {
+                            // Stopped, or the heartbeat handle was dropped.
+                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                        }
+                        let current = match claim.lock() {
+                            Ok(guard) => guard.clone(),
+                            Err(_) => break,
+                        };
+                        match claims.renew_claim(&current, now(), lease_seconds) {
+                            Ok(renewed) => {
+                                if let Ok(mut guard) = claim.lock() {
+                                    *guard = renewed;
+                                }
+                            }
+                            Err(ClaimStoreError::ClaimLost(_)) => {
+                                // Signal the driving future that the lease was
+                                // stolen so it stops before writing a terminal
+                                // result against a stale version.
+                                lost.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            // Transient store error: retry on the next tick.
+                            Err(_) => continue,
+                        }
+                    }
+                    let (done, cv) = &*finished;
+                    if let Ok(mut guard) = done.lock() {
+                        *guard = true;
+                    }
+                    cv.notify_all();
+                })
+                .expect("spawn heartbeat thread")
+        };
+        Self {
+            claim,
+            lost,
+            finished,
+            stop: Some(stop_tx),
+            thread: Some(thread),
+            interval,
+        }
+    }
+
+    /// True once renewal has observed the lease was stolen by a peer.
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+
+    /// The latest renewed token (for release).
+    pub fn latest(&self) -> TaskClaim {
+        self.claim
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// Stop renewing and return the latest token for release.
+    ///
+    /// Waits at most `interval + 1s` for the thread to wind down (a renew
+    /// blocked on a wedged store must not hang the worker); a thread still
+    /// alive past that is detached, exactly as the Python `join(timeout)`.
+    pub fn stop(mut self) -> TaskClaim {
+        self.signal_stop();
+        let (done, cv) = &*self.finished;
+        if let Ok(guard) = done.lock() {
+            let _ = cv.wait_timeout_while(guard, self.interval + Duration::from_secs(1), |d| !*d);
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.is_finished()
+        {
+            let _ = thread.join();
+        }
+        self.latest()
+    }
+
+    fn signal_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for ClaimHeartbeat {
+    fn drop(&mut self) {
+        // A dropped heartbeat (the driving future was cancelled) stops
+        // renewing; the lease then lapses on its own if nobody releases it.
+        self.signal_stop();
+    }
+}

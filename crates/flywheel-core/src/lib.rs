@@ -32,6 +32,7 @@ pub mod recovery_summarizer;
 pub mod redaction;
 pub mod store;
 pub mod store_memory;
+pub mod store_postgres;
 pub mod store_sqlite;
 pub mod strategy;
 pub mod task;

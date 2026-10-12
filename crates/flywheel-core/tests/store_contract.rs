@@ -1,16 +1,22 @@
 //! Shared contract suite for every store backend, plus cross-implementation
-//! interop with the Python `SqliteStore`.
+//! interop with the Python `SqliteStore` and `PostgresStore`.
 //!
 //! A case that lives here is a statement about the trait surface in
 //! `flywheel_core::store`, not about a particular backend: the same cases
-//! run against `InMemoryStore` and a file-backed `SqliteStore` through one
-//! generic `contract` driver. Backend-specific behaviour (pragmas, triggers,
-//! schema migration, locked retry) is covered by each module's own tests.
+//! run against `InMemoryStore`, a file-backed `SqliteStore`, and a
+//! `PostgresStore` (one fresh schema per case on a throwaway container)
+//! through one generic `contract` driver. Backend-specific behaviour
+//! (pragmas, triggers, schema migration, locked retry, LISTEN/NOTIFY) is
+//! covered by each backend's own tests.
 //!
 //! The interop tests build a database with the Python store and read it with
-//! the Rust store, and the reverse. They run the Python side through `uv run
-//! python` from the repository root and skip, with a message, only when `uv`
-//! is not on `PATH`.
+//! the Rust store, and the reverse, for both durable backends. They run the
+//! Python side through `uv run python` from the repository root and skip,
+//! with a message, only when `uv` is not on `PATH` (or, for Postgres, when
+//! Docker or the Python `postgres` extra is unavailable).
+
+#[path = "support/pg_container.rs"]
+mod pg_container;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +35,14 @@ use flywheel_core::events::{
 use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use flywheel_core::loaders::{serialize_task, task_digest};
 use flywheel_core::store::{
-    ControlCommandStore, DomainEventStore, GraderResultRecord, GraderResultStore, HarnessStore,
-    JsonObject, LifecycleFilter, LifecycleStore, SpendSummary, SpendWindow, StoreConflictError,
-    StoreError, TaskStore,
+    GraderResultRecord, HarnessStore, JsonObject, LifecycleFilter, SpendSummary, SpendWindow,
+    StoreConflictError, StoreError,
 };
 use flywheel_core::store_memory::InMemoryStore;
+use flywheel_core::store_postgres::PostgresStore;
 use flywheel_core::store_sqlite::SqliteStore;
 use flywheel_core::task::{CommandGrader, Context, Grader, GraderType, RubricGrader, Task};
+use pg_container::Postgres;
 
 // --- Fixtures ---------------------------------------------------------------------
 
@@ -1423,6 +1430,15 @@ fn sqlite_in_memory_store_satisfies_the_contract() {
 }
 
 #[test]
+fn postgres_store_satisfies_the_contract() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let dsn = pg.dsn();
+    contract(|| PostgresStore::connect(&dsn, &pg.fresh_schema("fw_contract")).unwrap());
+}
+
+#[test]
 fn contract_cases_are_uniquely_named() {
     let mut names: Vec<&str> = CASES.iter().map(|(name, _)| *name).collect();
     let total = names.len();
@@ -1452,14 +1468,26 @@ fn uv_available() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// Run `script` under the workspace's Python, with `db` exposed as
-/// `FW_INTEROP_DB`, returning stdout.
-fn run_python(script: &str, db: &Path) -> String {
+/// Whether the workspace's Python can import the `postgres` extra.
+fn python_has_postgres_extra() -> bool {
+    Command::new("uv")
+        .args(["run", "--project"])
+        .arg(repo_root())
+        .args(["python", "-c", "import psycopg, psycopg_pool"])
+        .env_remove("VIRTUAL_ENV")
+        .current_dir(repo_root())
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Run `script` under the workspace's Python with `env` set, returning
+/// stdout.
+fn run_python(script: &str, env: &[(&str, String)]) -> String {
     let output = Command::new("uv")
         .args(["run", "--project"])
         .arg(repo_root())
         .args(["python", "-c", script])
-        .env("FW_INTEROP_DB", db)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .env_remove("VIRTUAL_ENV")
         .current_dir(repo_root())
         .output()
@@ -1593,13 +1621,34 @@ fn seed_interop_with_rust(store: &dyn HarnessStore) -> String {
     digest
 }
 
-/// The same timeline, written by the Python store.
-const PYTHON_SEED: &str = r#"
+/// Python prelude opening the SQLite store named by `FW_INTEROP_DB`.
+const PYTHON_OPEN_SQLITE: &str = r#"
 import os
+from flywheel_core import SqliteStore
+store = SqliteStore(os.environ["FW_INTEROP_DB"])
+"#;
+
+/// Python prelude opening the Postgres store named by `FW_INTEROP_DSN` /
+/// `FW_INTEROP_SCHEMA`.
+const PYTHON_OPEN_POSTGRES: &str = r#"
+import os
+from flywheel_core import PostgresStore
+store = PostgresStore(
+    os.environ["FW_INTEROP_DSN"], schema=os.environ["FW_INTEROP_SCHEMA"], pool_min=1, pool_max=2
+)
+"#;
+
+/// One interop script: an open prelude followed by a body that uses `store`.
+fn python_script(open: &str, body: &str) -> String {
+    format!("{open}\n{body}")
+}
+
+/// The same timeline, written by the Python store bound to `store`.
+const PYTHON_SEED: &str = r#"
 from datetime import datetime, timezone
 from flywheel_core import (
     AttemptFinalized, AttemptStarted, CommandGrader, Context, GraderEvaluated,
-    LandingParked, LifecycleInitialized, Outcome, RubricGrader, SqliteStore,
+    LandingParked, LifecycleInitialized, Outcome, RubricGrader,
     Status, Task, TransitionedTo,
 )
 
@@ -1607,7 +1656,6 @@ def t(n):
     return datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)
 
 RUN = "run-interop"
-store = SqliteStore(os.environ["FW_INTEROP_DB"])
 task = Task(
     id="interop-task",
     goal="Port the stores.",
@@ -1674,19 +1722,18 @@ store.close()
 print(digest)
 "#;
 
-/// Read the timeline back with the Python store and print a JSON summary.
+/// Read the timeline back with the Python store bound to `store` and print
+/// a JSON summary.
 const PYTHON_READ: &str = r#"
 import json
-import os
 from datetime import datetime, timezone
-from flywheel_core import SqliteStore, replay
+from flywheel_core import replay
 from flywheel_core.loaders import serialize_task, task_digest
 
 def t(n):
     return datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)
 
 RUN = "run-interop"
-store = SqliteStore(os.environ["FW_INTEROP_DB"])
 lc = store.load_lifecycle(RUN)
 events = store.list_domain_events(RUN)
 task = store.load_task_for_run(RUN)
@@ -1765,23 +1812,14 @@ fn interop_clock_matches_the_python_fixture() {
     assert_eq!(iso(INTEROP_TIMELINE_SECONDS), "2026-05-28T12:00:12+00:00");
 }
 
-#[test]
-fn python_written_database_reads_back_through_the_rust_store() {
-    if !uv_available() {
-        eprintln!("skipping python->rust interop: `uv` is not on PATH");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("python-seeded.sqlite");
-    let digest = run_python(PYTHON_SEED, &db).trim().to_owned();
+/// Everything the Rust store must read back from a Python-seeded timeline.
+fn assert_rust_reads_python_seed(store: &dyn HarnessStore, digest: &str) {
     let task = interop_task();
     assert_eq!(
         digest,
         task_digest(&task),
         "digest parity across implementations"
     );
-
-    let store = SqliteStore::open(&db).unwrap();
     let lc = store.load_lifecycle(INTEROP_RUN).unwrap().unwrap();
     assert_eq!(lc.status, Status::Done);
     assert_eq!(lc.version, 9);
@@ -1885,21 +1923,10 @@ fn python_written_database_reads_back_through_the_rust_store() {
     assert_eq!(listed, vec![lc]);
 }
 
-#[test]
-fn rust_written_database_reads_back_through_the_python_store() {
-    if !uv_available() {
-        eprintln!("skipping rust->python interop: `uv` is not on PATH");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("rust-seeded.sqlite");
-    let store = SqliteStore::open(&db).unwrap();
-    let digest = seed_interop_with_rust(&store);
+/// Everything the Python store must report after reading a Rust-seeded
+/// timeline (`PYTHON_READ`'s JSON summary).
+fn assert_python_reads_rust_seed(out: &Value, digest: &str) {
     let task = interop_task();
-    store.close().unwrap();
-
-    let stdout = run_python(PYTHON_READ, &db);
-    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(out["status"], "done");
     assert_eq!(out["version"], 9);
     assert_eq!(out["task_id"], INTEROP_TASK);
@@ -1968,4 +1995,100 @@ fn rust_written_database_reads_back_through_the_python_store() {
             "cache_read_tokens": 5, "total_cost_usd": 0.75,
         })
     );
+}
+
+#[test]
+fn python_written_database_reads_back_through_the_rust_store() {
+    if !uv_available() {
+        eprintln!("skipping python->rust interop: `uv` is not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("python-seeded.sqlite");
+    let digest = run_python(
+        &python_script(PYTHON_OPEN_SQLITE, PYTHON_SEED),
+        &[("FW_INTEROP_DB", db.display().to_string())],
+    )
+    .trim()
+    .to_owned();
+    let store = SqliteStore::open(&db).unwrap();
+    assert_rust_reads_python_seed(&store, &digest);
+}
+
+#[test]
+fn rust_written_database_reads_back_through_the_python_store() {
+    if !uv_available() {
+        eprintln!("skipping rust->python interop: `uv` is not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rust-seeded.sqlite");
+    let store = SqliteStore::open(&db).unwrap();
+    let digest = seed_interop_with_rust(&store);
+    store.close().unwrap();
+
+    let stdout = run_python(
+        &python_script(PYTHON_OPEN_SQLITE, PYTHON_READ),
+        &[("FW_INTEROP_DB", db.display().to_string())],
+    );
+    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_python_reads_rust_seed(&out, &digest);
+}
+
+/// The Postgres interop prerequisites: `uv`, the Python `postgres` extra,
+/// and a throwaway container. `None` means skip (with the reason printed).
+fn postgres_interop_fixture(direction: &str) -> Option<Postgres> {
+    if !uv_available() {
+        eprintln!("skipping {direction} postgres interop: `uv` is not on PATH");
+        return None;
+    }
+    if !python_has_postgres_extra() {
+        eprintln!(
+            "skipping {direction} postgres interop: the Python `postgres` extra is not installed"
+        );
+        return None;
+    }
+    Postgres::acquire()
+}
+
+#[test]
+fn python_written_postgres_schema_reads_back_through_the_rust_store() {
+    let Some(pg) = postgres_interop_fixture("python->rust") else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_interop_py");
+    let digest = run_python(
+        &python_script(PYTHON_OPEN_POSTGRES, PYTHON_SEED),
+        &[
+            ("FW_INTEROP_DSN", pg.dsn()),
+            ("FW_INTEROP_SCHEMA", schema.clone()),
+        ],
+    )
+    .trim()
+    .to_owned();
+    // The Python store bootstrapped the schema; the Rust store opens it
+    // unchanged (same schema_version, idempotent DDL) and reads every row.
+    let store = PostgresStore::connect(&pg.dsn(), &schema).unwrap();
+    assert_rust_reads_python_seed(&store, &digest);
+}
+
+#[test]
+fn rust_written_postgres_schema_reads_back_through_the_python_store() {
+    let Some(pg) = postgres_interop_fixture("rust->python") else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_interop_rs");
+    let store = PostgresStore::connect(&pg.dsn(), &schema).unwrap();
+    let digest = seed_interop_with_rust(&store);
+    store.close().unwrap();
+
+    let stdout = run_python(
+        &python_script(PYTHON_OPEN_POSTGRES, PYTHON_READ),
+        &[
+            ("FW_INTEROP_DSN", pg.dsn()),
+            ("FW_INTEROP_SCHEMA", schema.clone()),
+        ],
+    );
+    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_python_reads_rust_seed(&out, &digest);
 }

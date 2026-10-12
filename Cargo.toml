@@ -1,0 +1,40 @@
+# Cargo workspace for the Rust implementation of flywheel.
+#
+# Mirrors the Python workspace under packages/: one crate per package, the
+# dependency arrow pointing one way only (core imports nothing downstream).
+#
+#   crates/flywheel-agents        multi-agent execution layer (below core)
+#   crates/flywheel-core          the lifecycle of a SINGLE task
+#   crates/flywheel-orchestrator  many tasks: DAG, claims, work sources
+#   crates/flywheel-worktree      git-worktree submit strategy + worker
+#   crates/flywheel-container     Docker sandbox execution backend
+#   crates/flywheel               the `flywheel` / `fw` product shell
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/johnayoung/flywheel"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs", "signal"] }
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+regex = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

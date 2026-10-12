@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn consecutive_failed_runs_groups_by_run_id() {
         let mut lc = Lifecycle::new("t");
-        let mut a = |n, run, outcome| {
+        let a = |n, run, outcome| {
             let mut att = Attempt::new(n, at(0), run);
             att.outcome = outcome;
             att

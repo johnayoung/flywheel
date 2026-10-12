@@ -67,8 +67,8 @@ use crate::rollup::{
 };
 use crate::sources::{LogSink, WorkItem, WorkSource};
 use crate::strategy::{
-    PlainDirectoryStrategy, SandboxHandle, SandboxMode, SandboxRequest, SubmitRequest,
-    SubmitStrategy, prepare_sandbox_guarded, submit_guarded,
+    PlainDirectoryStrategy, SandboxHandle, SandboxRequest, SubmitRequest, SubmitStrategy,
+    prepare_sandbox_guarded, submit_guarded,
 };
 use crate::work_graph::{ReadySetQuery, WorkGraph};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -82,7 +82,6 @@ use flywheel_core::harness::{
 use flywheel_core::invoker_client::Clock;
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, StoreConflictError, StoreError};
-use flywheel_core::task::Task;
 use flywheel_core::telemetry_file::FileTelemetrySink;
 use flywheel_core::validation::validate_task;
 use serde::{Deserialize, Serialize};
@@ -1018,14 +1017,6 @@ pub async fn orchestrate(
                 Some(run_id) => SandboxRequest::resume(item, run_id.clone()),
                 None => SandboxRequest::fresh(item),
             };
-            debug_assert_eq!(
-                sandbox_request.mode,
-                if resume_run_id.is_some() {
-                    SandboxMode::Resume
-                } else {
-                    SandboxMode::Fresh
-                }
-            );
             let handle = match prepare_sandbox_guarded(strategy.as_ref(), &sandbox_request) {
                 Ok(handle) => handle,
                 Err(err) => {
@@ -1089,12 +1080,4 @@ fn release_after_prepare(
             ),
         );
     }
-}
-
-/// The task a row refers to, when the listing carries it.
-pub fn task_for_row<'a>(items: &'a [WorkItem], row: &TaskStatusRow) -> Option<&'a Task> {
-    items
-        .iter()
-        .find(|i| i.task.id == row.task_id)
-        .map(|i| &i.task)
 }

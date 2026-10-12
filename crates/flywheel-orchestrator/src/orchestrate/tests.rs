@@ -9,7 +9,7 @@ use crate::claims::{
 };
 use crate::held_out_gate::FilesystemHeldOutGraderSource;
 use crate::sources::{WorkReport, WorkSourceError};
-use crate::strategy::{LandabilityVerdict, PrepareError, SubmitOutcome, Teardown};
+use crate::strategy::{LandabilityVerdict, PrepareError, SandboxMode, SubmitOutcome, Teardown};
 use crate::work_graph::GraphValidationIssue;
 use chrono::TimeZone;
 use flywheel_core::envelope::BlockedRequirement;
@@ -25,7 +25,7 @@ use flywheel_core::store::{
 };
 use flywheel_core::store_memory::InMemoryStore;
 use flywheel_core::store_sqlite::SqliteStore;
-use flywheel_core::task::{CommandGrader, Grader, ManualGrader};
+use flywheel_core::task::{CommandGrader, Grader, ManualGrader, Task};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

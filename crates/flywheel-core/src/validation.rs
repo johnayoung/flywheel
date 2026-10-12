@@ -26,6 +26,7 @@
 //! self-correcting cycle. `repo_root` is retained on [`validate_task`] for a
 //! future revival that discriminates input from output.
 
+use crate::loaders::py_str_repr;
 use crate::task::{Grader, Task};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -75,7 +76,10 @@ pub fn validate_task(task: &Task, repo_root: &Path) -> Vec<TaskDefect> {
             Ok(true) => {}
             Ok(false) => defects.push(TaskDefect {
                 task_id: task.id.clone(),
-                detail: format!("command grader 'run' does not parse as a shell command: {run:?}"),
+                detail: format!(
+                    "command grader 'run' does not parse as a shell command: {}",
+                    py_str_repr(run)
+                ),
             }),
             Err(err) => defects.push(TaskDefect {
                 task_id: task.id.clone(),

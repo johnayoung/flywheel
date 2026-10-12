@@ -787,7 +787,11 @@ fn py_repr(value: &Value) -> String {
     }
 }
 
-fn py_str_repr(s: &str) -> String {
+/// Python's `repr()` of a `str`: single-quoted unless the text holds a
+/// single quote and no double quote, with backslash escapes for the quote,
+/// backslashes, and control characters. Operator-facing messages that the
+/// Python implementation renders with `{value!r}` use this for parity.
+pub fn py_str_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
     } else {

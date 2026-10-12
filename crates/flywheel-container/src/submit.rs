@@ -477,12 +477,9 @@ mod tests {
 
     fn invocation() -> InvocationRequest {
         InvocationRequest {
-            prompt: "do the thing".into(),
-            transcript_graders: Vec::new(),
             attempt_number: 1,
             iteration_number: 1,
-            checkpoint_nudge_seconds: None,
-            agent_iteration_ceiling_seconds: None,
+            ..InvocationRequest::new("do the thing")
         }
     }
 

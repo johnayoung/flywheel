@@ -322,6 +322,7 @@ dependencies = [
  "flywheel-core",
  "flywheel-orchestrator",
  "hex",
+ "libc",
  "regex",
  "serde",
  "serde_json",

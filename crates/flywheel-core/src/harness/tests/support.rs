@@ -16,8 +16,8 @@ use crate::recovery_summarizer::{
 };
 use crate::store::{
     AttemptStore, ControlCommandRecord, ControlCommandStore, DomainEventStore, GraderResultRecord,
-    GraderResultStore, HarnessStore, JsonObject, LifecycleFilter, LifecycleStore, SpendSummary,
-    SpendWindow, StoreError, TaskStore, TelemetryRecord, TelemetrySink,
+    GraderResultStore, JsonObject, LifecycleFilter, LifecycleStore, SpendSummary, SpendWindow,
+    StoreError, TaskStore, TelemetryRecord, TelemetrySink,
 };
 use crate::store_memory::InMemoryStore;
 use crate::task::{CommandGrader, Grader, Task};
@@ -68,7 +68,9 @@ impl ListSink {
         self.all()
             .into_iter()
             .filter(|r| {
-                r.run_id == run_id && !r.kind.starts_with("harness.") && !r.kind.starts_with("domain.")
+                r.run_id == run_id
+                    && !r.kind.starts_with("harness.")
+                    && !r.kind.starts_with("domain.")
             })
             .collect()
     }
@@ -160,7 +162,11 @@ impl LifecycleStore for FailingStore {
     fn create_lifecycle(&self, lifecycle: &Lifecycle) -> Result<(), StoreError> {
         self.inner.create_lifecycle(lifecycle)
     }
-    fn update_lifecycle(&self, lifecycle: &Lifecycle, expected_version: u64) -> Result<(), StoreError> {
+    fn update_lifecycle(
+        &self,
+        lifecycle: &Lifecycle,
+        expected_version: u64,
+    ) -> Result<(), StoreError> {
         self.inner.update_lifecycle(lifecycle, expected_version)
     }
     fn load_lifecycle(&self, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
@@ -178,7 +184,11 @@ impl TaskStore for FailingStore {
     fn save_task(&self, task: &Task, now: DateTime<Utc>) -> Result<String, StoreError> {
         self.inner.save_task(task, now)
     }
-    fn load_task(&self, task_id: &str, content_hash: Option<&str>) -> Result<Option<Task>, StoreError> {
+    fn load_task(
+        &self,
+        task_id: &str,
+        content_hash: Option<&str>,
+    ) -> Result<Option<Task>, StoreError> {
         self.inner.load_task(task_id, content_hash)
     }
     fn load_task_for_run(&self, run_id: &str) -> Result<Option<Task>, StoreError> {
@@ -187,7 +197,11 @@ impl TaskStore for FailingStore {
 }
 
 impl DomainEventStore for FailingStore {
-    fn append_domain_event(&self, event: &DomainEvent, expected_version: u64) -> Result<Lifecycle, StoreError> {
+    fn append_domain_event(
+        &self,
+        event: &DomainEvent,
+        expected_version: u64,
+    ) -> Result<Lifecycle, StoreError> {
         if self.fail_event_kind == Some(event.kind()) {
             return Err(simulated("simulated ledger append failure"));
         }
@@ -199,7 +213,12 @@ impl DomainEventStore for FailingStore {
 }
 
 impl AttemptStore for FailingStore {
-    fn save_attempt(&self, run_id: &str, attempt: &Attempt, expected_version: Option<u64>) -> Result<(), StoreError> {
+    fn save_attempt(
+        &self,
+        run_id: &str,
+        attempt: &Attempt,
+        expected_version: Option<u64>,
+    ) -> Result<(), StoreError> {
         if self.fail_save_attempt {
             return Err(simulated("simulated rollup write failure"));
         }
@@ -214,19 +233,36 @@ impl AttemptStore for FailingStore {
 }
 
 impl GraderResultStore for FailingStore {
-    fn append_grader_result(&self, result: &GraderResultRecord) -> Result<GraderResultRecord, StoreError> {
+    fn append_grader_result(
+        &self,
+        result: &GraderResultRecord,
+    ) -> Result<GraderResultRecord, StoreError> {
         self.inner.append_grader_result(result)
     }
-    fn list_grader_results(&self, run_id: &str, attempt_number: u32) -> Result<Vec<GraderResultRecord>, StoreError> {
+    fn list_grader_results(
+        &self,
+        run_id: &str,
+        attempt_number: u32,
+    ) -> Result<Vec<GraderResultRecord>, StoreError> {
         self.inner.list_grader_results(run_id, attempt_number)
     }
 }
 
 impl ControlCommandStore for FailingStore {
-    fn enqueue_command(&self, run_id: &str, kind: &str, payload: JsonObject, now: DateTime<Utc>) -> Result<ControlCommandRecord, StoreError> {
+    fn enqueue_command(
+        &self,
+        run_id: &str,
+        kind: &str,
+        payload: JsonObject,
+        now: DateTime<Utc>,
+    ) -> Result<ControlCommandRecord, StoreError> {
         self.inner.enqueue_command(run_id, kind, payload, now)
     }
-    fn claim_commands(&self, run_id: &str, now: DateTime<Utc>) -> Result<Vec<ControlCommandRecord>, StoreError> {
+    fn claim_commands(
+        &self,
+        run_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ControlCommandRecord>, StoreError> {
         self.inner.claim_commands(run_id, now)
     }
     fn delete_command(&self, command_id: i64) -> Result<(), StoreError> {
@@ -609,8 +645,9 @@ impl SummarizerInvoke for ScriptedSummarizer {
                     }))
                     .unwrap()
                 )),
-                Err(message) => Err(Box::new(std::io::Error::other(message.clone()))
-                    as SummarizerInvokeError),
+                Err(message) => {
+                    Err(Box::new(std::io::Error::other(message.clone())) as SummarizerInvokeError)
+                }
             }
         })
     }

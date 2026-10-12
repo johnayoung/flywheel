@@ -45,6 +45,11 @@ pub use envelope::{
     BlockedRequirement, CLOSING_FENCE, EnvelopeResult, Intent, OPENING_FENCE, ValidEnvelope,
     parse_envelope,
 };
+pub use harness::{
+    HarnessConfig, HarnessError, HarnessOutcome, RecheckOutcome, ResolveApprovalOutcome,
+    RunOptions, ShutdownSignal, finalize_stranded_lifecycle, recheck_blocked_lifecycle,
+    resolve_manual_approval, run_task,
+};
 pub use lifecycle::{Attempt, Lifecycle, LifecycleTransitionError, Outcome, Status};
 pub use task::{
     CommandGrader, Context, Grader, GraderType, ManualGrader, RubricGrader, Task, TaskBudgets,

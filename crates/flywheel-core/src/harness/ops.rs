@@ -9,6 +9,7 @@ use super::state::{Run, object};
 use super::telemetry::{MirroringStore, RunTelemetry, SharedSink};
 use super::validate::awaiting_approval_payload;
 use super::{default_clock, default_monotonic};
+use crate::deadline_config::DeadlineClass;
 use crate::envelope::BlockedRequirement;
 use crate::events::{AttemptFinalized, AwaitingApproval, DomainEventPayload};
 use crate::grader_manual::{
@@ -27,6 +28,7 @@ use serde_json::{Value, json};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Knobs for [`finalize_stranded_lifecycle`].
 #[derive(Clone)]
@@ -171,14 +173,33 @@ impl RecheckOutcome {
 }
 
 /// Knobs for [`recheck_blocked_lifecycle`].
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RecheckOptions {
     pub dry_run: bool,
     /// The task's sandbox the predicates are evaluated against; the
     /// process working directory when `None`.
     pub cwd: Option<PathBuf>,
+    /// Wall-clock ceiling for each `command_grader` predicate's subprocess
+    /// (the `command_grader` deadline-class default); `None` waits
+    /// unbounded. A predicate that outlives it is killed and reported
+    /// unsatisfied.
+    pub command_timeout: Option<Duration>,
     pub sink: Option<SharedSink>,
     pub now: Option<Clock>,
+}
+
+impl Default for RecheckOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            cwd: None,
+            command_timeout: Some(Duration::from_secs_f64(
+                DeadlineClass::CommandGrader.default_seconds(),
+            )),
+            sink: None,
+            now: None,
+        }
+    }
 }
 
 impl fmt::Debug for RecheckOptions {
@@ -199,6 +220,11 @@ impl RecheckOptions {
 
     pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_command_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.command_timeout = timeout;
         self
     }
 
@@ -228,13 +254,16 @@ fn predicate_entry(kind: &str, identifier: Value, satisfied: bool, detail: &str)
 ///
 /// `command_grader` predicates run the named grader's `run` string through
 /// `/bin/sh -c` in `cwd` (the process working directory when `None`),
-/// inheriting the environment; exit code `0` is satisfied. No
-/// `grader_results` row is written: recheck is a control-plane operation
-/// whose audit surface is the event payload.
+/// inheriting the environment; exit code `0` is satisfied. Only the exit
+/// code is consulted, so the subprocess's output is discarded rather than
+/// buffered, and a predicate that outlives `timeout` is killed and reported
+/// unsatisfied. No `grader_results` row is written: recheck is a
+/// control-plane operation whose audit surface is the event payload.
 pub fn evaluate_blocked_predicate(
     req: &BlockedRequirement,
     task: &Task,
     cwd: Option<&Path>,
+    timeout: Option<Duration>,
 ) -> JsonObject {
     match req {
         BlockedRequirement::CommandGrader { name } => {
@@ -242,29 +271,18 @@ pub fn evaluate_blocked_predicate(
             let Some(Grader::Command(grader)) = grader else {
                 return predicate_entry("command_grader", json!(name), false, "grader not found");
             };
-            let mut command = std::process::Command::new("/bin/sh");
-            command.arg("-c").arg(&grader.run);
-            command.stdin(std::process::Stdio::null());
-            if let Some(cwd) = cwd {
-                command.current_dir(cwd);
-            }
-            match command.output() {
-                Ok(output) => {
-                    let exit_code = exit_code_of(&output.status);
-                    predicate_entry(
+            let detail = match run_predicate_command(&grader.run, cwd, timeout) {
+                Ok(exit_code) => {
+                    return predicate_entry(
                         "command_grader",
                         json!(name),
                         exit_code == 0,
                         &format!("exit_code={exit_code}"),
-                    )
+                    );
                 }
-                Err(err) => predicate_entry(
-                    "command_grader",
-                    json!(name),
-                    false,
-                    &format!("subprocess failed to start: {err}"),
-                ),
-            }
+                Err(detail) => detail,
+            };
+            predicate_entry("command_grader", json!(name), false, &detail)
         }
         BlockedRequirement::FileExists { path, present } => {
             let probe = match cwd {
@@ -291,6 +309,52 @@ pub fn evaluate_blocked_predicate(
                 if satisfied { "set" } else { "unset_or_empty" },
             )
         }
+    }
+}
+
+/// Run one predicate command to completion (bounded by `timeout`) and
+/// return its exit code, or a human-readable failure detail.
+fn run_predicate_command(
+    run: &str,
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<i32, String> {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(run)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("subprocess failed to start: {err}"))?;
+    let Some(timeout) = timeout else {
+        let status = child
+            .wait()
+            .map_err(|err| format!("subprocess wait failed: {err}"))?;
+        return Ok(exit_code_of(&status));
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(exit_code_of(&status)),
+            Ok(None) => {}
+            Err(err) => return Err(format!("subprocess wait failed: {err}")),
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "timed out after {}s",
+                crate::task::python_float_repr(timeout.as_secs_f64())
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -367,7 +431,9 @@ pub fn recheck_blocked_lifecycle(
 
     let evaluated: Vec<JsonObject> = parsed
         .iter()
-        .map(|req| evaluate_blocked_predicate(req, task, options.cwd.as_deref()))
+        .map(|req| {
+            evaluate_blocked_predicate(req, task, options.cwd.as_deref(), options.command_timeout)
+        })
         .collect();
     let all_satisfied = evaluated
         .iter()
@@ -498,7 +564,7 @@ fn emit_control_applied(run: &Run, command: &ControlCommandRecord, attempt_numbe
 ///   `harness.awaiting_approval`) or transition `-> DONE`. Emits
 ///   `harness.manual_approved`.
 /// * reject: a `passed=false` receipt carrying the operator feedback (or
-///   the documented placeholder); `-> FAILED_VALIDATION` with
+///   the documented `(no feedback provided)` substitution); `-> FAILED_VALIDATION` with
 ///   `manual grader '<name>' rejected by operator`, then the same retry arm
 ///   `run_task` drives (`-> READY` consuming one retry with
 ///   `harness.retry_scheduled`, or `-> FAILED`). Emits

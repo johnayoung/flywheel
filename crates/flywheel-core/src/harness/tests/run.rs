@@ -10,9 +10,9 @@ use crate::events::{DomainEventKind, replay};
 use crate::harness::state::Run;
 use crate::harness::telemetry::{MirroringStore, RunTelemetry};
 use crate::harness::{
-    DEFERRED_LOOP_SUBSYSTEMS, HarnessConfig, HarnessError, RunOptions, ShutdownSignal,
-    build_observation, build_usage_breakdown, finalize_stranded_lifecycle, run_task,
-    FinalizeStrandedOptions,
+    DEFERRED_LOOP_SUBSYSTEMS, FinalizeStrandedOptions, HarnessConfig, HarnessError, RunOptions,
+    ShutdownSignal, build_observation, build_usage_breakdown, finalize_stranded_lifecycle,
+    run_task,
 };
 use crate::invoker::{InvocationSignals, IterationResult};
 use crate::invoker_client::FAILURE_OPERATOR_INTERRUPT;
@@ -95,7 +95,10 @@ async fn command_grader_runs_in_worktree() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("sentinel.flag"), "ok").unwrap();
     let h = Harness::new();
-    let task = task(vec![command("test -f sentinel.flag", Some("relative-check"))]);
+    let task = task(vec![command(
+        "test -f sentinel.flag",
+        Some("relative-check"),
+    )]);
     let mut lc = lifecycle("run-wt-cwd");
     let (invoke, _) = scripted_invoker(vec![verify_iteration()]);
     let outcome = h.run(&task, &mut lc, &worktree_config(&dir), invoke).await;
@@ -146,7 +149,11 @@ async fn validation_failure_retries_when_budget_remains() {
     assert_eq!(outcome.attempts.len(), 2);
     assert_eq!(outcome.attempts[0].outcome, Some(Outcome::ValidationFailed));
     assert_eq!(outcome.attempts[1].outcome, Some(Outcome::Succeeded));
-    assert!(h.sink.kinds("run-retry").contains(&"harness.retry_scheduled".to_string()));
+    assert!(
+        h.sink
+            .kinds("run-retry")
+            .contains(&"harness.retry_scheduled".to_string())
+    );
 }
 
 #[tokio::test]
@@ -162,8 +169,15 @@ async fn validation_failure_terminates_when_retries_exhausted() {
     assert_eq!(outcome.lifecycle.retries, 0);
     assert_eq!(outcome.attempts.len(), 1);
     assert_eq!(outcome.attempts[0].outcome, Some(Outcome::ValidationFailed));
-    assert_eq!(outcome.attempts[0].error, "command grader \"command\" failed");
-    assert!(!h.sink.kinds("run-exhaust").contains(&"harness.retry_scheduled".to_string()));
+    assert_eq!(
+        outcome.attempts[0].error,
+        "command grader \"command\" failed"
+    );
+    assert!(
+        !h.sink
+            .kinds("run-exhaust")
+            .contains(&"harness.retry_scheduled".to_string())
+    );
 }
 
 // --- Envelope protocol failures -------------------------------------------
@@ -192,10 +206,8 @@ async fn protocol_failure_routes_to_failed_validation() {
         let task = task(vec![ok_command()]);
         let run_id = format!("run-proto-{expected}");
         let mut lc = lifecycle(&run_id);
-        let (invoke, _) = scripted_invoker(vec![iteration(
-            envelope,
-            vec![assistant(), result_msg()],
-        )]);
+        let (invoke, _) =
+            scripted_invoker(vec![iteration(envelope, vec![assistant(), result_msg()])]);
         let outcome = h
             .run(&task, &mut lc, &HarnessConfig::default(), invoke)
             .await;
@@ -256,7 +268,12 @@ async fn blocked_transitions_to_interrupted_and_preserves_retries() {
     let attempt = &outcome.attempts[0];
     assert_eq!(attempt.outcome, Some(Outcome::Cancelled));
     assert!(attempt.error.contains("need API key"));
-    assert!(h.store.list_grader_results("run-blocked", 1).unwrap().is_empty());
+    assert!(
+        h.store
+            .list_grader_results("run-blocked", 1)
+            .unwrap()
+            .is_empty()
+    );
     let expected_requires = json!([
         {"type": "command_grader", "name": "full-suite"},
         {"type": "env_var_set", "name": "MISSING_KEY"},
@@ -264,7 +281,9 @@ async fn blocked_transitions_to_interrupted_and_preserves_retries() {
     // Python json.dumps spacing on the persisted column.
     assert_eq!(
         outcome.lifecycle.blocked_requires_json.as_deref(),
-        Some(r#"[{"type": "command_grader", "name": "full-suite"}, {"type": "env_var_set", "name": "MISSING_KEY"}]"#)
+        Some(
+            r#"[{"type": "command_grader", "name": "full-suite"}, {"type": "env_var_set", "name": "MISSING_KEY"}]"#
+        )
     );
     let blocked = h.sink.of_kind("run-blocked", "harness.blocked");
     assert_eq!(blocked.len(), 1);
@@ -317,7 +336,12 @@ async fn abort_transitions_to_failed() {
     assert_eq!(outcome.lifecycle.retries, 0);
     assert_eq!(outcome.attempts[0].outcome, Some(Outcome::AgentError));
     // Abort never enters VALIDATING.
-    assert!(!outcome.lifecycle.timestamps.contains_key(&Status::Validating));
+    assert!(
+        !outcome
+            .lifecycle
+            .timestamps
+            .contains_key(&Status::Validating)
+    );
 }
 
 // --- Crash ----------------------------------------------------------------
@@ -406,7 +430,10 @@ async fn continue_loops_within_cap_then_verifies() {
     let (invoke, calls) = scripted_invoker(vec![
         iteration(valid(Intent::Continue), vec![assistant()]),
         iteration(valid(Intent::Continue), vec![assistant()]),
-        iteration(valid(Intent::Verify), vec![assistant(), result_msg_with(3, None)]),
+        iteration(
+            valid(Intent::Verify),
+            vec![assistant(), result_msg_with(3, None)],
+        ),
     ]);
     let config = HarnessConfig {
         max_iterations_per_attempt: 3,
@@ -418,7 +445,10 @@ async fn continue_loops_within_cap_then_verifies() {
     assert_eq!(outcome.attempts.len(), 1);
     let requests = calls.lock().unwrap();
     assert_eq!(
-        requests.iter().map(|r| r.iteration_number).collect::<Vec<_>>(),
+        requests
+            .iter()
+            .map(|r| r.iteration_number)
+            .collect::<Vec<_>>(),
         [1, 2, 3]
     );
     assert!(requests.iter().all(|r| r.attempt_number == 1));
@@ -442,7 +472,12 @@ async fn continue_past_cap_fails_validation_without_grading() {
     let attempt = &outcome.attempts[0];
     assert_eq!(attempt.outcome, Some(Outcome::AgentError));
     assert_eq!(attempt.error, "agent did not converge after 2 iterations");
-    assert!(h.store.list_grader_results("run-continue-cap", 1).unwrap().is_empty());
+    assert!(
+        h.store
+            .list_grader_results("run-continue-cap", 1)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -475,8 +510,16 @@ async fn pending_lifecycle_is_brought_to_ready() {
         .run(&task, &mut lc, &HarnessConfig::default(), invoke)
         .await;
     assert_eq!(outcome.lifecycle.status, Status::Done);
-    for status in [Status::Ready, Status::Running, Status::Validating, Status::Done] {
-        assert!(outcome.lifecycle.timestamps.contains_key(&status), "{status}");
+    for status in [
+        Status::Ready,
+        Status::Running,
+        Status::Validating,
+        Status::Done,
+    ] {
+        assert!(
+            outcome.lifecycle.timestamps.contains_key(&status),
+            "{status}"
+        );
     }
 }
 
@@ -491,7 +534,8 @@ async fn resume_from_interrupted_runs_a_new_attempt() {
         requires: vec![BlockedRequirement::CommandGrader { name: "ok".into() }],
     });
     let (first, _) = scripted_invoker(vec![iteration(blocked, vec![assistant()])]);
-    h.run(&task, &mut lc, &HarnessConfig::default(), first).await;
+    h.run(&task, &mut lc, &HarnessConfig::default(), first)
+        .await;
     assert_eq!(lc.status, Status::Interrupted);
     assert!(lc.blocked_requires_json.is_some());
 
@@ -516,7 +560,8 @@ async fn stale_caller_lifecycle_is_reconciled_from_the_persisted_row() {
         requires: vec![BlockedRequirement::CommandGrader { name: "ok".into() }],
     });
     let (first, _) = scripted_invoker(vec![iteration(blocked, vec![assistant()])]);
-    h.run(&task, &mut lc, &HarnessConfig::default(), first).await;
+    h.run(&task, &mut lc, &HarnessConfig::default(), first)
+        .await;
     let persisted = h.store.load_lifecycle("run-resume-clean").unwrap().unwrap();
     assert!(persisted.version > 1);
 
@@ -527,7 +572,11 @@ async fn stale_caller_lifecycle_is_reconciled_from_the_persisted_row() {
         .run(&task, &mut stale, &HarnessConfig::default(), second)
         .await;
     assert_eq!(outcome.lifecycle.status, Status::Done);
-    assert!(h.sink.of_kind("run-resume-clean", "harness.crash").is_empty());
+    assert!(
+        h.sink
+            .of_kind("run-resume-clean", "harness.crash")
+            .is_empty()
+    );
 }
 
 // --- Rate limits ----------------------------------------------------------
@@ -626,13 +675,26 @@ async fn transient_rate_limit_retries_on_the_separate_budget() {
     let delays = delays.lock().unwrap().clone();
     assert_eq!(delays.len(), 2);
     assert!(delays.windows(2).all(|w| w[1] >= w[0]));
-    assert!(delays.iter().all(|d| *d <= config.transient_backoff.cap_seconds()));
+    assert!(
+        delays
+            .iter()
+            .all(|d| *d <= config.transient_backoff.cap_seconds())
+    );
     let kinds = h.sink.kinds("run-rl-retry");
-    assert_eq!(kinds.iter().filter(|k| *k == "harness.transient_retry").count(), 2);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "harness.transient_retry")
+            .count(),
+        2
+    );
     assert!(!kinds.contains(&"harness.retry_scheduled".to_string()));
     let retries = h.sink.of_kind("run-rl-retry", "harness.transient_retry");
     assert_eq!(retries[0].payload["reason"], "api_error_status=429");
-    assert_eq!(retries[1].payload["reason"], "rate_limit_rejected:five_hour");
+    assert_eq!(
+        retries[1].payload["reason"],
+        "rate_limit_rejected:five_hour"
+    );
 }
 
 #[tokio::test]
@@ -661,7 +723,9 @@ async fn transient_rate_limit_exhausted_is_bounded_and_transient_classified() {
         outcome.attempts[0].error,
         "transient rate-limit retries exhausted after 3 invocations"
     );
-    let exhausted = h.sink.of_kind("run-rl-exhausted", "harness.transient_exhausted");
+    let exhausted = h
+        .sink
+        .of_kind("run-rl-exhausted", "harness.transient_exhausted");
     assert_eq!(exhausted.len(), 1);
     assert_eq!(exhausted[0].payload["classification"], "transient");
     assert_eq!(exhausted[0].payload["invocations"], budget + 1);
@@ -718,12 +782,17 @@ async fn session_limit_rejected_event_future_reset_fast_aborts() {
     let kinds = h.sink.kinds("run-session-reject");
     assert!(!kinds.contains(&"harness.transient_retry".to_string()));
     assert!(!kinds.contains(&"harness.transient_exhausted".to_string()));
-    let session = h.sink.of_kind("run-session-reject", "harness.session_limit");
+    let session = h
+        .sink
+        .of_kind("run-session-reject", "harness.session_limit");
     assert_eq!(session.len(), 1);
     assert_eq!(session[0].payload["reset_at"], "2026-07-09T18:00:00+00:00");
     assert_eq!(session[0].payload["source"], "rate_limit_event");
     assert_eq!(session[0].payload["classification"], "transient");
-    assert_eq!(session[0].payload["reason"], "rate_limit_rejected:five_hour");
+    assert_eq!(
+        session[0].payload["reason"],
+        "rate_limit_rejected:five_hour"
+    );
 }
 
 #[tokio::test]
@@ -731,7 +800,10 @@ async fn session_limit_pipe_epoch_transcript_fast_aborts() {
     let h = Harness::new();
     let task = passing_task();
     let mut lc = lifecycle("run-session-pipe");
-    let transcript = format!("Claude AI usage limit reached|{}", future_reset().timestamp());
+    let transcript = format!(
+        "Claude AI usage limit reached|{}",
+        future_reset().timestamp()
+    );
     let mut result = iteration(EnvelopeResult::Missing, vec![]);
     result.transcript = transcript.clone();
     result.signals = InvocationSignals {
@@ -832,7 +904,13 @@ async fn session_limit_past_reset_falls_through_to_transient_retry() {
     assert_eq!(outcome.session_limit_reset, None);
     let kinds = h.sink.kinds("run-session-past");
     assert!(!kinds.contains(&"harness.session_limit".to_string()));
-    assert_eq!(kinds.iter().filter(|k| *k == "harness.transient_retry").count(), 1);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "harness.transient_retry")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -861,7 +939,11 @@ async fn session_limit_valid_envelope_with_future_reset_not_aborted() {
     assert_eq!(call_count(&calls), 1);
     assert_eq!(outcome.lifecycle.status, Status::Done);
     assert_eq!(outcome.session_limit_reset, None);
-    assert!(!h.sink.kinds("run-session-valid").contains(&"harness.session_limit".to_string()));
+    assert!(
+        !h.sink
+            .kinds("run-session-valid")
+            .contains(&"harness.session_limit".to_string())
+    );
 }
 
 // --- Iteration-completed telemetry ---------------------------------------
@@ -904,10 +986,21 @@ async fn usage_breakdown_attached_to_payload() {
         })
     );
     // Python key order on the usage object.
-    let keys: Vec<_> = payloads[0]["usage"].as_object().unwrap().keys().cloned().collect();
+    let keys: Vec<_> = payloads[0]["usage"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
     assert_eq!(
         keys,
-        ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "total_tokens"]
+        [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "total_tokens"
+        ]
     );
 }
 
@@ -967,7 +1060,9 @@ async fn two_iterations_each_carry_own_usage_not_running_sum() {
     let (invoke, _) = scripted_invoker(vec![
         iteration(
             valid(Intent::Continue),
-            vec![assistant_usage(json!({"input_tokens": 10, "output_tokens": 5}))],
+            vec![assistant_usage(
+                json!({"input_tokens": 10, "output_tokens": 5}),
+            )],
         ),
         iteration(
             valid(Intent::Verify),
@@ -996,7 +1091,9 @@ async fn failed_iteration_still_carries_breakdown() {
     let mut lc = lifecycle("run-usage-fail");
     let mut result = iteration(
         EnvelopeResult::Missing,
-        vec![assistant_usage(json!({"input_tokens": 9, "output_tokens": 4}))],
+        vec![assistant_usage(
+            json!({"input_tokens": 9, "output_tokens": 4}),
+        )],
     );
     result.failure = Some(failure("ProcessError", "agent crashed"));
     let (invoke, _) = scripted_invoker(vec![result]);
@@ -1078,7 +1175,9 @@ async fn attempt_row_carries_cumulative_aggregates_after_run() {
     let mut first = iteration(
         valid(Intent::Continue),
         vec![
-            assistant_usage(json!({"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 2})),
+            assistant_usage(
+                json!({"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 2}),
+            ),
             result_msg_with(3, None),
         ],
     );
@@ -1087,7 +1186,9 @@ async fn attempt_row_carries_cumulative_aggregates_after_run() {
     let mut second = iteration(
         valid(Intent::Verify),
         vec![
-            assistant_usage(json!({"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 50})),
+            assistant_usage(
+                json!({"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 50}),
+            ),
             result_msg_with(2, None),
         ],
     );
@@ -1137,7 +1238,10 @@ async fn none_turns_and_cost_roll_up_as_zero() {
 // --- Operator interruption: signal-killed command graders ----------------
 
 fn signal_killed_task(signal: &str) -> Task {
-    task(vec![command(&format!("kill -{signal} $$"), Some("signaled"))])
+    task(vec![command(
+        &format!("kill -{signal} $$"),
+        Some("signaled"),
+    )])
 }
 
 #[tokio::test]
@@ -1196,7 +1300,10 @@ async fn non_operator_signal_still_routes_to_failed_validation() {
 
 /// An invoker that pumps `pre_messages`, triggers the shutdown signal, then
 /// stalls: the harness must observe the signal at its cancellation point.
-fn cancelling_invoker(shutdown: ShutdownSignal, pre_messages: Vec<Value>) -> crate::harness::InvokeFn {
+fn cancelling_invoker(
+    shutdown: ShutdownSignal,
+    pre_messages: Vec<Value>,
+) -> crate::harness::InvokeFn {
     Arc::new(move |request| {
         let shutdown = shutdown.clone();
         let pre_messages = pre_messages.clone();
@@ -1238,7 +1345,11 @@ async fn cancelled_mid_stream_finalizes_interrupted() {
     let mut lc = lifecycle("run-interrupt-mid");
     let err = run_interrupted(&h, &task, &mut lc, vec![assistant()]).await;
     assert!(matches!(err, HarnessError::Interrupted));
-    let reloaded = h.store.load_lifecycle("run-interrupt-mid").unwrap().unwrap();
+    let reloaded = h
+        .store
+        .load_lifecycle("run-interrupt-mid")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.status, Status::Interrupted);
     assert_eq!(reloaded.retries, 0);
     assert_eq!(lc.status, Status::Interrupted);
@@ -1255,7 +1366,10 @@ async fn cancelled_mid_stream_finalizes_interrupted() {
     // The observability event records the exogenous stop.
     let interrupted = h.sink.of_kind("run-interrupt-mid", "harness.interrupted");
     assert_eq!(interrupted.len(), 1);
-    assert_eq!(interrupted[0].payload["classification"], "worker_interrupted");
+    assert_eq!(
+        interrupted[0].payload["classification"],
+        "worker_interrupted"
+    );
     assert_eq!(interrupted[0].payload["from_status"], "running");
     assert_eq!(interrupted[0].attempt_number, Some(1));
     let kinds = h.sink.kinds("run-interrupt-mid");
@@ -1302,15 +1416,29 @@ async fn operator_interrupt_command_routes_through_the_interrupt_path() {
     let task = task(vec![]);
     let mut lc = lifecycle("run-interrupt-command");
     let mut result = iteration(EnvelopeResult::Missing, vec![assistant()]);
-    result.failure = Some(failure(FAILURE_OPERATOR_INTERRUPT, "run interrupted by operator"));
+    result.failure = Some(failure(
+        FAILURE_OPERATOR_INTERRUPT,
+        "run interrupted by operator",
+    ));
     let (invoke, _) = scripted_invoker(vec![result]);
     let err = h
-        .run_with(&task, &mut lc, &HarnessConfig::default(), invoke, h.options())
+        .run_with(
+            &task,
+            &mut lc,
+            &HarnessConfig::default(),
+            invoke,
+            h.options(),
+        )
         .await
         .expect_err("interrupted");
     assert!(matches!(err, HarnessError::Interrupted));
     assert_eq!(lc.status, Status::Interrupted);
-    assert_eq!(h.sink.of_kind("run-interrupt-command", "harness.interrupted").len(), 1);
+    assert_eq!(
+        h.sink
+            .of_kind("run-interrupt-command", "harness.interrupted")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1320,7 +1448,12 @@ async fn handle_interrupt_is_idempotent() {
     let mut lc = lifecycle("run-interrupt-idemp");
     run_interrupted(&h, &task, &mut lc, vec![]).await;
     let first_events = h.sink.events("run-interrupt-idemp").len();
-    let first_version = h.store.load_lifecycle("run-interrupt-idemp").unwrap().unwrap().version;
+    let first_version = h
+        .store
+        .load_lifecycle("run-interrupt-idemp")
+        .unwrap()
+        .unwrap()
+        .version;
 
     let telemetry = Arc::new(RunTelemetry::new(
         Some(h.sink.clone()),
@@ -1328,7 +1461,11 @@ async fn handle_interrupt_is_idempotent() {
         Arc::new(Utc::now),
     ));
     let store: Arc<dyn HarnessStore> = h.store.clone();
-    let reloaded = h.store.load_lifecycle("run-interrupt-idemp").unwrap().unwrap();
+    let reloaded = h
+        .store
+        .load_lifecycle("run-interrupt-idemp")
+        .unwrap()
+        .unwrap();
     let run = Run::new(
         Arc::new(MirroringStore::new(store, telemetry.clone())),
         telemetry,
@@ -1340,10 +1477,19 @@ async fn handle_interrupt_is_idempotent() {
     run.handle_interrupt(None);
     assert_eq!(h.sink.events("run-interrupt-idemp").len(), first_events);
     assert_eq!(
-        h.store.load_lifecycle("run-interrupt-idemp").unwrap().unwrap().version,
+        h.store
+            .load_lifecycle("run-interrupt-idemp")
+            .unwrap()
+            .unwrap()
+            .version,
         first_version
     );
-    assert_eq!(h.sink.of_kind("run-interrupt-idemp", "harness.interrupted").len(), 1);
+    assert_eq!(
+        h.sink
+            .of_kind("run-interrupt-idemp", "harness.interrupted")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1371,9 +1517,17 @@ async fn interrupt_transition_failure_is_observable() {
     run.handle_interrupt(None);
     let crash = sink.of_kind("run-interrupt-transition-fail", "harness.crash");
     assert_eq!(crash.len(), 1);
-    assert_eq!(crash[0].payload["classification"], "interrupt_transition_failed");
+    assert_eq!(
+        crash[0].payload["classification"],
+        "interrupt_transition_failed"
+    );
     assert_eq!(crash[0].payload["exception_type"], "StoreBackendError");
-    assert!(crash[0].payload["message"].as_str().unwrap().contains("simulated ledger append failure"));
+    assert!(
+        crash[0].payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("simulated ledger append failure")
+    );
     assert_eq!(run.status(), Status::Running);
 }
 
@@ -1389,7 +1543,13 @@ async fn interrupt_during_validating_finalizes_interrupted() {
             let trigger = trigger.clone();
             async move {
                 trigger.trigger();
-                std::future::pending::<Result<crate::grader_rubric::JudgeResponse, crate::grader_rubric::JudgeInvokeError>>().await
+                std::future::pending::<
+                    Result<
+                        crate::grader_rubric::JudgeResponse,
+                        crate::grader_rubric::JudgeInvokeError,
+                    >,
+                >()
+                .await
             }
         },
     );
@@ -1404,15 +1564,27 @@ async fn interrupt_during_validating_finalizes_interrupted() {
         ..worktree_config(&dir)
     };
     let err = h
-        .run_with(&task, &mut lc, &config, invoke, h.options().with_shutdown(shutdown))
+        .run_with(
+            &task,
+            &mut lc,
+            &config,
+            invoke,
+            h.options().with_shutdown(shutdown),
+        )
         .await
         .expect_err("interrupted");
     assert!(matches!(err, HarnessError::Interrupted));
-    let reloaded = h.store.load_lifecycle("run-interrupt-validating").unwrap().unwrap();
+    let reloaded = h
+        .store
+        .load_lifecycle("run-interrupt-validating")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.status, Status::Interrupted);
     let attempt = &h.store.list_attempts("run-interrupt-validating").unwrap()[0];
     assert_eq!(attempt.outcome, Some(Outcome::InternalError));
-    let interrupted = h.sink.of_kind("run-interrupt-validating", "harness.interrupted");
+    let interrupted = h
+        .sink
+        .of_kind("run-interrupt-validating", "harness.interrupted");
     assert_eq!(interrupted.len(), 1);
     assert_eq!(interrupted[0].payload["from_status"], "validating");
 }
@@ -1461,8 +1633,16 @@ fn finalize_running_transitions_to_interrupted() {
         h.sink.kinds("run-strand-r"),
         ["harness.attempt_finalized", "harness.crash"]
     );
-    let mirrors: Vec<_> = h.sink.domain_mirrors("run-strand-r").into_iter().map(|m| m.kind).collect();
-    assert_eq!(mirrors, ["domain.attempt_finalized", "domain.transitioned_to"]);
+    let mirrors: Vec<_> = h
+        .sink
+        .domain_mirrors("run-strand-r")
+        .into_iter()
+        .map(|m| m.kind)
+        .collect();
+    assert_eq!(
+        mirrors,
+        ["domain.attempt_finalized", "domain.transitioned_to"]
+    );
 }
 
 #[test]
@@ -1477,7 +1657,11 @@ fn finalize_validating_transitions_to_interrupted() {
     .unwrap();
     assert!(ok);
     assert_eq!(
-        h.store.load_lifecycle("run-strand-v").unwrap().unwrap().status,
+        h.store
+            .load_lifecycle("run-strand-v")
+            .unwrap()
+            .unwrap()
+            .status,
         Status::Interrupted
     );
 }
@@ -1487,7 +1671,12 @@ fn finalize_done_or_missing_lifecycle_is_noop() {
     let h = Harness::new();
     let now = Utc::now();
     let mut lc = lifecycle("run-strand-done");
-    for s in [Status::Ready, Status::Running, Status::Validating, Status::Done] {
+    for s in [
+        Status::Ready,
+        Status::Running,
+        Status::Validating,
+        Status::Done,
+    ] {
         lc.transition_to(s, "", Some(now)).unwrap();
     }
     h.store.create_lifecycle(&lc).unwrap();
@@ -1498,8 +1687,22 @@ fn finalize_done_or_missing_lifecycle_is_noop() {
     )
     .unwrap();
     assert!(!ok);
-    assert_eq!(h.store.load_lifecycle("run-strand-done").unwrap().unwrap().status, Status::Done);
-    assert!(!finalize_stranded_lifecycle(h.store.clone(), "run-does-not-exist", FinalizeStrandedOptions::default()).unwrap());
+    assert_eq!(
+        h.store
+            .load_lifecycle("run-strand-done")
+            .unwrap()
+            .unwrap()
+            .status,
+        Status::Done
+    );
+    assert!(
+        !finalize_stranded_lifecycle(
+            h.store.clone(),
+            "run-does-not-exist",
+            FinalizeStrandedOptions::default()
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -1507,7 +1710,12 @@ fn finalize_awaiting_approval_lifecycle_is_noop() {
     let h = Harness::new();
     let now = Utc::now();
     let mut lc = lifecycle("run-strand-awaiting");
-    for s in [Status::Ready, Status::Running, Status::Validating, Status::AwaitingApproval] {
+    for s in [
+        Status::Ready,
+        Status::Running,
+        Status::Validating,
+        Status::AwaitingApproval,
+    ] {
         lc.transition_to(s, "", Some(now)).unwrap();
     }
     lc.awaiting_manual_ordinal = Some(1);
@@ -1515,7 +1723,9 @@ fn finalize_awaiting_approval_lifecycle_is_noop() {
     let mut attempt = Attempt::new(1, now, "run-strand-awaiting");
     attempt.ended_at = Some(now);
     attempt.outcome = Some(Outcome::Succeeded);
-    h.store.save_attempt("run-strand-awaiting", &attempt, None).unwrap();
+    h.store
+        .save_attempt("run-strand-awaiting", &attempt, None)
+        .unwrap();
     let ok = finalize_stranded_lifecycle(
         h.store.clone(),
         "run-strand-awaiting",
@@ -1523,13 +1733,21 @@ fn finalize_awaiting_approval_lifecycle_is_noop() {
     )
     .unwrap();
     assert!(!ok);
-    let reloaded = h.store.load_lifecycle("run-strand-awaiting").unwrap().unwrap();
+    let reloaded = h
+        .store
+        .load_lifecycle("run-strand-awaiting")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.status, Status::AwaitingApproval);
     assert_eq!(reloaded.awaiting_manual_ordinal, Some(1));
     let attempts = h.store.list_attempts("run-strand-awaiting").unwrap();
     assert_eq!(attempts[0].outcome, Some(Outcome::Succeeded));
     assert_eq!(attempts[0].ended_at, Some(now));
-    assert!(h.sink.of_kind("run-strand-awaiting", "harness.crash").is_empty());
+    assert!(
+        h.sink
+            .of_kind("run-strand-awaiting", "harness.crash")
+            .is_empty()
+    );
 }
 
 // --- Entry-time crash recording ------------------------------------------
@@ -1555,7 +1773,11 @@ async fn store_failure_mid_attempt_writes_crash_event_and_walks_to_failed() {
     assert!(matches!(err, HarnessError::Store(_)), "{err:?}");
     assert!(err.to_string().contains("simulated rollup write failure"));
     // The lifecycle row exists and walked RUNNING -> FAILED.
-    let reloaded = failing.inner.load_lifecycle("run-entry-crash").unwrap().unwrap();
+    let reloaded = failing
+        .inner
+        .load_lifecycle("run-entry-crash")
+        .unwrap()
+        .unwrap();
     assert_eq!(reloaded.status, Status::Failed);
     assert!(reloaded.error.contains("StoreBackendError"));
     assert!(reloaded.error.contains("simulated rollup write failure"));
@@ -1565,13 +1787,20 @@ async fn store_failure_mid_attempt_writes_crash_event_and_walks_to_failed() {
     assert_eq!(crashes.len(), 1);
     assert_eq!(crashes[0].payload["classification"], "entry_error");
     assert_eq!(crashes[0].payload["exception_type"], "StoreBackendError");
-    assert!(sink.kinds("run-entry-crash").contains(&"harness.attempt_started".to_string()));
+    assert!(
+        sink.kinds("run-entry-crash")
+            .contains(&"harness.attempt_started".to_string())
+    );
     // The open attempt was finalized, never stranded under a terminal row.
     let attempts = failing.inner.list_attempts("run-entry-crash").unwrap();
     assert_eq!(attempts.len(), 1);
     assert!(attempts[0].ended_at.is_some());
     assert_eq!(attempts[0].outcome, Some(Outcome::InternalError));
-    assert!(attempts[0].error.starts_with("attempt crashed: StoreBackendError:"));
+    assert!(
+        attempts[0]
+            .error
+            .starts_with("attempt crashed: StoreBackendError:")
+    );
 }
 
 #[tokio::test]
@@ -1621,8 +1850,22 @@ async fn invalid_config_is_rejected_at_entry() {
         .await
         .expect_err("rejected");
     assert!(err.to_string().contains("context_window_tokens"));
-    assert!(HarnessConfig { context_recovery_trigger_ratio: 1.0, ..HarnessConfig::default() }.validate().is_ok());
-    assert!(HarnessConfig { context_window_tokens: Some(200_000), ..HarnessConfig::default() }.validate().is_ok());
+    assert!(
+        HarnessConfig {
+            context_recovery_trigger_ratio: 1.0,
+            ..HarnessConfig::default()
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        HarnessConfig {
+            context_window_tokens: Some(200_000),
+            ..HarnessConfig::default()
+        }
+        .validate()
+        .is_ok()
+    );
 }
 
 // --- SDK message persistence and stream ordering -------------------------
@@ -1633,7 +1876,10 @@ async fn each_iteration_persists_its_message_batch() {
     let task = passing_task();
     let mut lc = lifecycle("run-sdk-persist");
     let (invoke, _) = scripted_invoker(vec![
-        iteration(valid(Intent::Continue), vec![assistant_with("iter-1-a", None)]),
+        iteration(
+            valid(Intent::Continue),
+            vec![assistant_with("iter-1-a", None)],
+        ),
         iteration(
             valid(Intent::Verify),
             vec![
@@ -1653,10 +1899,27 @@ async fn each_iteration_persists_its_message_batch() {
     let kinds: Vec<_> = listed.iter().map(|m| m.kind.as_str()).collect();
     assert_eq!(
         kinds,
-        ["AssistantMessage", "AssistantMessage", "AssistantMessage", "ResultMessage"]
+        [
+            "AssistantMessage",
+            "AssistantMessage",
+            "AssistantMessage",
+            "ResultMessage"
+        ]
     );
-    assert_eq!(listed.iter().filter(|m| m.iteration_number == Some(1)).count(), 1);
-    assert_eq!(listed.iter().filter(|m| m.iteration_number == Some(2)).count(), 3);
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|m| m.iteration_number == Some(1))
+            .count(),
+        1
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|m| m.iteration_number == Some(2))
+            .count(),
+        3
+    );
     assert!(listed.iter().all(|m| m.attempt_number == Some(1)));
 }
 
@@ -1669,7 +1932,12 @@ async fn zero_message_iteration_still_emits_iteration_completed() {
     h.run(&task, &mut lc, &HarnessConfig::default(), invoke)
         .await;
     assert!(h.sink.messages("run-sdk-empty").is_empty());
-    assert_eq!(h.sink.of_kind("run-sdk-empty", "harness.iteration_completed").len(), 1);
+    assert_eq!(
+        h.sink
+            .of_kind("run-sdk-empty", "harness.iteration_completed")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1687,7 +1955,10 @@ async fn run_stream_interleaves_messages_telemetry_and_domain_mirrors() {
         .await;
     let records = h.sink.all();
     let kinds: Vec<&str> = records.iter().map(|r| r.kind.as_str()).collect();
-    let completed_idx = kinds.iter().position(|k| *k == "harness.iteration_completed").unwrap();
+    let completed_idx = kinds
+        .iter()
+        .position(|k| *k == "harness.iteration_completed")
+        .unwrap();
     let message_indices: Vec<usize> = kinds
         .iter()
         .enumerate()
@@ -1698,8 +1969,16 @@ async fn run_stream_interleaves_messages_telemetry_and_domain_mirrors() {
     assert!(message_indices.iter().all(|i| *i < completed_idx));
     // Every ledger append is mirrored, store row first; the kinds agree.
     let rows = h.store.list_domain_events("run-interleaved").unwrap();
-    let mirrors: Vec<String> = h.sink.domain_mirrors("run-interleaved").into_iter().map(|m| m.kind).collect();
-    let expected: Vec<String> = rows.iter().map(|e| format!("domain.{}", e.kind().as_str())).collect();
+    let mirrors: Vec<String> = h
+        .sink
+        .domain_mirrors("run-interleaved")
+        .into_iter()
+        .map(|m| m.kind)
+        .collect();
+    let expected: Vec<String> = rows
+        .iter()
+        .map(|e| format!("domain.{}", e.kind().as_str()))
+        .collect();
     assert_eq!(mirrors, expected);
     // The full telemetry sequence of a happy path.
     assert_eq!(
@@ -1769,7 +2048,10 @@ async fn sink_failure_never_aborts_the_run() {
     assert_eq!(outcome.lifecycle.status, Status::Done);
     assert_eq!(outcome.attempts[0].outcome, Some(Outcome::Succeeded));
     assert!(sink.attempts() > 1);
-    assert_eq!(store.list_grader_results("run-sink-fail", 1).unwrap().len(), 1);
+    assert_eq!(
+        store.list_grader_results("run-sink-fail", 1).unwrap().len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1858,8 +2140,14 @@ async fn run_persists_task_and_pins_content_hash() {
     assert_eq!(outcome.lifecycle.status, Status::Done);
     let digest = task_digest(&task);
     assert_eq!(outcome.lifecycle.task_content_hash, digest);
-    assert_eq!(h.store.load_task("persist-me", Some(&digest)).unwrap(), Some(task.clone()));
-    assert_eq!(h.store.load_task_for_run("run-persist").unwrap(), Some(task));
+    assert_eq!(
+        h.store.load_task("persist-me", Some(&digest)).unwrap(),
+        Some(task.clone())
+    );
+    assert_eq!(
+        h.store.load_task_for_run("run-persist").unwrap(),
+        Some(task)
+    );
 }
 
 #[tokio::test]
@@ -1886,5 +2174,9 @@ async fn wall_clock_elapsed_uses_the_injected_clock() {
         .await
         .unwrap();
     assert_eq!(outcome.lifecycle.status, Status::Failed);
-    assert!(outcome.attempts[0].error.starts_with("budget ceiling breached: wall_clock_seconds"));
+    assert!(
+        outcome.attempts[0]
+            .error
+            .starts_with("budget ceiling breached: wall_clock_seconds")
+    );
 }

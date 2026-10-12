@@ -163,11 +163,14 @@ name = "flywheel-agents"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

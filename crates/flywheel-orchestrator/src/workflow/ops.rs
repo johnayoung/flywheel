@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flywheel_core::harness::{
-    FinalizeStrandedOptions, RecheckOptions, RecheckOutcome, SharedSink,
-    finalize_stranded_lifecycle, recheck_blocked_lifecycle,
+    RecheckOptions, RecheckOutcome, SharedSink, recheck_blocked_lifecycle,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, JsonObject, LifecycleFilter, StoreError};
 use flywheel_core::task::Task;
 use flywheel_core::telemetry_file::FileTelemetrySink;
+pub use flywheel_core::workflow::recover_stranded_lifecycles;
 use serde_json::Value;
 
 use crate::claims::{ClaimStore, RESOLUTION_ATTRIBUTION_OPERATOR, STOP_RESOLVED};
@@ -162,40 +162,6 @@ pub fn cmd_recheck_blocked(
         )?;
     }
     Ok(0)
-}
-
-/// Finalize every lifecycle stranded in RUNNING / VALIDATING (optionally
-/// only `task_id`'s), oldest-updated first; returns the run ids actually
-/// finalized. Each one closes its open attempt as INTERNAL_ERROR, emits
-/// `harness.crash`, and transitions to INTERRUPTED with its retry budget
-/// intact.
-pub fn recover_stranded_lifecycles(
-    store: Arc<dyn HarnessStore>,
-    task_id: Option<&str>,
-    sink: Option<SharedSink>,
-) -> Result<Vec<String>, StoreError> {
-    let mut filter =
-        LifecycleFilter::default().with_statuses([Status::Running, Status::Validating]);
-    if let Some(task_id) = task_id {
-        filter = filter.with_task_id(task_id);
-    }
-    let stranded: Vec<String> = store
-        .list_lifecycles(&filter)?
-        .into_iter()
-        .rev()
-        .map(|lc| lc.run_id)
-        .collect();
-    let mut finalized = Vec::new();
-    for run_id in stranded {
-        let mut options = FinalizeStrandedOptions::default();
-        if let Some(sink) = &sink {
-            options = options.with_sink(sink.clone());
-        }
-        if finalize_stranded_lifecycle(store.clone(), &run_id, options)? {
-            finalized.push(run_id);
-        }
-    }
-    Ok(finalized)
 }
 
 /// Finalize stranded lifecycles and print each transitioned run id, or

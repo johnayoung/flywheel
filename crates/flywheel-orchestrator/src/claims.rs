@@ -1491,7 +1491,7 @@ impl SqliteClaimStore {
     /// Open (and bootstrap or migrate) the store at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClaimStoreError> {
         let conn = Connection::open(path.as_ref())?;
-        bootstrap(&conn)?;
+        with_locked_retry(|| bootstrap(&conn))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -1515,13 +1515,50 @@ impl SqliteClaimStore {
     /// transition).
     fn write<T>(
         &self,
-        body: impl FnOnce(&Transaction<'_>) -> Result<T, ClaimStoreError>,
+        mut body: impl FnMut(&Transaction<'_>) -> Result<T, ClaimStoreError>,
     ) -> Result<T, ClaimStoreError> {
         let mut conn = self.lock()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = body(&tx)?;
-        tx.commit()?;
-        Ok(value)
+        with_locked_retry(|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = body(&tx)?;
+            tx.commit()?;
+            Ok(value)
+        })
+    }
+}
+
+/// Transient-lock retries past `busy_timeout`, mirroring the core SQLite
+/// store: `SQLITE_BUSY`/`SQLITE_LOCKED` after the busy handler gave up is
+/// retried on the shared backoff schedule. Every claim-store verb is one
+/// atomic unit (an immediate transaction that rolls back on error), so a
+/// locked error surfaces before any row commits and re-running
+/// double-applies nothing. On budget exhaustion the last locked error
+/// propagates, never a fabricated success.
+const MAX_TRANSIENT_RETRIES: u32 = 6;
+
+fn is_locked(err: &ClaimStoreError) -> bool {
+    let ClaimStoreError::Backend(source) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(flywheel_core::faults::is_sqlite_locked)
+}
+
+fn with_locked_retry<T>(
+    mut op: impl FnMut() -> Result<T, ClaimStoreError>,
+) -> Result<T, ClaimStoreError> {
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_locked(&err) && attempt < MAX_TRANSIENT_RETRIES => {
+                let delay = flywheel_core::faults::DEFAULT_BACKOFF.delay_for(attempt);
+                std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -2376,7 +2413,7 @@ impl ClaimStore for SqliteClaimStore {
                 "INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at) \
                  VALUES (?1, ?2, ?3)",
             )?;
-            for prerequisite in unique {
+            for prerequisite in &unique {
                 insert.execute(params![task_id, prerequisite, now_text])?;
             }
             Ok(())

@@ -1,7 +1,16 @@
-//! Contract suite for the orchestrator's claim store, run against both the
-//! in-memory and the SQLite backends (a port of the meaningful cases in the
-//! Python `test_orchestrator_claims.py`), plus SQLite-only concurrency,
-//! migration, and Rust/Python interoperability cases.
+//! Contract suite for the orchestrator's claim store, run against the
+//! in-memory, SQLite, and Postgres backends (a port of the meaningful cases
+//! in the Python `test_orchestrator_claims.py`), plus SQLite-only
+//! concurrency and migration cases and Rust/Python interoperability cases
+//! for both durable backends.
+//!
+//! The Postgres backend joins every shared case through the throwaway
+//! container in `flywheel-core/tests/support/pg_container.rs` and drops out,
+//! with a message, when Docker is unavailable; its own concurrency and
+//! migration cases live in `claims_postgres.rs`.
+
+#[path = "../../flywheel-core/tests/support/pg_container.rs"]
+mod pg_container;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +29,8 @@ use flywheel_orchestrator::claims::{
     REASON_AWAITING_APPROVAL, REASON_PREREQUISITE_MISSING, STOP_DANGLING_PREREQUISITE,
     STOP_NO_OP_CYCLE, STOP_PREPARE_SKIP, SqliteClaimStore, WorkItemObservation, conflict_keys,
 };
+use flywheel_orchestrator::claims_postgres::PostgresClaimStore;
+use pg_container::Postgres;
 
 fn t(second: u32) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 5, 28, 12, 0, second).unwrap()
@@ -33,23 +44,40 @@ struct Backend {
     name: &'static str,
     store: Box<dyn ClaimStore>,
     _dir: Option<tempfile::TempDir>,
+    /// Keeps the shared container alive for the Postgres backend's lifetime.
+    _pg: Option<Postgres>,
 }
 
+/// Every backend the shared cases run against: memory and sqlite always,
+/// and a Postgres store on a fresh schema whenever the container is up.
 fn backends() -> Vec<Backend> {
     let dir = tempfile::tempdir().unwrap();
     let sqlite = SqliteClaimStore::open(dir.path().join("claims.db")).unwrap();
-    vec![
+    let mut all = vec![
         Backend {
             name: "memory",
             store: Box::new(InMemoryClaimStore::new()),
             _dir: None,
+            _pg: None,
         },
         Backend {
             name: "sqlite",
             store: Box::new(sqlite),
             _dir: Some(dir),
+            _pg: None,
         },
-    ]
+    ];
+    if let Some(pg) = Postgres::acquire() {
+        let schema = pg.fresh_schema("fw_claims");
+        let store = PostgresClaimStore::connect(&pg.dsn(), &schema).unwrap();
+        all.push(Backend {
+            name: "postgres",
+            store: Box::new(store),
+            _dir: None,
+            _pg: Some(pg),
+        });
+    }
+    all
 }
 
 /// Run `case` once per backend, labelling any panic with the backend name.
@@ -1298,11 +1326,13 @@ fn repo_root() -> PathBuf {
         .unwrap()
 }
 
-/// Python script driving the Python `SqliteClaimStore` against a db path:
-/// `seed` writes a fixed transcript, `dump` prints the store's view as JSON
-/// in the same shape [`rust_view`] produces.
+/// Python script driving the Python claim store against a target: a sqlite
+/// db path, or a `postgresql://` DSN (with the schema in
+/// `FW_INTEROP_SCHEMA`) for the Python `PostgresClaimStore`. `seed` writes a
+/// fixed transcript, `dump` prints the store's view as JSON in the same
+/// shape [`rust_view`] produces.
 const PY_INTEROP: &str = r#"
-import json, sys
+import json, os, sys
 from datetime import datetime, timezone
 from flywheel_core.task import Task, CommandGrader
 from flywheel_orchestrator._claims import SqliteClaimStore, GraphSnapshotItem
@@ -1315,7 +1345,13 @@ def iso(ts):
     return ts.isoformat() if ts is not None else None
 
 mode, path = sys.argv[1], sys.argv[2]
-store = SqliteClaimStore(path)
+if path.startswith("postgresql://"):
+    from flywheel_orchestrator._claims_postgres import PostgresClaimStore
+    store = PostgresClaimStore(
+        path, schema=os.environ["FW_INTEROP_SCHEMA"], pool_min=1, pool_max=2
+    )
+else:
+    store = SqliteClaimStore(path)
 
 if mode == "seed":
     a = store.acquire_claim("task-a", "py-worker", now=t(0, 123456), lease_seconds=30,
@@ -1571,16 +1607,18 @@ enum Python {
     Missing(String),
 }
 
-/// Run the interop script through `uv run python` inside the workspace.
-/// `Missing` when `uv` is not on PATH; a failing script is a test failure.
-fn run_python(mode: &str, db: &Path, script_dir: &Path) -> Python {
+/// Run the interop script through `uv run python` inside the workspace
+/// against `target` (a db path or a DSN) with `env` set. `Missing` when
+/// `uv` is not on PATH; a failing script is a test failure.
+fn run_python(mode: &str, target: &str, script_dir: &Path, env: &[(&str, &str)]) -> Python {
     let script = script_dir.join("interop.py");
     std::fs::write(&script, PY_INTEROP).unwrap();
     let output = Command::new("uv")
         .args(["run", "--quiet", "python"])
         .arg(&script)
         .arg(mode)
-        .arg(db)
+        .arg(target)
+        .envs(env.iter().copied())
         .current_dir(repo_root())
         .env_remove("VIRTUAL_ENV")
         .output();
@@ -1601,8 +1639,8 @@ fn run_python(mode: &str, db: &Path, script_dir: &Path) -> Python {
     }
 }
 
-fn python_view(db: &Path, script_dir: &Path) -> Option<Value> {
-    match run_python("dump", db, script_dir) {
+fn python_view(target: &str, script_dir: &Path, env: &[(&str, &str)]) -> Option<Value> {
+    match run_python("dump", target, script_dir, env) {
         Python::Missing(reason) => {
             eprintln!("SKIPPED interop: {reason}");
             None
@@ -1615,7 +1653,8 @@ fn python_view(db: &Path, script_dir: &Path) -> Option<Value> {
 fn interop_python_seeds_rust_reads_and_coordinates() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("py-seeded.db");
-    match run_python("seed", &db, dir.path()) {
+    let target = db.to_str().unwrap();
+    match run_python("seed", target, dir.path(), &[]) {
         Python::Missing(reason) => {
             eprintln!("SKIPPED interop: {reason}");
             return;
@@ -1623,8 +1662,16 @@ fn interop_python_seeds_rust_reads_and_coordinates() {
         Python::Ran(_) => {}
     }
     let store = SqliteClaimStore::open(&db).unwrap();
+    assert_rust_reads_python_seed(&store);
+    let py = python_view(target, dir.path(), &[]).unwrap();
+    assert_eq!(rust_view(&store), py);
+    assert_rust_steals_after_python_lease_lapses(&store);
+    let py_after = python_view(target, dir.path(), &[]).unwrap();
+    assert_python_sees_rust_steal(&store, &py_after);
+}
 
-    // Rust reads back exactly what Python wrote.
+/// Rust reads back exactly what the Python `seed` transcript wrote.
+fn assert_rust_reads_python_seed(store: &dyn ClaimStore) {
     let a = store.load_claim("task-a").unwrap().unwrap();
     assert_eq!(a.worker_id, "py-worker");
     assert_eq!(a.version, 2);
@@ -1679,13 +1726,11 @@ fn interop_python_seeds_rust_reads_and_coordinates() {
         vec!["task-a", "task-b"]
     );
     assert_eq!(store.load_source_sync(1).unwrap().unwrap().status, "ok");
+}
 
-    // The two implementations agree on every row.
-    let py = python_view(&db, dir.path()).unwrap();
-    assert_eq!(rust_view(&store), py);
-
-    // Rust honours Python's live leases and conflict keys, then steals after
-    // expiry; Python sees the Rust-written transition.
+/// Rust honours Python's live leases and conflict keys, then steals after
+/// expiry.
+fn assert_rust_steals_after_python_lease_lapses(store: &dyn ClaimStore) {
     assert!(
         store
             .acquire_claim("task-a", "rust-worker", t(20), 30.0, &none())
@@ -1709,12 +1754,15 @@ fn interop_python_seeds_rust_reads_and_coordinates() {
         .unwrap()
         .expect("lease lapsed at :35");
     assert_eq!(stolen.version, 3);
-    let py_after = python_view(&db, dir.path()).unwrap();
+}
+
+/// Python sees the Rust-written steal as the ledger's last row.
+fn assert_python_sees_rust_steal(store: &dyn ClaimStore, py_after: &Value) {
     let last = py_after["events"].as_array().unwrap().last().unwrap();
     assert_eq!(last["event_type"], "stolen");
     assert_eq!(last["worker_id"], "rust-worker");
     assert_eq!(last["lease_expires_at"], "2026-05-28T12:01:05+00:00");
-    assert_eq!(rust_view(&store), py_after);
+    assert_eq!(&rust_view(store), py_after);
 }
 
 #[test]
@@ -1722,6 +1770,15 @@ fn interop_rust_seeds_python_reads() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("rust-seeded.db");
     let store = SqliteClaimStore::open(&db).unwrap();
+    seed_with_rust(&store);
+    let Some(py) = python_view(db.to_str().unwrap(), dir.path(), &[]) else {
+        return;
+    };
+    assert_python_reads_rust_seed(&store, &py);
+}
+
+/// Seed `store` with the Rust twin of the Python `seed` transcript.
+fn seed_with_rust(store: &dyn ClaimStore) {
     let a = store
         .acquire_claim(
             "task-a",
@@ -1809,12 +1866,13 @@ fn interop_rust_seeds_python_reads() {
     store
         .record_source_sync_finish(sync, "ok", 1, None, t(19))
         .unwrap();
+}
 
-    let Some(py) = python_view(&db, dir.path()) else {
-        return;
-    };
-    assert_eq!(rust_view(&store), py);
-    // Spot-check the Python-side decoding of Rust-written text.
+/// The Python view of a Rust-seeded store equals the Rust view, and decodes
+/// the Rust-written values.
+fn assert_python_reads_rust_seed(store: &dyn ClaimStore, py: &Value) {
+    assert_eq!(&rust_view(store), py);
+    // Spot-check the Python-side decoding of Rust-written values.
     assert_eq!(
         py["claims"][0]["claimed_at"],
         "2026-05-28T12:00:00.123456+00:00"
@@ -1833,4 +1891,78 @@ fn interop_rust_seeds_python_reads() {
         "[\"resource-x\"]"
     );
     assert_eq!(py["review_queue"][0]["reason"], "awaiting-approval");
+}
+
+/// Whether the workspace's Python can import the `postgres` extra.
+fn python_has_postgres_extra() -> bool {
+    Command::new("uv")
+        .args([
+            "run",
+            "--quiet",
+            "python",
+            "-c",
+            "import psycopg, psycopg_pool",
+        ])
+        .current_dir(repo_root())
+        .env_remove("VIRTUAL_ENV")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The Postgres interop prerequisites: the Python `postgres` extra and a
+/// container. `None` means skip (with the reason printed); a missing `uv`
+/// is reported by the script runner itself.
+fn postgres_interop_fixture(direction: &str) -> Option<Postgres> {
+    if !python_has_postgres_extra() {
+        eprintln!(
+            "SKIPPED {direction} postgres interop: `uv` is not on PATH or the Python `postgres` \
+             extra is not installed"
+        );
+        return None;
+    }
+    Postgres::acquire()
+}
+
+#[test]
+fn interop_postgres_python_seeds_rust_reads_and_coordinates() {
+    let Some(pg) = postgres_interop_fixture("python->rust") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let schema = pg.fresh_schema("fw_interop_py");
+    let dsn = pg.dsn();
+    let env = [("FW_INTEROP_SCHEMA", schema.as_str())];
+    match run_python("seed", &dsn, dir.path(), &env) {
+        Python::Missing(reason) => {
+            eprintln!("SKIPPED interop: {reason}");
+            return;
+        }
+        Python::Ran(_) => {}
+    }
+    // The Python store bootstrapped the schema; the Rust store opens it
+    // unchanged (same sentinel, idempotent DDL) and reads every row.
+    let store = PostgresClaimStore::connect(&dsn, &schema).unwrap();
+    assert_rust_reads_python_seed(&store);
+    let py = python_view(&dsn, dir.path(), &env).unwrap();
+    assert_eq!(rust_view(&store), py);
+    assert_rust_steals_after_python_lease_lapses(&store);
+    let py_after = python_view(&dsn, dir.path(), &env).unwrap();
+    assert_python_sees_rust_steal(&store, &py_after);
+}
+
+#[test]
+fn interop_postgres_rust_seeds_python_reads() {
+    let Some(pg) = postgres_interop_fixture("rust->python") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let schema = pg.fresh_schema("fw_interop_rs");
+    let dsn = pg.dsn();
+    let store = PostgresClaimStore::connect(&dsn, &schema).unwrap();
+    seed_with_rust(&store);
+    let env = [("FW_INTEROP_SCHEMA", schema.as_str())];
+    let Some(py) = python_view(&dsn, dir.path(), &env) else {
+        return;
+    };
+    assert_python_reads_rust_seed(&store, &py);
 }

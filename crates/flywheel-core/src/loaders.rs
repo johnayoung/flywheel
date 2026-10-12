@@ -15,7 +15,8 @@
 //! and Python stores pin identical `task_versions` rows for the same task.
 
 use crate::task::{
-    CommandGrader, Context, Grader, ManualGrader, RubricGrader, Task, TaskBudgets, TranscriptGrader,
+    CommandGrader, Context, Grader, ManualGrader, RubricGrader, Seconds, Task, TaskBudgets,
+    TranscriptGrader, python_float_repr,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -219,10 +220,22 @@ fn opt_u64(obj: &Map<String, Value>, key: &str, what: &str) -> Result<Option<u64
     }
 }
 
-fn opt_f64(obj: &Map<String, Value>, key: &str, what: &str) -> Result<Option<f64>, TaskLoadError> {
+fn number_to_seconds(n: &serde_json::Number) -> Option<Seconds> {
+    if let Some(i) = n.as_i64() {
+        Some(Seconds::Int(i))
+    } else {
+        n.as_f64().map(Seconds::Float)
+    }
+}
+
+fn opt_seconds(
+    obj: &Map<String, Value>,
+    key: &str,
+    what: &str,
+) -> Result<Option<Seconds>, TaskLoadError> {
     match get(obj, key) {
         None => Ok(None),
-        Some(Value::Number(n)) => Ok(n.as_f64()),
+        Some(Value::Number(n)) => Ok(number_to_seconds(n)),
         Some(_) => Err(TaskLoadError::new(format!(
             "{what} '{key}' must be a number or None"
         ))),
@@ -303,7 +316,7 @@ fn build_grader(
         Some("transcript") => Grader::Transcript(TranscriptGrader {
             max_turns: opt_u64(entry, "max_turns", &what("transcript"))?,
             max_total_tokens: opt_u64(entry, "max_total_tokens", &what("transcript"))?,
-            max_wall_seconds: opt_f64(entry, "max_wall_seconds", &what("transcript"))?,
+            max_wall_seconds: opt_seconds(entry, "max_wall_seconds", &what("transcript"))?,
             name: opt_string(entry, "name", &what("transcript"))?,
         }),
         _ => {
@@ -412,10 +425,10 @@ fn budgets_field(value: &Value, source: &str) -> Result<TaskBudgets, TaskLoadErr
             py_str_list(&BUDGET_KEYS)
         )));
     }
-    let seconds = |key: &str| -> Result<Option<f64>, TaskLoadError> {
+    let seconds = |key: &str| -> Result<Option<Seconds>, TaskLoadError> {
         match get(obj, key) {
             None => Ok(None),
-            Some(Value::Number(n)) => Ok(n.as_f64()),
+            Some(Value::Number(n)) => Ok(number_to_seconds(n)),
             Some(_) => Err(TaskLoadError::new(format!(
                 "{source}: budgets.{key} must be a number of seconds"
             ))),
@@ -732,60 +745,6 @@ fn write_python_escaped(s: &str, out: &mut String) {
         }
     }
     out.push('"');
-}
-
-/// Python `float.__repr__`: shortest round-trip digits, fixed notation when
-/// the decimal exponent is in `[-4, 16)`, otherwise `d.ddde[+-]XX`.
-pub fn python_float_repr(x: f64) -> String {
-    if x.is_nan() {
-        return "NaN".to_owned();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
-    }
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
-    }
-    // `{:e}` yields the shortest round-trip digits as `[-]d[.ddd]e[-]N`.
-    let sci = format!("{x:e}");
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((sci.as_str(), "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", mantissa),
-    };
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    // value = 0.<digits> * 10^decpt
-    let decpt = exp + 1;
-    let mut out = String::from(sign);
-    if decpt <= -4 || decpt > 16 {
-        out.push_str(&digits[..1]);
-        if digits.len() > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        let _ = write!(out, "e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    } else if decpt <= 0 {
-        out.push_str("0.");
-        for _ in 0..(-decpt) {
-            out.push('0');
-        }
-        out.push_str(&digits);
-    } else {
-        let decpt = decpt as usize;
-        if decpt < digits.len() {
-            out.push_str(&digits[..decpt]);
-            out.push('.');
-            out.push_str(&digits[decpt..]);
-        } else {
-            out.push_str(&digits);
-            for _ in digits.len()..decpt {
-                out.push('0');
-            }
-            out.push_str(".0");
-        }
-    }
-    out
 }
 
 // --- Python-flavored diagnostics ----------------------------------------------
@@ -1293,7 +1252,7 @@ mod tests {
         );
         let task = load_task_data(&payload, "S").unwrap();
         assert!(
-            matches!(&task.graders[0], Grader::Transcript(g) if g.max_wall_seconds == Some(30.0))
+            matches!(&task.graders[0], Grader::Transcript(g) if g.max_wall_seconds == Some(Seconds::Int(30)))
         );
         let payload = with(well_formed(), "graders", json!([5]));
         assert_eq!(
@@ -1632,7 +1591,10 @@ mod tests {
             "budgets": {"agent_iteration_seconds": 7200, "rubric_judge_max_turns": 64},
         });
         let task = load_task_data(&data, "S").unwrap();
-        assert_eq!(task.budgets.agent_iteration_seconds, Some(7200.0));
+        assert_eq!(
+            task.budgets.agent_iteration_seconds,
+            Some(Seconds::Int(7200))
+        );
         assert_eq!(task.budgets.rubric_judge_max_turns, Some(64));
         assert_eq!(task.budgets.rubric_judge_seconds, None);
         let reloaded = deserialize_task(&serialize_task(&task)).unwrap();

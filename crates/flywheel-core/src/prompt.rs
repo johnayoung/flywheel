@@ -31,6 +31,8 @@
 
 use crate::envelope::{CLOSING_FENCE, Intent, OPENING_FENCE};
 use crate::lifecycle::Lifecycle;
+#[cfg(test)]
+use crate::task::Seconds;
 use crate::task::{Grader, Task};
 use serde::{Deserialize, Serialize};
 
@@ -1119,7 +1121,7 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
                 Grader::Transcript(TranscriptGrader {
                     max_turns: Some(20),
                     max_total_tokens: Some(500_000),
-                    max_wall_seconds: Some(900.0),
+                    max_wall_seconds: Some(Seconds::Int(900)),
                     name: Some("budget".into()),
                 }),
                 Grader::Manual(ManualGrader {
@@ -1151,7 +1153,7 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
                 Grader::Rubric(RubricGrader::new(vec!["one".into()]).unwrap()),
                 Grader::Manual(ManualGrader::new("Check it").unwrap()),
                 Grader::Transcript(TranscriptGrader {
-                    max_wall_seconds: Some(30.5),
+                    max_wall_seconds: Some(Seconds::Float(30.5)),
                     ..Default::default()
                 }),
             ],
@@ -1215,29 +1217,35 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     #[test]
     fn parity_minimal_task_first_iteration() {
         let task = minimal_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
         assert_eq!(prompt, EXPECTED_MINIMAL);
     }
 
     #[test]
     fn parity_fully_briefed_task_every_context_field_and_grader_type() {
         let task = briefed_task();
-        let prompt =
-            build_iteration_prompt(&task, &lifecycle(&task, "run-abc"), &IterationInputs::new(3));
+        let prompt = build_iteration_prompt(
+            &task,
+            &lifecycle(&task, "run-abc"),
+            &IterationInputs::new(3),
+        );
         assert_eq!(prompt, EXPECTED_BRIEFED);
     }
 
     #[test]
     fn parity_unnamed_graders_fall_back_to_type_labels() {
         let task = unnamed_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
         assert_eq!(prompt, EXPECTED_UNNAMED);
     }
 
     #[test]
     fn parity_prior_attempt_feedback_with_pending_attempt() {
         let task = minimal_task();
-        let prompt = build_iteration_prompt(&task, &retried_lifecycle(&task), &IterationInputs::new(3));
+        let prompt =
+            build_iteration_prompt(&task, &retried_lifecycle(&task), &IterationInputs::new(3));
         assert_eq!(prompt, EXPECTED_RETRY);
     }
 
@@ -1261,7 +1269,8 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     #[test]
     fn parity_reviewer_feedback_rubric_and_manual_interleaved() {
         let task = briefed_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &mixed_findings_inputs());
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &mixed_findings_inputs());
         assert_eq!(prompt, EXPECTED_REVIEWER);
     }
 
@@ -1325,7 +1334,8 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     #[test]
     fn builder_omits_context_section_when_all_fields_are_empty() {
         let task = minimal_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
         assert!(!prompt.contains("# Context"));
         assert!(prompt.contains(&task.goal));
         assert!(prompt.contains(OPENING_FENCE));
@@ -1337,7 +1347,10 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
             "Edge cases",
             "Notes",
         ] {
-            assert!(!prompt.contains(forbidden), "hallucinated heading {forbidden:?}");
+            assert!(
+                !prompt.contains(forbidden),
+                "hallucinated heading {forbidden:?}"
+            );
         }
     }
 
@@ -1345,18 +1358,23 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     fn whitespace_only_notes_do_not_render_a_notes_block() {
         let mut task = minimal_task();
         task.context.notes = "   \n\t".into();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(2));
         assert!(!prompt.contains("# Context"));
     }
 
     #[test]
     fn envelope_contract_names_fences_and_every_intent() {
         let task = minimal_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
         assert!(prompt.contains(OPENING_FENCE));
         assert!(prompt.contains(CLOSING_FENCE));
         for intent in Intent::ALL {
-            assert!(prompt.contains(&format!("\"{}\"", intent.as_str())), "{intent}");
+            assert!(
+                prompt.contains(&format!("\"{}\"", intent.as_str())),
+                "{intent}"
+            );
         }
         let lowered = prompt.to_lowercase();
         assert!(lowered.contains("closed enum"));
@@ -1366,8 +1384,16 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     #[test]
     fn blocked_intent_documents_requires_contract() {
         let task = minimal_task();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
-        for needle in ["requires", "command_grader", "file_exists", "env_var_set", "\"requires\"", "abort"] {
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
+        for needle in [
+            "requires",
+            "command_grader",
+            "file_exists",
+            "env_var_set",
+            "\"requires\"",
+            "abort",
+        ] {
             assert!(prompt.contains(needle), "{needle}");
         }
         let lowered = prompt.to_lowercase();
@@ -1395,7 +1421,8 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
         let long_notes = "Sentence one. ".repeat(500);
         let mut task = Task::new("Do a thing.", vec![cmd("true", None)]).with_id("long-notes");
         task.context.notes = long_notes.clone();
-        let prompt = build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
         assert!(prompt.contains(&long_notes));
     }
 
@@ -1452,7 +1479,10 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
         let one = prompt.find("## attempt #1").unwrap();
         let two = prompt.find("## attempt #2").unwrap();
         assert!(one < two);
-        assert!(prompt.find("first-attempt finding").unwrap() < prompt.find("second-attempt finding").unwrap());
+        assert!(
+            prompt.find("first-attempt finding").unwrap()
+                < prompt.find("second-attempt finding").unwrap()
+        );
         assert_eq!(prompt.matches("## attempt #1").count(), 1);
         assert_eq!(prompt.matches("## attempt #2").count(), 1);
     }
@@ -1517,10 +1547,7 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
     fn transcript_grader_with_no_caps_renders_empty_cap_list() {
         // Not constructible through validation, but the renderer must not
         // panic on a struct built directly.
-        let line = grader_line(
-            2,
-            &Grader::Transcript(TranscriptGrader::default()),
-        );
+        let line = grader_line(2, &Grader::Transcript(TranscriptGrader::default()));
         assert_eq!(line, "2. transcript `transcript` (hard run-time caps): ");
     }
 
@@ -1532,10 +1559,9 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
         assert_eq!(back, inputs);
         let bare: IterationInputs = serde_json::from_str(r#"{"max_retries":2}"#).unwrap();
         assert_eq!(bare, IterationInputs::new(2));
-        let finding: RubricFindings = serde_json::from_str(
-            r#"{"grader_name":"g","attempt_number":1,"summary":"s"}"#,
-        )
-        .unwrap();
+        let finding: RubricFindings =
+            serde_json::from_str(r#"{"grader_name":"g","attempt_number":1,"summary":"s"}"#)
+                .unwrap();
         assert_eq!(finding.ordinal, 0);
     }
 }

@@ -151,7 +151,9 @@ fn default_clock() -> MonotonicClock {
     Arc::new(monotonic_seconds)
 }
 
-enum MessageKind {
+/// How a recorded message counts toward the transcript totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageKind {
     /// One agent turn (an SDK `AssistantMessage`, a stream-json `assistant`
     /// line, or a normalized `message.assistant` / `tool.started` event).
     Assistant,
@@ -164,7 +166,7 @@ enum MessageKind {
     Other,
 }
 
-fn message_kind(msg: &Value) -> MessageKind {
+pub(crate) fn message_kind(msg: &Value) -> MessageKind {
     match msg.get("message_type").and_then(Value::as_str) {
         Some("AssistantMessage") => return MessageKind::Assistant,
         Some("ResultMessage") => return MessageKind::Result,
@@ -179,7 +181,7 @@ fn message_kind(msg: &Value) -> MessageKind {
     }
 }
 
-fn message_usage(msg: &Value) -> Option<&Value> {
+pub(crate) fn message_usage(msg: &Value) -> Option<&Value> {
     msg.get("usage")
         .filter(|u| u.is_object())
         .or_else(|| msg.get("message").and_then(|m| m.get("usage")))

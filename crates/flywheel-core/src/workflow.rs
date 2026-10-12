@@ -2368,3 +2368,1752 @@ pub fn main_with_store(argv: &[String], store: Option<Arc<dyn RunStore>>) -> i32
 pub fn main(argv: &[String]) -> i32 {
     main_with_store(argv, None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents_invoke::InvocationRequest;
+    use crate::agents_invoke::test_support::{SCENARIO_VAR, write_fake_claude};
+    use crate::envelope::{EnvelopeResult, Intent, ValidEnvelope};
+    use crate::events::DomainEventKind;
+    use crate::invoker::{InvocationSignals, IterationResult};
+    use crate::lifecycle::{Attempt, Outcome};
+    use crate::store::{AttemptStore, DomainEventStore, GraderResultStore, TaskStore};
+    use crate::store_memory::InMemoryStore;
+    use crate::task::{GraderType, Seconds, TaskBudgets};
+    use chrono::TimeZone;
+    use serde_json::Map;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    // --- Fixtures ------------------------------------------------------------
+
+    #[derive(Default)]
+    struct ListSink {
+        records: Mutex<Vec<TelemetryRecord>>,
+    }
+
+    impl ListSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn kinds(&self) -> Vec<String> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.kind.clone())
+                .collect()
+        }
+    }
+
+    impl TelemetrySink for ListSink {
+        fn append_telemetry(&self, record: &TelemetryRecord) -> Result<(), StoreError> {
+            self.records.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    struct FailingSink;
+
+    impl TelemetrySink for FailingSink {
+        fn append_telemetry(&self, _record: &TelemetryRecord) -> Result<(), StoreError> {
+            Err(StoreError::backend(std::io::Error::other("sink down")))
+        }
+    }
+
+    type Lines = Arc<Mutex<Vec<String>>>;
+
+    fn capture() -> (LineSink, Lines) {
+        let lines: Lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let line_sink: LineSink =
+            Arc::new(move |line: &str| sink.lock().unwrap().push(line.to_owned()));
+        (line_sink, lines)
+    }
+
+    fn lines_of(lines: &Lines) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    fn verify_result() -> IterationResult {
+        let transcript = format!(
+            "{}\n{{\"intent\": \"verify\", \"reason\": \"done\"}}\n{}",
+            crate::envelope::OPENING_FENCE,
+            crate::envelope::CLOSING_FENCE
+        );
+        IterationResult {
+            transcript,
+            messages: vec![
+                json!({"type": "message.assistant", "payload": {"text": "ok"}}),
+                json!({"type": "session.finished", "payload": {"subtype": "success", "num_turns": 1, "total_cost_usd": 0.01}}),
+            ],
+            envelope: EnvelopeResult::Valid(ValidEnvelope {
+                intent: Intent::Verify,
+                reason: Some("done".into()),
+                requires: Vec::new(),
+            }),
+            signals: InvocationSignals {
+                stop_reason: Some("end_turn".into()),
+                num_turns: Some(1),
+                total_cost_usd: Some(0.01),
+                result_is_error: Some(false),
+                result_subtype: Some("success".into()),
+                session_id: Some("sess-1".into()),
+                ..InvocationSignals::default()
+            },
+            failure: None,
+            usage: None,
+        }
+    }
+
+    /// A one-shot invoker returning a `verify` iteration; honors the
+    /// per-message observer contract exactly as the production invoker does.
+    fn verify_invoke() -> InvokeFn {
+        Arc::new(|request: InvocationRequest| {
+            Box::pin(async move {
+                let result = verify_result();
+                if let Some(observer) = &request.observers.on_message {
+                    for msg in &result.messages {
+                        let _ = catch_unwind(AssertUnwindSafe(|| observer(msg)));
+                    }
+                }
+                result
+            })
+        })
+    }
+
+    /// An invoker that hangs forever, so only a deadline or a shutdown can
+    /// end it.
+    fn never_returns() -> InvokeFn {
+        Arc::new(|_request: InvocationRequest| {
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                unreachable!("the pending future never resolves")
+            })
+        })
+    }
+
+    fn task(goal: &str) -> Task {
+        Task::new(goal, Vec::new())
+    }
+
+    fn memory_store() -> Arc<InMemoryStore> {
+        Arc::new(InMemoryStore::new())
+    }
+
+    fn seed_open(store: &InMemoryStore, task_id: &str, run_id: &str, status: Status) {
+        let now = Utc::now();
+        let mut lc = Lifecycle::new(task_id);
+        lc.run_id = run_id.to_owned();
+        lc.transition_to(Status::Ready, "", Some(now)).unwrap();
+        if status != Status::Ready {
+            lc.transition_to(Status::Running, "", Some(now)).unwrap();
+        }
+        if status == Status::Validating {
+            lc.transition_to(Status::Validating, "", Some(now)).unwrap();
+        }
+        store.create_lifecycle(&lc).unwrap();
+        if matches!(status, Status::Running | Status::Validating) {
+            store
+                .save_attempt(run_id, &Attempt::new(1, now, run_id), None)
+                .unwrap();
+        }
+    }
+
+    fn base_options(store: &Arc<InMemoryStore>, sink: &Arc<ListSink>) -> RunTaskOptions {
+        let store: Arc<dyn RunStore> = store.clone();
+        let sink: SharedSink = sink.clone();
+        RunTaskOptions::default()
+            .with_invoke(verify_invoke())
+            .with_store(store)
+            .with_sink(sink)
+            .with_stream(Arc::new(|_line: &str| {}))
+    }
+
+    fn ts_micro() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap() + chrono::Duration::microseconds(123456)
+    }
+
+    fn ts_whole() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap()
+    }
+
+    fn record(
+        kind: &str,
+        ts: DateTime<Utc>,
+        payload: Value,
+        attempt: Option<u32>,
+        iteration: Option<u32>,
+    ) -> TelemetryRecord {
+        let mut record = TelemetryRecord::new("run-1", ts, kind);
+        record.payload = payload.as_object().cloned().unwrap_or_default();
+        record.attempt_number = attempt;
+        record.iteration_number = iteration;
+        record
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    // --- Formatting (fixtures generated from the Python module) -----------------
+
+    #[test]
+    fn short_matches_python() {
+        assert_eq!(short("hello", 60), "hello");
+        assert_eq!(
+            short(&"a".repeat(61), 60),
+            format!("{}\u{2026}", "a".repeat(59))
+        );
+        assert_eq!(short(&"a".repeat(60), 60), "a".repeat(60));
+        assert_eq!(short("line1\nline2\rx", 60), "line1 line2 x");
+        assert_eq!(short("x", 1), "x");
+        assert_eq!(short("xy", 1), "x\u{2026}");
+        assert_eq!(
+            short(&"h\u{e9}llo w\u{f6}rld ".repeat(10), 40),
+            "h\u{e9}llo w\u{f6}rld h\u{e9}llo w\u{f6}rld h\u{e9}llo w\u{f6}rld h\u{e9}l\u{2026}"
+        );
+    }
+
+    #[test]
+    fn py_str_matches_python_str() {
+        assert_eq!(py_str(&Value::Null), "None");
+        assert_eq!(py_str(&json!(3.5)), "3.5");
+        assert_eq!(py_str(&json!(true)), "True");
+        assert_eq!(py_str(&json!(1.0)), "1.0");
+        assert_eq!(py_str(&json!([1, "a"])), "[1, 'a']");
+        assert_eq!(py_str(&json!({"k": "v"})), "{'k': 'v'}");
+        assert_eq!(py_str(&json!("it's")), "it's");
+        assert_eq!(py_repr(&json!("it's")), "\"it's\"");
+        assert_eq!(py_repr(&json!("a\nb")), "'a\\nb'");
+    }
+
+    #[test]
+    fn payload_summary_matches_python() {
+        assert_eq!(event_payload_summary(&Map::new(), 100), "");
+        let payload = json!({
+            "a": 1, "b": "two\nlines", "c": "x".repeat(45), "d": null, "e": 1.0,
+            "f": [1, 2], "g": {"k": "v"}, "h": true,
+        });
+        assert_eq!(
+            event_payload_summary(payload.as_object().unwrap(), 100),
+            format!(
+                "a=1 b=two lines c={}\u{2026} d=None e=1.0 f=[1, 2] g={{'k': 'v'}} h=True",
+                "x".repeat(39)
+            )
+        );
+        let mut wide = Map::new();
+        for i in 0..6 {
+            wide.insert(format!("k{i}"), json!("v".repeat(30)));
+        }
+        assert_eq!(
+            event_payload_summary(&wide, 100),
+            format!(
+                "k0={} k1={} k2={}\u{2026}",
+                "v".repeat(30),
+                "v".repeat(30),
+                "v".repeat(28)
+            )
+        );
+    }
+
+    #[test]
+    fn event_lines_match_python() {
+        let r1 = record(
+            "harness.attempt_started",
+            ts_micro(),
+            json!({"number": 1, "model_id": "claude-x"}),
+            Some(1),
+            None,
+        );
+        assert_eq!(
+            format_event_line(&r1),
+            "[03:04:05] harness.attempt_started attempt=1  number=1 model_id=claude-x"
+        );
+        assert_eq!(
+            event_json_line(&r1),
+            "{\"attempt_number\": 1, \"iteration_number\": null, \"kind\": \"harness.attempt_started\", \"payload\": {\"model_id\": \"claude-x\", \"number\": 1}, \"run_id\": \"run-1\", \"ts\": \"2024-01-02T03:04:05.123456+00:00\"}"
+        );
+        let r2 = record(
+            "harness.lifecycle_initialized",
+            ts_whole(),
+            json!({}),
+            None,
+            None,
+        );
+        assert_eq!(
+            format_event_line(&r2),
+            "[03:04:05] harness.lifecycle_initialized"
+        );
+        assert_eq!(
+            event_json_line(&r2),
+            "{\"attempt_number\": null, \"iteration_number\": null, \"kind\": \"harness.lifecycle_initialized\", \"payload\": {}, \"run_id\": \"run-1\", \"ts\": \"2024-01-02T03:04:05+00:00\"}"
+        );
+        let r3 = record(
+            "harness.z",
+            ts_micro(),
+            json!({"text": "h\u{e9}llo\nw\u{f6}rld", "f": 1.5, "n": null, "l": [1, "a"], "o": {"b": 1, "a": 2}}),
+            Some(2),
+            Some(3),
+        );
+        assert_eq!(
+            format_event_line(&r3),
+            "[03:04:05] harness.z attempt=2  text=h\u{e9}llo w\u{f6}rld f=1.5 n=None l=[1, 'a'] o={'b': 1, 'a': 2}"
+        );
+        assert_eq!(
+            event_json_line(&r3),
+            "{\"attempt_number\": 2, \"iteration_number\": 3, \"kind\": \"harness.z\", \"payload\": {\"f\": 1.5, \"l\": [1, \"a\"], \"n\": null, \"o\": {\"a\": 2, \"b\": 1}, \"text\": \"h\\u00e9llo\\nw\\u00f6rld\"}, \"run_id\": \"run-1\", \"ts\": \"2024-01-02T03:04:05.123456+00:00\"}"
+        );
+    }
+
+    #[test]
+    fn tool_use_matches_python() {
+        let input = json!({"file_path": "/tmp/x.py", "content": "a".repeat(50), "c": 1, "d": 2});
+        assert_eq!(
+            format_tool_use("Write", input.as_object().unwrap()),
+            format!(
+                "Write(file_path=/tmp/x.py, content={}\u{2026}, c=1)",
+                "a".repeat(39)
+            )
+        );
+        assert_eq!(format_tool_use("Bash", &Map::new()), "Bash()");
+        let edit = json!({"old": "x\ny"});
+        assert_eq!(
+            format_tool_use("Edit", edit.as_object().unwrap()),
+            "Edit(old=x y)"
+        );
+    }
+
+    #[test]
+    fn live_message_summaries() {
+        let cases: Vec<(Value, (&str, String))> = vec![
+            (
+                json!({"type": "message.assistant", "payload": {"text": "  hello\nworld  "}}),
+                ("ASSISTANT", "hello world".into()),
+            ),
+            (
+                json!({"type": "message.assistant", "payload": {"text": "   "}}),
+                ("ASSISTANT", "(no content)".into()),
+            ),
+            (
+                json!({"type": "tool.started", "payload": {"tool_use_id": "t1", "tool_name": "Write", "tool_input": {"file_path": "/a"}}}),
+                ("ASSISTANT", "Write(file_path=/a)".into()),
+            ),
+            (
+                json!({"type": "tool.finished", "payload": {"tool_use_id": "t1", "is_error": false, "content": "abcd"}}),
+                ("USER", "tool_result(4B)".into()),
+            ),
+            (
+                json!({"type": "tool.finished", "payload": {"tool_use_id": "t1", "is_error": true, "content": null}}),
+                ("USER", "tool_result(0B ERR)".into()),
+            ),
+            (
+                json!({"type": "tool.finished", "payload": {"tool_use_id": "t1", "is_error": null, "content": [{"type": "text", "text": "x"}]}}),
+                ("USER", "tool_result(31B)".into()),
+            ),
+            (
+                json!({"type": "message.user", "payload": {"text": "echo"}}),
+                ("USER", "echo".into()),
+            ),
+            (
+                json!({"type": "message.user", "payload": {}}),
+                ("USER", "(empty)".into()),
+            ),
+            (
+                json!({"type": "session.finished", "payload": {"subtype": "success", "num_turns": 3, "total_cost_usd": 0.0123456}}),
+                ("RESULT", "subtype=success turns=3 cost=$0.0123".into()),
+            ),
+            (
+                json!({"type": "session.finished", "payload": {"subtype": null, "num_turns": null, "total_cost_usd": null}}),
+                ("RESULT", "subtype=None turns=None".into()),
+            ),
+            (
+                json!({"type": "session.started", "payload": {"session_id": "s", "model": "m"}}),
+                ("SYSTEM", "init".into()),
+            ),
+            (
+                json!({"type": "context.usage", "payload": {"usage": {}}}),
+                ("CONTEXT.USAGE", String::new()),
+            ),
+        ];
+        for (msg, (label, detail)) in cases {
+            assert_eq!(
+                summarize_live_message(&msg),
+                (label.to_owned(), detail),
+                "{msg}"
+            );
+        }
+        let line = format_live_message(
+            &json!({"type": "message.assistant", "payload": {"text": "hi"}}),
+            ts_whole(),
+        );
+        assert_eq!(line, "[03:04:05] ASSISTANT  hi");
+        let bare = format_live_message(&json!({"type": "warning", "payload": {}}), ts_whole());
+        assert_eq!(bare, "[03:04:05] WARNING");
+    }
+
+    #[test]
+    fn message_json_line_sorts_keys_like_python() {
+        let msg =
+            json!({"type": "message.assistant", "payload": {"text": "h\u{e9}"}, "sequence": 2});
+        assert_eq!(
+            message_json_line(&msg),
+            "{\"payload\": {\"text\": \"h\\u00e9\"}, \"sequence\": 2, \"type\": \"message.assistant\"}"
+        );
+    }
+
+    #[test]
+    fn events_mode_names_round_trip() {
+        for mode in [EventsMode::Plain, EventsMode::Json, EventsMode::None] {
+            assert_eq!(EventsMode::from_name(mode.as_str()), Some(mode));
+            assert_eq!(mode.to_string(), mode.as_str());
+        }
+        assert_eq!(EventsMode::from_name("loud"), None);
+        assert_eq!(resolve_events_mode(false, false), EventsMode::Plain);
+        assert_eq!(resolve_events_mode(true, false), EventsMode::Json);
+        assert_eq!(resolve_events_mode(true, true), EventsMode::None);
+        assert_eq!(EventsMode::default(), EventsMode::None);
+    }
+
+    #[test]
+    fn observers_and_emitters_follow_the_mode() {
+        let (out, lines) = capture();
+        assert!(make_message_observer(EventsMode::None, out.clone()).is_none());
+        assert!(make_event_emitter(EventsMode::None, out.clone()).is_none());
+
+        let msg = json!({"type": "message.assistant", "payload": {"text": "hi"}});
+        make_message_observer(EventsMode::Plain, out.clone()).unwrap()(&msg);
+        make_message_observer(EventsMode::Json, out.clone()).unwrap()(&msg);
+        let rec = record("harness.x", ts_whole(), json!({"a": 1}), None, None);
+        make_event_emitter(EventsMode::Plain, out.clone()).unwrap()(&rec);
+        make_event_emitter(EventsMode::Json, out).unwrap()(&rec);
+
+        let lines = lines_of(&lines);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].ends_with("] ASSISTANT  hi"), "{}", lines[0]);
+        assert_eq!(lines[1], message_json_line(&msg));
+        assert_eq!(lines[2], "[03:04:05] harness.x  a=1");
+        assert_eq!(lines[3], event_json_line(&rec));
+    }
+
+    #[test]
+    fn streaming_sink_appends_first_and_emits_only_harness_records() {
+        let wrapped = ListSink::new();
+        let (out, lines) = capture();
+        let sink = StreamingTelemetrySink::new(
+            wrapped.clone(),
+            make_event_emitter(EventsMode::Plain, out).unwrap(),
+        );
+        for kind in [
+            "harness.a",
+            "message.assistant",
+            "domain.transitioned_to",
+            "harness.b",
+        ] {
+            sink.append_telemetry(&record(kind, ts_whole(), json!({}), None, None))
+                .unwrap();
+        }
+        assert_eq!(
+            wrapped.kinds(),
+            strings(&[
+                "harness.a",
+                "message.assistant",
+                "domain.transitioned_to",
+                "harness.b"
+            ])
+        );
+        assert_eq!(
+            lines_of(&lines),
+            strings(&["[03:04:05] harness.a", "[03:04:05] harness.b"])
+        );
+
+        let (out, lines) = capture();
+        let failing = StreamingTelemetrySink::new(
+            Arc::new(FailingSink),
+            make_event_emitter(EventsMode::Plain, out).unwrap(),
+        );
+        let err = failing
+            .append_telemetry(&record("harness.a", ts_whole(), json!({}), None, None))
+            .unwrap_err();
+        assert!(err.to_string().contains("sink down"));
+        assert!(lines_of(&lines).is_empty(), "a failed append must not emit");
+    }
+
+    // --- Inline tasks and observers ----------------------------------------------
+
+    #[test]
+    fn build_inline_task_shapes_graders() {
+        let task = build_inline_task(
+            "do it",
+            &strings(&["cargo test", "cargo clippy"]),
+            &strings(&["it works", "it is tested"]),
+            Some("inline-1"),
+        )
+        .unwrap();
+        assert_eq!(task.id, "inline-1");
+        assert_eq!(task.goal, "do it");
+        assert_eq!(task.graders.len(), 3);
+        match (&task.graders[0], &task.graders[1], &task.graders[2]) {
+            (Grader::Command(a), Grader::Command(b), Grader::Rubric(r)) => {
+                assert_eq!(
+                    (a.run.as_str(), a.name.as_deref()),
+                    ("cargo test", Some("check-1"))
+                );
+                assert_eq!(
+                    (b.run.as_str(), b.name.as_deref()),
+                    ("cargo clippy", Some("check-2"))
+                );
+                assert_eq!(r.assertions, strings(&["it works", "it is tested"]));
+            }
+            other => panic!("unexpected graders: {other:?}"),
+        }
+        let bare = build_inline_task("goal only", &[], &[], None).unwrap();
+        assert!(bare.graders.is_empty());
+        assert!(!bare.id.is_empty());
+        assert!(build_inline_task("   ", &[], &[], None).is_err());
+        assert!(build_inline_task("g", &strings(&[""]), &[], None).is_err());
+    }
+
+    #[test]
+    fn compose_message_observers_filters_and_contains_panics() {
+        assert!(compose_message_observers([None, None]).is_none());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record_as = |tag: &'static str| -> MessageObserver {
+            let seen = seen.clone();
+            Arc::new(move |msg: &Value| {
+                seen.lock().unwrap().push(format!("{tag}:{}", msg["n"]));
+            })
+        };
+        let single = record_as("solo");
+        let composed = compose_message_observers([None, Some(single.clone())]).unwrap();
+        assert!(
+            Arc::ptr_eq(&composed, &single),
+            "a lone observer is returned unwrapped"
+        );
+
+        let panicking: MessageObserver = Arc::new(|_msg: &Value| panic!("renderer broke"));
+        let composed = compose_message_observers([
+            Some(record_as("a")),
+            Some(panicking),
+            Some(record_as("b")),
+        ])
+        .unwrap();
+        composed(&json!({"n": 1}));
+        composed(&json!({"n": 2}));
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            strings(&["a:1", "b:1", "a:2", "b:2"])
+        );
+    }
+
+    // --- Agent options -------------------------------------------------------------
+
+    #[test]
+    fn permission_vocabulary_mapping_never_defaults_to_bypass() {
+        let table: BTreeMap<&str, &str> = PERMISSION_POLICIES.into_iter().collect();
+        assert_eq!(table["bypassPermissions"], "auto");
+        assert_eq!(table["plan"], "plan");
+        assert_eq!(table["default"], "supervised");
+        assert_eq!(table["acceptEdits"], "supervised");
+        for (mode, policy) in PERMISSION_POLICIES {
+            assert_eq!(permission_policy_for(mode).as_str(), policy);
+        }
+        assert_eq!(
+            permission_policy_for("anythingElse"),
+            PermissionPolicy::Supervised
+        );
+    }
+
+    #[test]
+    fn fast_primitives_reproduce_the_bare_configuration() {
+        let configuration = build_agent_configuration("claude-code", &AgentOptions::default());
+        assert_eq!(configuration.agent_id, "claude-code");
+        assert_eq!(configuration.model_id, None);
+        assert_eq!(configuration.max_turns, Some(500));
+        assert_eq!(configuration.permission_policy, PermissionPolicy::Auto);
+        assert!(configuration.environment.is_empty());
+        assert_eq!(configuration.command_override, None);
+        let keys: Vec<&String> = configuration.adapter_options.keys().collect();
+        assert_eq!(keys, vec!["skills"]);
+        assert_eq!(configuration.adapter_options["skills"], json!("all"));
+        // Spec 00063: the co-author suppression layer is always on.
+        let settings =
+            flywheel_agents::claude_code::cli::build_settings_value(&configuration).unwrap();
+        let settings: Value = serde_json::from_str(&settings.unwrap()).unwrap();
+        assert_eq!(settings["includeCoAuthoredBy"], json!(false));
+        assert!(settings.get("sandbox").is_none());
+    }
+
+    #[test]
+    fn changed_primitives_change_the_configuration() {
+        let options = AgentOptions {
+            model: Some("claude-sonnet-4-5".into()),
+            max_turns: 7,
+            permission_mode: "default".into(),
+            skills: Skills::Named(strings(&["fw-spec"])),
+            allowed_tools: strings(&["Bash", "Edit"]),
+            denied_tools: strings(&["WebFetch"]),
+            setting_sources: Some(strings(&["project"])),
+            mcp_servers: strings(&["serena"]),
+            mcp_strict: true,
+            exec_enabled: true,
+            exec_auto_allow: false,
+            agent_env: BTreeMap::from([("FOO".to_owned(), "bar".to_owned())]),
+            transport: Some("cli".into()),
+            command_override: Some(strings(&["/bin/true"])),
+        };
+        let configuration = build_agent_configuration("claude-code", &options);
+        assert_eq!(configuration.model_id.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(configuration.max_turns, Some(7));
+        assert_eq!(
+            configuration.permission_policy,
+            PermissionPolicy::Supervised
+        );
+        assert_eq!(configuration.environment["FOO"], "bar");
+        assert_eq!(
+            configuration.command_override,
+            Some(strings(&["/bin/true"]))
+        );
+        let adapter = &configuration.adapter_options;
+        assert_eq!(adapter["skills"], json!(["fw-spec"]));
+        assert_eq!(adapter["allowed_tools"], json!(["Bash", "Edit"]));
+        assert_eq!(adapter["disallowed_tools"], json!(["WebFetch"]));
+        assert_eq!(adapter["setting_sources"], json!(["project"]));
+        assert_eq!(adapter["mcp_servers"], json!(["serena"]));
+        assert_eq!(adapter["mcp_strict"], json!(true));
+        assert_eq!(
+            adapter["sandbox_exec"],
+            json!({"enabled": true, "autoAllowBashIfSandboxed": false})
+        );
+        assert_eq!(adapter["transport"], json!("cli"));
+        let settings =
+            flywheel_agents::claude_code::cli::build_settings_value(&configuration).unwrap();
+        let settings: Value = serde_json::from_str(&settings.unwrap()).unwrap();
+        assert_eq!(
+            settings["sandbox"]["autoAllowBashIfSandboxed"],
+            json!(false)
+        );
+    }
+
+    // --- Stranded recovery -----------------------------------------------------------
+
+    #[test]
+    fn stranded_run_ids_are_filtered_and_oldest_first() {
+        let store = memory_store();
+        seed_open(&store, "t1", "run-a", Status::Running);
+        seed_open(&store, "t1", "run-b", Status::Validating);
+        seed_open(&store, "t1", "run-c", Status::Ready);
+        seed_open(&store, "t2", "run-d", Status::Running);
+
+        let listed = store
+            .list_lifecycles(&LifecycleFilter::default().with_statuses(STRANDED_STATUSES))
+            .unwrap();
+        let expected: Vec<String> = listed.into_iter().rev().map(|lc| lc.run_id).collect();
+        assert_eq!(expected.len(), 3);
+        assert_eq!(stranded_run_ids(store.as_ref(), None).unwrap(), expected);
+        assert_eq!(
+            stranded_run_ids(store.as_ref(), Some("t2")).unwrap(),
+            strings(&["run-d"])
+        );
+        assert!(
+            stranded_run_ids(store.as_ref(), Some("t9"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!has_done_lifecycle(store.as_ref(), "t1").unwrap());
+    }
+
+    #[test]
+    fn recover_stranded_lifecycles_finalizes_each_match() {
+        let store = memory_store();
+        let sink = ListSink::new();
+        seed_open(&store, "t1", "run-a", Status::Running);
+        seed_open(&store, "t1", "run-b", Status::Validating);
+        seed_open(&store, "t1", "run-c", Status::Ready);
+        let backend: Arc<dyn HarnessStore> = store.clone();
+        let sink_shared: SharedSink = sink.clone();
+        let mut finalized =
+            recover_stranded_lifecycles(backend.clone(), Some("t1"), Some(sink_shared)).unwrap();
+        finalized.sort();
+        assert_eq!(finalized, strings(&["run-a", "run-b"]));
+        for run_id in ["run-a", "run-b"] {
+            let lc = store.load_lifecycle(run_id).unwrap().unwrap();
+            assert_eq!(lc.status, Status::Interrupted);
+        }
+        assert_eq!(
+            store.load_lifecycle("run-c").unwrap().unwrap().status,
+            Status::Ready
+        );
+        assert!(sink.kinds().iter().any(|k| k == "harness.crash"));
+        assert!(
+            recover_stranded_lifecycles(backend, Some("t1"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- run_task_object ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn injected_store_holds_complete_run_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let db_path = dir.path().join("nested").join("flywheel.sqlite");
+        let sandbox = dir.path().join("sandbox");
+        let task = Task::new(
+            "produce a green run",
+            vec![Grader::Command(CommandGrader {
+                run: "true".into(),
+                name: Some("ok".into()),
+            })],
+        );
+
+        let outcome = run_task_object(&task, &db_path, &sandbox, base_options(&store, &sink))
+            .await
+            .unwrap();
+        let run_id = outcome.lifecycle.run_id.clone();
+
+        assert!(!db_path.exists(), "no sqlite file when a store is injected");
+        assert!(!db_path.parent().unwrap().exists());
+        assert!(sandbox.is_dir(), "the sandbox is created");
+        assert_eq!(outcome.lifecycle.status, Status::Done);
+        let loaded = store.load_lifecycle(&run_id).unwrap().unwrap();
+        assert_eq!(loaded.status, Status::Done);
+        assert!(!loaded.attempts.is_empty());
+        assert_eq!(
+            store.load_task_for_run(&run_id).unwrap().unwrap().goal,
+            task.goal
+        );
+        assert!(!store.list_attempts(&run_id).unwrap().is_empty());
+        assert!(!store.list_domain_events(&run_id).unwrap().is_empty());
+        let grader_rows = store.list_grader_results(&run_id, 1).unwrap();
+        assert_eq!(grader_rows.len(), 1);
+        assert_eq!(grader_rows[0].grader_type, GraderType::Command);
+        assert!(grader_rows.iter().all(|r| r.passed));
+        assert!(sink.kinds().iter().any(|k| k == "harness.attempt_started"));
+    }
+
+    #[tokio::test]
+    async fn injected_store_receives_run_events_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let db_path = dir.path().join("db").join("flywheel.sqlite");
+        let outcome = run_task_object(
+            &task("unverified but recorded"),
+            &db_path,
+            &dir.path().join("sandbox"),
+            base_options(&store, &sink),
+        )
+        .await
+        .unwrap();
+        let events = store.list_domain_events(&outcome.lifecycle.run_id).unwrap();
+        assert!(events.len() >= 2);
+        assert_eq!(events[0].kind(), DomainEventKind::LifecycleInitialized);
+        assert!(!db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn default_store_and_sink_materialize_under_the_db_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".flywheel").join("flywheel.sqlite");
+        let options = RunTaskOptions::default()
+            .with_invoke(verify_invoke())
+            .with_stream(Arc::new(|_line: &str| {}));
+        let outcome = run_task_object(
+            &task("persist me"),
+            &db_path,
+            &dir.path().join("sb"),
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.lifecycle.status, Status::Done);
+        assert!(db_path.is_file(), "the sqlite store is opened at db_path");
+        let logs = FileTelemetrySink::new(dir.path().join(".flywheel").join("logs"));
+        let run_file = logs.path_for(&outcome.lifecycle.run_id).unwrap();
+        assert!(run_file.is_file(), "one JSONL file per run under logs/runs");
+        let text = std::fs::read_to_string(run_file).unwrap();
+        assert!(text.contains("harness.attempt_started"));
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        assert!(has_done_lifecycle(&store, &outcome.lifecycle.task_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn deadlines_override_cancels_a_never_returning_invoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let deadlines = DeadlineConfig {
+            agent_iteration_seconds: Some(0.05),
+            ..DeadlineConfig::default()
+        };
+        let options = base_options(&store, &sink)
+            .with_invoke(never_returns())
+            .with_max_retries(0)
+            .with_deadlines(deadlines);
+        let started = Instant::now();
+        let outcome = run_task_object(
+            &task("hang forever"),
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(outcome.lifecycle.status, Status::Failed);
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].outcome, Some(Outcome::InternalError));
+        assert!(
+            outcome.attempts[0].error.contains("deadline"),
+            "{}",
+            outcome.attempts[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn task_budget_overrides_the_iteration_ceiling_per_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let mut task = task("hang forever");
+        task.budgets = TaskBudgets {
+            agent_iteration_seconds: Some(Seconds::Float(0.05)),
+            ..TaskBudgets::default()
+        };
+        let options = base_options(&store, &sink)
+            .with_invoke(never_returns())
+            .with_max_retries(0);
+        let started = Instant::now();
+        let outcome = run_task_object(
+            &task,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the task's own ceiling governs"
+        );
+        assert_eq!(outcome.lifecycle.status, Status::Failed);
+        assert_eq!(outcome.attempts[0].outcome, Some(Outcome::InternalError));
+        assert!(outcome.attempts[0].error.contains("deadline"));
+    }
+
+    #[test]
+    fn harness_config_forwards_budgets_and_preserves_defaults() {
+        let sandbox = Path::new("/tmp/sbx");
+        let context = BTreeMap::from([("model_id".to_owned(), "m".to_owned())]);
+        let overridden = RunTaskOptions::default()
+            .with_rubric_judge_max_turns(8)
+            .with_deadlines(DeadlineConfig {
+                rubric_judge_seconds: Some(123.0),
+                ..DeadlineConfig::default()
+            });
+        let config = harness_config_for(&overridden, sandbox, context.clone(), None, None);
+        assert_eq!(config.rubric_judge_max_turns, 8);
+        assert_eq!(config.deadlines.rubric_judge_seconds, Some(123.0));
+        assert_eq!(config.worktree.as_deref(), Some(sandbox));
+        assert_eq!(config.agent_context, context);
+        assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(config.agent_id, DEFAULT_AGENT_ID);
+
+        let defaults = harness_config_for(&RunTaskOptions::default(), sandbox, context, None, None);
+        assert_eq!(defaults.rubric_judge_max_turns, 32);
+        assert_eq!(defaults.deadlines, DeadlineConfig::default());
+        assert_eq!(defaults.checkpoint_nudge_seconds, 300.0);
+        assert!(defaults.rubric_judge_invoke.is_none());
+        assert!(defaults.recovery_summarizer_invoke.is_none());
+
+        let mut tuned = RunTaskOptions::default().with_agent_id("codex");
+        tuned.max_cost_usd = 2.5;
+        tuned.max_tokens = 10;
+        tuned.wall_clock_seconds = 60;
+        tuned.checkpoint_nudge_seconds = Some(0.0);
+        tuned.artifacts_root = Some(PathBuf::from("/tmp/art"));
+        tuned.grader_env = Some(BTreeMap::from([("A".to_owned(), "b".to_owned())]));
+        let config = harness_config_for(&tuned, sandbox, BTreeMap::new(), None, None);
+        assert_eq!(config.max_cost_usd, 2.5);
+        assert_eq!(config.max_tokens, 10);
+        assert_eq!(config.wall_clock_seconds, 60);
+        assert_eq!(config.checkpoint_nudge_seconds, 0.0);
+        assert_eq!(
+            config.artifacts_root.as_deref(),
+            Some(Path::new("/tmp/art"))
+        );
+        assert_eq!(config.grader_env.unwrap()["A"], "b");
+        assert_eq!(config.agent_id, "codex");
+    }
+
+    #[tokio::test]
+    async fn agent_context_pins_model_runtime_and_base_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = build_agent_context(&RunTaskOptions::default(), dir.path()).await;
+        assert_eq!(plain["model_id"], "claude-code-default");
+        assert_eq!(plain["agent_sdk"], "flywheel_agents");
+        assert_eq!(plain["agent_id"], DEFAULT_AGENT_ID);
+        assert_eq!(plain["sandbox"], dir.path().display().to_string());
+        assert!(
+            !plain.contains_key("base_commit_sha"),
+            "no pin outside a git checkout"
+        );
+
+        let mut options = RunTaskOptions::default().with_agent_id("codex");
+        options.agent.model = Some("claude-opus-4-8".into());
+        let repo = git_repo_with_commit();
+        let pinned = build_agent_context(&options, repo.path()).await;
+        assert_eq!(pinned["model_id"], "claude-opus-4-8");
+        assert_eq!(pinned["agent_id"], "codex");
+        assert_eq!(pinned["base_commit_sha"].len(), 40);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_and_plain_event_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (stream, diagnostics) = capture();
+        let (events_out, events) = capture();
+        let task = task("observe me").with_id("task-obs");
+        let options = base_options(&store, &sink)
+            .with_stream(stream)
+            .with_source("tests/obs.json")
+            .with_events(EventsMode::Plain, events_out);
+        let outcome = run_task_object(
+            &task,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        let diagnostics = lines_of(&diagnostics);
+        assert_eq!(
+            diagnostics,
+            vec![
+                "[workflow] task    : task-obs".to_owned(),
+                "[workflow] source  : tests/obs.json".to_owned(),
+                "[workflow] graders : none (unverified run \u{2014} DONE reflects the agent's own claim)"
+                    .to_owned(),
+                format!("[workflow] run_id  : {}", outcome.lifecycle.run_id),
+                "[workflow] status  : done".to_owned(),
+            ]
+        );
+        let events = lines_of(&events);
+        assert!(!events.is_empty());
+        assert!(
+            events
+                .iter()
+                .all(|line| line.starts_with('[') && line.contains("harness."))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("harness.attempt_started attempt=1"))
+        );
+        assert!(
+            !events.iter().any(|line| line.contains("domain.")),
+            "domain mirrors stay off the live stream"
+        );
+        // The wrapped sink still carries every record, mirrors included.
+        assert!(sink.kinds().iter().any(|k| k.starts_with("domain.")));
+    }
+
+    #[tokio::test]
+    async fn json_event_stream_emits_sorted_ndjson() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (events_out, events) = capture();
+        let options = base_options(&store, &sink).with_events(EventsMode::Json, events_out);
+        let outcome = run_task_object(
+            &task("json me"),
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        let events = lines_of(&events);
+        assert!(!events.is_empty());
+        for line in &events {
+            let parsed: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["run_id"], json!(outcome.lifecycle.run_id));
+            let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted, "{line}");
+            assert!(parsed["kind"].as_str().unwrap().starts_with("harness."));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_id_resume_and_error_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (stream, diagnostics) = capture();
+        let failing = Task::new(
+            "fail validation",
+            vec![Grader::Command(CommandGrader {
+                run: "false".into(),
+                name: Some("red".into()),
+            })],
+        );
+        let options = base_options(&store, &sink)
+            .with_stream(stream)
+            .with_run_id("run-fixed")
+            .with_max_retries(0);
+        let mut worker = options;
+        worker.worker_id = Some("worker-7".into());
+        let outcome = run_task_object(
+            &failing,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            worker,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.lifecycle.run_id, "run-fixed");
+        assert_eq!(outcome.lifecycle.worker_id, "worker-7");
+        assert_eq!(outcome.lifecycle.status, Status::Failed);
+        let diagnostics = lines_of(&diagnostics);
+        assert!(diagnostics.contains(&"[workflow] run_id  : run-fixed".to_owned()));
+        assert!(diagnostics.contains(&"[workflow] status  : failed".to_owned()));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.starts_with("[workflow] error   : "))
+        );
+        assert_eq!(
+            store.load_lifecycle("run-fixed").unwrap().unwrap().status,
+            Status::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_prior_run_is_recovered_before_the_new_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (stream, diagnostics) = capture();
+        let task = task("again").with_id("task-strand");
+        seed_open(&store, "task-strand", "run-old", Status::Running);
+        seed_open(&store, "other-task", "run-other", Status::Running);
+        let options = base_options(&store, &sink).with_stream(stream);
+        let outcome = run_task_object(
+            &task,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.lifecycle.status, Status::Done);
+        assert_eq!(
+            lines_of(&diagnostics)[0],
+            "[workflow] recovered: stranded run run-old -> interrupted"
+        );
+        assert_eq!(
+            store.load_lifecycle("run-old").unwrap().unwrap().status,
+            Status::Interrupted
+        );
+        assert_eq!(
+            store.load_lifecycle("run-other").unwrap().unwrap().status,
+            Status::Running,
+            "only the task's own stranded runs are swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_parks_the_lifecycle_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (stream, diagnostics) = capture();
+        let signal = ShutdownSignal::new();
+        let mut options = base_options(&store, &sink)
+            .with_stream(stream)
+            .with_invoke(never_returns())
+            .with_run_id("run-sig");
+        options.shutdown = Some(signal.clone());
+        let trigger = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.trigger();
+        });
+        let err = run_task_object(
+            &task("interrupt me"),
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_interrupted(), "{err}");
+        assert_eq!(
+            store.load_lifecycle("run-sig").unwrap().unwrap().status,
+            Status::Interrupted
+        );
+        assert_eq!(
+            lines_of(&diagnostics).last().unwrap(),
+            "[workflow] status  : interrupted (worker received signal)"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_cancel_on_signal_returns_an_abortable_listener() {
+        let signal = ShutdownSignal::new();
+        let listener = install_cancel_on_signal(&signal);
+        if cfg!(unix) {
+            let handle = listener.expect("unix installs a listener");
+            assert!(!signal.is_triggered());
+            handle.abort();
+            assert!(handle.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(listener.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn run_task_file_loads_the_task_and_sets_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_file = dir.path().join("task.json");
+        std::fs::write(
+            &task_file,
+            r#"{"id": "from-file", "goal": "Load me.", "graders": []}"#,
+        )
+        .unwrap();
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (stream, diagnostics) = capture();
+        let options = base_options(&store, &sink)
+            .with_stream(stream)
+            .with_source("ignored");
+        let outcome = run_task_file(
+            &task_file,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.lifecycle.task_id, "from-file");
+        assert_eq!(outcome.lifecycle.source, task_file.display().to_string());
+        assert!(
+            lines_of(&diagnostics)
+                .contains(&format!("[workflow] source  : {}", task_file.display()))
+        );
+
+        let missing = dir.path().join("missing.json");
+        let err = run_task_file(
+            &missing,
+            &dir.path().join("db").join("flywheel.sqlite"),
+            &dir.path().join("sandbox"),
+            base_options(&store, &sink),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, WorkflowError::TaskLoad(_)), "{err}");
+        assert!(err.to_string().contains("cannot read file"));
+    }
+
+    #[tokio::test]
+    async fn production_invoker_runs_the_agent_and_streams_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_claude(dir.path());
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (events_out, events) = capture();
+        let mut options = RunTaskOptions::default()
+            .with_store(store.clone() as Arc<dyn RunStore>)
+            .with_sink(sink.clone() as SharedSink)
+            .with_stream(Arc::new(|_line: &str| {}))
+            .with_events(EventsMode::Plain, events_out)
+            .with_agent_id("claude-code");
+        options.agent.command_override = Some(vec!["/bin/sh".into(), script.display().to_string()]);
+        options
+            .agent
+            .agent_env
+            .insert(SCENARIO_VAR.into(), "envelope".into());
+        options.agent.transport = Some("cli".into());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_task_object(
+                &task("real agent path"),
+                &dir.path().join("db").join("flywheel.sqlite"),
+                &dir.path().join("sandbox"),
+                options,
+            ),
+        )
+        .await
+        .expect("the fake agent finishes promptly")
+        .unwrap();
+        assert_eq!(outcome.lifecycle.status, Status::Done);
+        assert_eq!(outcome.attempts[0].agent_context["agent_id"], "claude-code");
+        let events = lines_of(&events);
+        assert!(
+            events.iter().any(|l| l.contains("] SYSTEM  init")),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|l| l.contains("] ASSISTANT  done")),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|l| l.contains("] RESULT  subtype=success turns=1 cost=$0.0100")),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|l| l.contains("harness.attempt_started")));
+        // The persistence observer still fired alongside the renderer.
+        assert!(
+            sink.kinds().iter().any(|k| k == "message.assistant"),
+            "{:?}",
+            sink.kinds()
+        );
+    }
+
+    #[test]
+    fn claude_code_invoke_stamps_control_audit_records_with_the_attempt() {
+        let store = memory_store();
+        let sink = ListSink::new();
+        let (renderer, rendered) = capture();
+        let observer: MessageObserver =
+            Arc::new(move |msg: &Value| renderer(&msg["type"].to_string()));
+        let invoke = make_claude_code_invoke(
+            Path::new("/tmp"),
+            "claude-code",
+            &AgentOptions::default(),
+            Some(observer),
+            Some(ControlRoute {
+                store: store.clone(),
+                run_id: "run-ctl".into(),
+            }),
+            Some(sink.clone()),
+        );
+        drop(invoke);
+        assert!(rendered.lock().unwrap().is_empty());
+        assert!(sink.kinds().is_empty());
+    }
+
+    fn git_repo_with_commit() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        run(&["add", "f"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn resolve_base_commit_sha_in_and_out_of_git() {
+        let repo = git_repo_with_commit();
+        let sha = resolve_base_commit_sha(repo.path()).await.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_base_commit_sha(plain.path()).await, None);
+        assert_eq!(
+            resolve_base_commit_sha(Path::new("/nonexistent/dir")).await,
+            None
+        );
+    }
+
+    // --- CLI ----------------------------------------------------------------------------
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        strings(items)
+    }
+
+    fn expect_error(items: &[&str], usage: &str, prog: &str, message: &str) {
+        let exit = parse_args(&argv(items)).unwrap_err();
+        assert_eq!(
+            exit,
+            CliExit::Error {
+                usage: usage.to_owned(),
+                prog: prog.to_owned(),
+                message: message.to_owned(),
+            },
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn parse_errors_match_argparse() {
+        let run_prog = "python -m flywheel_core.workflow run";
+        expect_error(
+            &[],
+            MAIN_USAGE,
+            PROG,
+            "the following arguments are required: command",
+        );
+        expect_error(
+            &["bogus"],
+            MAIN_USAGE,
+            PROG,
+            "argument command: invalid choice: 'bogus' (choose from run, is-done, interrupt, steer, set-model, approve, reject)",
+        );
+        expect_error(
+            &["run"],
+            RUN_USAGE,
+            run_prog,
+            "the following arguments are required: GOAL_OR_FILE",
+        );
+        expect_error(
+            &["run", "g", "--max-turns", "abc"],
+            RUN_USAGE,
+            run_prog,
+            "argument --max-turns: invalid int value: 'abc'",
+        );
+        expect_error(
+            &["run", "g", "--max-retries", "1.5"],
+            RUN_USAGE,
+            run_prog,
+            "argument --max-retries: invalid int value: '1.5'",
+        );
+        expect_error(
+            &["run", "g", "--json", "--quiet"],
+            RUN_USAGE,
+            run_prog,
+            "argument --quiet: not allowed with argument --json",
+        );
+        expect_error(
+            &["run", "g", "--quiet", "--json"],
+            RUN_USAGE,
+            run_prog,
+            "argument --json: not allowed with argument --quiet",
+        );
+        expect_error(
+            &["run", "g", "--bogus"],
+            MAIN_USAGE,
+            PROG,
+            "unrecognized arguments: --bogus",
+        );
+        expect_error(
+            &["run", "g", "extra"],
+            MAIN_USAGE,
+            PROG,
+            "unrecognized arguments: extra",
+        );
+        expect_error(
+            &["interrupt", "--db", "x", "r1", "extra"],
+            MAIN_USAGE,
+            PROG,
+            "unrecognized arguments: extra",
+        );
+        expect_error(
+            &["run", "g", "--db"],
+            RUN_USAGE,
+            run_prog,
+            "argument --db: expected one argument",
+        );
+        expect_error(
+            &["run", "g", "--db", "--json"],
+            RUN_USAGE,
+            run_prog,
+            "argument --db: expected one argument",
+        );
+        expect_error(
+            &["run", "--check"],
+            RUN_USAGE,
+            run_prog,
+            "argument --check: expected one argument",
+        );
+        expect_error(
+            &["run", "g", "--ma", "1"],
+            RUN_USAGE,
+            run_prog,
+            "ambiguous option: --ma could match --max-turns, --max-retries",
+        );
+        expect_error(
+            &["run", "g", "--json=1"],
+            RUN_USAGE,
+            run_prog,
+            "argument --json: ignored explicit argument '1'",
+        );
+        expect_error(
+            &["reject", "r1", "--feedback"],
+            REJECT_USAGE,
+            "python -m flywheel_core.workflow reject",
+            "argument --feedback: expected one argument",
+        );
+        expect_error(
+            &["is-done"],
+            IS_DONE_USAGE,
+            "python -m flywheel_core.workflow is-done",
+            "the following arguments are required: task_file",
+        );
+        expect_error(
+            &["steer", "r1"],
+            STEER_USAGE,
+            "python -m flywheel_core.workflow steer",
+            "the following arguments are required: MESSAGE",
+        );
+        expect_error(
+            &["steer"],
+            STEER_USAGE,
+            "python -m flywheel_core.workflow steer",
+            "the following arguments are required: RUN_ID, MESSAGE",
+        );
+        expect_error(
+            &["set-model", "r1"],
+            SET_MODEL_USAGE,
+            "python -m flywheel_core.workflow set-model",
+            "the following arguments are required: MODEL",
+        );
+        expect_error(
+            &["approve"],
+            APPROVE_USAGE,
+            "python -m flywheel_core.workflow approve",
+            "the following arguments are required: RUN_ID",
+        );
+        expect_error(
+            &["interrupt"],
+            INTERRUPT_USAGE,
+            "python -m flywheel_core.workflow interrupt",
+            "the following arguments are required: RUN_ID",
+        );
+    }
+
+    #[test]
+    fn help_exits_match_argparse() {
+        let cases: [(&[&str], &str); 10] = [
+            (&["-h"], MAIN_HELP),
+            (&["--help"], MAIN_HELP),
+            (&["--he"], MAIN_HELP),
+            (&["run", "-h"], RUN_HELP),
+            (&["run", "-h", "g"], RUN_HELP),
+            (&["is-done", "--help"], IS_DONE_HELP),
+            (&["interrupt", "-h"], INTERRUPT_HELP),
+            (&["steer", "-h"], STEER_HELP),
+            (&["set-model", "-h"], SET_MODEL_HELP),
+            (&["approve", "-h"], APPROVE_HELP),
+        ];
+        for (items, help) in cases {
+            assert_eq!(
+                parse_args(&argv(items)).unwrap_err(),
+                CliExit::Help(help.to_owned()),
+                "{items:?}"
+            );
+        }
+        assert_eq!(
+            parse_args(&argv(&["reject", "r", "-h"])).unwrap_err(),
+            CliExit::Help(REJECT_HELP.to_owned())
+        );
+        assert_eq!(CliExit::Help(MAIN_HELP.to_owned()).report(), 0);
+        assert_eq!(
+            CliExit::error(
+                MAIN_USAGE,
+                PROG,
+                "the following arguments are required: command"
+            )
+            .report(),
+            2
+        );
+    }
+
+    #[test]
+    fn parse_run_defaults_options_and_prefixes() {
+        let parsed = parse_args(&argv(&["run", "do the thing"])).unwrap();
+        assert_eq!(
+            parsed,
+            Command::Run(RunArgs {
+                target: "do the thing".into(),
+                db: None,
+                check: Vec::new(),
+                rubric: Vec::new(),
+                sandbox: None,
+                model: None,
+                max_turns: DEFAULT_MAX_TURNS,
+                max_retries: DEFAULT_MAX_RETRIES,
+                json: false,
+                quiet: false,
+            })
+        );
+        let parsed = parse_args(&argv(&[
+            "run",
+            "--check",
+            "a",
+            "g",
+            "--check",
+            "b",
+            "--rubric",
+            "r",
+            "--max-turns=7",
+            "--max-r",
+            "2",
+            "--db",
+            "x.sqlite",
+            "--sandbox",
+            "sb",
+            "--mod",
+            "m",
+            "--quiet",
+            "--quiet",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Command::Run(RunArgs {
+                target: "g".into(),
+                db: Some("x.sqlite".into()),
+                check: strings(&["a", "b"]),
+                rubric: strings(&["r"]),
+                sandbox: Some("sb".into()),
+                model: Some("m".into()),
+                max_turns: 7,
+                max_retries: 2,
+                json: false,
+                quiet: true,
+            })
+        );
+        // `--` ends option parsing; a negative number is a value, not a flag.
+        let parsed = parse_args(&argv(&["run", "--", "-dash goal"])).unwrap();
+        assert!(
+            matches!(parsed, Command::Run(RunArgs { ref target, .. }) if target == "-dash goal")
+        );
+        let parsed = parse_args(&argv(&["run", "-1"])).unwrap();
+        assert!(matches!(parsed, Command::Run(RunArgs { ref target, .. }) if target == "-1"));
+        let parsed = parse_args(&argv(&["run", "g", "--max-turns", " +12 ", "--json"])).unwrap();
+        assert!(matches!(
+            parsed,
+            Command::Run(RunArgs {
+                max_turns: 12,
+                json: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_steering_verbs() {
+        assert_eq!(
+            parse_args(&argv(&["interrupt", "r1", "--db", "d"])).unwrap(),
+            Command::Interrupt {
+                run_id: "r1".into(),
+                db: Some("d".into())
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["steer", "r1", "hello there"])).unwrap(),
+            Command::Steer {
+                run_id: "r1".into(),
+                message: "hello there".into(),
+                db: None
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["set-model", "r1", "claude-x"])).unwrap(),
+            Command::SetModel {
+                run_id: "r1".into(),
+                model: "claude-x".into(),
+                db: None
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["approve", "r1"])).unwrap(),
+            Command::Approve {
+                run_id: "r1".into(),
+                db: None
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["reject", "r1", "--feedback", "needs tests"])).unwrap(),
+            Command::Reject {
+                run_id: "r1".into(),
+                feedback: Some("needs tests".into()),
+                db: None
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["is-done", "t.json"])).unwrap(),
+            Command::IsDone {
+                task_file: "t.json".into(),
+                db: None
+            }
+        );
+        assert_eq!(resolve_db(None), PathBuf::from(DEFAULT_DB_PATH));
+        assert_eq!(resolve_db(Some("")), PathBuf::from(DEFAULT_DB_PATH));
+        assert_eq!(resolve_db(Some("x.db")), PathBuf::from("x.db"));
+    }
+
+    #[test]
+    fn main_is_done_and_sqlite_pinned_verbs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state").join("flywheel.sqlite");
+        let db_arg = db.display().to_string();
+        let task_file = dir.path().join("task.json");
+        std::fs::write(
+            &task_file,
+            r#"{"id": "cli-task", "goal": "CLI.", "graders": []}"#,
+        )
+        .unwrap();
+        let task_arg = task_file.display().to_string();
+
+        assert_eq!(
+            main(&argv(&["is-done", "missing.json", "--db", &db_arg])),
+            2
+        );
+        assert_eq!(main(&argv(&["interrupt", "run-none", "--db", &db_arg])), 2);
+        assert!(
+            db.is_file(),
+            "the producer verb opens the sqlite store at --db"
+        );
+        assert_eq!(main(&argv(&["is-done", &task_arg, "--db", &db_arg])), 1);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let options = RunTaskOptions::default()
+            .with_invoke(verify_invoke())
+            .with_stream(Arc::new(|_line: &str| {}));
+        let outcome = runtime
+            .block_on(run_task_file(
+                &task_file,
+                &db,
+                &dir.path().join("sb"),
+                options,
+            ))
+            .unwrap();
+        assert_eq!(outcome.lifecycle.status, Status::Done);
+        assert_eq!(main(&argv(&["is-done", &task_arg, "--db", &db_arg])), 0);
+        // A done run is not in-flight: the command is enqueued with the stale note.
+        assert_eq!(
+            main(&argv(&[
+                "steer",
+                &outcome.lifecycle.run_id,
+                "hi",
+                "--db",
+                &db_arg
+            ])),
+            0
+        );
+        assert_eq!(
+            main(&argv(&[
+                "steer",
+                &outcome.lifecycle.run_id,
+                "",
+                "--db",
+                &db_arg
+            ])),
+            2
+        );
+        let store = SqliteStore::open(&db).unwrap();
+        let commands = store
+            .claim_commands(&outcome.lifecycle.run_id, Utc::now())
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].kind, CONTROL_COMMAND_SAY);
+        assert_eq!(commands[0].payload["text"], json!("hi"));
+        assert_eq!(main(&argv(&["bogus"])), 2);
+        assert_eq!(main(&argv(&["run", &task_arg, "--check", "true"])), 2);
+        assert_eq!(main(&argv(&["run", "   ", "--db", &db_arg])), 2);
+    }
+
+    #[test]
+    fn injected_store_lands_every_producer_verb() {
+        let store = memory_store();
+        seed_open(&store, "t1", "run-live", Status::Running);
+        seed_open(&store, "t1", "run-ready", Status::Ready);
+        let mut parked = Lifecycle::new("t1");
+        parked.run_id = "run-parked".into();
+        let now = Utc::now();
+        for status in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            parked.transition_to(status, "", Some(now)).unwrap();
+        }
+        store.create_lifecycle(&parked).unwrap();
+        let injected: Arc<dyn RunStore> = store.clone();
+        let unused = Path::new("/nonexistent/never-created.sqlite");
+
+        let verbs: [(&[&str], &str, Value); 5] = [
+            (
+                &["interrupt", "run-live"],
+                CONTROL_COMMAND_INTERRUPT,
+                json!({}),
+            ),
+            (
+                &["steer", "run-live", "focus"],
+                CONTROL_COMMAND_SAY,
+                json!({"text": "focus"}),
+            ),
+            (
+                &["set-model", "run-ready", "m2"],
+                CONTROL_COMMAND_SET_MODEL,
+                json!({"model": "m2"}),
+            ),
+            (
+                &["approve", "run-parked"],
+                CONTROL_COMMAND_APPROVE,
+                json!({}),
+            ),
+            (
+                &["reject", "run-parked", "--feedback", "no"],
+                CONTROL_COMMAND_REJECT,
+                json!({"feedback": "no"}),
+            ),
+        ];
+        for (items, kind, payload) in verbs {
+            assert_eq!(
+                main_with_store(&argv(items), Some(injected.clone())),
+                0,
+                "{items:?}"
+            );
+            let run_id = items[1];
+            let claimed = store.claim_commands(run_id, Utc::now()).unwrap();
+            let last = claimed.last().unwrap();
+            assert_eq!(last.kind, kind);
+            assert_eq!(Value::Object(last.payload.clone()), payload);
+        }
+        assert_eq!(
+            main_with_store(&argv(&["reject", "run-parked"]), Some(injected.clone())),
+            0
+        );
+        let claimed = store.claim_commands("run-parked", Utc::now()).unwrap();
+        assert!(claimed.last().unwrap().payload.is_empty());
+        assert_eq!(
+            main_with_store(&argv(&["approve", "run-none"]), Some(injected)),
+            2
+        );
+        assert!(!unused.exists());
+        assert_eq!(
+            enqueue_control_command(
+                unused,
+                "run-live",
+                CONTROL_COMMAND_SAY,
+                JsonObject::new(),
+                Some(store.clone())
+            ),
+            0
+        );
+        assert!(
+            !unused.exists(),
+            "an injected store never materializes the sqlite path"
+        );
+    }
+}

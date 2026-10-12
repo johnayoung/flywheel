@@ -625,8 +625,11 @@ pub async fn orchestrate(
         // Graph snapshot (spec 00055): one immutable cross-section at the
         // top of the pass, after graph/states/readiness are known and
         // BEFORE any dispatch. A pure read-and-record side channel.
+        // Assembled from the graph's surviving items: an isolated task
+        // (duplicate id, self-dependency, cycle) is not part of the graph
+        // this pass built, and a snapshot is keyed by task id.
         let snapshot_items = assemble_graph_snapshot_items(
-            &items,
+            graph.items(),
             graph,
             &states,
             &worker_capabilities,

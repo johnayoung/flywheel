@@ -1,0 +1,14 @@
+/home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/deps/serde-a79fe92f1a29f845.d: /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/build/serde-ad11d60d86a79bc9/out/private.rs
+
+/home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/deps/libserde-a79fe92f1a29f845.rlib: /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/build/serde-ad11d60d86a79bc9/out/private.rs
+
+/home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/deps/libserde-a79fe92f1a29f845.rmeta: /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/build/serde-ad11d60d86a79bc9/out/private.rs
+
+/home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/johnayoung/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/build/serde-ad11d60d86a79bc9/out/private.rs:
+
+# env-dep:OUT_DIR=/home/johnayoung/code/flywheel.worktrees/rust-rewrite/target/debug/build/serde-ad11d60d86a79bc9/out

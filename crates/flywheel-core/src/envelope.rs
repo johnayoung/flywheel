@@ -25,7 +25,12 @@ pub enum Intent {
 }
 
 impl Intent {
-    pub const ALL: [Intent; 4] = [Intent::Verify, Intent::Blocked, Intent::Continue, Intent::Abort];
+    pub const ALL: [Intent; 4] = [
+        Intent::Verify,
+        Intent::Blocked,
+        Intent::Continue,
+        Intent::Abort,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -98,9 +103,16 @@ pub struct ValidEnvelope {
 pub enum EnvelopeResult {
     Valid(ValidEnvelope),
     Missing,
-    Truncated { detail: String },
-    Duplicate { count: usize },
-    Malformed { reason: String, offending: Option<String> },
+    Truncated {
+        detail: String,
+    },
+    Duplicate {
+        count: usize,
+    },
+    Malformed {
+        reason: String,
+        offending: Option<String>,
+    },
 }
 
 impl EnvelopeResult {
@@ -150,7 +162,10 @@ fn json_type_name(v: &Value) -> &'static str {
 }
 
 fn malformed(reason: impl Into<String>, inner: &str) -> EnvelopeResult {
-    EnvelopeResult::Malformed { reason: reason.into(), offending: Some(truncate(inner)) }
+    EnvelopeResult::Malformed {
+        reason: reason.into(),
+        offending: Some(truncate(inner)),
+    }
 }
 
 fn parse_name_field(
@@ -204,8 +219,7 @@ fn parse_requirement(entry: &Value, inner: &str) -> Result<BlockedRequirement, E
             return Err(malformed(
                 format!(
                     "envelope 'requires' entry 'type' must be one of {:?}, got {}",
-                    VALID_REQUIREMENT_TYPES,
-                    other
+                    VALID_REQUIREMENT_TYPES, other
                 ),
                 inner,
             ));
@@ -251,7 +265,10 @@ fn parse_requirement(entry: &Value, inner: &str) -> Result<BlockedRequirement, E
                     ));
                 }
             };
-            Ok(BlockedRequirement::FileExists { path: path.clone(), present })
+            Ok(BlockedRequirement::FileExists {
+                path: path.clone(),
+                present,
+            })
         }
         _ => {
             let name = parse_name_field(entry, "env_var_set", inner)?;
@@ -285,7 +302,9 @@ fn parse_requires(
             inner,
         ));
     }
-    raw.iter().map(|entry| parse_requirement(entry, inner)).collect()
+    raw.iter()
+        .map(|entry| parse_requirement(entry, inner))
+        .collect()
 }
 
 /// Parse the loop-status envelope out of an agent iteration's output.
@@ -307,7 +326,9 @@ pub fn parse_envelope(output: &str) -> EnvelopeResult {
         };
     }
     if open_positions.len() > 1 {
-        return EnvelopeResult::Duplicate { count: open_positions.len() };
+        return EnvelopeResult::Duplicate {
+            count: open_positions.len(),
+        };
     }
     if close_positions.is_empty() {
         return EnvelopeResult::Truncated {
@@ -340,7 +361,10 @@ pub fn parse_envelope(output: &str) -> EnvelopeResult {
     };
     let Value::Object(data) = data else {
         return malformed(
-            format!("envelope payload must be a JSON object, got {}", json_type_name(&data)),
+            format!(
+                "envelope payload must be a JSON object, got {}",
+                json_type_name(&data)
+            ),
             inner,
         );
     };
@@ -353,7 +377,10 @@ pub fn parse_envelope(output: &str) -> EnvelopeResult {
     };
     let Some(intent) = intent else {
         return malformed(
-            format!("envelope 'intent' must be one of {:?}, got {}", VALID_INTENTS, raw_intent),
+            format!(
+                "envelope 'intent' must be one of {:?}, got {}",
+                VALID_INTENTS, raw_intent
+            ),
             inner,
         );
     };
@@ -378,7 +405,11 @@ pub fn parse_envelope(output: &str) -> EnvelopeResult {
     } else {
         Vec::new()
     };
-    EnvelopeResult::Valid(ValidEnvelope { intent, reason, requires })
+    EnvelopeResult::Valid(ValidEnvelope {
+        intent,
+        reason,
+        requires,
+    })
 }
 
 #[cfg(test)]
@@ -440,17 +471,44 @@ mod tests {
             ("{}", "missing required 'intent'"),
             (r#"{"intent":"finish"}"#, "must be one of"),
             (r#"{"intent":7}"#, "must be one of"),
-            (r#"{"intent":"verify","reason":3}"#, "'reason' must be a string"),
+            (
+                r#"{"intent":"verify","reason":3}"#,
+                "'reason' must be a string",
+            ),
             (r#"{"intent":"blocked"}"#, "missing required 'requires'"),
             (r#"{"intent":"blocked","requires":{}}"#, "must be a list"),
-            (r#"{"intent":"blocked","requires":[]}"#, "at least one predicate"),
-            (r#"{"intent":"blocked","requires":[1]}"#, "must each be a JSON object, got number"),
-            (r#"{"intent":"blocked","requires":[{}]}"#, "missing required 'type'"),
-            (r#"{"intent":"blocked","requires":[{"type":"x"}]}"#, "'type' must be one of"),
-            (r#"{"intent":"blocked","requires":[{"type":"command_grader"}]}"#, "missing required 'name'"),
-            (r#"{"intent":"blocked","requires":[{"type":"command_grader","name":""}]}"#, "non-empty string"),
-            (r#"{"intent":"blocked","requires":[{"type":"file_exists","path":"p","present":"y"}]}"#, "'present' must be a bool"),
-            (r#"{"intent":"blocked","requires":[{"type":"env_var_set","name":1}]}"#, "must be a string, got number"),
+            (
+                r#"{"intent":"blocked","requires":[]}"#,
+                "at least one predicate",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[1]}"#,
+                "must each be a JSON object, got number",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{}]}"#,
+                "missing required 'type'",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{"type":"x"}]}"#,
+                "'type' must be one of",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{"type":"command_grader"}]}"#,
+                "missing required 'name'",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{"type":"command_grader","name":""}]}"#,
+                "non-empty string",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{"type":"file_exists","path":"p","present":"y"}]}"#,
+                "'present' must be a bool",
+            ),
+            (
+                r#"{"intent":"blocked","requires":[{"type":"env_var_set","name":1}]}"#,
+                "must be a string, got number",
+            ),
         ];
         for (payload, expect) in cases {
             match parse_envelope(&wrap(payload)) {
@@ -477,10 +535,20 @@ mod tests {
         assert_eq!(
             v.requires,
             vec![
-                BlockedRequirement::CommandGrader { name: "tests".into() },
-                BlockedRequirement::FileExists { path: "a.txt".into(), present: true },
-                BlockedRequirement::FileExists { path: "b.txt".into(), present: false },
-                BlockedRequirement::EnvVarSet { name: "TOKEN".into() },
+                BlockedRequirement::CommandGrader {
+                    name: "tests".into()
+                },
+                BlockedRequirement::FileExists {
+                    path: "a.txt".into(),
+                    present: true
+                },
+                BlockedRequirement::FileExists {
+                    path: "b.txt".into(),
+                    present: false
+                },
+                BlockedRequirement::EnvVarSet {
+                    name: "TOKEN".into()
+                },
             ]
         );
         // Requirements round-trip through JSON with the same tagged shape.

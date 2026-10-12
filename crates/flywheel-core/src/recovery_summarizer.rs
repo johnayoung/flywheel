@@ -50,11 +50,20 @@ const REQUIRED_FIELDS: [&str; 4] = [
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandoffResult {
-    Valid { handoff: RecoveryHandoff },
+    Valid {
+        handoff: RecoveryHandoff,
+    },
     Missing,
-    Truncated { detail: String },
-    Duplicate { count: usize },
-    Malformed { reason: String, offending: Option<String> },
+    Truncated {
+        detail: String,
+    },
+    Duplicate {
+        count: usize,
+    },
+    Malformed {
+        reason: String,
+        offending: Option<String>,
+    },
 }
 
 impl HandoffResult {
@@ -122,7 +131,10 @@ fn json_type_name(v: &Value) -> &'static str {
 }
 
 fn malformed(reason: impl Into<String>, inner: &str) -> HandoffResult {
-    HandoffResult::Malformed { reason: reason.into(), offending: Some(truncate(inner)) }
+    HandoffResult::Malformed {
+        reason: reason.into(),
+        offending: Some(truncate(inner)),
+    }
 }
 
 /// Parse the recovery-handoff envelope out of a summarizer response.
@@ -175,7 +187,10 @@ pub fn parse_handoff(text: &str) -> HandoffResult {
 
     let Value::Object(data) = data else {
         return malformed(
-            format!("handoff payload must be a JSON object, got {}", json_type_name(&data)),
+            format!(
+                "handoff payload must be a JSON object, got {}",
+                json_type_name(&data)
+            ),
             inner,
         );
     };
@@ -228,7 +243,9 @@ pub struct RecoverySummarizerError {
 
 impl RecoverySummarizerError {
     pub fn new(reason: impl Into<String>) -> Self {
-        Self { reason: reason.into() }
+        Self {
+            reason: reason.into(),
+        }
     }
 }
 
@@ -284,7 +301,11 @@ and abort recovery.
 
 /// Render the summarizer prompt from the task goal, the cumulative
 /// diff/artifacts, and the recent transcript tail. Byte-deterministic.
-pub fn build_summarizer_prompt(task: &Task, cumulative_diff: &str, transcript_tail: &str) -> String {
+pub fn build_summarizer_prompt(
+    task: &Task,
+    cumulative_diff: &str,
+    transcript_tail: &str,
+) -> String {
     format!(
         "# Role\n\n\
          You are the recovery summarizer for a coding agent whose prior \
@@ -407,7 +428,12 @@ and abort recovery.
     }
 
     fn well_formed() -> String {
-        payload("implemented module X", "wire harness", "fresh-context summarizer", "run pytest")
+        payload(
+            "implemented module X",
+            "wire harness",
+            "fresh-context summarizer",
+            "run pytest",
+        )
     }
 
     fn task(goal: &str) -> Task {
@@ -436,7 +462,10 @@ and abort recovery.
 
     impl SummarizerInvoke for Scripted {
         fn invoke<'a>(&'a self, prompt: &'a str, worktree: &'a Path) -> SummarizerFuture<'a> {
-            self.calls.lock().unwrap().push((prompt.to_owned(), worktree.to_path_buf()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((prompt.to_owned(), worktree.to_path_buf()));
             let next = self
                 .responses
                 .lock()
@@ -452,12 +481,20 @@ and abort recovery.
 
     impl SummarizerInvoke for Raising {
         fn invoke<'a>(&'a self, _prompt: &'a str, _worktree: &'a Path) -> SummarizerFuture<'a> {
-            let err = self.0.lock().unwrap().take().expect("raising summarizer fires once");
+            let err = self
+                .0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("raising summarizer fires once");
             Box::pin(async move { Err(err) })
         }
     }
 
-    async fn run(invoker: &dyn SummarizerInvoke, worktree: Option<&Path>) -> Result<RecoveryHandoff, RecoverySummarizerError> {
+    async fn run(
+        invoker: &dyn SummarizerInvoke,
+        worktree: Option<&Path>,
+    ) -> Result<RecoveryHandoff, RecoverySummarizerError> {
         run_recovery_summarizer(&task("Implement feature foo."), "t", "d", worktree, invoker).await
     }
 
@@ -521,7 +558,9 @@ and abort recovery.
         let reversed = format!("{CLOSING_FENCE}{OPENING_FENCE}");
         assert_eq!(
             parse_handoff(&reversed),
-            HandoffResult::Truncated { detail: "closing fence appears before opening fence".into() }
+            HandoffResult::Truncated {
+                detail: "closing fence appears before opening fence".into()
+            }
         );
     }
 
@@ -534,7 +573,10 @@ and abort recovery.
         );
         assert_eq!(parse_handoff(&text), HandoffResult::Duplicate { count: 2 });
         let lopsided = format!("{OPENING_FENCE}{CLOSING_FENCE}{CLOSING_FENCE}");
-        assert_eq!(parse_handoff(&lopsided), HandoffResult::Duplicate { count: 2 });
+        assert_eq!(
+            parse_handoff(&lopsided),
+            HandoffResult::Duplicate { count: 2 }
+        );
     }
 
     #[test]
@@ -679,7 +721,9 @@ and abort recovery.
                 Ok(canned)
             }
         };
-        let handoff = run(&invoker, Some(Path::new("/tmp/wt-closure"))).await.unwrap();
+        let handoff = run(&invoker, Some(Path::new("/tmp/wt-closure")))
+            .await
+            .unwrap();
         assert_eq!(handoff.suggested_next_step, "run pytest");
     }
 
@@ -706,8 +750,14 @@ and abort recovery.
         let dup = format!("{}\n{}", wrap(&well_formed()), wrap(&well_formed()));
         let cases = [
             (String::new(), "missing handoff envelope"),
-            (wrap(r#"{"work_done": "wd", "work_remaining""#), "malformed handoff envelope"),
-            (format!("{OPENING_FENCE}\n{}", well_formed()), "truncated handoff envelope"),
+            (
+                wrap(r#"{"work_done": "wd", "work_remaining""#),
+                "malformed handoff envelope",
+            ),
+            (
+                format!("{OPENING_FENCE}\n{}", well_formed()),
+                "truncated handoff envelope",
+            ),
             (dup, "duplicate handoff envelopes (count=2)"),
             (
                 wrap(r#"{"work_done":"wd","work_remaining":"wr","key_decisions":"kd"}"#),
@@ -716,7 +766,9 @@ and abort recovery.
         ];
         for (response, expect) in cases {
             let summarizer = Scripted::new([response.clone()]);
-            let err = run(&summarizer, Some(Path::new("/tmp/wt"))).await.unwrap_err();
+            let err = run(&summarizer, Some(Path::new("/tmp/wt")))
+                .await
+                .unwrap_err();
             assert!(err.reason.contains(expect), "{response:?}: {}", err.reason);
         }
     }

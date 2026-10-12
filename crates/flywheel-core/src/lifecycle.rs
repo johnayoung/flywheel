@@ -333,8 +333,7 @@ impl Lifecycle {
         }
         let is_retry_edge = self.status.is_retry_source() && target == Status::Ready;
         self.status = target;
-        self.timestamps
-            .insert(target, now.unwrap_or_else(Utc::now));
+        self.timestamps.insert(target, now.unwrap_or_else(Utc::now));
         if is_retry_edge {
             self.retries += 1;
             self.error.clear();
@@ -427,7 +426,12 @@ mod tests {
             (Status::Ready, &[Status::Running]),
             (
                 Status::Running,
-                &[Status::Validating, Status::Failed, Status::Interrupted, Status::InternalError],
+                &[
+                    Status::Validating,
+                    Status::Failed,
+                    Status::Interrupted,
+                    Status::InternalError,
+                ],
             ),
             (
                 Status::Validating,
@@ -439,7 +443,10 @@ mod tests {
                     Status::InternalError,
                 ],
             ),
-            (Status::AwaitingApproval, &[Status::Done, Status::FailedValidation]),
+            (
+                Status::AwaitingApproval,
+                &[Status::Done, Status::FailedValidation],
+            ),
             (Status::FailedValidation, &[Status::Ready, Status::Failed]),
             (Status::InternalError, &[Status::Ready, Status::Failed]),
             (Status::Interrupted, &[Status::Ready]),
@@ -448,7 +455,11 @@ mod tests {
         ];
         for (from, targets) in spec {
             for to in Status::ALL {
-                assert_eq!(from.can_transition_to(to), targets.contains(&to), "{from} -> {to}");
+                assert_eq!(
+                    from.can_transition_to(to),
+                    targets.contains(&to),
+                    "{from} -> {to}"
+                );
             }
         }
     }
@@ -461,7 +472,10 @@ mod tests {
         assert_eq!(lc.timestamps[&Status::Ready], at(10));
         assert_eq!(
             lc.transition_to(Status::Done, "", None).unwrap_err(),
-            LifecycleTransitionError::IllegalEdge { from: Status::Ready, to: Status::Done }
+            LifecycleTransitionError::IllegalEdge {
+                from: Status::Ready,
+                to: Status::Done
+            }
         );
     }
 
@@ -474,7 +488,8 @@ mod tests {
             lc.transition_to(Status::Failed, "", None).unwrap_err(),
             LifecycleTransitionError::MissingError { to: Status::Failed }
         );
-        lc.transition_to(Status::InternalError, "boom", None).unwrap();
+        lc.transition_to(Status::InternalError, "boom", None)
+            .unwrap();
         assert_eq!(lc.error, "boom");
     }
 

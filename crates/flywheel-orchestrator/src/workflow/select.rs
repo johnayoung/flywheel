@@ -7,17 +7,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use flywheel_core::lifecycle::Status;
-use flywheel_core::store::{LifecycleFilter, LifecycleStore, StoreError};
+use flywheel_core::store::{LifecycleStore, StoreError};
 
 use crate::policy::WorkPolicy;
 use crate::rollup::{
-    PrerequisiteReachabilityHold, TaskState, TaskStatusRow, satisfied_prerequisites_from_store,
-    status_rows_for_items,
+    TaskState, TaskStatusRow, satisfied_prerequisites_from_store, status_rows_for_items,
 };
 use crate::sources::{DirectoryWorkSource, WorkItem, WorkSource};
 
 use super::{WorkflowError, python_path_str};
+pub use crate::orchestrate::{
+    LatestLifecycleRow, latest_lifecycle_row, reachability_held_prerequisites,
+};
 
 /// A status row paired with the work item it classifies.
 ///
@@ -44,34 +45,6 @@ impl StatusRow {
     pub fn task_file(&self) -> Option<&Path> {
         self.status.task_file.as_deref()
     }
-}
-
-/// The columns of the most recent lifecycle for a task, or `None` when no
-/// lifecycle exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LatestLifecycleRow {
-    pub run_id: String,
-    pub status: Status,
-    pub error: String,
-    pub blocked_requires_json: Option<String>,
-    pub awaiting_manual_ordinal: Option<u32>,
-}
-
-/// The most-recently-updated lifecycle for `task_id` through the public
-/// `list_lifecycles` surface (the first element of its
-/// `(updated_at DESC, run_id DESC)` order on every backend).
-pub fn latest_lifecycle_row<S: LifecycleStore + ?Sized>(
-    store: &S,
-    task_id: &str,
-) -> Result<Option<LatestLifecycleRow>, StoreError> {
-    let lifecycles = store.list_lifecycles(&LifecycleFilter::default().with_task_id(task_id))?;
-    Ok(lifecycles.into_iter().next().map(|lc| LatestLifecycleRow {
-        run_id: lc.run_id,
-        status: lc.status,
-        error: lc.error,
-        blocked_requires_json: lc.blocked_requires_json,
-        awaiting_manual_ordinal: lc.awaiting_manual_ordinal,
-    }))
 }
 
 /// Classify each work item against `store`, in item order, keeping the
@@ -193,144 +166,6 @@ pub fn git_capture(repo_root: &Path, args: &[&str]) -> (i32, String) {
     }
 }
 
-/// `git merge-base --is-ancestor ancestor rev`: exit 0 is "reachable";
-/// every non-zero exit (including an unresolvable revision) reads as "not
-/// an ancestor" so an unresolvable base fails closed.
-fn is_ancestor(repo_root: &Path, ancestor: &str, rev: &str) -> bool {
-    git_capture(repo_root, &["merge-base", "--is-ancestor", ancestor, rev]).0 == 0
-}
-
-/// The phase integration branch tip commit (`refs/heads/<phase_branch>`),
-/// or `None` when the ref does not exist.
-fn resolve_phase_branch_tip(repo_root: &Path, phase_branch: &str) -> Option<String> {
-    let (code, out) = git_capture(
-        repo_root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{phase_branch}"),
-        ],
-    );
-    if code != 0 {
-        return None;
-    }
-    let tip = out.trim();
-    (!tip.is_empty()).then(|| tip.to_owned())
-}
-
-/// Whether any `flywheel/phase/<phase>` integration branch exists -- the
-/// only landing strategy that creates them is the phase strategy, so this
-/// short-circuits the hold to a no-op for merge/pr repos.
-fn phase_branches_present(repo_root: &Path) -> bool {
-    let (code, out) = git_capture(
-        repo_root,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads/flywheel/phase/",
-        ],
-    );
-    code == 0 && !out.trim().is_empty()
-}
-
-/// The phase directory name a file-backed row belongs to, or `""` for a
-/// pathless (external) row.
-fn phase_of_row(row: &TaskStatusRow) -> String {
-    row.task_file
-        .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::file_name)
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-/// Dependents to withhold because a DONE cross-phase prerequisite's landed
-/// work is not yet reachable from the base they would branch from (spec
-/// 00079, #7).
-///
-/// Returns an empty map -- a total no-op preserving merge/pr scheduling --
-/// when `repo_root` / `true_base` is absent or no `flywheel/phase/*` branch
-/// exists. A hold is recorded only for a listed prerequisite that is in a
-/// *different* phase than the dependent, classified DONE, and whose phase
-/// branch tip is not an ancestor of `true_base`. A prerequisite whose phase
-/// branch no longer resolves is reachable and never holds; so is an
-/// unlisted one.
-pub fn reachability_held_prerequisites(
-    rows: &[TaskStatusRow],
-    repo_root: Option<&Path>,
-    true_base: Option<&str>,
-) -> BTreeMap<String, PrerequisiteReachabilityHold> {
-    let (Some(root), Some(base)) = (repo_root, true_base) else {
-        return BTreeMap::new();
-    };
-    if rows.is_empty() || !phase_branches_present(root) {
-        return BTreeMap::new();
-    }
-    let phase_by_id: BTreeMap<&str, String> = rows
-        .iter()
-        .map(|row| (row.task_id.as_str(), phase_of_row(row)))
-        .collect();
-    let state_by_id: BTreeMap<&str, TaskState> = rows
-        .iter()
-        .map(|row| (row.task_id.as_str(), row.state))
-        .collect();
-    let mut tip_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut ancestor_cache: BTreeMap<String, bool> = BTreeMap::new();
-    let mut holds = BTreeMap::new();
-    for row in rows {
-        let dep_phase = &phase_by_id[row.task_id.as_str()];
-        if dep_phase.is_empty() {
-            continue;
-        }
-        let mut held_by: Vec<String> = Vec::new();
-        let mut blocking_phase = String::new();
-        for prereq_id in &row.prerequisites {
-            let Some(prereq_phase) = phase_by_id.get(prereq_id.as_str()) else {
-                continue;
-            };
-            if prereq_phase.is_empty() || prereq_phase == dep_phase {
-                continue;
-            }
-            if state_by_id.get(prereq_id.as_str()) != Some(&TaskState::Done) {
-                continue;
-            }
-            let tip = tip_cache
-                .entry(prereq_phase.clone())
-                .or_insert_with(|| {
-                    resolve_phase_branch_tip(root, &format!("flywheel/phase/{prereq_phase}"))
-                })
-                .clone();
-            let Some(tip) = tip else {
-                continue;
-            };
-            let reachable = *ancestor_cache
-                .entry(tip.clone())
-                .or_insert_with(|| is_ancestor(root, &tip, base));
-            if reachable {
-                continue;
-            }
-            held_by.push(prereq_id.clone());
-            if blocking_phase.is_empty() {
-                blocking_phase = prereq_phase.clone();
-            }
-        }
-        if !held_by.is_empty() {
-            holds.insert(
-                row.task_id.clone(),
-                PrerequisiteReachabilityHold {
-                    task_id: row.task_id.clone(),
-                    blocking_phase,
-                    held_by,
-                },
-            );
-        }
-    }
-    holds
-}
-
-// --- The `next` verb --------------------------------------------------------------------
-
 /// Print the next eligible task's path (or source ref) and return 0; return
 /// 1 when nothing is eligible.
 ///
@@ -380,6 +215,8 @@ pub fn pick_output(pick: &StatusRow) -> PathBuf {
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::rollup::PrerequisiteReachabilityHold;
+    use flywheel_core::lifecycle::Status;
     use flywheel_core::store_memory::InMemoryStore;
     use tempfile::TempDir;
 

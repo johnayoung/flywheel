@@ -22,16 +22,16 @@
 //! (`[triage]`), `docs/autopilot.md`.
 
 use crate::github::{GhRunner, ProcessGhRunner};
-use crate::policy::{DEFAULT_POLICY_FILENAME, PolicyError, WorkPolicy, load_policy};
 use crate::sources::LogSink;
 use crate::triage::{
     TriageAgentOptions, TriageBoard, TriageError, TriagePass, TriagePassResult, TriageSeams,
     build_grader_executor, build_triage_authoring_invoker, resolve_base_sha,
 };
+pub use crate::workflow::load_effective_policy;
 use flywheel_core::audit::StopFlag;
 use std::cell::Cell;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,49 +165,6 @@ fn log_result(log: &LogSink, result: &TriagePassResult) {
 }
 
 // --- Policy resolution ------------------------------------------------------------------
-
-/// Load the policy the orchestrator verbs honor for an invocation.
-///
-/// Mirrors the orchestrate CLI's precedence (a local port of the Python
-/// `_workflow.load_effective_policy`, pending the workflow module):
-///
-/// * an explicit `policy_path` is loaded (a missing/invalid file is an
-///   error, propagated as [`PolicyError`]);
-/// * otherwise `flywheel.toml` in the working directory is auto-detected;
-/// * otherwise the parents of the working directory are searched toward the
-///   filesystem root, and a hit RE-ANCHORS the process there
-///   (`set_current_dir`) before loading, so every cwd-relative default
-///   resolves exactly as a repo-root invocation would;
-/// * otherwise there is no policy (`None`) and every default falls back to
-///   the built-in `.flywheel/` layout.
-///
-/// An empty `policy_path` is treated as "not specified".
-pub fn load_effective_policy(
-    policy_path: Option<&Path>,
-) -> Result<Option<WorkPolicy>, PolicyError> {
-    if let Some(path) = policy_path.filter(|p| !p.as_os_str().is_empty()) {
-        return load_policy(path).map(Some);
-    }
-    let candidate = Path::new(DEFAULT_POLICY_FILENAME);
-    if candidate.is_file() {
-        return load_policy(candidate).map(Some);
-    }
-    let cwd = std::env::current_dir().map_err(|err| PolicyError::Read {
-        path: PathBuf::from(DEFAULT_POLICY_FILENAME),
-        message: format!("cannot resolve the working directory: {err}"),
-    })?;
-    for parent in cwd.ancestors().skip(1) {
-        let found = parent.join(DEFAULT_POLICY_FILENAME);
-        if found.is_file() {
-            std::env::set_current_dir(parent).map_err(|err| PolicyError::Read {
-                path: found.clone(),
-                message: format!("cannot re-anchor to {}: {err}", parent.display()),
-            })?;
-            return load_policy(candidate).map(Some);
-        }
-    }
-    Ok(None)
-}
 
 /// Resolve the repo root (`git rev-parse --show-toplevel`) of the working
 /// directory. The error is the message to print before exiting 1.
@@ -690,9 +647,11 @@ pub fn run_main(argv: &[String], host: &dyn TriageHost) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyError;
     use crate::triage::test_support::ForbiddenGh;
     use crate::triage::{Decision, TriageOutcome};
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::Mutex;
 
     const GITHUB_SOURCE: &str =

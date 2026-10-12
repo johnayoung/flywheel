@@ -14,6 +14,7 @@ pub mod autopilot_activity;
 pub mod autopilot_run;
 pub mod autopilot_supervised_run;
 pub mod claims;
+pub mod claims_postgres;
 pub mod github;
 pub mod github_ci;
 pub mod github_review;

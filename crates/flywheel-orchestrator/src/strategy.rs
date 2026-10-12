@@ -26,16 +26,13 @@
 
 use crate::sources::{GraderReceipt, WorkItem};
 use flywheel_core::events::PARK_KIND_SUBMIT_ERROR;
-use flywheel_core::invoker::IterationResult;
 use flywheel_core::lifecycle::Status;
-use flywheel_core::task::{Task, TranscriptGrader};
+use flywheel_core::task::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
 // --- Requests -----------------------------------------------------------------
@@ -164,32 +161,10 @@ impl SubmitRequest {
 
 // --- Invocation seam --------------------------------------------------------------
 
-/// The data an invoker is handed for one agent iteration.
-///
-/// The orchestrator-side mirror of the Python harness's `InvocationRequest`
-/// (its data fields; the per-call observer callbacks are harness wiring,
-/// not request data). It lives here because the Rust core does not yet
-/// export the harness request type; a sandbox backend's [`InvokeWrapper`]
-/// is keyed on it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InvocationRequest {
-    pub prompt: String,
-    #[serde(default)]
-    pub transcript_graders: Vec<TranscriptGrader>,
-    pub attempt_number: u32,
-    pub iteration_number: u32,
-    #[serde(default)]
-    pub checkpoint_nudge_seconds: Option<f64>,
-    #[serde(default)]
-    pub agent_iteration_ceiling_seconds: Option<f64>,
-}
-
-/// The future one agent iteration resolves to.
-pub type InvokeFuture = Pin<Box<dyn Future<Output = IterationResult> + Send>>;
-
-/// One agent iteration as a shareable async function: the Rust spelling of
-/// the Python `InvokeFunc` (`Callable[[InvocationRequest], Awaitable[IterationResult]]`).
-pub type InvokeFn = Arc<dyn Fn(InvocationRequest) -> InvokeFuture + Send + Sync>;
+/// The invocation seam is owned by core: the request type, the future, and
+/// the shareable invoke function are re-exported here so sandbox backends
+/// key their [`InvokeWrapper`] on the same types the harness drives.
+pub use flywheel_core::agents_invoke::{InvocationRequest, InvokeFn, InvokeFuture};
 
 /// Wraps the run's base invoke so the iteration executes in the backend.
 ///
@@ -601,6 +576,7 @@ mod tests {
     use super::*;
     use flywheel_core::envelope::EnvelopeResult;
     use flywheel_core::invoker::InvocationSignals;
+    use flywheel_core::invoker::IterationResult;
     use flywheel_core::task::{CommandGrader, Grader};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -621,12 +597,9 @@ mod tests {
 
     fn request() -> InvocationRequest {
         InvocationRequest {
-            prompt: "do it".into(),
-            transcript_graders: Vec::new(),
             attempt_number: 1,
             iteration_number: 1,
-            checkpoint_nudge_seconds: None,
-            agent_iteration_ceiling_seconds: None,
+            ..InvocationRequest::new("do it")
         }
     }
 

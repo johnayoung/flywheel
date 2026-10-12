@@ -209,6 +209,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "flywheel-worktree"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flywheel-agents",
+ "flywheel-core",
+ "flywheel-orchestrator",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

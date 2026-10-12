@@ -1,0 +1,1923 @@
+{
+ "generated_by": "uv run python (DirectoryWorkSource over .flywheel/tasks, archive copied to a temp active/ tree)",
+ "active": {
+  "items": [],
+  "skipped_count": 0,
+  "skipped": []
+ },
+ "archive": {
+  "items": [
+   {
+    "file": "01-containment-floor/autopilot-daemon-circuit-breaker.json",
+    "id": "autopilot-daemon-circuit-breaker",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "5a2c2e637f0781aecef1ae83754e308cc6d2bc4a321edd672cc1a3e88b2129fc",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/directory-source-skip-bad-item.json",
+    "id": "directory-source-skip-bad-item",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "d5d91c23004c210a88ef7b7c0ffd9185bc9056c7731ffc796c1ecab4ea61a10c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/github-ci-source-skip-bad-item.json",
+    "id": "github-ci-source-skip-bad-item",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "de82592d234d9b1dd9cbb07c13736c351a5fb921bb3619ae54a538ecfe2ddf6a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/github-review-source-skip-bad-item.json",
+    "id": "github-review-source-skip-bad-item",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8e5b00678e6c80e78dd03bda9e216d3e68a86a8c19a52339a0f69a04e1bfddee",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/github-source-skip-bad-item.json",
+    "id": "github-source-skip-bad-item",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "7509df94c1d93a3b12e395a297aab84cda57800ec17d5b9e9688bf16fc0e8d1b",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/grader-spawn-failure-internal-error.json",
+    "id": "grader-spawn-failure-internal-error",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e2b17b5b84119e01e2c43479c593719700b8ccd314a571327c1f2d541c33c28c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/orchestrate-main-loop-contain-source-and-gate.json",
+    "id": "orchestrate-main-loop-contain-source-and-gate",
+    "phase": "01-containment-floor",
+    "prerequisites": [
+     "workgraph-isolate-invalid-task"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "27af8b1085e4cb38f5715ca24d6762e1f6aa15d55fa356e4bfbfdb38a6f9bbfd",
+    "source_kind": "directory"
+   },
+   {
+    "file": "01-containment-floor/workgraph-isolate-invalid-task.json",
+    "id": "workgraph-isolate-invalid-task",
+    "phase": "01-containment-floor",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "0c3ccd8534cfbd6d3afc1b6ca0d539bcbe72b0f78ede6fdec0002c082250ffad",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/agent-iteration-deadline.json",
+    "id": "agent-iteration-deadline",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-primitive",
+     "deadline-config-defaults"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "338c7317c4e3ef0bd625c9f6c027b6aba4f4512fa281c4d71f31f7e510a812a2",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/autopilot-agent-deadline.json",
+    "id": "autopilot-agent-deadline",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-primitive",
+     "deadline-config-defaults"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b73f6b7bd26377ccd55325f7abea5e8572f32d0058b8048a8a1013400d46bc24",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/command-grader-default-timeout.json",
+    "id": "command-grader-default-timeout",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-config-defaults"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b6c03fe5933335206d6579e439e79741c41ffc098f6bd325eaaa96906270ed16",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/deadline-config-defaults.json",
+    "id": "deadline-config-defaults",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-primitive"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "5651c95d094f3786e8117360266159137687fb61175274e1c0765ddccab3eb2d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/deadline-primitive.json",
+    "id": "deadline-primitive",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8f0d35a925489000d77f5f312638a943bc77c2c34d4eac5f16b26f8a6ffc79b0",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/docker-management-deadline.json",
+    "id": "docker-management-deadline",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-config-defaults"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "dbaecc2d6e66ef31b705d27488ead6ff05216660c88dbe0b5d77b978867d04bf",
+    "source_kind": "directory"
+   },
+   {
+    "file": "02-universal-deadlines/rubric-judge-deadline.json",
+    "id": "rubric-judge-deadline",
+    "phase": "02-universal-deadlines",
+    "prerequisites": [
+     "deadline-primitive",
+     "deadline-config-defaults"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "ad5f255b21f938b30b1e71037d8fa2f933cefd9eeeeebcfc6f3d3caba977356f",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/api-rate-limit-retry.json",
+    "id": "api-rate-limit-retry",
+    "phase": "03-transient-resilience",
+    "prerequisites": [
+     "transient-classifier-backoff"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8869bda813865536524bba8085a851f18a536367d25a263e5e81e3882b57a7a4",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/postgres-pool-bound.json",
+    "id": "postgres-pool-bound",
+    "phase": "03-transient-resilience",
+    "prerequisites": [
+     "transient-classifier-backoff"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "f5fa7390ae26676df657b1accddace64a9080be978d0ef1400f7fd93400362d7",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/schema-mismatch-permanent-stop.json",
+    "id": "schema-mismatch-permanent-stop",
+    "phase": "03-transient-resilience",
+    "prerequisites": [
+     "transient-classifier-backoff"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8727293cafb96b1536cc0200b7d375bd36ae4a58536249ae7b999cf9cdcd309d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/sqlite-store-retry.json",
+    "id": "sqlite-store-retry",
+    "phase": "03-transient-resilience",
+    "prerequisites": [
+     "transient-classifier-backoff"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b753e56e0fcd4f48ac6d0507a0e3838625bf2afb08e31126e0fee816bf0faf72",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/transient-classifier-backoff.json",
+    "id": "transient-classifier-backoff",
+    "phase": "03-transient-resilience",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "ee8129332c7332b4ec4e1c0b0cac7e88e0117be7903f254ff2760baa571a5c06",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/two-worker-double-claim-deflake.json",
+    "id": "two-worker-double-claim-deflake",
+    "phase": "03-transient-resilience",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e7fe5dfbdd7031fa53611aba1fe05a1a7df0ecb4e09f358af6b080114bb98e94",
+    "source_kind": "directory"
+   },
+   {
+    "file": "03-transient-resilience/worker-breaker-transient-integration.json",
+    "id": "worker-breaker-transient-integration",
+    "phase": "03-transient-resilience",
+    "prerequisites": [
+     "sqlite-store-retry",
+     "schema-mismatch-permanent-stop"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "1f8e8de8c006cb2e267005f4c6377162a5cb407a63b568c67d360015ad3bd699",
+    "source_kind": "directory"
+   },
+   {
+    "file": "04-stop-observability/per-run-park-records.json",
+    "id": "per-run-park-records",
+    "phase": "04-stop-observability",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "62fb7ad75bcb3585e6598a3bf2bedbe33a2ac220c05e126faf08a3876117057a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "04-stop-observability/per-task-stop-records.json",
+    "id": "per-task-stop-records",
+    "phase": "04-stop-observability",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "cadbd5c1833c7a3a21408c2eb602ee1e85acdad87b330961d7f91ec05814ad78",
+    "source_kind": "directory"
+   },
+   {
+    "file": "04-stop-observability/status-enumerates-stops.json",
+    "id": "status-enumerates-stops",
+    "phase": "04-stop-observability",
+    "prerequisites": [
+     "per-run-park-records",
+     "per-task-stop-records"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "717e50083d7ecff71e2418c75d21f8fb7f14731fc293e196977baff47f0829c8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/01-redriver-queue-surface.json",
+    "id": "redriver-queue-surface",
+    "phase": "05-work-redriver",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "741789162b4ca0d63c2d82cf00426ad2a45c022691a6d06cb8c4ccd3205c2255",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/02-redriver-lease-sweep.json",
+    "id": "redriver-lease-sweep",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "5c0d2b34d0d7444da04f6caa1d5946a8ad5b7607c6a8543d2e7abb0cbcefb6d9",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/03-redriver-landing-redriver.json",
+    "id": "redriver-landing-redriver",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface",
+     "redriver-lease-sweep"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "809d87c0f776babdc67775dbed92eefcb9c59419a19d38bd21eca859413de4ff",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/04-redriver-retry-escalation.json",
+    "id": "redriver-retry-escalation",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e2c6e3ae4ce2164217d7301c41a21f85f72e14bac35659d8e818a6a2fb360129",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/05-redriver-prereq-redriver.json",
+    "id": "redriver-prereq-redriver",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "38d3c162943c5cd42096b8eb0124e0f059e1285a6670643988e260d272b327c8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/06-redriver-no-progress-backoff.json",
+    "id": "redriver-no-progress-backoff",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "357e88db4c44ce4d3341b5187fcf45315a6b95c757664d035cef4d40489b36c7",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/07-redriver-human-gate-routing.json",
+    "id": "redriver-human-gate-routing",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-queue-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e5ae093b8fb39af607abb88d978273f5b8f02c3cbdbc4a3d51207f33071577bf",
+    "source_kind": "directory"
+   },
+   {
+    "file": "05-work-redriver/08-redriver-discipline-and-aggregate.json",
+    "id": "redriver-discipline-and-aggregate",
+    "phase": "05-work-redriver",
+    "prerequisites": [
+     "redriver-lease-sweep",
+     "redriver-landing-redriver",
+     "redriver-retry-escalation",
+     "redriver-prereq-redriver",
+     "redriver-no-progress-backoff",
+     "redriver-human-gate-routing"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "07590fc793423616a8248635c54d8c85c407cce507a286b8c0a0d061e60efb94",
+    "source_kind": "directory"
+   },
+   {
+    "file": "06-process-supervision/autopilot-liveness-record.json",
+    "id": "autopilot-liveness-record",
+    "phase": "06-process-supervision",
+    "prerequisites": [
+     "supervision-policy-core",
+     "console-supervisor-respawn"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "091600ccfcd5db943a4e425b928f03b557e8787803a22c1f6b4ef5a666a46e6e",
+    "source_kind": "directory"
+   },
+   {
+    "file": "06-process-supervision/console-supervisor-respawn.json",
+    "id": "console-supervisor-respawn",
+    "phase": "06-process-supervision",
+    "prerequisites": [
+     "supervision-policy-core"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "bea511a7ef0df2f2e4a46dfa9adb1aabd1d275bc3e61766b03f5c446a69f3f8c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "06-process-supervision/headless-supervised-autopilot.json",
+    "id": "headless-supervised-autopilot",
+    "phase": "06-process-supervision",
+    "prerequisites": [
+     "supervision-policy-core",
+     "autopilot-liveness-record",
+     "console-supervisor-respawn"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b2eb97bb717768d2dc25ca58c4c932600bae94122bfd19f074c819de7194268a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "06-process-supervision/pool-slot-retirement.json",
+    "id": "pool-slot-retirement",
+    "phase": "06-process-supervision",
+    "prerequisites": [
+     "supervision-policy-core"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "04dfa7d3c138e4f03f19e5dbf45039f6b015d3347a639edd61d7431f6c8fd7ad",
+    "source_kind": "directory"
+   },
+   {
+    "file": "06-process-supervision/supervision-policy-core.json",
+    "id": "supervision-policy-core",
+    "phase": "06-process-supervision",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "168f3a86caa7058dcbb27f3ea9b53325723d912fa81c89f6eabf096fa5b40392",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/bound-run-logs.json",
+    "id": "bound-run-logs",
+    "phase": "07-resource-hardening",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "1b7f57cd7ab193f9d509f12e3ffc5f4b9bbb793a19e51ae3e4348cba0b45cfc6",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/bound-supervisor-logs.json",
+    "id": "bound-supervisor-logs",
+    "phase": "07-resource-hardening",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel/src/flywheel/_autopilot_supervisor.py"
+    ],
+    "source_version": "405285a2d58470be0241fef659053c4f1dc4e1b96e7edede541a5cb815a2509d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/container-owner-marker.json",
+    "id": "container-owner-marker",
+    "phase": "07-resource-hardening",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-container/src/flywheel_container/_docker.py"
+    ],
+    "source_version": "1d277e0dcfa3d1d7ed24814cbe214e6044945184c8190a86248284560f64b93d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/disk-inode-preflight.json",
+    "id": "disk-inode-preflight",
+    "phase": "07-resource-hardening",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "314e075c36310f803876b6d40940235e61beec53867168a5561aa72195a437a1",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/reap-orphan-containers.json",
+    "id": "reap-orphan-containers",
+    "phase": "07-resource-hardening",
+    "prerequisites": [
+     "container-owner-marker"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-container/src/flywheel_container/_docker.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "bc3de13abe93b8f154833da0e36f92b8357c54f92216d30e020c4957c1d88eca",
+    "source_kind": "directory"
+   },
+   {
+    "file": "07-resource-hardening/recurring-worktree-sweep.json",
+    "id": "recurring-worktree-sweep",
+    "phase": "07-resource-hardening",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "cf5fec02da4a2446e4f1ef9af75ac1d97e81bfdd2c33ac792fb2d875550ddf14",
+    "source_kind": "directory"
+   },
+   {
+    "file": "08-agent-usage-surface/flywheel-ops-skill.json",
+    "id": "flywheel-ops-skill",
+    "phase": "08-agent-usage-surface",
+    "prerequisites": [
+     "fw-docs-verb"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "cdb923d1e39862fd55268d39e332b8cc43f24f9f82221323a84212b1669d9378",
+    "source_kind": "directory"
+   },
+   {
+    "file": "08-agent-usage-surface/fw-docs-verb.json",
+    "id": "fw-docs-verb",
+    "phase": "08-agent-usage-surface",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "93547f90c000a9c77d407f8b15417af8d587ed954dcaeb4ffa3206059fed8666",
+    "source_kind": "directory"
+   },
+   {
+    "file": "08-agent-usage-surface/init-claudemd-breadcrumb.json",
+    "id": "init-claudemd-breadcrumb",
+    "phase": "08-agent-usage-surface",
+    "prerequisites": [
+     "flywheel-ops-skill"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "0e1f33c9a2e37580820c2db99b2db0a68465773a2d0f5ff2b64ab6d289f9b9a3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/attempt-grader-history.json",
+    "id": "attempt-grader-history",
+    "phase": "09-run-decision-record",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "37149fd96ffa84414eaa768f486a7212571ec4286a859e5a35590c48158c0eef",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/audit-landing-stream.json",
+    "id": "audit-landing-stream",
+    "phase": "09-run-decision-record",
+    "prerequisites": [
+     "gate-verdict-record",
+     "landing-success-record"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "97840df0f93c76fe22804a5240f4dd8f4972624cd0645705beea1069a239d1be",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/gate-verdict-record.json",
+    "id": "gate-verdict-record",
+    "phase": "09-run-decision-record",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "afbdbcfcfea218a946b35a815c4b53f2d324875870308025988974af1000f973",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/landing-success-record.json",
+    "id": "landing-success-record",
+    "phase": "09-run-decision-record",
+    "prerequisites": [
+     "gate-verdict-record"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "272afe3a280ac54b66822a3a6ca6a9d9a326ab9bb933021605c3319e54cfa120",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/redrive-record.json",
+    "id": "redrive-record",
+    "phase": "09-run-decision-record",
+    "prerequisites": [
+     "landing-success-record"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "1d8dd57bbe92e30fd457c7883f8163fee9146a321bd32780e60b1656a04dde85",
+    "source_kind": "directory"
+   },
+   {
+    "file": "09-run-decision-record/run-detail-decision-surface.json",
+    "id": "run-detail-decision-surface",
+    "phase": "09-run-decision-record",
+    "prerequisites": [
+     "gate-verdict-record",
+     "landing-success-record",
+     "redrive-record",
+     "attempt-grader-history"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e10b2d6af75b0a2747d3c44411f00f1d6151edc326b7c0f9ed590fca0f6bc05f",
+    "source_kind": "directory"
+   },
+   {
+    "file": "10-redrive-gate-integrity/park-output-excerpts.json",
+    "id": "park-output-excerpts",
+    "phase": "10-redrive-gate-integrity",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "39d6c8cbe6eb727a3e98a7b8ede5b1651d30b0accd54f913e071b827e6ddf96e",
+    "source_kind": "directory"
+   },
+   {
+    "file": "10-redrive-gate-integrity/redrive-gate-reevaluation.json",
+    "id": "redrive-gate-reevaluation",
+    "phase": "10-redrive-gate-integrity",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "2fe682d8fd732ec34bb314abdb9f65c52d1d90a8eba31aa76603efb0a028c2d3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "11-distributed-store-unification/core-run-store-injection.json",
+    "id": "core-run-store-injection",
+    "phase": "11-distributed-store-unification",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "3944d7bc9e80d781ef47480b644fc4f14566f8bfd8cc73ab8850527f98c3488d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "11-distributed-store-unification/distributed-read-surfaces.json",
+    "id": "distributed-read-surfaces",
+    "phase": "11-distributed-store-unification",
+    "prerequisites": [
+     "postgres-data-plane-routing"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "3443a46adc204de6f3693812f95c987543b854fb13c8606dab511874fbc3c9f3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "11-distributed-store-unification/postgres-bootstrap-serialization.json",
+    "id": "postgres-bootstrap-serialization",
+    "phase": "11-distributed-store-unification",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b05229de936b0f6e4a8deb7e254a9b295a3a347d3ed17a660465368190244599",
+    "source_kind": "directory"
+   },
+   {
+    "file": "11-distributed-store-unification/postgres-data-plane-routing.json",
+    "id": "postgres-data-plane-routing",
+    "phase": "11-distributed-store-unification",
+    "prerequisites": [
+     "core-run-store-injection",
+     "postgres-bootstrap-serialization"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "2e93ad47453d1b60af7ce6be7ebe39e279c205d2201f9f27ccd468f91f59ca1b",
+    "source_kind": "directory"
+   },
+   {
+    "file": "11-distributed-store-unification/postgres-fail-loud.json",
+    "id": "postgres-fail-loud",
+    "phase": "11-distributed-store-unification",
+    "prerequisites": [
+     "postgres-data-plane-routing"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "7b109038f59fb4adcc9d689d24672f9aafdb6035013daad757efacf908bdc269",
+    "source_kind": "directory"
+   },
+   {
+    "file": "12-postgres-control-plane/approval-sweep-mark-expiry.json",
+    "id": "approval-sweep-mark-expiry",
+    "phase": "12-postgres-control-plane",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+    ],
+    "source_version": "ab3348dac79e62035e31fa57c469a2423036d7b6eb3a1e7edf9be0e1b8559647",
+    "source_kind": "directory"
+   },
+   {
+    "file": "12-postgres-control-plane/control-producer-store-routing.json",
+    "id": "control-producer-store-routing",
+    "phase": "12-postgres-control-plane",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-core/src/flywheel_core/workflow.py",
+     "packages/flywheel/src/flywheel/_cli.py"
+    ],
+    "source_version": "039d59ccf02715cbe16438f46a033d555d15536b14c2b6e36fbde35c613798c3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "12-postgres-control-plane/postgres-control-plane-e2e.json",
+    "id": "postgres-control-plane-e2e",
+    "phase": "12-postgres-control-plane",
+    "prerequisites": [
+     "control-producer-store-routing",
+     "approval-sweep-mark-expiry"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-core/src/flywheel_core/workflow.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+    ],
+    "source_version": "a52e696a38c93f4911c02cd5199603bbdb1cd2609ba80adf6c21b2fad0d52a9e",
+    "source_kind": "directory"
+   },
+   {
+    "file": "13-cross-phase-prereqs/cross-phase-prereq-rollup.json",
+    "id": "cross-phase-prereq-rollup",
+    "phase": "13-cross-phase-prereqs",
+    "prerequisites": [
+     "cross-phase-prereq-scheduling"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a34266580cc813acfc3d450aa24e2370c965d2e5900c1e58d5e7d5d39a6913af",
+    "source_kind": "directory"
+   },
+   {
+    "file": "13-cross-phase-prereqs/cross-phase-prereq-scheduling.json",
+    "id": "cross-phase-prereq-scheduling",
+    "phase": "13-cross-phase-prereqs",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "0e26770bbe3ef20532f90f293383c89e952a5a2a4850699c0ae9b3ec5c4462a0",
+    "source_kind": "directory"
+   },
+   {
+    "file": "14-attempt-budget-config/attempt-budgets-from-toml.json",
+    "id": "attempt-budgets-from-toml",
+    "phase": "14-attempt-budget-config",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-core/src/flywheel_core/harness.py",
+     "packages/flywheel-core/src/flywheel_core/workflow.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py"
+    ],
+    "source_version": "22b4490a471f9587e10ddbbb8e7f25ac1dd9b911644b4cbc2b6a0e58c7121ed5",
+    "source_kind": "directory"
+   },
+   {
+    "file": "14-attempt-budget-config/autopilot-deadline-from-toml.json",
+    "id": "autopilot-deadline-from-toml",
+    "phase": "14-attempt-budget-config",
+    "prerequisites": [
+     "attempt-budgets-from-toml"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "90576361af181cfdc0b6c4de64ed4588272d7b7a1d9e91ab5f5a8e8d6e3c0667",
+    "source_kind": "directory"
+   },
+   {
+    "file": "14-attempt-budget-config/docker-management-deadline-from-toml.json",
+    "id": "docker-management-deadline-from-toml",
+    "phase": "14-attempt-budget-config",
+    "prerequisites": [
+     "attempt-budgets-from-toml"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "cd8220d8c4e2bfe2c65249c84957b106d6320a47e25a5bc9fa8c637851cba58b",
+    "source_kind": "directory"
+   },
+   {
+    "file": "14-attempt-budget-config/document-attempt-budget-keys.json",
+    "id": "document-attempt-budget-keys",
+    "phase": "14-attempt-budget-config",
+    "prerequisites": [
+     "attempt-budgets-from-toml",
+     "autopilot-deadline-from-toml",
+     "docker-management-deadline-from-toml"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/configuration.md"
+    ],
+    "source_version": "eadd301f8e555e59835ede5978072b5b1238cf8ccb3ba15dfe56fa8f5201a183",
+    "source_kind": "directory"
+   },
+   {
+    "file": "15-unattended-landing-recovery/agentic-conflict-resolution.json",
+    "id": "agentic-conflict-resolution",
+    "phase": "15-unattended-landing-recovery",
+    "prerequisites": [
+     "landing-merge-fallback"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/configuration.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "d81cfe646f0a2c8abccdf4e1ae5a0e7d07fb6a88fd8c3ccd932a6ca5096e0098",
+    "source_kind": "directory"
+   },
+   {
+    "file": "15-unattended-landing-recovery/approval-parked-landing.json",
+    "id": "approval-parked-landing",
+    "phase": "15-unattended-landing-recovery",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py"
+    ],
+    "source_version": "3554d025a7d34af4de35587d553f7b4e93c2208608f7bcab3d7f52cb618a528c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "15-unattended-landing-recovery/landing-merge-fallback.json",
+    "id": "landing-merge-fallback",
+    "phase": "15-unattended-landing-recovery",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-core/src/flywheel_core/events.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "3eb85a7c5a2ddec5c9cc83661ddc663d8c0c60b46f45bf8c84ce176935598702",
+    "source_kind": "directory"
+   },
+   {
+    "file": "16-conflict-surface-lint/fw-plan-conflict-surface-checklist.json",
+    "id": "fw-plan-conflict-surface-checklist",
+    "phase": "16-conflict-surface-lint",
+    "prerequisites": [
+     "validate-surface-overlap-lint"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     ".claude/skills/fw-plan/SKILL.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/fw-plan-delivery-directory.md"
+    ],
+    "source_version": "4a83d510bd30be5d8d1900257ae0282aa0a63c008f14705d777543ad04868a27",
+    "source_kind": "directory"
+   },
+   {
+    "file": "16-conflict-surface-lint/validate-surface-overlap-lint.json",
+    "id": "validate-surface-overlap-lint",
+    "phase": "16-conflict-surface-lint",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/cli.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_autopilot.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_sources.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "875f3c339fce98d7c62ee49d9e5dd152e84e9d056f9b5925ed056123313221ba",
+    "source_kind": "directory"
+   },
+   {
+    "file": "17-run-loop-resilience/checkpoint-nudge-injection.json",
+    "id": "checkpoint-nudge-injection",
+    "phase": "17-run-loop-resilience",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "core-harness",
+     "packages/flywheel-core/src/flywheel_core/harness.py",
+     "packages/flywheel-core/src/flywheel_core/workflow.py"
+    ],
+    "source_version": "32b751bae806284db651fcad7637e2303c0fe350f00bd0252bf17a5c10d9575d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "17-run-loop-resilience/checkpoint-nudge-wiring.json",
+    "id": "checkpoint-nudge-wiring",
+    "phase": "17-run-loop-resilience",
+    "prerequisites": [
+     "checkpoint-nudge-injection"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/configuration.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+     "worker-config-surface"
+    ],
+    "source_version": "e2d276591b2547055fce4450d466a3ffe23c07f254546c20ad2f33ee2a3159e2",
+    "source_kind": "directory"
+   },
+   {
+    "file": "17-run-loop-resilience/session-limit-claim-pause.json",
+    "id": "session-limit-claim-pause",
+    "phase": "17-run-loop-resilience",
+    "prerequisites": [
+     "session-limit-classification"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/configuration.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_orchestrate.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+     "worker-config-surface"
+    ],
+    "source_version": "7d95540b957b4c71f2b31da6003c65758e39b2aaa90e939bf4875da354e80417",
+    "source_kind": "directory"
+   },
+   {
+    "file": "17-run-loop-resilience/session-limit-classification.json",
+    "id": "session-limit-classification",
+    "phase": "17-run-loop-resilience",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "core-harness",
+     "packages/flywheel-core/src/flywheel_core/harness.py"
+    ],
+    "source_version": "1198743f845256f21732825b0d354a69235805dc415ed92206e4a0bdd2061a6a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "18-phase-archival-integrity/archive-landed-predicate.json",
+    "id": "archive-landed-predicate",
+    "phase": "18-phase-archival-integrity",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+     "packages/flywheel/src/flywheel/_tui.py"
+    ],
+    "source_version": "ca3a4c407cb8960607b9ff656cc82eb906b48e0ffc180c739dd0511400012c86",
+    "source_kind": "directory"
+   },
+   {
+    "file": "18-phase-archival-integrity/resolve-strand-verb.json",
+    "id": "resolve-strand-verb",
+    "phase": "18-phase-archival-integrity",
+    "prerequisites": [
+     "strand-resolution-attribution"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "docs/cli.md",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+     "packages/flywheel/src/flywheel/_cli.py"
+    ],
+    "source_version": "0fb2dbb4e2acc371e1c8c6bb309bb894b95b7694dd382093d9dcd2ab7d503620",
+    "source_kind": "directory"
+   },
+   {
+    "file": "18-phase-archival-integrity/strand-resolution-attribution.json",
+    "id": "strand-resolution-attribution",
+    "phase": "18-phase-archival-integrity",
+    "prerequisites": [
+     "archive-landed-predicate"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_claims.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "91c0bde378d4b178486b0b7fe037c1b44e4bf29d2c6930feca397f1667d1da21",
+    "source_kind": "directory"
+   },
+   {
+    "file": "18-phase-archival-integrity/stranded-surface-store-backed.json",
+    "id": "stranded-surface-store-backed",
+    "phase": "18-phase-archival-integrity",
+    "prerequisites": [
+     "strand-resolution-attribution"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "b8b2094a86aca737fd3f91745f739cbd067a74bc80a883dbe4528ba241b68a9e",
+    "source_kind": "directory"
+   },
+   {
+    "file": "19-commit-provenance-trailers/fw-show-commit-lookup.json",
+    "id": "fw-show-commit-lookup",
+    "phase": "19-commit-provenance-trailers",
+    "prerequisites": [
+     "merge-landing-trailer-stamp"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "e6a5694a7d6094192794ab9d46e86575a4d5fa5df4d7e2ef87e64761dfe04100",
+    "source_kind": "directory"
+   },
+   {
+    "file": "19-commit-provenance-trailers/merge-landing-trailer-stamp.json",
+    "id": "merge-landing-trailer-stamp",
+    "phase": "19-commit-provenance-trailers",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "b7fed0b702313b4faf5f2bdb2937881ed298728fe4318f5a8c5ac9faeeac3078",
+    "source_kind": "directory"
+   },
+   {
+    "file": "19-commit-provenance-trailers/pr-push-trailer-stamp.json",
+    "id": "pr-push-trailer-stamp",
+    "phase": "19-commit-provenance-trailers",
+    "prerequisites": [
+     "merge-landing-trailer-stamp"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "a25bc9efb2fd20211939778803ac037002a253a16d72dd4a49112748f16959e6",
+    "source_kind": "directory"
+   },
+   {
+    "file": "20-phase-branch-landing/phase-archival-on-merge.json",
+    "id": "phase-archival-on-merge",
+    "phase": "20-phase-branch-landing",
+    "prerequisites": [
+     "phase-pr-at-completion",
+     "archive-landed-predicate"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py",
+     "packages/flywheel/src/flywheel/_tui.py"
+    ],
+    "source_version": "0cf2d8b6d6630e2b5c0fc773bf163ab5002d9c275640807cc0efd6c6b9c8345c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "20-phase-branch-landing/phase-pr-at-completion.json",
+    "id": "phase-pr-at-completion",
+    "phase": "20-phase-branch-landing",
+    "prerequisites": [
+     "phase-strategy-landing"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "27ba818fad85b510aaf3c7585912de1b117cd6e665375861d07b534b05c9dba2",
+    "source_kind": "directory"
+   },
+   {
+    "file": "20-phase-branch-landing/phase-pr-completion-reconcile.json",
+    "id": "phase-pr-completion-reconcile",
+    "phase": "20-phase-branch-landing",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/pr.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "9d45b4b65873aeb245bcd9c8eeb79c1b0636156cd9f44f876e2a730c49f45ed3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "20-phase-branch-landing/phase-prereq-reachability-hold.json",
+    "id": "phase-prereq-reachability-hold",
+    "phase": "20-phase-branch-landing",
+    "prerequisites": [
+     "phase-strategy-landing",
+     "cross-phase-prereq-scheduling"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_rollup.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_work_graph.py",
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_workflow.py"
+    ],
+    "source_version": "beafd44031e50ab7c753f1a28f3ced38a90d5adcf7b9e6f5c999fb651a00a092",
+    "source_kind": "directory"
+   },
+   {
+    "file": "20-phase-branch-landing/phase-strategy-landing.json",
+    "id": "phase-strategy-landing",
+    "phase": "20-phase-branch-landing",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [
+     "packages/flywheel-orchestrator/src/flywheel_orchestrator/_policy.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/_submit_registry.py",
+     "packages/flywheel-worktree/src/flywheel_worktree/worker.py"
+    ],
+    "source_version": "dbd3712625b32709647ce100f61d8e15ab02f09caf411ea8c11c9f48ef1ffeb8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "21-github-issue-triage/github-drain-trust.json",
+    "id": "github-drain-trust",
+    "phase": "21-github-issue-triage",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a6dd021238df215464ea4f798c750475b44855e8f8f60fbcd5deee9dda00996a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "21-github-issue-triage/triage-compile-pass.json",
+    "id": "triage-compile-pass",
+    "phase": "21-github-issue-triage",
+    "prerequisites": [
+     "github-drain-trust"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8d5b007b3a7104aeb4aece9e2453f03f01bb21abce163d4ccf1bfe60087128db",
+    "source_kind": "directory"
+   },
+   {
+    "file": "21-github-issue-triage/triage-pass-hygiene.json",
+    "id": "triage-pass-hygiene",
+    "phase": "21-github-issue-triage",
+    "prerequisites": [
+     "triage-compile-pass"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b468c15ec800c6c22a8933fbf15fccfb60688fa171c95ce22dcb56906d23d10d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "21-github-issue-triage/triage-verb-daemon.json",
+    "id": "triage-verb-daemon",
+    "phase": "21-github-issue-triage",
+    "prerequisites": [
+     "triage-pass-hygiene"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a7fbca98f1ee2bb64600b07b6e777472129b722b1b898a97c5a81ea759ebb61a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "activate-held-out-gate/01-held-out-gate-activate-config.json",
+    "id": "held-out-gate-activate-config",
+    "phase": "activate-held-out-gate",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "57c0b70d1144022d3e6b5cb380ab84904e8a720cabd694ebc3e24f7231e33ea7",
+    "source_kind": "directory"
+   },
+   {
+    "file": "activate-held-out-gate/02-held-out-gate-prove-end-to-end.json",
+    "id": "held-out-gate-prove-end-to-end",
+    "phase": "activate-held-out-gate",
+    "prerequisites": [
+     "held-out-gate-activate-config"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "c7bb678fbdd210f89b949f62cd27bb9407bc3a110567268529958eb62f892c31",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/01-autopilot-scoring.json",
+    "id": "autopilot-scoring",
+    "phase": "autopilot-mvp",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "1c5d56468964c4fe9f8120921ed591638e91e98a6fd3cff3f3de5b6de6c4a5e2",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/02-autopilot-discovery.json",
+    "id": "autopilot-discovery",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-scoring"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "c8ba2b21d6709ab92042fd50feca291dc7839127be1e30697c0b42a6ebc4194a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/03-autopilot-authoring.json",
+    "id": "autopilot-authoring",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-discovery"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "88aee6789d9e30c35196b5f75307fdc431d4fe2493c95f90ec48c5fa91915afa",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/04-autopilot-loop.json",
+    "id": "autopilot-loop",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-scoring",
+     "autopilot-discovery",
+     "autopilot-authoring"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "ebcf0aa40f1dba8bc1f90bd72be8eeec1dcd29db354a7119a777dfa2c3cadffb",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/05-autopilot-e2e.json",
+    "id": "autopilot-e2e",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-loop"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "4be59ed0dd7bac11e620a32e42cc7debdf830b1fb74a18fa99f1180654eb5a9a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/06-autopilot-daemon.json",
+    "id": "autopilot-daemon",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-loop"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "ddb0313025040820d8e44b2851b98490b29229427536c26063fc7bb626d7b4e3",
+    "source_kind": "directory"
+   },
+   {
+    "file": "autopilot-mvp/07-autopilot-activation.json",
+    "id": "autopilot-activation",
+    "phase": "autopilot-mvp",
+    "prerequisites": [
+     "autopilot-daemon"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8aca57de015182fe994e81b6dde0b739d33095a25d076d1ca08731be7dcbd08e",
+    "source_kind": "directory"
+   },
+   {
+    "file": "distributed-scheduling-metadata/01-scheduling-metadata-fields.json",
+    "id": "scheduling-metadata-fields",
+    "phase": "distributed-scheduling-metadata",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "408387322dac0c3a13d3258a395ff3909b927bdeb72504c9c4f29b2cc6712c0f",
+    "source_kind": "directory"
+   },
+   {
+    "file": "distributed-scheduling-metadata/02-priority-capability-scheduling.json",
+    "id": "priority-capability-scheduling",
+    "phase": "distributed-scheduling-metadata",
+    "prerequisites": [
+     "scheduling-metadata-fields"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "6ceba9b5f0b118dabf8330d37d792caac68693dabae0a8120e9f9890c98839ab",
+    "source_kind": "directory"
+   },
+   {
+    "file": "distributed-scheduling-metadata/03-conflict-key-exclusion.json",
+    "id": "conflict-key-exclusion",
+    "phase": "distributed-scheduling-metadata",
+    "prerequisites": [
+     "scheduling-metadata-fields"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "d5d5b1b7337b11bb0903c78ba0193496e62ebc843b3cdd30f35fddb8756b8eb6",
+    "source_kind": "directory"
+   },
+   {
+    "file": "distributed-scheduling-metadata/04-claim-liveness-sweep.json",
+    "id": "claim-liveness-sweep",
+    "phase": "distributed-scheduling-metadata",
+    "prerequisites": [
+     "conflict-key-exclusion"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "18f16cfecc1f100429702fa307995ac9acfaba847120fe4a1d2744c7ea8aea03",
+    "source_kind": "directory"
+   },
+   {
+    "file": "execution-mode-guard/execution-mode-guard.json",
+    "id": "execution-mode-guard",
+    "phase": "execution-mode-guard",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "e210a472a6fe2f44e40bacb7ccfce32a0f8d05b4c7647537ed801f0e3e441898",
+    "source_kind": "directory"
+   },
+   {
+    "file": "github-ci-failure-source/01-github-ci-source.json",
+    "id": "github-ci-source",
+    "phase": "github-ci-failure-source",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b0739d6b777946aab1ecf89a4dc497e1f7fd8b062f2ebd68056002ef243e7c98",
+    "source_kind": "directory"
+   },
+   {
+    "file": "github-ci-failure-source/02-github-ci-loop-integration.json",
+    "id": "github-ci-loop-integration",
+    "phase": "github-ci-failure-source",
+    "prerequisites": [
+     "github-ci-source"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "5bdef053e2c59625099567db4359b16f3f7d774c17a95b0e4ec06093ce1c6c11",
+    "source_kind": "directory"
+   },
+   {
+    "file": "github-source-listing-truncation/01-truncation-warning-issue-source.json",
+    "id": "truncation-warning-issue-source",
+    "phase": "github-source-listing-truncation",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "63eadcbf29ae8f4fa29c1c50566155991b222068c8aeba0479463212686bf0b8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "github-source-listing-truncation/02-truncation-warning-ci-review-sources.json",
+    "id": "truncation-warning-ci-review-sources",
+    "phase": "github-source-listing-truncation",
+    "prerequisites": [
+     "truncation-warning-issue-source"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a662db71f4e40cd1d1c09edd04bd86a390f54e65ba0e5951cb7e6bc0c83cde22",
+    "source_kind": "directory"
+   },
+   {
+    "file": "graph-snapshots/01-graph-snapshot-store.json",
+    "id": "graph-snapshot-store",
+    "phase": "graph-snapshots",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "88425c7996de932ea4e3766f21f5328e4156b8367c3cd3c749dd47aaa237c7e9",
+    "source_kind": "directory"
+   },
+   {
+    "file": "graph-snapshots/02-graph-snapshot-loop-integration.json",
+    "id": "graph-snapshot-loop-integration",
+    "phase": "graph-snapshots",
+    "prerequisites": [
+     "graph-snapshot-store"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "9e4dd9adbd1cdf47e0dc0c801f66851c82df49acceb394e29ce751d9c06305de",
+    "source_kind": "directory"
+   },
+   {
+    "file": "graph-snapshots/03-graph-snapshot-postgres.json",
+    "id": "graph-snapshot-postgres",
+    "phase": "graph-snapshots",
+    "prerequisites": [
+     "graph-snapshot-store"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "7a42ff313fd0da0c3629ee10257c838d72b672de5d82e5fa1f128ca51a791e92",
+    "source_kind": "directory"
+   },
+   {
+    "file": "held-out-landing-gate/01-held-out-gate-engine.json",
+    "id": "held-out-gate-engine",
+    "phase": "held-out-landing-gate",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "17b383547fcf60298cb97126c14477b97ad8680addbd424689028609b9da5e1b",
+    "source_kind": "directory"
+   },
+   {
+    "file": "held-out-landing-gate/02-held-out-landing-integration.json",
+    "id": "held-out-landing-integration",
+    "phase": "held-out-landing-gate",
+    "prerequisites": [
+     "held-out-gate-engine"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "919a754b8b11c9f07010e5a64e6038748766a22edce399fc3434a793fe4ed1d5",
+    "source_kind": "directory"
+   },
+   {
+    "file": "held-out-oracle-registration/01-held-out-gate-activation.json",
+    "id": "held-out-gate-activation",
+    "phase": "held-out-oracle-registration",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a1eea046788dcb45d9be183cd15af1539b57b4173b2f906054066612e0d6de14",
+    "source_kind": "directory"
+   },
+   {
+    "file": "held-out-oracle-registration/02-held-out-registration-shape.json",
+    "id": "held-out-registration-shape",
+    "phase": "held-out-oracle-registration",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "dc5d43e40b41e194ba1dca29c7d0b8baa6734e27571808ab27d0b83343c4cc6c",
+    "source_kind": "directory"
+   },
+   {
+    "file": "held-out-oracle-registration/03-fw-verify-emits-registration.json",
+    "id": "fw-verify-emits-registration",
+    "phase": "held-out-oracle-registration",
+    "prerequisites": [
+     "held-out-registration-shape"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "9781a3441b272ccf549d5aee69d838b818162ff4087bc134c2f3748e1ffceba8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "landable-change-gate/01-landable-change-predicate.json",
+    "id": "landable-change-predicate",
+    "phase": "landable-change-gate",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "3f47e9d1058507673ea7dd4821c020e9da7a4d8550630d9534658da427c36906",
+    "source_kind": "directory"
+   },
+   {
+    "file": "landable-change-gate/02-landable-change-gate.json",
+    "id": "landable-change-gate",
+    "phase": "landable-change-gate",
+    "prerequisites": [
+     "landable-change-predicate"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "15fb9aa0803c84c9c3ab78c7c2a631a4a8fe4dfbf5728d4fa7a5c27a76ecc566",
+    "source_kind": "directory"
+   },
+   {
+    "file": "orchestrator-events/01-event-ledger-store.json",
+    "id": "event-ledger-store",
+    "phase": "orchestrator-events",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "fc32775c004da3a6fac172c8543a55f579c394ba1498e1e0e56d0f24741914ac",
+    "source_kind": "directory"
+   },
+   {
+    "file": "orchestrator-events/02-event-ledger-postgres.json",
+    "id": "event-ledger-postgres",
+    "phase": "orchestrator-events",
+    "prerequisites": [
+     "event-ledger-store"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "bc1785451057d7c0d877baacc18bfbdf601f42147c32a25ab411a4503e540ff0",
+    "source_kind": "directory"
+   },
+   {
+    "file": "orchestrator-persistence-v2/01-workitem-provenance.json",
+    "id": "workitem-provenance",
+    "phase": "orchestrator-persistence-v2",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "f1e101c4665fd385ee64e452d3e0a535423f5f7682553c7534d2135b9e344bf7",
+    "source_kind": "directory"
+   },
+   {
+    "file": "orchestrator-persistence-v2/02-workitem-persistence.json",
+    "id": "workitem-persistence",
+    "phase": "orchestrator-persistence-v2",
+    "prerequisites": [
+     "workitem-provenance"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "991de2a7e62aa95ed3b8b0ff7feaf4ee5991a09051223f513485f387f2b6ce81",
+    "source_kind": "directory"
+   },
+   {
+    "file": "orchestrator-persistence-v2/03-source-sync-recording.json",
+    "id": "source-sync-recording",
+    "phase": "orchestrator-persistence-v2",
+    "prerequisites": [
+     "workitem-persistence"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "97d33f431386d01339c7dc8d1ec5dace1fb3cab58c35c6b8283885c290a56d7a",
+    "source_kind": "directory"
+   },
+   {
+    "file": "pr-review-thread-source/01-pr-review-source.json",
+    "id": "pr-review-source",
+    "phase": "pr-review-thread-source",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "fcbd87f5a021fd3392a78b9694d94ff8b636ff48f4309f7dd07c79284b6a292b",
+    "source_kind": "directory"
+   },
+   {
+    "file": "pr-review-thread-source/02-pr-review-loop-integration.json",
+    "id": "pr-review-loop-integration",
+    "phase": "pr-review-thread-source",
+    "prerequisites": [
+     "pr-review-source"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "ec97be284bb20e896c49fb2cc46643782166480ae3dc449ec4d1144266e17463",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-budget/sandbox-budget-ceilings.json",
+    "id": "sandbox-budget-ceilings",
+    "phase": "sandbox-budget",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "0db84ce05aaa27f85a3f84a13c65328786cc5f8d5807b0078d33940053dcc474",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-budget/sandbox-limit-threading.json",
+    "id": "sandbox-limit-threading",
+    "phase": "sandbox-budget",
+    "prerequisites": [
+     "sandbox-budget-ceilings"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "6e076df554f2378fefa1fb28da8e02682ea0cc8be7ef2d94f41c91ab3833bf76",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-capabilities/sandbox-capability-presets.json",
+    "id": "sandbox-capability-presets",
+    "phase": "sandbox-capabilities",
+    "prerequisites": [
+     "sandbox-exec-wiring"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "cd40dabb383206d339c013dfbbe837f7ab8a4dbb646a9aa315dfec6ed95f2823",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-capabilities/sandbox-exec-wiring.json",
+    "id": "sandbox-exec-wiring",
+    "phase": "sandbox-capabilities",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "32e53a8de2e64eed752a4e4011f4a0d6f1ec68db190ee52ca1b4617a0106274d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-env/sandbox-env-builder.json",
+    "id": "sandbox-env-builder",
+    "phase": "sandbox-env",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "a7a09864226af81cf46592004c937e3c451a3d3554a2cdeb1a5311ef6998e601",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-env/sandbox-env-decomposition.json",
+    "id": "sandbox-env-decomposition",
+    "phase": "sandbox-env",
+    "prerequisites": [
+     "sandbox-env-builder"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "9210e0e0cf7046016856c0e31bfda8afbb780f09662f6c1ca341ab589d90b1ec",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-foundation/sandbox-policy-live-wire.json",
+    "id": "sandbox-policy-live-wire",
+    "phase": "sandbox-foundation",
+    "prerequisites": [
+     "sandbox-policy-surface"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "c56bba6f5ef3af8b239d4ad520ad203f69eb2acf41e0ff3d7238157ea46053a0",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-foundation/sandbox-policy-surface.json",
+    "id": "sandbox-policy-surface",
+    "phase": "sandbox-foundation",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "49009bba7f65504bcd48d81103be702c91cd8c368b02f281a6f338d4c4612c80",
+    "source_kind": "directory"
+   },
+   {
+    "file": "sandbox-retention/sandbox-retention.json",
+    "id": "sandbox-retention",
+    "phase": "sandbox-retention",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "1b2a23be98219bb85c678f41b4402525d0fdc0cfa53bb0c203648bef8225a96f",
+    "source_kind": "directory"
+   },
+   {
+    "file": "single-session-discovery/01-subagent-discovery-core.json",
+    "id": "subagent-discovery-core",
+    "phase": "single-session-discovery",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "fc47b68b4b1fd752d27004dae2286c424b45e1e63bdc0c0ed7ac29908afb7043",
+    "source_kind": "directory"
+   },
+   {
+    "file": "single-session-discovery/02-wire-single-session-discovery.json",
+    "id": "wire-single-session-discovery",
+    "phase": "single-session-discovery",
+    "prerequisites": [
+     "subagent-discovery-core"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "f7781ade73dfbff36acea348fd11e543fddbc1a66e28bde262d77b72f6b02698",
+    "source_kind": "directory"
+   },
+   {
+    "file": "worker-concurrency-pool/01-worker-concurrency-config.json",
+    "id": "worker-concurrency-config",
+    "phase": "worker-concurrency-pool",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "58541022c1288d31f06c77ff4b22ae55b184aa90ef24194d28e28ed3aefbd53d",
+    "source_kind": "directory"
+   },
+   {
+    "file": "worker-concurrency-pool/02-worker-concurrency-pool.json",
+    "id": "worker-concurrency-pool",
+    "phase": "worker-concurrency-pool",
+    "prerequisites": [
+     "worker-concurrency-config"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8d13987edb486db7ef61889df782dd89765aea514b2b0b7b584a6f209b837a12",
+    "source_kind": "directory"
+   },
+   {
+    "file": "worker-concurrency-pool/03-worker-concurrency-safety.json",
+    "id": "worker-concurrency-safety",
+    "phase": "worker-concurrency-pool",
+    "prerequisites": [
+     "worker-concurrency-pool"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "8ab609ee2616cfa50cc9826c9e0a29fbe377537c88d06ff197436e14702ddb16",
+    "source_kind": "directory"
+   },
+   {
+    "file": "workgraph/builder.json",
+    "id": "workgraph-builder",
+    "phase": "workgraph",
+    "prerequisites": [
+     "workgraph-model"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "856a9cfeb7070d83951cfcf6e36615f2b7b36d10807ab3ac51f1efe53ebb1bf7",
+    "source_kind": "directory"
+   },
+   {
+    "file": "workgraph/graph-model.json",
+    "id": "workgraph-model",
+    "phase": "workgraph",
+    "prerequisites": [],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "288a41cbcb77f8bec144a989a995d451c1e74a125299504103d043ebc337b6d8",
+    "source_kind": "directory"
+   },
+   {
+    "file": "workgraph/scheduler-integration.json",
+    "id": "workgraph-scheduler-integration",
+    "phase": "workgraph",
+    "prerequisites": [
+     "workgraph-builder"
+    ],
+    "priority": 0,
+    "required_capabilities": [],
+    "conflict_keys": [],
+    "source_version": "b28fc675a076842b3f90703a2a0cc969b78b325248fc404efe4022bdd9edd24c",
+    "source_kind": "directory"
+   }
+  ],
+  "skipped_count": 0,
+  "skipped": []
+ }
+}

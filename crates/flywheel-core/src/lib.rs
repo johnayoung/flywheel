@@ -8,6 +8,7 @@
 //! The authoritative specs live in `docs/` at the repository root and
 //! override any behavior inferred from this code.
 
+pub mod agents_invoke;
 pub mod audit;
 pub mod deadline;
 pub mod deadline_config;

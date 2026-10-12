@@ -1,19 +1,24 @@
-//! One agent iteration's structured result, and the envelope-salvage
-//! helpers over it.
+//! One agent iteration: its structured result, the entry point that drives
+//! it, and the envelope-salvage helpers over it.
 //!
-//! This is the SDK-independent half of the Python `flywheel_core.invoker`
-//! module: the data shapes every SDK signal enumerated in `docs/loop.md`'s
-//! state-detection map is projected into, plus the pure helpers the harness
-//! uses to recover a lost closing envelope. `invoke_iteration` (the function
-//! that actually drives an agent turn) and the SDK message serializer are
-//! deliberately **not** here: in the Rust implementation the harness drives
-//! agents through the `flywheel-agents` crate (adapters, normalized events,
-//! execution hosts), and that agents-backed path is what produces an
-//! [`IterationResult`]. Opaque agent payloads (raw messages, rate-limit and
-//! hook events, permission denials) are carried as `serde_json::Value`.
+//! The data shapes project every agent signal enumerated in `docs/loop.md`'s
+//! state-detection map so the harness never re-parses raw messages. Opaque
+//! agent payloads (recorded messages, rate-limit and hook events, permission
+//! denials) are carried as `serde_json::Value`.
+//!
+//! [`invoke_iteration`] is the harness's single entry point for one agent
+//! turn. The Rust implementation has no vendor SDK: every agent runs through
+//! the `flywheel-agents` crate (adapters, normalized events, execution
+//! hosts), so the function delegates to [`crate::agents_invoke`] -- one
+//! [`AgentsInvoker`] drives the run, streams each normalized event to the
+//! per-message observer, enforces transcript hard limits, hosts the in-run
+//! control watcher, and folds the completed run into an [`IterationResult`].
+//! The invoker owns nothing else: no retry policy, no lifecycle mutation, no
+//! graders, no prompt construction.
 //!
 //! Envelope extraction delegates entirely to [`crate::envelope`].
 
+use crate::agents_invoke::{AgentsInvoker, InvocationRequest};
 use crate::envelope::EnvelopeResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -136,6 +141,25 @@ pub struct IterationResult {
     pub failure: Option<InvocationFailure>,
     #[serde(default)]
     pub usage: Option<Usage>,
+}
+
+/// Drive exactly one agent iteration and return its structured result.
+///
+/// `invoker` is the configured agents-backed transport (agent, working
+/// directory, host, control plane); `request` carries the prompt, the
+/// transcript graders enforced as hard limits mid-run, the session to
+/// resume, and the per-iteration observers (`on_message` is called with
+/// each recorded message the instant it arrives, before the result is
+/// assembled; a panicking observer is contained so a faulty live renderer
+/// can never break the run). Never fails at the type level: a run that
+/// could not start, crashed, timed out, or was cancelled reports through
+/// [`IterationResult::failure`]. Multi-iteration orchestration belongs to
+/// the harness.
+pub async fn invoke_iteration(
+    invoker: &AgentsInvoker,
+    request: InvocationRequest,
+) -> IterationResult {
+    invoker.invoke(request).await
 }
 
 /// True when an iteration finished cleanly but lost its envelope tail.
@@ -403,6 +427,21 @@ mod tests {
                 ("output_tokens".to_string(), 12)
             ]))
         );
+    }
+
+    #[tokio::test]
+    async fn invoke_iteration_delegates_to_the_agents_invoker() {
+        use crate::agents_invoke::test_support::{fake_configuration, write_fake_claude};
+        use crate::envelope::Intent;
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_fake_claude(dir.path());
+        let invoker = AgentsInvoker::new(fake_configuration(&script, "envelope"), dir.path())
+            .with_timeout_seconds(Some(30.0));
+        let result = invoke_iteration(&invoker, InvocationRequest::new("go")).await;
+        assert!(result.failure.is_none(), "{:?}", result.failure);
+        assert_eq!(result.envelope.as_valid().unwrap().intent, Intent::Verify);
+        assert_eq!(result.signals.session_id.as_deref(), Some("sess-core"));
+        assert!(!result.messages.is_empty());
     }
 
     #[test]

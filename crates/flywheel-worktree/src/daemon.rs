@@ -2012,3 +2012,1353 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     log("Shutting down.");
     code
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::submitter::test_support::{commit, git_ok, init_repo, rev, task_file};
+    use flywheel_core::envelope::{EnvelopeResult, Intent, ValidEnvelope};
+    use flywheel_core::events::DomainEventPayload;
+    use flywheel_core::harness::HarnessConfig;
+    use flywheel_core::invoker::{InvocationSignals, IterationResult};
+    use flywheel_core::lifecycle::{Lifecycle, Status};
+    use flywheel_core::store::{
+        AttemptStore, ControlCommandStore, DomainEventStore, LifecycleFilter, LifecycleStore,
+    };
+    use flywheel_core::store_sqlite::SqliteStore;
+    use flywheel_core::task::Task;
+    use flywheel_orchestrator::orchestrate::{AgentPrimitives, RunMode};
+    use flywheel_orchestrator::policy::load_policy_str;
+    use flywheel_orchestrator::strategy::PlainDirectoryStrategy;
+    use std::fs;
+    use std::sync::Mutex;
+
+    /// Serializes the tests that change the process cwd.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn quiet() -> Logger {
+        Arc::new(|_m: &str| {})
+    }
+
+    fn capture() -> (Logger, Arc<Mutex<Vec<String>>>) {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&lines);
+        (
+            Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+            lines,
+        )
+    }
+
+    fn policy(text: &str) -> WorkPolicy {
+        let text = format!("[source]\nkind = \"directory\"\n{text}");
+        load_policy_str(&text, Path::new("/tmp/flywheel.toml")).unwrap()
+    }
+
+    fn submitter(repo: &Path) -> GitWorktreeSubmitter {
+        let worktrees = repo.join(".flywheel").join("worktrees");
+        fs::create_dir_all(&worktrees).unwrap();
+        GitWorktreeSubmitter::new(
+            repo,
+            repo.join(".flywheel").join("tasks"),
+            worktrees,
+            "main",
+            repo.join(".flywheel").join(".merge.lock"),
+            quiet(),
+        )
+    }
+
+    fn args(argv: &[&str]) -> WorkerArgs {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        match parse_args(&argv).unwrap() {
+            Parsed::Args(args) => args,
+            Parsed::Help(_) => panic!("help requested"),
+        }
+    }
+
+    fn arg_error(argv: &[&str]) -> String {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        parse_args(&argv).unwrap_err().render()
+    }
+
+    fn live_row(detail: &str, iterations_completed: u64) -> LiveRunRow {
+        LiveRunRow {
+            run_id: "run-task-x".into(),
+            task_id: "task-x".into(),
+            status: Status::Running,
+            attempt: Some(1),
+            iteration: Some(2),
+            last_kind: "ASSISTANT".into(),
+            last_detail: detail.into(),
+            last_ts: Some(Utc::now()),
+            tokens_total: 0,
+            cost_usd_total: 0.0,
+            turns_total: 0,
+            iterations_completed,
+            awaiting_instruction: None,
+            started_at: None,
+            worker_id: None,
+        }
+    }
+
+    // --- logging / heartbeat rendering ------------------------------------------------
+
+    #[test]
+    fn log_line_is_stamped_prefixed_and_spaced() {
+        let now = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_log_line("[worker]", "hello", now),
+            "2026-01-02T03:04:05Z [worker] hello"
+        );
+    }
+
+    #[test]
+    fn heartbeat_renders_breadcrumb_totals_and_action() {
+        let mut row = live_row("Edit(file_path=x.py)", 3);
+        row.task_id = "task-h".into();
+        row.attempt = Some(2);
+        row.iteration = Some(3);
+        row.tokens_total = 2500;
+        row.cost_usd_total = 0.123_456;
+        row.turns_total = 7;
+        let line = format_heartbeat(&row, Utc::now());
+        assert!(
+            line.starts_with("task-h running attempt=2 iter=3 "),
+            "{line}"
+        );
+        assert!(
+            line.contains("tokens=2500 cost=$0.1235 turns=7 age=0s ASSISTANT Edit(file_path=x.py)")
+        );
+    }
+
+    #[test]
+    fn heartbeat_renders_working_placeholder_before_the_first_iteration() {
+        let line = format_heartbeat(&live_row("x", 0), Utc::now());
+        assert!(
+            line.contains("working (iteration 1 in progress; totals land at iteration boundaries)")
+        );
+        assert!(!line.contains("tokens=0"));
+    }
+
+    #[test]
+    fn heartbeat_unknown_breadcrumb_renders_question_marks_and_dash() {
+        let mut row = live_row("(no activity yet)", 0);
+        row.attempt = None;
+        row.iteration = None;
+        row.last_kind = "(none)".into();
+        row.last_ts = None;
+        let line = format_heartbeat(&row, Utc::now());
+        assert!(line.contains("attempt=? iter=?"), "{line}");
+        assert!(
+            line.contains("age=\u{2014} (none) (no activity yet)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_truncates_overlong_detail_with_an_ellipsis() {
+        let line = format_heartbeat(&live_row(&"z".repeat(5000), 1), Utc::now());
+        assert!(line.chars().count() < HEARTBEAT_DETAIL_MAX_WIDTH + 200);
+        assert!(line.ends_with('\u{2026}'));
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abcd", 3), "ab\u{2026}");
+    }
+
+    #[test]
+    fn heartbeat_lines_reads_live_rows_from_the_store_and_is_quiet_when_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("flywheel.sqlite");
+        assert!(heartbeat_lines(&db, None, Utc::now()).unwrap().is_empty());
+        let mut heartbeat = Heartbeat::new(&db, 1, quiet(), None).start();
+        heartbeat.stop();
+        heartbeat.stop();
+        let idle = Heartbeat::new(&db, 0, quiet(), None).start();
+        assert!(idle.thread.is_none());
+    }
+
+    // --- model / concurrency / held-out resolution ---------------------------------------
+
+    #[test]
+    fn resolve_model_precedence() {
+        let p = policy("[agent]\nmodel = \"claude-from-policy\"\n");
+        assert_eq!(
+            resolve_model(Some("claude-from-flag"), Some(&p)).as_deref(),
+            Some("claude-from-flag")
+        );
+        assert_eq!(
+            resolve_model(None, Some(&p)).as_deref(),
+            Some("claude-from-policy")
+        );
+        assert_eq!(
+            resolve_model(Some(""), Some(&p)).as_deref(),
+            Some("claude-from-policy")
+        );
+        assert_eq!(resolve_model(None, None), None);
+        assert_eq!(resolve_model(None, Some(&policy(""))), None);
+    }
+
+    #[test]
+    fn resolve_concurrency_precedence_and_validation() {
+        assert_eq!(resolve_concurrency(None, None).unwrap(), 1);
+        let four = policy("[worker]\nconcurrency = 4\n");
+        assert_eq!(resolve_concurrency(None, Some(&four)).unwrap(), 4);
+        let three = policy("[worker]\nconcurrency = 3\n");
+        assert_eq!(resolve_concurrency(Some("1"), Some(&three)).unwrap(), 1);
+        let one = policy("[worker]\nconcurrency = 1\n");
+        assert_eq!(resolve_concurrency(Some("3"), Some(&one)).unwrap(), 3);
+        let zero = WorkPolicy {
+            worker_concurrency: 0,
+            ..WorkPolicy::default()
+        };
+        assert_eq!(resolve_concurrency(Some("3"), Some(&zero)).unwrap(), 3);
+        for bad in ["0", "-2", "two"] {
+            let err = resolve_concurrency(Some(bad), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("concurrency"), "{err}");
+        }
+        assert_eq!(
+            resolve_concurrency(Some("two"), None)
+                .unwrap_err()
+                .to_string(),
+            "--concurrency / [worker] concurrency must be an integer >= 1, got 'two'"
+        );
+        assert_eq!(
+            resolve_concurrency(None, Some(&zero))
+                .unwrap_err()
+                .to_string(),
+            "--concurrency / [worker] concurrency must resolve to an integer >= 1, got 0"
+        );
+        assert_eq!(resolve_concurrency(Some(" +2 "), None).unwrap(), 2);
+    }
+
+    #[test]
+    fn build_held_out_source_is_opt_in_and_repo_root_anchored() {
+        let repo_root = Path::new("/srv/repo");
+        assert!(build_held_out_source(None, repo_root).is_none());
+        assert!(build_held_out_source(Some(&policy("")), repo_root).is_none());
+        let relative = policy("[held_out]\nroot = \".flywheel/held-out\"\n");
+        assert_eq!(
+            build_held_out_source(Some(&relative), repo_root)
+                .unwrap()
+                .root,
+            PathBuf::from("/srv/repo/.flywheel/held-out")
+        );
+        let absolute = policy("[held_out]\nroot = \"/elsewhere/held-out\"\n");
+        assert_eq!(
+            build_held_out_source(Some(&absolute), repo_root)
+                .unwrap()
+                .root,
+            PathBuf::from("/elsewhere/held-out")
+        );
+    }
+
+    // --- landing base ------------------------------------------------------------------
+
+    #[test]
+    fn landing_base_falls_back_to_the_checked_out_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        assert_eq!(resolve_landing_base(&repo, None, None).unwrap(), "main");
+        assert_eq!(
+            resolve_landing_base(&repo, Some(&policy("")), None).unwrap(),
+            "main"
+        );
+    }
+
+    #[test]
+    fn landing_base_refuses_the_checked_out_branch_and_detached_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let p = policy("[submit]\nbase = \"main\"\n");
+        let err = resolve_landing_base(&repo, Some(&p), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "configured landing base 'main' is the operator's currently-checked-out branch"
+            ),
+            "{err}"
+        );
+        git_ok(&repo, &["checkout", "--detach"]);
+        let err = resolve_landing_base(&repo, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("worker started on detached HEAD"), "{err}");
+        assert_eq!(resolve_landing_base(&repo, Some(&p), None).unwrap(), "main");
+    }
+
+    #[test]
+    fn configured_base_is_fetched_fresh_from_its_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        init_repo(&upstream);
+        let repo = tmp.path().join("repo");
+        git_ok(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                upstream.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        git_ok(&repo, &["checkout", "-q", "-b", "feature"]);
+        let advanced = commit(&upstream, "new.txt", "x", "advance upstream");
+        assert_ne!(rev(&repo, "main"), advanced);
+        let (log, lines) = capture();
+        let p = policy("[submit]\nbase = \"main\"\n");
+        assert_eq!(
+            resolve_landing_base(&repo, Some(&p), Some(&log)).unwrap(),
+            "main"
+        );
+        assert_eq!(rev(&repo, "main"), advanced);
+        assert!(lines.lock().unwrap().is_empty());
+        // A base the remote does not have logs the failure and keeps the local ref.
+        fetch_base_fresh(&repo, "nope", Some(&log)).unwrap();
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("fresh fetch of base 'nope' from 'origin' failed"),
+            "{logged}"
+        );
+        // No remotes at all: a no-op.
+        fetch_base_fresh(&upstream, "main", Some(&log)).unwrap();
+    }
+
+    #[test]
+    fn repo_root_outside_a_repository_is_an_error() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = repo_root();
+        std::env::set_current_dir(previous).unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "ERROR: not inside a git repository."
+        );
+    }
+
+    // --- the RunTask binding -------------------------------------------------------------
+
+    #[test]
+    fn run_task_options_map_every_request_field() {
+        let store = Arc::new(flywheel_core::store_memory::InMemoryStore::new());
+        let config = HarnessConfig {
+            max_retries: 3,
+            max_cost_usd: 2.5,
+            max_tokens: 1000,
+            wall_clock_seconds: 60,
+            rubric_judge_max_turns: 9,
+            checkpoint_nudge_seconds: 42.0,
+            grader_env: Some(BTreeMap::from([("K".to_owned(), "V".to_owned())])),
+            landability_gate: Some(Arc::new(|| None)),
+            checkpoint_progress_probe: Some(Arc::new(|| None)),
+            ..HarnessConfig::default()
+        };
+        let request = RunTaskRequest {
+            task: Task::new("goal", Vec::new()).with_id("t1"),
+            lifecycle: Lifecycle::new("t1").with_run_id("run-7"),
+            mode: RunMode::Fresh,
+            store,
+            sandbox: PathBuf::from("/sb"),
+            agent: AgentPrimitives {
+                agent_id: Some("codex".into()),
+                agent_transport: Some("cli".into()),
+                permission_mode: "default".into(),
+                skills: PolicySkills::List(vec!["fw-spec".into()]),
+                allowed_tools: vec!["Bash".into()],
+                denied_tools: vec!["WebFetch".into()],
+                setting_sources: Some(vec!["project".into()]),
+                mcp_servers: vec!["serena".into()],
+                mcp_strict: true,
+                exec_enabled: true,
+                exec_auto_allow: false,
+                agent_env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
+                grader_env: None,
+            },
+            invoke: None,
+            config,
+            model: Some("claude-x".into()),
+            max_turns: 11,
+            max_retries: 3,
+            worker_id: "w-1".into(),
+            source_ref: "ref:t1".into(),
+            telemetry_root: None,
+            sink: None,
+            now: Arc::new(Utc::now),
+            shutdown: Some(ShutdownSignal::new()),
+            log: None,
+        };
+        let options = run_task_options_for(&request, None, EventsMode::Json);
+        assert_eq!(options.agent_id.as_deref(), Some("codex"));
+        assert_eq!(options.agent.model.as_deref(), Some("claude-x"));
+        assert_eq!(options.agent.max_turns, 11);
+        assert_eq!(options.agent.permission_mode, "default");
+        assert_eq!(
+            options.agent.skills,
+            CoreSkills::Named(vec!["fw-spec".into()])
+        );
+        assert_eq!(options.agent.allowed_tools, vec!["Bash"]);
+        assert_eq!(options.agent.denied_tools, vec!["WebFetch"]);
+        assert_eq!(options.agent.setting_sources, Some(vec!["project".into()]));
+        assert_eq!(options.agent.mcp_servers, vec!["serena"]);
+        assert!(options.agent.mcp_strict && options.agent.exec_enabled);
+        assert!(!options.agent.exec_auto_allow);
+        assert_eq!(
+            options.agent.agent_env.get("A").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(options.agent.transport.as_deref(), Some("cli"));
+        assert_eq!(options.max_retries, Some(3));
+        assert_eq!(
+            options
+                .grader_env
+                .as_ref()
+                .unwrap()
+                .get("K")
+                .map(String::as_str),
+            Some("V")
+        );
+        assert_eq!(options.max_cost_usd, 2.5);
+        assert_eq!(options.max_tokens, 1000);
+        assert_eq!(options.wall_clock_seconds, 60);
+        assert_eq!(options.rubric_judge_max_turns, Some(9));
+        assert_eq!(options.checkpoint_nudge_seconds, Some(42.0));
+        assert!(options.landability_gate.is_some() && options.checkpoint_progress_probe.is_some());
+        assert_eq!(options.run_id.as_deref(), Some("run-7"));
+        assert_eq!(options.source.as_deref(), Some("ref:t1"));
+        assert_eq!(options.worker_id.as_deref(), Some("w-1"));
+        assert!(options.store.is_some() && options.shutdown.is_some());
+        assert_eq!(options.events, EventsMode::Json);
+        assert!(options.deadlines.is_some());
+        assert_eq!(
+            core_skills(&PolicySkills::Named("all".into())),
+            CoreSkills::All
+        );
+        assert_eq!(
+            core_skills(&PolicySkills::Named("none".into())),
+            CoreSkills::Named(vec![])
+        );
+        assert_eq!(
+            core_skills(&PolicySkills::Named("one".into())),
+            CoreSkills::Named(vec!["one".into()])
+        );
+        assert!(format!("{:?}", CoreRunTask::new("/db")).contains("CoreRunTask"));
+    }
+
+    // --- container backend wiring ------------------------------------------------------
+
+    #[test]
+    fn worktree_backend_returns_the_strategy_unchanged() {
+        let inner: Arc<dyn SubmitStrategy> = Arc::new(PlainDirectoryStrategy::new("/tmp/x"));
+        let out =
+            wrap_for_backend(Arc::clone(&inner), None, None, &BTreeMap::new(), &quiet()).unwrap();
+        assert!(Arc::ptr_eq(&inner, &out));
+        let p = policy("[sandbox]\nbackend = \"worktree\"\n");
+        let out = wrap_for_backend(
+            Arc::clone(&inner),
+            Some(&p),
+            Some("m"),
+            &BTreeMap::new(),
+            &quiet(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&inner, &out));
+    }
+
+    #[test]
+    fn container_backend_wraps_with_the_resolved_model_and_logs_selection() {
+        let inner: Arc<dyn SubmitStrategy> = Arc::new(PlainDirectoryStrategy::new("/tmp/x"));
+        let p = policy(
+            "[sandbox]\nbackend = \"container\"\n[sandbox.container]\nimage = \"img:1\"\nauth = \"none\"\n",
+        );
+        let (log, lines) = capture();
+        let out = wrap_for_backend(
+            Arc::clone(&inner),
+            Some(&p),
+            Some("claude-w"),
+            &BTreeMap::new(),
+            &log,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&inner, &out));
+        assert_eq!(
+            lines.lock().unwrap().as_slice(),
+            ["backend=container image=img:1 model=claude-w auth=none network=allow"]
+        );
+        let missing = wrap_for_backend(inner, Some(&p), None, &BTreeMap::new(), &quiet());
+        assert!(matches!(missing, Err(ConfigError::MissingModel)));
+    }
+
+    #[test]
+    fn container_invoke_configuration_carries_model_and_permissions() {
+        let spec = ContainerInvokeSpec {
+            agent_id: "claude-code".into(),
+            working_directory: PathBuf::from("/workspace"),
+            model: "claude-c".into(),
+            permission_policy: "auto".into(),
+            timeout_seconds: Some(5.0),
+        };
+        let configuration = container_agent_configuration(&spec);
+        assert_eq!(configuration.agent_id, "claude-code");
+        assert_eq!(configuration.model_id.as_deref(), Some("claude-c"));
+        assert_eq!(configuration.permission_policy, PermissionPolicy::Auto);
+        let supervised = ContainerInvokeSpec {
+            permission_policy: "supervised".into(),
+            ..spec
+        };
+        assert_eq!(
+            container_agent_configuration(&supervised).permission_policy,
+            PermissionPolicy::Supervised
+        );
+        let builder = host_invoke_builder();
+        let _invoke = builder(Arc::new(flywheel_agents::hosts::LocalHost), &supervised);
+    }
+
+    #[test]
+    fn registry_and_strategy_selection() {
+        let registry = worker_registry();
+        assert_eq!(registry.names(), vec!["merge", "phase", "pr", "tiered"]);
+        assert_eq!(strategy_name_for(None), "merge");
+        assert_eq!(
+            strategy_name_for(Some(&policy("[submit]\nstrategy = \"pr\"\n"))),
+            "pr"
+        );
+        let tiered = policy("[[submit.tiers]]\ntier = 2\npaths = [\"**\"]\n");
+        assert_eq!(strategy_name_for(Some(&tiered)), "tiered");
+    }
+
+    // --- the agents-backed conflict resolver ---------------------------------------------
+
+    const RESOLVER_FAKE: &str = r#"#!/bin/sh
+IFS= read -r FIRST_LINE || true
+emit() { printf '%s\n' "$1"; }
+emit '{"type":"system","subtype":"init","session_id":"sess-resolve","model":"claude-fake-1"}'
+case "${RESOLVER_FAKE_MODE:-complete}" in
+complete)
+  emit '{"type":"assistant","message":{"content":[{"type":"text","text":"conflicts staged"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":2}}}'
+  emit '{"type":"result","subtype":"success","is_error":false,"result":"conflicts staged","num_turns":4,"total_cost_usd":0.01,"usage":{"input_tokens":7,"output_tokens":2}}'
+  ;;
+sleep)
+  sleep 60
+  ;;
+esac
+"#;
+
+    fn resolver_fake(dir: &Path, mode: &str) -> Vec<String> {
+        let path = dir.join(format!("fake_{mode}.sh"));
+        fs::write(&path, RESOLVER_FAKE).unwrap();
+        vec![
+            "/usr/bin/env".to_owned(),
+            format!("RESOLVER_FAKE_MODE={mode}"),
+            "/bin/sh".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[test]
+    fn agents_resolver_reports_real_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = make_agents_resolve_conflict(
+            "claude-code",
+            None,
+            Some(resolver_fake(tmp.path(), "complete")),
+        );
+        let report = resolver(&ConflictResolutionRequest {
+            prompt: "resolve the conflict markers".into(),
+            worktree: tmp.path().to_path_buf(),
+            max_turns: 12,
+            max_wall_seconds: 120.0,
+            model: None,
+        })
+        .unwrap();
+        assert_eq!(report.turns, 4);
+        assert!(report.wall_seconds >= 0.0 && report.wall_seconds < 30.0);
+    }
+
+    #[test]
+    fn agents_resolver_timeout_reports_at_bounds_promptly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = make_agents_resolve_conflict(
+            "claude-code",
+            Some("cli"),
+            Some(resolver_fake(tmp.path(), "sleep")),
+        );
+        let started = Instant::now();
+        let report = resolver(&ConflictResolutionRequest {
+            prompt: "resolve the conflict markers".into(),
+            worktree: tmp.path().to_path_buf(),
+            max_turns: 7,
+            max_wall_seconds: 1.0,
+            model: None,
+        })
+        .unwrap();
+        assert_eq!(report.turns, 7);
+        assert_eq!(report.wall_seconds, 1.0);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn agents_resolver_start_failure_is_a_resolution_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = make_agents_resolve_conflict("no-such-agent", None, None);
+        let err = resolver(&ConflictResolutionRequest {
+            prompt: "x".into(),
+            worktree: tmp.path().to_path_buf(),
+            max_turns: 1,
+            max_wall_seconds: 1.0,
+            model: None,
+        })
+        .unwrap_err();
+        assert!(!err.0.is_empty());
+    }
+
+    #[test]
+    fn session_blocking_runs_inside_and_outside_a_runtime() {
+        assert_eq!(run_session_blocking(async { 7 }).unwrap(), 7);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let inner = runtime.block_on(async { run_session_blocking(async { "resolved" }).unwrap() });
+        assert_eq!(inner, "resolved");
+    }
+
+    // --- run_once ------------------------------------------------------------------------
+
+    fn verify_result(messages: Vec<Value>) -> IterationResult {
+        IterationResult {
+            transcript: "ok".into(),
+            messages,
+            envelope: EnvelopeResult::Valid(ValidEnvelope {
+                intent: Intent::Verify,
+                reason: None,
+                requires: Vec::new(),
+            }),
+            signals: InvocationSignals {
+                stop_reason: Some("end_turn".into()),
+                num_turns: Some(2),
+                total_cost_usd: Some(0.05),
+                result_is_error: Some(false),
+                result_subtype: Some("success".into()),
+                session_id: Some("sess".into()),
+                ..InvocationSignals::default()
+            },
+            failure: None,
+            usage: None,
+        }
+    }
+
+    fn scripted_messages() -> Vec<Value> {
+        let usage = json!({
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "cache_creation_input_tokens": 10,
+            "cache_read_input_tokens": 30,
+        });
+        vec![
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}], "model": "claude-test", "usage": usage}}),
+            json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": 2, "total_cost_usd": 0.05, "usage": usage}),
+        ]
+    }
+
+    /// Plays the agent: commits work in the prepared worktree, then claims
+    /// completion so the harness verifies (grader `true` passes) -> DONE.
+    fn committing_invoke(worktree: PathBuf) -> InvokeFn {
+        Arc::new(move |_request| {
+            let worktree = worktree.clone();
+            Box::pin(async move {
+                commit(&worktree, "work.txt", "agent output", "agent work");
+                verify_result(scripted_messages())
+            })
+        })
+    }
+
+    #[test]
+    fn run_once_merges_a_completed_task_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let s = submitter(&repo);
+        task_file(&repo, "01-phase", "t1", "true");
+        let worktree = repo.join(".flywheel").join("worktrees").join("t1");
+        let db_path = repo.join(".flywheel").join("flywheel.sqlite");
+        let base_before = rev(&repo, "main");
+
+        let mut request = RunOnceRequest::for_submitter(
+            &s,
+            repo.join(".flywheel").join("tasks"),
+            &db_path,
+            repo.join(".flywheel").join("worktrees"),
+        );
+        request.max_turns = 4;
+        request.max_retries = 0;
+        request.invoke = Some(committing_invoke(worktree.clone()));
+        request.stream = Some(Arc::new(|_line: &str| {}));
+        let report = run_once(request).unwrap();
+
+        let statuses: Vec<Status> = report.runs.iter().map(|r| r.status).collect();
+        assert_eq!(statuses, vec![Status::Done]);
+        assert!(repo.join("work.txt").exists());
+        assert_ne!(rev(&repo, "main"), base_before);
+        assert!(!worktree.exists());
+        assert!(!s.branch_exists("flywheel/01-phase/t1").unwrap());
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        let rows = store
+            .list_lifecycles(&LifecycleFilter::default().with_task_id("t1"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, Status::Done);
+        // Spec 00025 FR-9: the run's telemetry JSONL is the only artifact; no
+        // .log re-render anywhere in the repo.
+        let run_file = db_path
+            .parent()
+            .unwrap()
+            .join("logs")
+            .join("runs")
+            .join(format!("{}.jsonl", report.runs[0].run_id));
+        assert!(run_file.is_file());
+        assert!(!fs::read_to_string(&run_file).unwrap().trim().is_empty());
+        assert!(!has_log_files(&repo.join(".flywheel")));
+        assert!(!repo.join("logs").exists());
+    }
+
+    fn has_log_files(root: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(root) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                has_log_files(&path)
+            } else {
+                path.extension().is_some_and(|e| e == "log")
+            }
+        })
+    }
+
+    #[test]
+    fn real_loop_routes_telemetry_aggregates_and_steering() {
+        // Spec 00025 (data taxonomy): telemetry lands in the per-run JSONL,
+        // token/iteration aggregates on the relational attempt row, a
+        // steering command round-trips into the ledger, and the attempt
+        // carries the world-state pin.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let s = submitter(&repo);
+        task_file(&repo, "01-phase", "t1", "true");
+        let worktree = repo.join(".flywheel").join("worktrees").join("t1");
+        let db_path = repo.join(".flywheel").join("flywheel.sqlite");
+
+        let invoke_db = db_path.clone();
+        let invoke_worktree = worktree.clone();
+        let invoke: InvokeFn = Arc::new(move |request| {
+            let worktree = invoke_worktree.clone();
+            let db_path = invoke_db.clone();
+            Box::pin(async move {
+                commit(&worktree, "work.txt", "agent output", "agent work");
+                // Play the operator mid-iteration: enqueue a steering command
+                // through the real store producer path (a separate
+                // connection), then play the live watcher: claim it and feed
+                // it through the harness's on_command_applied seam.
+                let producer = SqliteStore::open(&db_path).unwrap();
+                let run_id = producer
+                    .list_lifecycles(&LifecycleFilter::default().with_task_id("t1"))
+                    .unwrap()[0]
+                    .run_id
+                    .clone();
+                let mut payload = serde_json::Map::new();
+                payload.insert("text".into(), json!("focus on graders"));
+                producer
+                    .enqueue_command(&run_id, "say", payload.clone(), Utc::now())
+                    .unwrap();
+                let claimed = producer.claim_commands(&run_id, Utc::now()).unwrap();
+                assert_eq!(claimed.len(), 1);
+                let on_applied = request.observers.on_command_applied.clone().unwrap();
+                on_applied(
+                    &claimed[0],
+                    &flywheel_core::events::CommandApplied {
+                        command_kind: "say".into(),
+                        command_payload: payload,
+                        command_id: claimed[0].id,
+                    },
+                );
+                let messages = scripted_messages();
+                if let Some(on_message) = &request.observers.on_message {
+                    for message in &messages {
+                        on_message(message);
+                    }
+                }
+                verify_result(messages)
+            })
+        });
+
+        let mut request = RunOnceRequest::for_submitter(
+            &s,
+            repo.join(".flywheel").join("tasks"),
+            &db_path,
+            repo.join(".flywheel").join("worktrees"),
+        );
+        request.model = Some("claude-opus-4-8".into());
+        request.max_turns = 4;
+        request.max_retries = 0;
+        request.invoke = Some(invoke);
+        request.stream = Some(Arc::new(|_line: &str| {}));
+        let report = run_once(request).unwrap();
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(report.runs[0].status, Status::Done);
+        let run_id = report.runs[0].run_id.clone();
+
+        let run_file = db_path
+            .parent()
+            .unwrap()
+            .join("logs")
+            .join("runs")
+            .join(format!("{run_id}.jsonl"));
+        let kinds: Vec<String> = fs::read_to_string(&run_file)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        for kind in [
+            "assistant",
+            "harness.iteration_completed",
+            "domain.attempt_finalized",
+            "domain.command_applied",
+        ] {
+            assert!(
+                kinds.iter().any(|k| k == kind),
+                "missing {kind} in {kinds:?}"
+            );
+        }
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        let attempts = store.list_attempts(&run_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.input_tokens, 120);
+        assert_eq!(attempt.output_tokens, 45);
+        assert_eq!(attempt.cache_read_input_tokens, 30);
+        assert_eq!(attempt.iterations_completed, 1);
+        assert_eq!(attempt.turns, 2);
+        assert!((attempt.total_cost_usd - 0.05).abs() < 1e-9);
+        assert!(attempt.last_activity_at.is_some());
+        let steering: Vec<_> = store
+            .list_domain_events(&run_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                DomainEventPayload::CommandApplied(applied) => Some(applied),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steering.len(), 1);
+        assert_eq!(steering[0].command_kind, "say");
+        assert_eq!(
+            steering[0].command_payload["text"],
+            json!("focus on graders")
+        );
+        assert!(
+            store
+                .claim_commands(&run_id, Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            attempt.agent_context.get("model_id").map(String::as_str),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(
+            attempt
+                .agent_context
+                .get("base_commit_sha")
+                .map(String::len),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn run_once_postgres_policy_without_dsn_fails_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let s = submitter(&repo);
+        task_file(&repo, "01-phase", "t1", "true");
+        let mut request = RunOnceRequest::for_submitter(
+            &s,
+            repo.join(".flywheel").join("tasks"),
+            repo.join(".flywheel").join("flywheel.sqlite"),
+            repo.join(".flywheel").join("worktrees"),
+        );
+        request.policy = Some(Arc::new(policy("[store]\nbackend = \"postgres\"\n")));
+        request.environ = Some(BTreeMap::new());
+        request.invoke = Some(Arc::new(|_request| {
+            Box::pin(async { panic!("invoke must not run: store construction fails") })
+        }));
+        let err = run_once(request).unwrap_err();
+        assert!(matches!(err, RunOnceError::StoreConfig(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("FLYWHEEL_PG_DSN") && message.contains("DATABASE_URL"),
+            "{message}"
+        );
+        assert_eq!(err.kind(), "StoreConfigError");
+    }
+
+    #[test]
+    fn run_once_records_phase_bases_and_archives_a_completed_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        task_file(&repo, "01-phase", "t1", "true");
+        let tasks_dir = repo.join(".flywheel").join("tasks");
+        let db_path = repo.join(".flywheel").join("flywheel.sqlite");
+        // The submitter's ledger records the Landed receipt the archive
+        // sweep's landed predicate reads (main always wires one).
+        let ledger: Arc<dyn LandingLedger> = Arc::new(SqliteStore::open(&db_path).unwrap());
+        let s = submitter(&repo).with_store(ledger);
+        let head = rev(&repo, "main");
+        let mut request = RunOnceRequest::for_submitter(
+            &s,
+            &tasks_dir,
+            &db_path,
+            repo.join(".flywheel").join("worktrees"),
+        );
+        request.max_turns = 4;
+        request.max_retries = 0;
+        request.invoke = Some(committing_invoke(
+            repo.join(".flywheel").join("worktrees").join("t1"),
+        ));
+        request.stream = Some(Arc::new(|_line: &str| {}));
+        run_once(request).unwrap();
+        // The phase archived: its loop-base ref (captured at HEAD before the
+        // task landed) was materialized into the archived dir's dotfile.
+        assert!(!tasks_dir.join("active").join("01-phase").exists());
+        let archived = tasks_dir.join("archive").join("01-phase");
+        assert!(archived.join("t1.json").is_file());
+        assert_eq!(
+            fs::read_to_string(archived.join(crate::phase::LOOP_BASE_FILENAME))
+                .unwrap()
+                .trim(),
+            head
+        );
+        assert_ne!(rev(&repo, "main"), head);
+    }
+
+    // --- the daemon loop ------------------------------------------------------------------
+
+    fn no_sleep(_seconds: f64, _stop: &dyn Fn() -> bool) {}
+
+    #[test]
+    fn loop_once_stops_after_one_successful_cycle() {
+        let mut cycles = 0;
+        let mut run_cycle = || {
+            cycles += 1;
+            Ok(CycleOutcome::Completed)
+        };
+        let code = run_daemon_loop(
+            &mut run_cycle,
+            true,
+            0.0,
+            &|| false,
+            &no_sleep,
+            &LoopHooks::default(),
+        );
+        assert_eq!((code, cycles), (0, 1));
+    }
+
+    #[test]
+    fn loop_counts_strikes_resets_on_success_and_gives_up() {
+        let strikes: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let gave_up: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let on_cycle_failure = |_err: &CycleError, n: u32| strikes.lock().unwrap().push(n);
+        let on_give_up = |n: u32| gave_up.lock().unwrap().push(n);
+        let hooks = LoopHooks {
+            on_cycle_failure: Some(&on_cycle_failure),
+            on_give_up: Some(&on_give_up),
+            max_cycles: Some(1),
+            ..LoopHooks::default()
+        };
+        let mut failing = || -> Result<CycleOutcome, CycleError> {
+            Err("a real, non-transient cycle failure".into())
+        };
+        assert_eq!(
+            run_daemon_loop(&mut failing, true, 0.0, &|| false, &no_sleep, &hooks),
+            0
+        );
+        assert_eq!(strikes.lock().unwrap().as_slice(), [1]);
+        assert!(gave_up.lock().unwrap().is_empty());
+
+        // Five consecutive strikes give up with exit 1; a success in between
+        // resets the counter.
+        strikes.lock().unwrap().clear();
+        let mut calls = 0;
+        let mut flaky = || -> Result<CycleOutcome, CycleError> {
+            calls += 1;
+            if calls == 3 {
+                Ok(CycleOutcome::Completed)
+            } else {
+                Err("boom".into())
+            }
+        };
+        let hooks = LoopHooks {
+            on_cycle_failure: Some(&on_cycle_failure),
+            on_give_up: Some(&on_give_up),
+            ..LoopHooks::default()
+        };
+        assert_eq!(
+            run_daemon_loop(&mut flaky, false, 0.0, &|| false, &no_sleep, &hooks),
+            1
+        );
+        assert_eq!(strikes.lock().unwrap().as_slice(), [1, 2, 1, 2, 3, 4, 5]);
+        assert_eq!(gave_up.lock().unwrap().as_slice(), [5]);
+    }
+
+    #[test]
+    fn loop_permanent_fault_stops_after_one_cycle_with_the_distinct_exit() {
+        let permanent: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let strikes: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let on_permanent_stop = |err: &CycleError| permanent.lock().unwrap().push(err.to_string());
+        let on_cycle_failure = |_err: &CycleError, n: u32| strikes.lock().unwrap().push(n);
+        let hooks = LoopHooks {
+            on_permanent_stop: Some(&on_permanent_stop),
+            on_cycle_failure: Some(&on_cycle_failure),
+            ..LoopHooks::default()
+        };
+        let mut schema_mismatch = || -> Result<CycleOutcome, CycleError> {
+            let err = flywheel_core::store::StoreError::Schema(
+                flywheel_core::store::StoreSchemaError::new(Some(1)),
+            );
+            Err(Box::new(RunOnceError::StoreConfig(StoreConfigError::Core(
+                err,
+            ))))
+        };
+        let code = run_daemon_loop(
+            &mut schema_mismatch,
+            false,
+            0.0,
+            &|| false,
+            &no_sleep,
+            &hooks,
+        );
+        assert_eq!(code, PERMANENT_STOP_EXIT_CODE);
+        assert_eq!(permanent.lock().unwrap().len(), 1);
+        assert!(strikes.lock().unwrap().is_empty());
+        let claims: CycleError = Box::new(RunOnceError::Orchestrate(OrchestrateError::Claims(
+            ClaimStoreError::Schema(flywheel_orchestrator::claims::OrchestratorSchemaError {
+                observed: Some(1),
+                expected: 2,
+            }),
+        )));
+        assert_eq!(classify_cycle_error(&claims), Some(FaultClass::Permanent));
+        let bare: CycleError = Box::new(flywheel_core::store::StoreError::Schema(
+            flywheel_core::store::StoreSchemaError::new(None),
+        ));
+        assert_eq!(classify_cycle_error(&bare), Some(FaultClass::Permanent));
+        let io: CycleError = Box::new(RunOnceError::Io(std::io::Error::other("x")));
+        assert_eq!(classify_cycle_error(&io), None);
+    }
+
+    #[test]
+    fn loop_interrupt_and_stop_flag_end_the_loop_cleanly() {
+        let interrupted = Mutex::new(0);
+        let on_interrupt = || *interrupted.lock().unwrap() += 1;
+        let hooks = LoopHooks {
+            on_interrupt: Some(&on_interrupt),
+            ..LoopHooks::default()
+        };
+        let mut cycle = || Ok(CycleOutcome::Interrupted);
+        assert_eq!(
+            run_daemon_loop(&mut cycle, false, 0.0, &|| false, &no_sleep, &hooks),
+            0
+        );
+        assert_eq!(*interrupted.lock().unwrap(), 1);
+        // The stop flag checked before the first cycle: nothing runs.
+        let mut never = || -> Result<CycleOutcome, CycleError> { panic!("must not run") };
+        assert_eq!(
+            run_daemon_loop(
+                &mut never,
+                false,
+                0.0,
+                &|| true,
+                &no_sleep,
+                &LoopHooks::default()
+            ),
+            0
+        );
+        // The poll sleep is handed the stop predicate; a stop set during it
+        // ends the loop after the cycle.
+        let stop = StopFlag::new();
+        let sleep_stop = stop.clone();
+        let sleep = move |_seconds: f64, _stop: &dyn Fn() -> bool| sleep_stop.set();
+        let mut ran = 0;
+        let mut counting = || {
+            ran += 1;
+            Ok(CycleOutcome::Completed)
+        };
+        assert_eq!(
+            run_daemon_loop(
+                &mut counting,
+                false,
+                1.0,
+                &|| stop.is_set(),
+                &sleep,
+                &LoopHooks::default()
+            ),
+            0
+        );
+        assert_eq!(ran, 1);
+        interruptible_sleep(0.0, &|| false);
+        interruptible_sleep(f64::NAN, &|| false);
+        interruptible_sleep(5.0, &|| true);
+    }
+
+    // --- argv parsing ----------------------------------------------------------------------
+
+    #[test]
+    fn parse_defaults_match_argparse() {
+        assert_eq!(args(&[]), WorkerArgs::default());
+        let d = WorkerArgs::default();
+        assert_eq!(
+            (d.max_turns, d.max_retries, d.worktree_retention_days),
+            (500, 1, 7)
+        );
+        assert_eq!(
+            (d.run_log_retention, d.heartbeat, d.poll_interval),
+            (500, 10, 5)
+        );
+        assert_eq!(
+            (d.lease_seconds, d.reconcile_seconds, d.once),
+            (300.0, 15.0, false)
+        );
+    }
+
+    #[test]
+    fn parse_every_flag_with_prefixes_and_equals() {
+        let parsed = args(&[
+            "--tasks-dir",
+            "/t",
+            "--db=/d.sqlite",
+            "--sandbox-root",
+            "@cache",
+            "--model",
+            "sonnet",
+            "--max-turns",
+            "9",
+            "--max-retries",
+            "2",
+            "--worktree-retention-days",
+            "3",
+            "--run-log-retention",
+            "42",
+            "--heartbeat",
+            "0",
+            "--poll-interval",
+            "1",
+            "--worker-id",
+            "w",
+            "--concurrency",
+            "3",
+            "--lease-seconds",
+            "120",
+            "--reconcile-seconds",
+            "0",
+            "--once",
+        ]);
+        assert_eq!(parsed.tasks_dir.as_deref(), Some("/t"));
+        assert_eq!(parsed.db.as_deref(), Some("/d.sqlite"));
+        assert_eq!(parsed.sandbox_root.as_deref(), Some("@cache"));
+        assert_eq!(parsed.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            (
+                parsed.max_turns,
+                parsed.max_retries,
+                parsed.worktree_retention_days
+            ),
+            (9, 2, 3)
+        );
+        assert_eq!(
+            (
+                parsed.run_log_retention,
+                parsed.heartbeat,
+                parsed.poll_interval
+            ),
+            (42, 0, 1)
+        );
+        assert_eq!(parsed.worker_id.as_deref(), Some("w"));
+        assert_eq!(parsed.concurrency.as_deref(), Some("3"));
+        assert_eq!(
+            (parsed.lease_seconds, parsed.reconcile_seconds, parsed.once),
+            (120.0, 0.0, true)
+        );
+        // Unambiguous prefixes resolve; the last of a repeated option wins.
+        let prefixed = args(&["--max-t", "4", "--heart", "7", "--once", "--max-t", "6"]);
+        assert_eq!(
+            (prefixed.max_turns, prefixed.heartbeat, prefixed.once),
+            (6, 7, true)
+        );
+        assert_eq!(args(&["--lease-seconds", "-5"]).lease_seconds, -5.0);
+    }
+
+    #[test]
+    fn parse_help_and_errors_render_argparse_text() {
+        let help: Vec<String> = vec!["-h".into()];
+        assert_eq!(parse_args(&help).unwrap(), Parsed::Help(HELP.to_owned()));
+        let help: Vec<String> = vec!["--once".into(), "--help".into()];
+        assert!(matches!(parse_args(&help).unwrap(), Parsed::Help(_)));
+        assert_eq!(
+            arg_error(&["--max-turns", "x"]),
+            format!(
+                "{USAGE}flywheel worker: error: argument --max-turns: invalid int value: 'x'\n"
+            )
+        );
+        assert_eq!(
+            arg_error(&["--max-turns", "1.5"]),
+            format!(
+                "{USAGE}flywheel worker: error: argument --max-turns: invalid int value: '1.5'\n"
+            )
+        );
+        assert_eq!(
+            arg_error(&["--lease-seconds", "x"]),
+            format!(
+                "{USAGE}flywheel worker: error: argument --lease-seconds: invalid float value: 'x'\n"
+            )
+        );
+        assert_eq!(
+            arg_error(&["--bogus"]),
+            format!("{USAGE}flywheel worker: error: unrecognized arguments: --bogus\n")
+        );
+        assert_eq!(
+            arg_error(&["--once", "1"]),
+            format!("{USAGE}flywheel worker: error: unrecognized arguments: 1\n")
+        );
+        assert_eq!(
+            arg_error(&["extra", "--bogus"]),
+            format!("{USAGE}flywheel worker: error: unrecognized arguments: extra --bogus\n")
+        );
+        assert_eq!(
+            arg_error(&["--db"]),
+            format!("{USAGE}flywheel worker: error: argument --db: expected one argument\n")
+        );
+        assert_eq!(
+            arg_error(&["--once=1"]),
+            format!(
+                "{USAGE}flywheel worker: error: argument --once: ignored explicit argument '1'\n"
+            )
+        );
+        assert_eq!(
+            arg_error(&["--m", "x"]),
+            format!(
+                "{USAGE}flywheel worker: error: ambiguous option: --m could match --model, --max-turns, --max-retries\n"
+            )
+        );
+        assert!(HELP.starts_with(USAGE));
+    }
+
+    // --- main ------------------------------------------------------------------------------
+
+    struct CwdGuard {
+        previous: PathBuf,
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn enter(dir: &Path) -> CwdGuard {
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        CwdGuard { previous }
+    }
+
+    fn run_main(argv: &[&str]) -> (i32, String, String) {
+        let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = main_with(&argv, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    #[test]
+    fn main_subone_concurrency_exits_nonzero_and_claims_nothing() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        fs::write(
+            repo.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n",
+        )
+        .unwrap();
+        task_file(&repo, "01-phase", "t1", "true");
+        let _cwd = enter(&repo);
+        let (code, _out, err) = run_main(&["--concurrency", "0", "--once"]);
+        assert_ne!(code, 0);
+        assert!(err.contains("concurrency"), "{err}");
+        assert!(err.starts_with("flywheel worker: policy error: "), "{err}");
+        assert!(!repo.join(".flywheel").join("flywheel.sqlite").exists());
+    }
+
+    #[test]
+    fn main_help_and_usage_errors() {
+        let (code, out, _err) = run_main(&["--help"]);
+        assert_eq!((code, out.as_str()), (0, HELP));
+        let (code, _out, err) = run_main(&["--bogus"]);
+        assert_eq!(code, 2);
+        assert!(err.ends_with("flywheel worker: error: unrecognized arguments: --bogus\n"));
+    }
+
+    #[test]
+    fn main_once_on_an_empty_queue_exits_zero_and_creates_the_store() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        fs::write(
+            repo.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
+        let _cwd = enter(&repo);
+        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(repo.join(".flywheel").join("flywheel.sqlite").exists());
+        assert!(repo.join(".flywheel").join("worktrees").is_dir());
+    }
+
+    #[test]
+    fn main_outside_a_repository_reports_the_git_error() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let _cwd = enter(tmp.path());
+        let (code, _out, err) = run_main(&["--once"]);
+        assert_eq!(
+            (code, err.as_str()),
+            (1, "ERROR: not inside a git repository.\n")
+        );
+    }
+
+    #[test]
+    fn describe_cycle_error_names_the_python_kind() {
+        let err: CycleError = Box::new(RunOnceError::Io(std::io::Error::other("disk gone")));
+        assert_eq!(describe_cycle_error(&err), "OSError: disk gone");
+        let plain: CycleError = "bare".into();
+        assert_eq!(describe_cycle_error(&plain), "bare");
+    }
+}

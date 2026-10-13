@@ -924,3 +924,531 @@ pub fn run_pool(
     ));
     pool.run_supervised()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+
+    fn quiet() -> Logger {
+        Arc::new(|_m: &str| {})
+    }
+
+    fn capture() -> (Logger, Arc<Mutex<Vec<String>>>) {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&lines);
+        (
+            Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
+            lines,
+        )
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()]
+    }
+
+    fn sleep_argv() -> SpawnMember {
+        Arc::new(|_id: &str| sh("exec sleep 300"))
+    }
+
+    fn exit_zero_argv() -> SpawnMember {
+        Arc::new(|_id: &str| sh("exit 0"))
+    }
+
+    fn crash_argv() -> SpawnMember {
+        Arc::new(|_id: &str| sh("exit 7"))
+    }
+
+    /// A member that ignores SIGTERM and spawns a SIGTERM-ignoring
+    /// grandchild whose pid it writes to `pidfile`: only the escalation to
+    /// SIGKILL can end them -- a true group-escalation probe.
+    fn ignore_term_argv(pidfile: &Path) -> Vec<String> {
+        sh(&format!(
+            "trap '' TERM; ( trap '' TERM; exec sleep 300 ) & echo $! > '{}'; wait",
+            pidfile.display()
+        ))
+    }
+
+    /// Alive and not a zombie (a reaped-by-init orphan reads as gone; a
+    /// zombie would still answer `kill(pid, 0)`).
+    fn alive(pid: u32) -> bool {
+        // SAFETY: signal 0 performs no delivery; it only probes existence.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+            return false;
+        }
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let after_comm = stat.rsplit(')').next().unwrap_or("");
+                !after_comm.trim_start().starts_with('Z')
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn read_pid(pidfile: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(text) = fs::read_to_string(pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("grandchild pid file never appeared");
+    }
+
+    fn pool(size: i64, spawn: SpawnMember, once: bool, prefix: &str) -> WorkerPool {
+        WorkerPool::new(PoolOptions::new(size, spawn, quiet(), once).with_prefix(prefix)).unwrap()
+    }
+
+    // --- spawn / identity ---------------------------------------------------------------
+
+    #[test]
+    fn pool_spawns_size_distinct_members() {
+        let mut pool = pool(3, sleep_argv(), false, "t");
+        pool.start().unwrap();
+        let pids = pool.live_member_pids();
+        assert_eq!(pids.len(), 3);
+        assert_eq!(pids.iter().collect::<BTreeSet<_>>().len(), 3);
+        pool.stop(Some(0.5));
+        assert!(pool.live_member_pids().is_empty());
+        assert_eq!(pool.size(), 3);
+    }
+
+    #[test]
+    fn pool_member_worker_ids_are_distinct_and_prefixed() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let spawn: SpawnMember = Arc::new(move |id: &str| {
+            sink.lock().unwrap().push(id.to_owned());
+            sh("exec sleep 300")
+        });
+        let (log, lines) = capture();
+        let mut pool =
+            WorkerPool::new(PoolOptions::new(3, spawn, log, false).with_prefix("fleet")).unwrap();
+        pool.start().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["fleet-0", "fleet-1", "fleet-2"]
+        );
+        pool.stop(Some(0.5));
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("pool member fleet-0 spawned pid="),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn pool_rejects_a_sub_one_size_and_a_bad_budget() {
+        let err = WorkerPool::new(PoolOptions::new(0, sleep_argv(), quiet(), false)).unwrap_err();
+        assert_eq!(err.to_string(), "worker pool size must be >= 1, got 0");
+        let err = WorkerPool::new(
+            PoolOptions::new(1, sleep_argv(), quiet(), false).with_restart_budget(1, 0.0),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PoolError::Budget(_)));
+    }
+
+    // --- --once drain / retire -----------------------------------------------------------
+
+    #[test]
+    fn pool_once_retires_cleanly_drained_members() {
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(2, exit_zero_argv(), quiet(), true)
+                .with_prefix("once")
+                .with_poll_interval(0.02),
+        )
+        .unwrap();
+        assert_eq!(pool.run_supervised(), 0);
+        assert!(pool.is_done());
+        assert!(pool.live_member_pids().is_empty());
+        assert_eq!(pool.retired(), &BTreeSet::from([0, 1]));
+        assert!(pool.exhausted().is_empty());
+    }
+
+    #[test]
+    fn pool_once_does_not_respawn_clean_members() {
+        let spawns: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&spawns);
+        let spawn: SpawnMember = Arc::new(move |id: &str| {
+            sink.lock().unwrap().push(id.to_owned());
+            sh("exit 0")
+        });
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(2, spawn, quiet(), true)
+                .with_prefix("once")
+                .with_poll_interval(0.02),
+        )
+        .unwrap();
+        assert_eq!(pool.run_supervised(), 0);
+        let mut seen = spawns.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, ["once-0", "once-1"]);
+    }
+
+    // --- crash restart-and-reclaim (bounded) ----------------------------------------------
+
+    #[test]
+    fn pool_restarts_crashed_member_same_slot() {
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(1, crash_argv(), quiet(), false)
+                .with_prefix("r")
+                .with_restart_budget(3, 300.0),
+        )
+        .unwrap();
+        pool.start().unwrap();
+        let first_pid = pool.member_pid(0).unwrap();
+        assert!(pool.wait_member(0, Duration::from_secs(5)));
+        pool.supervise_tick().unwrap();
+        let restarted = pool.member_pid(0).unwrap();
+        assert_ne!(restarted, first_pid);
+        assert!(pool.retired().is_empty());
+        pool.stop(Some(0.5));
+    }
+
+    #[test]
+    fn pool_gives_up_after_restart_budget() {
+        let (log, lines) = capture();
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(1, crash_argv(), log, false)
+                .with_prefix("g")
+                .with_poll_interval(0.02)
+                .with_restart_budget(2, 300.0),
+        )
+        .unwrap();
+        // A member that crashes on every (re)start exhausts its windowed
+        // crash-loop budget and the pool RETIRES that slot rather than
+        // spinning forever; the single slot is the whole fleet, so the pool
+        // ends with a non-zero exit for operator inspection.
+        assert_eq!(pool.run_supervised(), 1);
+        assert!(pool.live_member_pids().is_empty());
+        assert_eq!(pool.exhausted(), &BTreeSet::from([0]));
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains(
+                "pool member g-0 exited 7; respawning (death 1 within 300s window, budget 2)"
+            ),
+            "{logged}"
+        );
+        assert!(logged.contains("exhausted its crash-loop budget (2 respawns within 300s, last exit 7); retiring this slot"), "{logged}");
+    }
+
+    #[test]
+    fn slot_retire_keeps_fleet() {
+        // A pool of size 2 where one slot crash-loops past its budget
+        // retires THAT slot in isolation and keeps the healthy member
+        // running (spec 00070, D-C): the surviving pid is still alive after
+        // slot 0 retires, no pool-wide stop was requested, and stop()
+        // afterwards still leaves nothing alive.
+        let spawn: SpawnMember = Arc::new(|id: &str| {
+            if id.ends_with("-0") {
+                sh("exit 7")
+            } else {
+                sh("exec sleep 300")
+            }
+        });
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(2, spawn, quiet(), false)
+                .with_prefix("fleet")
+                .with_restart_budget(1, 300.0),
+        )
+        .unwrap();
+        pool.start().unwrap();
+        let healthy_pid = pool.member_pid(1).unwrap();
+        assert!(alive(healthy_pid));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !pool.retired().contains(&0) && Instant::now() < deadline {
+            pool.wait_member(0, Duration::from_secs(5));
+            pool.supervise_tick().unwrap();
+        }
+        assert!(pool.retired().contains(&0), "failing slot never retired");
+        assert!(pool.exhausted().contains(&0));
+        assert!(alive(healthy_pid));
+        assert_eq!(pool.live_member_pids(), vec![healthy_pid]);
+        assert!(!pool.stop_requested());
+        assert!(!pool.retired().contains(&1));
+        pool.stop(Some(1.0));
+        assert!(pool.live_member_pids().is_empty());
+        assert!(!alive(healthy_pid));
+    }
+
+    #[test]
+    fn pool_slot_budget_is_windowed_not_lifetime() {
+        // Two crashes straddling the window both respawn: the budget is
+        // windowed, not a lifetime counter (spec 00070, D-B).
+        let now = Arc::new(Mutex::new(0.0f64));
+        let clock_now = Arc::clone(&now);
+        let spawns: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&spawns);
+        let spawn: SpawnMember = Arc::new(move |id: &str| {
+            sink.lock().unwrap().push(id.to_owned());
+            sh("exit 7")
+        });
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(1, spawn, quiet(), false)
+                .with_prefix("w")
+                .with_restart_budget(1, 10.0)
+                .with_clock(Arc::new(move || *clock_now.lock().unwrap())),
+        )
+        .unwrap();
+        pool.start().unwrap();
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        assert!(pool.wait_member(0, Duration::from_secs(5)));
+        pool.supervise_tick().unwrap();
+        assert!(!pool.retired().contains(&0));
+        assert_eq!(spawns.lock().unwrap().len(), 2);
+        *now.lock().unwrap() = 25.0;
+        assert!(pool.wait_member(0, Duration::from_secs(5)));
+        pool.supervise_tick().unwrap();
+        assert!(
+            !pool.retired().contains(&0),
+            "windowed budget must replenish"
+        );
+        assert!(!pool.exhausted().contains(&0));
+        assert_eq!(spawns.lock().unwrap().len(), 3);
+        pool.stop(Some(1.0));
+    }
+
+    // --- orphan-free shutdown ---------------------------------------------------------------
+
+    #[test]
+    fn pool_stop_force_kills_sigterm_ignoring_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfiles: BTreeMap<String, PathBuf> = BTreeMap::from([
+            ("k-0".to_owned(), tmp.path().join("gc-0.pid")),
+            ("k-1".to_owned(), tmp.path().join("gc-1.pid")),
+        ]);
+        let files = pidfiles.clone();
+        let spawn: SpawnMember = Arc::new(move |id: &str| ignore_term_argv(&files[id]));
+        let mut pool = pool(2, spawn, false, "k");
+        pool.start().unwrap();
+        let member_pids = pool.live_member_pids();
+        let grandchild_pids: Vec<u32> = ["k-0", "k-1"]
+            .iter()
+            .map(|id| read_pid(&pidfiles[*id]))
+            .collect();
+        assert_eq!(member_pids.len(), 2);
+        assert!(
+            member_pids
+                .iter()
+                .chain(&grandchild_pids)
+                .all(|p| alive(*p))
+        );
+        // SIGTERM is ignored, so stop must escalate to SIGKILL within the
+        // window and take down every member's whole process group.
+        pool.stop(Some(0.5));
+        assert!(member_pids.iter().all(|p| !alive(*p)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while grandchild_pids.iter().any(|p| alive(*p)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(grandchild_pids.iter().all(|p| !alive(*p)));
+    }
+
+    #[test]
+    fn pool_stop_is_idempotent_and_drop_stops() {
+        let mut pool = pool(1, sleep_argv(), false, "i");
+        pool.start().unwrap();
+        let pid = pool.member_pid(0).unwrap();
+        pool.stop(Some(0.5));
+        pool.stop(Some(0.5));
+        assert!(pool.live_member_pids().is_empty());
+        assert!(!alive(pid));
+        let mut dropped = pool_with(1, sleep_argv(), "d");
+        dropped.start().unwrap();
+        let pid = dropped.member_pid(0).unwrap();
+        drop(dropped);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(pid));
+    }
+
+    fn pool_with(size: i64, spawn: SpawnMember, prefix: &str) -> WorkerPool {
+        WorkerPool::new(
+            PoolOptions::new(size, spawn, quiet(), false)
+                .with_prefix(prefix)
+                .with_poll_interval(0.02),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn member_output_is_captured_and_tailed_on_death() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spawn: SpawnMember =
+            Arc::new(|_id: &str| sh("echo first; echo second; echo oops >&2; exit 3"));
+        let (log, lines) = capture();
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(1, spawn, log, false)
+                .with_prefix("c")
+                .with_log_dir(tmp.path().join("logs"))
+                .with_restart_budget(0, 300.0),
+        )
+        .unwrap();
+        pool.start().unwrap();
+        assert!(pool.wait_member(0, Duration::from_secs(5)));
+        pool.supervise_tick().unwrap();
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("pool member c-0 last output: first"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("pool member c-0 last output: oops"),
+            "{logged}"
+        );
+        assert!(logged.contains("last exit 3"), "{logged}");
+        let log_files: Vec<_> = fs::read_dir(tmp.path().join("logs"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(log_files.len(), 1);
+        assert!(
+            log_files[0]
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pool-c-0-")
+        );
+        assert!(death_log_tail(None).is_empty());
+        assert!(death_log_tail(Some(Path::new("/nonexistent/x.log"))).is_empty());
+    }
+
+    #[test]
+    fn spawn_failure_is_reported_not_panicked() {
+        let spawn: SpawnMember = Arc::new(|_id: &str| vec!["/nonexistent/bin/worker".to_owned()]);
+        let mut pool = pool(1, spawn, false, "s");
+        let err = pool.start().unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot spawn pool member s-0: "),
+            "{err}"
+        );
+        let empty: SpawnMember = Arc::new(|_id: &str| Vec::new());
+        let mut pool = pool_with(1, empty, "e");
+        assert_eq!(pool.run_supervised(), 1);
+    }
+
+    // --- member argv plumbing ----------------------------------------------------------------
+
+    fn program() -> Vec<String> {
+        vec!["/opt/flywheel".to_owned(), "worker".to_owned()]
+    }
+
+    fn full_args() -> WorkerArgs {
+        WorkerArgs {
+            max_turns: 12,
+            max_retries: 4,
+            worktree_retention_days: 7,
+            heartbeat: 30,
+            poll_interval: 5,
+            ..WorkerArgs::default()
+        }
+    }
+
+    fn value_after<'a>(argv: &'a [String], flag: &str) -> &'a str {
+        let index = argv
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("{flag} missing"));
+        &argv[index + 1]
+    }
+
+    #[test]
+    fn pool_member_argv_pins_concurrency_one_and_distinct_id() {
+        let argv = pool_member_argv(&program(), &full_args(), "fleet-2", None);
+        assert_eq!(&argv[..2], &program()[..]);
+        assert_eq!(value_after(&argv, "--concurrency"), "1");
+        assert_eq!(value_after(&argv, "--worker-id"), "fleet-2");
+        let other = pool_member_argv(&program(), &full_args(), "fleet-1", None);
+        assert_eq!(value_after(&other, "--worker-id"), "fleet-1");
+    }
+
+    #[test]
+    fn pool_member_argv_forwards_run_knobs() {
+        let args = WorkerArgs {
+            max_turns: 9,
+            max_retries: 2,
+            lease_seconds: 120.0,
+            run_log_retention: 42,
+            tasks_dir: Some("/tmp/tasks".into()),
+            db: Some("/tmp/db.sqlite".into()),
+            sandbox_root: Some("@cache".into()),
+            once: true,
+            ..full_args()
+        };
+        let argv = pool_member_argv(&program(), &args, "fleet-0", Some("sonnet"));
+        assert_eq!(value_after(&argv, "--max-turns"), "9");
+        assert_eq!(value_after(&argv, "--max-retries"), "2");
+        assert_eq!(value_after(&argv, "--lease-seconds"), "120.0");
+        assert_eq!(value_after(&argv, "--reconcile-seconds"), "15.0");
+        assert_eq!(value_after(&argv, "--run-log-retention"), "42");
+        assert_eq!(value_after(&argv, "--heartbeat"), "30");
+        assert_eq!(value_after(&argv, "--poll-interval"), "5");
+        assert_eq!(value_after(&argv, "--worktree-retention-days"), "7");
+        assert_eq!(value_after(&argv, "--tasks-dir"), "/tmp/tasks");
+        assert_eq!(value_after(&argv, "--db"), "/tmp/db.sqlite");
+        assert_eq!(value_after(&argv, "--sandbox-root"), "@cache");
+        assert_eq!(value_after(&argv, "--model"), "sonnet");
+        assert!(argv.iter().any(|a| a == "--once"));
+        // The member argv round-trips through the worker parser.
+        let parsed = crate::daemon::parse_args(&argv[2..]).unwrap();
+        assert!(matches!(parsed, crate::daemon::Parsed::Args(ref a) if a.once && a.max_turns == 9));
+    }
+
+    #[test]
+    fn pool_member_argv_omits_optional_flags_when_unset() {
+        let argv = pool_member_argv(&program(), &full_args(), "fleet-0", None);
+        for flag in ["--tasks-dir", "--db", "--sandbox-root", "--model", "--once"] {
+            assert!(!argv.iter().any(|a| a == flag), "{flag} present");
+        }
+    }
+
+    #[test]
+    fn member_program_is_this_executable_worker_verb() {
+        let program = member_program().unwrap();
+        assert_eq!(program.len(), 2);
+        assert_eq!(program[1], "worker");
+    }
+
+    // --- rendering helpers ----------------------------------------------------------------
+
+    #[test]
+    fn python_g_formatting() {
+        assert_eq!(format_g(300.0), "300");
+        assert_eq!(format_g(10.0), "10");
+        assert_eq!(format_g(0.5), "0.5");
+        assert_eq!(format_g(1.25), "1.25");
+        assert_eq!(format_g(0.0), "0");
+        assert_eq!(format_g(1e-5), "1e-05");
+        assert_eq!(format_g(2_500_000.0), "2.5e+06");
+        assert_eq!(format_g(f64::INFINITY), "inf");
+        assert_eq!(format_g(f64::NAN), "nan");
+    }
+
+    #[test]
+    fn member_exit_renders_like_popen_returncode() {
+        let code = MemberExit {
+            code: Some(7),
+            signal: None,
+        };
+        assert_eq!(code.to_string(), "7");
+        assert!(!code.is_clean());
+        let signalled = MemberExit {
+            code: None,
+            signal: Some(9),
+        };
+        assert_eq!(signalled.to_string(), "-9");
+        let unknown = MemberExit {
+            code: None,
+            signal: None,
+        };
+        assert_eq!(unknown.to_string(), "?");
+        let stop = take_stop_signal();
+        assert_eq!(stop, None);
+    }
+}

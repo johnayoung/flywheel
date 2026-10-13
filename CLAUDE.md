@@ -37,6 +37,18 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 
 New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.md`).
 
+## Rust workspace (the rewrite)
+
+The Rust implementation lives in the root Cargo workspace, one crate per package under `crates/` (`flywheel-agents`, `flywheel-core`, `flywheel-orchestrator`, `flywheel-worktree`, `flywheel-container`, `flywheel`), same dependency arrow. The `flywheel` / `fw` binaries are the product entry points. Stores, ledgers, task digests, prompts, and rendered output are byte-compatible with the Python implementation (SQLite and Postgres files are shared both ways). The agents crate ships only the CLI transports (claude-code stream-json, codex); there is no SDK path in Rust.
+
+```bash
+scripts/check-rust.sh                 # rustfmt -> clippy -D warnings -> cargo test, quiet on success
+cargo test -p flywheel-core harness   # one crate, one keyword (iterating)
+cargo build --release -p flywheel     # target/release/{flywheel,fw}
+```
+
+Docker-backed tests (Postgres, container backend) skip themselves without a daemon. Run `scripts/check-rust.sh` before reporting Rust work done.
+
 ## Commands
 
 ```bash

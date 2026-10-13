@@ -11,6 +11,7 @@ repository.workspace = true
 flywheel-core = { path = "../flywheel-core" }
 flywheel-orchestrator = { path = "../flywheel-orchestrator" }
 flywheel-agents = { path = "../flywheel-agents" }
+flywheel-container = { path = "../flywheel-container" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -24,8 +24,9 @@
 //! * the `gh` subprocess seam ([`GhRunner`]), reused for the issue reads and
 //!   every label / body / comment write;
 //! * the authoring-agent seam ([`TriageInvoke`]: prompt in, text out), whose
-//!   production implementation ([`AgentsTriageInvoker`]) is a cold
-//!   flywheel-agents session rooted in the repo;
+//!   production implementation is the autopilot repo invoker
+//!   ([`crate::autopilot::AgentsRepoInvoker`]): a cold flywheel-agents
+//!   session rooted in the repo;
 //! * the grader-command seam ([`TriageGraderExecutor`]): given the
 //!   authoritative command, run it against the current base and return its
 //!   observed exit code. The ready flip is ordered strictly after this call
@@ -54,13 +55,15 @@
 //! Authoritative specs: `docs/autopilot.md` (triage), `docs/work-sources.md`
 //! (the triage trust rule).
 
+use crate::autopilot::{
+    AgentsRepoInvoker, AutopilotInvoker, RepoInvokerOptions, build_repo_invoker,
+};
 use crate::github::{GhRunner, ISSUE_LIST_FIELDS, LIST_LIMIT, run_gh};
 use crate::sources::{LogSink, WorkSourceError};
 use crate::triage_receipt::{
     RECEIPT_KEY, SPEC_FENCE_CLOSE, SPEC_FENCE_OPEN, TriageReceipt, content_hash, is_fail_first,
     parse_receipt, py_splitlines, strip_spec_block,
 };
-use flywheel_core::agents_invoke::ColdSession;
 use flywheel_core::deadline_config::DEFAULT_AUTOPILOT_AGENT_SECONDS;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -77,7 +80,7 @@ pub const DEFAULT_TRIAGE_MAX_TURNS: u32 = 120;
 
 /// The agent the production authoring invoker drives when the policy names
 /// none (`[agent] id` unset).
-pub const DEFAULT_TRIAGE_AGENT_ID: &str = "claude-code";
+pub use crate::autopilot::DEFAULT_AGENT_ID as DEFAULT_TRIAGE_AGENT_ID;
 
 /// The `--limit` the issue listing passes to `gh` (one page of
 /// [`LIST_LIMIT`]).
@@ -145,7 +148,7 @@ pub type TriageInvokeFuture<'a> =
 /// The authoring-agent seam: a prompt in, the agent's response text out.
 ///
 /// Structurally the same shape as the autopilot's invoker seam; the
-/// production implementation is [`AgentsTriageInvoker`]. Tests script it.
+/// production implementation is [`crate::autopilot::AgentsRepoInvoker`]. Tests script it.
 pub trait TriageInvoke: Send + Sync {
     fn invoke<'a>(&'a self, prompt: &'a str) -> TriageInvokeFuture<'a>;
 }
@@ -1082,78 +1085,43 @@ impl Default for TriageAgentOptions {
     }
 }
 
-/// The production authoring seam: a cold flywheel-agents session rooted in
-/// the repo.
-///
-/// Each prompt runs in a fresh session with the repo as its working
-/// directory (the agent reads the code to judge what grader the issue's
-/// intent implies), under the configured turn budget and wall-clock
-/// deadline. Only the agent's text crosses the seam.
-pub struct AgentsTriageInvoker {
-    repo_root: PathBuf,
-    session: ColdSession,
-}
-
-impl fmt::Debug for AgentsTriageInvoker {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentsTriageInvoker")
-            .field("repo_root", &self.repo_root)
-            .field("session", &self.session)
-            .finish()
-    }
-}
-
-impl AgentsTriageInvoker {
-    /// An invoker driving `session` with `repo_root` as its working
-    /// directory.
-    pub fn new(repo_root: impl Into<PathBuf>, session: ColdSession) -> Self {
-        Self {
-            repo_root: repo_root.into(),
-            session,
+impl TriageAgentOptions {
+    /// The repo-invoker options this authoring seam resolves to.
+    pub fn repo_invoker_options(&self) -> RepoInvokerOptions {
+        RepoInvokerOptions {
+            agent_id: self.agent_id.clone(),
+            agent_transport: self.agent_transport.clone(),
+            model: self.model.clone(),
+            max_turns: self.max_turns,
+            deadline_seconds: self.deadline_seconds,
+            command_override: None,
         }
     }
-
-    /// An invoker whose session is built from `options`.
-    pub fn from_options(repo_root: impl Into<PathBuf>, options: &TriageAgentOptions) -> Self {
-        let mut session = ColdSession::new(
-            &options.agent_id,
-            options.model.as_deref(),
-            options.max_turns,
-        )
-        .with_timeout_seconds(options.deadline_seconds);
-        if let Some(transport) = options.agent_transport.as_deref() {
-            session = session.with_transport(transport);
-        }
-        Self::new(repo_root, session)
-    }
-
-    pub fn repo_root(&self) -> &Path {
-        &self.repo_root
-    }
-
-    pub fn session(&self) -> &ColdSession {
-        &self.session
-    }
 }
 
-impl TriageInvoke for AgentsTriageInvoker {
+/// The autopilot repo invoker is the production authoring seam: one cold
+/// session per prompt, rooted in the repo, under the configured turn
+/// budget and wall-clock ceiling. Only the agent's text crosses the seam.
+impl TriageInvoke for AgentsRepoInvoker {
     fn invoke<'a>(&'a self, prompt: &'a str) -> TriageInvokeFuture<'a> {
         Box::pin(async move {
-            self.session
-                .run(prompt, &self.repo_root, None)
+            AutopilotInvoker::invoke(self, prompt)
                 .await
-                .map(|output| output.text)
                 .map_err(|err| TriageError::Invoke(err.to_string()))
         })
     }
 }
 
-/// The production authoring seam for `repo_root` under `options`.
+/// The production authoring seam for `repo_root` under `options`: the same
+/// repo invoker autopilot authors tasks with.
 pub fn build_triage_authoring_invoker(
     repo_root: impl Into<PathBuf>,
     options: &TriageAgentOptions,
 ) -> Arc<dyn TriageInvoke> {
-    Arc::new(AgentsTriageInvoker::from_options(repo_root, options))
+    Arc::new(build_repo_invoker(
+        repo_root,
+        options.repo_invoker_options(),
+    ))
 }
 
 /// The production grader-command seam: run the command through the POSIX
@@ -2507,8 +2475,8 @@ mod tests {
             max_turns: 9,
             deadline_seconds: Some(5.0),
         };
-        let invoker = AgentsTriageInvoker::from_options("/repo", &options);
-        let configuration = invoker.session().configuration();
+        let invoker = build_repo_invoker("/repo", options.repo_invoker_options());
+        let configuration = invoker.configuration();
         assert_eq!(configuration.agent_id, "codex");
         assert_eq!(configuration.model_id.as_deref(), Some("m"));
         assert_eq!(configuration.max_turns, Some(9));
@@ -2516,7 +2484,6 @@ mod tests {
             configuration.adapter_options.get("transport"),
             Some(&json!("cli"))
         );
-        assert_eq!(invoker.repo_root(), Path::new("/repo"));
         let defaults = TriageAgentOptions::default();
         assert_eq!(defaults.agent_id, DEFAULT_TRIAGE_AGENT_ID);
         assert_eq!(defaults.max_turns, DEFAULT_TRIAGE_MAX_TURNS);

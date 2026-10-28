@@ -539,11 +539,19 @@ impl Redactor for FieldPathRedactor {
 /// - the normalized agent events the Rust adapters record: a tool call
 ///   `{"tool_use_id", "tool_name", "tool_input"}`, an approval request
 ///   `{"tool_name", "tool_input" | "input"}`, and a tool result
-///   `{"tool_use_id", "content"}`.
+///   `{"tool_use_id", "content"}`;
+/// - a codex item the adapter could not normalize (no `id`), recorded raw
+///   as `{"data": {"item": {"type" | "item_type", "command",
+///   "aggregated_output", "arguments", "result", "error", ...}}}`.
 ///
 /// An object naming a denylisted tool (`name` or `tool_name`) has its
 /// sibling `input` / `tool_input` / `content` values replaced with
-/// redaction tokens. A tool *result* carries no name, so the redactor
+/// redaction tokens. A tool name is denylisted when it is listed exactly or
+/// starts with a configured prefix ([`ToolDenylistRedactor::with_prefixes`],
+/// for tool families with open-ended names such as MCP tools). An object
+/// with no name key whose `type` / `item_type` is denylisted (a raw codex
+/// item) has its codex data keys (`command`, `aggregated_output`,
+/// `arguments`, `result`, `error`) redacted the same way. A tool *result* carries no name, so the redactor
 /// remembers every tool call id it has seen and the name it was issued
 /// under, and redacts a result's `content` when its `tool_use_id` maps to a
 /// denylisted tool. A result whose originating call was never observed
@@ -563,6 +571,8 @@ impl Redactor for FieldPathRedactor {
 #[derive(Debug)]
 pub struct ToolDenylistRedactor {
     names: HashSet<String>,
+    /// Name prefixes denylisting a whole tool family.
+    prefixes: Vec<String>,
     salt: Option<Vec<u8>>,
     label: String,
     /// Tool call id -> the tool name it was issued under, learned from the
@@ -574,6 +584,7 @@ impl Clone for ToolDenylistRedactor {
     fn clone(&self) -> Self {
         Self {
             names: self.names.clone(),
+            prefixes: self.prefixes.clone(),
             salt: self.salt.clone(),
             label: self.label.clone(),
             calls: Mutex::new(self.lock_calls().clone()),
@@ -587,6 +598,18 @@ const TOOL_NAME_KEYS: [&str; 2] = ["name", "tool_name"];
 const TOOL_ID_KEYS: [&str; 2] = ["id", "tool_use_id"];
 /// Keys carrying a denylisted tool's input or output.
 const TOOL_DATA_KEYS: [&str; 3] = ["input", "tool_input", "content"];
+/// Keys carrying a raw codex item's input or output (`command_execution`:
+/// `command`, `aggregated_output`; `mcp_tool_call`: `arguments`, `result`,
+/// `error`).
+const CODEX_ITEM_DATA_KEYS: [&str; 5] = [
+    "command",
+    "aggregated_output",
+    "arguments",
+    "result",
+    "error",
+];
+/// Keys carrying a raw codex item's type (the key drifted across releases).
+const CODEX_ITEM_TYPE_KEYS: [&str; 2] = ["type", "item_type"];
 /// The token suffix for a result whose originating call was never seen.
 const UNATTRIBUTED_TOOL: &str = "unknown";
 
@@ -618,10 +641,34 @@ impl ToolDenylistRedactor {
         }
         Ok(Self {
             names,
+            prefixes: Vec::new(),
             salt: salt.map(<[u8]>::to_vec),
             label: label.to_owned(),
             calls: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Also denylist every tool whose name starts with one of `prefixes`
+    /// (e.g. `mcp__` for claude-code MCP tools, `mcp:` for codex ones).
+    pub fn with_prefixes(mut self, prefixes: &[&str]) -> Result<Self, RedactionError> {
+        for prefix in prefixes {
+            if prefix.is_empty() {
+                return Err(configuration(
+                    "ToolDenylistRedactor prefixes must be non-empty strings",
+                ));
+            }
+            self.prefixes.push((*prefix).to_owned());
+        }
+        Ok(self)
+    }
+
+    /// Whether `tool_name` is denylisted, exactly or by prefix.
+    fn denies(&self, tool_name: &str) -> bool {
+        self.names.contains(tool_name)
+            || self
+                .prefixes
+                .iter()
+                .any(|prefix| tool_name.starts_with(prefix.as_str()))
     }
 
     fn lock_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -652,18 +699,26 @@ impl ToolDenylistRedactor {
                         {
                             self.lock_calls().insert(id.to_owned(), tool_name.clone());
                         }
-                        if self.names.contains(&tool_name) {
+                        if self.denies(&tool_name) {
                             self.redact_keys(map, &tool_name, &TOOL_DATA_KEYS);
                         }
                     }
                     None => {
+                        let item_type = CODEX_ITEM_TYPE_KEYS
+                            .iter()
+                            .find_map(|key| map.get(*key).and_then(Value::as_str))
+                            .filter(|item_type| self.denies(item_type))
+                            .map(str::to_owned);
+                        if let Some(item_type) = item_type {
+                            self.redact_keys(map, &item_type, &CODEX_ITEM_DATA_KEYS);
+                        }
                         let result_of = map
                             .get("tool_use_id")
                             .and_then(Value::as_str)
                             .filter(|_| map.contains_key("content"))
                             .map(|id| self.lock_calls().get(id).cloned());
                         match result_of {
-                            Some(Some(origin)) if self.names.contains(&origin) => {
+                            Some(Some(origin)) if self.denies(&origin) => {
                                 self.redact_keys(map, &origin, &["content"]);
                             }
                             Some(None) => self.redact_keys(map, UNATTRIBUTED_TOOL, &["content"]),
@@ -819,16 +874,39 @@ pub fn default_policy(salt: Option<&[u8]>) -> PatternRedactor {
 }
 
 /// Tools whose outputs commonly contain credentials (`.env` files, AWS
-/// credential files, `~/.ssh` material, decoded JWTs, etc.). `Read` is the
-/// direct filesystem-read tool; `Bash` is a general shell that is routinely
-/// used to `cat` credential files; `command_execution` is the codex
-/// adapter's name for the same shell tool. [`strict_policy`] suppresses
+/// credential files, `~/.ssh` material, decoded JWTs, etc.).
+///
+/// claude-code: `Read` (and the legacy `NotebookRead`) return file contents;
+/// `Grep` returns matching file lines (a `.env` hit echoes the secret);
+/// `Bash` is a general shell routinely used to `cat` credential files, and
+/// `BashOutput` / `TaskOutput` return a background shell's output. codex:
+/// `command_execution` is its shell tool and `mcp_tool_call` the raw item
+/// type of an MCP call. Left out on purpose: `Glob` (paths only) and
+/// `WebFetch` (remote content, not local files; a token in its URL is
+/// still caught by the default patterns). [`strict_policy`] suppresses
 /// these tools' inputs and outputs entirely; only the tool name is
 /// preserved so a reader can still follow the agent's actions.
-pub const CREDENTIAL_READING_TOOLS: [&str; 3] = ["Read", "Bash", "command_execution"];
+pub const CREDENTIAL_READING_TOOLS: [&str; 8] = [
+    "Read",
+    "NotebookRead",
+    "Grep",
+    "Bash",
+    "BashOutput",
+    "TaskOutput",
+    "command_execution",
+    "mcp_tool_call",
+];
+
+/// Tool-name prefixes [`strict_policy`] denylists as whole families: MCP
+/// tools take arbitrary inputs and return arbitrary data (a code-search
+/// server reads files like `Grep` does). `mcp__` is claude-code's
+/// `mcp__<server>__<tool>`; `mcp:` is the codex adapter's
+/// `mcp:<server>.<tool>`.
+pub const CREDENTIAL_READING_TOOL_PREFIXES: [&str; 2] = ["mcp__", "mcp:"];
 
 /// Return a [`Redactor`] equal to [`default_policy`] plus a
-/// [`ToolDenylistRedactor`] over [`CREDENTIAL_READING_TOOLS`].
+/// [`ToolDenylistRedactor`] over [`CREDENTIAL_READING_TOOLS`] and
+/// [`CREDENTIAL_READING_TOOL_PREFIXES`].
 ///
 /// Suitable for runs where an agent may have `cat`-ed or read a credential
 /// file: the denylist blanks the input and result blocks for those tools
@@ -836,7 +914,8 @@ pub const CREDENTIAL_READING_TOOLS: [&str; 3] = ["Read", "Bash", "command_execut
 /// shows *which* tool was invoked without leaking *what* it read.
 pub fn strict_policy(salt: Option<&[u8]>) -> ComposedRedactor {
     let denylist = ToolDenylistRedactor::new(&CREDENTIAL_READING_TOOLS, salt)
-        .expect("CREDENTIAL_READING_TOOLS are non-empty tool names");
+        .and_then(|denylist| denylist.with_prefixes(&CREDENTIAL_READING_TOOL_PREFIXES))
+        .expect("CREDENTIAL_READING_TOOLS and prefixes are non-empty");
     compose(vec![Box::new(default_policy(salt)), Box::new(denylist)])
 }
 
@@ -1639,5 +1718,223 @@ mod tests {
             payload(&result)["payload"]["content"],
             "[REDACTED:tool:command_execution]"
         );
+    }
+
+    /// Feed `lines` through a real adapter normalizer and record each event
+    /// exactly as the harness does (`event_to_message` into an SDK-message
+    /// record), so the strict tests bind to the shapes actually persisted.
+    fn adapter_records(
+        mut feed: impl FnMut(&str) -> flywheel_agents::jsonl::LineOutcome,
+        lines: &[Value],
+    ) -> Vec<AuditRecord> {
+        let mut records = Vec::new();
+        for line in lines {
+            for event in feed(&line.to_string()).events {
+                let message = crate::agents_invoke::event_to_message(&event);
+                let sequence = records.len() as u64 + 1;
+                records.push(AuditRecord::SdkMessage(SdkMessageRecord {
+                    run_id: "run-1".into(),
+                    attempt_number: 1,
+                    iteration_number: 1,
+                    message_type: message["type"].as_str().unwrap_or_default().into(),
+                    payload: object(message),
+                    ts: at(),
+                    sequence: Some(sequence),
+                    id: None,
+                }));
+            }
+        }
+        records
+    }
+
+    fn redacted_text(redactor: &dyn Redactor, records: &[AuditRecord]) -> Vec<Value> {
+        records
+            .iter()
+            .map(|record| payload(&redactor.redact(record)))
+            .collect()
+    }
+
+    fn claude_tool_turn(id: &str, name: &str, input: Value, result: &str) -> [Value; 2] {
+        [
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id, "name": name, "input": input}
+            ]}}),
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": id, "content": result}
+            ]}}),
+        ]
+    }
+
+    #[test]
+    fn strict_policy_redacts_claude_file_reading_and_mcp_tools() {
+        let redactor = strict_policy(None);
+        let mut normalizer = flywheel_agents::claude_code::ClaudeStreamNormalizer::new();
+        let mut lines = Vec::new();
+        for (id, name) in [
+            ("toolu_g", "Grep"),
+            ("toolu_o", "BashOutput"),
+            ("toolu_t", "TaskOutput"),
+            ("toolu_n", "NotebookRead"),
+            ("toolu_m", "mcp__serena__search_for_pattern"),
+        ] {
+            lines.extend(claude_tool_turn(
+                id,
+                name,
+                json!({"pattern": "DB_PASSWORD"}),
+                ".env:1:DB_PASSWORD=hunter2",
+            ));
+        }
+        let records = adapter_records(|line| normalizer.feed_line(line), &lines);
+        let started: Vec<_> = records
+            .iter()
+            .filter(|record| matches!(record, AuditRecord::SdkMessage(m) if m.message_type == "tool.started"))
+            .collect();
+        assert_eq!(started.len(), 5, "every tool call was normalized");
+        let out = redacted_text(&redactor, &records);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("DB_PASSWORD"), "{text}");
+        let grep_call = out
+            .iter()
+            .find(|message| message["payload"]["tool_name"] == "Grep")
+            .unwrap();
+        assert_eq!(grep_call["payload"]["tool_input"], "[REDACTED:tool:Grep]");
+        // The MCP result is attributed through its call id, not left as an
+        // unattributed fallback.
+        assert!(text.contains("[REDACTED:tool:mcp__serena__search_for_pattern]"));
+
+        // Paths-only and remote-content tools pass through untouched.
+        let mut normalizer = flywheel_agents::claude_code::ClaudeStreamNormalizer::new();
+        let mut lines = claude_tool_turn(
+            "toolu_l",
+            "Glob",
+            json!({"pattern": "**/*.rs"}),
+            "src/lib.rs",
+        )
+        .to_vec();
+        lines.extend(claude_tool_turn(
+            "toolu_w",
+            "WebFetch",
+            json!({"url": "https://example.com"}),
+            "page",
+        ));
+        let fresh = strict_policy(None);
+        for record in adapter_records(|line| normalizer.feed_line(line), &lines) {
+            assert_eq!(fresh.redact(&record), record);
+        }
+    }
+
+    #[test]
+    fn strict_policy_redacts_codex_mcp_tool_calls_in_both_recorded_shapes() {
+        let redactor = strict_policy(None);
+        let mut normalizer = flywheel_agents::codex::CodexStreamNormalizer::new();
+        let item = json!({
+            "type": "mcp_tool_call",
+            "server": "files",
+            "tool": "read_file",
+            "arguments": {"path": ".env"},
+            "result": {"content": [{"type": "text", "text": "SECRET=hunter2"}]},
+            "error": null,
+            "status": "completed",
+        });
+        let mut with_id = item.clone();
+        with_id["id"] = json!("item_5");
+        let lines = [
+            json!({"type": "item.completed", "item": with_id}),
+            // No `id`: the adapter falls back to a raw event carrying the item.
+            json!({"type": "item.completed", "item": item}),
+        ];
+        let records = adapter_records(|line| normalizer.feed_line(line), &lines);
+        let kinds: Vec<_> = records
+            .iter()
+            .map(|record| match record {
+                AuditRecord::SdkMessage(m) => m.message_type.clone(),
+                AuditRecord::Event(_) => String::new(),
+            })
+            .collect();
+        assert_eq!(kinds, ["tool.started", "tool.finished", "raw"]);
+        let out = redacted_text(&redactor, &records);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains(".env"), "{text}");
+        assert_eq!(out[0]["payload"]["tool_name"], "mcp:files.read_file");
+        assert_eq!(
+            out[0]["payload"]["tool_input"],
+            "[REDACTED:tool:mcp:files.read_file]"
+        );
+        assert_eq!(
+            out[1]["payload"]["content"],
+            "[REDACTED:tool:mcp:files.read_file]"
+        );
+        let raw_item = &out[2]["payload"]["data"]["item"];
+        assert_eq!(raw_item["arguments"], "[REDACTED:tool:mcp_tool_call]");
+        assert_eq!(raw_item["result"], "[REDACTED:tool:mcp_tool_call]");
+        // The server and tool still say what was invoked.
+        assert_eq!(raw_item["server"], "files");
+        assert_eq!(raw_item["tool"], "read_file");
+    }
+
+    #[test]
+    fn strict_policy_redacts_a_codex_shell_item_recorded_raw_without_an_id() {
+        let redactor = strict_policy(None);
+        let mut normalizer = flywheel_agents::codex::CodexStreamNormalizer::new();
+        let lines = [
+            json!({"type": "item.completed", "item": {
+                "type": "command_execution",
+                "command": "cat .env",
+                "aggregated_output": "SECRET=hunter2",
+                "exit_code": 0,
+                "status": "completed",
+            }}),
+            // The drifted `item_type` key is recognised too.
+            json!({"type": "item.completed", "item": {
+                "item_type": "command_execution",
+                "command": "cat ~/.aws/credentials",
+                "aggregated_output": "aws_key=hunter2",
+                "exit_code": 0,
+            }}),
+        ];
+        let records = adapter_records(|line| normalizer.feed_line(line), &lines);
+        assert_eq!(records.len(), 2);
+        let out = redacted_text(&redactor, &records);
+        for message in &out {
+            assert_eq!(message["type"], "raw");
+            let item = &message["payload"]["data"]["item"];
+            assert_eq!(item["command"], "[REDACTED:tool:command_execution]");
+            assert_eq!(
+                item["aggregated_output"],
+                "[REDACTED:tool:command_execution]"
+            );
+            assert_eq!(item["exit_code"], 0);
+        }
+        // A non-denylisted raw item is untouched.
+        let other = adapter_records(
+            |line| normalizer.feed_line(line),
+            &[
+                json!({"type": "item.completed", "item": {"type": "file_change", "command": "kept"}}),
+            ],
+        );
+        assert_eq!(redactor.redact(&other[0]), other[0]);
+    }
+
+    #[test]
+    fn tool_denylist_prefixes_reject_empty_and_match_families() {
+        assert!(
+            ToolDenylistRedactor::new(&["Read"], None)
+                .unwrap()
+                .with_prefixes(&[""])
+                .is_err()
+        );
+        let redactor = ToolDenylistRedactor::new(&[], None)
+            .unwrap()
+            .with_prefixes(&["mcp__"])
+            .unwrap();
+        let out = redactor.redact(&sdk(json!({"content": [
+            {"type": "tool_use", "id": "a", "name": "mcp__db__query", "input": {"sql": "select"}},
+            {"type": "tool_use", "id": "b", "name": "Edit", "input": {"file_path": "x"}},
+        ]})));
+        let content = &payload(&out)["content"];
+        assert_eq!(content[0]["input"], "[REDACTED:tool:mcp__db__query]");
+        assert_eq!(content[1]["input"], json!({"file_path": "x"}));
     }
 }

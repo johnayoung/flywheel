@@ -134,7 +134,7 @@ Streams the totally-ordered audit records for one run, routed by the shell (`aud
 | `--follow` | tail until terminal status (Ctrl-C exits 130) |
 | `--poll-interval` | tail cadence |
 | `--redact` | explicit opt-in (already default) |
-| `--redact-policy NAME`, `--redact-salt SALT` | redaction tuning; `NAME` is a built-in (`default`, `strict`; `strict` also blanks Read/Bash/`command_execution` tool inputs and results) |
+| `--redact-policy NAME`, `--redact-salt SALT` | redaction tuning; `NAME` is a built-in (`default`, `strict`; `strict` also blanks the inputs and results of Read/Grep/Bash/BashOutput/TaskOutput/NotebookRead, every MCP tool (`mcp__*`, codex `mcp:*`), and codex `command_execution`/`mcp_tool_call` items, including ones recorded raw; Glob and WebFetch are kept) |
 | `--raw` | disable redaction (authorized forensics) |
 | `--dry-run` | coverage report only |
 

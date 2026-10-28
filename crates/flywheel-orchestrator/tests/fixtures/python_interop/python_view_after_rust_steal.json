@@ -1,0 +1,228 @@
+{
+  "claims": [
+    {
+      "claimed_at": "2026-05-28T12:00:35+00:00",
+      "lease_expires_at": "2026-05-28T12:01:05+00:00",
+      "task_id": "task-a",
+      "version": 3,
+      "worker_id": "rust-worker"
+    },
+    {
+      "claimed_at": "2026-05-28T12:00:11+00:00",
+      "lease_expires_at": "2026-05-28T12:00:41+00:00",
+      "task_id": "task-c",
+      "version": 2,
+      "worker_id": "py-worker"
+    }
+  ],
+  "dependencies": [
+    [
+      "task-w",
+      "task-a"
+    ],
+    [
+      "task-w",
+      "task-b"
+    ]
+  ],
+  "events": [
+    {
+      "event_type": "acquired",
+      "id": 1,
+      "lease_expires_at": "2026-05-28T12:00:30.123456+00:00",
+      "occurred_at": "2026-05-28T12:00:00.123456+00:00",
+      "task_id": "task-a",
+      "version": 1,
+      "worker_id": "py-worker"
+    },
+    {
+      "event_type": "acquired",
+      "id": 2,
+      "lease_expires_at": "2026-05-28T12:00:31+00:00",
+      "occurred_at": "2026-05-28T12:00:01+00:00",
+      "task_id": "task-b",
+      "version": 1,
+      "worker_id": "py-worker"
+    },
+    {
+      "event_type": "renewed",
+      "id": 3,
+      "lease_expires_at": "2026-05-28T12:00:35+00:00",
+      "occurred_at": "2026-05-28T12:00:05+00:00",
+      "task_id": "task-a",
+      "version": 2,
+      "worker_id": "py-worker"
+    },
+    {
+      "event_type": "released",
+      "id": 4,
+      "lease_expires_at": "2026-05-28T12:00:31+00:00",
+      "occurred_at": "2026-05-28T12:00:06+00:00",
+      "task_id": "task-b",
+      "version": 1,
+      "worker_id": "py-worker"
+    },
+    {
+      "event_type": "acquired",
+      "id": 5,
+      "lease_expires_at": "2026-05-28T12:00:10+00:00",
+      "occurred_at": "2026-05-28T12:00:00+00:00",
+      "task_id": "task-c",
+      "version": 1,
+      "worker_id": "py-other"
+    },
+    {
+      "event_type": "stolen",
+      "id": 6,
+      "lease_expires_at": "2026-05-28T12:00:41+00:00",
+      "occurred_at": "2026-05-28T12:00:11+00:00",
+      "task_id": "task-c",
+      "version": 2,
+      "worker_id": "py-worker"
+    },
+    {
+      "event_type": "acquired",
+      "id": 7,
+      "lease_expires_at": "2026-05-28T12:00:05+00:00",
+      "occurred_at": "2026-05-28T12:00:00+00:00",
+      "task_id": "task-d",
+      "version": 1,
+      "worker_id": "py-dead"
+    },
+    {
+      "event_type": "expired",
+      "id": 8,
+      "lease_expires_at": "2026-05-28T12:00:05+00:00",
+      "occurred_at": "2026-05-28T12:00:12+00:00",
+      "task_id": "task-d",
+      "version": 1,
+      "worker_id": "py-dead"
+    },
+    {
+      "event_type": "stolen",
+      "id": 9,
+      "lease_expires_at": "2026-05-28T12:01:05+00:00",
+      "occurred_at": "2026-05-28T12:00:35+00:00",
+      "task_id": "task-a",
+      "version": 3,
+      "worker_id": "rust-worker"
+    }
+  ],
+  "pause_until_at_20": "2026-05-28T12:00:36+00:00",
+  "pauses": [
+    {
+      "id": 1,
+      "pause_until": "2026-05-28T12:00:36+00:00",
+      "recorded_at": "2026-05-28T12:00:16+00:00",
+      "reset_at": "2026-05-28T12:00:50+00:00",
+      "run_id": "run-1"
+    }
+  ],
+  "review_queue": [
+    {
+      "detail": "manual gate",
+      "id": 2,
+      "occurred_at": "2026-05-28T12:00:15+00:00",
+      "reason": "awaiting-approval",
+      "run_id": "run-1",
+      "task_id": "task-a"
+    }
+  ],
+  "snapshots": [
+    {
+      "captured_at": "2026-05-28T12:00:13+00:00",
+      "id": 1,
+      "item_count": 2,
+      "items": [
+        {
+          "claim_holder": "py-worker",
+          "conflict_keys": [
+            "resource-x",
+            "resource-y"
+          ],
+          "priority": 5,
+          "ready": true,
+          "required_capabilities": [
+            "gpu",
+            "linux"
+          ],
+          "resolved_prerequisites": [],
+          "source_kind": "directory",
+          "source_ref": "/tasks/a.json",
+          "source_url": null,
+          "source_version": "hash-a",
+          "state": "running",
+          "task_id": "task-a"
+        },
+        {
+          "claim_holder": null,
+          "conflict_keys": [],
+          "priority": 0,
+          "ready": false,
+          "required_capabilities": [],
+          "resolved_prerequisites": [
+            "task-a",
+            "task-z"
+          ],
+          "source_kind": null,
+          "source_ref": null,
+          "source_url": null,
+          "source_version": null,
+          "state": "blocked",
+          "task_id": "task-b"
+        }
+      ],
+      "last_event_id": 8
+    }
+  ],
+  "source_syncs": [
+    {
+      "error": null,
+      "finished_at": "2026-05-28T12:00:19+00:00",
+      "id": 1,
+      "metadata_json": "{}",
+      "observed_count": 1,
+      "source_kind": "directory",
+      "source_name": "/tasks",
+      "started_at": "2026-05-28T12:00:18+00:00",
+      "status": "ok"
+    }
+  ],
+  "stop_events": [
+    {
+      "attribution": "",
+      "detail": "needs task-z",
+      "id": 1,
+      "kind": "dangling-prerequisite",
+      "occurred_at": "2026-05-28T12:00:14+00:00",
+      "run_id": "",
+      "subject": "task-b"
+    },
+    {
+      "attribution": "",
+      "detail": "manual gate",
+      "id": 2,
+      "kind": "awaiting-approval",
+      "occurred_at": "2026-05-28T12:00:15+00:00",
+      "run_id": "run-1",
+      "subject": "task-a"
+    }
+  ],
+  "work_items": [
+    {
+      "conflict_keys_json": "[\"resource-x\"]",
+      "disappeared_at": null,
+      "first_seen_at": "2026-05-28T12:00:17+00:00",
+      "last_seen_at": "2026-05-28T12:00:17+00:00",
+      "metadata_json": "{}",
+      "priority": 3,
+      "required_capabilities_json": "[\"linux\"]",
+      "source_kind": "directory",
+      "source_ref": "/tasks/w.json",
+      "source_url": null,
+      "source_version": "v1",
+      "task_content_hash": "8834826824ec343fe0d810e8ccdad1a64f1abb3fe50e4fe1fac231b7d6538dd7",
+      "task_id": "task-w"
+    }
+  ]
+}

@@ -1,5 +1,5 @@
-//! Shared contract suite for every store backend, plus cross-implementation
-//! interop with the Python `SqliteStore` and `PostgresStore`.
+//! Shared contract suite for every store backend, plus interop with stores
+//! written by the Python `SqliteStore` and `PostgresStore`.
 //!
 //! A case that lives here is a statement about the trait surface in
 //! `flywheel_core::store`, not about a particular backend: the same cases
@@ -9,18 +9,17 @@
 //! (pragmas, triggers, schema migration, locked retry, LISTEN/NOTIFY) is
 //! covered by each backend's own tests.
 //!
-//! The interop tests build a database with the Python store and read it with
-//! the Rust store, and the reverse, for both durable backends. They run the
-//! Python side through `uv run python` from the repository root and skip,
-//! with a message, only when `uv` is not on `PATH` (or, for Postgres, when
-//! Docker or the Python `postgres` extra is unavailable).
+//! The interop tests read frozen Python-written fixtures (a SQLite file and a
+//! Postgres dump under `tests/fixtures/python_interop/`) through the Rust
+//! store, and check that the Rust store writes the same schema and rows the
+//! Python store wrote, for both durable backends. The Postgres cases skip,
+//! with a message, only when Docker is unavailable.
 
 #[path = "support/pg_container.rs"]
 mod pg_container;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -33,7 +32,7 @@ use flywheel_core::events::{
     replay,
 };
 use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
-use flywheel_core::loaders::{serialize_task, task_digest};
+use flywheel_core::loaders::task_digest;
 use flywheel_core::store::{
     GraderResultRecord, HarnessStore, JsonObject, LifecycleFilter, SpendSummary, SpendWindow,
     StoreConflictError, StoreError,
@@ -1448,61 +1447,198 @@ fn contract_cases_are_uniquely_named() {
     assert!(total >= 38);
 }
 
-// --- Cross-implementation interop with the Python SqliteStore --------------------
+// --- Interop with Python-written stores (frozen golden fixtures) ---------------------
+//
+// Deployments that predate the Rust port hold SQLite files and Postgres
+// schemas written by the Python `SqliteStore` / `PostgresStore`. The fixtures
+// under `tests/fixtures/python_interop/` were written by those Python stores
+// running the interop timeline that `seed_interop_with_rust` mirrors step for
+// step, then frozen:
+//
+// - `store.sqlite`: the SQLite database file exactly as the Python store left it.
+// - `store_postgres.sql`: `pg_dump --inserts` of the schema the Python store
+//   bootstrapped and seeded (schema name `fw_golden_store`).
 
 const INTEROP_RUN: &str = "run-interop";
 const INTEROP_TASK: &str = "interop-task";
 
-/// The repository root: `uv run` resolves the workspace from here.
-fn repo_root() -> PathBuf {
+/// The task digest the Python store returned from `save_task` when it wrote
+/// the fixtures.
+const PYTHON_TASK_DIGEST: &str = "e3f7d2a2191dc72871eb3b7b6049e4617b9790d20dc5846dc7d54dbcc88e6ea3";
+
+/// The schema name baked into `store_postgres.sql`.
+const GOLDEN_PG_SCHEMA: &str = "fw_golden_store";
+
+/// Columns the store stamps from the wall clock rather than the caller's
+/// `now`, so they differ between any two seedings of the same timeline.
+const WALL_CLOCK_COLUMNS: &[(&str, &str)] = &[("lifecycles", "updated_at")];
+
+fn python_fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
+        .join("tests/fixtures/python_interop")
+        .join(name)
+}
+
+/// A private copy of the Python-written SQLite fixture: opening a store
+/// writes WAL/SHM side files and may touch the database, and the committed
+/// fixture must stay byte-for-byte what Python wrote.
+fn python_written_sqlite(dir: &Path) -> PathBuf {
+    let db = dir.join("python-seeded.sqlite");
+    std::fs::copy(python_fixture("store.sqlite"), &db).unwrap();
+    db
+}
+
+/// Recreate the Python-written Postgres schema from its dump under `schema`.
+fn load_python_written_postgres(pg: &Postgres, schema: &str) {
+    let dump = std::fs::read_to_string(python_fixture("store_postgres.sql")).unwrap();
+    pg.admin()
+        .batch_execute(&dump.replace(GOLDEN_PG_SCHEMA, schema))
+        .unwrap();
+}
+
+fn without_wall_clock_columns(table: &str, mut row: JsonObject) -> JsonObject {
+    for (t, column) in WALL_CLOCK_COLUMNS {
+        if *t == table {
+            assert!(
+                row.remove(*column).is_some_and(|v| !v.is_null()),
+                "{table}.{column} is written on every save"
+            );
+        }
+    }
+    row
+}
+
+/// `value` serialized with every object's keys sorted, so two rows compare
+/// equal whatever order their JSON documents were written in.
+fn canonical_json(value: &Value) -> String {
+    fn sorted(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| *key);
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, v)| (key.clone(), sorted(v)))
+                        .collect(),
+                )
+            }
+            Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+    sorted(value).to_string()
+}
+
+/// A SQLite cell as JSON; text holding a JSON object or array is decoded so
+/// key order and whitespace (which differ between Python's `json.dumps` and
+/// `serde_json`) do not count.
+fn sqlite_cell(value: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => json!(i),
+        ValueRef::Real(f) => json!(f),
+        ValueRef::Text(bytes) => {
+            let text = std::str::from_utf8(bytes).unwrap();
+            match serde_json::from_str::<Value>(text) {
+                Ok(decoded @ (Value::Object(_) | Value::Array(_))) => decoded,
+                _ => Value::String(text.to_owned()),
+            }
+        }
+        ValueRef::Blob(bytes) => json!(bytes),
+    }
+}
+
+/// Every schema object's DDL and every table's rows (order-insensitive),
+/// keyed by object name.
+fn sqlite_snapshot(path: &Path) -> BTreeMap<String, (Option<String>, Vec<String>)> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let objects: Vec<(String, String, Option<String>)> = conn
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
         .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut snapshot = BTreeMap::new();
+    for (kind, name, sql) in objects {
+        let mut rows = Vec::new();
+        if kind == "table" {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns: Vec<String> = stmt
+                .column_names()
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect();
+            let mut cursor = stmt.query([]).unwrap();
+            while let Some(row) = cursor.next().unwrap() {
+                let mut object = JsonObject::new();
+                for (i, column) in columns.iter().enumerate() {
+                    object.insert(column.clone(), sqlite_cell(row.get_ref(i).unwrap()));
+                }
+                rows.push(canonical_json(&Value::Object(without_wall_clock_columns(
+                    &name, object,
+                ))));
+            }
+            rows.sort();
+        }
+        snapshot.insert(format!("{kind} {name}"), (sql, rows));
+    }
+    snapshot
 }
 
-fn uv_available() -> bool {
-    Command::new("uv")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
+/// Every table's column catalog and rows (order-insensitive) in `schema`.
+fn postgres_snapshot(pg: &Postgres, schema: &str) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+    let mut client = pg.admin();
+    let tables: Vec<String> = client
+        .query(
+            "SELECT table_name::text FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name",
+            &[&schema],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let mut snapshot = BTreeMap::new();
+    for table in tables {
+        let columns: Vec<String> = client
+            .query(
+                "SELECT column_name::text, data_type::text, is_nullable::text \
+                 FROM information_schema.columns \
+                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+                &[&schema, &table],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let (name, ty, nullable): (String, String, String) = (r.get(0), r.get(1), r.get(2));
+                format!("{name} {ty} nullable={nullable}")
+            })
+            .collect();
+        let mut rows: Vec<String> = client
+            .query(
+                &format!("SELECT row_to_json(t)::text FROM \"{schema}\".\"{table}\" t"),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let row: Value = serde_json::from_str(r.get::<_, &str>(0)).unwrap();
+                let Value::Object(row) = row else {
+                    panic!("row_to_json returned a non-object")
+                };
+                canonical_json(&Value::Object(without_wall_clock_columns(&table, row)))
+            })
+            .collect();
+        rows.sort();
+        snapshot.insert(table, (columns, rows));
+    }
+    snapshot
 }
 
-/// Whether the workspace's Python can import the `postgres` extra.
-fn python_has_postgres_extra() -> bool {
-    Command::new("uv")
-        .args(["run", "--project"])
-        .arg(repo_root())
-        .args(["python", "-c", "import psycopg, psycopg_pool"])
-        .env_remove("VIRTUAL_ENV")
-        .current_dir(repo_root())
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-/// Run `script` under the workspace's Python with `env` set, returning
-/// stdout.
-fn run_python(script: &str, env: &[(&str, String)]) -> String {
-    let output = Command::new("uv")
-        .args(["run", "--project"])
-        .arg(repo_root())
-        .args(["python", "-c", script])
-        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
-        .env_remove("VIRTUAL_ENV")
-        .current_dir(repo_root())
-        .output()
-        .expect("spawn uv");
-    assert!(
-        output.status.success(),
-        "python interop step failed ({}):\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
-/// The task both implementations seed, built with the Rust types.
+/// The task the interop timeline saves, built with the Rust types.
 fn interop_task() -> Task {
     let mut command = CommandGrader::new("cargo test").unwrap();
     command.name = Some("tests".into());
@@ -1524,8 +1660,8 @@ fn interop_task() -> Task {
 
 const INTEROP_TIMELINE_SECONDS: i64 = 12;
 
-/// Seed `store` with the interop timeline using the Rust types. Mirrors
-/// `PYTHON_SEED` step for step.
+/// Seed `store` with the interop timeline using the Rust types: the same
+/// calls, in the same order, the Python store made to write the fixtures.
 fn seed_interop_with_rust(store: &dyn HarnessStore) -> String {
     let task = interop_task();
     let digest = store.save_task(&task, t(0)).unwrap();
@@ -1621,193 +1757,14 @@ fn seed_interop_with_rust(store: &dyn HarnessStore) -> String {
     digest
 }
 
-/// Python prelude opening the SQLite store named by `FW_INTEROP_DB`.
-const PYTHON_OPEN_SQLITE: &str = r#"
-import os
-from flywheel_core import SqliteStore
-store = SqliteStore(os.environ["FW_INTEROP_DB"])
-"#;
-
-/// Python prelude opening the Postgres store named by `FW_INTEROP_DSN` /
-/// `FW_INTEROP_SCHEMA`.
-const PYTHON_OPEN_POSTGRES: &str = r#"
-import os
-from flywheel_core import PostgresStore
-store = PostgresStore(
-    os.environ["FW_INTEROP_DSN"], schema=os.environ["FW_INTEROP_SCHEMA"], pool_min=1, pool_max=2
-)
-"#;
-
-/// One interop script: an open prelude followed by a body that uses `store`.
-fn python_script(open: &str, body: &str) -> String {
-    format!("{open}\n{body}")
-}
-
-/// The same timeline, written by the Python store bound to `store`.
-const PYTHON_SEED: &str = r#"
-from datetime import datetime, timezone
-from flywheel_core import (
-    AttemptFinalized, AttemptStarted, CommandGrader, Context, GraderEvaluated,
-    LandingParked, LifecycleInitialized, Outcome, RubricGrader,
-    Status, Task, TransitionedTo,
-)
-
-def t(n):
-    return datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)
-
-RUN = "run-interop"
-task = Task(
-    id="interop-task",
-    goal="Port the stores.",
-    graders=[
-        CommandGrader(run="cargo test", name="tests"),
-        RubricGrader(assertions=["It works", "It is idiomatic"], name="review"),
-    ],
-    tags=["rust", "stores"],
-    context=Context(relevant=["crates/flywheel-core"], notes="Keep parity."),
-)
-digest = store.save_task(task, now=t(0))
-store.append_domain_event(
-    LifecycleInitialized(
-        run_id=RUN, ts=t(0), task_id="interop-task", worker_id="w-interop",
-        artifacts_dir="/artifacts", task_content_hash=digest, source="owner/repo#42",
-    ),
-    expected_version=0,
-)
-store.append_domain_event(TransitionedTo(run_id=RUN, ts=t(1), target=Status.READY), expected_version=1)
-store.append_domain_event(TransitionedTo(run_id=RUN, ts=t(2), target=Status.RUNNING), expected_version=2)
-store.append_domain_event(
-    AttemptStarted(
-        run_id=RUN, ts=t(3), attempt_number=1, number=1, attempt_run_id=RUN, started_at=t(3),
-        agent_context={"model_id": "claude-opus-4-8", "base_commit_sha": "abc123"},
-    ),
-    expected_version=3,
-)
-rolled = store.load_attempt(RUN, 1)
-rolled.input_tokens = 1200
-rolled.output_tokens = 300
-rolled.cache_creation_input_tokens = 40
-rolled.cache_read_input_tokens = 5
-rolled.iterations_completed = 2
-rolled.turns = 6
-rolled.total_cost_usd = 0.75
-rolled.last_activity_at = t(4)
-store.save_attempt(RUN, rolled, expected_version=4)
-store.append_domain_event(TransitionedTo(run_id=RUN, ts=t(5), target=Status.VALIDATING), expected_version=4)
-store.append_domain_event(
-    GraderEvaluated(
-        run_id=RUN, ts=t(6), attempt_number=1, ordinal=0, grader_type="command", passed=True,
-        duration_ms=7, grader_name="tests",
-        grader_spec={"type": "command", "run": "cargo test", "name": "tests"},
-        payload={"exit_code": 0, "stdout_tail": "ok"},
-    ),
-    expected_version=5,
-)
-store.append_domain_event(
-    AttemptFinalized(
-        run_id=RUN, ts=t(7), attempt_number=1, number=1, outcome=Outcome.SUCCEEDED,
-        ended_at=t(7), agent_output="ported",
-    ),
-    expected_version=6,
-)
-store.append_domain_event(TransitionedTo(run_id=RUN, ts=t(8), target=Status.DONE), expected_version=7)
-store.append_domain_event(
-    LandingParked(run_id=RUN, ts=t(9), park_kind="divergent-base", detail="base advanced"),
-    expected_version=8,
-)
-store.enqueue_command(RUN, "say", {"text": "focus"}, now=t(10))
-assert len(store.claim_commands(RUN, now=t(11))) == 1
-store.enqueue_command(RUN, "interrupt", {}, now=t(12))
-store.close()
-print(digest)
-"#;
-
-/// Read the timeline back with the Python store bound to `store` and print
-/// a JSON summary.
-const PYTHON_READ: &str = r#"
-import json
-from datetime import datetime, timezone
-from flywheel_core import replay
-from flywheel_core.loaders import serialize_task, task_digest
-
-def t(n):
-    return datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)
-
-RUN = "run-interop"
-lc = store.load_lifecycle(RUN)
-events = store.list_domain_events(RUN)
-task = store.load_task_for_run(RUN)
-results = store.list_grader_results(RUN, 1)
-claimed = store.claim_commands(RUN, now=t(13))
-spend = store.summarize_spend()
-
-# The ledger reproduces everything except the boundary rollups, which the
-# versioned save_attempt path writes to the attempts table only.
-folded = replay(events)
-stripped = store.load_lifecycle(RUN)
-for a in stripped.attempts:
-    a.input_tokens = a.output_tokens = 0
-    a.cache_creation_input_tokens = a.cache_read_input_tokens = 0
-    a.iterations_completed = a.turns = 0
-    a.total_cost_usd = 0.0
-    a.last_activity_at = None
-
-out = {
-    "status": lc.status.value,
-    "version": lc.version,
-    "task_id": lc.task_id,
-    "worker_id": lc.worker_id,
-    "artifacts_dir": lc.artifacts_dir,
-    "source": lc.source,
-    "task_content_hash": lc.task_content_hash,
-    "agent_output": lc.agent_output,
-    "timestamps": {k.value: v.isoformat() for k, v in lc.timestamps.items()},
-    "attempts": [
-        {
-            "number": a.number, "run_id": a.run_id, "outcome": a.outcome.value,
-            "started_at": a.started_at.isoformat(), "ended_at": a.ended_at.isoformat(),
-            "agent_output": a.agent_output, "agent_context": dict(a.agent_context),
-            "input_tokens": a.input_tokens, "output_tokens": a.output_tokens,
-            "cache_creation_input_tokens": a.cache_creation_input_tokens,
-            "cache_read_input_tokens": a.cache_read_input_tokens,
-            "iterations_completed": a.iterations_completed, "turns": a.turns,
-            "total_cost_usd": a.total_cost_usd,
-            "last_activity_at": a.last_activity_at.isoformat(),
-        }
-        for a in lc.attempts
-    ],
-    "events": [[type(e).__name__, e.sequence, e.ts.isoformat()] for e in events],
-    "replay_matches": folded == stripped,
-    "grader_results": [
-        {
-            "ordinal": r.ordinal, "grader_type": r.grader_type, "grader_name": r.grader_name,
-            "passed": r.passed, "duration_ms": r.duration_ms,
-            "grader_spec": dict(r.grader_spec), "payload": dict(r.payload), "ts": r.ts.isoformat(),
-        }
-        for r in results
-    ],
-    "task": serialize_task(task),
-    "digest_matches": task_digest(task) == lc.task_content_hash,
-    "claimed": [[c.kind, c.id, c.enqueued_at.isoformat(), c.claimed_at.isoformat()] for c in claimed],
-    "claim_again": len(store.claim_commands(RUN, now=t(14))),
-    "spend": {
-        "input_tokens": spend.input_tokens, "output_tokens": spend.output_tokens,
-        "cache_creation_tokens": spend.cache_creation_tokens,
-        "cache_read_tokens": spend.cache_read_tokens, "total_cost_usd": spend.total_cost_usd,
-    },
-}
-store.close()
-print(json.dumps(out))
-"#;
-
 fn iso(second: i64) -> String {
     flywheel_core::event_serde::format_timestamp(&t(second))
 }
 
 #[test]
 fn interop_clock_matches_the_python_fixture() {
-    // `datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)` on the Python
-    // side; both interop scripts hard-code the same instant.
+    // `datetime(2026, 5, 28, 12, 0, n, tzinfo=timezone.utc)` is the clock the
+    // Python store wrote the fixtures against.
     assert_eq!(iso(0), "2026-05-28T12:00:00+00:00");
     assert_eq!(iso(INTEROP_TIMELINE_SECONDS), "2026-05-28T12:00:12+00:00");
 }
@@ -1923,172 +1880,83 @@ fn assert_rust_reads_python_seed(store: &dyn HarnessStore, digest: &str) {
     assert_eq!(listed, vec![lc]);
 }
 
-/// Everything the Python store must report after reading a Rust-seeded
-/// timeline (`PYTHON_READ`'s JSON summary).
-fn assert_python_reads_rust_seed(out: &Value, digest: &str) {
-    let task = interop_task();
-    assert_eq!(out["status"], "done");
-    assert_eq!(out["version"], 9);
-    assert_eq!(out["task_id"], INTEROP_TASK);
-    assert_eq!(out["worker_id"], "w-interop");
-    assert_eq!(out["artifacts_dir"], "/artifacts");
-    assert_eq!(out["source"], "owner/repo#42");
-    assert_eq!(out["task_content_hash"], digest);
-    assert_eq!(out["agent_output"], "ported");
-    assert_eq!(
-        out["timestamps"],
-        json!({"ready": iso(1), "running": iso(2), "validating": iso(5), "done": iso(8)})
-    );
-    assert_eq!(
-        out["attempts"],
-        json!([{
-            "number": 1, "run_id": INTEROP_RUN, "outcome": "succeeded",
-            "started_at": iso(3), "ended_at": iso(7), "agent_output": "ported",
-            "agent_context": {"model_id": "claude-opus-4-8", "base_commit_sha": "abc123"},
-            "input_tokens": 1200, "output_tokens": 300,
-            "cache_creation_input_tokens": 40, "cache_read_input_tokens": 5,
-            "iterations_completed": 2, "turns": 6, "total_cost_usd": 0.75,
-            "last_activity_at": iso(4),
-        }])
-    );
-    assert_eq!(
-        out["events"],
-        json!([
-            ["LifecycleInitialized", 1, iso(0)],
-            ["TransitionedTo", 2, iso(1)],
-            ["TransitionedTo", 3, iso(2)],
-            ["AttemptStarted", 4, iso(3)],
-            ["TransitionedTo", 5, iso(5)],
-            ["GraderEvaluated", 6, iso(6)],
-            ["AttemptFinalized", 7, iso(7)],
-            ["TransitionedTo", 8, iso(8)],
-            ["LandingParked", 9, iso(9)],
-        ])
-    );
-    assert_eq!(
-        out["replay_matches"], true,
-        "python replay of a rust-written ledger"
-    );
-    assert_eq!(
-        out["grader_results"],
-        json!([{
-            "ordinal": 0, "grader_type": "command", "grader_name": "tests", "passed": true,
-            "duration_ms": 7,
-            "grader_spec": {"type": "command", "run": "cargo test", "name": "tests"},
-            "payload": {"exit_code": 0, "stdout_tail": "ok"}, "ts": iso(6),
-        }])
-    );
-    assert_eq!(out["task"], serialize_task(&task));
-    assert_eq!(
-        out["digest_matches"], true,
-        "python re-digests the rust-written task"
-    );
-    assert_eq!(
-        out["claimed"],
-        json!([["interrupt", 2, iso(INTEROP_TIMELINE_SECONDS), iso(13)]])
-    );
-    assert_eq!(out["claim_again"], 0);
-    assert_eq!(
-        out["spend"],
-        json!({
-            "input_tokens": 1200, "output_tokens": 300, "cache_creation_tokens": 40,
-            "cache_read_tokens": 5, "total_cost_usd": 0.75,
-        })
-    );
-}
-
 #[test]
 fn python_written_database_reads_back_through_the_rust_store() {
-    if !uv_available() {
-        eprintln!("skipping python->rust interop: `uv` is not on PATH");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("python-seeded.sqlite");
-    let digest = run_python(
-        &python_script(PYTHON_OPEN_SQLITE, PYTHON_SEED),
-        &[("FW_INTEROP_DB", db.display().to_string())],
-    )
-    .trim()
-    .to_owned();
-    let store = SqliteStore::open(&db).unwrap();
-    assert_rust_reads_python_seed(&store, &digest);
+    let store = SqliteStore::open(python_written_sqlite(dir.path())).unwrap();
+    assert_rust_reads_python_seed(&store, PYTHON_TASK_DIGEST);
 }
 
 #[test]
-fn rust_written_database_reads_back_through_the_python_store() {
-    if !uv_available() {
-        eprintln!("skipping rust->python interop: `uv` is not on PATH");
-        return;
-    }
+fn rust_written_database_matches_the_python_written_golden() {
+    // Rust seeding the same timeline must produce the same schema and the
+    // same rows the Python store wrote, so a database holding rows from
+    // both implementations is indistinguishable from either alone.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("rust-seeded.sqlite");
     let store = SqliteStore::open(&db).unwrap();
-    let digest = seed_interop_with_rust(&store);
+    assert_eq!(seed_interop_with_rust(&store), PYTHON_TASK_DIGEST);
     store.close().unwrap();
 
-    let stdout = run_python(
-        &python_script(PYTHON_OPEN_SQLITE, PYTHON_READ),
-        &[("FW_INTEROP_DB", db.display().to_string())],
+    let rust = sqlite_snapshot(&db);
+    let python = sqlite_snapshot(&python_written_sqlite(dir.path()));
+    assert_eq!(
+        rust.keys().collect::<Vec<_>>(),
+        python.keys().collect::<Vec<_>>(),
+        "schema objects"
     );
-    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_python_reads_rust_seed(&out, &digest);
-}
-
-/// The Postgres interop prerequisites: `uv`, the Python `postgres` extra,
-/// and a throwaway container. `None` means skip (with the reason printed).
-fn postgres_interop_fixture(direction: &str) -> Option<Postgres> {
-    if !uv_available() {
-        eprintln!("skipping {direction} postgres interop: `uv` is not on PATH");
-        return None;
+    for (name, (sql, rows)) in &python {
+        let (rust_sql, rust_rows) = &rust[name];
+        assert_eq!(rust_sql, sql, "DDL of {name}");
+        assert_eq!(rust_rows, rows, "rows of {name}");
     }
-    if !python_has_postgres_extra() {
-        eprintln!(
-            "skipping {direction} postgres interop: the Python `postgres` extra is not installed"
-        );
-        return None;
-    }
-    Postgres::acquire()
+    assert_eq!(
+        python["table events"].1.len(),
+        9,
+        "the golden carries the full ledger"
+    );
 }
 
 #[test]
 fn python_written_postgres_schema_reads_back_through_the_rust_store() {
-    let Some(pg) = postgres_interop_fixture("python->rust") else {
+    let Some(pg) = Postgres::acquire() else {
         return;
     };
     let schema = pg.fresh_schema("fw_interop_py");
-    let digest = run_python(
-        &python_script(PYTHON_OPEN_POSTGRES, PYTHON_SEED),
-        &[
-            ("FW_INTEROP_DSN", pg.dsn()),
-            ("FW_INTEROP_SCHEMA", schema.clone()),
-        ],
-    )
-    .trim()
-    .to_owned();
+    load_python_written_postgres(&pg, &schema);
     // The Python store bootstrapped the schema; the Rust store opens it
     // unchanged (same schema_version, idempotent DDL) and reads every row.
     let store = PostgresStore::connect(&pg.dsn(), &schema).unwrap();
-    assert_rust_reads_python_seed(&store, &digest);
+    assert_rust_reads_python_seed(&store, PYTHON_TASK_DIGEST);
 }
 
 #[test]
-fn rust_written_postgres_schema_reads_back_through_the_python_store() {
-    let Some(pg) = postgres_interop_fixture("rust->python") else {
+fn rust_written_postgres_schema_matches_the_python_written_golden() {
+    let Some(pg) = Postgres::acquire() else {
         return;
     };
-    let schema = pg.fresh_schema("fw_interop_rs");
-    let store = PostgresStore::connect(&pg.dsn(), &schema).unwrap();
-    let digest = seed_interop_with_rust(&store);
+    let rust_schema = pg.fresh_schema("fw_interop_rs");
+    let store = PostgresStore::connect(&pg.dsn(), &rust_schema).unwrap();
+    assert_eq!(seed_interop_with_rust(&store), PYTHON_TASK_DIGEST);
     store.close().unwrap();
+    let python_schema = pg.fresh_schema("fw_interop_py");
+    load_python_written_postgres(&pg, &python_schema);
 
-    let stdout = run_python(
-        &python_script(PYTHON_OPEN_POSTGRES, PYTHON_READ),
-        &[
-            ("FW_INTEROP_DSN", pg.dsn()),
-            ("FW_INTEROP_SCHEMA", schema.clone()),
-        ],
+    let rust = postgres_snapshot(&pg, &rust_schema);
+    let python = postgres_snapshot(&pg, &python_schema);
+    assert_eq!(
+        rust.keys().collect::<Vec<_>>(),
+        python.keys().collect::<Vec<_>>(),
+        "tables"
     );
-    let out: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_python_reads_rust_seed(&out, &digest);
+    for (table, (columns, rows)) in &python {
+        let (rust_columns, rust_rows) = &rust[table];
+        assert_eq!(rust_columns, columns, "columns of {table}");
+        assert_eq!(rust_rows, rows, "rows of {table}");
+    }
+    assert_eq!(
+        python["events"].1.len(),
+        9,
+        "the golden carries the full ledger"
+    );
 }

@@ -2308,7 +2308,14 @@ pub fn build_merge_submitter(
         Arc::clone(&request.log),
     )
     .with_protected_paths(request.protected_paths.iter().cloned())
-    .with_retention(request.on_done.clone(), request.on_failure.clone());
+    .with_retention(request.on_done.clone(), request.on_failure.clone())
+    // Default-on disk/inode preflight in front of the landing-park ledger
+    // append: a near-full disk yields a queryable degraded-space record
+    // instead of an ENOSPC crash that tears the store row. The default
+    // thresholds never trip on a healthy host.
+    .with_ledger_guard(Arc::new(
+        crate::disk_preflight::DiskPreflight::new().with_log(Arc::clone(&request.log)),
+    ));
     submitter.setup_command = request.setup_command.clone();
     submitter.store = request.store.clone();
     submitter.grader_env = request.grader_env.clone();

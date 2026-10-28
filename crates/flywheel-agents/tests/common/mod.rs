@@ -7,6 +7,52 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Whether `pid` is gone (or a zombie awaiting its reaper).
+#[cfg(unix)]
+pub fn process_dead(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only probes for existence.
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if !alive {
+        return true;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .map(|rest| rest.split_whitespace().next() == Some("Z"))
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+/// Poll until `pid` is dead, up to `within`; the final verdict.
+#[cfg(unix)]
+pub async fn wait_dead(pid: i32, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline && !process_dead(pid) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    process_dead(pid)
+}
+
+/// Poll for a pid written to `path`, up to `within`.
+pub async fn read_pid_file(path: &Path, within: std::time::Duration) -> i32 {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no pid written to {}",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, body).expect("write fixture script");
@@ -62,6 +108,13 @@ crash)
   ;;
 hang)
   init
+  sleep 300
+  ;;
+grandchild)
+  init
+  (trap '' TERM; exec sleep 300) &
+  echo $! > grandchild.pid
+  text "spawned"
   sleep 300
   ;;
 stderr)

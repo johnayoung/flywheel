@@ -42,7 +42,10 @@
 //! Each grader is spawned in its own process group (`setsid`-equivalent).
 //! On a wall-clock timeout the *whole group* is SIGKILLed, not just the
 //! `/bin/sh` wrapper, so grandchildren (the actual command behind the
-//! shell) do not survive and hold the output pipes open.
+//! shell) do not survive and hold the output pipes open. While the shell is
+//! unreaped the group is registered in
+//! [`flywheel_agents::process_groups`]: a daemon's shutdown sweep reaches
+//! it, and a grading future dropped mid-run SIGKILLs it.
 
 use crate::deadline::Deadline;
 use crate::store::{GraderResultRecord, GraderResultStore, JsonObject, StoreError};
@@ -415,6 +418,12 @@ fn take_capture(slot: &CaptureSlot) -> CapturedStream {
 /// out and the whole group is killed.
 async fn supervise(mut child: Child, deadline: &Deadline, capture_cap: Option<usize>) -> Execution {
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
+    // Registered for the life of the unreaped shell so a daemon shutdown
+    // sweep reaches the grader's own process group, and so a supervise
+    // future dropped mid-run SIGKILLs the group rather than orphaning it.
+    let mut group = pgid
+        .filter(|_| cfg!(unix))
+        .map(flywheel_agents::process_groups::GroupRegistration::register);
     let (mut stdout_task, stdout_slot) = spawn_capture(child.stdout.take(), capture_cap);
     let (mut stderr_task, stderr_slot) = spawn_capture(child.stderr.take(), capture_cap);
 
@@ -443,6 +452,9 @@ async fn supervise(mut child: Child, deadline: &Deadline, capture_cap: Option<us
             (status, true)
         }
     };
+    if let Some(group) = group.as_mut() {
+        group.release();
+    }
     let stdout = take_capture(&stdout_slot);
     let stderr = take_capture(&stderr_slot);
 
@@ -945,6 +957,45 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(dead, "grandchild {pid} survived the process-group kill");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropped_grading_future_kills_the_grader_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", pid_file.to_string_lossy());
+        let store = RecordingStore::default();
+        let t = task(vec![cmd(&script, Some("abandoned"))]);
+        let options = CommandGraderOptions::default();
+        let pid = {
+            let grading = run(&t, &store, &options);
+            tokio::pin!(grading);
+            let wait_pid = async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file)
+                        && !text.trim().is_empty()
+                    {
+                        return text.trim().to_owned();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            tokio::select! {
+                _ = &mut grading => panic!("the grader cannot finish on its own"),
+                pid = wait_pid => pid,
+            }
+            // The grading future (e.g. a harness shutdown) drops here.
+        };
+        let mut dead = false;
+        for _ in 0..40 {
+            if !is_alive(&pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(dead, "grandchild {pid} outlived its dropped grader");
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ pub mod hosts;
 pub mod jsonl;
 pub mod models;
 pub mod probe;
+pub mod process_groups;
 pub mod registry;
 pub mod runtime;
 
@@ -57,5 +58,6 @@ pub use models::{
     RunRequest, StopInfo, StopReason, ToolInteraction, ToolResult, Usage,
 };
 pub use probe::ProbeEnvironment;
+pub use process_groups::GroupRegistration;
 pub use registry::{AdapterRegistry, default_registry};
 pub use runtime::{ActiveRun, AgentRuntime, CancelHandle, RunOptions};

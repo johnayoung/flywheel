@@ -21,6 +21,14 @@ pub mod worker_supervisor;
 
 /// Shared entry point for both console scripts: parses argv, routes the
 /// verb, and returns the process exit code.
+///
+/// On the way out it terminates any agent or grader process group still
+/// registered (`flywheel_agents::process_groups`): each runs in a group of
+/// its own, so nothing else would stop it once this process exits.
 pub fn main_entry() -> i32 {
-    cli::run(std::env::args().collect())
+    let code = cli::run(std::env::args().collect());
+    flywheel_agents::process_groups::terminate_all_blocking(
+        flywheel_agents::hosts::DEFAULT_KILL_GRACE,
+    );
+    code
 }

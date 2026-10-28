@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{ScenarioBuilder, fake_claude};
+use common::{ScenarioBuilder, fake_claude, read_pid_file, wait_dead};
 use flywheel_agents::{
     AgentRuntime, ApprovalDecision, AuthenticationPolicy, CompletedRun, EventType, MemorySink,
     RunOptions, StopReason,
@@ -172,6 +172,49 @@ async fn hang_bounded_by_timeout() {
     assert_eq!(failure.error_type, "timeout");
     assert_eq!(run.stop.reason, StopReason::Unknown);
     assert!(run.exit.returncode.is_some_and(|c| c != 0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timeout_terminates_the_whole_agent_process_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let (run, _) = drive(
+        ScenarioBuilder::claude(
+            fake_claude(dir.path()),
+            "grandchild",
+            dir.path().to_path_buf(),
+        )
+        .timeout(1.0),
+    )
+    .await;
+    assert_eq!(run.failure.as_ref().unwrap().error_type, "timeout");
+    let grandchild = read_pid_file(&dir.path().join("grandchild.pid"), Duration::ZERO).await;
+    // The grandchild ignores SIGTERM: only the group SIGKILL sweep stops it.
+    assert!(wait_dead(grandchild, Duration::from_secs(5)).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_a_run_future_mid_flight_kills_the_process_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let request = ScenarioBuilder::claude(
+        fake_claude(dir.path()),
+        "grandchild",
+        dir.path().to_path_buf(),
+    )
+    .request();
+    let runtime = AgentRuntime::new();
+    let pid_file = dir.path().join("grandchild.pid");
+    let grandchild = {
+        let run = runtime.run(request, RunOptions::default());
+        tokio::pin!(run);
+        tokio::select! {
+            _ = &mut run => panic!("the hanging run cannot finish"),
+            pid = read_pid_file(&pid_file, Duration::from_secs(10)) => pid,
+        }
+        // `run` is dropped here without the runtime ever cancelling it.
+    };
+    assert!(wait_dead(grandchild, Duration::from_secs(5)).await);
 }
 
 #[tokio::test]

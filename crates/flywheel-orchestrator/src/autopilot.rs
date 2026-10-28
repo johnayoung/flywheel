@@ -41,6 +41,7 @@ use crate::policy::{AutopilotWeights, DEFAULT_AUTOPILOT_LANDING, DEFAULT_AUTOPIL
 use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError, load_active_tasks};
 use crate::surface_lint::conflict_key_for_path;
 use chrono::{DateTime, Utc};
+use flywheel_agents::hosts::DEFAULT_KILL_GRACE;
 use flywheel_agents::{
     AgentConfiguration, AgentError, AgentRuntime, ExecutionHost, PermissionPolicy, RunOptions,
     RunRequest,
@@ -628,6 +629,49 @@ async fn bounded<F: Future>(
     }
 }
 
+/// The runtime's failure marker for a run that hit `RunRequest.timeout_seconds`.
+const RUNTIME_TIMEOUT: &str = "timeout";
+
+/// Slack past an agent call's deadline for the runtime's own cancellation
+/// (SIGTERM to the agent's process group, the kill grace, the SIGKILL
+/// sweep, the reap) before the outer backstop drops the run outright.
+const AGENT_TEARDOWN_SLACK: Duration = DEFAULT_KILL_GRACE.saturating_mul(2);
+
+/// Run an agent call under its wall-clock deadline.
+///
+/// The deadline travels into the run itself (`RunRequest.timeout_seconds`)
+/// so the runtime cancels the agent and waits for its process tree to die;
+/// `call` maps the runtime's own `timeout` failure to
+/// [`DeadlineExceeded`] via `timed_out`. The outer bound is only a backstop
+/// for a teardown that itself wedges, set past the deadline by
+/// [`AGENT_TEARDOWN_SLACK`] so it never preempts the runtime's
+/// cancellation.
+async fn agent_deadline<F, T>(
+    call: F,
+    deadline_seconds: Option<f64>,
+    timed_out: impl FnOnce(&T) -> bool,
+) -> Result<T, DeadlineExceeded>
+where
+    F: Future<Output = T>,
+{
+    let started = tokio::time::Instant::now();
+    let backstop =
+        deadline_seconds.map(|seconds| seconds.max(0.0) + AGENT_TEARDOWN_SLACK.as_secs_f64());
+    let output = bounded(call, backstop)
+        .await
+        .map_err(|exceeded| DeadlineExceeded {
+            ceiling: Duration::from_secs_f64(deadline_seconds.unwrap_or_default().max(0.0)),
+            elapsed: exceeded.elapsed,
+        })?;
+    match deadline_seconds {
+        Some(seconds) if timed_out(&output) => Err(DeadlineExceeded {
+            ceiling: Duration::from_secs_f64(seconds.max(0.0)),
+            elapsed: started.elapsed(),
+        }),
+        _ => Ok(output),
+    }
+}
+
 /// Default per-tier turn budget for the agents-backed repo invoker.
 pub const DEFAULT_DISCOVERY_MAX_TURNS: u32 = 60;
 
@@ -740,9 +784,15 @@ impl AgentsRepoInvoker {
 impl AutopilotInvoker for AgentsRepoInvoker {
     fn invoke<'a>(&'a self, prompt: &'a str) -> AutopilotInvokeFuture<'a> {
         Box::pin(async move {
-            let output = bounded(
+            let output = agent_deadline(
                 self.session.run(prompt, &self.repo_root, None),
                 self.deadline_seconds,
+                |outcome| {
+                    matches!(
+                        outcome,
+                        Err(ColdSessionError::Run { error_type, .. }) if error_type == RUNTIME_TIMEOUT
+                    )
+                },
             )
             .await??;
             Ok(output.text)
@@ -760,7 +810,8 @@ pub fn build_repo_invoker(
     options: RepoInvokerOptions,
 ) -> AgentsRepoInvoker {
     AgentsRepoInvoker {
-        session: ColdSession::with_configuration(repo_invoker_configuration(&options)),
+        session: ColdSession::with_configuration(repo_invoker_configuration(&options))
+            .with_timeout_seconds(options.deadline_seconds),
         repo_root: repo_root.into(),
         deadline_seconds: options.deadline_seconds,
     }
@@ -1363,15 +1414,24 @@ impl DiscoverySessionRunner for AgentsSingleSessionRunner {
                 prompt: prompt.to_owned(),
                 working_directory: self.repo_root.clone(),
                 configuration: self.configuration.clone(),
-                timeout_seconds: None,
+                timeout_seconds: self.deadline_seconds,
             };
             let options = RunOptions {
                 sink: None,
                 host: self.host.clone(),
                 approval_resolver: None,
             };
-            let completed =
-                bounded(self.runtime.run(request, options), self.deadline_seconds).await??;
+            let completed = agent_deadline(
+                self.runtime.run(request, options),
+                self.deadline_seconds,
+                |outcome| {
+                    matches!(
+                        outcome,
+                        Ok(run) if run.failure.as_ref().is_some_and(|f| f.error_type == RUNTIME_TIMEOUT)
+                    )
+                },
+            )
+            .await??;
             Ok(completed_run_to_iteration_result(&completed, Vec::new()))
         })
     }
@@ -4456,6 +4516,43 @@ result "scripted agent text" 1"#;
     const SLEEPING_BODY: &str = r#"init
 sleep 60"#;
 
+    /// Records a graceful SIGTERM, and leaves a grandchild that ignores
+    /// SIGTERM (an MCP server / Bash tool child stand-in).
+    const PROCESS_TREE_BODY: &str = r#"init
+trap 'echo graceful > terminated.marker; exit 143' TERM
+(trap '' TERM; exec sleep 300) &
+echo $! > grandchild.pid
+sleep 60 &
+wait $!"#;
+
+    /// Gone, or a zombie awaiting its reaper (Linux `/proc`).
+    fn process_gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.split_whitespace().next() == Some("Z")),
+            Err(_) => true,
+        }
+    }
+
+    /// The deadline reached the agent through the runtime (a graceful
+    /// SIGTERM the fake recorded, not a bare drop) and the whole tree,
+    /// SIGTERM-ignoring grandchild included, is dead.
+    async fn assert_tree_terminated(dir: &Path) {
+        assert!(
+            dir.join("terminated.marker").exists(),
+            "the runtime never cancelled the agent"
+        );
+        let pid = std::fs::read_to_string(dir.join("grandchild.pid")).unwrap();
+        let pid = pid.trim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !process_gone(pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(process_gone(pid), "grandchild {pid} outlived the deadline");
+    }
+
     const STREAMING_BODY: &str = r#"init
 while true; do text "still streaming"; sleep 0.01; done"#;
 
@@ -4587,6 +4684,43 @@ while true; do text "still streaming"; sleep 0.01; done"#;
             InvokeError::DeadlineExceeded(exceeded) => assert_eq!(exceeded.ceiling_seconds(), 0.2),
             other => panic!("expected DeadlineExceeded, got {other:?}"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn autopilot_invoker_deadline_terminates_the_agent_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let invoker = build_repo_invoker(
+            tmp.path(),
+            RepoInvokerOptions {
+                deadline_seconds: Some(0.5),
+                command_override: Some(fake_agent(tmp.path(), "tree.sh", PROCESS_TREE_BODY)),
+                ..RepoInvokerOptions::default()
+            },
+        );
+        let err = invoker.invoke("prompt").await.unwrap_err();
+        match err {
+            InvokeError::DeadlineExceeded(exceeded) => assert_eq!(exceeded.ceiling_seconds(), 0.5),
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+        assert_tree_terminated(tmp.path()).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn autopilot_discovery_deadline_terminates_the_agent_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let runner = build_single_session_runner(
+            tmp.path(),
+            &SingleSessionOptions {
+                deadline_seconds: Some(0.5),
+                command_override: Some(fake_agent(tmp.path(), "tree.sh", PROCESS_TREE_BODY)),
+                ..SingleSessionOptions::default()
+            },
+        );
+        let err = runner.run("prompt").await.unwrap_err();
+        assert!(matches!(err, InvokeError::DeadlineExceeded(_)), "{err:?}");
+        assert_tree_terminated(tmp.path()).await;
     }
 
     #[tokio::test]

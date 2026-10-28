@@ -854,10 +854,14 @@ mod tests {
             .unwrap();
         runtime.block_on(invoke(invocation()));
         let echoed = seen.lock().unwrap().join("\n");
-        assert_eq!(
-            echoed,
-            format!("exec -i -w {DEFAULT_WORKDIR} {name} claude --print")
+        // The agent runs under the pgid-recording wrapper so a cancel can
+        // reach it inside the container.
+        assert!(
+            echoed.starts_with(&format!("exec -i -w {DEFAULT_WORKDIR} {name} /bin/sh -c ")),
+            "{echoed}"
         );
+        assert!(echoed.contains(" /tmp/flywheel-agent-"), "{echoed}");
+        assert!(echoed.ends_with(".pgid claude --print"), "{echoed}");
     }
 
     // --- submit delegates -----------------------------------------------------------

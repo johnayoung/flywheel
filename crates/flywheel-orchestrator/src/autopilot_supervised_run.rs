@@ -16,8 +16,10 @@
 //! The spawned child is the neverending daemon (NO `--once`), placed in its
 //! own process group so a Ctrl+C on the launching terminal never races it;
 //! a SIGTERM/SIGINT to this supervisor is forwarded to the child's whole
-//! group so the daemon shuts down gracefully and no agent/MCP grandchild is
-//! orphaned on stop.
+//! group so the daemon shuts down gracefully. Agent sessions run in process
+//! groups of their own; the daemon's stop-signal handler terminates every
+//! one registered in `flywheel_agents::process_groups`, so no agent/MCP
+//! grandchild is orphaned on stop.
 //!
 //! Every process-level effect sits behind [`SupervisedHost`] so the shell
 //! runs hermetically in tests; [`ProductionHost`] is the real one.
@@ -304,8 +306,9 @@ unsafe extern "C" {
 /// Signal the child's whole process group, ignoring an already-gone group.
 ///
 /// The daemon is spawned as its own process-group leader, so its pgid
-/// equals its pid and the signal reaches every agent/MCP descendant it
-/// spawned -- signaling only the pid would orphan those grandchildren.
+/// equals its pid and the signal reaches every descendant still in its
+/// group. Agent sessions lead groups of their own; the daemon's
+/// stop-signal handler sweeps those (`flywheel_agents::process_groups`).
 #[cfg(unix)]
 fn signal_group(pid: i32, sig: i32) {
     // SAFETY: killpg(2) takes two plain integers and touches no memory. The

@@ -1280,7 +1280,9 @@ pub fn interruptible_sleep(seconds: f64, should_stop: &dyn Fn() -> bool) {
 
 /// Arm the daemon's shutdown signals for the life of the process: every
 /// SIGTERM/SIGINT sets `stop` (the loop ends after the current cycle),
-/// triggers `shutdown` (the in-flight run parks `interrupted` in-band), and
+/// triggers `shutdown` (the in-flight run parks `interrupted` in-band),
+/// terminates every live agent / grader process group (each runs in a group
+/// of its own, out of reach of a signal aimed at this daemon's group), and
 /// logs the request. Spawned on `runtime`; a no-op off unix.
 pub fn arm_signals(runtime: &Runtime, stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
     runtime.spawn(watch_signals(stop, shutdown, log));
@@ -1310,6 +1312,7 @@ async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
         };
         stop.set();
         shutdown.trigger();
+        flywheel_agents::process_groups::spawn_shutdown_sweep();
         log(&format!(
             "Shutdown requested (signal {signum}); stopping after the current cycle."
         ));

@@ -299,7 +299,7 @@ class ExecutionHost(Protocol):
 ```
 
 - **`LocalHost`** — POSIX: `start_new_session=True`; the child env is `os.environ` merged with `plan.environment` minus `plan.denied_environment`; terminates the process group with SIGTERM, then SIGKILL after a grace period. Windows Job Objects come with Windows-native support, later.
-- **`DockerExecHost`** — `docker exec -i` against a named, already-running container; `plan.environment` becomes `-e` flags. Container provisioning, teardown, networking, and auth mounts stay owned by the caller (`flywheel-container`); the host only executes plans inside it. It cannot unset image-baked env (`denied_environment` is a no-op there) — in-container auth hygiene stays with the container lifecycle owner's auth guard. Run-level wall-clock ceilings live on `RunRequest.timeout_seconds`, enforced by the runtime.
+- **`DockerExecHost`** — `docker exec -i` against a named, already-running container; `plan.environment` becomes `-e` flags. Container provisioning, teardown, networking, and auth mounts stay owned by the caller (`flywheel-container`); the host only executes plans inside it. The agent runs under a `/bin/sh` wrapper that records its pgid in a per-run `/tmp` file; kill signals that group via a second `docker exec` (killing the local client alone would leave the agent running in the container). It cannot unset image-baked env (`denied_environment` is a no-op there) — in-container auth hygiene stays with the container lifecycle owner's auth guard. Run-level wall-clock ceilings live on `RunRequest.timeout_seconds`, enforced by the runtime.
 
 Commands are always argv arrays; no shell strings unless the plan explicitly opts in.
 

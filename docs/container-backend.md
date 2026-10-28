@@ -88,7 +88,7 @@ policy = "deny"
 
 ## exec_timeout watchdog
 
-`[sandbox.container] exec_timeout` (default `1800` seconds) is the hard wall-clock ceiling for the **whole in-container run**: it becomes the flywheel-agents run ceiling (`RunRequest.timeout_seconds`), so on expiry the runtime kills the `docker exec` client and the run surfaces as a structured `IterationResult.failure` with `error_type = "timeout"` (no exception; a nonzero agent exit surfaces as `error_type = "agent_exit"`). `0` means unbounded (not recommended). `build_container_strategy` maps `0` to `None` (`_config.py`).
+`[sandbox.container] exec_timeout` (default `1800` seconds) is the hard wall-clock ceiling for the **whole in-container run**: it becomes the flywheel-agents run ceiling (`RunRequest.timeout_seconds`), so on expiry the runtime terminates the agent's in-container process group (SIGTERM, grace, SIGKILL -- each a `docker exec kill` against the pgid the agent wrapper recorded under `/tmp`) and then the `docker exec` client, and the run surfaces as a structured `IterationResult.failure` with `error_type = "timeout"` (no exception; a nonzero agent exit surfaces as `error_type = "agent_exit"`). `0` means unbounded (not recommended). `build_container_strategy` maps `0` to `None` (`_config.py`).
 
 The harness hang-watchdog is also live on this path: every stream-json line the agent emits is normalized into events forwarded to `InvocationRequest.on_message`, so `hang_timeout_seconds` sees container liveness and can be used alongside `exec_timeout`.
 

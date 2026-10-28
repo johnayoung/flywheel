@@ -300,7 +300,9 @@ pub fn build_snapshot<S: LifecycleStore + TaskStore + ?Sized>(
         active_workers: live.len(),
         task_counts: counts,
         tokens_total: live.iter().map(|r| r.tokens_total).sum(),
-        cost_usd_total: live.iter().map(|r| r.cost_usd_total).sum(),
+        // Fold from +0.0: `f64`'s `Sum` starts at -0.0, so an empty sum
+        // would render as `-0.0`.
+        cost_usd_total: live.iter().fold(0.0, |total, r| total + r.cost_usd_total),
         runtime_seconds: elapsed_seconds(now, started_at),
     };
     Ok(DashboardSnapshot { summary, rows })
@@ -335,12 +337,19 @@ pub fn snapshot_to_json(snapshot: &DashboardSnapshot) -> Value {
             })
         })
         .collect();
+    // Python's `sum()` over no live rows is the integer 0; over any rows it
+    // is a float. Mirror that so `--json` prints `0`, never `0.0` / `-0.0`.
+    let cost_usd_total = if snapshot.rows.is_empty() && snapshot.summary.cost_usd_total == 0.0 {
+        Value::from(0)
+    } else {
+        Value::from(snapshot.summary.cost_usd_total)
+    };
     json!({
         "summary": {
             "active_workers": snapshot.summary.active_workers,
             "task_counts": Value::Object(counts),
             "tokens_total": snapshot.summary.tokens_total,
-            "cost_usd_total": snapshot.summary.cost_usd_total,
+            "cost_usd_total": cost_usd_total,
             "runtime_seconds": snapshot.summary.runtime_seconds,
         },
         "rows": rows,
@@ -592,7 +601,11 @@ mod tests {
         assert_eq!(snap.summary.active_workers, 0);
         assert_eq!(snap.summary.tokens_total, 0);
         assert_eq!(snap.summary.cost_usd_total, 0.0);
+        assert!(snap.summary.cost_usd_total.is_sign_positive());
         assert!(snap.summary.task_counts.is_empty());
+        let rendered = render_snapshot_json(&snap);
+        assert!(rendered.contains("\"cost_usd_total\": 0,"), "{rendered}");
+        assert!(!rendered.contains("-0.0"), "{rendered}");
     }
 
     #[test]
@@ -874,7 +887,7 @@ mod tests {
         assert_eq!(
             rendered,
             "{\n  \"summary\": {\n    \"active_workers\": 0,\n    \"task_counts\": {},\n    \
-             \"tokens_total\": 0,\n    \"cost_usd_total\": 0.0,\n    \"runtime_seconds\": 0\n  },\n  \
+             \"tokens_total\": 0,\n    \"cost_usd_total\": 0,\n    \"runtime_seconds\": 0\n  },\n  \
              \"rows\": []\n}"
         );
     }

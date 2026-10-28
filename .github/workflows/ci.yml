@@ -5,34 +5,36 @@ on:
     branches: [main]
   pull_request:
 
-jobs:
-  checks:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - name: Sync workspace
-        run: uv sync
-      - name: Lint
-        run: uv run ruff check .
-      - name: Type check
-        run: uv run pyright
-      - name: Tests
-        run: uv run pytest
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # The same three gates as scripts/check.sh, in the same order.
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The Docker-backed tests (Postgres store/claims, container backend)
+      # start containers under 120s readiness deadlines; pulling the images up
+      # front keeps registry latency out of those windows.
+      - name: Pre-pull test images
+        run: |
+          docker pull --quiet postgres:16
+          docker pull --quiet alpine:latest
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Includes the doctests of every library crate.
       - name: Tests
         run: cargo test --workspace

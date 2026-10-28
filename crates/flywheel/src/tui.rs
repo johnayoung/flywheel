@@ -434,6 +434,8 @@ impl InputBar {
 #[command(
     name = "fw",
     disable_help_subcommand = true,
+    // argparse accepts any unambiguous long-option prefix (`--no-wor`).
+    infer_long_args = true,
     about = "Interactive realtime dashboard of in-flight flywheel runs. Bare invocation opens \
              the console; --json (or a non-TTY stdout) prints one snapshot and exits."
 )]
@@ -1135,6 +1137,19 @@ mod tests {
         assert_eq!(args.model.as_deref(), Some("m"));
         assert!(args.no_worker);
         assert!(parse_args(&["--bogus".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_accepts_unambiguous_prefixes_like_argparse() {
+        let argv = |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_owned()).collect() };
+        let args = parse_args(&argv(&["--no-wor", "--js", "--poll", "2", "--tasks", "t"])).unwrap();
+        assert!(args.no_worker);
+        assert!(args.json);
+        assert_eq!(args.poll_interval, 2.0);
+        assert_eq!(args.tasks_dir.as_deref(), Some("t"));
+        assert_eq!(parse_args(&argv(&["--mod=m"])).unwrap().model.as_deref(), Some("m"));
+        // `--p` could be --policy or --poll-interval: ambiguous, rejected.
+        assert!(parse_args(&argv(&["--p", "x"])).is_err());
     }
 
     #[test]

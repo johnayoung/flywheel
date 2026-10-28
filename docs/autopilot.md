@@ -40,6 +40,16 @@ flowchart TD
 
 On a clean repo with nothing actionable, a pass writes zero tasks and returns cleanly — it never raises and never invents filler. If the queue is already at or above target depth, the pass returns early and emits nothing.
 
+### Cycle cost controls
+
+Three mechanisms (`autopilot_context.rs`) keep an idle or unchanged repo from re-paying full discovery every cycle. All are logged per cycle (`[autopilot] tier N skipped: ...`, `[autopilot] discovery cache: hit|miss|partial (...)|disabled (...)`) and mirrored into the activity record (`last_prefiltered_tiers`, `last_discovery_cache`).
+
+- **Structural pre-filter** — a deterministic file-listing check skips a tier whose precondition is absent; the skipped tier never reaches an agent and records a `structural pre-filter: ...` not-relevant reason. Tier 1 needs deployment config (Dockerfile/compose, k8s/Helm, Procfile, PaaS/serverless manifest, Terraform, service unit, deploy workflow); tier 3 needs a build manifest or CI config; tiers 6–8 need source code. Tiers 2, 4, 5, 9–11 are always dispatched.
+- **Shared repo digest** — one bounded summary (≤8,000 chars: recent commits, two-level layout with file counts, file-type histogram, structural markers, root manifest and README excerpts) is built per repo state and appended to every tier and authoring prompt as a `<repo-digest>` section, so sessions stop re-surveying the tree from cold. The base prompts are unchanged.
+- **Discovery verdict cache** — `.flywheel/logs/autopilot/discovery-cache.json` (gitignored, survives restarts). Entries key on HEAD plus a fingerprint of uncommitted changes outside `.flywheel/` (emitting tasks never invalidates it); each tier verdict additionally keys on its exact rendered prompt and agent config. A hit runs no discovery agent; errored verdicts are never cached, so only those tiers re-run (`partial`). Findings already authored (emitted or dropped) at the same state are skipped, never re-authored into duplicates. Bounded to 8 states and `discovery_cache_ttl_seconds` (default 6h; `0` disables).
+
+**Authoring fan-out.** Up to `authoring_concurrency` (default 3) authoring sessions run at once, never more than the slots still open. Results are emitted strictly in score-sequence order, so the emitted set, the per-pass write cap, the integrity checks, and the no-overwrite emit are identical to the serial loop (`1` = serial). Leaving the pass (cap reached, deadline, cancel) drops every in-flight session, which kills its process group.
+
 ## Running autopilot
 
 `flywheel autopilot` (and the identical `fw autopilot`) is a **neverending daemon by default**; `--once` runs a single refill pass and exits 0. This mirrors `flywheel worker` (daemon by default, `--once` for one drain). See [cli.md](cli.md).
@@ -72,6 +82,8 @@ The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `
 target_depth     = 5        # positive int; fill the queue to this depth
 landing          = "merge"  # "merge" (FF-merge) or "pr"
 interval_seconds = 300.0    # positive float; seconds between daemon cycles
+authoring_concurrency = 3   # positive int; concurrent authoring sessions (1 = serial)
+discovery_cache_ttl_seconds = 21600.0  # >= 0; cached discovery verdict lifetime (0 = off)
 ```
 
 | Key | Type | Default | Controls |
@@ -79,6 +91,8 @@ interval_seconds = 300.0    # positive float; seconds between daemon cycles
 | `target_depth` | int | `5` | Queue depth the refill pass fills to |
 | `landing` | string | `merge` | Submit strategy for emitted work: `merge` (FF-merge) or `pr` |
 | `interval_seconds` | float | `300.0` | Seconds between daemon cycles |
+| `authoring_concurrency` | int | `3` | Authoring sessions run at once per pass; `1` = serial |
+| `discovery_cache_ttl_seconds` | float | `21600.0` | Cached discovery verdict lifetime; `0` disables the cache |
 
 The model is not under `[autopilot]` — it comes from the top-level `[work].model`.
 

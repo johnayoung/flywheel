@@ -36,8 +36,16 @@
 //! criterion #6) so a stalled stream is cancelled rather than parking the
 //! daemon.
 
+use crate::autopilot_context::{
+    DiscoveryCache, DiscoveryCacheEntry, DiscoveryCacheStatus, RepoInventory, RepoState,
+    TierPrefilterSkip, build_repo_digest, prompt_with_digest, sha256_hex, structural_prefilter,
+};
 use crate::claims::{ClaimStore, ClaimStoreError, STOP_NO_OP_CYCLE};
-use crate::policy::{AutopilotWeights, DEFAULT_AUTOPILOT_LANDING, DEFAULT_AUTOPILOT_TARGET_DEPTH};
+use crate::policy::{
+    AutopilotWeights, DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY,
+    DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS, DEFAULT_AUTOPILOT_LANDING,
+    DEFAULT_AUTOPILOT_TARGET_DEPTH,
+};
 use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError, load_active_tasks};
 use crate::surface_lint::conflict_key_for_path;
 use chrono::{DateTime, Utc};
@@ -60,7 +68,7 @@ use flywheel_core::store::{LifecycleFilter, LifecycleStore};
 use flywheel_core::task::{Grader, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -472,15 +480,29 @@ pub struct TierVerdict {
     pub reason: String,
     #[serde(default)]
     pub findings: Vec<Finding>,
+    /// True when the verdict is an error fallback (the agent failed, its
+    /// output did not parse, or no result came back) rather than a judgment.
+    /// An errored verdict is never cached, so the next cycle re-asks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub errored: bool,
 }
 
 impl TierVerdict {
-    fn not_relevant(tier: Tier, reason: impl Into<String>) -> Self {
+    pub(crate) fn not_relevant(tier: Tier, reason: impl Into<String>) -> Self {
         Self {
             tier,
             relevant: false,
             reason: reason.into(),
             findings: Vec::new(),
+            errored: false,
+        }
+    }
+
+    /// A not-relevant verdict standing in for a failed discovery.
+    fn errored(tier: Tier, reason: impl Into<String>) -> Self {
+        Self {
+            errored: true,
+            ..Self::not_relevant(tier, reason)
         }
     }
 }
@@ -996,9 +1018,7 @@ fn value_as_text(value: &Value) -> String {
 pub fn parse_tier_verdict(tier: Tier, text: &str) -> TierVerdict {
     match extract_json_object(text) {
         Ok(data) => verdict_from_data(tier, &data),
-        Err(err) => {
-            TierVerdict::not_relevant(tier, format!("unparseable discovery response: {err}"))
-        }
+        Err(err) => TierVerdict::errored(tier, format!("unparseable discovery response: {err}")),
     }
 }
 
@@ -1022,6 +1042,7 @@ fn verdict_from_data(tier: Tier, data: &Map<String, Value>) -> TierVerdict {
         relevant: true,
         reason: reason.unwrap_or_else(|| "tier judged relevant to this codebase".to_owned()),
         findings: parse_findings(tier, data.get("findings")),
+        errored: false,
     }
 }
 
@@ -1048,10 +1069,21 @@ pub async fn discover_tier(
     repo_root: &Path,
     invoker: &dyn AutopilotInvoker,
 ) -> TierVerdict {
-    let prompt = tier_prompt(tier, repo_root);
+    discover_tier_with(tier, repo_root, None, invoker).await
+}
+
+/// [`discover_tier`] with the cycle's shared repo digest appended to the
+/// tier prompt ([`prompt_with_digest`]).
+pub async fn discover_tier_with(
+    tier: Tier,
+    repo_root: &Path,
+    digest: Option<&str>,
+    invoker: &dyn AutopilotInvoker,
+) -> TierVerdict {
+    let prompt = prompt_with_digest(tier_prompt(tier, repo_root), digest);
     match invoker.invoke(&prompt).await {
         Ok(text) => parse_tier_verdict(tier, &text),
-        Err(err) => TierVerdict::not_relevant(tier, format!("discovery agent error: {err}")),
+        Err(err) => TierVerdict::errored(tier, format!("discovery agent error: {err}")),
     }
 }
 
@@ -1115,19 +1147,50 @@ pub async fn run_discovery(
     repo_root: &Path,
     driver: DiscoveryDriver<'_>,
 ) -> Result<Vec<TierVerdict>, InvokeError> {
+    run_discovery_for(repo_root, driver, &Tier::ALL, None).await
+}
+
+/// [`run_discovery`] over a subset of tiers, with the cycle's shared repo
+/// digest injected into every tier prompt.
+///
+/// Returns exactly one verdict per tier in `tiers`, in tier order; tiers
+/// outside `tiers` are never dispatched (the structural pre-filter and the
+/// verdict cache supply them). An empty `tiers` runs no agent at all.
+pub async fn run_discovery_for(
+    repo_root: &Path,
+    driver: DiscoveryDriver<'_>,
+    tiers: &[Tier],
+    digest: Option<&str>,
+) -> Result<Vec<TierVerdict>, InvokeError> {
+    let tiers: Vec<Tier> = Tier::ALL
+        .into_iter()
+        .filter(|tier| tiers.contains(tier))
+        .collect();
+    if tiers.is_empty() {
+        return Ok(Vec::new());
+    }
     match driver {
         DiscoveryDriver::PerTier(invoker) => Ok(join_all(
-            Tier::ALL
+            tiers
                 .iter()
-                .map(|tier| discover_tier(*tier, repo_root, invoker))
+                .map(|tier| discover_tier_with(*tier, repo_root, digest, invoker))
                 .collect(),
         )
         .await),
         DiscoveryDriver::SingleSession(runner) => {
-            run_single_session_discovery(repo_root, Some(runner), &SingleSessionOptions::default())
-                .await
+            let options = SingleSessionOptions {
+                tiers,
+                digest: digest.map(str::to_owned),
+                ..SingleSessionOptions::default()
+            };
+            run_single_session_discovery(repo_root, Some(runner), &options).await
         }
         DiscoveryDriver::Production(options) => {
+            let options = SingleSessionOptions {
+                tiers,
+                digest: digest.map(str::to_owned),
+                ..options
+            };
             run_single_session_discovery(repo_root, None, &options).await
         }
     }
@@ -1231,7 +1294,20 @@ pub fn build_tier_agents(
     max_turns: u32,
     effort: DiscoveryEffort,
 ) -> BTreeMap<String, TierAgentDefinition> {
-    Tier::ALL
+    build_tier_agents_for(repo_root, &Tier::ALL, None, model, max_turns, effort)
+}
+
+/// [`build_tier_agents`] for a subset of tiers, each subagent prompt
+/// carrying the cycle's shared repo digest.
+pub fn build_tier_agents_for(
+    repo_root: &Path,
+    tiers: &[Tier],
+    digest: Option<&str>,
+    model: Option<&str>,
+    max_turns: u32,
+    effort: DiscoveryEffort,
+) -> BTreeMap<String, TierAgentDefinition> {
+    tiers
         .iter()
         .map(|tier| {
             (
@@ -1242,7 +1318,7 @@ pub fn build_tier_agents(
                         tier.value(),
                         tier.name()
                     ),
-                    prompt: tier_prompt(*tier, repo_root),
+                    prompt: prompt_with_digest(tier_prompt(*tier, repo_root), digest),
                     tools: SUBAGENT_READONLY_TOOLS
                         .iter()
                         .map(|t| (*t).to_owned())
@@ -1267,22 +1343,41 @@ pub fn build_tier_agents(
 /// a tool-result to a tier (spec 00059 D-2 supersession); the per-tier
 /// tool-results remain the trusted source.
 pub fn orchestrator_prompt(repo_root: &Path) -> String {
-    let keys = Tier::ALL
+    orchestrator_prompt_for(repo_root, &Tier::ALL)
+}
+
+/// The capitalized English count word for 1-11 (the dispatcher prompt's
+/// "Eleven tier-relevance subagents" spelling), digits beyond.
+fn count_word(n: usize) -> String {
+    const WORDS: [&str; 11] = [
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven",
+    ];
+    n.checked_sub(1)
+        .and_then(|i| WORDS.get(i))
+        .map_or_else(|| n.to_string(), |w| (*w).to_owned())
+}
+
+/// [`orchestrator_prompt`] for the subset of tiers actually dispatched this
+/// cycle (byte-identical to it for all 11).
+pub fn orchestrator_prompt_for(repo_root: &Path, tiers: &[Tier]) -> String {
+    let keys = tiers
         .iter()
         .map(|tier| tier_agent_key(*tier))
         .collect::<Vec<_>>()
         .join(", ");
+    let n = tiers.len();
+    let word = count_word(n);
     format!(
         "You are autopilot's discovery dispatcher for the repository at {}.\n\n\
-         Eleven tier-relevance subagents are registered: {keys}.\n\n\
-         Use the Agent tool (a.k.a. Task) to dispatch EVERY one of these 11 subagents \
+         {word} tier-relevance subagents are registered: {keys}.\n\n\
+         Use the Agent tool (a.k.a. Task) to dispatch EVERY one of these {n} subagents \
          exactly once, each with subagent_type set to its key. Tell each subagent to \
          read the repository, judge whether its tier is relevant to THIS codebase, and \
          return its verdict as the fenced JSON block its own instructions define. \
-         Dispatch all 11 regardless of your own opinion -- do not skip, merge, or \
+         Dispatch all {n} regardless of your own opinion -- do not skip, merge, or \
          pre-judge any tier. The per-tier tool-results are read directly, so you need \
          not restate them.\n\n\
-         After all 11 subagents return, emit exactly one final fenced JSON block \
+         After all {n} subagents return, emit exactly one final fenced JSON block \
          aggregating every verdict as a safety net:\n\
          ```json\n\
          {{\"verdicts\": [{{\"tier\": 1, \"relevant\": false, \"reason\": \"...\", \
@@ -1304,6 +1399,10 @@ pub struct SingleSessionOptions {
     pub deadline_seconds: Option<f64>,
     /// Test-only escape hatch substituting the agent executable.
     pub command_override: Option<Vec<String>>,
+    /// The tiers registered and dispatched (tier order); all 11 by default.
+    pub tiers: Vec<Tier>,
+    /// The cycle's shared repo digest, appended to every subagent prompt.
+    pub digest: Option<String>,
 }
 
 impl Default for SingleSessionOptions {
@@ -1315,6 +1414,8 @@ impl Default for SingleSessionOptions {
             subagent_effort: DEFAULT_DISCOVERY_SUBAGENT_EFFORT,
             deadline_seconds: Some(DEFAULT_AUTOPILOT_AGENT_SECONDS),
             command_override: None,
+            tiers: Tier::ALL.to_vec(),
+            digest: None,
         }
     }
 }
@@ -1346,8 +1447,10 @@ pub fn build_single_session_configuration(
     configuration.max_turns = Some(options.max_turns);
     configuration.permission_policy = PermissionPolicy::Auto;
     configuration.command_override = options.command_override.clone();
-    let agents = build_tier_agents(
+    let agents = build_tier_agents_for(
         repo_root,
+        &options.tiers,
+        options.digest.as_deref(),
         options.model.as_deref(),
         options.subagent_max_turns,
         options.subagent_effort,
@@ -1566,24 +1669,35 @@ pub struct DiscoveryCollection {
 /// absent it yields a (not relevant) error verdict. Always returns exactly
 /// 11 verdicts in tier order.
 pub fn collect_tier_verdicts(result: &IterationResult) -> DiscoveryCollection {
+    collect_tier_verdicts_for(result, &Tier::ALL)
+}
+
+/// [`collect_tier_verdicts`] for the tiers actually dispatched: exactly one
+/// verdict per tier in `tiers` (tier order); a result keyed to any other
+/// tier is ignored.
+pub fn collect_tier_verdicts_for(result: &IterationResult, tiers: &[Tier]) -> DiscoveryCollection {
+    let tiers: Vec<Tier> = Tier::ALL
+        .into_iter()
+        .filter(|tier| tiers.contains(tier))
+        .collect();
     let mut from_tool: BTreeMap<Tier, TierVerdict> = BTreeMap::new();
     for interaction in &result.signals.tool_interactions {
         if !SUBAGENT_TOOL_NAMES.contains(&interaction.tool_name.as_str()) {
             continue;
         }
-        let Some(tier) = tier_from_agent_key(interaction.tool_input.get("subagent_type")) else {
+        let Some(tier) = tier_from_agent_key(interaction.tool_input.get("subagent_type"))
+            .filter(|tier| tiers.contains(tier))
+        else {
             continue;
         };
         let verdict = match tool_result_text(interaction.result.as_ref()) {
             Some(text) => parse_tier_verdict(tier, &text),
-            None => {
-                TierVerdict::not_relevant(tier, "subagent tool-result missing, errored, or empty")
-            }
+            None => TierVerdict::errored(tier, "subagent tool-result missing, errored, or empty"),
         };
         from_tool.insert(tier, verdict);
     }
 
-    let missing = Tier::ALL.iter().any(|tier| !from_tool.contains_key(tier));
+    let missing = tiers.iter().any(|tier| !from_tool.contains_key(tier));
     let mut aggregated = if missing {
         parse_aggregated_verdicts(&result.transcript)
     } else {
@@ -1591,7 +1705,7 @@ pub fn collect_tier_verdicts(result: &IterationResult) -> DiscoveryCollection {
     };
 
     let (mut used_tool, mut used_aggregated, mut used_error) = (false, false, false);
-    let verdicts = Tier::ALL
+    let verdicts = tiers
         .iter()
         .map(|tier| {
             if let Some(verdict) = from_tool.remove(tier) {
@@ -1602,7 +1716,7 @@ pub fn collect_tier_verdicts(result: &IterationResult) -> DiscoveryCollection {
                 verdict
             } else {
                 used_error = true;
-                TierVerdict::not_relevant(
+                TierVerdict::errored(
                     *tier,
                     "no discovery result for this tier: subagent was not dispatched and no \
                      aggregated verdict was emitted",
@@ -1644,7 +1758,7 @@ pub async fn run_single_session_discovery(
     session_runner: Option<&dyn DiscoverySessionRunner>,
     options: &SingleSessionOptions,
 ) -> Result<Vec<TierVerdict>, InvokeError> {
-    let prompt = orchestrator_prompt(repo_root);
+    let prompt = orchestrator_prompt_for(repo_root, &options.tiers);
     let result = match session_runner {
         Some(runner) => runner.run(&prompt).await?,
         None => {
@@ -1653,7 +1767,7 @@ pub async fn run_single_session_discovery(
                 .await?
         }
     };
-    Ok(collect_tier_verdicts(&result).verdicts)
+    Ok(collect_tier_verdicts_for(&result, &options.tiers).verdicts)
 }
 
 // --- Authoring: compile a finding into grader-bearing tasks ---------------------------
@@ -2030,7 +2144,18 @@ pub async fn author_finding(
     repo_root: &Path,
     invoker: &dyn AutopilotInvoker,
 ) -> AuthoringResult {
-    let prompt = authoring_prompt(finding, repo_root);
+    author_finding_with(finding, repo_root, None, invoker).await
+}
+
+/// [`author_finding`] with the cycle's shared repo digest appended to the
+/// authoring prompt ([`prompt_with_digest`]).
+pub async fn author_finding_with(
+    finding: &Finding,
+    repo_root: &Path,
+    digest: Option<&str>,
+    invoker: &dyn AutopilotInvoker,
+) -> AuthoringResult {
+    let prompt = prompt_with_digest(authoring_prompt(finding, repo_root), digest);
     let text = match invoker.invoke(&prompt).await {
         Ok(text) => text,
         Err(err) => {
@@ -2123,6 +2248,16 @@ pub struct AutopilotPassResult {
     pub not_relevant_tiers: Vec<Tier>,
     pub landing: String,
     pub reason: String,
+    /// Tiers the structural pre-filter skipped before discovery, each with
+    /// its reason (also counted in `not_relevant_tiers`).
+    pub prefiltered: Vec<TierPrefilterSkip>,
+    /// How discovery used the durable verdict cache this pass.
+    pub discovery_cache: DiscoveryCacheStatus,
+    /// Finding ids skipped because an earlier cycle already authored them
+    /// at this same repo state.
+    pub already_authored: Vec<String>,
+    /// Non-fatal operational notes (e.g. a cache write failure).
+    pub notes: Vec<String>,
 }
 
 impl Default for AutopilotPassResult {
@@ -2137,6 +2272,10 @@ impl Default for AutopilotPassResult {
             not_relevant_tiers: Vec::new(),
             landing: DEFAULT_LANDING.to_owned(),
             reason: String::new(),
+            prefiltered: Vec::new(),
+            discovery_cache: DiscoveryCacheStatus::NotConsulted,
+            already_authored: Vec::new(),
+            notes: Vec::new(),
         }
     }
 }
@@ -2282,6 +2421,16 @@ pub struct RefillPassOptions<'a> {
     /// constructions (an injected invoker is unaffected).
     pub agent_id: Option<String>,
     pub agent_transport: Option<String>,
+    /// Authoring sessions run at once (`[autopilot] authoring_concurrency`);
+    /// 1 is the serial loop. Emission order and the write cap are
+    /// independent of it.
+    pub authoring_concurrency: usize,
+    /// The durable discovery-verdict cache file; `None` disables caching
+    /// (the digest and pre-filter still run, uncached).
+    pub discovery_cache: Option<PathBuf>,
+    /// Cached-verdict lifetime (`[autopilot] discovery_cache_ttl_seconds`);
+    /// `0` disables caching.
+    pub discovery_cache_ttl_seconds: f64,
 }
 
 impl<'a> RefillPassOptions<'a> {
@@ -2305,6 +2454,10 @@ impl<'a> RefillPassOptions<'a> {
             now: None,
             agent_id: None,
             agent_transport: None,
+            authoring_concurrency: usize::try_from(DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY)
+                .unwrap_or(1),
+            discovery_cache: None,
+            discovery_cache_ttl_seconds: DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
         }
     }
 }
@@ -2413,18 +2566,119 @@ pub async fn run_refill_pass(
 
     // Discovery routes itself: a scripted `discovery_invoker` (tests)
     // drives the per-tier fan-out; `None` (production) drives the
-    // single-session tier-subagent path. Either way `run_discovery`
-    // returns exactly 11 verdicts.
-    let driver = match (options.discovery_invoker, options.discovery_session_runner) {
-        (Some(invoker), _) => DiscoveryDriver::PerTier(invoker),
-        (None, Some(runner)) => DiscoveryDriver::SingleSession(runner),
-        (None, None) => DiscoveryDriver::Production(SingleSessionOptions {
-            model: options.model.clone(),
-            deadline_seconds: autopilot_ceiling,
-            ..SingleSessionOptions::default()
-        }),
+    // single-session tier-subagent path. Either way `run_discovery_for`
+    // returns exactly one verdict per dispatched tier.
+    let (driver, driver_label) = match (options.discovery_invoker, options.discovery_session_runner)
+    {
+        (Some(invoker), _) => (DiscoveryDriver::PerTier(invoker), "per_tier"),
+        (None, Some(runner)) => (DiscoveryDriver::SingleSession(runner), "single_session"),
+        (None, None) => (
+            DiscoveryDriver::Production(SingleSessionOptions {
+                model: options.model.clone(),
+                deadline_seconds: autopilot_ceiling,
+                ..SingleSessionOptions::default()
+            }),
+            "single_session",
+        ),
     };
-    let verdicts = run_discovery(&options.repo_root, driver).await?;
+
+    // The cycle context (P2/P5): the repo state keys a durable cache of the
+    // shared digest, the structural pre-filter decisions, and every tier
+    // verdict, so an unchanged repo reuses all three across cycles and
+    // daemon restarts.
+    let now_epoch = epoch_seconds(options.now.map_or_else(Utc::now, |clock| clock()));
+    let mut notes = Vec::new();
+    let state = RepoState::probe(&options.repo_root);
+    let mut cache: Result<DiscoveryCache, String> = match (&options.discovery_cache, &state) {
+        (None, _) => Err("no cache path configured".to_owned()),
+        (Some(_), _) if options.discovery_cache_ttl_seconds <= 0.0 => {
+            Err("discovery_cache_ttl_seconds is 0".to_owned())
+        }
+        (Some(_), Err(reason)) => Err(reason.clone()),
+        (Some(path), Ok(_)) => Ok(DiscoveryCache::load(
+            path,
+            options.discovery_cache_ttl_seconds,
+            now_epoch,
+        )),
+    };
+    let state_key = state.as_ref().map(RepoState::state_key).unwrap_or_default();
+    let mut entry = match cache.as_ref().ok().and_then(|c| c.entry(&state_key)) {
+        Some(entry) => entry.clone(),
+        None => {
+            let inventory = RepoInventory::scan(&options.repo_root);
+            let head = state.as_ref().ok().map(|s| s.head.clone());
+            DiscoveryCacheEntry {
+                state_key: state_key.clone(),
+                head: head.clone().unwrap_or_default(),
+                created_at: now_epoch,
+                digest: build_repo_digest(&options.repo_root, &inventory, head.as_deref()),
+                prefiltered: structural_prefilter(&inventory),
+                verdicts: Vec::new(),
+                consumed: BTreeSet::new(),
+            }
+        }
+    };
+    let digest = entry.digest.clone();
+    let prefiltered = entry.prefiltered.clone();
+    let dispatch: Vec<Tier> = Tier::ALL
+        .into_iter()
+        .filter(|tier| !prefiltered.iter().any(|skip| skip.tier == *tier))
+        .collect();
+    let config = discovery_config_fingerprint(&options, driver_label);
+    let keys: BTreeMap<Tier, String> = dispatch
+        .iter()
+        .map(|tier| {
+            let prompt = prompt_with_digest(tier_prompt(*tier, &options.repo_root), Some(&digest));
+            (
+                *tier,
+                sha256_hex(&format!("{state_key}\n{config}\n{prompt}")),
+            )
+        })
+        .collect();
+    let reused: BTreeMap<Tier, TierVerdict> = if cache.is_ok() {
+        keys.iter()
+            .filter_map(|(tier, key)| entry.verdict_for(*tier, key).map(|v| (*tier, v.clone())))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let to_discover: Vec<Tier> = dispatch
+        .iter()
+        .copied()
+        .filter(|tier| !reused.contains_key(tier))
+        .collect();
+    let fresh = run_discovery_for(&options.repo_root, driver, &to_discover, Some(&digest)).await?;
+    for verdict in fresh.iter().filter(|v| !v.errored) {
+        if let Some(key) = keys.get(&verdict.tier) {
+            entry.put_verdict(key.clone(), verdict.clone());
+        }
+    }
+    let discovery_cache = match &cache {
+        Err(reason) => DiscoveryCacheStatus::Disabled(reason.clone()),
+        Ok(_) if to_discover.is_empty() => DiscoveryCacheStatus::Hit,
+        Ok(_) if reused.is_empty() => DiscoveryCacheStatus::Miss,
+        Ok(_) => DiscoveryCacheStatus::Partial {
+            reused: reused.keys().copied().collect(),
+        },
+    };
+    persist_cache(&mut cache, &entry, &mut notes);
+
+    let mut fresh_by_tier: BTreeMap<Tier, TierVerdict> =
+        fresh.into_iter().map(|v| (v.tier, v)).collect();
+    let verdicts: Vec<TierVerdict> = Tier::ALL
+        .iter()
+        .map(|tier| {
+            if let Some(skip) = prefiltered.iter().find(|skip| skip.tier == *tier) {
+                TierVerdict::not_relevant(*tier, skip.reason.clone())
+            } else if let Some(verdict) = reused.get(tier) {
+                verdict.clone()
+            } else {
+                fresh_by_tier.remove(tier).unwrap_or_else(|| {
+                    TierVerdict::errored(*tier, "no discovery result for this tier")
+                })
+            }
+        })
+        .collect();
     let relevant_tiers: Vec<Tier> = verdicts
         .iter()
         .filter(|v| v.relevant)
@@ -2435,24 +2689,50 @@ pub async fn run_refill_pass(
         .filter(|v| !v.relevant)
         .map(|v| v.tier)
         .collect();
-    let findings: Vec<Finding> = verdicts
+    // A finding already authored at this repo state (emitted or dropped by
+    // an earlier cycle reusing the same cached verdict) is never authored
+    // again: re-authoring it could only duplicate queued work.
+    let mut already_authored = Vec::new();
+    let mut findings: Vec<Finding> = Vec::new();
+    for finding in verdicts
         .iter()
         .filter(|v| v.relevant)
-        .flat_map(|v| v.findings.iter().cloned())
-        .collect();
+        .flat_map(|v| v.findings.iter())
+    {
+        if entry.consumed.contains(&finding.id) {
+            already_authored.push(finding.id.clone());
+        } else {
+            findings.push(finding.clone());
+        }
+    }
+    let base = AutopilotPassResult {
+        queue_depth_before: current,
+        target_depth,
+        relevant_tiers,
+        not_relevant_tiers,
+        landing: options.landing.clone(),
+        prefiltered,
+        discovery_cache,
+        already_authored,
+        ..AutopilotPassResult::default()
+    };
 
     let sequenced = sequence_findings(&findings, &options.weights);
     if sequenced.is_empty() {
-        let reason = "no actionable findings this cycle; idling without emitting";
-        record_no_op(reason)?;
+        let reason = if base.already_authored.is_empty() {
+            "no actionable findings this cycle; idling without emitting".to_owned()
+        } else {
+            format!(
+                "no actionable findings this cycle ({} already authored at this repo state); \
+                 idling without emitting",
+                base.already_authored.len()
+            )
+        };
+        record_no_op(&reason)?;
         return Ok(AutopilotPassResult {
-            queue_depth_before: current,
-            target_depth,
-            relevant_tiers,
-            not_relevant_tiers,
-            landing: options.landing.clone(),
-            reason: reason.to_owned(),
-            ..AutopilotPassResult::default()
+            reason,
+            notes,
+            ..base
         });
     }
 
@@ -2460,39 +2740,69 @@ pub async fn run_refill_pass(
     let mut emitted_paths: Vec<PathBuf> = Vec::new();
     let mut dropped = Vec::new();
     let slots = usize::try_from(slots).unwrap_or(usize::MAX);
+    let limit = options.authoring_concurrency.max(1);
 
     // Author the top-sequenced findings until the queue reaches the target
     // or the actionable findings run out; only enough to fill the
-    // depth-to-target. Each emitted task carries the breakdown of the
-    // finding it was authored from (never a lookup by finding id, which two
-    // same-slug findings could collide on).
-    for scored in &sequenced {
-        if emitted_paths.len() >= slots {
-            break;
-        }
-        let result = author_finding(&scored.finding, &options.repo_root, author).await;
-        dropped.extend(result.dropped);
-        for task in result.emitted {
-            let path = emit_emitted_task(
-                &task,
-                &scored.breakdown,
-                &options.tasks_dir,
-                AUTOPILOT_PHASE,
-            )
-            .map_err(|source| RefillError::Emit {
-                path: options
-                    .tasks_dir
-                    .join("active")
-                    .join(AUTOPILOT_PHASE)
-                    .join(format!("{}.json", task.task.id)),
-                source,
-            })?;
-            if let Some(path) = path {
-                emitted.push(task);
-                emitted_paths.push(path);
+    // depth-to-target. Up to `limit` authoring sessions run at once, never
+    // more than the slots still open, and results are emitted strictly in
+    // sequence order regardless of which session finishes first -- so the
+    // emitted set and the write cap match the serial loop exactly (limit 1
+    // IS the serial loop). Leaving the loop drops every in-flight session,
+    // which cancels it and kills its process group. Each emitted task
+    // carries the breakdown of the finding it was authored from (never a
+    // lookup by finding id, which two same-slug findings could collide on).
+    {
+        let mut window: VecDeque<InFlight<_>> = VecDeque::new();
+        let mut next = 0usize;
+        loop {
+            while window.len() < limit
+                && next < sequenced.len()
+                && emitted_paths.len() + window.len() < slots
+            {
+                window.push_back(InFlight::new(
+                    next,
+                    author_finding_with(
+                        &sequenced[next].finding,
+                        &options.repo_root,
+                        Some(&digest),
+                        author,
+                    ),
+                ));
+                next += 1;
+            }
+            let Some((index, result)) = next_in_order(&mut window).await else {
+                break;
+            };
+            let scored = &sequenced[index];
+            entry.consumed.insert(scored.finding.id.clone());
+            dropped.extend(result.dropped);
+            for task in result.emitted {
+                let path = emit_emitted_task(
+                    &task,
+                    &scored.breakdown,
+                    &options.tasks_dir,
+                    AUTOPILOT_PHASE,
+                )
+                .map_err(|source| RefillError::Emit {
+                    path: options
+                        .tasks_dir
+                        .join("active")
+                        .join(AUTOPILOT_PHASE)
+                        .join(format!("{}.json", task.task.id)),
+                    source,
+                })?;
+                if let Some(path) = path {
+                    emitted.push(task);
+                    emitted_paths.push(path);
+                }
+            }
+            if emitted_paths.len() >= slots {
+                break;
             }
         }
     }
+    persist_cache(&mut cache, &entry, &mut notes);
 
     let reason = if emitted_paths.is_empty() {
         let reason = "no grader-bearing task could be authored this cycle";
@@ -2508,13 +2818,97 @@ pub async fn run_refill_pass(
         emitted_paths,
         emitted,
         dropped,
-        queue_depth_before: current,
-        target_depth,
-        relevant_tiers,
-        not_relevant_tiers,
         landing: options.landing,
         reason,
+        notes,
+        ..base
     })
+}
+
+/// Epoch seconds (millisecond precision) of a UTC instant.
+fn epoch_seconds(at: DateTime<Utc>) -> f64 {
+    at.timestamp_millis() as f64 / 1000.0
+}
+
+/// Everything besides the rendered prompt that changes a tier verdict: the
+/// discovery route and the agent configuration it runs under.
+fn discovery_config_fingerprint(options: &RefillPassOptions<'_>, driver: &str) -> String {
+    json!({
+        "driver": driver,
+        "model": options.model,
+        "agent_id": options.agent_id,
+        "agent_transport": options.agent_transport,
+        "max_turns": DEFAULT_DISCOVERY_MAX_TURNS,
+        "subagent_max_turns": DEFAULT_DISCOVERY_SUBAGENT_MAX_TURNS,
+        "subagent_effort": DEFAULT_DISCOVERY_SUBAGENT_EFFORT.as_str(),
+        "dispatcher": sha256_hex(&orchestrator_prompt(&options.repo_root)),
+    })
+    .to_string()
+}
+
+/// Upsert `entry` and write the cache; a write failure is a recorded note,
+/// never a failed cycle.
+fn persist_cache(
+    cache: &mut Result<DiscoveryCache, String>,
+    entry: &DiscoveryCacheEntry,
+    notes: &mut Vec<String>,
+) {
+    if let Ok(cache) = cache {
+        cache.upsert(entry.clone());
+        if let Err(err) = cache.save() {
+            notes.push(format!(
+                "discovery cache write failed ({}): {err}",
+                cache.path().display()
+            ));
+        }
+    }
+}
+
+/// One authoring session in the ordered fan-out window: its sequence
+/// index, the running future, and its output once ready.
+struct InFlight<F: Future> {
+    index: usize,
+    future: Option<Pin<Box<F>>>,
+    output: Option<F::Output>,
+}
+
+impl<F: Future> InFlight<F> {
+    fn new(index: usize, future: F) -> Self {
+        Self {
+            index,
+            future: Some(Box::pin(future)),
+            output: None,
+        }
+    }
+}
+
+/// Drive every in-flight future until the OLDEST one is done, then hand
+/// back its `(index, output)`; later futures that finish first keep their
+/// output buffered for their turn. `None` when the window is empty.
+async fn next_in_order<F: Future>(
+    window: &mut VecDeque<InFlight<F>>,
+) -> Option<(usize, F::Output)> {
+    if window.is_empty() {
+        return None;
+    }
+    std::future::poll_fn(|cx: &mut TaskContext<'_>| {
+        for slot in window.iter_mut() {
+            if let Some(future) = slot.future.as_mut()
+                && let Poll::Ready(output) = future.as_mut().poll(cx)
+            {
+                slot.output = Some(output);
+                slot.future = None;
+            }
+        }
+        if window.front().is_some_and(|slot| slot.output.is_some()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    let head = window.pop_front()?;
+    Some((head.index, head.output?))
 }
 
 /// Current work-source depth: the directory adapter's active-item count.
@@ -4788,5 +5182,560 @@ while true; do text "still streaming"; sleep 0.01; done"#;
             .await
             .unwrap_err();
         assert_eq!(err.ceiling_seconds(), 0.01);
+    }
+
+    // --- cycle cost controls: pre-filter, digest, verdict cache, fan-out --------------
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// `seed_repo` committed to a fresh git repository.
+    fn git_seed_repo(tmp: &TempDir) -> PathBuf {
+        let repo = seed_repo(tmp);
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "seed"]);
+        repo
+    }
+
+    fn values(tiers: &[Tier]) -> Vec<u8> {
+        tiers.iter().map(|t| t.value()).collect()
+    }
+
+    fn seen_sorted(seen: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+        let mut out = seen.lock().unwrap().clone();
+        out.sort_unstable();
+        out
+    }
+
+    const SUBSET_DISPATCHER_PROMPT: &str = "You are autopilot's discovery dispatcher for the repository at /repo.\n\nTwo tier-relevance subagents are registered: tier-5, tier-10.\n\nUse the Agent tool (a.k.a. Task) to dispatch EVERY one of these 2 subagents exactly once, each with subagent_type set to its key. Tell each subagent to read the repository, judge whether its tier is relevant to THIS codebase, and return its verdict as the fenced JSON block its own instructions define. Dispatch all 2 regardless of your own opinion -- do not skip, merge, or pre-judge any tier. The per-tier tool-results are read directly, so you need not restate them.\n\nAfter all 2 subagents return, emit exactly one final fenced JSON block aggregating every verdict as a safety net:\n```json\n{\"verdicts\": [{\"tier\": 1, \"relevant\": false, \"reason\": \"...\", \"findings\": []}]}\n```";
+
+    #[test]
+    fn dispatcher_prompt_for_a_subset_names_only_those_tiers() {
+        assert_eq!(
+            orchestrator_prompt_for(&repo(), &Tier::ALL),
+            PY_ORCHESTRATOR_PROMPT
+        );
+        assert_eq!(
+            orchestrator_prompt_for(&repo(), &[Tier::CoreFeatureWork, Tier::Documentation]),
+            SUBSET_DISPATCHER_PROMPT
+        );
+    }
+
+    #[test]
+    fn digest_rides_after_the_unchanged_tier_and_authoring_prompts() {
+        let tier = prompt_with_digest(tier_prompt(Tier::ProductionDown, &repo()), Some("DIGEST"));
+        assert_eq!(
+            tier,
+            format!(
+                "{PY_TIER1_PROMPT}\n\nSHARED REPOSITORY DIGEST (built once this cycle by \
+                 autopilot; use it for the repo's layout, manifests, and recent history instead \
+                 of re-surveying them, and open files only to confirm specific evidence):\n\
+                 <repo-digest>\nDIGEST\n</repo-digest>"
+            )
+        );
+        let mut f = coverage_finding();
+        f.evidence.push("src/parser.py:40".to_owned());
+        let authoring = prompt_with_digest(authoring_prompt(&f, &repo()), Some("DIGEST"));
+        assert!(authoring.starts_with(PY_AUTHORING_PROMPT));
+        assert!(authoring.ends_with("<repo-digest>\nDIGEST\n</repo-digest>"));
+    }
+
+    #[test]
+    fn single_session_configuration_registers_only_dispatched_tiers_with_the_digest() {
+        let options = SingleSessionOptions {
+            tiers: vec![Tier::TestCoverage, Tier::Documentation],
+            digest: Some("DIGEST".to_owned()),
+            ..SingleSessionOptions::default()
+        };
+        let config = build_single_session_configuration(&repo(), &options);
+        let agents = config.adapter_options["agents"].as_object().unwrap();
+        assert_eq!(
+            agents.keys().cloned().collect::<Vec<_>>(),
+            vec!["tier-10", "tier-6"]
+        );
+        for agent in agents.values() {
+            assert!(
+                agent["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("DIGEST\n</repo-digest>")
+            );
+        }
+    }
+
+    #[test]
+    fn subset_collection_ignores_results_for_undispatched_tiers() {
+        let collection =
+            collect_tier_verdicts_for(&all_tiers_result(), &[Tier::BrokenBuild, Tier::Polish]);
+        assert_eq!(
+            collection
+                .verdicts
+                .iter()
+                .map(|v| v.tier.value())
+                .collect::<Vec<_>>(),
+            vec![3, 11]
+        );
+        assert_eq!(collection.source, CollectSource::ToolResult);
+        let missing = collect_tier_verdicts_for(&session_result(Vec::new(), ""), &[Tier::Polish]);
+        assert!(missing.verdicts[0].errored);
+        assert!(!collection.verdicts[0].errored);
+    }
+
+    #[tokio::test]
+    async fn discovery_for_a_subset_dispatches_only_those_tiers() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let invoker = library_invoker(seen.clone());
+        let verdicts = run_discovery_for(
+            &repo(),
+            DiscoveryDriver::PerTier(&invoker),
+            &[Tier::Polish, Tier::BrokenBuild],
+            Some("DIGEST"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verdicts.iter().map(|v| v.tier.value()).collect::<Vec<_>>(),
+            vec![3, 11]
+        );
+        assert_eq!(seen_sorted(&seen), vec![3, 11]);
+        let none = run_discovery_for(&repo(), DiscoveryDriver::PerTier(&invoker), &[], None)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn refill_pass_prefilters_structurally_absent_tiers_and_records_why() {
+        let tmp = TempDir::new().unwrap();
+        // Only a Python test file: no deployment config, no build manifest
+        // or CI -- tiers 1 and 3 cannot apply.
+        let repo = seed_repo(&tmp);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let discovery = library_invoker(seen.clone());
+        let author = tier_task_author();
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen_sorted(&seen), vec![2, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            result
+                .prefiltered
+                .iter()
+                .map(|s| s.tier.value())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            result
+                .prefiltered
+                .iter()
+                .all(|s| s.reason.starts_with("structural pre-filter: "))
+        );
+        assert_eq!(values(&result.not_relevant_tiers), vec![1, 2, 3, 4]);
+        assert_eq!(
+            result.discovery_cache,
+            DiscoveryCacheStatus::Disabled("no cache path configured".to_owned())
+        );
+        assert_eq!(result.emitted_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn refill_pass_injects_one_shared_digest_into_discovery_and_authoring() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let prompts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = prompts.clone();
+        let discovery = move |prompt: String| {
+            let recorded = recorded.clone();
+            async move {
+                let tier = tier_in_prompt(&prompt);
+                recorded.lock().unwrap().push(prompt);
+                Ok(library_response(tier))
+            }
+        };
+        let authored = Arc::new(Mutex::new(Vec::<String>::new()));
+        let author_log = authored.clone();
+        let author = move |prompt: String| {
+            let author_log = author_log.clone();
+            async move {
+                author_log.lock().unwrap().push(prompt);
+                Ok(fenced(&json!({"tasks": [authored_entry(
+                    "task-x", "pytest tests/test_existing.py", "tests/test_existing.py"
+                )]})))
+            }
+        };
+        run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap();
+        let digest_of = |prompt: &str| -> String {
+            let start = prompt.find("<repo-digest>\n").expect("digest injected");
+            prompt[start..].to_owned()
+        };
+        let discovery_prompts = prompts.lock().unwrap();
+        let authoring_prompts = authored.lock().unwrap();
+        assert_eq!(discovery_prompts.len(), 9);
+        assert_eq!(authoring_prompts.len(), 1);
+        let shared = digest_of(&discovery_prompts[0]);
+        assert!(shared.contains("tests/ (1 files)"));
+        assert!(shared.contains("deployment: none found"));
+        for prompt in discovery_prompts.iter().chain(authoring_prompts.iter()) {
+            assert_eq!(digest_of(prompt), shared);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_cache_reuses_verdicts_until_the_repo_state_changes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git_seed_repo(&tmp);
+        let tasks_dir = tmp.path().join("tasks");
+        let cache_path = tmp.path().join("state/discovery-cache.json");
+        let author = tier_task_author();
+        let empty_queue = |_: &Path| Ok(0usize);
+
+        // Cycle 1: a cold cache discovers every dispatchable tier.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let discovery = library_invoker(seen.clone());
+        let first = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            queue_depth: Some(&empty_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.discovery_cache, DiscoveryCacheStatus::Miss);
+        assert_eq!(seen_sorted(&seen), vec![2, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(task_ids_in(&tasks_dir), vec!["task-t5"]);
+        assert!(cache_path.is_file());
+
+        // Cycle 2 (a fresh pass, as after a daemon restart): same HEAD, so
+        // no discovery agent runs, and the finding cycle 1 already authored
+        // is skipped rather than re-authored into a duplicate.
+        let panicking = |_prompt: String| async move { panic!("cache hit must not rediscover") };
+        let second = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&panicking),
+            authoring_invoker: Some(&author),
+            queue_depth: Some(&empty_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(second.discovery_cache, DiscoveryCacheStatus::Hit);
+        assert_eq!(second.already_authored, vec!["t5-f1"]);
+        assert_eq!(values(&second.relevant_tiers), vec![5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            second
+                .prefiltered
+                .iter()
+                .map(|s| s.tier.value())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(task_ids_in(&tasks_dir), vec!["task-t5", "task-t6"]);
+
+        // Emitting into .flywheel/ inside the repo does not invalidate it.
+        let in_repo_tasks = repo.join(".flywheel").join("tasks");
+        let third = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&panicking),
+            authoring_invoker: Some(&author),
+            queue_depth: Some(&empty_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(&in_repo_tasks, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(third.discovery_cache, DiscoveryCacheStatus::Hit);
+        assert_eq!(third.already_authored, vec!["t5-f1", "t6-f1"]);
+
+        // A commit moves HEAD: the cache misses and discovery runs again.
+        std::fs::write(
+            repo.join("tests/test_more.py"),
+            "def test_more():\n    pass\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "tests/test_more.py"]);
+        git(&repo, &["commit", "-q", "-m", "more"]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let discovery = library_invoker(seen.clone());
+        let moved = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            queue_depth: Some(&empty_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(moved.discovery_cache, DiscoveryCacheStatus::Miss);
+        assert!(moved.already_authored.is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn errored_tier_verdicts_are_not_cached_and_are_rediscovered_alone() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git_seed_repo(&tmp);
+        let cache_path = tmp.path().join("discovery-cache.json");
+        let full_queue = |_: &Path| Ok(0usize);
+        let dropper = scripted(fenced(&json!({"tasks": [], "dropped": "ungradeable"})));
+        let flaky = |prompt: String| async move {
+            let tier = tier_in_prompt(&prompt);
+            if tier == 5 {
+                Err(InvokeError::from("tier 5 agent crashed"))
+            } else {
+                Ok(library_response(tier))
+            }
+        };
+        let first = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&flaky),
+            authoring_invoker: Some(&dropper),
+            queue_depth: Some(&full_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.discovery_cache, DiscoveryCacheStatus::Miss);
+        assert!(!first.relevant_tiers.contains(&Tier::CoreFeatureWork));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let discovery = library_invoker(seen.clone());
+        let second = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&dropper),
+            queue_depth: Some(&full_queue),
+            discovery_cache: Some(cache_path.clone()),
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen_sorted(&seen), vec![5]);
+        assert_eq!(
+            second.discovery_cache,
+            DiscoveryCacheStatus::Partial {
+                reused: vec![
+                    Tier::ImminentSevereRisk,
+                    Tier::CommittedDeliverables,
+                    Tier::TestCoverage,
+                    Tier::NonCriticalBugs,
+                    Tier::TechDebt,
+                    Tier::ObservabilityTooling,
+                    Tier::Documentation,
+                    Tier::Polish,
+                ]
+            }
+        );
+        assert!(second.relevant_tiers.contains(&Tier::CoreFeatureWork));
+        // Dropped findings count as authored: tiers 6-11 were all tried in
+        // cycle 1 and are not re-authored; only tier 5's new finding is.
+        assert_eq!(second.dropped.len(), 1);
+        assert_eq!(second.dropped[0].finding.id, "t5-f1");
+    }
+
+    #[tokio::test]
+    async fn cache_is_disabled_by_a_zero_ttl_or_outside_git() {
+        let tmp = TempDir::new().unwrap();
+        let git_repo = git_seed_repo(&tmp);
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let author = tier_task_author();
+        let zero = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            discovery_cache: Some(tmp.path().join("c.json")),
+            discovery_cache_ttl_seconds: 0.0,
+            ..RefillPassOptions::new(tmp.path().join("tasks-a"), &git_repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            zero.discovery_cache,
+            DiscoveryCacheStatus::Disabled("discovery_cache_ttl_seconds is 0".to_owned())
+        );
+        assert!(!tmp.path().join("c.json").exists());
+
+        let plain = TempDir::new().unwrap();
+        let plain_repo = seed_repo(&plain);
+        let outside = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            discovery_cache: Some(plain.path().join("c.json")),
+            ..RefillPassOptions::new(plain.path().join("tasks"), &plain_repo)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            outside.discovery_cache,
+            DiscoveryCacheStatus::Disabled("repository has no git HEAD".to_owned())
+        );
+    }
+
+    /// An authoring invoker that tracks how many sessions are in flight,
+    /// records completion order, and finishes EARLIER tiers LATER so a
+    /// fan-out completes out of sequence order.
+    fn timed_author(
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        finished: Arc<Mutex<Vec<u8>>>,
+    ) -> impl AutopilotInvoker {
+        use std::sync::atomic::Ordering;
+        move |prompt: String| {
+            let (in_flight, peak, finished) = (in_flight.clone(), peak.clone(), finished.clone());
+            async move {
+                let start = prompt.find("Finding (Tier ").unwrap() + "Finding (Tier ".len();
+                let tier: u8 = prompt[start..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap();
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                let delay = 30 * u64::from(12 - tier);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                finished.lock().unwrap().push(tier);
+                Ok(fenced(&json!({"tasks": [authored_entry(
+                    &format!("task-t{tier}"), "pytest tests/test_existing.py", "tests/test_existing.py"
+                )]})))
+            }
+        }
+    }
+
+    async fn fan_out_pass(
+        concurrency: usize,
+        target_depth: i64,
+    ) -> (AutopilotPassResult, usize, Vec<u8>) {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let author = timed_author(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak.clone(),
+            finished.clone(),
+        );
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            authoring_concurrency: concurrency,
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        })
+        .await
+        .unwrap();
+        let finished = finished.lock().unwrap().clone();
+        (
+            result,
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            finished,
+        )
+    }
+
+    fn emitted_ids(result: &AutopilotPassResult) -> Vec<&str> {
+        result.emitted.iter().map(|e| e.task.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn authoring_fans_out_but_emits_in_sequence_order() {
+        let (result, peak, finished) = fan_out_pass(3, 3).await;
+        assert_eq!(peak, 3);
+        // Sessions finished out of order (tier 7 first) ...
+        assert_eq!(finished, vec![7, 6, 5]);
+        // ... yet emission follows the score sequence exactly.
+        assert_eq!(emitted_ids(&result), vec!["task-t5", "task-t6", "task-t7"]);
+        assert!(result.emitted_paths[0].ends_with("task-t5.json"));
+    }
+
+    #[tokio::test]
+    async fn concurrency_one_is_the_serial_loop() {
+        let (result, peak, finished) = fan_out_pass(1, 3).await;
+        assert_eq!(peak, 1);
+        assert_eq!(finished, vec![5, 6, 7]);
+        assert_eq!(emitted_ids(&result), vec!["task-t5", "task-t6", "task-t7"]);
+    }
+
+    #[tokio::test]
+    async fn fan_out_never_launches_more_sessions_than_open_slots() {
+        let (result, peak, finished) = fan_out_pass(5, 2).await;
+        assert_eq!(peak, 2);
+        assert_eq!(finished.len(), 2);
+        assert_eq!(emitted_ids(&result), vec!["task-t5", "task-t6"]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pass_drops_every_in_flight_authoring_session() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (s, d) = (started.clone(), dropped.clone());
+        let author = move |_prompt: String| {
+            let (s, d) = (s.clone(), d.clone());
+            async move {
+                let _guard = Dropped(d);
+                s.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<String, InvokeError>>().await
+            }
+        };
+        let pass = run_refill_pass(RefillPassOptions {
+            target_depth: 5,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            authoring_concurrency: 3,
+            ..RefillPassOptions::new(tmp.path().join("tasks"), &repo)
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), pass)
+                .await
+                .is_err()
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
     }
 }

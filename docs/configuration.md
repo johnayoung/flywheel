@@ -215,6 +215,8 @@ Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.m
 | `target_depth` | int (>0) | `5` | how deep autopilot fills the queue |
 | `landing` | enum `merge`/`pr` | `merge` | landing posture for autopilot-authored work |
 | `interval_seconds` | float (>0) | `300.0` | seconds between daemon cycles |
+| `authoring_concurrency` | int (>0) | `3` | authoring sessions run at once per pass; `1` = serial. Emission order and the per-pass write cap are unchanged |
+| `discovery_cache_ttl_seconds` | float (>=0) | `21600.0` | lifetime of cached discovery verdicts (keyed on HEAD + working tree); `0` disables the cache |
 
 `[autopilot.weights]` overrides individual score axes; each unset weight keeps the engine default (`AutopilotWeights`, `policy.rs`).
 

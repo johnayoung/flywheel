@@ -11,6 +11,7 @@
 
 pub mod autopilot;
 pub mod autopilot_activity;
+pub mod autopilot_context;
 pub mod autopilot_run;
 pub mod autopilot_supervised_run;
 pub mod claims;

@@ -1,0 +1,116 @@
+name: Release
+
+# Builds the `flywheel` and `fw` binaries for every supported target,
+# packages each target as a tar.gz with a sha256 sum, and attaches them to a
+# GitHub Release for the tag.
+#
+# Triggers:
+#   * pushing a `v*` tag publishes a release for that tag;
+#   * workflow_dispatch builds the artifacts and, when `tag` names an
+#     existing tag, publishes a release for it (otherwise the archives are
+#     only uploaded as workflow artifacts).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (leave empty to build artifacts only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p flywheel --target ${{ matrix.target }}
+      - name: Smoke-test native binaries
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          for bin in flywheel fw; do
+            "target/${{ matrix.target }}/release/${bin}" --help > /dev/null
+          done
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.tag || github.ref_name }}"
+          name="flywheel-${ref}-${{ matrix.target }}"
+          stage="dist/${name}"
+          mkdir -p "${stage}"
+          cp "target/${{ matrix.target }}/release/flywheel" "target/${{ matrix.target }}/release/fw" "${stage}/"
+          cp LICENSE README.md "${stage}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (inputs.tag || '') != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Combine checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.tar.gz.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber
+          else
+            gh release create "${TAG}" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS \
+              --title "${TAG}" --generate-notes --verify-tag
+          fi

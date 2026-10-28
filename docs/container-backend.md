@@ -101,7 +101,7 @@ exec_timeout = 1800   # seconds; 0 = unbounded (not recommended)
 
 ## Container lifecycle and orphan reap
 
-Containers are started without `--rm` so a dead sandbox stays inspectable (`docker logs`, exit code) until teardown (`stop` + `rm`) or the exit-time registry removes it. Each container carries owner labels: host, pid, and (Linux) process start time. At worker boot, `reap_container_orphans` removes only flywheel containers whose owner is provably dead **on this host** (pid gone, or pid reused by another process); live owners and other hosts' containers are never touched. Containers without owner labels (pre-0.6.0) are treated as orphans.
+Containers are started without `--rm` so a dead sandbox stays inspectable (`docker logs`, exit code) until teardown (`stop` + `rm`) or the exit-time registry removes it. Each container carries owner labels: host, pid, and (Linux) process start time and pid namespace. At worker boot, `reap_container_orphans` removes only flywheel containers whose owner is provably dead **on this host and in this pid namespace** (pid gone, or pid reused by another process); live owners, other hosts', and other namespaces' containers (sibling WSL2 distros, containerised workers) are never touched. Containers without owner labels (pre-0.6.0) are treated as orphans.
 
 ## Limitations operators must know
 

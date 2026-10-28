@@ -471,11 +471,31 @@ where
     AuditStream::new(run_id, store, options, true)
 }
 
+/// The quiescence window the follow loop waits out after observing a
+/// terminal status before its final pass. Independent of the poll interval
+/// so a long poll never delays the exit of an already-finished run. A writer that records its last line just after the terminal
+/// transition -- or is descheduled between the two under load -- lands that
+/// line inside the window instead of after the stream has exited.
+pub const FOLLOW_SETTLE_WINDOW: Duration = Duration::from_millis(250);
+
+/// The hard ceiling on the post-terminal settle: a writer that keeps
+/// appending after the terminal status cannot hold the follow open past
+/// this, so the stream always ends.
+pub const FOLLOW_SETTLE_CAP: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Drain,
     FollowCheck,
-    FollowPage { eof_final: bool, yielded: bool },
+    /// A non-terminal poll: read every complete line, then re-check status.
+    FollowPage,
+    /// Terminal observed: keep draining complete lines; on an empty read,
+    /// wait one quiescence window (`idle_waited` records that) and read
+    /// again, so a write racing the terminal transition is not dropped.
+    Settle { idle_waited: bool },
+    /// The quiescent final pass: drain what remains and discard a partial
+    /// trailing line (a crash mid-write that will never complete).
+    FinalPage,
     Tail,
     Finished,
 }
@@ -492,6 +512,7 @@ pub struct AuditStream<'a, S: ?Sized> {
     include_landing_tail: bool,
     last_sequence: u64,
     phase: Phase,
+    settle_started: Option<Instant>,
     tail: std::vec::IntoIter<EventRecord>,
 }
 
@@ -517,6 +538,7 @@ where
             include_landing_tail,
             last_sequence: 0,
             phase: Phase::Drain,
+            settle_started: None,
             tail: Vec::new().into_iter(),
         }
     }
@@ -568,12 +590,22 @@ where
     }
 
     fn sleep(&self) {
+        self.sleep_for(self.poll_interval);
+    }
+
+    fn sleep_for(&self, duration: Duration) {
         match &self.stop {
             Some(stop) => {
-                stop.wait(self.poll_interval);
+                stop.wait(duration);
             }
-            None => thread::sleep(self.poll_interval),
+            None => thread::sleep(duration),
         }
+    }
+
+    /// Whether one more quiescence wait fits under [`FOLLOW_SETTLE_CAP`].
+    fn may_settle(&mut self) -> bool {
+        let started = *self.settle_started.get_or_insert_with(Instant::now);
+        !self.stopped() && started.elapsed() < FOLLOW_SETTLE_CAP
     }
 }
 
@@ -614,33 +646,40 @@ where
                         self.enter_tail();
                         continue;
                     };
-                    let terminal = TERMINAL_STATUSES.contains(&status);
-                    if !terminal {
+                    if TERMINAL_STATUSES.contains(&status) {
+                        self.phase = Phase::Settle { idle_waited: false };
+                    } else {
                         self.sleep();
-                    }
-                    self.phase = Phase::FollowPage {
-                        eof_final: terminal,
-                        yielded: false,
-                    };
-                }
-                Phase::FollowPage { eof_final, yielded } => {
-                    match self.reader.next_record(eof_final) {
-                        Err(err) => return self.fail(err.into()),
-                        Ok(Some(record)) => {
-                            self.phase = Phase::FollowPage {
-                                eof_final,
-                                yielded: true,
-                            };
-                            return Some(Ok(self.emit(record)));
-                        }
-                        // A terminal lifecycle triggers one final drain before
-                        // the loop exits, so the line written alongside the
-                        // terminal transition is never dropped; an empty final
-                        // page ends the follow.
-                        Ok(None) if eof_final && !yielded => self.enter_tail(),
-                        Ok(None) => self.phase = Phase::FollowCheck,
+                        self.phase = Phase::FollowPage;
                     }
                 }
+                Phase::FollowPage => match self.reader.next_record(false) {
+                    Err(err) => return self.fail(err.into()),
+                    Ok(Some(record)) => return Some(Ok(self.emit(record))),
+                    Ok(None) => self.phase = Phase::FollowCheck,
+                },
+                // A terminal lifecycle does not end the follow on the first
+                // empty read: the line written alongside (or just after) the
+                // terminal transition may not have landed yet. Drain until a
+                // read comes back empty after a full quiescence window, then
+                // run the final pass.
+                Phase::Settle { idle_waited } => match self.reader.next_record(false) {
+                    Err(err) => return self.fail(err.into()),
+                    Ok(Some(record)) => {
+                        self.phase = Phase::Settle { idle_waited: false };
+                        return Some(Ok(self.emit(record)));
+                    }
+                    Ok(None) if !idle_waited && self.may_settle() => {
+                        self.sleep_for(FOLLOW_SETTLE_WINDOW);
+                        self.phase = Phase::Settle { idle_waited: true };
+                    }
+                    Ok(None) => self.phase = Phase::FinalPage,
+                },
+                Phase::FinalPage => match self.reader.next_record(true) {
+                    Err(err) => return self.fail(err.into()),
+                    Ok(Some(record)) => return Some(Ok(self.emit(record))),
+                    Ok(None) => self.enter_tail(),
+                },
                 Phase::Tail => match self.tail.next() {
                     Some(event) => return Some(Ok(self.emit(AuditRecord::Event(event)))),
                     None => self.phase = Phase::Finished,
@@ -2240,6 +2279,28 @@ mod tests {
         file.write_all(b"{\"kind\": \"harness.tru").unwrap();
         let collected = consumer.join().unwrap();
         assert_eq!(kinds(&collected), vec!["harness.first", "harness.last"]);
+    }
+
+    #[test]
+    fn stream_follow_keeps_a_write_landing_just_after_terminal() {
+        // The writer is descheduled between the terminal transition and its
+        // last append (simulated by a delay shorter than the settle window):
+        // the follow must still deliver that append.
+        let dir = tempfile::tempdir().unwrap();
+        let store = TestStore::with_running("r1");
+        let sink = FileTelemetrySink::new(dir.path());
+        append_event(&sink, "r1", "harness.first");
+        let logs_root = dir.path().to_path_buf();
+        let consumer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || collect("r1", &*store, &follow_opts(&logs_root, 10)))
+        };
+        thread::sleep(Duration::from_millis(50));
+        store.set_status("r1", Status::Done);
+        thread::sleep(FOLLOW_SETTLE_WINDOW / 2);
+        append_event(&sink, "r1", "harness.late");
+        let collected = consumer.join().unwrap();
+        assert_eq!(kinds(&collected), vec!["harness.first", "harness.late"]);
     }
 
     #[test]

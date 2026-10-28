@@ -20,6 +20,7 @@
 //! The screen takes `fetch` and `status` closures rather than a store
 //! handle so tests drive deterministic frames without timer races.
 
+use crate::dashboard::MOUSE_SCROLL_LINES;
 use crate::session::{EntryKind, TranscriptEntry, is_terminal, short};
 use crate::slash::{
     SLASH_APPROVE, SLASH_ARCHIVE, SLASH_AUTOPILOT, SLASH_EXIT, SLASH_HELP, SLASH_INTERRUPT,
@@ -27,7 +28,7 @@ use crate::slash::{
     unknown_command_notice,
 };
 use crate::tui::{InputBar, InputEvent};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use flywheel_core::invoker_client::{
     CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT, CONTROL_COMMAND_SAY,
 };
@@ -648,6 +649,26 @@ impl SessionScreen {
         if !self.follow {
             self.scroll = self.scroll.saturating_add(self.page());
         }
+    }
+
+    /// Route one mouse event: the wheel scrolls the transcript
+    /// ([`MOUSE_SCROLL_LINES`] per notch). Scrolling up pauses tail-follow
+    /// exactly as the Up key does; End (or the keyboard) resumes it.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> SessionAction {
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                for _ in 0..MOUSE_SCROLL_LINES {
+                    self.scroll_up();
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                for _ in 0..MOUSE_SCROLL_LINES {
+                    self.scroll_down();
+                }
+            }
+            _ => {}
+        }
+        SessionAction::None
     }
 
     /// Route one key press. Navigation keys drive the transcript; the
@@ -1355,6 +1376,38 @@ mod tests {
         let b = entry(EntryKind::ToolCall, "tool(Read)", "b.py", 1);
         assert_eq!(block_group(&a), block_group(&b));
         assert!(!needs_blank_separator(Some(&a), &b));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_transcript_and_pauses_follow() {
+        let (queue, fetch) = scripted_fetch();
+        let mut screen = SessionScreen::new("run-x", "task-alpha", fetch, || Ok(running()));
+        queue.borrow_mut().push_back(
+            (0..40)
+                .map(|i| entry(EntryKind::AgentText, "agent", &format!("line {i}"), i))
+                .collect(),
+        );
+        screen.refresh_now();
+        let mut term = terminal(80, 12);
+        term.draw(|f| screen.render(f, f.area())).unwrap();
+        assert!(screen.follow());
+        let bottom = screen.last_top;
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            screen.handle_mouse(wheel(MouseEventKind::ScrollUp)),
+            SessionAction::None
+        );
+        assert!(!screen.follow());
+        term.draw(|f| screen.render(f, f.area())).unwrap();
+        assert_eq!(screen.last_top, bottom - MOUSE_SCROLL_LINES);
+        screen.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        term.draw(|f| screen.render(f, f.area())).unwrap();
+        assert_eq!(screen.last_top, bottom);
     }
 
     #[test]

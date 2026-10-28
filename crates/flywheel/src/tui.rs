@@ -986,18 +986,66 @@ pub fn build_dashboard(
         .with_daemons(daemons)
 }
 
-/// Restores the terminal on drop so a panic inside the loop never leaves
-/// the operator's shell in raw / alternate-screen mode.
-struct TerminalGuard;
+/// Undo everything [`run_terminal`] set up: mouse capture, the alternate
+/// screen, the hidden cursor, and raw mode. Idempotent and best-effort, so
+/// both the drop guard and the panic hook may call it.
+pub fn restore_terminal() {
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// The panic hook in force while the console owns the terminal.
+type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+/// Compose `restore` in front of `previous`: the terminal is handed back
+/// (alternate screen left, raw mode and mouse capture off) *before* the
+/// previous hook prints the panic, so the message lands on the operator's
+/// normal screen instead of vanishing with the alternate one.
+pub fn restoring_panic_hook(
+    restore: Arc<dyn Fn() + Send + Sync + 'static>,
+    previous: PanicHook,
+) -> Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static> {
+    Box::new(move |info| {
+        restore();
+        previous(info);
+    })
+}
+
+/// Restores the terminal (and the process's prior panic hook) on drop, so
+/// neither an error return nor a panic unwinding out of the loop leaves the
+/// operator's shell in raw / alternate-screen / mouse-capture mode.
+struct TerminalGuard {
+    previous_hook: PanicHook,
+}
+
+impl TerminalGuard {
+    /// Install the restoring panic hook in front of the current one.
+    fn install() -> Self {
+        let previous_hook: PanicHook = Arc::from(std::panic::take_hook());
+        std::panic::set_hook(restoring_panic_hook(
+            Arc::new(restore_terminal),
+            Arc::clone(&previous_hook),
+        ));
+        Self { previous_hook }
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen,
-            crossterm::cursor::Show
-        );
+        restore_terminal();
+        // Hand the process its prior hook back (not while panicking: the
+        // hook has already run and swapping it mid-unwind would itself
+        // panic).
+        if !std::thread::panicking() {
+            let previous = Arc::clone(&self.previous_hook);
+            let _ = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| previous(info)));
+        }
     }
 }
 
@@ -1012,10 +1060,11 @@ pub fn run_terminal(app: &mut DashboardApp) -> i32 {
         eprintln!("fw: cannot enable raw mode on this terminal");
         return 2;
     }
-    let _guard = TerminalGuard;
+    let _guard = TerminalGuard::install();
     if crossterm::execute!(
         std::io::stdout(),
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
         crossterm::cursor::Hide
     )
     .is_err()
@@ -1043,6 +1092,7 @@ pub fn run_terminal(app: &mut DashboardApp) -> i32 {
         match crossterm::event::poll(wait) {
             Ok(true) => match crossterm::event::read() {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => app.handle_key(key),
+                Ok(Event::Mouse(mouse)) => app.handle_mouse(mouse),
                 Ok(_) => {}
                 Err(_) => return 2,
             },
@@ -1347,6 +1397,25 @@ mod tests {
         control.detach(DAEMON_WORKER);
         assert_eq!(control.death_reason(DAEMON_WORKER), None);
         assert_eq!(DaemonState::DeadAfterBudget.as_str(), "dead_after_budget");
+    }
+
+    #[test]
+    fn panic_hook_restores_the_terminal_before_reporting() {
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let restore_log = Arc::clone(&order);
+        let report_log = Arc::clone(&order);
+        let hook = restoring_panic_hook(
+            Arc::new(move || restore_log.lock().unwrap().push("restore")),
+            Arc::new(move |_info: &std::panic::PanicHookInfo<'_>| {
+                report_log.lock().unwrap().push("report");
+            }),
+        );
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(hook);
+        let outcome = std::panic::catch_unwind(|| panic!("console blew up"));
+        std::panic::set_hook(previous);
+        assert!(outcome.is_err());
+        assert_eq!(*order.lock().unwrap(), vec!["restore", "report"]);
     }
 
     #[test]

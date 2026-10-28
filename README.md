@@ -4,18 +4,23 @@ An orchestration loop for AI coding agents: the agent is the brain, flywheel is 
 
 ## Quickstart
 
-Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
+Install (gives `flywheel` and its alias `fw`):
 
 ```bash
-uv sync                        # install all workspace packages
-uv run flywheel init           # scaffold .flywheel/, a work policy, and the SDD skills
-export ANTHROPIC_API_KEY=...   # or run `claude login` — authenticate the agent first
-uv run flywheel worker --once  # claim one task, run it, exit
-uv run flywheel                # operator console (alias: fw)
-scripts/check.sh               # full CI gate: ruff, pyright, pytest (quiet on success)
+cargo install --git https://github.com/johnayoung/flywheel flywheel   # Rust 1.91+
+cargo install --path crates/flywheel                                   # or from a checkout
 ```
 
-The worker drives the Claude agent, so authenticate it before the first run: set `ANTHROPIC_API_KEY` or run `claude login`. Without it the first worker run fails when the agent SDK cannot authenticate.
+Prebuilt binaries (linux x86_64/aarch64, macOS x86_64/aarch64) are attached to each [GitHub Release](https://github.com/johnayoung/flywheel/releases).
+
+```bash
+flywheel init           # scaffold .flywheel/, a work policy, and the SDD skills
+claude login            # or export ANTHROPIC_API_KEY=... -- authenticate the agent CLI first
+flywheel worker --once  # claim one task, run it, exit
+flywheel                # operator console (alias: fw)
+```
+
+The worker drives the agent through its CLI (`claude`, or `codex` via `[agent]`), so the CLI must be on `PATH` and authenticated before the first run.
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).
 
@@ -39,17 +44,20 @@ Each task runs in its own git worktree on a `flywheel/<phase>/<task-id>` branch.
 
 Either way the work itself is never trusted blind: agent claims feed verification, graders gate the landing, and a `[submit] protected_paths` list keeps a task from rewriting the verification surface (grader config, CI) it is judged by. The worker never commits to your branch directly.
 
-## Packages
+## Crates
 
-A uv workspace of five packages under `packages/`. Dependencies point one way only — core imports nothing downstream.
+A Cargo workspace of six crates under `crates/`. Dependencies point one way only — core imports nothing downstream.
 
-| Package | Role |
+| Crate | Role |
 | --- | --- |
-| `flywheel-core` | Lifecycle of a single task: invoke, validate envelopes, verify via graders, record attempts, retry. The agent SDK is an optional extra (`flywheel-core[claude]`); the data and lifecycle surface need no SDK. |
+| `flywheel-agents` | Multi-agent execution layer below core: adapters (Claude Code stream-json, Codex), normalized events, execution hosts. Depends on no other flywheel crate. |
+| `flywheel-core` | Lifecycle of a single task: invoke, validate envelopes, verify via graders, record attempts, retry. |
 | `flywheel-orchestrator` | Drives many tasks on top of core: prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon, and the `SubmitStrategy` landing seam. |
 | `flywheel-worktree` | Git-worktree landing strategies — FF-merge (default) or pull request — plus the worker daemon. |
-| `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. SDK-free; activated via `[sandbox] backend = "container"`. |
-| `flywheel` | The `flywheel` / `fw` shell: verb router and operator console. Bundles the Claude agent SDK and the container backend. |
+| `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. Activated via `[sandbox] backend = "container"`. |
+| `flywheel` | The `flywheel` / `fw` binaries: verb router and operator console. Bundles the container backend. |
+
+Development: `scripts/check.sh` runs the full CI gate (rustfmt, clippy, cargo test; quiet on success). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Docs
 

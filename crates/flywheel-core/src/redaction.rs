@@ -1507,7 +1507,12 @@ mod tests {
     /// One normalized agent event exactly as the Rust adapters record it:
     /// `RunTelemetry::sdk_message` over `event_to_message`, with the
     /// event's `type` as the record's message type.
-    fn recorded_event(kind: &str, native: &str, event_payload: Value, sequence: u64) -> AuditRecord {
+    fn recorded_event(
+        kind: &str,
+        native: &str,
+        event_payload: Value,
+        sequence: u64,
+    ) -> AuditRecord {
         AuditRecord::SdkMessage(SdkMessageRecord {
             run_id: "run-1".into(),
             attempt_number: 1,
@@ -1572,7 +1577,10 @@ mod tests {
             json!({"tool_use_id": "toolu_99", "is_error": false, "content": "cat output"}),
             5,
         ));
-        assert_eq!(payload(&orphan)["payload"]["content"], "[REDACTED:tool:unknown]");
+        assert_eq!(
+            payload(&orphan)["payload"]["content"],
+            "[REDACTED:tool:unknown]"
+        );
         // The approval request carries the input both flat and in `detail`.
         let approval = redactor.redact(&recorded_event(
             "approval.requested",
@@ -1588,7 +1596,10 @@ mod tests {
         ));
         let approval = payload(&approval);
         assert_eq!(approval["payload"]["tool_input"], "[REDACTED:tool:Bash]");
-        assert_eq!(approval["payload"]["detail"]["input"], "[REDACTED:tool:Bash]");
+        assert_eq!(
+            approval["payload"]["detail"]["input"],
+            "[REDACTED:tool:Bash]"
+        );
         assert_eq!(approval["payload"]["tool_name"], "Bash");
     }
 

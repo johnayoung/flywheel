@@ -10,8 +10,8 @@
 // args (all optional except a way to name the two variants):
 //   Convenience for a skill template change:
 //     { skill: "fw-plan", oldRef: "HEAD~1" }
-//       -> A = `git show <oldRef>:_skill_templates/<skill>.md`  (default oldRef HEAD)
-//          B = the working-tree _skill_templates/<skill>.md
+//       -> A = `git show <oldRef>:crates/flywheel-orchestrator/skill_templates/<skill>.md`  (default oldRef HEAD)
+//          B = the working-tree crates/flywheel-orchestrator/skill_templates/<skill>.md
 //   Explicit variants (any artifact):
 //     { a: { label, source }, b: { label, source }, task: "what the artifact does" }
 //       source is one of: { git: "REF:PATH" } | { file: "PATH" } | { text: "<inline>" }
@@ -43,7 +43,7 @@ export const meta = {
 }
 
 const A = args || {}
-const SKILL_DIR = 'packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/'
+const SKILL_DIR = 'crates/flywheel-orchestrator/skill_templates/'
 
 function resolveVariants() {
   if (A.skill) {

@@ -69,9 +69,7 @@ use crate::store_memory::{
 use crate::task::{GraderType, Task};
 
 /// The canonical DDL, embedded verbatim from its single source of truth.
-pub const SCHEMA_SQL: &str = include_str!(
-    "../../../packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql"
-);
+pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema.sql");
 
 /// Append-only enforcement on `grader_results`. Applied post-bootstrap so
 /// the canonical schema file is unchanged; `IF NOT EXISTS` makes the

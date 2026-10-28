@@ -6,7 +6,7 @@
 //! or network IO; durable persistence lives in [`crate::store_sqlite`].
 //!
 //! Storage follows the table boundaries in
-//! `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql`:
+//! `crates/flywheel-core/schema/persistence-schema.sql`:
 //!
 //! * `lifecycles` is keyed by `run_id` and holds the row state with no
 //!   attempts attached; `attempts` are populated on read by joining the

@@ -87,9 +87,7 @@ use crate::task::{GraderType, Task};
 
 /// The canonical Postgres DDL, embedded verbatim from its single source of
 /// truth.
-pub const SCHEMA_SQL: &str = include_str!(
-    "../../../packages/flywheel-core/src/flywheel_core/_schema/persistence-schema-postgres.sql"
-);
+pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema-postgres.sql");
 
 /// Indexes for the store's own access patterns that the canonical DDL does
 /// not declare. Postgres does not index foreign-key columns automatically, so

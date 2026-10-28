@@ -67,15 +67,11 @@ pub const DEFAULT_SKILLS_ROOT: &str = ".claude/skills";
 const DEFAULT_TASKS_DIR: &str = ".flywheel/tasks";
 const DEFAULT_DB_PATH: &str = ".flywheel/flywheel.sqlite";
 
-/// The skill templates, embedded from the single shipped copy under the
-/// Python package's `_skill_templates/` directory so the two
-/// implementations can never drift.
+/// The skill templates, embedded at build time from the single canonical
+/// copy under this crate's `skill_templates/` directory.
 macro_rules! skill_template {
     ($file:literal) => {
-        include_str!(concat!(
-            "../../../packages/flywheel-orchestrator/src/flywheel_orchestrator/_skill_templates/",
-            $file
-        ))
+        include_str!(concat!("../skill_templates/", $file))
     };
 }
 

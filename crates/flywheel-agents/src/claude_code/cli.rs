@@ -135,6 +135,10 @@ pub fn select_project_mcp_servers(
     Ok(selected)
 }
 
+/// The CLI's `--permission-prompt-tool` value that delivers permission
+/// prompts to the host as `can_use_tool` control requests.
+pub const PERMISSION_PROMPT_TOOL_STDIO: &str = "stdio";
+
 /// Build the headless stream-json invocation for one run.
 pub fn build_cli_plan(request: &RunRequest) -> Result<ProcessPlan, AgentError> {
     let cfg = &request.configuration;
@@ -165,6 +169,19 @@ pub fn build_cli_plan(request: &RunRequest) -> Result<ProcessPlan, AgentError> {
             let mode = permission_mode_for(policy)?;
             argv.extend(["--permission-mode".to_string(), mode.to_string()]);
         }
+    }
+    // Route permission prompts over the stream-json control protocol as
+    // inbound `can_use_tool` requests, answered by the run's approval
+    // resolver (the caller's, else the default deny-all). Without this flag
+    // the CLI never sends `can_use_tool` and decides prompts itself, so the
+    // resolver would be inert. The agent SDK sets the same value whenever
+    // its `can_use_tool` callback is installed. Text input closes stdin, so
+    // there is no channel to answer on and the CLI keeps its own default.
+    if input_mode == InputMode::StreamJson {
+        argv.extend([
+            "--permission-prompt-tool".to_string(),
+            PERMISSION_PROMPT_TOOL_STDIO.to_string(),
+        ]);
     }
     argv.extend([
         "--add-dir".to_string(),

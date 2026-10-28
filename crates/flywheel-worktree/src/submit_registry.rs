@@ -450,6 +450,9 @@ mod tests {
         assert_eq!(sub.setup_command.as_deref(), Some("echo setup"));
         assert!(sub.verify_command.is_none());
         assert_eq!(sub.recovery_agent_max_turns, 0);
+        // The disk/inode preflight is default-on in front of the ledger
+        // append, matching the Python worker's bare-construction default.
+        assert!(sub.ledger_guard.is_some());
         drop(strategy);
     }
 

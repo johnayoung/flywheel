@@ -1801,10 +1801,10 @@ mod tests {
         f.done("t1", "run-t1");
         // Record the base, then land a watched schema change past it.
         assert!(write_phase_base_if_missing(&f.repo, &phase));
-        fs::create_dir_all(f.repo.join("pkg/_schema")).unwrap();
+        fs::create_dir_all(f.repo.join("pkg/schema")).unwrap();
         commit(
             &f.repo,
-            "pkg/_schema/x.sql",
+            "pkg/schema/x.sql",
             "CREATE TABLE foo (id INTEGER);\n",
             "schema",
         );
@@ -1858,7 +1858,7 @@ mod tests {
         assert!(write_phase_base_if_missing(&f.repo, &phase2));
         commit(
             &f.repo,
-            "pkg/_schema/y.sql",
+            "pkg/schema/y.sql",
             "CREATE TABLE bar (id INTEGER);\n",
             "schema 2",
         );

@@ -62,8 +62,11 @@ pub const OWNER_LABEL_SELECTOR: &str = "label=flywheel.owner";
 // startup reap must remove only containers whose owning process is provably
 // dead, so every container also records who started it: the host name, the
 // pid, and (on Linux) the process start time, which guards against a recycled
-// pid. A container from another host is never reaped -- its owner's liveness
-// cannot be observed from here. A legacy container carrying the presence
+// pid. Liveness is only observable inside the owner's pid namespace, so the
+// namespace identity (`/proc/self/ns/pid`) is recorded too: a container from
+// another host, or from another pid namespace on the same host (a sibling
+// WSL2 distro or a containerised worker sharing the daemon and the host
+// name), is never reaped -- its owner's liveness cannot be observed from here. A legacy container carrying the presence
 // marker but no owner identity (started before these labels existed) is
 // reaped as before.
 
@@ -74,6 +77,9 @@ pub const OWNER_PID_LABEL: &str = "flywheel.owner-pid";
 /// Label: the owning process's start time (`/proc/<pid>/stat` field 22, in
 /// clock ticks since boot); absent where `/proc` is unavailable.
 pub const OWNER_START_LABEL: &str = "flywheel.owner-start";
+/// Label: the owning process's pid namespace (`/proc/self/ns/pid` link
+/// target, e.g. `pid:[4026531836]`); absent where `/proc` is unavailable.
+pub const OWNER_PIDNS_LABEL: &str = "flywheel.owner-pidns";
 
 /// Who started a container: host, pid, and (when observable) start time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +87,7 @@ pub struct OwnerIdentity {
     pub host: String,
     pub pid: u32,
     pub start: Option<String>,
+    pub pid_namespace: Option<String>,
 }
 
 impl OwnerIdentity {
@@ -91,6 +98,7 @@ impl OwnerIdentity {
             host: local_hostname(),
             pid,
             start: process_start_time(pid),
+            pid_namespace: local_pid_namespace(),
         }
     }
 
@@ -102,6 +110,9 @@ impl OwnerIdentity {
         ]);
         if let Some(start) = &self.start {
             labels.insert(OWNER_START_LABEL.to_owned(), start.clone());
+        }
+        if let Some(namespace) = &self.pid_namespace {
+            labels.insert(OWNER_PIDNS_LABEL.to_owned(), namespace.clone());
         }
         labels
     }
@@ -118,6 +129,14 @@ pub fn local_hostname() -> String {
     }
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// This process's pid namespace identity (the `/proc/self/ns/pid` link
+/// target); `None` where `/proc` is unavailable (macOS).
+pub fn local_pid_namespace() -> Option<String> {
+    std::fs::read_link("/proc/self/ns/pid")
+        .ok()
+        .map(|target| target.to_string_lossy().into_owned())
 }
 
 /// A process's start time: field 22 of `/proc/<pid>/stat`, read after the
@@ -153,25 +172,28 @@ pub struct OwnedContainer {
     pub owner_host: String,
     pub owner_pid: String,
     pub owner_start: String,
+    pub owner_pid_namespace: String,
 }
 
 impl OwnedContainer {
     /// Whether the startup reap may remove this container, judged from
-    /// `local_host`: a legacy container without owner labels is reapable;
-    /// a container from another host never is; otherwise it is reapable
+    /// `local_host` / `local_pid_namespace` (empty where unobservable): a
+    /// legacy container without owner labels is reapable; a container from
+    /// another host or another pid namespace never is; otherwise it is reapable
     /// only when its owner is provably dead -- the pid is not alive, or the
     /// recorded start time no longer matches the live process (a recycled
     /// pid). Unparseable owner labels are not proof of death, so they keep.
     pub fn owner_is_dead(
         &self,
         local_host: &str,
+        local_pid_namespace: &str,
         alive: &dyn Fn(u32) -> bool,
         start_of: &dyn Fn(u32) -> Option<String>,
     ) -> bool {
         if self.owner_host.is_empty() && self.owner_pid.is_empty() {
             return true;
         }
-        if self.owner_host != local_host {
+        if self.owner_host != local_host || self.owner_pid_namespace != local_pid_namespace {
             return false;
         }
         let Ok(pid) = self.owner_pid.parse::<u32>() else {
@@ -732,11 +754,14 @@ impl Docker {
             .labels
             .entry(OWNER_LABEL.to_owned())
             .or_insert_with(|| OWNER_LABEL_VALUE.to_owned());
-        // The owner identity the startup reap judges liveness by. A caller
-        // that supplies its own (a supervisor starting on a child's behalf)
-        // keeps it.
-        for (key, value) in OwnerIdentity::current().labels() {
-            labelled.labels.entry(key).or_insert(value);
+        // The owner identity the startup reap judges liveness by, stamped as
+        // a unit: a caller that supplies any owner label (a supervisor
+        // starting on a child's behalf) keeps its own set untouched, so this
+        // process's start time or namespace is never mixed into another
+        // process's identity.
+        let identity = OwnerIdentity::current().labels();
+        if !identity.keys().any(|key| labelled.labels.contains_key(key)) {
+            labelled.labels.extend(identity);
         }
         let out = self.run(build_run_argv(&labelled), timeout)?;
         Ok(out.trim().to_owned())
@@ -973,7 +998,7 @@ impl Docker {
         timeout: Option<Duration>,
     ) -> Result<Vec<OwnedContainer>, DockerError> {
         let format = format!(
-            "{{{{.Names}}}}\t{{{{.Label \"{OWNER_HOST_LABEL}\"}}}}\t{{{{.Label \"{OWNER_PID_LABEL}\"}}}}\t{{{{.Label \"{OWNER_START_LABEL}\"}}}}"
+            "{{{{.Names}}}}\t{{{{.Label \"{OWNER_HOST_LABEL}\"}}}}\t{{{{.Label \"{OWNER_PID_LABEL}\"}}}}\t{{{{.Label \"{OWNER_START_LABEL}\"}}}}\t{{{{.Label \"{OWNER_PIDNS_LABEL}\"}}}}"
         );
         let argv = vec![
             "docker".to_owned(),
@@ -998,6 +1023,7 @@ impl Docker {
                     owner_host: next(),
                     owner_pid: next(),
                     owner_start: next(),
+                    owner_pid_namespace: next(),
                 })
             })
             .collect())
@@ -1028,10 +1054,16 @@ impl Docker {
         timeout: Option<Duration>,
     ) -> Result<Vec<String>, DockerError> {
         let local_host = local_hostname();
+        let local_namespace = local_pid_namespace().unwrap_or_default();
         let mut reaped = Vec::new();
         for container in self.list_owned_container_owners(timeout)? {
             if active.contains(&container.name)
-                || !container.owner_is_dead(&local_host, &pid_alive, &process_start_time)
+                || !container.owner_is_dead(
+                    &local_host,
+                    &local_namespace,
+                    &pid_alive,
+                    &process_start_time,
+                )
             {
                 continue;
             }
@@ -1680,14 +1712,16 @@ mod tests {
         let host = local_hostname();
         let me = std::process::id();
         let my_start = process_start_time(me).unwrap_or_default();
+        let ns = local_pid_namespace().unwrap_or_default();
         let dead = dead_pid();
         let listing = [
-            "keep-legacy-active\t\t\t".to_owned(),
-            "reap-legacy\t\t\t".to_owned(),
-            format!("keep-other-host\t{host}-elsewhere\t{dead}\t"),
-            format!("reap-dead-owner\t{host}\t{dead}\t"),
-            format!("keep-live-owner\t{host}\t{me}\t{my_start}"),
-            format!("keep-garbled-pid\t{host}\tnot-a-pid\t"),
+            "keep-legacy-active\t\t\t\t".to_owned(),
+            "reap-legacy\t\t\t\t".to_owned(),
+            format!("keep-other-host\t{host}-elsewhere\t{dead}\t\t{ns}"),
+            format!("keep-other-pidns\t{host}\t{dead}\t\tpid:[1]{ns}"),
+            format!("reap-dead-owner\t{host}\t{dead}\t\t{ns}"),
+            format!("keep-live-owner\t{host}\t{me}\t{my_start}\t{ns}"),
+            format!("keep-garbled-pid\t{host}\tnot-a-pid\t\t{ns}"),
         ];
         let listing_file = dir.path().join("ps.out");
         std::fs::write(&listing_file, listing.join("\n") + "\n").unwrap();
@@ -1718,22 +1752,32 @@ mod tests {
             owner_host: host.to_owned(),
             owner_pid: pid.to_owned(),
             owner_start: start.to_owned(),
+            owner_pid_namespace: if host.is_empty() {
+                String::new()
+            } else {
+                "ns".to_owned()
+            },
         };
         let alive = |pid: u32| pid == 42;
         let start_of = |pid: u32| (pid == 42).then(|| "1000".to_owned());
         // Legacy: no owner identity at all.
-        assert!(container("", "", "").owner_is_dead("h", &alive, &start_of));
+        assert!(container("", "", "").owner_is_dead("h", "ns", &alive, &start_of));
         // Another host: never provably dead from here.
-        assert!(!container("other", "7", "").owner_is_dead("h", &alive, &start_of));
+        assert!(!container("other", "7", "").owner_is_dead("h", "ns", &alive, &start_of));
         // Same host, dead pid.
-        assert!(container("h", "7", "").owner_is_dead("h", &alive, &start_of));
+        assert!(container("h", "7", "").owner_is_dead("h", "ns", &alive, &start_of));
         // Same host, live pid, matching or unrecorded start time.
-        assert!(!container("h", "42", "1000").owner_is_dead("h", &alive, &start_of));
-        assert!(!container("h", "42", "").owner_is_dead("h", &alive, &start_of));
+        assert!(!container("h", "42", "1000").owner_is_dead("h", "ns", &alive, &start_of));
+        assert!(!container("h", "42", "").owner_is_dead("h", "ns", &alive, &start_of));
         // Same host, live pid, different start time: the pid was recycled.
-        assert!(container("h", "42", "999").owner_is_dead("h", &alive, &start_of));
+        assert!(container("h", "42", "999").owner_is_dead("h", "ns", &alive, &start_of));
+        // Same host, another pid namespace (sibling WSL2 distro, containerised
+        // worker): never provably dead from here, even with a dead-looking pid.
+        let mut foreign_ns = container("h", "7", "");
+        foreign_ns.owner_pid_namespace = "other-ns".to_owned();
+        assert!(!foreign_ns.owner_is_dead("h", "ns", &alive, &start_of));
         // Unparseable pid is not proof of death.
-        assert!(!container("h", "x", "").owner_is_dead("h", &alive, &start_of));
+        assert!(!container("h", "x", "").owner_is_dead("h", "ns", &alive, &start_of));
     }
 
     #[test]
@@ -1753,6 +1797,9 @@ mod tests {
         let labels = me.labels();
         assert_eq!(labels[OWNER_PID_LABEL], me.pid.to_string());
         assert_eq!(labels[OWNER_HOST_LABEL], me.host);
+        if std::path::Path::new("/proc/self/ns/pid").exists() {
+            assert!(labels[OWNER_PIDNS_LABEL].starts_with("pid:["));
+        }
     }
 
     #[test]
@@ -2143,6 +2190,7 @@ mod tests {
                 host: host.clone(),
                 pid,
                 start,
+                pid_namespace: local_pid_namespace(),
             }
             .labels()
         };
@@ -2180,8 +2228,12 @@ mod tests {
             .map(|c| c.name.clone())
             .filter(|n| !test_names.contains(&n))
             .collect();
+        // A concurrent run's container whose owner died after the listing
+        // may legitimately be reaped too, so assert on this test's own three.
         let reaped = docker.reap_orphan_containers(&active, timeout).unwrap();
-        assert_eq!(reaped, vec![dead_owner.clone()]);
+        assert!(reaped.contains(&dead_owner), "{reaped:?}");
+        assert!(!reaped.contains(&live_foreign), "{reaped:?}");
+        assert!(!reaped.contains(&mine), "{reaped:?}");
         let remaining = docker.list_owned_containers(timeout).unwrap();
         assert!(remaining.contains(&live_foreign));
         assert!(remaining.contains(&mine));

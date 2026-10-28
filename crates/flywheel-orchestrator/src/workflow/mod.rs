@@ -58,7 +58,7 @@ pub use args::{
 pub use init::{
     InitHost, ProductionInitHost, PromptError, cmd_init, cmd_init_agent, render_init_policy,
 };
-pub use live::{LiveRunRow, cmd_live, collect_live_rows, format_live_line};
+pub use live::{LiveRunRow, cmd_live, cmd_live_until, collect_live_rows, format_live_line};
 pub use ops::{
     cmd_recheck_blocked, cmd_recover, cmd_resolve, format_recheck_line, recover_stranded_lifecycles,
 };

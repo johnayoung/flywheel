@@ -34,6 +34,7 @@ toml.workspace = true
 clap.workspace = true
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

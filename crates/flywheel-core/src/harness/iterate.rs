@@ -6,8 +6,8 @@
 use super::state::{AttemptError, Run, object, wait_shutdown};
 use super::telemetry::RunTelemetry;
 use super::{HarnessConfig, InvokeFn, RecoveryState};
-use crate::agents_invoke::{InvocationObservers, InvocationRequest};
-use crate::deadline::run_with_deadline;
+use crate::agents_invoke::{InvocationAbort, InvocationObservers, InvocationRequest, InvokeFuture};
+use crate::deadline::Deadline;
 use crate::deadline_config::DeadlineClass;
 use crate::envelope::{EnvelopeResult, Intent};
 use crate::event_serde::format_timestamp;
@@ -24,6 +24,7 @@ use crate::prompt::{IterationInputs, build_iteration_prompt};
 use crate::store::{AttemptStore, JsonObject};
 use crate::task::{Grader, Task, TranscriptGrader};
 use chrono::{DateTime, Utc};
+use flywheel_agents::hosts::DEFAULT_KILL_GRACE;
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -402,75 +403,48 @@ impl ThresholdChecker {
     }
 }
 
-/// Race `invoker(request)` against the inter-message hang watchdog.
+/// How long the harness waits, after aborting an invocation, for the
+/// invoker to report its agent terminated: the runtime's SIGTERM-to-SIGKILL
+/// grace plus slack for the SIGKILL sweep and the reap. Past it the
+/// invocation is dropped; the agent's process-group handle still SIGKILLs
+/// the group on drop.
+pub const INVOCATION_TEARDOWN_SECONDS: f64 = DEFAULT_KILL_GRACE.as_secs_f64() * 2.0;
+
+/// Stop an in-flight invocation and wait for its agent to die.
 ///
-/// Any observed message resets the timer (the watchdog wraps the
-/// per-message observer, so a rate-limit notice or a thinking block counts
-/// as liveness). On silence past `hang_timeout` the invocation is dropped
-/// (cancelled), `harness.hang_detected` is emitted, and
-/// [`AttemptError::Hang`] returned. A completed invocation always wins the
-/// race.
-async fn invoke_with_watchdog(
-    run: &Run,
-    invoker: &InvokeFn,
-    mut request: InvocationRequest,
-    hang_timeout: f64,
-    attempt_number: u32,
-    iteration_number: u32,
-) -> Result<IterationResult, AttemptError> {
-    let last_activity = Arc::new(Mutex::new(run.monotonic()));
-    let base = request.observers.on_message.take();
-    let mclock = run.mclock.clone();
-    let heartbeat = last_activity.clone();
-    request.observers.on_message = Some(Arc::new(move |msg: &Value| {
-        if let Ok(mut slot) = heartbeat.lock() {
-            *slot = mclock();
-        }
-        if let Some(base) = &base {
-            base(msg);
-        }
-    }));
-    let tick = (hang_timeout / 4.0).clamp(
-        HANG_WATCHDOG_MIN_TICK_SECONDS,
-        HANG_WATCHDOG_MAX_TICK_SECONDS,
-    );
-    let mut invocation = invoker(request);
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut invocation => return Ok(result),
-            _ = tokio::time::sleep(Duration::from_secs_f64(tick)) => {
-                let last = last_activity.lock().map(|s| *s).unwrap_or(0.0);
-                let silence = run.monotonic() - last;
-                if silence > hang_timeout {
-                    drop(invocation);
-                    run.telemetry.emit(
-                        "harness.hang_detected",
-                        object(json!({
-                            "iteration": iteration_number,
-                            "hang_timeout_seconds": hang_timeout,
-                            "silence_seconds": silence,
-                        })),
-                        Some(attempt_number),
-                        None,
-                    );
-                    return Err(AttemptError::Hang {
-                        timeout_seconds: hang_timeout,
-                        silence_seconds: silence,
-                    });
-                }
-            }
-        }
+/// Python awaited `agent.cancel(); agent.wait()` before propagating a
+/// hang, deadline, or interrupt; dropping the future would only *request*
+/// cancellation and leave the teardown running detached, so a retry could
+/// spawn a new agent into the same worktree beside the old one. An invoker
+/// that bound `abort` resolves once its agent is terminated and reaped;
+/// one that did not owns no process and is dropped straight away.
+async fn stop_invocation(invocation: InvokeFuture, abort: &InvocationAbort) {
+    abort.abort();
+    if abort.is_bound() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs_f64(INVOCATION_TEARDOWN_SECONDS),
+            invocation,
+        )
+        .await;
     }
 }
 
-/// One bounded invocation: the hang watchdog (when enabled) inside the
-/// wall-clock agent-iteration deadline (when bounded), the whole thing
-/// raced against the operator shutdown signal.
+/// One bounded invocation: the inter-message hang watchdog (when enabled)
+/// and the wall-clock agent-iteration deadline (when bounded), raced
+/// against the operator shutdown signal.
+///
+/// Any observed message resets the hang timer (the watchdog wraps the
+/// per-message observer, so a rate-limit notice or a thinking block counts
+/// as liveness). On silence past `hang_timeout` `harness.hang_detected` is
+/// emitted and [`AttemptError::Hang`] returned; past the deadline
+/// `harness.deadline_exceeded` and [`AttemptError::Deadline`]; on shutdown
+/// [`AttemptError::Interrupted`]. Each of the three first stops the
+/// invocation and waits for its agent to terminate ([`stop_invocation`]).
+/// A completed invocation always wins the race.
 async fn run_invocation(
     run: &Run,
     invoker: &InvokeFn,
-    request: InvocationRequest,
+    mut request: InvocationRequest,
     hang_timeout: Option<f64>,
     agent_ceiling: Option<f64>,
     attempt_number: u32,
@@ -483,53 +457,94 @@ async fn run_invocation(
     {
         return Err(AttemptError::Interrupted);
     }
-    let guarded = async {
-        match hang_timeout {
-            Some(timeout) if timeout > 0.0 => {
-                invoke_with_watchdog(
-                    run,
-                    invoker,
-                    request,
-                    timeout,
-                    attempt_number,
-                    iteration_number,
-                )
-                .await
+    let hang_timeout = hang_timeout.filter(|timeout| *timeout > 0.0);
+    let last_activity = Arc::new(Mutex::new(run.monotonic()));
+    if hang_timeout.is_some() {
+        let base = request.observers.on_message.take();
+        let mclock = run.mclock.clone();
+        let heartbeat = last_activity.clone();
+        request.observers.on_message = Some(Arc::new(move |msg: &Value| {
+            if let Ok(mut slot) = heartbeat.lock() {
+                *slot = mclock();
             }
-            _ => Ok(invoker(request).await),
+            if let Some(base) = &base {
+                base(msg);
+            }
+        }));
+    }
+    let tick = hang_timeout.map(|timeout| {
+        Duration::from_secs_f64((timeout / 4.0).clamp(
+            HANG_WATCHDOG_MIN_TICK_SECONDS,
+            HANG_WATCHDOG_MAX_TICK_SECONDS,
+        ))
+    });
+    let abort = InvocationAbort::new();
+    request.abort = Some(abort.clone());
+    let deadline = Deadline::from_ceiling(agent_ceiling.map(Duration::from_secs_f64));
+    let deadline_sleep = async {
+        match deadline.remaining() {
+            Some(remaining) => tokio::time::sleep(remaining).await,
+            None => std::future::pending::<()>().await,
         }
     };
-    let bounded = async {
-        match agent_ceiling {
-            None => guarded.await,
-            Some(ceiling) => {
-                match run_with_deadline(guarded, Duration::from_secs_f64(ceiling)).await {
-                    Ok(outcome) => outcome,
-                    Err(exceeded) => {
-                        run.telemetry.emit(
-                            "harness.deadline_exceeded",
-                            object(json!({
-                                "iteration": iteration_number,
-                                "deadline_class": DeadlineClass::AgentIteration.as_str(),
-                                "ceiling_seconds": ceiling,
-                                "elapsed_seconds": exceeded.elapsed_seconds(),
-                            })),
-                            Some(attempt_number),
-                            None,
-                        );
-                        Err(AttemptError::Deadline {
-                            ceiling_seconds: ceiling,
-                            elapsed_seconds: exceeded.elapsed_seconds(),
-                        })
-                    }
+    tokio::pin!(deadline_sleep);
+    let mut invocation = invoker(request);
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut invocation => return Ok(result),
+            _ = &mut deadline_sleep => {
+                let ceiling = agent_ceiling.unwrap_or_default();
+                let elapsed = deadline.elapsed().as_secs_f64();
+                run.telemetry.emit(
+                    "harness.deadline_exceeded",
+                    object(json!({
+                        "iteration": iteration_number,
+                        "deadline_class": DeadlineClass::AgentIteration.as_str(),
+                        "ceiling_seconds": ceiling,
+                        "elapsed_seconds": elapsed,
+                    })),
+                    Some(attempt_number),
+                    None,
+                );
+                stop_invocation(invocation, &abort).await;
+                return Err(AttemptError::Deadline {
+                    ceiling_seconds: ceiling,
+                    elapsed_seconds: elapsed,
+                });
+            }
+            _ = async {
+                match tick {
+                    Some(tick) => tokio::time::sleep(tick).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let Some(hang_timeout) = hang_timeout else { continue };
+                let last = last_activity.lock().map(|s| *s).unwrap_or(0.0);
+                let silence = run.monotonic() - last;
+                if silence > hang_timeout {
+                    run.telemetry.emit(
+                        "harness.hang_detected",
+                        object(json!({
+                            "iteration": iteration_number,
+                            "hang_timeout_seconds": hang_timeout,
+                            "silence_seconds": silence,
+                        })),
+                        Some(attempt_number),
+                        None,
+                    );
+                    stop_invocation(invocation, &abort).await;
+                    return Err(AttemptError::Hang {
+                        timeout_seconds: hang_timeout,
+                        silence_seconds: silence,
+                    });
                 }
             }
+            _ = wait_shutdown(run.shutdown.as_ref()) => {
+                stop_invocation(invocation, &abort).await;
+                return Err(AttemptError::Interrupted);
+            }
         }
-    };
-    tokio::select! {
-        biased;
-        outcome = bounded => outcome,
-        _ = wait_shutdown(run.shutdown.as_ref()) => Err(AttemptError::Interrupted),
     }
 }
 
@@ -692,6 +707,7 @@ pub(super) async fn drive_iterations(
             checkpoint_nudge_seconds: Some(config.checkpoint_nudge_seconds),
             agent_iteration_ceiling_seconds: agent_ceiling,
             resume_session_id: None,
+            abort: None,
             observers: InvocationObservers {
                 on_message: Some(on_message),
                 context_observer: Some(context_observer),

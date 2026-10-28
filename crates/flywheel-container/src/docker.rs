@@ -1652,6 +1652,133 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(15));
     }
 
+    /// Whether container pid `pid` is gone (or a zombie: the alpine
+    /// `sleep infinity` pid 1 never reaps).
+    fn container_pid_gone(container: &LiveContainer, pid: &str) -> bool {
+        let probe = container.exec(
+            &format!("cat /proc/{pid}/stat 2>/dev/null || echo GONE"),
+            ExecOptions::default(),
+        );
+        let out = probe.stdout.trim();
+        out == "GONE"
+            || out
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.split_whitespace().next() == Some("Z"))
+    }
+
+    fn wait_container_pid_gone(container: &LiveContainer, pid: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if container_pid_gone(container, pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// An agent tree inside the container whose grandchild ignores SIGTERM
+    /// (an MCP server / Bash tool stand-in); returns the handle and the
+    /// grandchild's in-container pid.
+    async fn spawn_container_tree(
+        name: &str,
+    ) -> (Box<dyn flywheel_agents::RunningProcess>, String) {
+        use flywheel_agents::{DockerExecHost, ExecutionHost, ProcessPlan};
+        let host = DockerExecHost::new(name);
+        let mut process = host
+            .spawn(ProcessPlan::new(sv(&[
+                "/bin/sh",
+                "-c",
+                "(trap '' TERM; exec sleep 300) & echo $!; wait",
+            ])))
+            .await
+            .unwrap();
+        let pid = process.next_line().await.unwrap().unwrap();
+        (process, pid.trim().to_owned())
+    }
+
+    #[test]
+    fn live_docker_exec_kill_terminates_the_in_container_tree() {
+        require_docker!();
+        let _daemon = live_lock();
+        let container = LiveContainer::alpine();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut process, grandchild) = runtime.block_on(spawn_container_tree(&container.name));
+        assert!(!container_pid_gone(&container, &grandchild));
+        let started = Instant::now();
+        let exit = runtime.block_on(async {
+            process.kill(Duration::from_secs(1)).await;
+            process.wait().await
+        });
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(exit.returncode.is_some_and(|code| code != 0), "{exit:?}");
+        // Killing only the local `docker exec` client would leave the agent
+        // running in the container.
+        assert!(container_pid_gone(&container, &grandchild));
+        // The KILL sweep removed the pgid file.
+        let leftover = container.exec(
+            "ls /tmp | grep -c '^flywheel-agent-' || true",
+            ExecOptions::default(),
+        );
+        assert_eq!(leftover.stdout.trim(), "0");
+    }
+
+    #[test]
+    fn live_dropped_docker_exec_handle_terminates_the_in_container_tree() {
+        require_docker!();
+        let _daemon = live_lock();
+        let container = LiveContainer::alpine();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (process, grandchild) = runtime.block_on(spawn_container_tree(&container.name));
+        assert!(!container_pid_gone(&container, &grandchild));
+        drop(process);
+        assert!(wait_container_pid_gone(&container, &grandchild));
+    }
+
+    #[test]
+    fn live_runtime_timeout_terminates_the_in_container_agent() {
+        require_docker!();
+        let _daemon = live_lock();
+        let container = LiveContainer::alpine();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // A claude-code "agent" that announces itself, records its tree, and
+        // goes silent; the run's own timeout must stop it in the container.
+        let script = "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}'; \
+                      (trap '' TERM; exec sleep 300) & echo $! > /tmp/agent-grandchild.pid; \
+                      sleep 300";
+        let mut configuration = flywheel_agents::AgentConfiguration::new("claude-code");
+        configuration.command_override = Some(sv(&["/bin/sh", "-c", script]));
+        let request = flywheel_agents::RunRequest {
+            prompt: "p".into(),
+            working_directory: std::path::PathBuf::from("/tmp"),
+            configuration,
+            timeout_seconds: Some(1.0),
+        };
+        let host: std::sync::Arc<dyn flywheel_agents::ExecutionHost> =
+            std::sync::Arc::new(flywheel_agents::DockerExecHost::new(&container.name));
+        let run = runtime
+            .block_on(flywheel_agents::AgentRuntime::new().run(
+                request,
+                flywheel_agents::RunOptions::default().with_host(host),
+            ))
+            .unwrap();
+        assert_eq!(run.failure.as_ref().unwrap().error_type, "timeout");
+        let grandchild = container.exec("cat /tmp/agent-grandchild.pid", ExecOptions::default());
+        let grandchild = grandchild.stdout.trim().to_owned();
+        assert!(!grandchild.is_empty());
+        assert!(container_pid_gone(&container, &grandchild));
+    }
+
     #[test]
     fn live_bind_mount_uid_alignment() {
         require_docker!();

@@ -96,6 +96,68 @@ impl fmt::Debug for InvocationObservers {
     }
 }
 
+/// The harness's request to stop an in-flight invocation and the
+/// invoker's acknowledgement that it owns a process whose termination the
+/// harness must wait for.
+///
+/// Dropping an invocation future only *requests* cancellation of a run
+/// whose teardown (SIGTERM, grace, SIGKILL, reap) happens elsewhere, so a
+/// retry could otherwise start a new agent in the same worktree while the
+/// old one is still alive. Instead the harness calls [`abort`] and keeps
+/// awaiting the invocation; an invoker that [`bind`]s the handle cancels
+/// its run on abort and resolves only once the agent is gone. An invoker
+/// that never binds (a scripted test double) owns no process, so the
+/// harness drops it immediately.
+///
+/// [`abort`]: InvocationAbort::abort
+/// [`bind`]: InvocationAbort::bind
+#[derive(Debug, Clone)]
+pub struct InvocationAbort {
+    aborted: watch::Sender<bool>,
+    bound: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for InvocationAbort {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InvocationAbort {
+    pub fn new() -> Self {
+        Self {
+            aborted: watch::Sender::new(false),
+            bound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Request the invocation stop. Idempotent.
+    pub fn abort(&self) {
+        self.aborted.send_replace(true);
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        *self.aborted.borrow()
+    }
+
+    /// Resolve once [`InvocationAbort::abort`] has been called.
+    pub async fn aborted(&self) {
+        let mut rx = self.aborted.subscribe();
+        // The sender lives in `self`, so the channel cannot close here.
+        let _ = rx.wait_for(|aborted| *aborted).await;
+    }
+
+    /// Declare that this invocation drives a process the harness must
+    /// wait on after an abort.
+    pub fn bind(&self) {
+        self.bound.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.bound.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// The data handed to the harness's invoke callable for one iteration.
 ///
 /// Decoupled from the invoker so the harness can hand the transcript graders
@@ -117,6 +179,9 @@ pub struct InvocationRequest {
     /// Native session to resume; `None` starts a fresh session.
     pub resume_session_id: Option<String>,
     pub observers: InvocationObservers,
+    /// The harness's stop request for this invocation; `None` when the
+    /// caller never aborts (it awaits the invocation to completion).
+    pub abort: Option<InvocationAbort>,
 }
 
 impl InvocationRequest {
@@ -143,6 +208,10 @@ impl fmt::Debug for InvocationRequest {
             )
             .field("resume_session_id", &self.resume_session_id)
             .field("observers", &self.observers)
+            .field(
+                "abort",
+                &self.abort.as_ref().map(InvocationAbort::is_aborted),
+            )
             .finish()
     }
 }
@@ -446,6 +515,9 @@ impl AgentsInvoker {
     /// limit ends cleanly (no failure) with whatever was observed; the
     /// grader stage records the breach.
     pub async fn invoke(&self, request: InvocationRequest) -> IterationResult {
+        if let Some(abort) = &request.abort {
+            abort.bind();
+        }
         let base = self
             .run_once(
                 &request,
@@ -453,7 +525,13 @@ impl AgentsInvoker {
                 request.resume_session_id.as_deref(),
             )
             .await;
-        if !self.salvage_lost_envelope || !iteration_envelope_is_salvageable(&base) {
+        if !self.salvage_lost_envelope
+            || !iteration_envelope_is_salvageable(&base)
+            || request
+                .abort
+                .as_ref()
+                .is_some_and(InvocationAbort::is_aborted)
+        {
             return base;
         }
         let Some(session_id) = base.signals.session_id.clone() else {
@@ -493,6 +571,16 @@ impl AgentsInvoker {
             Err(err) => return startup_failure_result(&err),
         };
         let cancel = active.cancel.clone();
+        // A harness abort cancels the run; the drain below then ends and
+        // `finish` resolves only after the runtime has terminated and
+        // reaped the agent's process tree.
+        let abort_forward = request.abort.clone().map(|abort| {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                abort.aborted().await;
+                cancel.cancel();
+            })
+        });
         let (stop_tx, stop_rx) = watch::channel(false);
         let watcher = active.control.clone().map(|control| {
             let watcher = self.watcher_for(request);
@@ -504,6 +592,9 @@ impl AgentsInvoker {
             cancel.cancel();
         }
         let completed = active.finish().await;
+        if let Some(forward) = abort_forward {
+            forward.abort();
+        }
         let _ = stop_tx.send(true);
         let watcher_stop = match watcher {
             Some(handle) => handle.await.unwrap_or(WatcherStop::Finished),
@@ -849,7 +940,9 @@ pub(crate) mod test_support {
     /// control request and reports its subtype), `interrupt` (acknowledges
     /// one control request then sleeps), `crash` (exit 3), `verdict`
     /// (a RUBRIC_VERDICT naming the `--model` / `--max-turns` it received),
-    /// `handoff` (a RECOVERY_HANDOFF), `no_verdict` (prose only).
+    /// `handoff` (a RECOVERY_HANDOFF), `no_verdict` (prose only), `tree`
+    /// (records a graceful SIGTERM in `terminated.marker` and leaves a
+    /// SIGTERM-ignoring grandchild whose pid lands in `grandchild.pid`).
     pub const FAKE_CLAUDE: &str = r#"#!/bin/sh
 IFS= read -r FIRST_LINE || true
 MODEL=default; MAXT=none; PREV=""
@@ -925,6 +1018,14 @@ crash)
   text "about to crash"
   echo "fake-agent: fatal explosion" >&2
   exit 3
+  ;;
+tree)
+  init
+  trap 'echo graceful > terminated.marker; exit 143' TERM
+  (trap '' TERM; exec sleep 300) &
+  echo $! > grandchild.pid
+  sleep 60 &
+  wait $!
   ;;
 verdict)
   init

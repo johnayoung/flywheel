@@ -15,6 +15,7 @@
 use crate::BoxFuture;
 use crate::errors::AgentError;
 use crate::models::AgentExit;
+use crate::process_groups::{self, GroupRegistration};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -135,7 +136,14 @@ pub trait ExecutionHost: Send + Sync {
 }
 
 /// Shared [`RunningProcess`] implementation over a tokio child process.
+///
+/// The child leads its own process group, registered in
+/// [`crate::process_groups`] until the leader is reaped. Dropping a handle
+/// whose process was never reaped (a run future dropped mid-flight, an
+/// early return after spawn) SIGKILLs the whole group, so no MCP server or
+/// tool subprocess outlives it.
 pub struct SubprocessHandle {
+    group: Option<GroupRegistration>,
     child: Child,
     pid: u32,
     started_at: Instant,
@@ -203,19 +211,6 @@ fn exit_code(status: ExitStatus) -> Option<i32> {
     status.code()
 }
 
-#[cfg(unix)]
-fn signal_group(pid: u32, signal: libc::c_int) {
-    let Ok(pgid) = libc::pid_t::try_from(pid) else {
-        return;
-    };
-    // SAFETY: killpg is a plain syscall wrapper with no memory-safety
-    // preconditions; a stale or foreign pgid yields ESRCH/EPERM, which is
-    // ignored exactly as the Python host ignores ProcessLookupError.
-    unsafe {
-        libc::killpg(pgid, signal);
-    }
-}
-
 async fn spawn_plan(
     argv: &[String],
     cwd: Option<&PathBuf>,
@@ -252,6 +247,12 @@ async fn spawn_plan(
     let pid = child.id().ok_or_else(|| {
         AgentError::AgentStartup(format!("{program:?} exited before it could be tracked"))
     })?;
+    // process_group(0) makes the child its own group leader: pgid == pid.
+    let group = if cfg!(unix) {
+        i32::try_from(pid).ok().map(GroupRegistration::register)
+    } else {
+        None
+    };
     let reader = child
         .stdout
         .take()
@@ -274,6 +275,7 @@ async fn spawn_plan(
         }
     };
     Ok(SubprocessHandle {
+        group,
         child,
         pid,
         started_at: Instant::now(),
@@ -292,6 +294,15 @@ impl SubprocessHandle {
         self.pid
     }
 
+    /// Record the reaped leader's status and unregister its group.
+    fn reaped(&mut self, status: ExitStatus) -> ExitStatus {
+        self.status = Some(status);
+        if let Some(group) = self.group.as_mut() {
+            group.release();
+        }
+        status
+    }
+
     async fn reap(&mut self) -> ExitStatus {
         if let Some(status) = self.status {
             return status;
@@ -299,8 +310,17 @@ impl SubprocessHandle {
         // `wait` only fails when the child was already reaped out from
         // under us; report the default status rather than hanging.
         let status = self.child.wait().await.unwrap_or_default();
-        self.status = Some(status);
-        status
+        self.reaped(status)
+    }
+
+    /// Signal the whole group while the leader is still unreaped (its pid
+    /// pins the group id, so no unrelated group can be hit).
+    fn signal_own_group(&self, signal: process_groups::Signal) {
+        if self.status.is_none()
+            && let Some(group) = &self.group
+        {
+            process_groups::signal_group(group.pgid(), signal);
+        }
     }
 
     async fn read_line(&mut self) -> Result<Option<String>, AgentError> {
@@ -341,20 +361,29 @@ impl SubprocessHandle {
             return;
         }
         if let Ok(Some(status)) = self.child.try_wait() {
-            self.status = Some(status);
+            self.reaped(status);
             return;
         }
         #[cfg(unix)]
-        signal_group(self.pid, libc::SIGTERM);
+        self.signal_own_group(process_groups::Signal::Term);
         #[cfg(not(unix))]
         let _ = self.child.start_kill();
-        if let Ok(Ok(status)) = tokio::time::timeout(grace, self.child.wait()).await {
-            self.status = Some(status);
-            return;
+        let exited = tokio::time::timeout(grace, self.child.wait()).await;
+        // Sweep the group with SIGKILL whether or not the leader honored
+        // SIGTERM: a tool child that ignores SIGTERM must not outlive the
+        // run. The leader is reaped at most just now, so its group id
+        // cannot have been recycled yet.
+        if let Some(group) = &self.group {
+            process_groups::signal_group(group.pgid(), process_groups::Signal::Kill);
         }
-        #[cfg(unix)]
-        signal_group(self.pid, libc::SIGKILL);
-        let _ = self.child.start_kill();
+        match exited {
+            Ok(Ok(status)) => {
+                self.reaped(status);
+            }
+            _ => {
+                let _ = self.child.start_kill();
+            }
+        }
     }
 
     async fn wait_exit(&mut self) -> AgentExit {
@@ -378,6 +407,17 @@ impl SubprocessHandle {
             returncode: exit_code(status),
             stderr_tail: self.stderr_tail.clone(),
             duration_seconds: Some(self.started_at.elapsed().as_secs_f64()),
+        }
+    }
+}
+
+impl Drop for SubprocessHandle {
+    fn drop(&mut self) {
+        // Never reaped: the run was abandoned mid-flight. `kill_on_drop`
+        // only reaches the leader; take the whole group down with it.
+        self.signal_own_group(process_groups::Signal::Kill);
+        if let Some(group) = self.group.as_mut() {
+            group.release();
         }
     }
 }
@@ -449,14 +489,44 @@ impl ExecutionHost for LocalHost {
 /// Container provisioning, teardown, networking, and auth mounts stay owned
 /// by the caller; this host only executes plans.
 ///
-/// `kill` terminates the local docker client, which does **not** reap the
-/// in-container process (Docker's documented exec behavior). The container
-/// lifecycle owner reaps survivors at teardown (stop/rm).
+/// Killing the local docker client does **not** stop the in-container
+/// process (Docker's documented exec behavior), so the agent is launched
+/// under a `/bin/sh` wrapper that records its own pid in a per-run file
+/// under [`CONTAINER_PGID_DIR`] and then `exec`s the agent argv. `docker
+/// exec` starts every process as a session (and therefore group) leader,
+/// so that pid is the in-container process-group id. `kill` signals that
+/// group through a second `docker exec` (SIGTERM, the grace, then a SIGKILL
+/// sweep that also removes the file) before reaping the local client; a
+/// handle dropped without a kill issues the SIGKILL sweep from a background
+/// thread. The image must provide `/bin/sh` with a `kill` that accepts a
+/// negative pid (POSIX sh, dash, bash, and busybox all do).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerExecHost {
     pub container_name: String,
     pub docker_argv: Vec<String>,
 }
+
+/// In-container directory holding the per-run process-group files.
+pub const CONTAINER_PGID_DIR: &str = "/tmp";
+
+/// Wall-clock ceiling for one in-container signal `docker exec`.
+pub const CONTAINER_SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The agent wrapper: record `$$` (pid == pgid == sid under `docker exec`)
+/// in the file named by `$0`, then become the agent. A file that cannot be
+/// written never blocks the agent; it only loses in-container cancellation.
+const PGID_WRAPPER: &str = r#"{ printf '%s\n' "$$" > "$0"; } 2>/dev/null; exec "$@""#;
+
+/// Signal the recorded group: `$1` is the file, `$2` the signal name. A
+/// missing or malformed file is a no-op; the KILL sweep removes the file.
+const PGID_SIGNAL_SCRIPT: &str = r#"f=$1; s=$2
+[ -r "$f" ] || exit 0
+read -r g < "$f" || [ -n "$g" ] || exit 0
+case $g in ''|*[!0-9]*) exit 0 ;; esac
+[ "$g" -gt 1 ] || exit 0
+kill -s "$s" "-$g" 2>/dev/null
+if [ "$s" = KILL ]; then rm -f "$f"; fi
+exit 0"#;
 
 impl DockerExecHost {
     pub fn new(container_name: impl Into<String>) -> Self {
@@ -471,8 +541,17 @@ impl DockerExecHost {
         self
     }
 
-    /// The full `docker exec` argv for `plan`.
-    pub fn assemble_argv(&self, plan: &ProcessPlan) -> Vec<String> {
+    /// A fresh in-container process-group file path for one spawn.
+    pub fn new_pgid_file() -> String {
+        format!(
+            "{CONTAINER_PGID_DIR}/flywheel-agent-{}.pgid",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    /// The full `docker exec` argv for `plan`, the agent wrapped so it
+    /// records its process-group id in `pgid_file`.
+    pub fn assemble_argv(&self, plan: &ProcessPlan, pgid_file: &str) -> Vec<String> {
         let mut argv = self.docker_argv.clone();
         argv.push("exec".to_string());
         if plan.stdin != StdinPlan::Closed {
@@ -487,7 +566,30 @@ impl DockerExecHost {
             argv.push(cwd.to_string_lossy().into_owned());
         }
         argv.push(self.container_name.clone());
+        argv.extend([
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            PGID_WRAPPER.to_string(),
+            pgid_file.to_string(),
+        ]);
         argv.extend(plan.argv.iter().cloned());
+        argv
+    }
+
+    /// The `docker exec` argv that sends `signal` (`TERM` / `KILL`) to the
+    /// process group recorded in `pgid_file`.
+    pub fn signal_argv(&self, pgid_file: &str, signal: &str) -> Vec<String> {
+        let mut argv = self.docker_argv.clone();
+        argv.extend([
+            "exec".to_string(),
+            self.container_name.clone(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            PGID_SIGNAL_SCRIPT.to_string(),
+            "flywheel-signal".to_string(),
+            pgid_file.to_string(),
+            signal.to_string(),
+        ]);
         argv
     }
 }
@@ -498,12 +600,146 @@ impl ExecutionHost for DockerExecHost {
         plan: ProcessPlan,
     ) -> BoxFuture<'_, Result<Box<dyn RunningProcess>, AgentError>> {
         Box::pin(async move {
-            let argv = self.assemble_argv(&plan);
+            if plan.argv.is_empty() {
+                return Err(AgentError::AgentStartup(
+                    "cannot spawn an empty argv".into(),
+                ));
+            }
+            let pgid_file = Self::new_pgid_file();
+            let argv = self.assemble_argv(&plan, &pgid_file);
             // The docker *client* inherits the parent environment; the plan's
             // extras travel as -e flags into the container.
-            let handle = spawn_plan(&argv, None, None, &plan.stdin).await?;
-            Ok(Box::new(handle) as Box<dyn RunningProcess>)
+            let client = spawn_plan(&argv, None, None, &plan.stdin).await?;
+            Ok(Box::new(DockerExecProcess {
+                client,
+                term_argv: self.signal_argv(&pgid_file, "TERM"),
+                kill_argv: self.signal_argv(&pgid_file, "KILL"),
+                swept: false,
+            }) as Box<dyn RunningProcess>)
         })
+    }
+}
+
+/// A `docker exec` agent: the local client plus the in-container group it
+/// started. See [`DockerExecHost`].
+struct DockerExecProcess {
+    client: SubprocessHandle,
+    term_argv: Vec<String>,
+    kill_argv: Vec<String>,
+    /// The in-container SIGKILL sweep has run.
+    swept: bool,
+}
+
+/// Run one in-container signal `docker exec` to completion, bounded by
+/// [`CONTAINER_SIGNAL_TIMEOUT`]. Best effort: a container that is already
+/// gone took the agent with it.
+async fn run_signal(argv: &[String]) {
+    let Some((program, rest)) = argv.split_first() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .args(rest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Ok(mut child) = command.spawn()
+        && tokio::time::timeout(CONTAINER_SIGNAL_TIMEOUT, child.wait())
+            .await
+            .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
+impl DockerExecProcess {
+    async fn kill_tree(&mut self, grace: Duration) {
+        if self.swept {
+            return;
+        }
+        let mut client_exited = self.client.status.is_some();
+        if !client_exited && let Ok(Some(status)) = self.client.child.try_wait() {
+            self.client.reaped(status);
+            client_exited = true;
+        }
+        if !client_exited {
+            run_signal(&self.term_argv).await;
+            // The client exits once the in-container leader does.
+            client_exited = tokio::time::timeout(grace, self.client.reap())
+                .await
+                .is_ok();
+        }
+        // Sweep survivors that ignored SIGTERM (or outlived a leader that
+        // exited on its own) and drop the pgid file.
+        run_signal(&self.kill_argv).await;
+        self.swept = true;
+        if !client_exited {
+            self.client.kill_group(Duration::ZERO).await;
+        }
+    }
+}
+
+impl RunningProcess for DockerExecProcess {
+    fn next_line(&mut self) -> BoxFuture<'_, Result<Option<String>, AgentError>> {
+        Box::pin(self.client.read_line())
+    }
+
+    fn stdin(&self) -> Option<StdinWriter> {
+        self.client.stdin_writer.clone()
+    }
+
+    fn kill(&mut self, grace: Duration) -> BoxFuture<'_, ()> {
+        Box::pin(self.kill_tree(grace))
+    }
+
+    fn wait(&mut self) -> BoxFuture<'_, AgentExit> {
+        Box::pin(self.client.wait_exit())
+    }
+}
+
+impl Drop for DockerExecProcess {
+    fn drop(&mut self) {
+        if self.swept {
+            return;
+        }
+        // Dropped without a kill (abandoned mid-run, or finished without
+        // one): SIGKILL whatever is left of the in-container group and
+        // remove its file. Drop cannot await, so the docker call runs on a
+        // detached thread.
+        let argv = std::mem::take(&mut self.kill_argv);
+        let _ = std::thread::Builder::new()
+            .name("flywheel-docker-kill".to_string())
+            .spawn(move || run_signal_blocking(&argv));
+    }
+}
+
+/// [`run_signal`] for a caller with no async context (a `Drop`).
+fn run_signal_blocking(argv: &[String]) {
+    let Some((program, rest)) = argv.split_first() else {
+        return;
+    };
+    let Ok(mut child) = std::process::Command::new(program)
+        .args(rest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + CONTAINER_SIGNAL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
     }
 }
 
@@ -520,7 +756,7 @@ mod tests {
         plan.environment.insert("Z".into(), "9".into());
         plan.stdin = StdinPlan::Payload("prompt-on-stdin".into());
         assert_eq!(
-            host.assemble_argv(&plan),
+            host.assemble_argv(&plan, "/tmp/run.pgid"),
             vec![
                 "/bin/echo",
                 "exec",
@@ -532,6 +768,10 @@ mod tests {
                 "-w",
                 "/inside/workdir",
                 "cont-1",
+                "/bin/sh",
+                "-c",
+                PGID_WRAPPER,
+                "/tmp/run.pgid",
                 "claude",
                 "--print"
             ]
@@ -543,15 +783,55 @@ mod tests {
         let host = DockerExecHost::new("cont-2").with_docker_argv(vec!["/bin/echo".into()]);
         let plan = ProcessPlan::new(vec!["claude".into(), "--version".into()]);
         assert_eq!(
-            host.assemble_argv(&plan),
-            vec!["/bin/echo", "exec", "cont-2", "claude", "--version"]
+            host.assemble_argv(&plan, "f")[..3],
+            ["/bin/echo", "exec", "cont-2"]
         );
         let mut open = ProcessPlan::new(vec!["claude".into()]);
         open.stdin = StdinPlan::Open;
         assert_eq!(
-            host.assemble_argv(&open),
-            vec!["/bin/echo", "exec", "-i", "cont-2", "claude"]
+            host.assemble_argv(&open, "f")[..4],
+            ["/bin/echo", "exec", "-i", "cont-2"]
         );
+    }
+
+    #[test]
+    fn docker_signal_argv_targets_the_recorded_group() {
+        let host = DockerExecHost::new("cont-3");
+        assert_eq!(
+            host.signal_argv("/tmp/run.pgid", "TERM"),
+            vec![
+                "docker",
+                "exec",
+                "cont-3",
+                "/bin/sh",
+                "-c",
+                PGID_SIGNAL_SCRIPT,
+                "flywheel-signal",
+                "/tmp/run.pgid",
+                "TERM"
+            ]
+        );
+        let file = DockerExecHost::new_pgid_file();
+        assert!(file.starts_with("/tmp/flywheel-agent-") && file.ends_with(".pgid"));
+        assert_ne!(file, DockerExecHost::new_pgid_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pgid_wrapper_records_its_pid_then_execs_the_agent() {
+        let dir = std::env::temp_dir().join(format!("fw-wrap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("run.pgid");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", PGID_WRAPPER])
+            .arg(&file)
+            .args(["/bin/sh", "-c", "echo $$"])
+            .output()
+            .unwrap();
+        let exec_pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let recorded = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(recorded.trim(), exec_pid);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

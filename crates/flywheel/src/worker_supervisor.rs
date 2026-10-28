@@ -102,9 +102,14 @@ pub fn python_exit_code(status: ExitStatus) -> i32 {
 /// exists.
 ///
 /// The child is a session leader (spawned through `setsid`), so its pgid
-/// equals its pid and the signal reaches every descendant it spawned --
-/// the agent subprocesses and their MCP children. Signaling only the child
-/// pid would orphan those grandchildren.
+/// equals its pid and the signal reaches every descendant that stayed in
+/// its group. Agents and command graders do NOT: each runs in a process
+/// group of its own, registered in `flywheel_agents::process_groups`. The
+/// daemon's SIGTERM/SIGINT handler terminates every registered group
+/// (SIGTERM, then SIGKILL after the agent kill grace) the moment the
+/// signal lands, so the sweep finishes inside [`DEFAULT_STOP_TIMEOUT`] and
+/// reaches the agent trees and their MCP / tool children before any
+/// escalation to SIGKILL here.
 #[cfg(unix)]
 fn signal_group(child: &mut Child, sig: i32) -> bool {
     let Ok(pid) = i32::try_from(child.id()) else {

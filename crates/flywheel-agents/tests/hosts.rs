@@ -6,6 +6,8 @@
 mod common;
 
 use common::write_script;
+#[cfg(unix)]
+use common::{process_dead, wait_dead};
 use flywheel_agents::hosts::DEFAULT_KILL_GRACE;
 use flywheel_agents::{
     AgentExit, DockerExecHost, ExecutionHost, LocalHost, ProcessPlan, StdinPlan,
@@ -132,23 +134,6 @@ async fn spawn_failure_is_a_startup_error() {
 }
 
 #[cfg(unix)]
-fn process_dead(pid: i32) -> bool {
-    // SAFETY: kill with signal 0 only probes for existence.
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    if !alive {
-        return true;
-    }
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat
-            .rsplit(')')
-            .next()
-            .map(|rest| rest.split_whitespace().next() == Some("Z"))
-            .unwrap_or(true),
-        Err(_) => true,
-    }
-}
-
-#[cfg(unix)]
 #[tokio::test]
 async fn kill_terminates_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,6 +177,46 @@ async fn kill_after_exit_is_a_noop() {
     assert_eq!(process.wait().await.returncode, Some(0));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_sweeps_a_grandchild_that_ignores_sigterm() {
+    let mut process = LocalHost
+        .spawn(sh("(trap '' TERM; exec sleep 300) & echo $!; wait"))
+        .await
+        .unwrap();
+    let grandchild: i32 = process
+        .next_line()
+        .await
+        .unwrap()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    process.kill(Duration::from_millis(200)).await;
+    process.wait().await;
+    assert!(wait_dead(grandchild, Duration::from_secs(5)).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_an_unreaped_handle_kills_its_whole_group() {
+    let mut process = LocalHost
+        .spawn(sh("sleep 300 & echo $!; wait"))
+        .await
+        .unwrap();
+    let grandchild: i32 = process
+        .next_line()
+        .await
+        .unwrap()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!process_dead(grandchild));
+    drop(process);
+    assert!(wait_dead(grandchild, Duration::from_secs(5)).await);
+}
+
 #[tokio::test]
 async fn docker_exec_host_argv_assembly_through_a_real_spawn() {
     let host = DockerExecHost::new("cont-1").with_docker_argv(vec!["/bin/echo".into()]);
@@ -207,10 +232,12 @@ async fn docker_exec_host_argv_assembly_through_a_real_spawn() {
     };
     let mut process = host.spawn(plan).await.unwrap();
     let line = process.next_line().await.unwrap().unwrap();
-    assert_eq!(
-        line,
-        "exec -i -e K=V -e Z=9 -w /inside/workdir cont-1 claude --print"
+    assert!(
+        line.starts_with("exec -i -e K=V -e Z=9 -w /inside/workdir cont-1 /bin/sh -c "),
+        "{line}"
     );
+    assert!(line.contains(" /tmp/flywheel-agent-"), "{line}");
+    assert!(line.ends_with(".pgid claude --print"), "{line}");
     assert_eq!(process.next_line().await.unwrap(), None);
     assert_eq!(process.wait().await.returncode, Some(0));
 }
@@ -222,9 +249,8 @@ async fn docker_exec_host_omits_stdin_flag_without_payload() {
         .spawn(ProcessPlan::new(vec!["claude".into(), "--version".into()]))
         .await
         .unwrap();
-    assert_eq!(
-        process.next_line().await.unwrap().as_deref(),
-        Some("exec cont-2 claude --version")
-    );
+    let line = process.next_line().await.unwrap().unwrap();
+    assert!(line.starts_with("exec cont-2 /bin/sh -c "), "{line}");
+    assert!(line.ends_with(".pgid claude --version"), "{line}");
     assert_eq!(process.wait().await.returncode, Some(0));
 }

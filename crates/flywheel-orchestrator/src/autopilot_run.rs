@@ -909,7 +909,9 @@ pub const SIGINT: i32 = 2;
 
 /// Call `on_signal(signum)` on every SIGTERM/SIGINT for the life of the
 /// process (the handler stays armed across cycles, as Python's re-arming
-/// achieved).
+/// achieved), then terminate every live agent process group: agent
+/// sessions lead groups of their own, out of reach of a signal aimed at
+/// this daemon's group.
 #[cfg(unix)]
 pub(crate) async fn watch_stop_signals(on_signal: SignalHandler, log: LogSink) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -933,6 +935,7 @@ pub(crate) async fn watch_stop_signals(on_signal: SignalHandler, log: LogSink) {
             _ = int.recv() => SIGINT,
         };
         on_signal(signum);
+        flywheel_agents::process_groups::spawn_shutdown_sweep();
     }
 }
 
@@ -944,6 +947,7 @@ pub(crate) async fn watch_stop_signals(on_signal: SignalHandler, log: LogSink) {
             return;
         }
         on_signal(SIGINT);
+        flywheel_agents::process_groups::spawn_shutdown_sweep();
     }
 }
 

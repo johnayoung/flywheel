@@ -448,7 +448,9 @@ impl TriageHost for ProductionHost {
 }
 
 /// Set `stop` on every SIGTERM/SIGINT for the life of the process, logging
-/// each one (the handler stays armed, as Python's did across cycles).
+/// each one (the handler stays armed, as Python's did across cycles), and
+/// terminate every live agent process group (each leads a group of its
+/// own, out of reach of a signal aimed at this daemon's group).
 #[cfg(unix)]
 async fn watch_stop_signals(stop: StopFlag, log: LogSink) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -472,6 +474,7 @@ async fn watch_stop_signals(stop: StopFlag, log: LogSink) {
             _ = int.recv() => SignalKind::interrupt().as_raw_value(),
         };
         stop.set();
+        flywheel_agents::process_groups::spawn_shutdown_sweep();
         log(&format!(
             "stop signal {signum}; exiting after the current cycle"
         ));
@@ -486,6 +489,7 @@ async fn watch_stop_signals(stop: StopFlag, log: LogSink) {
             return;
         }
         stop.set();
+        flywheel_agents::process_groups::spawn_shutdown_sweep();
         log("stop signal 2; exiting after the current cycle");
     }
 }

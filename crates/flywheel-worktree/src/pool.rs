@@ -19,10 +19,12 @@
 //! running -- one bad slot never group-kills the healthy fleet.
 //!
 //! Shutdown reuses the group-kill supervisor model (commit 36a0622): each
-//! member is a session leader whose agent/MCP children share its process
-//! group, so [`WorkerPool::stop`] signals every member's whole group
-//! (SIGTERM, then SIGKILL on the survivors after the stop window) and
-//! returns with nothing left alive.
+//! member is a session leader, and [`WorkerPool::stop`] signals every
+//! member's whole group (SIGTERM, then SIGKILL on the survivors after the
+//! stop window). Agents and command graders run in process groups of their
+//! own, which a member-group signal does not reach; each member's
+//! SIGTERM/SIGINT handler terminates every group it registered in
+//! `flywheel_agents::process_groups` before it exits.
 
 use crate::daemon::WorkerArgs;
 use crate::submitter::Logger;
@@ -129,9 +131,10 @@ impl fmt::Display for MemberExit {
 
 /// One supervised pool member: a single-task worker subprocess.
 ///
-/// The child is its own session leader (`setsid`), so its agent/MCP
-/// children share its process group and a group signal reaches the whole
-/// subtree. `log_path` is the redirected stdout/stderr sink (`None` when
+/// The child is its own session leader (`setsid`), so a group signal
+/// reaches the member and every descendant still in its group; its agents
+/// and graders lead groups of their own, swept by the member's own signal
+/// handler. `log_path` is the redirected stdout/stderr sink (`None` when
 /// output is inherited), kept for forensics after the member dies.
 pub struct PoolMember {
     pub slot: usize,
@@ -612,9 +615,11 @@ impl WorkerPool {
     /// Sends SIGTERM to each live member's process group first (a shared
     /// graceful window so the pool does not pay `timeout` per member),
     /// waits out the window, then escalates the survivors to SIGKILL so the
-    /// pool always returns with nothing left alive -- no member, no agent,
-    /// no MCP child. A force-killed member's lease simply lapses and
-    /// another worker reclaims its task.
+    /// pool always returns with no member left alive. The SIGTERM reaches
+    /// each member's signal handler, which terminates its own agent and
+    /// grader groups (and their MCP / tool children) within the window. A
+    /// force-killed member's lease simply lapses and another worker
+    /// reclaims its task.
     pub fn stop(&mut self, timeout: Option<f64>) {
         if self.stopped {
             return;
@@ -676,8 +681,9 @@ impl WorkerPool {
         if let Some(env) = &self.env {
             command.env_clear().envs(env);
         }
-        // Own session so each member's agent/MCP children share its process
-        // group and a group signal takes the whole subtree down; also so a
+        // Own session so a group signal takes the member and everything
+        // still in its group down (its agents and graders, in groups of
+        // their own, are swept by the member's signal handler); also so a
         // Ctrl+C on the console terminal does not reach members behind the
         // pool's back.
         #[cfg(unix)]

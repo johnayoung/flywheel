@@ -2241,6 +2241,7 @@ fn cmd_run(args: RunArgs) -> i32 {
             return 2;
         }
         let result = runtime.block_on(run_task_file(target, &db_path, &sandbox, options));
+        drain_agent_teardown(&runtime);
         return exit_code_for(result);
     }
     let task = match build_inline_task(&args.target, &args.check, &args.rubric, None) {
@@ -2252,7 +2253,20 @@ fn cmd_run(args: RunArgs) -> i32 {
     };
     options.source = Some("(inline goal)".to_owned());
     let result = runtime.block_on(run_task_object(&task, &db_path, &sandbox, options));
+    drain_agent_teardown(&runtime);
     exit_code_for(result)
+}
+
+/// Let any agent or grader teardown still in flight on `runtime` (SIGTERM,
+/// grace, SIGKILL sweep, reap) finish before the runtime is dropped:
+/// dropping it would cancel those tasks mid-teardown. The harness already
+/// awaits the agent it cancels; this covers a teardown that outlived the
+/// harness's bounded wait. Anything still registered after the window is
+/// SIGKILLed when its handle drops with the runtime.
+fn drain_agent_teardown(runtime: &tokio::runtime::Runtime) {
+    runtime.block_on(flywheel_agents::process_groups::wait_released(
+        flywheel_agents::hosts::DEFAULT_KILL_GRACE.saturating_mul(2),
+    ));
 }
 
 fn cmd_is_done(task_file: &str, db: Option<&str>) -> i32 {

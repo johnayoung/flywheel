@@ -2,7 +2,7 @@
 //!
 //! Pure type module: defines the wire-level shape every concrete store must
 //! satisfy (in-memory, SQLite, future backends). Keying mirrors
-//! `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql`
+//! `crates/flywheel-core/schema/persistence-schema.sql`
 //! column-level definitions exactly so concrete stores converge on the same
 //! surface.
 //!

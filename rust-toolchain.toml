@@ -1,3 +1,4 @@
 [toolchain]
+# Keep in sync with dtolnay/rust-toolchain@<version> in .github/workflows/*.yml.
 channel = "1.91.1"
 components = ["rustfmt", "clippy"]

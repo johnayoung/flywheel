@@ -5,7 +5,7 @@
 # the hundreds of task JSON files and the lockfile skew the detected language.
 
 .flywheel/**            linguist-generated
-uv.lock                 linguist-generated
+Cargo.lock              linguist-generated
 *.loop-base             linguist-generated
 
 # Documentation should not count toward the language bar.

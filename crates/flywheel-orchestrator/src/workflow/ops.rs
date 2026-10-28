@@ -186,10 +186,13 @@ pub fn cmd_recover(
 
 /// Deliberately abandon a strand (spec 00077, criterion 5 / D-3): record an
 /// operator-attributed `stop-resolved` marker keyed to the task id carrying
-/// `--reason` verbatim. Refuses (exit 1) when the subject has no stop row or
-/// its latest row is already a resolution; an empty reason exits 2.
+/// `--reason` verbatim. A strand is either an unresolved pre-run stop or a
+/// ledger-only landing strand (a parked DONE run with no stop row, which
+/// `status` surfaces); the marker clears both. Refuses (exit 1) when the
+/// subject has neither; an empty reason exits 2.
 pub fn cmd_resolve(
     args: &ResolveArgs,
+    store: &dyn HarnessStore,
     claims: &dyn ClaimStore,
     now: DateTime<Utc>,
     out: &mut dyn Write,
@@ -201,18 +204,24 @@ pub fn cmd_resolve(
     }
     let events = claims.list_subject_stop_events(&args.task_id)?;
     let latest = events.last();
-    let Some(latest) = latest.filter(|e| e.kind != STOP_RESOLVED) else {
-        let state = if latest.is_some() {
-            "already resolved"
-        } else {
-            "no stop event"
-        };
-        writeln!(
-            err,
-            "error: task {} has no unresolved stop event to abandon ({state})",
-            py_repr(&args.task_id)
-        )?;
-        return Ok(1);
+    let superseded = match latest.filter(|e| e.kind != STOP_RESOLVED) {
+        Some(stop) => stop.kind.clone(),
+        None => match super::status::unresolved_landing_strand(store, &events, &args.task_id)? {
+            Some(park) => park.park_kind,
+            None => {
+                let state = if latest.is_some() {
+                    "already resolved"
+                } else {
+                    "no stop event"
+                };
+                writeln!(
+                    err,
+                    "error: task {} has no unresolved stop event to abandon ({state})",
+                    py_repr(&args.task_id)
+                )?;
+                return Ok(1);
+            }
+        },
     };
     claims.record_stop_event(
         STOP_RESOLVED,
@@ -225,7 +234,7 @@ pub fn cmd_resolve(
         out,
         "resolved {}: abandoned strand (superseded {})",
         args.task_id,
-        py_repr(&latest.kind)
+        py_repr(&superseded)
     )?;
     Ok(0)
 }
@@ -607,6 +616,7 @@ mod tests {
 
     #[test]
     fn resolve_records_an_operator_marker_once_and_refuses_otherwise() {
+        let store = InMemoryStore::new();
         let claims = InMemoryClaimStore::new();
         claims
             .record_stop_event(STOP_PREPARE_SKIP, "e", "skip cause", t0(), "")
@@ -619,7 +629,7 @@ mod tests {
                 db: None,
             };
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = cmd_resolve(&args, &claims, t0(), &mut out, &mut err).unwrap();
+            let code = cmd_resolve(&args, &store, &claims, t0(), &mut out, &mut err).unwrap();
             (
                 code,
                 String::from_utf8(out).unwrap(),

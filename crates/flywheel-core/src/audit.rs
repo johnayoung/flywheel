@@ -492,7 +492,9 @@ enum Phase {
     /// Terminal observed: keep draining complete lines; on an empty read,
     /// wait one quiescence window (`idle_waited` records that) and read
     /// again, so a write racing the terminal transition is not dropped.
-    Settle { idle_waited: bool },
+    Settle {
+        idle_waited: bool,
+    },
     /// The quiescent final pass: drain what remains and discard a partial
     /// trailing line (a crash mid-write that will never complete).
     FinalPage,

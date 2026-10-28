@@ -205,11 +205,15 @@ pub fn source_settings_from_policy(policy: &WorkPolicy) -> toml::Table {
                 settings.insert("repo".into(), s(repo));
             }
         }
-        _ => {
+        "directory" => {
             if let Some(tasks_dir) = &policy.tasks_dir {
                 settings.insert("tasks_dir".into(), s(&tasks_dir.to_string_lossy()));
             }
         }
+        // Any other kind carries only `kind`: the registry rejects a name it
+        // does not know, so an unknown kind can never be built as a
+        // directory source.
+        _ => {}
     }
     settings
 }
@@ -1043,6 +1047,35 @@ mod tests {
         assert_eq!(settings["require_triage_receipt"].as_bool(), Some(false));
         let source = build_work_source(&policy, &default_source_registry()).unwrap();
         assert!(source.source_name().contains("o/r"));
+    }
+
+    #[test]
+    fn unknown_source_kind_is_an_error_never_a_directory_fallback() {
+        // The policy loader rejects it outright...
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("flywheel.toml");
+        std::fs::write(&file, "[source]\nkind = \"jira\"\ntasks_dir = \"tasks\"\n").unwrap();
+        let err = load_effective_policy(Some(&file)).unwrap_err().to_string();
+        assert!(
+            err.contains("source.kind must be one of ('directory', 'github', 'github_ci', 'github_review'), got 'jira'"),
+            "{err}"
+        );
+        // ...and a directly constructed policy fails at the registry.
+        let policy = WorkPolicy {
+            source_kind: "jira".into(),
+            tasks_dir: Some(PathBuf::from("tasks")),
+            ..WorkPolicy::default()
+        };
+        let settings = source_settings_from_policy(&policy);
+        assert_eq!(settings.len(), 1, "{settings:?}");
+        let Err(err) = build_work_source(&policy, &default_source_registry()) else {
+            panic!("an unknown source kind built a work source");
+        };
+        assert!(err.to_string().contains("jira"), "{err}");
+        let Err(err) = resolve_work_source(None, Some(&policy), &default_source_registry()) else {
+            panic!("an unknown source kind resolved a work source");
+        };
+        assert!(err.to_string().contains("jira"), "{err}");
     }
 
     #[test]

@@ -21,6 +21,10 @@
 //! Authoritative specs: `docs/cli.md` (`triage`), `docs/configuration.md`
 //! (`[triage]`), `docs/autopilot.md`.
 
+use crate::autopilot_run::{
+    looks_like_negative_number, match_long_option, parse_float_arg, reject_inline, split_flag,
+    take_value,
+};
 use crate::github::{GhRunner, ProcessGhRunner};
 use crate::sources::LogSink;
 use crate::triage::{
@@ -79,48 +83,55 @@ pub struct TriageArgs {
     pub help: bool,
 }
 
+/// The long options `flywheel triage` defines, for unique-prefix matching.
+const LONG_OPTIONS: [&str; 4] = ["--help", "--model", "--interval", "--once"];
+
 /// Parse `argv` (everything after the verb) as argparse would: `--model M`,
-/// `--interval SECONDS` (a float), `--once`, `-h`/`--help`; the `--flag=value`
-/// spelling is accepted; a repeated option takes its last value. The error
-/// is argparse's message for the failure.
+/// `--interval SECONDS` (a float), `--once`, `-h`/`--help`; every long option
+/// accepts the `--flag=value` spelling and a unique-prefix abbreviation
+/// (`--int 5`, `--on`), a repeated option takes its last value, and every
+/// token no option claims is collected into one `unrecognized arguments: ...`
+/// error. The error is argparse's message for the failure.
 pub fn parse_args(argv: &[String]) -> Result<TriageArgs, String> {
     let mut args = TriageArgs::default();
+    let mut unrecognized: Vec<String> = Vec::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        let (flag, inline) = match arg.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
-            _ => (arg.as_str(), None),
+        if arg == "-h" {
+            args.help = true;
+            continue;
+        }
+        if !arg.starts_with("--") || looks_like_negative_number(arg) {
+            unrecognized.push(arg.clone());
+            continue;
+        }
+        let (flag, inline) = split_flag(arg);
+        let Some(option) = match_long_option(arg, flag, &LONG_OPTIONS)? else {
+            unrecognized.push(arg.clone());
+            continue;
         };
-        let value = |iter: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
-            if let Some(inline) = &inline {
-                return Ok(inline.clone());
+        match option {
+            "--help" => {
+                reject_inline(option, inline)?;
+                args.help = true;
             }
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("argument {flag}: expected one argument"))
-        };
-        match flag {
-            "-h" | "--help" => args.help = true,
             "--once" => {
-                if inline.is_some() {
-                    return Err(format!(
-                        "argument --once: ignored explicit argument '{}'",
-                        inline.unwrap()
-                    ));
-                }
+                reject_inline(option, inline)?;
                 args.once = true;
             }
-            "--model" => args.model = Some(value(&mut iter)?),
+            "--model" => args.model = Some(take_value(option, inline, &mut iter)?),
             "--interval" => {
-                let raw = value(&mut iter)?;
-                let parsed: f64 = raw
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("argument --interval: invalid float value: '{raw}'"))?;
-                args.interval = Some(parsed);
+                let raw = take_value(option, inline, &mut iter)?;
+                args.interval = Some(parse_float_arg(option, &raw)?);
             }
-            other => return Err(format!("unrecognized arguments: {other}")),
+            other => unrecognized.push(other.to_owned()),
         }
+    }
+    if !unrecognized.is_empty() {
+        return Err(format!(
+            "unrecognized arguments: {}",
+            unrecognized.join(" ")
+        ));
     }
     Ok(args)
 }
@@ -707,6 +718,33 @@ mod tests {
         assert_eq!(
             parse_args(&argv(&["--bogus"])).unwrap_err(),
             "unrecognized arguments: --bogus"
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_unique_prefix_abbreviations() {
+        let parsed = parse_args(&argv(&["--on", "--mod", "m", "--int=3"])).unwrap();
+        assert_eq!(
+            parsed,
+            TriageArgs {
+                model: Some("m".into()),
+                interval: Some(3.0),
+                once: true,
+                help: false
+            }
+        );
+        assert!(parse_args(&argv(&["--he"])).unwrap().help);
+        assert_eq!(
+            parse_args(&argv(&["--int", "x"])).unwrap_err(),
+            "argument --interval: invalid float value: 'x'"
+        );
+        assert_eq!(
+            parse_args(&argv(&["--o=1"])).unwrap_err(),
+            "argument --once: ignored explicit argument '1'"
+        );
+        assert_eq!(
+            parse_args(&argv(&["--onces"])).unwrap_err(),
+            "unrecognized arguments: --onces"
         );
     }
 

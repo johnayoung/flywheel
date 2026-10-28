@@ -7,7 +7,8 @@
 //! task at a time; multi-task scheduling (selection over a prerequisite DAG,
 //! phases, the live dashboard) lives in the orchestrator crate.
 //!
-//! The operator verbs are reachable through [`main`] (the Rust spelling of
+//! The operator verbs are reachable through [`main`], routed by the product
+//! shell as the hidden `flywheel workflow` verb (the Rust spelling of
 //! `python -m flywheel_core.workflow`), with argparse-identical usage, help,
 //! and error text:
 //!
@@ -1453,13 +1454,13 @@ fn enqueue_control_command_inner(
 
 // --- CLI plumbing -------------------------------------------------------------------
 
-const PROG: &str = "python -m flywheel_core.workflow";
+const PROG: &str = "flywheel workflow";
 
-const MAIN_USAGE: &str = "usage: python -m flywheel_core.workflow [-h]
-                                        {run,is-done,interrupt,steer,set-model,approve,reject} ...";
+const MAIN_USAGE: &str = "usage: flywheel workflow [-h]
+                         {run,is-done,interrupt,steer,set-model,approve,reject} ...";
 
-const MAIN_HELP: &str = "usage: python -m flywheel_core.workflow [-h]
-                                        {run,is-done,interrupt,steer,set-model,approve,reject} ...
+const MAIN_HELP: &str = "usage: flywheel workflow [-h]
+                         {run,is-done,interrupt,steer,set-model,approve,reject} ...
 
 Run and steer a single flywheel task. Multi-task scheduling lives in the
 flywheel-orchestrator package, exposed via the flywheel/fw product shell.
@@ -1497,23 +1498,17 @@ positional arguments:
 options:
   -h, --help            show this help message and exit";
 
-const RUN_USAGE: &str = "usage: python -m flywheel_core.workflow run [-h] [--db DB] [--check CMD]
-                                            [--rubric ASSERTION]
-                                            [--sandbox SANDBOX]
-                                            [--model MODEL]
-                                            [--max-turns MAX_TURNS]
-                                            [--max-retries MAX_RETRIES]
-                                            [--json | --quiet]
-                                            GOAL_OR_FILE";
+const RUN_USAGE: &str = "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
+                             [--sandbox SANDBOX] [--model MODEL]
+                             [--max-turns MAX_TURNS]
+                             [--max-retries MAX_RETRIES] [--json | --quiet]
+                             GOAL_OR_FILE";
 
-const RUN_HELP: &str = "usage: python -m flywheel_core.workflow run [-h] [--db DB] [--check CMD]
-                                            [--rubric ASSERTION]
-                                            [--sandbox SANDBOX]
-                                            [--model MODEL]
-                                            [--max-turns MAX_TURNS]
-                                            [--max-retries MAX_RETRIES]
-                                            [--json | --quiet]
-                                            GOAL_OR_FILE
+const RUN_HELP: &str = "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
+                             [--sandbox SANDBOX] [--model MODEL]
+                             [--max-turns MAX_TURNS]
+                             [--max-retries MAX_RETRIES] [--json | --quiet]
+                             GOAL_OR_FILE
 
 TARGET is either an inline goal string (e.g. 'add retries to the http client')
 or a path to a task JSON file. An inline goal with no --check/--rubric runs
@@ -1545,11 +1540,9 @@ options:
   --quiet               Suppress the event stream; print only the final
                         status.";
 
-const IS_DONE_USAGE: &str =
-    "usage: python -m flywheel_core.workflow is-done [-h] [--db DB] task_file";
+const IS_DONE_USAGE: &str = "usage: flywheel workflow is-done [-h] [--db DB] task_file";
 
-const IS_DONE_HELP: &str =
-    "usage: python -m flywheel_core.workflow is-done [-h] [--db DB] task_file
+const IS_DONE_HELP: &str = "usage: flywheel workflow is-done [-h] [--db DB] task_file
 
 positional arguments:
   task_file
@@ -1558,11 +1551,9 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const INTERRUPT_USAGE: &str =
-    "usage: python -m flywheel_core.workflow interrupt [-h] [--db DB] RUN_ID";
+const INTERRUPT_USAGE: &str = "usage: flywheel workflow interrupt [-h] [--db DB] RUN_ID";
 
-const INTERRUPT_HELP: &str =
-    "usage: python -m flywheel_core.workflow interrupt [-h] [--db DB] RUN_ID
+const INTERRUPT_HELP: &str = "usage: flywheel workflow interrupt [-h] [--db DB] RUN_ID
 
 positional arguments:
   RUN_ID      Lifecycle run_id of the in-flight run to interrupt.
@@ -1571,11 +1562,9 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const STEER_USAGE: &str =
-    "usage: python -m flywheel_core.workflow steer [-h] [--db DB] RUN_ID MESSAGE";
+const STEER_USAGE: &str = "usage: flywheel workflow steer [-h] [--db DB] RUN_ID MESSAGE";
 
-const STEER_HELP: &str =
-    "usage: python -m flywheel_core.workflow steer [-h] [--db DB] RUN_ID MESSAGE
+const STEER_HELP: &str = "usage: flywheel workflow steer [-h] [--db DB] RUN_ID MESSAGE
 
 positional arguments:
   RUN_ID      Lifecycle run_id of the in-flight run to steer.
@@ -1585,11 +1574,9 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const SET_MODEL_USAGE: &str =
-    "usage: python -m flywheel_core.workflow set-model [-h] [--db DB] RUN_ID MODEL";
+const SET_MODEL_USAGE: &str = "usage: flywheel workflow set-model [-h] [--db DB] RUN_ID MODEL";
 
-const SET_MODEL_HELP: &str =
-    "usage: python -m flywheel_core.workflow set-model [-h] [--db DB] RUN_ID MODEL
+const SET_MODEL_HELP: &str = "usage: flywheel workflow set-model [-h] [--db DB] RUN_ID MODEL
 
 positional arguments:
   RUN_ID      Lifecycle run_id of the in-flight run to retarget.
@@ -1599,9 +1586,9 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const APPROVE_USAGE: &str = "usage: python -m flywheel_core.workflow approve [-h] [--db DB] RUN_ID";
+const APPROVE_USAGE: &str = "usage: flywheel workflow approve [-h] [--db DB] RUN_ID";
 
-const APPROVE_HELP: &str = "usage: python -m flywheel_core.workflow approve [-h] [--db DB] RUN_ID
+const APPROVE_HELP: &str = "usage: flywheel workflow approve [-h] [--db DB] RUN_ID
 
 positional arguments:
   RUN_ID      Lifecycle run_id of the AWAITING_APPROVAL run to approve.
@@ -1610,13 +1597,9 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const REJECT_USAGE: &str = "usage: python -m flywheel_core.workflow reject [-h] [--feedback TEXT]
-                                               [--db DB]
-                                               RUN_ID";
+const REJECT_USAGE: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID";
 
-const REJECT_HELP: &str = "usage: python -m flywheel_core.workflow reject [-h] [--feedback TEXT]
-                                               [--db DB]
-                                               RUN_ID
+const REJECT_HELP: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID
 
 positional arguments:
   RUN_ID           Lifecycle run_id of the AWAITING_APPROVAL run to reject.
@@ -3697,7 +3680,7 @@ mod tests {
 
     #[test]
     fn parse_errors_match_argparse() {
-        let run_prog = "python -m flywheel_core.workflow run";
+        let run_prog = "flywheel workflow run";
         expect_error(
             &[],
             MAIN_USAGE,
@@ -3791,43 +3774,43 @@ mod tests {
         expect_error(
             &["reject", "r1", "--feedback"],
             REJECT_USAGE,
-            "python -m flywheel_core.workflow reject",
+            "flywheel workflow reject",
             "argument --feedback: expected one argument",
         );
         expect_error(
             &["is-done"],
             IS_DONE_USAGE,
-            "python -m flywheel_core.workflow is-done",
+            "flywheel workflow is-done",
             "the following arguments are required: task_file",
         );
         expect_error(
             &["steer", "r1"],
             STEER_USAGE,
-            "python -m flywheel_core.workflow steer",
+            "flywheel workflow steer",
             "the following arguments are required: MESSAGE",
         );
         expect_error(
             &["steer"],
             STEER_USAGE,
-            "python -m flywheel_core.workflow steer",
+            "flywheel workflow steer",
             "the following arguments are required: RUN_ID, MESSAGE",
         );
         expect_error(
             &["set-model", "r1"],
             SET_MODEL_USAGE,
-            "python -m flywheel_core.workflow set-model",
+            "flywheel workflow set-model",
             "the following arguments are required: MODEL",
         );
         expect_error(
             &["approve"],
             APPROVE_USAGE,
-            "python -m flywheel_core.workflow approve",
+            "flywheel workflow approve",
             "the following arguments are required: RUN_ID",
         );
         expect_error(
             &["interrupt"],
             INTERRUPT_USAGE,
-            "python -m flywheel_core.workflow interrupt",
+            "flywheel workflow interrupt",
             "the following arguments are required: RUN_ID",
         );
     }

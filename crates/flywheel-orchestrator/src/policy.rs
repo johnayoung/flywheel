@@ -2522,6 +2522,14 @@ mod tests {
                 "{FILE}: submit.strategy must be one of ('merge', 'pr', 'phase'), got 'rebase'"
             )
         );
+        // "tiered" is the tier router's internal registry name, selected only
+        // by configuring [[submit.tiers]]; it is not a [submit] strategy.
+        assert_eq!(
+            err_dir("[submit]\nstrategy = \"tiered\"\n"),
+            format!(
+                "{FILE}: submit.strategy must be one of ('merge', 'pr', 'phase'), got 'tiered'"
+            )
+        );
         assert!(
             err_dir("[submit]\nremote = \"\"\n")
                 .contains("submit.remote must be a non-empty string")

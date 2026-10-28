@@ -272,6 +272,40 @@ fn tool_lists_mcp_and_agents_passthrough() {
 }
 
 #[test]
+fn mcp_server_names_select_from_the_project_mcp_json() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let serena = json!({"command": "uvx", "args": ["serena", "start-mcp-server"]});
+    let proto = json!({"type": "http", "url": "https://proto.example/mcp"});
+    std::fs::write(
+        sandbox.path().join(".mcp.json"),
+        json!({"mcpServers": {"serena": serena.clone(), "proto": proto, "other": {"command": "x"}}})
+            .to_string(),
+    )
+    .unwrap();
+    let request = |names: Value| {
+        let mut request = options(&[("mcp_servers", names), ("mcp_strict", json!(true))]);
+        request.working_directory = sandbox.path().to_path_buf();
+        request
+    };
+    let argv = argv(&request(json!(["serena"])));
+    let mcp: Value = serde_json::from_str(&value_after(&argv, "--mcp-config").unwrap()).unwrap();
+    assert_eq!(mcp, json!({"mcpServers": {"serena": serena}}));
+    assert!(argv.contains(&"--strict-mcp-config".to_string()));
+
+    let err = build_cli_plan(&request(json!(["serena", "missing"])))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not declare missing"), "{err}");
+    assert!(err.contains("declared: other, proto, serena"), "{err}");
+
+    let bare = tempfile::tempdir().unwrap();
+    let mut no_file = options(&[("mcp_servers", json!(["serena"]))]);
+    no_file.working_directory = bare.path().to_path_buf();
+    let err = build_cli_plan(&no_file).unwrap_err().to_string();
+    assert!(err.contains("cannot be read"), "{err}");
+}
+
+#[test]
 fn session_resume_flags_use_equals_form() {
     let argv = argv(&options(&[
         ("resume", json!("-abc")),

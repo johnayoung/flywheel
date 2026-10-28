@@ -18,7 +18,8 @@
 //! file-path/JSON string), `sandbox_exec` (object), `hooks` (object, the
 //! settings-file hook schema), `skills` (`"all"` default | list | null),
 //! `allowed_tools`, `disallowed_tools`, `tools`, `setting_sources`,
-//! `add_dirs`, `mcp_servers` (object or string), `mcp_strict`, `agents`
+//! `add_dirs`, `mcp_servers` (object, string, or a list of server names
+//! selected from the working directory's `.mcp.json`), `mcp_strict`, `agents`
 //! (object), `resume`, `session_id`, `fork_session`,
 //! `continue_conversation`, `fallback_model`, `max_budget_usd`, `effort`,
 //! `max_thinking_tokens`, `system_prompt`, `append_system_prompt`,
@@ -70,6 +71,68 @@ fn option_duration(cfg: &AgentConfiguration, key: &str, default: Duration) -> Du
         .filter(|s| s.is_finite() && *s >= 0.0)
         .map(Duration::from_secs_f64)
         .unwrap_or(default)
+}
+
+/// The project MCP config file the CLI auto-loads from the working directory.
+pub const PROJECT_MCP_CONFIG: &str = ".mcp.json";
+
+/// Resolve `mcp_servers` given as a list of server *names* (the
+/// `[sandbox.capabilities.mcp] servers` shape) against the project's
+/// `.mcp.json` in `working_directory`, returning the selected
+/// `mcpServers` entries keyed by name.
+///
+/// The selection is passed to the CLI inline via `--mcp-config`, so under
+/// `mcp_strict` (`--strict-mcp-config`) exactly the named servers load. A
+/// name the project file does not declare, a missing or malformed file, or
+/// a non-string entry is a configuration error: an explicitly requested
+/// server must never be dropped silently.
+pub fn select_project_mcp_servers(
+    working_directory: &std::path::Path,
+    names: &[Value],
+) -> Result<Map<String, Value>, AgentError> {
+    let path = working_directory.join(PROJECT_MCP_CONFIG);
+    let unusable = |detail: String| {
+        AgentError::UnsupportedCapability(format!(
+            "mcp_servers names MCP servers to load from {}, but {detail}",
+            path.display()
+        ))
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| unusable(format!("it cannot be read: {err}")))?;
+    let parsed: Value = serde_json::from_str(&text)
+        .map_err(|err| unusable(format!("it is not valid JSON: {err}")))?;
+    let Some(Value::Object(declared)) = parsed.get("mcpServers") else {
+        return Err(unusable("it has no \"mcpServers\" object".to_string()));
+    };
+    let mut selected = Map::new();
+    let mut missing = Vec::new();
+    for name in names {
+        let Some(name) = name.as_str().filter(|n| !n.is_empty()) else {
+            return Err(unusable(format!(
+                "the entry {name} is not a server name string"
+            )));
+        };
+        match declared.get(name) {
+            Some(server) => {
+                selected.insert(name.to_string(), server.clone());
+            }
+            None => missing.push(name.to_string()),
+        }
+    }
+    if !missing.is_empty() {
+        let mut available: Vec<&str> = declared.keys().map(String::as_str).collect();
+        available.sort_unstable();
+        return Err(unusable(format!(
+            "it does not declare {} (declared: {})",
+            missing.join(", "),
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            }
+        )));
+    }
+    Ok(selected)
 }
 
 /// Build the headless stream-json invocation for one run.
@@ -141,6 +204,13 @@ pub fn build_cli_plan(request: &RunRequest) -> Result<ProcessPlan, AgentError> {
         }
         Some(Value::String(path)) if !path.is_empty() => {
             argv.extend(["--mcp-config".to_string(), path.clone()]);
+        }
+        Some(Value::Array(names)) if !names.is_empty() => {
+            let selected = select_project_mcp_servers(&request.working_directory, names)?;
+            argv.extend([
+                "--mcp-config".to_string(),
+                json!({"mcpServers": selected}).to_string(),
+            ]);
         }
         _ => {}
     }

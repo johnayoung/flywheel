@@ -386,7 +386,7 @@ Target: child environments constructed, not inherited — base safe set (`HOME`,
 
 One canonical `McpServerConfig` (name, command, args, environment, url, transport) that adapters translate into their native launch configuration (`mcpServers`, `mcp_servers`, ...). Config-**file** writing is out of scope for v1; flywheel's committed repo `.mcp.json` remains the operative mechanism.
 
-**Status: not built** (backlog — codex MCP config stays in `~/.codex/config.toml`, untouched by the adapter). Today the claude-code adapter passes an `mcp_servers` object (or config path string) to `--mcp-config` and `mcp_strict` to `--strict-mcp-config`.
+**Status: not built** (backlog — codex MCP config stays in `~/.codex/config.toml`, untouched by the adapter). Today the claude-code adapter resolves `mcp_servers` (a list of names looked up in the sandbox's `.mcp.json`, or an object / config path string) into `--mcp-config` and passes `mcp_strict` as `--strict-mcp-config`.
 
 ## 14. Errors, registry, versioning
 

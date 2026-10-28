@@ -34,7 +34,7 @@ use crate::tui::{
     DAEMON_AUTOPILOT, DAEMON_WORKER, DaemonControl, DaemonState, DaemonStatus, InputBar, InputEvent,
 };
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flywheel_core::invoker_client::{
     CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT,
 };
@@ -160,6 +160,8 @@ pub enum Screen {
 /// `daemons`) make the corresponding verbs degrade to an inline "not
 /// wired" notice when absent so snapshot-only tests stay light.
 pub struct DashboardApp {
+    table_hit: Option<TableHit>,
+    input_area: Rect,
     poll: PollSnapshot,
     poll_interval: Duration,
     session_poll_interval: Duration,
@@ -193,6 +195,8 @@ pub struct DashboardApp {
 impl DashboardApp {
     pub fn new(poll: impl FnMut() -> Result<DashboardSnapshot, String> + 'static) -> Self {
         Self {
+            table_hit: None,
+            input_area: Rect::default(),
             poll: Box::new(poll),
             poll_interval: Duration::from_secs_f64(DEFAULT_POLL_INTERVAL_SECONDS),
             session_poll_interval: Duration::from_secs_f64(DEFAULT_SESSION_POLL_INTERVAL_SECONDS),
@@ -669,6 +673,59 @@ impl DashboardApp {
         }
     }
 
+    // ----- Mouse --------------------------------------------------------------
+
+    /// Route one mouse event (the Textual console's mouse surface): the
+    /// wheel scrolls the scrollable pane on screen, and a left click on a
+    /// table row selects it -- or, on the already-selected row, opens it
+    /// exactly as Enter does. A click on the input bar focuses it. The quit
+    /// prompt is modal, so the mouse is ignored while it is up.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        if self.quit_prompt.is_some() {
+            return;
+        }
+        match self.stack.last_mut() {
+            Some(Screen::Session(session)) => {
+                let action = session.handle_mouse(event);
+                self.handle_session_action(action);
+            }
+            Some(Screen::History(history)) => {
+                let action = history.handle_mouse(event);
+                self.handle_history_action(action);
+            }
+            None => self.handle_dashboard_mouse(event),
+        }
+    }
+
+    fn handle_dashboard_mouse(&mut self, event: MouseEvent) {
+        match event.kind {
+            MouseEventKind::ScrollUp => self.cursor_up(),
+            MouseEventKind::ScrollDown => self.cursor_down(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if rect_contains(self.input_area, event.column, event.row) {
+                    self.set_focus(Focus::Input);
+                    return;
+                }
+                let Some(index) = self
+                    .table_hit
+                    .and_then(|hit| hit.row_at(event.column, event.row))
+                else {
+                    return;
+                };
+                if index >= self.visible.len() {
+                    return;
+                }
+                self.set_focus(Focus::Table);
+                if index == self.cursor {
+                    self.action_open_session();
+                } else {
+                    self.cursor = index;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn cursor_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
@@ -1116,6 +1173,7 @@ impl DashboardApp {
             Constraint::Length(1),
         ])
         .split(area);
+        self.input_area = chunks[7];
 
         frame.render_widget(Paragraph::new(summary), chunks[0]);
         if let Some(bar) = daemon_bar {
@@ -1147,7 +1205,7 @@ impl DashboardApp {
         self.input.render(frame, chunks[7]);
     }
 
-    fn render_table(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_table(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let header = Row::new(
             TABLE_COLUMNS
                 .iter()
@@ -1184,6 +1242,45 @@ impl DashboardApp {
             state.select(Some(self.cursor));
         }
         frame.render_stateful_widget(table, area, &mut state);
+        self.table_hit = Some(TableHit::new(area, state.offset()));
+    }
+}
+
+// --- Mouse hit-testing --------------------------------------------------------------
+
+/// Wheel notches scroll a transcript by this many lines.
+pub const MOUSE_SCROLL_LINES: usize = 3;
+
+/// Whether the cell `(column, row)` lies inside `area`.
+pub fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+/// Where a header-led table was last drawn: its area and the first data
+/// row the render scrolled to. Maps a click back to a data-row index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableHit {
+    pub area: Rect,
+    pub offset: usize,
+}
+
+impl TableHit {
+    pub fn new(area: Rect, offset: usize) -> Self {
+        Self { area, offset }
+    }
+
+    /// The data-row index under `(column, row)`: `None` outside the table
+    /// or on its header line. The caller bounds the index by its row count.
+    pub fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        if !rect_contains(self.area, column, row) {
+            return None;
+        }
+        let line = usize::from(row - self.area.y);
+        // Line 0 is the header row.
+        line.checked_sub(1).map(|data_line| self.offset + data_line)
     }
 }
 
@@ -1921,6 +2018,98 @@ mod tests {
         let mut bare = app_with(vec![row("alpha")]);
         bare.handle_key(key(KeyCode::Enter));
         assert_eq!(bare.screen_depth(), 0);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn mouse_wheel_moves_and_clicks_select_then_open_rows() {
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let probe = Rc::clone(&opened);
+        let snap = snapshot(&[row("alpha"), row("beta"), row("gamma")]);
+        let mut app = DashboardApp::new(move || Ok(snap.clone())).with_open_session(
+            move |run_id, task_id| {
+                probe.borrow_mut().push(run_id.to_owned());
+                Some(SessionScreen::new(
+                    run_id,
+                    task_id,
+                    || Ok(Vec::new()),
+                    || Ok(SessionStatus::new(Some(Status::Running), None)),
+                ))
+            },
+        );
+        app.refresh_now();
+        let mut term = terminal(100, 14);
+        term.draw(|f| app.render(f)).unwrap();
+        // Layout: summary on line 0, the table header on line 1, rows from 2.
+        let text = buffer_text(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].contains("alpha"), "{text}");
+        assert!(lines[4].contains("gamma"), "{text}");
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 3));
+        assert_eq!(app.cursor(), 1);
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 5, 3));
+        assert_eq!(app.cursor(), 0);
+        // A header click and a click below the last row change nothing.
+        app.handle_mouse(click(5, 1));
+        app.handle_mouse(click(5, 8));
+        assert_eq!(app.cursor(), 0);
+        assert!(opened.borrow().is_empty());
+        // First click selects; a click on the selected row opens it.
+        app.handle_mouse(click(5, 4));
+        assert_eq!(app.cursor(), 2);
+        assert!(opened.borrow().is_empty());
+        app.handle_mouse(click(5, 4));
+        assert_eq!(*opened.borrow(), vec!["run-gamma"]);
+        assert_eq!(app.session().map(|s| s.run_id()), Some("run-gamma"));
+        app.handle_key(key(KeyCode::Esc));
+
+        // Clicking the input bar (the last line) focuses it.
+        term.draw(|f| app.render(f)).unwrap();
+        app.handle_mouse(click(3, 13));
+        assert_eq!(app.focus(), Focus::Input);
+        app.handle_mouse(click(5, 2));
+        assert_eq!(app.focus(), Focus::Table);
+        assert_eq!(app.cursor(), 0);
+    }
+
+    #[test]
+    fn mouse_routes_to_pushed_screens_and_is_ignored_under_the_quit_prompt() {
+        let mut app = DashboardApp::new(|| Ok(snapshot(&[])))
+            .with_open_history(|| {
+                Some(HistoryScreen::new(|| Ok(vec![hrow("alpha"), hrow("beta")])))
+            })
+            .with_open_session(|run_id, task_id| {
+                Some(SessionScreen::new(
+                    run_id,
+                    task_id,
+                    || Ok(Vec::new()),
+                    || Ok(SessionStatus::new(Some(Status::Done), None)),
+                ))
+            });
+        app.refresh_now();
+        app.handle_key(key(KeyCode::Char('h')));
+        let mut term = terminal(100, 12);
+        term.draw(|f| app.render(f)).unwrap();
+        // History: title line 0, table header line 1, rows from line 2.
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 3));
+        assert_eq!(app.history().unwrap().cursor(), 1);
+        app.handle_mouse(click(4, 2));
+        assert_eq!(app.history().unwrap().cursor(), 0);
+        app.handle_mouse(click(4, 2));
+        assert_eq!(app.session().map(|s| s.run_id()), Some("run-alpha"));
     }
 
     fn hrow(task_id: &str) -> HistoryRow {

@@ -12,9 +12,9 @@
 //! Pure state plus [`HistoryScreen::render`]: the dashboard owns the
 //! screen stack and interprets the [`HistoryAction`] each key returns.
 
-use crate::dashboard::{format_tokens, table_widths};
+use crate::dashboard::{TableHit, format_tokens, table_widths};
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flywheel_core::lifecycle::Status;
 use flywheel_orchestrator::history::HistoryRow;
 use ratatui::Frame;
@@ -101,6 +101,7 @@ pub struct HistoryScreen {
     cells: Vec<[String; 7]>,
     cursor: usize,
     last_error: Option<String>,
+    table_hit: Option<TableHit>,
 }
 
 impl HistoryScreen {
@@ -113,6 +114,7 @@ impl HistoryScreen {
             cells: Vec::new(),
             cursor: 0,
             last_error: None,
+            table_hit: None,
         };
         screen.reload_now();
         screen
@@ -202,6 +204,38 @@ impl HistoryScreen {
         }
     }
 
+    /// Route one mouse event: the wheel moves the row cursor, and a left
+    /// click selects a row -- or opens the already-selected one, as Enter
+    /// does (the Textual `DataTable` click behaviour).
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> HistoryAction {
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.cursor_up();
+                HistoryAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.cursor_down();
+                HistoryAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = self
+                    .table_hit
+                    .and_then(|hit| hit.row_at(event.column, event.row))
+                    .filter(|index| *index < self.visible_run_order.len())
+                else {
+                    return HistoryAction::None;
+                };
+                if index == self.cursor {
+                    self.open_selected()
+                } else {
+                    self.cursor = index;
+                    HistoryAction::None
+                }
+            }
+            _ => HistoryAction::None,
+        }
+    }
+
     /// Draw the header, the table, and the empty-state / error lines.
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let empty_rows = u16::from(self.rows.is_empty());
@@ -249,6 +283,7 @@ impl HistoryScreen {
             state.select(Some(self.cursor));
         }
         frame.render_stateful_widget(table, chunks[1], &mut state);
+        self.table_hit = Some(TableHit::new(chunks[1], state.offset()));
         if self.rows.is_empty() {
             frame.render_widget(
                 Paragraph::new("(no finished runs)")
@@ -415,5 +450,44 @@ mod tests {
         let cells = row_to_cells(&ungrouped);
         assert_eq!(cells[0], "-");
         assert_eq!(cells[3], "-");
+    }
+
+    #[test]
+    fn mouse_wheel_moves_the_cursor_and_clicks_select_then_open() {
+        let mut screen = HistoryScreen::new(|| {
+            Ok(vec![
+                hrow("alpha", Status::Done),
+                hrow("beta", Status::Failed),
+            ])
+        });
+        let mut term = terminal(100, 10);
+        term.draw(|f| screen.render(f, f.area())).unwrap();
+        let event = |kind, row| MouseEvent {
+            kind,
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(
+            screen.handle_mouse(event(MouseEventKind::ScrollDown, 5)),
+            HistoryAction::None
+        );
+        assert_eq!(screen.cursor(), 1);
+        screen.handle_mouse(event(MouseEventKind::ScrollUp, 5));
+        assert_eq!(screen.cursor(), 0);
+        // The header line and the empty space below the rows are inert.
+        assert_eq!(screen.handle_mouse(event(left, 1)), HistoryAction::None);
+        assert_eq!(screen.handle_mouse(event(left, 7)), HistoryAction::None);
+        assert_eq!(screen.cursor(), 0);
+        assert_eq!(screen.handle_mouse(event(left, 3)), HistoryAction::None);
+        assert_eq!(screen.cursor(), 1);
+        assert_eq!(
+            screen.handle_mouse(event(left, 3)),
+            HistoryAction::OpenSession {
+                run_id: "run-beta".to_owned(),
+                task_id: "beta".to_owned(),
+            }
+        );
     }
 }

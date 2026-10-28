@@ -1,0 +1,1 @@
+../../../docs/team-mode.md

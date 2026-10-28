@@ -1,15 +1,20 @@
 //! The `flywheel docs` / `fw docs` verb: serve the curated operator docs.
 //!
-//! The curated topics are embedded at build time, byte-identical copies of
-//! the canonical `docs/*.md` (`include_str!`), so a topic prints
-//! identically from any working directory and never resolves a path outside
-//! the binary.
+//! The curated topics are embedded at build time (`include_str!`) from
+//! `crates/flywheel/doc_pages/<topic>.md`, each a relative symlink to the
+//! canonical repo-root `docs/<topic>.md`. Repo-root `docs/` stays the single
+//! source of truth for humans; the in-crate symlinks keep every
+//! `include_str!` path inside the crate, so `cargo package` (which
+//! dereferences them into regular files) and `cargo install --git` both
+//! build. A topic prints identically from any working directory and never
+//! resolves a path outside the binary.
 //!
 //! [`TOPICS`] is the single source of truth for the curated set. The bare
 //! listing, the per-topic serving path, and the parity test all consume this
 //! one constant -- there is no second copy of the topic names anywhere.
 //! Adding or renaming a curated doc is a one-line edit here (plus the
-//! matching `include_str!` arm in [`render_topic`]).
+//! matching `include_str!` arm in [`render_topic`] and its
+//! `doc_pages/<topic>.md -> ../../../docs/<topic>.md` symlink).
 //!
 //! Docs are knowledge, not policy: this verb loads no `flywheel.toml` and
 //! touches no store, so it works in a bare directory with nothing
@@ -75,19 +80,20 @@ pub fn is_topic(topic: &str) -> bool {
 }
 
 /// The byte-for-byte content of one curated doc, or `None` for an unknown
-/// topic. Every arm embeds the canonical `docs/<topic>.md` at build time.
+/// topic. Every arm embeds `doc_pages/<topic>.md` (a symlink to the
+/// canonical `docs/<topic>.md`) at build time.
 pub fn render_topic(topic: &str) -> Option<&'static str> {
     let page = match topic {
-        "cli" => include_str!("../../../docs/cli.md"),
-        "configuration" => include_str!("../../../docs/configuration.md"),
-        "task-schema" => include_str!("../../../docs/task-schema.md"),
-        "loop" => include_str!("../../../docs/loop.md"),
-        "workflow" => include_str!("../../../docs/workflow.md"),
-        "strategy" => include_str!("../../../docs/strategy.md"),
-        "sandbox" => include_str!("../../../docs/sandbox.md"),
-        "held-out-gate" => include_str!("../../../docs/held-out-gate.md"),
-        "autopilot" => include_str!("../../../docs/autopilot.md"),
-        "team-mode" => include_str!("../../../docs/team-mode.md"),
+        "cli" => include_str!("../doc_pages/cli.md"),
+        "configuration" => include_str!("../doc_pages/configuration.md"),
+        "task-schema" => include_str!("../doc_pages/task-schema.md"),
+        "loop" => include_str!("../doc_pages/loop.md"),
+        "workflow" => include_str!("../doc_pages/workflow.md"),
+        "strategy" => include_str!("../doc_pages/strategy.md"),
+        "sandbox" => include_str!("../doc_pages/sandbox.md"),
+        "held-out-gate" => include_str!("../doc_pages/held-out-gate.md"),
+        "autopilot" => include_str!("../doc_pages/autopilot.md"),
+        "team-mode" => include_str!("../doc_pages/team-mode.md"),
         _ => return None,
     };
     Some(page)
@@ -186,6 +192,22 @@ mod tests {
                 canonical.display()
             );
         }
+    }
+
+    #[test]
+    fn doc_pages_holds_exactly_the_curated_topics() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("doc_pages");
+        let mut present: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        present.sort_unstable();
+        let mut expected: Vec<String> = topic_names().map(|t| format!("{t}.md")).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            present, expected,
+            "doc_pages/ must hold one {{topic}}.md symlink per TOPICS entry"
+        );
     }
 
     #[test]

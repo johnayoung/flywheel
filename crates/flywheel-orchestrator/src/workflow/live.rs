@@ -4,6 +4,7 @@
 use std::io::Write;
 
 use chrono::{DateTime, Utc};
+use flywheel_core::audit::StopFlag;
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{AttemptStore, LifecycleFilter, LifecycleStore, StoreError, TaskStore};
 use flywheel_core::task::Grader;
@@ -223,8 +224,28 @@ where
 }
 
 /// Print one snapshot (exit 0), or with `--watch N` clear the screen and
-/// refresh every N seconds until the process is interrupted.
+/// refresh every N seconds until the operator presses Ctrl-C, which exits
+/// cleanly with code 0 (the Python verb caught `KeyboardInterrupt` and
+/// returned 0).
 pub fn cmd_live<S>(args: &LiveArgs, store: &S, out: &mut dyn Write) -> Result<i32, WorkflowError>
+where
+    S: LifecycleStore + AttemptStore + TaskStore + ?Sized,
+{
+    let stop = StopFlag::new();
+    if args.watch > 0 {
+        arm_interrupt(stop.clone());
+    }
+    cmd_live_until(args, store, out, &stop)
+}
+
+/// [`cmd_live`] with an explicit stop signal: the `--watch` loop returns
+/// `Ok(0)` as soon as `stop` is set, waking from its refresh sleep.
+pub fn cmd_live_until<S>(
+    args: &LiveArgs,
+    store: &S,
+    out: &mut dyn Write,
+    stop: &StopFlag,
+) -> Result<i32, WorkflowError>
 where
     S: LifecycleStore + AttemptStore + TaskStore + ?Sized,
 {
@@ -233,7 +254,7 @@ where
         snapshot(store, out)?;
         return Ok(0);
     }
-    loop {
+    while !stop.is_set() {
         // ANSI clear+home; falls back to scroll on dumb terminals.
         out.write_all(b"\x1b[2J\x1b[H")?;
         writeln!(
@@ -242,8 +263,32 @@ where
         )?;
         snapshot(store, out)?;
         out.flush()?;
-        std::thread::sleep(std::time::Duration::from_secs(interval as u64));
+        if stop.wait(std::time::Duration::from_secs(interval as u64)) {
+            break;
+        }
     }
+    Ok(0)
+}
+
+/// Arm a Ctrl-C watcher that trips `flag`, so `--watch` ends with exit 0
+/// instead of dying on SIGINT (exit 130). Best effort: when the watcher
+/// cannot be installed, Ctrl-C keeps its default disposition.
+fn arm_interrupt(flag: StopFlag) {
+    let _ = std::thread::Builder::new()
+        .name("live-interrupt".to_owned())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    flag.set();
+                }
+            });
+        });
 }
 
 #[cfg(test)]
@@ -529,6 +574,30 @@ mod tests {
                 "x".repeat(119)
             )
         );
+    }
+
+    #[test]
+    fn watch_loop_exits_zero_when_interrupted() {
+        let store = InMemoryStore::new();
+        let args = LiveArgs {
+            watch: 3600,
+            ..LiveArgs::default()
+        };
+        let stop = StopFlag::new();
+        let trip = stop.clone();
+        let started = std::time::Instant::now();
+        let tripper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            trip.set();
+        });
+        let mut out = Vec::new();
+        assert_eq!(cmd_live_until(&args, &store, &mut out, &stop).unwrap(), 0);
+        tripper.join().unwrap();
+        // The refresh sleep is interruptible: no waiting out the interval.
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("Ctrl-C to exit"), "{rendered}");
+        assert!(rendered.contains("(no in-flight runs)"), "{rendered}");
     }
 
     #[test]

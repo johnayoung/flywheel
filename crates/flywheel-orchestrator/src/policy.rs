@@ -69,6 +69,9 @@ pub const DEFAULT_TRIAGE_INTERVAL_SECONDS: f64 = 300.0;
 
 /// The `[store] backend` vocabulary.
 pub const STORE_BACKENDS: [&str; 2] = ["sqlite", "postgres"];
+/// Valid `[agent] transport` values: every shipped adapter (claude-code,
+/// codex) runs its agent CLI headless; there is no other transport.
+pub const AGENT_TRANSPORTS: [&str; 1] = ["cli"];
 
 /// The `[execution] mode` vocabulary.
 pub const EXECUTION_MODES: [&str; 2] = ["local", "distributed"];
@@ -662,6 +665,20 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
         return Err(ctx.err(
             "agent.transport requires agent.id (the multi-agent opt-in; see docs/agent-harness.md)",
         ));
+    }
+    if let Some(transport) = agent_transport.as_deref()
+        && !AGENT_TRANSPORTS.contains(&transport)
+    {
+        // Rejected here rather than at the first run: every shipped adapter
+        // speaks only the CLI transport, so any other value would fail every
+        // run after the daemon started.
+        return Err(ctx.err(format!(
+            "agent.transport must be one of {}, got {}; the Python-era \"sdk\" transport is \
+             gone (the cli transport speaks the same stream-json control protocol) -- set \
+             transport = \"cli\" or remove the key",
+            py_tuple(&AGENT_TRANSPORTS),
+            py_str_repr(transport)
+        )));
     }
 
     let store = ctx.section(data, "store")?;
@@ -2293,6 +2310,18 @@ mod tests {
                 .contains("agent.model must be a non-empty string")
         );
         assert!(err_dir("[agent]\nid = \"\"\n").contains("agent.id must be a non-empty string"));
+        assert_eq!(
+            err_dir("[agent]\nid = \"claude-code\"\ntransport = \"sdk\"\n"),
+            format!(
+                "{FILE}: agent.transport must be one of ('cli',), got 'sdk'; the Python-era \
+                 \"sdk\" transport is gone (the cli transport speaks the same stream-json \
+                 control protocol) -- set transport = \"cli\" or remove the key"
+            )
+        );
+        assert!(
+            err_dir("[agent]\nid = \"codex\"\ntransport = \"grpc\"\n")
+                .contains("agent.transport must be one of ('cli',), got 'grpc'")
+        );
         assert_eq!(
             err_dir("[agent]\ntransport = \"cli\"\n"),
             format!(

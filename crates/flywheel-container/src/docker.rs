@@ -56,6 +56,140 @@ pub const OWNER_LABEL_VALUE: &str = "1";
 /// containers. Consumers import this rather than re-deriving the string.
 pub const OWNER_LABEL_SELECTOR: &str = "label=flywheel.owner";
 
+// --- owning-process identity -------------------------------------------------
+// Several flywheel processes may share one Docker daemon (a worker pool, an
+// autopilot, workers for other repos, other hosts on a remote daemon). The
+// startup reap must remove only containers whose owning process is provably
+// dead, so every container also records who started it: the host name, the
+// pid, and (on Linux) the process start time, which guards against a recycled
+// pid. A container from another host is never reaped -- its owner's liveness
+// cannot be observed from here. A legacy container carrying the presence
+// marker but no owner identity (started before these labels existed) is
+// reaped as before.
+
+/// Label: the host name of the process that started the container.
+pub const OWNER_HOST_LABEL: &str = "flywheel.owner-host";
+/// Label: the pid of the process that started the container.
+pub const OWNER_PID_LABEL: &str = "flywheel.owner-pid";
+/// Label: the owning process's start time (`/proc/<pid>/stat` field 22, in
+/// clock ticks since boot); absent where `/proc` is unavailable.
+pub const OWNER_START_LABEL: &str = "flywheel.owner-start";
+
+/// Who started a container: host, pid, and (when observable) start time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerIdentity {
+    pub host: String,
+    pub pid: u32,
+    pub start: Option<String>,
+}
+
+impl OwnerIdentity {
+    /// This process's identity.
+    pub fn current() -> Self {
+        let pid = std::process::id();
+        Self {
+            host: local_hostname(),
+            pid,
+            start: process_start_time(pid),
+        }
+    }
+
+    /// The owner labels to stamp on a container this identity starts.
+    pub fn labels(&self) -> BTreeMap<String, String> {
+        let mut labels = BTreeMap::from([
+            (OWNER_HOST_LABEL.to_owned(), self.host.clone()),
+            (OWNER_PID_LABEL.to_owned(), self.pid.to_string()),
+        ]);
+        if let Some(start) = &self.start {
+            labels.insert(OWNER_START_LABEL.to_owned(), start.clone());
+        }
+        labels
+    }
+}
+
+/// This host's name (`gethostname(2)`); empty if it cannot be read.
+pub fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for `buf.len()` bytes and gethostname
+    // writes at most that many.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// A process's start time: field 22 of `/proc/<pid>/stat`, read after the
+/// parenthesised command name (which may itself contain spaces or `)`).
+/// `None` when the process is gone or `/proc` is unavailable.
+pub fn process_start_time(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // Fields after the command name start at field 3 (state), so field 22
+    // is the 20th whitespace-separated token here.
+    after_comm.split_whitespace().nth(19).map(str::to_owned)
+}
+
+/// Whether `pid` names a live process on this host (`kill(pid, 0)`: success
+/// or `EPERM` means it exists).
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence/permission check.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// One flywheel-owned container as `docker ps` reports it, with whatever
+/// owner identity labels it carries (empty when absent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedContainer {
+    pub name: String,
+    pub owner_host: String,
+    pub owner_pid: String,
+    pub owner_start: String,
+}
+
+impl OwnedContainer {
+    /// Whether the startup reap may remove this container, judged from
+    /// `local_host`: a legacy container without owner labels is reapable;
+    /// a container from another host never is; otherwise it is reapable
+    /// only when its owner is provably dead -- the pid is not alive, or the
+    /// recorded start time no longer matches the live process (a recycled
+    /// pid). Unparseable owner labels are not proof of death, so they keep.
+    pub fn owner_is_dead(
+        &self,
+        local_host: &str,
+        alive: &dyn Fn(u32) -> bool,
+        start_of: &dyn Fn(u32) -> Option<String>,
+    ) -> bool {
+        if self.owner_host.is_empty() && self.owner_pid.is_empty() {
+            return true;
+        }
+        if self.owner_host != local_host {
+            return false;
+        }
+        let Ok(pid) = self.owner_pid.parse::<u32>() else {
+            return false;
+        };
+        if !alive(pid) {
+            return true;
+        }
+        if self.owner_start.is_empty() {
+            return false;
+        }
+        match start_of(pid) {
+            Some(start) => start != self.owner_start,
+            None => false,
+        }
+    }
+}
+
 /// Poll interval for the deadline-bounded child wait.
 const WAIT_POLL: Duration = Duration::from_millis(10);
 
@@ -598,6 +732,12 @@ impl Docker {
             .labels
             .entry(OWNER_LABEL.to_owned())
             .or_insert_with(|| OWNER_LABEL_VALUE.to_owned());
+        // The owner identity the startup reap judges liveness by. A caller
+        // that supplies its own (a supervisor starting on a child's behalf)
+        // keeps it.
+        for (key, value) in OwnerIdentity::current().labels() {
+            labelled.labels.entry(key).or_insert(value);
+        }
         let out = self.run(build_run_argv(&labelled), timeout)?;
         Ok(out.trim().to_owned())
     }
@@ -824,16 +964,59 @@ impl Docker {
             .collect())
     }
 
+    /// Every flywheel-owned container with its owner identity labels.
+    ///
+    /// Same selection and failure contract as
+    /// [`Docker::list_owned_containers`]; a missing label reads as empty.
+    pub fn list_owned_container_owners(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<OwnedContainer>, DockerError> {
+        let format = format!(
+            "{{{{.Names}}}}\t{{{{.Label \"{OWNER_HOST_LABEL}\"}}}}\t{{{{.Label \"{OWNER_PID_LABEL}\"}}}}\t{{{{.Label \"{OWNER_START_LABEL}\"}}}}"
+        );
+        let argv = vec![
+            "docker".to_owned(),
+            "ps".to_owned(),
+            "-a".to_owned(),
+            "--filter".to_owned(),
+            OWNER_LABEL_SELECTOR.to_owned(),
+            "--format".to_owned(),
+            format,
+        ];
+        let Some(out) = self.run_best_effort(argv, timeout)? else {
+            return Ok(Vec::new());
+        };
+        Ok(out
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t').map(str::trim);
+                let name = fields.next().filter(|n| !n.is_empty())?;
+                let mut next = || fields.next().unwrap_or("").to_owned();
+                Some(OwnedContainer {
+                    name: name.to_owned(),
+                    owner_host: next(),
+                    owner_pid: next(),
+                    owner_start: next(),
+                })
+            })
+            .collect())
+    }
+
     /// Force-remove every flywheel-owned orphan container; return their names.
     ///
     /// The startup backstop for the SIGKILL/OOM case the exit-time registry
     /// cannot cover: a killed worker's exit hook never ran, so its labelled
     /// container survives. This scans for flywheel-owned containers
-    /// ([`Docker::list_owned_containers`]) and `docker rm -f`s each orphan,
-    /// every one whose name is not in `active` (the containers a live worker
-    /// in THIS process still owns; see [`CleanupRegistry::active_names`]).
-    /// Unrelated, non-flywheel containers are invisible to the owner-label
-    /// filter and are never touched.
+    /// ([`Docker::list_owned_container_owners`]) and `docker rm -f`s each one
+    /// whose owning process is provably dead on this host (see
+    /// [`OwnedContainer::owner_is_dead`]) and that is not in `active` (the
+    /// containers THIS process still owns; see
+    /// [`CleanupRegistry::active_names`]). A sibling worker's live sandbox,
+    /// and any container started from another host, is left alone. A legacy
+    /// container without owner labels is reaped. Unrelated, non-flywheel
+    /// containers are invisible to the owner-label filter and are never
+    /// touched.
     ///
     /// Best-effort per container: an ordinary removal failure is swallowed
     /// inside [`Docker::force_remove_container`] so one wedged container does
@@ -844,13 +1027,16 @@ impl Docker {
         active: &BTreeSet<String>,
         timeout: Option<Duration>,
     ) -> Result<Vec<String>, DockerError> {
+        let local_host = local_hostname();
         let mut reaped = Vec::new();
-        for name in self.list_owned_containers(timeout)? {
-            if active.contains(&name) {
+        for container in self.list_owned_container_owners(timeout)? {
+            if active.contains(&container.name)
+                || !container.owner_is_dead(&local_host, &pid_alive, &process_start_time)
+            {
                 continue;
             }
-            self.force_remove_container(&name, timeout)?;
-            reaped.push(name);
+            self.force_remove_container(&container.name, timeout)?;
+            reaped.push(container.name);
         }
         Ok(reaped)
     }
@@ -968,10 +1154,12 @@ pub fn flush_cleanup_registry() {
 /// never covers (spec 00071 #5). Called by the worker at boot.
 ///
 /// The scan selects strictly on the shared flywheel-owner label, so
-/// unrelated containers are never touched, and the reap excludes any
-/// container this live process still owns. Best-effort: a docker error (e.g.
-/// the daemon is absent, or wedged) is logged and swallowed so the worker
-/// still starts.
+/// unrelated containers are never touched, and it removes only containers
+/// whose owning process is provably dead on this host (plus legacy ones
+/// without owner labels): a sibling worker's, an autopilot's, or another
+/// host's live sandbox survives, as does anything this process still owns.
+/// Best-effort: a docker error (e.g. the daemon is absent, or wedged) is
+/// logged and swallowed so the worker still starts.
 pub fn reap_container_orphans(log: &dyn Fn(&str)) {
     reap_container_orphans_with(&Docker::new(), log);
 }
@@ -1298,6 +1486,11 @@ mod tests {
             Some(OWNER_LABEL_VALUE)
         );
         assert!(selects(OWNER_LABEL_SELECTOR, &labels));
+        // The owner identity the startup reap judges liveness by.
+        let me = OwnerIdentity::current();
+        for (key, value) in me.labels() {
+            assert_eq!(labels.get(&key), Some(&value), "{key}");
+        }
     }
 
     #[test]
@@ -1472,30 +1665,94 @@ mod tests {
         assert!(docker.list_owned_containers(FAST).unwrap().is_empty());
     }
 
+    /// A pid that is provably dead: a child that has already been reaped.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid));
+        pid
+    }
+
     #[test]
-    fn reap_skips_active_names_and_force_removes_the_rest() {
+    fn reap_removes_only_containers_whose_owner_is_provably_dead() {
         let dir = tempfile::tempdir().unwrap();
-        let body = r#"case "$1" in ps) printf 'keep\nreap-me\n\n' ;; esac"#;
-        let (docker, log) = scripted_docker(dir.path(), body);
-        let active = BTreeSet::from(["keep".to_owned()]);
+        let host = local_hostname();
+        let me = std::process::id();
+        let my_start = process_start_time(me).unwrap_or_default();
+        let dead = dead_pid();
+        let listing = [
+            "keep-legacy-active\t\t\t".to_owned(),
+            "reap-legacy\t\t\t".to_owned(),
+            format!("keep-other-host\t{host}-elsewhere\t{dead}\t"),
+            format!("reap-dead-owner\t{host}\t{dead}\t"),
+            format!("keep-live-owner\t{host}\t{me}\t{my_start}"),
+            format!("keep-garbled-pid\t{host}\tnot-a-pid\t"),
+        ];
+        let listing_file = dir.path().join("ps.out");
+        std::fs::write(&listing_file, listing.join("\n") + "\n").unwrap();
+        let body = format!(
+            r#"case "$1" in ps) cat '{}' ;; esac"#,
+            listing_file.display()
+        );
+        let (docker, log) = scripted_docker(dir.path(), &body);
+        let active = BTreeSet::from(["keep-legacy-active".to_owned()]);
         assert_eq!(
             docker.reap_orphan_containers(&active, FAST).unwrap(),
-            vec!["reap-me"]
+            vec!["reap-legacy", "reap-dead-owner"]
         );
         let calls = recorded_calls(&log);
         assert_eq!(
-            calls[0],
-            sv(&[
-                "ps",
-                "-a",
-                "--filter",
-                OWNER_LABEL_SELECTOR,
-                "--format",
-                "{{.Names}}"
-            ])
+            &calls[0][..5],
+            &sv(&["ps", "-a", "--filter", OWNER_LABEL_SELECTOR, "--format"])
         );
-        assert_eq!(calls[1], sv(&["rm", "-f", "reap-me"]));
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], sv(&["rm", "-f", "reap-legacy"]));
+        assert_eq!(calls[2], sv(&["rm", "-f", "reap-dead-owner"]));
+        assert_eq!(calls.len(), 3);
+    }
+
+    #[test]
+    fn owner_liveness_rules() {
+        let container = |host: &str, pid: &str, start: &str| OwnedContainer {
+            name: "c".to_owned(),
+            owner_host: host.to_owned(),
+            owner_pid: pid.to_owned(),
+            owner_start: start.to_owned(),
+        };
+        let alive = |pid: u32| pid == 42;
+        let start_of = |pid: u32| (pid == 42).then(|| "1000".to_owned());
+        // Legacy: no owner identity at all.
+        assert!(container("", "", "").owner_is_dead("h", &alive, &start_of));
+        // Another host: never provably dead from here.
+        assert!(!container("other", "7", "").owner_is_dead("h", &alive, &start_of));
+        // Same host, dead pid.
+        assert!(container("h", "7", "").owner_is_dead("h", &alive, &start_of));
+        // Same host, live pid, matching or unrecorded start time.
+        assert!(!container("h", "42", "1000").owner_is_dead("h", &alive, &start_of));
+        assert!(!container("h", "42", "").owner_is_dead("h", &alive, &start_of));
+        // Same host, live pid, different start time: the pid was recycled.
+        assert!(container("h", "42", "999").owner_is_dead("h", &alive, &start_of));
+        // Unparseable pid is not proof of death.
+        assert!(!container("h", "x", "").owner_is_dead("h", &alive, &start_of));
+    }
+
+    #[test]
+    fn owner_identity_reads_this_process() {
+        let me = OwnerIdentity::current();
+        assert_eq!(me.pid, std::process::id());
+        assert!(!me.host.is_empty());
+        assert!(pid_alive(me.pid));
+        if std::path::Path::new("/proc/self/stat").exists() {
+            assert_eq!(me.start, process_start_time(me.pid));
+            assert!(
+                me.start
+                    .as_deref()
+                    .is_some_and(|s| s.parse::<u64>().is_ok())
+            );
+        }
+        let labels = me.labels();
+        assert_eq!(labels[OWNER_PID_LABEL], me.pid.to_string());
+        assert_eq!(labels[OWNER_HOST_LABEL], me.host);
     }
 
     #[test]
@@ -1870,36 +2127,72 @@ mod tests {
     }
 
     #[test]
-    fn live_owned_containers_are_listed_and_reaped_by_label() {
+    fn live_reap_spares_live_owners_and_removes_dead_ones() {
         require_docker!();
         let _daemon = live_lock();
         let docker = Docker::new();
         let timeout = default_management_timeout();
-        let name = unique_name("flywheel-test");
-        docker
-            .start_container(
-                &RunSpec::new(&name, ALPINE).with_command(sv(&["sleep", "infinity"])),
-                Some(DEFAULT_START_TIMEOUT),
-            )
+        let host = local_hostname();
+        // A live foreign owner: another process on this host.
+        let mut sibling = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
             .unwrap();
-        let owned = docker.list_owned_containers(timeout).unwrap();
-        assert!(owned.contains(&name));
-        // Only this test's container is an orphan here: every other owned
-        // container on the daemon is treated as active so a live worker's
-        // sandbox on the same machine is never touched.
-        let active: BTreeSet<String> = owned.into_iter().filter(|n| *n != name).collect();
-        assert_eq!(
-            docker.reap_orphan_containers(&active, timeout).unwrap(),
-            vec![name.clone()]
+        let owned_by = |pid: u32, start: Option<String>| {
+            OwnerIdentity {
+                host: host.clone(),
+                pid,
+                start,
+            }
+            .labels()
+        };
+        let live_foreign = unique_name("flywheel-test");
+        let dead_owner = unique_name("flywheel-test");
+        let mine = unique_name("flywheel-test");
+        let start = |name: &str, labels: BTreeMap<String, String>| {
+            docker
+                .start_container(
+                    &RunSpec::new(name, ALPINE)
+                        .with_command(sv(&["sleep", "infinity"]))
+                        .with_labels(labels),
+                    Some(DEFAULT_START_TIMEOUT),
+                )
+                .unwrap();
+        };
+        start(
+            &live_foreign,
+            owned_by(sibling.id(), process_start_time(sibling.id())),
         );
-        assert!(
-            !docker
-                .list_owned_containers(timeout)
-                .unwrap()
-                .contains(&name)
-        );
+        start(&dead_owner, owned_by(dead_pid(), None));
+        start(&mine, BTreeMap::new());
+
+        let owners = docker.list_owned_container_owners(timeout).unwrap();
+        let ours = |name: &str| owners.iter().find(|c| c.name == name).cloned().unwrap();
+        assert_eq!(ours(&mine).owner_pid, std::process::id().to_string());
+        assert_eq!(ours(&mine).owner_host, host);
+        assert_eq!(ours(&live_foreign).owner_pid, sibling.id().to_string());
+
+        // Every other process's container stays out of this reap, whatever
+        // code started it, so a concurrent run on this daemon is untouched.
+        let test_names = [&live_foreign, &dead_owner, &mine];
+        let active: BTreeSet<String> = owners
+            .iter()
+            .map(|c| c.name.clone())
+            .filter(|n| !test_names.contains(&n))
+            .collect();
+        let reaped = docker.reap_orphan_containers(&active, timeout).unwrap();
+        assert_eq!(reaped, vec![dead_owner.clone()]);
+        let remaining = docker.list_owned_containers(timeout).unwrap();
+        assert!(remaining.contains(&live_foreign));
+        assert!(remaining.contains(&mine));
+        assert!(!remaining.contains(&dead_owner));
+
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+        docker.remove_container(&live_foreign, timeout).unwrap();
+        docker.remove_container(&mine, timeout).unwrap();
         // remove_container on an already-gone container is a clean no-op.
-        docker.remove_container(&name, timeout).unwrap();
+        docker.remove_container(&dead_owner, timeout).unwrap();
     }
 
     #[test]

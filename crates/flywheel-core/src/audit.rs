@@ -1201,6 +1201,17 @@ pub fn resolve_policy(args: &AuditArgs) -> Result<(Box<dyn Redactor>, String), P
     custom.sort_unstable();
     custom.dedup();
     let listed: Vec<String> = builtin.into_iter().chain(custom).map(py_repr).collect();
+    if name.contains(':') {
+        // The Python CLI imported `module.sub:factory` at run time; a
+        // compiled binary has no importable modules, so say so instead of
+        // reporting the dotted path as a mistyped built-in name.
+        return Err(PolicyError(format!(
+            "--redact-policy {}: dotted-path policy factories ('module.sub:factory') are not \
+             supported; expected one of [{}]",
+            py_repr(name),
+            listed.join(", ")
+        )));
+    }
     Err(PolicyError(format!(
         "unknown built-in policy {}; expected one of [{}] or a registered custom policy",
         py_repr(name),
@@ -2732,6 +2743,18 @@ mod tests {
         assert_eq!(
             err,
             "error: unknown built-in policy 'other'; expected one of ['default', 'strict', \"it's:broken\"] or a registered custom policy\n"
+        );
+
+        // A Python dotted-path factory is rejected with the supported names.
+        let mut dotted = AuditArgs::new("run-cli");
+        dotted.redact_policy = Some("mypkg.redact:build".to_owned());
+        let (code, out, err) = cli(&dotted, &store, dir.path());
+        assert_eq!(code, 2);
+        assert_eq!(out, "");
+        assert_eq!(
+            err,
+            "error: --redact-policy 'mypkg.redact:build': dotted-path policy factories \
+             ('module.sub:factory') are not supported; expected one of ['default', 'strict']\n"
         );
 
         // Built-in names resolve even when custom policies are registered.

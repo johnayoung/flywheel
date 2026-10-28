@@ -28,6 +28,7 @@ pub mod loaders;
 pub mod loop_guard;
 pub mod loop_path_marker;
 pub mod notifier;
+pub mod pg_tls;
 pub mod prompt;
 pub mod recovery_summarizer;
 pub mod redaction;

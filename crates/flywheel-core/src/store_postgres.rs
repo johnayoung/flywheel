@@ -64,7 +64,7 @@ use chrono::{DateTime, Utc};
 use postgres::error::SqlState;
 use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::{FromSql, ToSql};
-use postgres::{Client, GenericClient, NoTls, Row};
+use postgres::{Client, GenericClient, Row};
 use serde_json::{Map, Value};
 
 use crate::event_serde::{
@@ -409,6 +409,8 @@ impl Drop for Listener {
 /// its own transaction unless a verb opens an explicit transaction).
 pub struct PostgresStore {
     client: Mutex<Client>,
+    /// Kept to heal a closed connection; never logged or echoed.
+    dsn: String,
     schema: String,
     channel: String,
     notifier: Arc<RunNotifier>,
@@ -452,7 +454,8 @@ impl PostgresStore {
             .notifier
             .clone()
             .unwrap_or_else(|| Arc::new(RunNotifier::new()));
-        let mut client = Client::connect(dsn, NoTls).map_err(db)?;
+        let (config, tls) = crate::pg_tls::configure(dsn).map_err(StoreError::backend)?;
+        let mut client = config.connect(tls).map_err(db)?;
         // Pin the search_path for the session so unqualified DDL/DML
         // resolves under the store's schema without embedding the name in
         // every statement (the Python store's per-connection configure).
@@ -465,6 +468,7 @@ impl PostgresStore {
             .then(|| start_listener(dsn, &channel, &notifier));
         Ok(Self {
             client: Mutex::new(client),
+            dsn: dsn.to_owned(),
             schema,
             channel,
             notifier,
@@ -504,7 +508,9 @@ impl PostgresStore {
     /// orchestrator's own tables) and for inspection; the store's own
     /// invariants are not re-checked on whatever `f` does.
     pub fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
-        let mut client = self.lock();
+        let mut client = self.raw_lock();
+        // Best-effort heal; a still-dead connection surfaces through `f`.
+        let _ = crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema));
         f(&mut client)
     }
 
@@ -518,10 +524,19 @@ impl PostgresStore {
         client.close().map_err(db)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Client> {
+    fn raw_lock(&self) -> MutexGuard<'_, Client> {
         self.client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The connection under the store's lock, reconnected first when the
+    /// previous one was observed closed.
+    fn lock(&self) -> Result<MutexGuard<'_, Client>, StoreError> {
+        let mut client = self.raw_lock();
+        crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema))
+            .map_err(StoreError::backend)?;
+        Ok(client)
     }
 }
 
@@ -621,8 +636,12 @@ fn start_listener(dsn: &str, channel: &str, notifier: &Arc<RunNotifier>) -> List
 /// Runs on its own autocommit connection (`LISTEN` must be outside a
 /// transaction). Re-checks the stop flag every [`LISTEN_POLL`] between
 /// notification drains so dropping the store cancels promptly. Best-effort:
-/// a connection failure is recorded in the listener state and the consumer
-/// degrades to its bounded poll, never hangs.
+/// a failure to establish the first subscription is recorded in the
+/// listener state and the consumer degrades to its bounded poll, never
+/// hangs. Once listening, a dropped connection is re-established (and
+/// `LISTEN` re-issued) every [`LISTEN_RETRY_DELAY`] until it succeeds or
+/// the store is dropped; notifications sent while disconnected are covered
+/// by the consumers' bounded poll.
 fn run_listener(
     dsn: &str,
     channel: &str,
@@ -630,21 +649,26 @@ fn run_listener(
     stop: &AtomicBool,
     state: &(Mutex<ListenerState>, Condvar),
 ) {
-    let mut client = match Client::connect(dsn, NoTls) {
+    let mut client = match subscribe(dsn, channel) {
         Ok(client) => client,
-        Err(err) => {
-            Listener::set_state(state, ListenerState::Failed(describe_error(&err)));
+        Err(reason) => {
+            Listener::set_state(state, ListenerState::Failed(reason));
             return;
         }
     };
-    if let Err(err) = client.batch_execute(&format!("LISTEN \"{channel}\"")) {
-        Listener::set_state(state, ListenerState::Failed(describe_error(&err)));
-        return;
-    }
     // Signal readiness only after LISTEN is in effect, so a producer that
     // coordinates on this never issues a NOTIFY the listener would miss.
     Listener::set_state(state, ListenerState::Listening);
     while !stop.load(Ordering::SeqCst) {
+        if client.is_closed() {
+            match subscribe(dsn, channel) {
+                Ok(fresh) => client = fresh,
+                Err(_) => {
+                    std::thread::sleep(LISTEN_RETRY_DELAY);
+                    continue;
+                }
+            }
+        }
         let mut notifications = client.notifications();
         let mut drain = notifications.timeout_iter(LISTEN_POLL);
         loop {
@@ -666,6 +690,19 @@ fn run_listener(
             }
         }
     }
+}
+
+/// One connection with `LISTEN` on `channel` in effect, or the sanitized
+/// reason it could not be established.
+fn subscribe(dsn: &str, channel: &str) -> Result<Client, String> {
+    let mut client = crate::pg_tls::connect(dsn).map_err(|err| match err {
+        crate::pg_tls::ConnectError::Postgres(err) => describe_error(&err),
+        crate::pg_tls::ConnectError::Tls(err) => err.to_string(),
+    })?;
+    client
+        .batch_execute(&format!("LISTEN \"{channel}\""))
+        .map_err(|err| describe_error(&err))?;
+    Ok(client)
 }
 
 /// Translate a `"<run_id>:<sequence>"` payload into a notifier signal; a
@@ -1476,7 +1513,7 @@ fn control_command_from_row(row: &Row) -> Result<ControlCommandRecord, StoreErro
 
 impl LifecycleStore for PostgresStore {
     fn create_lifecycle(&self, lifecycle: &Lifecycle) -> Result<(), StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         let mut tx = client.transaction().map_err(db)?;
         insert_lifecycle(&mut tx, lifecycle)?;
         tx.commit().map_err(db)
@@ -1487,22 +1524,22 @@ impl LifecycleStore for PostgresStore {
         lifecycle: &Lifecycle,
         expected_version: u64,
     ) -> Result<(), StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         update_lifecycle_row(&mut *client, lifecycle, expected_version)
     }
 
     fn load_lifecycle(&self, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         load_lifecycle_row(&mut *client, run_id, false)
     }
 
     fn list_lifecycles(&self, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         list_lifecycle_rows(&mut *client, filter)
     }
 
     fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         summarize_spend_rows(&mut *client, window)
     }
 }
@@ -1519,7 +1556,7 @@ impl TaskStore for PostgresStore {
         let column = |key: &str| definition.get(key).cloned().unwrap_or(Value::Null);
         let (graders_json, tags_json, context_json) =
             (column("graders"), column("tags"), column("context"));
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         // One transaction so the identity row and the version row land
         // together. The version row is immutable (ON CONFLICT DO NOTHING
         // keeps the original created_at); the whole definition is part of
@@ -1556,12 +1593,12 @@ impl TaskStore for PostgresStore {
         task_id: &str,
         content_hash: Option<&str>,
     ) -> Result<Option<Task>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         load_task_row(&mut *client, task_id, content_hash)
     }
 
     fn load_task_for_run(&self, run_id: &str) -> Result<Option<Task>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         let pinned = client
             .query_opt(
                 "SELECT task_id, task_content_hash FROM lifecycles WHERE run_id = $1",
@@ -1615,7 +1652,7 @@ impl DomainEventStore for PostgresStore {
         expected_version: u64,
     ) -> Result<Lifecycle, StoreError> {
         let (folded, sequence) = {
-            let mut client = self.lock();
+            let mut client = self.lock()?;
             // One transaction: the version check, projection writes and
             // event-row append are atomic, and SELECT ... FOR UPDATE on the
             // lifecycle row keeps a concurrent appender from interleaving.
@@ -1656,7 +1693,7 @@ impl DomainEventStore for PostgresStore {
     }
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         list_domain_event_rows(&mut *client, run_id)
     }
 }
@@ -1668,7 +1705,7 @@ impl AttemptStore for PostgresStore {
         attempt: &Attempt,
         expected_version: Option<u64>,
     ) -> Result<(), StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         let Some(expected) = expected_version else {
             // Unconditional upsert: a direct caller's write, or the
             // domain-event projection (already inside the version-checked
@@ -1690,12 +1727,12 @@ impl AttemptStore for PostgresStore {
     }
 
     fn load_attempt(&self, run_id: &str, number: u32) -> Result<Option<Attempt>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         load_attempt_row(&mut *client, run_id, number)
     }
 
     fn list_attempts(&self, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         list_attempt_rows(&mut *client, run_id)
     }
 }
@@ -1705,7 +1742,7 @@ impl GraderResultStore for PostgresStore {
         &self,
         result: &GraderResultRecord,
     ) -> Result<GraderResultRecord, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         insert_grader_result(&mut *client, result)
     }
 
@@ -1714,7 +1751,7 @@ impl GraderResultStore for PostgresStore {
         run_id: &str,
         attempt_number: u32,
     ) -> Result<Vec<GraderResultRecord>, StoreError> {
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         list_grader_result_rows(&mut *client, run_id, attempt_number)
     }
 }
@@ -1732,7 +1769,7 @@ impl ControlCommandStore for PostgresStore {
         // enqueue-order key claim_commands consumes.
         let payload_json = Value::Object(payload.clone());
         let id: i64 = {
-            let mut client = self.lock();
+            let mut client = self.lock()?;
             let row = client
                 .query_one(
                     "INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at, claimed_at)
@@ -1759,7 +1796,7 @@ impl ControlCommandStore for PostgresStore {
         // RETURNING yields rows in arbitrary order; sort by id afterwards to
         // honor the enqueue-order contract.
         let rows = {
-            let mut client = self.lock();
+            let mut client = self.lock()?;
             client
                 .query(
                     "UPDATE control_commands SET claimed_at = $1
@@ -1786,7 +1823,7 @@ impl ControlCommandStore for PostgresStore {
         // Queue hygiene (spec 00025 FR-10): the consumer deletes an applied
         // row only after the steering domain event committed. Unknown ids
         // are a no-op by contract.
-        let mut client = self.lock();
+        let mut client = self.lock()?;
         client
             .execute("DELETE FROM control_commands WHERE id = $1", &[&command_id])
             .map_err(db)?;

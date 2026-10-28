@@ -18,6 +18,9 @@ sha2.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
 postgres.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-postgres-rustls.workspace = true
 tokio.workspace = true
 regex.workspace = true
 

@@ -286,6 +286,9 @@ Secrets and connection strings live in the environment, never in `flywheel.toml`
 | `DATABASE_URL` | Postgres DSN (fallback) | `_store_factory.py:35`; used only when `FLYWHEEL_PG_DSN` is unset |
 | `FLYWHEEL_DB` | SQLite store path fallback | fallback for `--db` (audit CLI, `flywheel_core/audit/_cli.py:119`); empty value treated as unset |
 | `ANTHROPIC_API_KEY` | raw API-key auth for the agent | `_auth.py:29`; in `api_key` container auth mode the token is read from this name |
+| `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | Postgres TLS defaults | used only when the DSN omits the matching keyword |
+
+Postgres TLS follows libpq: `sslmode` defaults to `prefer`; `verify-ca`/`verify-full` need `sslrootcert` (a PEM file, `~/.postgresql/root.crt`, or `system` for the platform store, which forces `verify-full`). Example: `postgresql://u:p@db.example.com/app?sslmode=verify-full&sslrootcert=system`.
 
 ## What `flywheel init` scaffolds
 

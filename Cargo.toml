@@ -15,7 +15,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -26,11 +26,11 @@ keywords = ["ai", "agents", "orchestration", "claude", "automation"]
 categories = ["development-tools", "command-line-utilities"]
 
 [workspace.dependencies]
-flywheel-agents = { path = "crates/flywheel-agents", version = "0.6.0" }
-flywheel-core = { path = "crates/flywheel-core", version = "0.6.0" }
-flywheel-orchestrator = { path = "crates/flywheel-orchestrator", version = "0.6.0" }
-flywheel-worktree = { path = "crates/flywheel-worktree", version = "0.6.0" }
-flywheel-container = { path = "crates/flywheel-container", version = "0.6.0" }
+flywheel-agents = { path = "crates/flywheel-agents", version = "0.6.1" }
+flywheel-core = { path = "crates/flywheel-core", version = "0.6.1" }
+flywheel-orchestrator = { path = "crates/flywheel-orchestrator", version = "0.6.1" }
+flywheel-worktree = { path = "crates/flywheel-worktree", version = "0.6.1" }
+flywheel-container = { path = "crates/flywheel-container", version = "0.6.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"

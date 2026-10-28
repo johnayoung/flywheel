@@ -518,6 +518,7 @@ dependencies = [
  "flywheel-core",
  "flywheel-orchestrator",
  "flywheel-worktree",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

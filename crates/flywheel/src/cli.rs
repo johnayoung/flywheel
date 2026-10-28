@@ -242,6 +242,25 @@ pub fn run_with(argv: Vec<String>, bindings: ShellBindings) -> i32 {
 /// orchestrator, and daemon entries write to the process stdio directly.
 /// Unknown verbs exit 2 (argparse convention) with a stderr line pointing
 /// at `fw --help`.
+/// One-shot, read-only verbs: they spawn no agents or graders, so a closed
+/// stdout (`fw status | head`) may end them the way it ends any Unix filter.
+const READ_ONLY_VERBS: [&str; 7] = [
+    "status", "live", "history", "show", "validate", AUDIT_VERB, DOCS_VERB,
+];
+
+/// Restore the default SIGPIPE disposition (the Rust runtime ignores it, so
+/// a closed pipe otherwise surfaces as an `error: Broken pipe` line). Only
+/// for [`READ_ONLY_VERBS`]: daemons keep ignoring SIGPIPE so a vanished
+/// reader can never kill a worker mid-run and orphan its process groups.
+fn exit_quietly_on_closed_stdout() {
+    #[cfg(unix)]
+    // SAFETY: resetting a signal disposition to its default has no
+    // preconditions; no handler is installed for SIGPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 pub fn route(
     args: &[String],
     bindings: &ShellBindings,
@@ -264,6 +283,9 @@ pub fn route(
     }
     let verb = first.as_str();
     let rest = &args[1..];
+    if READ_ONLY_VERBS.contains(&verb) {
+        exit_quietly_on_closed_stdout();
+    }
 
     if ORCHESTRATOR_VERBS.contains(&verb) || HIDDEN_ORCHESTRATOR_VERBS.contains(&verb) {
         return orchestrator_workflow::main(args, &bindings.verbs());

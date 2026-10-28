@@ -6,12 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
 
 [dependencies]
-flywheel-core = { path = "../flywheel-core" }
-flywheel-orchestrator = { path = "../flywheel-orchestrator" }
-flywheel-agents = { path = "../flywheel-agents" }
-flywheel-container = { path = "../flywheel-container" }
+flywheel-core.workspace = true
+flywheel-orchestrator.workspace = true
+flywheel-agents.workspace = true
+flywheel-container.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

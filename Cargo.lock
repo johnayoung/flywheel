@@ -508,7 +508,7 @@ checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "flywheel"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "clap",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel-agents"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "libc",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel-container"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "flywheel-agents",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel-core"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "flywheel-agents",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel-orchestrator"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "flywheel-agents",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "flywheel-worktree"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "flywheel-agents",

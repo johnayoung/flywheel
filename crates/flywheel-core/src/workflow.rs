@@ -1498,13 +1498,15 @@ positional arguments:
 options:
   -h, --help            show this help message and exit";
 
-const RUN_USAGE: &str = "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
+const RUN_USAGE: &str =
+    "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
                              [--sandbox SANDBOX] [--model MODEL]
                              [--max-turns MAX_TURNS]
                              [--max-retries MAX_RETRIES] [--json | --quiet]
                              GOAL_OR_FILE";
 
-const RUN_HELP: &str = "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
+const RUN_HELP: &str =
+    "usage: flywheel workflow run [-h] [--db DB] [--check CMD] [--rubric ASSERTION]
                              [--sandbox SANDBOX] [--model MODEL]
                              [--max-turns MAX_TURNS]
                              [--max-retries MAX_RETRIES] [--json | --quiet]
@@ -1597,7 +1599,8 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const REJECT_USAGE: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID";
+const REJECT_USAGE: &str =
+    "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID";
 
 const REJECT_HELP: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID
 
@@ -3010,7 +3013,10 @@ mod tests {
         .unwrap();
         let at = plan.argv.iter().position(|a| a == "--mcp-config").unwrap();
         let mcp: Value = serde_json::from_str(&plan.argv[at + 1]).unwrap();
-        assert_eq!(mcp, json!({"mcpServers": {"serena": {"command": "serena"}}}));
+        assert_eq!(
+            mcp,
+            json!({"mcpServers": {"serena": {"command": "serena"}}})
+        );
         assert!(plan.argv.contains(&"--strict-mcp-config".to_owned()));
     }
 

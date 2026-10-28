@@ -405,7 +405,8 @@ fn delegate_audit(rest: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
 pub const AUDIT_PROG: &str = "flywheel audit";
 
 /// The usage block argparse prints on a bad argument (80-column wrap).
-pub const AUDIT_USAGE: &str = "usage: flywheel audit [-h] [--db DB] [--logs-root LOGS_ROOT] [--json]
+pub const AUDIT_USAGE: &str =
+    "usage: flywheel audit [-h] [--db DB] [--logs-root LOGS_ROOT] [--json]
                       [--follow] [--poll-interval POLL_INTERVAL] [--redact]
                       [--redact-policy NAME] [--raw] [--dry-run]
                       [--redact-salt SALT]
@@ -1290,7 +1291,13 @@ mod tests {
         let db_str = db.to_str().unwrap();
         assert_eq!(
             run(
-                &["next", "--db", db_str, "--tasks-dir", tasks.to_str().unwrap()],
+                &[
+                    "next",
+                    "--db",
+                    db_str,
+                    "--tasks-dir",
+                    tasks.to_str().unwrap()
+                ],
                 &unbound()
             )
             .0,
@@ -1309,7 +1316,10 @@ mod tests {
         );
         assert_eq!(
             claimed(&db, &run_id),
-            vec![("set_model".to_owned(), serde_json::json!({"model": "claude-x"}))]
+            vec![(
+                "set_model".to_owned(),
+                serde_json::json!({"model": "claude-x"})
+            )]
         );
         // `workflow is-done` on a task with no done lifecycle exits 1.
         let task_file = tmp.path().join("t.json");
@@ -1320,7 +1330,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             run(
-                &["workflow", "is-done", "--db", db_str, task_file.to_str().unwrap()],
+                &[
+                    "workflow",
+                    "is-done",
+                    "--db",
+                    db_str,
+                    task_file.to_str().unwrap()
+                ],
                 &unbound()
             )
             .0,

@@ -1179,7 +1179,11 @@ mod tests {
         // A docker CLI whose daemon is unreachable exits non-zero.
         let no_daemon = Docker::with_program(sv(&["/bin/sh", "-c", "exit 1", "docker"]));
         reap_container_orphans_with(&no_daemon, &log);
-        assert!(lines.lock().unwrap().is_empty(), "{:?}", lines.lock().unwrap());
+        assert!(
+            lines.lock().unwrap().is_empty(),
+            "{:?}",
+            lines.lock().unwrap()
+        );
     }
 
     #[test]
@@ -1940,7 +1944,10 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         let state = loop {
             let state = docker
-                .run(sv(&["docker", "inspect", &name, "--format", format]), timeout)
+                .run(
+                    sv(&["docker", "inspect", &name, "--format", format]),
+                    timeout,
+                )
                 .unwrap();
             if state.trim() == "exited 3" || Instant::now() > deadline {
                 break state;

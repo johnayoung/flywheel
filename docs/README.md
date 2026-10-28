@@ -39,9 +39,9 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 
 ## Design rationale
 
-- [agent-harness.md](agent-harness.md) — the `flywheel-agents` multi-agent execution layer: architecture, per-section status markers, and the remaining backlog. Phases 1-5 shipped (claude-code + codex adapters, opt-in via `[agent] id`); the legacy SDK path stays the default.
+- [agent-harness.md](agent-harness.md) — the `flywheel-agents` multi-agent execution layer: architecture, per-section status markers, and the remaining backlog. claude-code and codex adapters shipped; `[agent] id` selects one (default `claude-code`). Agents run only through their CLIs; `[agent] transport = "sdk"` is rejected at config load.
 - [research/](research/) — cited design rationale for the `fw-*` authoring skills and the adoption-readiness audits. Not part of the normative spec set.
 
 ---
 
-The five workspace packages (`flywheel-core`, `flywheel-orchestrator`, `flywheel-worktree`, `flywheel-container`, `flywheel`) each carry a package-level `README.md`; the dependency arrow points one way only, with core importing nothing downstream. See the root [README.md](../README.md) for the package map and quickstart.
+The six workspace crates under `crates/` (`flywheel-agents`, `flywheel-core`, `flywheel-orchestrator`, `flywheel-worktree`, `flywheel-container`, `flywheel`) form a one-way dependency arrow: core depends on nothing downstream, and `flywheel-agents` depends on no other flywheel crate. See the root [README.md](../README.md) for the crate map and quickstart.

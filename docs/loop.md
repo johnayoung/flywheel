@@ -8,7 +8,7 @@ It does not queue, plan, or decompose work. It runs one task: invoke the agent, 
 
 - Invoke the agent and carry context across iterations
 - Own [lifecycle](task-lifecycle.md) transitions (the agent never mutates state directly)
-- Detect iteration state from SDK signals and the intent envelope
+- Detect iteration state from agent stream signals and the intent envelope
 - Verify completion claims before reaching `done`
 - Preserve attempt history and failure context
 - Emit structured events for telemetry
@@ -39,24 +39,24 @@ flowchart TD
 
 ## State detection
 
-Detection combines SDK-native signals (`StopReason`, hooks, typed messages) with a minimal intent envelope from the agent. Judgment-heavy logic — the verifier, thrash analysis, crash classification — lives in pluggable components the loop calls into, not in the core state machine.
+Detection combines agent-native stream signals (`StopReason`, hooks, typed messages from the agent CLI's event stream) with a minimal intent envelope from the agent. Judgment-heavy logic — the verifier, thrash analysis, crash classification — lives in pluggable components the loop calls into, not in the core state machine.
 
-| State | Description | SDK surface | Loop service |
+| State | Description | Agent signal surface | Loop service |
 |---|---|---|---|
 | `done` | Agent's turn ended cleanly and it believes the work is complete. Candidate for verification, not final. | `AssistantMessage.StopReason == "end_turn"` with no pending `ToolUseBlock`; `ResultMessage` with `IsError: false` | Run the task's graders in cost order and promote to lifecycle `done` only on all-pass. When automated graders all pass and the task declares any `ManualGrader`, the attempt is finalized `succeeded` and the lifecycle parks at `AWAITING_APPROVAL` instead of promoting to `done`; an operator resolves each gate out-of-band via `flywheel approve` / `flywheel reject`. |
 | `working` | Agent is making productive progress — tool calls succeeding, novel actions, diff growing. Default healthy state. | `PostToolUse` hook fires; `ToolResultBlock.IsError == false`; `TaskProgressMessage` arriving | **Simple:** reset watchdog timer, append event to progress window, continue. Pure bookkeeping. |
 | `blocked_explicit` | Agent has declared it needs external input to proceed. | Text content in `AssistantMessage`; `NotificationArrived` hook; simplified intent envelope | **Simple** if the intent envelope is a closed enum (`blocked`, `verify`, `continue`, `abort`) — trivial parse and pause. **Open question:** how the `reason` field is handled without it becoming free-form conditional logic inside the loop. |
-| `blocked_implicit` | Agent is stuck but doesn't know it — same tool failing repeatedly, same permission denied, same question re-asked. | `PostToolUseFailure` hook; `ToolResultBlock.IsError == true`; `ResultMessage.PermissionDenials` | **Shipped — mechanical case:** counter keyed on `(tool_name, sha256(input))` in `flywheel.loop_guard`, tripped after repeated consecutive `is_error` results and routed to `interrupted` (blocked, operator-recoverable) via the harness `STUCK` path. Permission denials surfaced as `is_error` tool results feed the same counter; a dedicated resource-keyed `(tool_name, resource)` counter is still deferred. **TODO — "same question re-asked":** requires semantic similarity between assistant text blocks; not deterministic. Research options include embedding-model similarity with a threshold study; each requires its own research phase. |
-| `thrashing` | Tool calls succeed but produce no net progress — same files edited with zero-sum diffs, input novelty collapsing. | `PostToolUse` hook with tool name + input; `WithFileCheckpointing` for diff observation | Three sub-problems with different difficulty. **(a) Shipped — tuple repetition** across a rolling window via `flywheel.loop_guard`'s `THRASH` verdict, routed through `failed_validation` -> the existing retry policy. **TODO (b) — net-diff-near-zero:** needs filesystem snapshots and a "meaningful change" heuristic (whitespace? comments? line count threshold?). **TODO (c) — input novelty score:** needs a distance metric over structured inputs, which is research. Each remaining sub-problem requires its own research phase. |
-| `hanging` | No output of any kind for longer than threshold — not thinking, not rate-limited, just silent. | Streaming iterator delivers messages one-by-one; `ThinkingBlock` and `RateLimitEvent` are valid liveness signals | **Shipped — mechanism:** an asyncio watchdog in the harness resets on every SDK message (including `ThinkingBlock` and `RateLimitEvent`); on silence past `hang_timeout_seconds` it cancels the in-flight invocation and routes the attempt to `internal_error`. **TODO — threshold default value:** `hang_timeout_seconds` ships as `None` (disabled). A grounded default still requires research informed by extended-thinking budgets and telemetry; the watchdog only runs once an operator supplies a value. |
+| `blocked_implicit` | Agent is stuck but doesn't know it — same tool failing repeatedly, same permission denied, same question re-asked. | `PostToolUseFailure` hook; `ToolResultBlock.IsError == true`; `ResultMessage.PermissionDenials` | **Shipped — mechanical case:** counter keyed on `(tool_name, sha256(input))` in `crates/flywheel-core/src/loop_guard.rs`, tripped after repeated consecutive `is_error` results and routed to `interrupted` (blocked, operator-recoverable) via the harness `STUCK` path. Permission denials surfaced as `is_error` tool results feed the same counter; a dedicated resource-keyed `(tool_name, resource)` counter is still deferred. **TODO — "same question re-asked":** requires semantic similarity between assistant text blocks; not deterministic. Research options include embedding-model similarity with a threshold study; each requires its own research phase. |
+| `thrashing` | Tool calls succeed but produce no net progress — same files edited with zero-sum diffs, input novelty collapsing. | `PostToolUse` hook with tool name + input; `WithFileCheckpointing` for diff observation | Three sub-problems with different difficulty. **(a) Shipped — tuple repetition** across a rolling window via the loop guard's `Thrash` verdict, routed through `failed_validation` -> the existing retry policy. **TODO (b) — net-diff-near-zero:** needs filesystem snapshots and a "meaningful change" heuristic (whitespace? comments? line count threshold?). **TODO (c) — input novelty score:** needs a distance metric over structured inputs, which is research. Each remaining sub-problem requires its own research phase. |
+| `hanging` | No output of any kind for longer than threshold — not thinking, not rate-limited, just silent. | Streaming iterator delivers messages one-by-one; `ThinkingBlock` and `RateLimitEvent` are valid liveness signals | **Shipped — mechanism:** an inter-message watchdog in the harness (`crates/flywheel-core/src/harness/iterate.rs`) resets on every agent stream message (including `ThinkingBlock` and `RateLimitEvent`); on silence past `hang_timeout_seconds` it cancels the in-flight invocation and routes the attempt to `internal_error`. **TODO — threshold default value:** `hang_timeout_seconds` ships unset (disabled). A grounded default still requires research informed by extended-thinking budgets and telemetry; the watchdog only runs once an operator supplies a value. |
 | `rate_limited` | Agent is waiting on API quota. Looks like hanging but is transient and expected. | `RateLimitEvent` with `RateLimitInfo` | **Simple:** flip a `rate_limited` flag that the watchdog checks before firing; compute ETA from `RateLimitInfo.ResetsAt` and emit to operator surface. Clear flag on next non-rate-limit message. |
 | `context_exhausted` | Conversation outgrew the context window. | `StopReason == "max_tokens"` on assistant or result; `Client.GetContextUsage()` approaching cap | **Simple — detection.** **TODO — recovery policy:** compacting (via `PreCompact` hook), summarize-and-restart, and fork-with-smaller-context are genuinely different strategies with different correctness tradeoffs. No default or sequencing — each candidate strategy requires its own research phase. |
-| `budget_exceeded` | Hit configured turn or cost ceiling. | `WithMaxTurns` / `WithMaxBudgetUSD` enforce; `ResultMessage.NumTurns` and `TotalCostUSD` for observation | **Simple:** SDK halts the agent automatically. Loop records cause, applies retry policy from task config (`max_retries`, `backoff`). Straightforward config-driven logic. |
-| `crashed` | Subprocess died, SDK errored, or transport failed. | Iterator returns `err`; global `Error` hook; context cancellation | **Simple — recording and surfacing.** **TODO — classification between infra / agent / protocol.** Error types from the SDK don't cleanly map to those categories; classification likely needs to inspect error wrapping, exit codes, and whether a partial envelope was received. Candidate heuristics (context deadline → infra; non-zero exit without iterator error → agent; malformed envelope → protocol) are research points, not defaults; a corpus of real crashes is needed before any classifier can be designed. |
+| `budget_exceeded` | Hit configured turn or cost ceiling. | `WithMaxTurns` / `WithMaxBudgetUSD` enforce; `ResultMessage.NumTurns` and `TotalCostUSD` for observation | **Simple:** the agent CLI halts the agent automatically. Loop records cause, applies retry policy from task config (`max_retries`, `backoff`). Straightforward config-driven logic. |
+| `crashed` | Subprocess died, agent CLI errored, or transport failed. | Iterator returns `err`; global `Error` hook; context cancellation | **Simple — recording and surfacing.** **TODO — classification between infra / agent / protocol.** Agent transport errors don't cleanly map to those categories; classification likely needs to inspect error wrapping, exit codes, and whether a partial envelope was received. Candidate heuristics (context deadline → infra; non-zero exit without iterator error → agent; malformed envelope → protocol) are research points, not defaults; a corpus of real crashes is needed before any classifier can be designed. |
 
 ## Iteration envelope
 
-The envelope carries agent intent only; observed state comes from SDK signals per the detection map above. Every iteration ends with a JSON envelope delimited by `<!-- LOOP_STATUS -->`.
+The envelope carries agent intent only; observed state comes from agent stream signals per the detection map above. Every iteration ends with a JSON envelope delimited by `<!-- LOOP_STATUS -->`.
 
 ```html
 <!-- LOOP_STATUS -->
@@ -81,7 +81,7 @@ The envelope is untrusted protocol input. The harness must handle malformed JSON
 
 ## Rubric verdict envelope
 
-Rubric graders run an LLM-as-judge in a fresh `claude-agent-sdk` session and require the judge to terminate its response with one fenced JSON block:
+Rubric graders run an LLM-as-judge in a fresh (cold) agent session through the `flywheel-agents` runtime (`crates/flywheel-core/src/grader_rubric.rs`) and require the judge to terminate its response with one fenced JSON block:
 
 ```html
 <!-- RUBRIC_VERDICT -->
@@ -106,9 +106,9 @@ When a rubric `passed=false` verdict triggers an auto-retry (`retry_on_fail=True
 
 Per-state dispatch is specified by the **Loop service** column of the detection map above. Each detected state maps to a concrete loop action — bookkeeping, watchdog reset, verification orchestration, pause-for-intervention, retry policy, or fail-loud. Remaining TODO subsystems flagged in that column are: thrash sub-problems (b) net-diff and (c) input-novelty, the still-ungrounded `hang_timeout_seconds` default value, fine-grained crash classification, context-recovery policy, and `blocked_implicit` "same question re-asked" semantic detection.
 
-Every harness `EventRecord` and every SDK `Message` observed during an iteration is persisted under a single per-run monotonic sequence; `flywheel.audit` is the canonical replay and live-inspection surface for that stream.
+Every harness `EventRecord` and every agent stream message observed during an iteration is persisted under a single per-run monotonic sequence; `flywheel audit` (`crates/flywheel-core/src/audit.rs`) is the canonical replay and live-inspection surface for that stream.
 
-Blocked lifecycles carry their `requires` snapshot on the persisted lifecycle row, and the `flywheel recheck-blocked` CLI subcommand drives `flywheel.harness.recheck_blocked_lifecycle` from outside the loop — by default it scans every `interrupted` lifecycle with a non-null `blocked_requires_json`, evaluates the persisted predicates against the caller's CWD, and applies `interrupted -> ready` for any whose predicates are all satisfied. `--run-id <id>` targets one lifecycle; `--dry-run` reports without transitioning (still emits `harness.recheck_attempted`, never emits `harness.unblocked`). `flywheel status` surfaces the same snapshot as a `blocked_on:` summary on interrupted rows (text) or a `blocked_requires` key on each JSON row.
+Blocked lifecycles carry their `requires` snapshot on the persisted lifecycle row, and the `flywheel recheck-blocked` CLI subcommand drives `recheck_blocked_lifecycle` (`crates/flywheel-core/src/harness/ops.rs`) from outside the loop — by default it scans every `interrupted` lifecycle with a non-null `blocked_requires_json`, evaluates the persisted predicates against the caller's CWD, and applies `interrupted -> ready` for any whose predicates are all satisfied. `--run-id <id>` targets one lifecycle; `--dry-run` reports without transitioning (still emits `harness.recheck_attempted`, never emits `harness.unblocked`). `flywheel status` surfaces the same snapshot as a `blocked_on:` summary on interrupted rows (text) or a `blocked_requires` key on each JSON row.
 
 ## Graders
 
@@ -127,15 +127,15 @@ A phase that adds a new loop path cannot archive until that path has run end-to-
 
 ### Trigger set
 
-Any of the following symbol-level signals in the phase diff marks it loop-path-bearing:
+Any of the following symbol-level signals in the phase diff marks it loop-path-bearing (detector: `detect_loop_path_signals`, `crates/flywheel-core/src/loop_path_marker.rs`):
 
 | # | Signal | Decidable test |
 | - | ------ | -------------- |
-| 1 | New `Status`/`Outcome` member or transition-rule entry | added enum member / new `_VALID_EDGES` entry in `lifecycle.py` |
-| 2 | New `ADD COLUMN` / table in `_schema/*.sql` | DDL on lifecycles, grader_results, events, attempts, control_commands |
-| 3 | New `Grader` union variant | new variant in `task.py`'s `Grader` union or new `grader_*.py` dispatched by the harness |
-| 4 | New store-contract / resolver entry | new method on a `store_protocols.py` Protocol AND a dispatch registration |
-| 5 | New control-command verb | new `CONTROL_COMMAND_*` constant in `invoker_client.py` |
+| 1 | New `Status`/`Outcome` member or transition-rule entry | added enum member / new `Status::valid_targets` edge in `crates/flywheel-core/src/lifecycle.rs` |
+| 2 | New `ADD COLUMN` / table in `crates/flywheel-core/schema/*.sql` | DDL on lifecycles, grader_results, events, attempts, control_commands |
+| 3 | New `Grader` variant | new variant of the `Grader` enum in `crates/flywheel-core/src/task.rs` or new `grader_*.rs` dispatched by the harness |
+| 4 | New store-contract / resolver entry | new method on a store trait in `crates/flywheel-core/src/store.rs` AND a dispatch registration |
+| 5 | New control-command verb | new `CONTROL_COMMAND_*` constant in `crates/flywheel-core/src/invoker_client.rs` |
 
 ### in-loop-verification task
 
@@ -143,7 +143,7 @@ A `command` grader that drives a fixture through the real `orchestrate`/harness 
 
 ### Opt-out artifact
 
-A false-positive marker (e.g. docstring fix in a watched file, reverted-within-phase column) is downgraded by committing `active/<phase>/loop-path-exempt.md` with structured front-matter recording phase, author, and reason. The archive gate parses this opt-out at archive time — honoring a well-formed one, rejecting a malformed one (`flywheel_orchestrator/_workflow.py`). The shipped `fw-*` skills carry no loop-path logic; the marker is evaluated by the gate itself, not by an authoring skill.
+A false-positive marker (e.g. docstring fix in a watched file, reverted-within-phase column) is downgraded by committing `active/<phase>/loop-path-exempt.md` with structured front-matter recording phase, author, and reason. The archive gate parses this opt-out at archive time — honoring a well-formed one, rejecting a malformed one (`load_loop_path_optout`, `crates/flywheel-worktree/src/phase.rs`). The shipped `fw-*` skills carry no loop-path logic; the marker is evaluated by the gate itself, not by an authoring skill.
 
 ## Intervention
 
@@ -167,7 +167,7 @@ Recorded distinctly even when lifecycle states overlap:
 | Task failure       | Agent could not complete                                            |
 | Validation failure | Completion claim disproved by any grader (command, transcript, rubric, manual) |
 | Protocol failure   | Malformed, missing, duplicate, or truncated envelope                |
-| Infrastructure     | SDK, subprocess, verifier, or storage failure                       |
+| Infrastructure     | Agent CLI, subprocess, verifier, or storage failure                 |
 
 Each detected state maps to a primary class. Notes capture classification shifts that can only be settled post-mortem:
 
@@ -193,8 +193,8 @@ Each detected state maps to a primary class. Notes capture classification shifts
 
 ## Surface
 
-A Python library, embeddable in CI pipelines, task queues, and orchestrators.
+A Rust library (`flywheel-core`), embeddable in CI pipelines, task queues, and orchestrators; the `flywheel` binary is its operator shell.
 
 ## Requirements
 
-- [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python) — the execution substrate for driving Claude Code as a subprocess. The loop invokes the agent through this SDK.
+- An agent CLI on `PATH` — `claude` (Claude Code, driven in headless stream-json mode) or `codex`. The loop invokes the agent as a subprocess through the `flywheel-agents` adapters; there is no in-process SDK.

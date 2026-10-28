@@ -57,7 +57,7 @@ Judge-infrastructure failures (a judge dying on its own turn/time budget, a tran
 
 Each entry in `graders` is a typed object. The `type` field selects which other fields apply. A task is `done` only when every grader passes. Graders are binary — no partial credit, no weights. An empty `graders` list reaches `done` vacuously: an unverified run that trusts the agent's claim. Use it for exploratory work; add at least one grader the moment "done" must mean something checkable.
 
-In Python, `Grader` is a discriminated union of `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at construction, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON shape is unchanged: loaders dispatch on `type` to build the right variant.
+In Rust, `Grader` is a serde-tagged enum (`crates/flywheel-core/src/task.rs`) over `CommandGrader`, `RubricGrader`, `ManualGrader`, and `TranscriptGrader`. Required fields are enforced at deserialization, so downstream code can `match` on the variant rather than re-checking optional fields. The JSON `type` tag selects the variant.
 
 The harness runs graders cost-cheapest-first: `command` → `transcript` → `rubric` → `manual`. Within a type, list order is respected. A failure inside one type aborts the rest of that type and skips later (more expensive) types. `manual` graders are executed as a human-approval gate: when the automated types all pass, the harness finalizes the attempt `succeeded` and parks the lifecycle at `awaiting_approval` (one gate at a time, in `task.graders` order) instead of promoting to `done`. See [task-lifecycle.md](task-lifecycle.md) for the state and [loop.md](loop.md) for the `approve`/`reject` resolution model.
 
@@ -71,11 +71,11 @@ The general workhorse. Tests, lint, typecheck, build, custom scripts, filesystem
 | `name` | no       | Short label for logs/UI attribution |
 
 ```json
-{ "type": "command", "run": "uv run pytest tests/http", "name": "tests" }
+{ "type": "command", "run": "cargo test --test http", "name": "tests" }
 ```
 
 **Security: a task file is executable code.** `run` is executed with
-`shell=True` in the agent's sandbox, inheriting the worker's full
+`/bin/sh -c` in the agent's sandbox, inheriting the worker's full
 environment (including any API keys). Loading and running a task is
 equivalent to running its `run` strings as the worker. The grader's
 stdout/stderr are persisted verbatim and unredacted to the store and
@@ -144,7 +144,7 @@ Two fields. `id` is generated; everything else is omitted.
 {
   "goal": "Add exponential backoff retry to the HTTP client.",
   "graders": [
-    { "type": "command", "run": "uv run pytest tests/http" }
+    { "type": "command", "run": "cargo test --test http" }
   ]
 }
 ```
@@ -159,14 +159,14 @@ Two fields. `id` is generated; everything else is omitted.
   "tags": ["http", "reliability"],
   "context": {
     "relevant": [
-      "src/flywheel/http/client.py",
-      "src/flywheel/http/config.py"
+      "src/http/client.rs",
+      "src/http/config.rs"
     ],
     "references": [
-      "src/flywheel/db/retry.py — mirror this backoff structure"
+      "src/db/retry.rs — mirror this backoff structure"
     ],
     "constraints": [
-      "Use stdlib + existing deps; no new packages",
+      "Use existing dependencies; no new crates",
       "Don't change ClientConfig's public surface beyond adding fields"
     ],
     "non_goals": [
@@ -179,9 +179,9 @@ Two fields. `id` is generated; everything else is omitted.
     ]
   },
   "graders": [
-    { "type": "command",    "run": "uv run pytest tests/http",      "name": "tests" },
-    { "type": "command",    "run": "uv run ruff check .",           "name": "lint" },
-    { "type": "command",    "run": "uv run mypy src/flywheel/http", "name": "typecheck" },
+    { "type": "command",    "run": "cargo test --test http",       "name": "tests" },
+    { "type": "command",    "run": "cargo clippy -- -D warnings",  "name": "lint" },
+    { "type": "command",    "run": "cargo check",                  "name": "typecheck" },
     { "type": "rubric",     "assertions": [
         "Retries on 5xx and timeout errors only",
         "Respects max_retries config (default 3)"

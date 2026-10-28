@@ -2,7 +2,7 @@
 
 Autopilot is a neverending **intake** daemon: each cycle it discovers work, scores it against the tier model below, compiles the top candidates into verifiable [tasks](task-schema.md), and emits them into the work queue until it reaches a target depth. It authors work; the [worker](orchestration.md) drains it. The two are independent supervised daemons.
 
-The engine lives in `flywheel_orchestrator._autopilot`; the CLI/daemon shell in `flywheel_orchestrator._autopilot_run`; the console supervisor in `flywheel._autopilot_supervisor`.
+The engine lives in `crates/flywheel-orchestrator/src/autopilot.rs`; the CLI/daemon shell in `crates/flywheel-orchestrator/src/autopilot_run.rs`; the console supervisor in `crates/flywheel/src/autopilot_supervisor.rs`.
 
 **Autopilot writes to the base branch unattended.** It is never auto-spawned on console launch (the worker is) — an operator must start it explicitly. See [The operator console](#the-operator-console).
 
@@ -19,13 +19,13 @@ Autopilot emits plain core `Task`s (`docs/task-schema.md`), each carrying at lea
 
 ## The refill pass
 
-One refill pass (`run_refill_pass`, `_autopilot.py:1059`) composes four stages and fills the queue **only up to the target depth, from actionable findings only** — never always-busy filler. It is headless and logs to stderr with an `[autopilot]` prefix (`make_logger`, `_autopilot_run.py:37`).
+One refill pass (`run_refill_pass`, `crates/flywheel-orchestrator/src/autopilot.rs`) composes four stages and fills the queue **only up to the target depth, from actionable findings only** — never always-busy filler. It is headless and logs to stderr with an `[autopilot]` prefix (`make_logger`, `crates/flywheel-orchestrator/src/autopilot_run.rs`).
 
 ```mermaid
 flowchart TD
     START["Daemon cycle (every interval_seconds)"] --> D{"actionable queue depth below target_depth?"}
     D -->|no| WAIT["Emit nothing; return cleanly; wait for the next cycle"]
-    D -->|yes| DISC["Discovery: one relevance agent per tier (11 concurrent) produces findings with evidence and estimates"]
+    D -->|yes| DISC["Discovery: one relevance judgment per tier (11 tier subagents in one session) produces findings with evidence and estimates"]
     DISC --> SCORE["Score and sequence: server-side final score, ready/preemptive band ahead of the scheduled band"]
     SCORE --> AUTH["Author: compile top findings into Tasks, each with an out-of-band grader and conflict_keys derived from grader_target and creates_files; un-lowerable findings dropped with a reason"]
     AUTH --> EMIT["Emit task JSON to .flywheel/tasks/active/autopilot/ (idempotent by task id)"]
@@ -33,10 +33,10 @@ flowchart TD
     EMIT -.->|"independent daemon"| WORKER["Worker drains the queue: claim (conflict_keys serialize overlapping tasks), run the agent, land via the SubmitStrategy"]
 ```
 
-1. **Discovery** (`run_discovery`, `_autopilot.py:616`) — fans out **one relevance agent per tier**, 11 concurrent invocations. Each agent reads the repo, judges whether its tier is relevant to this codebase, and returns a `TierVerdict` with zero or more findings carrying evidence plus 0–10 estimates for urgency, importance, blocks, and effort, and a `ready` flag. Relevance is agent-judged per repo, never coded detectors. The fan-out is best-effort: it always returns exactly 11 verdicts, even if every agent errors, and a not-relevant verdict always carries zero findings. Findings are stamped with their tier server-side, not by the agent.
-2. **Score** (`sequence_findings`, `_autopilot.py:262`) — applies [the scoring model](#the-scoring-model) to every finding from relevant tiers, partitioning the ready preemptive band ahead of the scheduled band, each ordered by descending score. The final score is computed here, never agent-reported; the agent only supplies the input estimates.
-3. **Author** (`author_finding`, `_autopilot.py:880`) — each selected finding is compiled by an agent into one or more validated core `Task`s, each with at least one grader. **The authoritative grader must be out-of-band** — a pre-existing committed repo check (`repo_command`) or a registered held-out oracle (`held_out_oracle`), never a check the same task's own diff creates. A self-attestation guard (`_validate_task_entry`, `_autopilot.py:765`) drops any task whose authoritative grader names or equals a file the task creates. A finding that cannot be lowered to such a task is **dropped with a recorded reason**, never written as a stub. Ambiguities a human would be asked about are recorded as `assumptions` on the emitted task.
-4. **Emit** (`emit_emitted_task`, `_autopilot.py:1032`) — writes each task to `<tasks_dir>/active/autopilot/<task_id>.json`. The file carries `priority` (derived from the final score so the scheduler orders it) and an `autopilot` provenance block recording the full score breakdown and grader metadata, keeping the recommendation auditable. **Idempotent:** if the target file already exists it is not overwritten, so re-running autopilot never duplicates in-flight work.
+1. **Discovery** (`run_discovery`, `crates/flywheel-orchestrator/src/autopilot.rs`) — runs **one relevance judgment per tier**. The production driver is a single agent session that registers all 11 tiers as read-only subagents (spec 00059); each verdict is read from the subagent's tool-result block, never the parent's prose. Each tier agent reads the repo, judges whether its tier is relevant to this codebase, and returns a `TierVerdict` with zero or more findings carrying evidence plus 0–10 estimates for urgency, importance, blocks, and effort, and a `ready` flag. Relevance is agent-judged per repo, never coded detectors. Discovery is best-effort per tier: it always returns exactly 11 verdicts (a tier that errors or returns malformed output yields a not-relevant verdict with the error reason), and a not-relevant verdict always carries zero findings. Findings are stamped with their tier server-side, not by the agent.
+2. **Score** (`sequence_findings`, `crates/flywheel-orchestrator/src/autopilot.rs`) — applies [the scoring model](#the-scoring-model) to every finding from relevant tiers, partitioning the ready preemptive band ahead of the scheduled band, each ordered by descending score. The final score is computed here, never agent-reported; the agent only supplies the input estimates.
+3. **Author** (`author_finding`) — each selected finding is compiled by an agent into one or more validated core `Task`s, each with at least one grader. **The authoritative grader must be out-of-band** — a pre-existing committed repo check (`repo_command`) or a registered held-out oracle (`held_out_oracle`), never a check the same task's own diff creates. A self-attestation guard (`validate_task_entry`) drops any task whose authoritative grader names or equals a file the task creates. A finding that cannot be lowered to such a task is **dropped with a recorded reason**, never written as a stub. Ambiguities a human would be asked about are recorded as `assumptions` on the emitted task.
+4. **Emit** (`emit_emitted_task`) — writes each task to `<tasks_dir>/active/autopilot/<task_id>.json`. The file carries `priority` (derived from the final score so the scheduler orders it) and an `autopilot` provenance block recording the full score breakdown and grader metadata, keeping the recommendation auditable. **Idempotent:** if the target file already exists it is not overwritten, so re-running autopilot never duplicates in-flight work.
 
 On a clean repo with nothing actionable, a pass writes zero tasks and returns cleanly — it never raises and never invents filler. If the queue is already at or above target depth, the pass returns early and emits nothing.
 
@@ -59,13 +59,13 @@ flywheel autopilot --interval 120       # 120s between daemon cycles
 | `--interval` | float | Seconds between daemon cycles (overrides `[autopilot].interval_seconds`) |
 | `--once` | flag | Run one refill pass and exit; no daemon loop |
 
-Flag precedence is CLI flag > policy > code default (`_resolve_runtime`, `_autopilot_run.py:87`). `landing` and the score weights come from policy only (no CLI flag).
+Flag precedence is CLI flag > policy > code default (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`). `landing` and the score weights come from policy only (no CLI flag).
 
-**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `_autopilot_run.py:136`). A policy error exits 2 before the loop starts.
+**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts.
 
 ## Configuration
 
-The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `WorkPolicy` (`_policy.py:1140`). A malformed value raises `PolicyError` so a typo never silently degrades autopilot. See [configuration.md](configuration.md).
+The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `WorkPolicy` (`crates/flywheel-orchestrator/src/policy.rs`). A malformed value raises `PolicyError` so a typo never silently degrades autopilot. See [configuration.md](configuration.md).
 
 ```toml
 [autopilot]
@@ -82,7 +82,7 @@ interval_seconds = 300.0    # positive float; seconds between daemon cycles
 
 The model is not under `[autopilot]` — it comes from the top-level `[work].model`.
 
-`[autopilot.weights]` overrides individual scoring weights; every unset weight keeps its engine default (`ScoreWeights`, `_autopilot.py:99`).
+`[autopilot.weights]` overrides individual scoring weights; every unset weight keeps its engine default (`AutopilotWeights::default`, `policy.rs`; aliased as `ScoreWeights` in `autopilot.rs`).
 
 | Weight | Default | Score term |
 | --- | --- | --- |
@@ -105,13 +105,13 @@ interrupt_base = 10000.0
 
 ## The operator console
 
-From the interactive console, `/autopilot start` spawns the neverending autopilot daemon as a detached supervised child; `/autopilot stop` SIGTERMs it (`handle_autopilot_slash`, `_dashboard.py:1022`). It mirrors `/worker start|stop` but runs independently — starting or stopping autopilot never touches the worker. See [cli.md](cli.md).
+From the interactive console, `/autopilot start` spawns the neverending autopilot daemon as a detached supervised child; `/autopilot stop` SIGTERMs it (`handle_autopilot_slash`, `crates/flywheel/src/dashboard.rs`). It mirrors `/worker start|stop` but runs independently — starting or stopping autopilot never touches the worker. See [cli.md](cli.md).
 
-**Autopilot is never auto-spawned on console launch, unlike the worker, because it writes to the base branch unattended — start it explicitly.** The supervisor is constructed so its status surface and the `/autopilot start` action exist, but nothing spawns until the operator opts in (`_tui.py:397`).
+**Autopilot is never auto-spawned on console launch, unlike the worker, because it writes to the base branch unattended — start it explicitly.** The supervisor is constructed so its status surface and the `/autopilot start` action exist, but nothing spawns until the operator opts in (`crates/flywheel/src/tui.rs`: only the worker honors `auto_start_worker`).
 
 - `start` is idempotent — an already-supervised daemon is left unchanged (no second daemon). The console spawns the continuous daemon, never `--once`.
-- The daemon spawns in its own session (`start_new_session=True`), so console Ctrl+C never reaches it and it **survives console exit**. The next console does not adopt a surviving daemon — autopilot writes no claim lease, so there is no detached-adoption state.
-- `stop` SIGTERMs the child and waits up to 10 seconds; it acts only when this console owns the daemon, otherwise it reports "no supervised autopilot to stop".
+- The daemon spawns in its own session (`setsid`), so console Ctrl+C never reaches it and it **survives console exit**. Autopilot writes no claim lease; instead its activity record (`.flywheel/logs/autopilot/activity.json`, carrying `pid` and an `expires_at` deadline pushed forward every cycle) is the liveness record. A later console that finds a live record adopts the daemon as `Detached` and spawns nothing; a stale record does not block a respawn (`crates/flywheel/src/autopilot_supervisor.rs`).
+- `stop` SIGTERMs the child's process group and waits (escalating to SIGKILL past the wait window); it acts only when this console owns the daemon, otherwise it reports "no supervised autopilot to stop".
 
 For where autopilot sits in the spec/plan/verify/execute/retro pipeline — it is the unattended intake half — see [workflow.md](workflow.md); for how emitted work lands, see [strategy.md](strategy.md).
 
@@ -121,7 +121,7 @@ For where autopilot sits in the spec/plan/verify/execute/retro pipeline — it i
 
 ### Tier hierarchy
 
-**Tiers 1–3 are preemptive interrupts**: whenever one is `ready`, it floats above everything else. **Tiers 4–11 are scheduled by weighted score**, not strict ordering. (`Tier`, `_autopilot.py:45`; the `<= 3` preemptive boundary lives in `PREEMPTIVE_MAX_TIER`, `_autopilot.py:74`.)
+**Tiers 1–3 are preemptive interrupts**: whenever one is `ready`, it floats above everything else. **Tiers 4–11 are scheduled by weighted score**, not strict ordering. (`Tier`, `crates/flywheel-orchestrator/src/autopilot.rs`; the `<= 3` preemptive boundary lives in `PREEMPTIVE_MAX_TIER`.)
 
 | Tier | Class                             | Mode       | Description                                                                                                                    |
 | ---- | --------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------ |
@@ -137,7 +137,7 @@ For where autopilot sits in the spec/plan/verify/execute/retro pipeline — it i
 | 10   | Documentation                     | Scheduled  | READMEs, API docs, runbooks, onboarding. Valuable, almost never time-critical.                                                 |
 | 11   | Polish / nice-to-have             | Scheduled  | Cosmetic tweaks, minor optimizations, "wouldn't it be nice."                                                                   |
 
-`TierWeight[Tier]` is `12 - tier.value` (tier 1 → 11, tier 11 → 1; `TIER_WEIGHTS`, `_autopilot.py:81`).
+`TierWeight[Tier]` is `12 - tier.value` (tier 1 → 11, tier 11 → 1; `tier_weight` / `Tier::weight`).
 
 ### Scoring
 
@@ -155,7 +155,7 @@ else:
 
 Urgency is a static agent-supplied 0–10 estimate; the scoring engine consumes it as-is and never escalates it over time. The engine has no clock, deadline, or `now` input.
 
-The shipped weight defaults are `w_tier=10`, `w_urg=3`, `w_imp=3`, `w_unblock=2`, `w_effort=1`, `INTERRUPT_BASE=10000` (`_autopilot.py:90`); all are tunable via `[autopilot.weights]`. `INTERRUPT_BASE` is large enough that any ready preemptive finding outscores every possible scheduled score, and `sequence_findings` also partitions the two bands before sorting, so the override is absolute by both arithmetic and partition. A Tier 1–3 finding that is not `ready` falls through to the scheduled branch and still scores (with its high tier weight). The recorded breakdown (`ScoreBreakdown`, `_autopilot.py:152`) persists every component plus the `preemptive` flag, so `recompute_final` (`_autopilot.py:241`) can re-derive the score from the recorded inputs.
+The shipped weight defaults are `w_tier=10`, `w_urg=3`, `w_imp=3`, `w_unblock=2`, `w_effort=1`, `INTERRUPT_BASE=10000` (`AutopilotWeights::default`); all are tunable via `[autopilot.weights]`. `INTERRUPT_BASE` is large enough that any ready preemptive finding outscores every possible scheduled score, and `sequence_findings` also partitions the two bands before sorting, so the override is absolute by both arithmetic and partition. A Tier 1–3 finding that is not `ready` falls through to the scheduled branch and still scores (with its high tier weight). The recorded breakdown (`ScoreBreakdown`) persists every component plus the `preemptive` flag, so `recompute_final` can re-derive the score from the recorded inputs.
 
 ---
 

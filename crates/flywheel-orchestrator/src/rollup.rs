@@ -1203,8 +1203,8 @@ mod tests {
         );
     }
 
-    /// The fixture `packages/flywheel-orchestrator`'s Python renderers were
-    /// run against; the expected strings below are their verbatim output.
+    /// The fixture the original Python renderers were run against; the
+    /// expected strings below are their verbatim output (pinned for parity).
     fn fixture_rollup() -> Rollup {
         let store = InMemoryStore::new();
         // a: verified across a retry -- attempt 1 red, attempt 2 all green.

@@ -12,9 +12,6 @@
 //! policy resolver ([`network`]), [`ContainerSubmitStrategy`] (which composes
 //! an inner landing strategy, [`submit`]), and the policy-to-strategy bridge
 //! ([`config`]). Activated via `[sandbox] backend = "container"`.
-//!
-//! Mirrors `packages/flywheel-container/src/flywheel_container/` one module
-//! per Python module.
 
 pub mod auth;
 pub mod config;

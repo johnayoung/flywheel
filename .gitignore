@@ -1,36 +1,7 @@
-# Python
+# Python bytecode (held-out oracle scripts may be Python)
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-*.egg
-*.egg-info/
-.eggs/
-build/
-dist/
-wheels/
-pip-wheel-metadata/
-
-# Virtual envs
 .venv/
-venv/
-env/
-
-# uv
-.uv/
-
-# Type checkers / linters / test caches
-.mypy_cache/
-.pyright/
-.pytype/
-.ruff_cache/
-.pytest_cache/
-.tox/
-.nox/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
 
 # IDE
 .idea/

@@ -44,4 +44,4 @@ root = ".flywheel/verification/held-out"
 # directory task files always declare their own).
 # [[defaults.graders]]
 # type = "command"
-# run = "uv run pytest"
+# run = "cargo test --workspace"

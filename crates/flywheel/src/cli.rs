@@ -401,28 +401,23 @@ fn delegate_audit(rest: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
 
 // --- The audit verb's command line --------------------------------------------------
 
-/// The audit parser's program name, as the Python CLI reported it.
-pub const AUDIT_PROG: &str = "python -m flywheel_core.audit";
+/// The audit parser's program name: the verb as the operator invokes it.
+pub const AUDIT_PROG: &str = "flywheel audit";
 
 /// The usage block argparse prints on a bad argument (80-column wrap).
-pub const AUDIT_USAGE: &str =
-    "usage: python -m flywheel_core.audit [-h] [--db DB] [--logs-root LOGS_ROOT]
-                                     [--json] [--follow]
-                                     [--poll-interval POLL_INTERVAL]
-                                     [--redact]
-                                     [--redact-policy NAME-OR-DOTTED-PATH]
-                                     [--raw] [--dry-run] [--redact-salt SALT]
-                                     run_id
+pub const AUDIT_USAGE: &str = "usage: flywheel audit [-h] [--db DB] [--logs-root LOGS_ROOT] [--json]
+                      [--follow] [--poll-interval POLL_INTERVAL] [--redact]
+                      [--redact-policy NAME] [--raw] [--dry-run]
+                      [--redact-salt SALT]
+                      run_id
 ";
 
 /// The `-h` text, byte-identical to argparse's.
-pub const AUDIT_HELP: &str = "usage: python -m flywheel_core.audit [-h] [--db DB] [--logs-root LOGS_ROOT]
-                                     [--json] [--follow]
-                                     [--poll-interval POLL_INTERVAL]
-                                     [--redact]
-                                     [--redact-policy NAME-OR-DOTTED-PATH]
-                                     [--raw] [--dry-run] [--redact-salt SALT]
-                                     run_id
+pub const AUDIT_HELP: &str = "usage: flywheel audit [-h] [--db DB] [--logs-root LOGS_ROOT] [--json]
+                      [--follow] [--poll-interval POLL_INTERVAL] [--redact]
+                      [--redact-policy NAME] [--raw] [--dry-run]
+                      [--redact-salt SALT]
+                      run_id
 
 Print the totally-ordered audit stream for one run. Default output is a human-readable one-line-per-record view; --json switches to NDJSON; --follow tails until the lifecycle reaches a terminal status (Ctrl-C exits cleanly with code 130).
 
@@ -448,33 +443,29 @@ options:
                         0.25).
   --redact              Explicitly enable redaction (already on by default).
                         Useful in scripts that want unambiguous intent.
-  --redact-policy NAME-OR-DOTTED-PATH
-                        Select a redaction policy. Built-in names: 'default'
-                        (pattern set + env-value redactor seeded from
-                        ANTHROPIC_API_KEY), 'strict' (default + denylist for
-                        credential-reading tools Read/Bash). A dotted path of
-                        the form 'module.sub:factory' resolves a Redactor-
-                        returning callable in any importable module;
-                        resolution failures fail fast before streaming.
+  --redact-policy NAME  Select a redaction policy: 'default' (pattern set +
+                        env-value redactor seeded from ANTHROPIC_API_KEY) or
+                        'strict' (default + denylist for credential-reading
+                        tools Read/Bash). Any other value fails fast before
+                        streaming.
   --raw                 Disable redaction and emit verbatim payloads exactly
                         as stored. Use only for authorized forensics on
                         trusted output sinks.
   --dry-run             Stream the run through the selected policy and emit a
                         coverage report (records scanned, records redacted,
                         hits per label) without printing any payload content.
-                        Useful for verifying a custom policy catches the
-                        secrets you expect before relying on it.
+                        Useful for verifying a policy catches the secrets you
+                        expect before relying on it.
   --redact-salt SALT    Salt for stable [REDACTED:label:digest] tokens (HMAC-
                         SHA256). Identical secrets render to the same token
                         across records so a consumer can correlate
                         occurrences; the cleartext is never recoverable from a
                         token. Default: no salt -> bare [REDACTED:label]
-                        tokens. Applies to built-in policies only -- custom
-                        dotted-path factories configure their own salt.
+                        tokens.
 
 Redaction usage (on by default; best-effort -- the store remains the unredacted source of truth):
   --redact                   explicit opt-in (already the default)
-  --redact-policy NAME|PATH  'default' | 'strict' | 'module.sub:factory'
+  --redact-policy NAME       'default' | 'strict'
   --redact-salt SALT         stable [REDACTED:label:digest] tokens for correlation
   --dry-run                  coverage report only; no payload content printed
   --raw                      verbatim output for authorized forensics (disables redaction)
@@ -1571,6 +1562,14 @@ mod tests {
             "error: unknown built-in policy 'x'; expected one of ['default', 'strict'] or a \
              registered custom policy\n"
         );
+        assert_eq!(
+            error(&["run-1", "--redact-policy", "pkg.mod:factory"]),
+            "error: --redact-policy 'pkg.mod:factory': dotted-path policy factories \
+             ('module.sub:factory') are not supported; expected one of ['default', 'strict']\n"
+        );
+        assert!(!AUDIT_HELP.contains("module.sub"));
+        assert!(!AUDIT_HELP.contains("DOTTED"));
+        assert!(AUDIT_HELP.starts_with("usage: flywheel audit [-h]"));
     }
 
     #[test]

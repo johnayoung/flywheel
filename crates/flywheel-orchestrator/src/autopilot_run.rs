@@ -181,7 +181,7 @@ pub fn parse_float_arg(name: &str, raw: &str) -> Result<f64, String> {
 }
 
 /// A long-option token split into its flag and inline `=value`.
-fn split_flag(arg: &str) -> (&str, Option<&str>) {
+pub(crate) fn split_flag(arg: &str) -> (&str, Option<&str>) {
     match arg.split_once('=') {
         Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
         _ => (arg, None),
@@ -190,7 +190,7 @@ fn split_flag(arg: &str) -> (&str, Option<&str>) {
 
 /// Take an option's value: the inline `=value`, else the next token unless
 /// it is missing or looks like another option.
-fn take_value(
+pub(crate) fn take_value(
     flag: &str,
     inline: Option<&str>,
     iter: &mut std::slice::Iter<'_, String>,
@@ -208,7 +208,7 @@ fn take_value(
 }
 
 /// Reject an inline value on a store-true flag (`--once=1`).
-fn reject_inline(flag: &str, inline: Option<&str>) -> Result<(), String> {
+pub(crate) fn reject_inline(flag: &str, inline: Option<&str>) -> Result<(), String> {
     match inline {
         Some(value) => Err(format!(
             "argument {flag}: ignored explicit argument '{value}'"

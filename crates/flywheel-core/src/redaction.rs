@@ -24,7 +24,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use regex::{NoExpand, Regex};
 use serde_json::{Map, Value};
@@ -530,23 +530,65 @@ impl Redactor for FieldPathRedactor {
 /// Redacts tool input/result data for tools on a configured denylist.
 ///
 /// Only applies to [`AuditRecord::SdkMessage`]; an [`AuditRecord::Event`]
-/// passes through as a fresh-but-equal record. Walks the payload tree and,
-/// for each object whose `"name"` field is in the denylist, replaces sibling
-/// `"input"` and `"content"` values with redaction tokens. This matches the
-/// on-the-wire shape of the agent SDK's `ToolUseBlock` / `ToolResultBlock`
-/// content blocks.
+/// passes through as a fresh-but-equal record. Walks the payload tree and
+/// recognises both recorded tool shapes:
+///
+/// - the agent SDK's content blocks (historical telemetry): a `ToolUseBlock`
+///   `{"id", "name", "input"}` and a `ToolResultBlock`
+///   `{"tool_use_id", "content"}`;
+/// - the normalized agent events the Rust adapters record: a tool call
+///   `{"tool_use_id", "tool_name", "tool_input"}`, an approval request
+///   `{"tool_name", "tool_input" | "input"}`, and a tool result
+///   `{"tool_use_id", "content"}`.
+///
+/// An object naming a denylisted tool (`name` or `tool_name`) has its
+/// sibling `input` / `tool_input` / `content` values replaced with
+/// redaction tokens. A tool *result* carries no name, so the redactor
+/// remembers every tool call id it has seen and the name it was issued
+/// under, and redacts a result's `content` when its `tool_use_id` maps to a
+/// denylisted tool. A result whose originating call was never observed
+/// (a stream read from the middle, a truncated file) is redacted too: under
+/// a denylist the safe reading of an unattributable result is that it may
+/// belong to a denylisted tool.
+///
+/// The correlation state lives inside the redactor, so one instance must
+/// see a run's records in stream order (which every reader in this crate
+/// guarantees); a fresh instance per independent stream keeps runs apart.
 ///
 /// The envelope (record variant, `run_id`, `id`, `sequence`, `ts`,
 /// `attempt_number`, `iteration_number`, `message_type`) is unchanged. The
 /// denylisted tool's *name* is intentionally preserved in the payload so a
 /// reader can still tell which tool was invoked; only its inputs and
 /// outputs are suppressed.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ToolDenylistRedactor {
     names: HashSet<String>,
     salt: Option<Vec<u8>>,
     label: String,
+    /// Tool call id -> the tool name it was issued under, learned from the
+    /// call records already walked.
+    calls: Mutex<HashMap<String, String>>,
 }
+
+impl Clone for ToolDenylistRedactor {
+    fn clone(&self) -> Self {
+        Self {
+            names: self.names.clone(),
+            salt: self.salt.clone(),
+            label: self.label.clone(),
+            calls: Mutex::new(self.lock_calls().clone()),
+        }
+    }
+}
+
+/// Keys naming the invoked tool, in both recorded shapes.
+const TOOL_NAME_KEYS: [&str; 2] = ["name", "tool_name"];
+/// Keys carrying a tool call's id, in both recorded shapes.
+const TOOL_ID_KEYS: [&str; 2] = ["id", "tool_use_id"];
+/// Keys carrying a denylisted tool's input or output.
+const TOOL_DATA_KEYS: [&str; 3] = ["input", "tool_input", "content"];
+/// The token suffix for a result whose originating call was never seen.
+const UNATTRIBUTED_TOOL: &str = "unknown";
 
 impl ToolDenylistRedactor {
     pub const DEFAULT_LABEL: &'static str = "tool";
@@ -578,26 +620,54 @@ impl ToolDenylistRedactor {
             names,
             salt: salt.map(<[u8]>::to_vec),
             label: label.to_owned(),
+            calls: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn lock_calls(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn redact_keys(&self, map: &mut JsonObject, tool_name: &str, keys: &[&str]) {
+        let token_label = format!("{}:{tool_name}", self.label);
+        for key in keys {
+            if let Some(value) = map.get_mut(*key) {
+                *value = Value::String(replace_value(value, &token_label, self.salt.as_deref()));
+            }
+        }
     }
 
     fn walk(&self, node: &mut Value) {
         match node {
             Value::Object(map) => {
-                let denylisted = map
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|name| self.names.contains(*name))
+                let tool_name = TOOL_NAME_KEYS
+                    .iter()
+                    .find_map(|key| map.get(*key).and_then(Value::as_str))
                     .map(str::to_owned);
-                if let Some(tool_name) = denylisted {
-                    let token_label = format!("{}:{tool_name}", self.label);
-                    for key in ["input", "content"] {
-                        if let Some(value) = map.get_mut(key) {
-                            *value = Value::String(replace_value(
-                                value,
-                                &token_label,
-                                self.salt.as_deref(),
-                            ));
+                match tool_name {
+                    Some(tool_name) => {
+                        if let Some(id) = TOOL_ID_KEYS
+                            .iter()
+                            .find_map(|key| map.get(*key).and_then(Value::as_str))
+                        {
+                            self.lock_calls().insert(id.to_owned(), tool_name.clone());
+                        }
+                        if self.names.contains(&tool_name) {
+                            self.redact_keys(map, &tool_name, &TOOL_DATA_KEYS);
+                        }
+                    }
+                    None => {
+                        let result_of = map
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .filter(|_| map.contains_key("content"))
+                            .map(|id| self.lock_calls().get(id).cloned());
+                        match result_of {
+                            Some(Some(origin)) if self.names.contains(&origin) => {
+                                self.redact_keys(map, &origin, &["content"]);
+                            }
+                            Some(None) => self.redact_keys(map, UNATTRIBUTED_TOOL, &["content"]),
+                            _ => {}
                         }
                     }
                 }
@@ -751,10 +821,11 @@ pub fn default_policy(salt: Option<&[u8]>) -> PatternRedactor {
 /// Tools whose outputs commonly contain credentials (`.env` files, AWS
 /// credential files, `~/.ssh` material, decoded JWTs, etc.). `Read` is the
 /// direct filesystem-read tool; `Bash` is a general shell that is routinely
-/// used to `cat` credential files. [`strict_policy`] suppresses these tools'
-/// inputs and outputs entirely; only the tool name is preserved so a reader
-/// can still follow the agent's actions.
-pub const CREDENTIAL_READING_TOOLS: [&str; 2] = ["Read", "Bash"];
+/// used to `cat` credential files; `command_execution` is the codex
+/// adapter's name for the same shell tool. [`strict_policy`] suppresses
+/// these tools' inputs and outputs entirely; only the tool name is
+/// preserved so a reader can still follow the agent's actions.
+pub const CREDENTIAL_READING_TOOLS: [&str; 3] = ["Read", "Bash", "command_execution"];
 
 /// Return a [`Redactor`] equal to [`default_policy`] plus a
 /// [`ToolDenylistRedactor`] over [`CREDENTIAL_READING_TOOLS`].
@@ -1431,5 +1502,131 @@ mod tests {
             })
         );
         let _ = strict_policy(Some(b"x"));
+    }
+
+    /// One normalized agent event exactly as the Rust adapters record it:
+    /// `RunTelemetry::sdk_message` over `event_to_message`, with the
+    /// event's `type` as the record's message type.
+    fn recorded_event(kind: &str, native: &str, event_payload: Value, sequence: u64) -> AuditRecord {
+        AuditRecord::SdkMessage(SdkMessageRecord {
+            run_id: "run-1".into(),
+            attempt_number: 1,
+            iteration_number: 1,
+            message_type: kind.into(),
+            payload: object(json!({
+                "type": kind,
+                "payload": event_payload,
+                "source": "claude-code",
+                "native_type": native,
+                "sequence": sequence,
+                "timestamp": "2026-06-02T12:00:00Z",
+            })),
+            ts: at(),
+            sequence: Some(sequence),
+            id: None,
+        })
+    }
+
+    #[test]
+    fn strict_policy_redacts_recorded_tool_calls_and_correlated_results() {
+        let redactor = strict_policy(None);
+        let read_call = redactor.redact(&recorded_event(
+            "tool.started",
+            "assistant",
+            json!({"tool_use_id": "toolu_01", "tool_name": "Read", "tool_input": {"file_path": "/home/me/.env"}}),
+            1,
+        ));
+        assert_eq!(
+            payload(&read_call)["payload"],
+            json!({"tool_use_id": "toolu_01", "tool_name": "Read", "tool_input": "[REDACTED:tool:Read]"})
+        );
+        let read_result = redactor.redact(&recorded_event(
+            "tool.finished",
+            "user",
+            json!({"tool_use_id": "toolu_01", "is_error": false, "content": "DB_PASSWORD=hunter2"}),
+            2,
+        ));
+        assert_eq!(
+            payload(&read_result)["payload"],
+            json!({"tool_use_id": "toolu_01", "is_error": false, "content": "[REDACTED:tool:Read]"})
+        );
+        // A non-denylisted tool's call and result pass through untouched.
+        let edit_call = recorded_event(
+            "tool.started",
+            "assistant",
+            json!({"tool_use_id": "toolu_02", "tool_name": "Edit", "tool_input": {"file_path": "src/x"}}),
+            3,
+        );
+        assert_eq!(redactor.redact(&edit_call), edit_call);
+        let edit_result = recorded_event(
+            "tool.finished",
+            "user",
+            json!({"tool_use_id": "toolu_02", "is_error": false, "content": "edited"}),
+            4,
+        );
+        assert_eq!(redactor.redact(&edit_result), edit_result);
+        // A result whose originating call was never observed fails closed.
+        let orphan = redactor.redact(&recorded_event(
+            "tool.finished",
+            "user",
+            json!({"tool_use_id": "toolu_99", "is_error": false, "content": "cat output"}),
+            5,
+        ));
+        assert_eq!(payload(&orphan)["payload"]["content"], "[REDACTED:tool:unknown]");
+        // The approval request carries the input both flat and in `detail`.
+        let approval = redactor.redact(&recorded_event(
+            "approval.requested",
+            "control_request",
+            json!({
+                "request_id": "r1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "cat ~/.aws/credentials"},
+                "tool_use_id": "toolu_03",
+                "detail": {"tool_name": "Bash", "input": {"command": "cat ~/.aws/credentials"}},
+            }),
+            6,
+        ));
+        let approval = payload(&approval);
+        assert_eq!(approval["payload"]["tool_input"], "[REDACTED:tool:Bash]");
+        assert_eq!(approval["payload"]["detail"]["input"], "[REDACTED:tool:Bash]");
+        assert_eq!(approval["payload"]["tool_name"], "Bash");
+    }
+
+    #[test]
+    fn strict_policy_still_redacts_historical_sdk_shaped_results() {
+        let redactor = strict_policy(None);
+        let _ = redactor.redact(&sdk(json!({
+            "message_type": "AssistantMessage",
+            "content": [{"type": "tool_use", "id": "tu-1", "name": "Bash", "input": {"command": "cat .env"}}],
+        })));
+        let result = redactor.redact(&sdk(json!({
+            "message_type": "UserMessage",
+            "content": [{"type": "tool_result", "tool_use_id": "tu-1", "content": "SECRET=1"}],
+        })));
+        assert_eq!(
+            payload(&result)["content"][0]["content"],
+            "[REDACTED:tool:Bash]"
+        );
+    }
+
+    #[test]
+    fn strict_policy_redacts_codex_shell_results() {
+        let redactor = strict_policy(None);
+        let _ = redactor.redact(&recorded_event(
+            "tool.started",
+            "item.started",
+            json!({"tool_use_id": "item_1", "tool_name": "command_execution", "tool_input": {"command": "cat .env"}}),
+            1,
+        ));
+        let result = redactor.redact(&recorded_event(
+            "tool.finished",
+            "item.completed",
+            json!({"tool_use_id": "item_1", "is_error": false, "content": "SECRET=1"}),
+            2,
+        ));
+        assert_eq!(
+            payload(&result)["payload"]["content"],
+            "[REDACTED:tool:command_execution]"
+        );
     }
 }

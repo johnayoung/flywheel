@@ -5,7 +5,7 @@
 #
 # Usage:
 #   scripts/seed-readme-task.sh
-#   uv run flywheel worker --once
+#   cargo run -p flywheel -- worker --once
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,17 +18,17 @@ mkdir -p "$PHASE_DIR"
 cat > "$PHASE_DIR/readme-rewrite.json" <<EOF
 {
   "id": "$TASK_ID",
-  "goal": "Rewrite the root README.md from scratch as a concise onboarding page for the flywheel workspace: one-line pitch, quickstart (Python 3.13, uv sync, running a task via uv run flywheel worker --once), the four-package layout, and links to docs/.",
+  "goal": "Rewrite the root README.md from scratch as a concise onboarding page for the flywheel workspace: one-line pitch, quickstart (cargo build, running a task via flywheel worker --once), the six-crate workspace layout, and links to docs/.",
   "tags": ["docs", "smoke"],
   "context": {
     "relevant": [
       "CLAUDE.md",
-      "pyproject.toml",
+      "Cargo.toml",
       "docs/vision.md",
       "docs/task-schema.md",
       "docs/task-lifecycle.md",
       "docs/loop.md",
-      "packages/flywheel/src/flywheel/_cli.py"
+      "crates/flywheel/src/cli.rs"
     ],
     "constraints": [
       "Write the README greenfield -- do not preserve or merge the existing README.md content.",
@@ -44,7 +44,7 @@ cat > "$PHASE_DIR/readme-rewrite.json" <<EOF
   },
   "graders": [
     { "type": "command", "run": "test -s README.md", "name": "readme-exists" },
-    { "type": "command", "run": "grep -qi flywheel README.md && grep -q 'uv sync' README.md", "name": "readme-content" },
+    { "type": "command", "run": "grep -qi flywheel README.md && grep -q 'cargo build' README.md", "name": "readme-content" },
     { "type": "command", "run": "git diff --name-only HEAD~1 HEAD | grep -qx README.md && [ \$(git diff --name-only HEAD~1 HEAD | wc -l) -eq 1 ]", "name": "only-readme-changed" },
     { "type": "command", "run": "git log -1 --format=%s | grep -q '^docs:'", "name": "commit-landed" },
     { "type": "transcript", "max_turns": 30 }
@@ -54,4 +54,4 @@ EOF
 
 echo "Seeded $PHASE_DIR/readme-rewrite.json"
 echo "Task id: $TASK_ID"
-echo "Next: uv run flywheel worker --once"
+echo "Next: cargo run -p flywheel -- worker --once"

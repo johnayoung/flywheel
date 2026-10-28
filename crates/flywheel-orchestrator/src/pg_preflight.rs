@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use flywheel_core::store::CURRENT_SCHEMA_VERSION;
 use flywheel_core::store_postgres::{PostgresStore, describe_error};
-use postgres::{Client, Config, NoTls};
+use postgres::Client;
 
 /// The schema versions the store migrates forward in place (v11 -> v12, an
 /// additive nullable column). Mirrors the store bootstrap; kept in sync here
@@ -175,18 +175,20 @@ pub fn sanitize(message: &str, dsn: &str, password: Option<&str>) -> String {
 /// libpq default (5432) that a URL-form DSN implies. `None` for a
 /// `key=value` DSN that names no port, or an unparseable string.
 pub fn dsn_port(dsn: &str) -> Option<u16> {
-    dsn.parse::<Config>()
+    flywheel_core::pg_tls::parse_config(dsn)
         .ok()
         .and_then(|config| config.get_ports().first().copied())
 }
 
 /// The password named by `dsn`, when it parses and carries one.
 pub fn dsn_password(dsn: &str) -> Option<String> {
-    dsn.parse::<Config>().ok().and_then(|config| {
-        config
-            .get_password()
-            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-    })
+    flywheel_core::pg_tls::parse_config(dsn)
+        .ok()
+        .and_then(|config| {
+            config
+                .get_password()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        })
 }
 
 /// Run the ordered Postgres readiness checks against `dsn`.
@@ -263,9 +265,9 @@ pub fn run_postgres_preflight(
 /// One autocommit connection with the preflight's bounded connect timeout,
 /// or the rendered driver error.
 fn connect(dsn: &str) -> Result<Client, String> {
-    let mut config: Config = dsn.parse().map_err(|err| describe_error(&err))?;
+    let (mut config, tls) = flywheel_core::pg_tls::configure(dsn).map_err(|err| err.to_string())?;
     config.connect_timeout(CONNECT_TIMEOUT);
-    config.connect(NoTls).map_err(|err| describe_error(&err))
+    config.connect(tls).map_err(|err| describe_error(&err))
 }
 
 /// What the session-state probe observed.

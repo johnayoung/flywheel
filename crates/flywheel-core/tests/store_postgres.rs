@@ -811,3 +811,110 @@ fn close_is_clean_and_a_reopened_store_sees_committed_state() {
     );
     assert_eq!(listing.lock().unwrap().len(), 1);
 }
+
+fn backend_pid(store: &PostgresStore) -> i32 {
+    store.with_client(|client| {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0)
+    })
+}
+
+fn terminate(pg: &Postgres, pid: i32) {
+    let mut admin = pg.admin();
+    let killed: bool = admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .unwrap()
+        .get(0);
+    assert!(killed, "terminated backend {pid}");
+}
+
+#[test]
+fn store_heals_a_terminated_connection() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_reconnect");
+    let store = open(&pg, &schema);
+    store
+        .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+        .unwrap();
+    let before = backend_pid(&store);
+    terminate(&pg, before);
+    // The call that meets the dead socket may fail (as with a pool); the
+    // store must be usable again by the next one, search_path re-pinned.
+    let first = store.load_lifecycle("r1");
+    let healed = match first {
+        Ok(found) => found,
+        Err(_) => store.load_lifecycle("r1").unwrap(),
+    };
+    assert_eq!(healed.unwrap().run_id, "r1");
+    assert_ne!(
+        backend_pid(&store),
+        before,
+        "a fresh backend serves the store"
+    );
+}
+
+#[test]
+fn listener_resubscribes_after_its_connection_is_terminated() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_listen_heal");
+    let writer = open(&pg, &schema);
+    let consumer = PostgresStore::connect_with(
+        &pg.dsn(),
+        PostgresStoreOptions {
+            schema: schema.clone(),
+            listen: true,
+            notifier: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        consumer.wait_listener(Duration::from_secs(5)),
+        Some(ListenerState::Listening)
+    );
+    let channel = consumer.channel().to_owned();
+    let mut admin = pg.admin();
+    let listener_pids: Vec<i32> = admin
+        .query(
+            "SELECT pid FROM pg_stat_activity WHERE query = $1",
+            &[&format!("LISTEN \"{channel}\"")],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(listener_pids.len(), 1, "one listener backend");
+    terminate(&pg, listener_pids[0]);
+    // Keep writing (a fresh run per probe) until the re-established LISTEN
+    // observes a NOTIFY.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for probe in 0.. {
+        let run_id = format!("run-pg-heal-{probe}");
+        let event = DomainEvent::new(
+            run_id.as_str(),
+            at(probe),
+            DomainEventPayload::LifecycleInitialized(LifecycleInitialized {
+                task_id: "t".into(),
+                ..Default::default()
+            }),
+        );
+        writer.append_domain_event(&event, 0).unwrap();
+        if consumer
+            .notifier()
+            .wait(&run_id, 0, Duration::from_millis(500))
+            >= 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "listener never resubscribed after termination"
+        );
+    }
+    assert!(consumer.listener_alive());
+}

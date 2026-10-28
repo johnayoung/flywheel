@@ -699,3 +699,25 @@ fn open_stores_routes_both_families_onto_one_postgres_schema() {
     let err = preflight_store(&registries, &config, &Environ::new()).unwrap_err();
     assert!(matches!(err, StoreConfigError::MissingDsn { .. }), "{err}");
 }
+
+#[test]
+fn claim_store_heals_a_terminated_connection() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_claims_reconnect");
+    let store = open(&pg, &schema);
+    let pid: i32 = store.with_client(|client| scalar(client, "SELECT pg_backend_pid()"));
+    let killed: bool = pg
+        .admin()
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .unwrap()
+        .get(0);
+    assert!(killed);
+    // The call that meets the dead socket may fail; the next must succeed.
+    if store.list_claims().is_err() {
+        store.list_claims().unwrap();
+    }
+    let fresh: i32 = store.with_client(|client| scalar(client, "SELECT pg_backend_pid()"));
+    assert_ne!(fresh, pid, "a fresh backend serves the claim store");
+}

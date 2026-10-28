@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use postgres::types::{FromSql, ToSql};
-use postgres::{Client, GenericClient, NoTls, Row, Transaction};
+use postgres::{Client, GenericClient, Row, Transaction};
 use serde_json::Value;
 
 use flywheel_core::store::HarnessStore;
@@ -668,6 +668,8 @@ fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
 /// locks, and the `ON CONFLICT` guard, never through anything in-process.
 pub struct PostgresClaimStore {
     client: Mutex<Client>,
+    /// Kept to heal a closed connection; never logged or echoed.
+    dsn: String,
     schema: String,
 }
 
@@ -693,13 +695,16 @@ impl PostgresClaimStore {
         let schema = validate_schema(schema)
             .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?
             .to_owned();
-        let mut client = Client::connect(dsn, NoTls).map_err(db)?;
+        let (config, tls) = flywheel_core::pg_tls::configure(dsn)
+            .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
+        let mut client = config.connect(tls).map_err(db)?;
         client
             .batch_execute(&search_path_sql(&schema))
             .map_err(db)?;
         bootstrap(&mut client, &schema)?;
         Ok(Self {
             client: Mutex::new(client),
+            dsn: dsn.to_owned(),
             schema,
         })
     }
@@ -717,6 +722,12 @@ impl PostgresClaimStore {
             .client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Best-effort heal; a still-dead connection surfaces through `f`.
+        let _ = flywheel_core::pg_tls::ensure_open(
+            &mut client,
+            &self.dsn,
+            &search_path_sql(&self.schema),
+        );
         f(&mut client)
     }
 
@@ -729,8 +740,13 @@ impl PostgresClaimStore {
         client.close().map_err(db)
     }
 
+    /// The connection under the store's lock, reconnected first when the
+    /// previous one was observed closed.
     fn lock(&self) -> Result<MutexGuard<'_, Client>, ClaimStoreError> {
-        self.client.lock().map_err(|_| ClaimStoreError::Poisoned)
+        let mut client = self.client.lock().map_err(|_| ClaimStoreError::Poisoned)?;
+        flywheel_core::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema))
+            .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
+        Ok(client)
     }
 
     /// Run `body` in one transaction: committed on `Ok`, rolled back on

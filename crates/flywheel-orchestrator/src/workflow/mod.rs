@@ -795,7 +795,14 @@ pub fn dispatch(
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
-            cmd_resolve(&args, &*stores.claims, chrono::Utc::now(), out, err)
+            cmd_resolve(
+                &args,
+                &*stores.core,
+                &*stores.claims,
+                chrono::Utc::now(),
+                out,
+                err,
+            )
         }
     }
 }

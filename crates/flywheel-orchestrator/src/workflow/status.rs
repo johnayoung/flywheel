@@ -119,6 +119,34 @@ fn landing_park_for_run(
         }))
 }
 
+/// The landing strand `task_id` still surfaces on: the park on its latest
+/// DONE run when that park is a strand kind and no attributed resolution
+/// marker postdates it -- the same rule `status` applies, so `resolve` can
+/// clear exactly what `status` shows.
+pub(crate) fn unresolved_landing_strand(
+    store: &dyn HarnessStore,
+    stop_events: &[OrchestratorStopEventRecord],
+    task_id: &str,
+) -> Result<Option<Park>, StoreError> {
+    let filter = LifecycleFilter::default()
+        .with_task_id(task_id)
+        .with_statuses([Status::Done]);
+    let Some(latest_done) = store.list_lifecycles(&filter)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(park) = landing_park_for_run(store, &latest_done.run_id)? else {
+        return Ok(None);
+    };
+    if !LANDING_STRAND_KINDS.contains(&park.park_kind.as_str()) {
+        return Ok(None);
+    }
+    let (_, resolved_at) = fold_stop_events(stop_events);
+    Ok(resolved_at
+        .get(task_id)
+        .is_none_or(|resolution| park.ts > *resolution)
+        .then_some(park))
+}
+
 /// The pre-run stop ledger folded two ways in one pass: the latest
 /// unresolved stop per subject (a `stop-resolved` row of ANY attribution
 /// clears the subject; only a later stop re-surfaces it), and the latest
@@ -862,6 +890,79 @@ mod tests {
         assert_eq!(
             run_status(&tmp, &store, &claims, true, true),
             "{\n  \"totals\": {},\n  \"phases\": []\n}\n"
+        );
+    }
+
+    #[test]
+    fn resolve_clears_a_ledger_only_landing_strand_until_it_recurs() {
+        use super::super::args::ResolveArgs;
+        use super::super::ops::cmd_resolve;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("active")).unwrap();
+        let store = InMemoryStore::new();
+        let claims = InMemoryClaimStore::new();
+        // A parked DONE run whose task left the listing and that never
+        // wrote a stop row: status surfaces it, so resolve must clear it.
+        let lc = seed_done(&store, "zz");
+        park(
+            &store,
+            &lc.run_id,
+            PARK_KIND_STANDING_VERIFY,
+            "red gate",
+            t0(),
+        );
+        assert!(
+            run_status(&tmp, &store, &claims, false, false)
+                .contains("zz [no active row]  stranded")
+        );
+        let resolve = |reason: &str, now: DateTime<Utc>| {
+            let args = ResolveArgs {
+                task_id: "zz".into(),
+                reason: reason.into(),
+                policy: None,
+                db: None,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_resolve(&args, &store, &claims, now, &mut out, &mut err).unwrap();
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let later = t0() + chrono::Duration::seconds(10);
+        assert_eq!(
+            resolve("superseded by main", later),
+            (
+                0,
+                "resolved zz: abandoned strand (superseded 'standing-verify')\n".into(),
+                String::new()
+            )
+        );
+        assert_eq!(
+            run_status(&tmp, &store, &claims, false, false),
+            "(no active tasks)\n"
+        );
+        let (code, _, err) = resolve("again", later);
+        assert_eq!(code, 1);
+        assert!(err.contains("(already resolved)"), "{err}");
+        // A park after the marker is a fresh recurrence: surfaced and
+        // resolvable again.
+        park(
+            &store,
+            &lc.run_id,
+            PARK_KIND_STANDING_VERIFY,
+            "red again",
+            later + chrono::Duration::seconds(10),
+        );
+        assert!(
+            run_status(&tmp, &store, &claims, false, false)
+                .contains("stranded: standing-verify -- red again")
+        );
+        assert_eq!(resolve("again", later + chrono::Duration::seconds(20)).0, 0);
+        assert_eq!(
+            run_status(&tmp, &store, &claims, false, false),
+            "(no active tasks)\n"
         );
     }
 

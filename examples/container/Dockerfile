@@ -10,9 +10,10 @@
 #   docker build -t flywheel-agent:latest \
 #     --build-arg AGENT_UID=$(id -u) --build-arg AGENT_GID=$(id -g) .
 #
-# For a task whose graders run the project's tooling (e.g. `uv run pytest`), add
-# Python 3.13 + uv + the project deps to this image. The bundled run_e2e.py uses
-# a trivial `test -f` grader, so this minimal image is enough for it.
+# For a task whose agent needs the project's toolchain to iterate (e.g. `cargo
+# test`), add that toolchain and the project deps to this image. The bundled
+# run_e2e.sh task needs nothing beyond a shell, so this minimal image is enough
+# for it.
 
 FROM node:22-bookworm
 

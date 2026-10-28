@@ -84,6 +84,13 @@ pub struct AutopilotActivity {
     pub last_relevant_tiers: Vec<u8>,
     #[serde(default)]
     pub last_emitted_tasks: Vec<EmittedSummary>,
+    /// Tiers the last cycle's structural pre-filter skipped before discovery.
+    #[serde(default)]
+    pub last_prefiltered_tiers: Vec<u8>,
+    /// How the last cycle used the discovery-verdict cache (`hit`, `miss`,
+    /// `partial (...)`, `disabled (...)`, `not consulted`).
+    #[serde(default)]
+    pub last_discovery_cache: String,
 }
 
 impl AutopilotActivity {
@@ -108,6 +115,8 @@ impl AutopilotActivity {
             last_reason: String::new(),
             last_relevant_tiers: Vec::new(),
             last_emitted_tasks: Vec::new(),
+            last_prefiltered_tiers: Vec::new(),
+            last_discovery_cache: String::new(),
         }
     }
 }
@@ -127,6 +136,8 @@ fn to_value(activity: &AutopilotActivity) -> Value {
         "last_reason": activity.last_reason,
         "last_relevant_tiers": activity.last_relevant_tiers,
         "last_emitted_tasks": activity.last_emitted_tasks,
+        "last_prefiltered_tiers": activity.last_prefiltered_tiers,
+        "last_discovery_cache": activity.last_discovery_cache,
     })
 }
 
@@ -204,13 +215,15 @@ fn from_value(data: &Value) -> Option<AutopilotActivity> {
         }
     }
 
-    let tiers = match data.get("last_relevant_tiers") {
-        Some(Value::Array(raw_tiers)) => raw_tiers
-            .iter()
-            .filter_map(|t| as_int(Some(t)))
-            .filter_map(|t| u8::try_from(t).ok())
-            .collect(),
-        _ => Vec::new(),
+    let tier_list = |key: &str| -> Vec<u8> {
+        match data.get(key) {
+            Some(Value::Array(raw_tiers)) => raw_tiers
+                .iter()
+                .filter_map(|t| as_int(Some(t)))
+                .filter_map(|t| u8::try_from(t).ok())
+                .collect(),
+            _ => Vec::new(),
+        }
     };
 
     Some(AutopilotActivity {
@@ -227,8 +240,13 @@ fn from_value(data: &Value) -> Option<AutopilotActivity> {
             .get("last_reason")
             .and_then(|v| as_text(Some(v)))
             .unwrap_or_default(),
-        last_relevant_tiers: tiers,
+        last_relevant_tiers: tier_list("last_relevant_tiers"),
         last_emitted_tasks: tasks,
+        last_prefiltered_tiers: tier_list("last_prefiltered_tiers"),
+        last_discovery_cache: data
+            .get("last_discovery_cache")
+            .and_then(|v| as_text(Some(v)))
+            .unwrap_or_default(),
     })
 }
 
@@ -334,6 +352,8 @@ mod tests {
                     tier: 3,
                 },
             ],
+            last_prefiltered_tiers: vec![1],
+            last_discovery_cache: "hit".to_owned(),
         }
     }
 

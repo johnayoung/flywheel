@@ -24,12 +24,16 @@ use crate::autopilot_activity::{
     AutopilotActivity, EmittedSummary, PHASE_IDLE, PHASE_RUNNING, PHASE_STARTING, epoch_now,
     write_activity,
 };
+use crate::autopilot_context::{DiscoveryCacheStatus, default_discovery_cache_path};
 use crate::claims::{ClaimStore, ClaimStoreError, OrchestratorSchemaError};
 use crate::orchestrate::{
     DEFAULT_NO_PROGRESS_BOUND, NoProgressObservation, NoProgressOutcome, NoProgressResult,
     OrchestrateError, redrive_no_progress,
 };
-use crate::policy::{DEFAULT_AUTOPILOT_INTERVAL_SECONDS, WorkPolicy};
+use crate::policy::{
+    DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
+    DEFAULT_AUTOPILOT_INTERVAL_SECONDS, WorkPolicy,
+};
 use crate::sources::{LogSink, WorkSourceError};
 use crate::store_factory::{StoreConfigError, build_claim_store, build_store};
 use crate::store_registry::{Environ, StoreRegistries, environ_from_process};
@@ -369,6 +373,22 @@ pub fn error_type_name(err: &(dyn Error + 'static)) -> &'static str {
 }
 
 fn log_result(log: &LogSink, result: &AutopilotPassResult) {
+    for skip in &result.prefiltered {
+        log(&format!("tier {} skipped: {}", skip.tier, skip.reason));
+    }
+    if result.discovery_cache != DiscoveryCacheStatus::NotConsulted {
+        log(&format!("discovery cache: {}", result.discovery_cache));
+    }
+    if !result.already_authored.is_empty() {
+        log(&format!(
+            "skipped {} finding(s) already authored at this repo state: {}",
+            result.already_authored.len(),
+            result.already_authored.join(", ")
+        ));
+    }
+    for note in &result.notes {
+        log(note);
+    }
     log(&result.reason);
     for path in &result.emitted_paths {
         log(&format!("emitted {}", python_path_str(path)));
@@ -453,6 +473,12 @@ pub struct SinglePassSpec {
     pub deadlines: Option<DeadlineConfig>,
     pub agent_id: Option<String>,
     pub agent_transport: Option<String>,
+    /// `[autopilot] authoring_concurrency` (1 = serial authoring).
+    pub authoring_concurrency: usize,
+    /// The durable discovery-verdict cache file; `None` disables it.
+    pub discovery_cache: Option<PathBuf>,
+    /// `[autopilot] discovery_cache_ttl_seconds` (0 disables the cache).
+    pub discovery_cache_ttl_seconds: f64,
 }
 
 impl SinglePassSpec {
@@ -468,6 +494,10 @@ impl SinglePassSpec {
             deadlines: None,
             agent_id: None,
             agent_transport: None,
+            authoring_concurrency: usize::try_from(DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY)
+                .unwrap_or(1),
+            discovery_cache: None,
+            discovery_cache_ttl_seconds: DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
         }
     }
 }
@@ -492,6 +522,9 @@ pub async fn run_single_pass(
     options.deadlines = spec.deadlines.clone();
     options.agent_id = spec.agent_id.clone();
     options.agent_transport = spec.agent_transport.clone();
+    options.authoring_concurrency = spec.authoring_concurrency.max(1);
+    options.discovery_cache = spec.discovery_cache.clone();
+    options.discovery_cache_ttl_seconds = spec.discovery_cache_ttl_seconds;
     run_refill_pass(options).await
 }
 
@@ -764,6 +797,8 @@ struct LastCycle {
     reason: String,
     relevant_tiers: Vec<u8>,
     emitted_tasks: Vec<EmittedSummary>,
+    prefiltered_tiers: Vec<u8>,
+    discovery_cache: String,
 }
 
 impl LastCycle {
@@ -781,6 +816,12 @@ impl LastCycle {
                     tier: u8::from(e.finding.tier),
                 })
                 .collect(),
+            prefiltered_tiers: result
+                .prefiltered
+                .iter()
+                .map(|s| u8::from(s.tier))
+                .collect(),
+            discovery_cache: result.discovery_cache.to_string(),
         }
     }
 }
@@ -867,6 +908,8 @@ impl ActivityRecorder {
             last_reason: last.reason,
             last_relevant_tiers: last.relevant_tiers,
             last_emitted_tasks: last.emitted_tasks,
+            last_prefiltered_tiers: last.prefiltered_tiers,
+            last_discovery_cache: last.discovery_cache,
         };
         // Best-effort by contract: a snapshot write failure never crashes a cycle.
         let _ = write_activity(&self.path, &activity);
@@ -1178,6 +1221,17 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         deadlines: policy.map(|p| p.deadlines.clone()),
         agent_id: policy.and_then(|p| p.agent_id.clone()),
         agent_transport: policy.and_then(|p| p.agent_transport.clone()),
+        authoring_concurrency: policy
+            .map_or(DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, |p| {
+                p.autopilot_authoring_concurrency
+            })
+            .try_into()
+            .unwrap_or(1),
+        discovery_cache: Some(default_discovery_cache_path(&repo_root)),
+        discovery_cache_ttl_seconds: policy
+            .map_or(DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS, |p| {
+                p.autopilot_discovery_cache_ttl_seconds
+            }),
     };
     let repo_text = python_path_str(&repo_root);
     let tasks_text = python_path_str(&runtime.tasks_dir);
@@ -1975,6 +2029,29 @@ mod tests {
         assert_eq!(running.cycle_index, 2);
         assert_eq!(running.last_emitted, 1);
         assert_eq!(running.last_reason, "cycle 1");
+        assert_eq!(running.last_discovery_cache, "not consulted");
+        assert!(running.last_prefiltered_tiers.is_empty());
+    }
+
+    #[test]
+    fn idle_snapshot_records_prefilter_skips_and_cache_use() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("activity.json");
+        let recorder = recorder_at(&path, 60.0, 1, &[0.0]);
+        recorder.before_cycle();
+        recorder.on_cycle(&AutopilotPassResult {
+            prefiltered: vec![crate::autopilot_context::TierPrefilterSkip {
+                tier: Tier::ProductionDown,
+                reason: "structural pre-filter: no deployment".to_owned(),
+            }],
+            discovery_cache: DiscoveryCacheStatus::Partial {
+                reused: vec![Tier::TestCoverage],
+            },
+            ..idle("cycle 1")
+        });
+        let snapshot = read_activity(Some(&path)).unwrap();
+        assert_eq!(snapshot.last_prefiltered_tiers, vec![1]);
+        assert_eq!(snapshot.last_discovery_cache, "partial (reused tiers 6)");
     }
 
     #[test]
@@ -2300,6 +2377,63 @@ mod tests {
         let specs = host.specs.lock().unwrap();
         let deadlines = specs[0].deadlines.clone().unwrap();
         assert_eq!(deadlines.for_class(DeadlineClass::AutopilotAgent), None);
+    }
+
+    #[test]
+    fn once_threads_the_cycle_cost_controls_to_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let host = host(&dir, "");
+        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        {
+            let specs = host.specs.lock().unwrap();
+            assert_eq!(specs[0].authoring_concurrency, 3);
+            assert_eq!(specs[0].discovery_cache_ttl_seconds, 21_600.0);
+            assert_eq!(
+                specs[0].discovery_cache.as_deref(),
+                Some(
+                    dir.path()
+                        .join(".flywheel/logs/autopilot/discovery-cache.json")
+                        .as_path()
+                )
+            );
+        }
+        let host = host_with(
+            &dir,
+            "[autopilot]\nauthoring_concurrency = 1\ndiscovery_cache_ttl_seconds = 0\n",
+        );
+        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        let specs = host.specs.lock().unwrap();
+        assert_eq!(specs[0].authoring_concurrency, 1);
+        assert_eq!(specs[0].discovery_cache_ttl_seconds, 0.0);
+    }
+
+    #[test]
+    fn log_result_reports_prefilter_skips_cache_use_and_suppressed_findings() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink_lines = lines.clone();
+        let log: LogSink =
+            Arc::new(move |line: &str| sink_lines.lock().unwrap().push(line.to_owned()));
+        let result = AutopilotPassResult {
+            prefiltered: vec![crate::autopilot_context::TierPrefilterSkip {
+                tier: Tier::ProductionDown,
+                reason: "structural pre-filter: no deployment".to_owned(),
+            }],
+            discovery_cache: DiscoveryCacheStatus::Hit,
+            already_authored: vec!["t5-a".to_owned()],
+            notes: vec!["discovery cache write failed (x): denied".to_owned()],
+            ..idle("idle")
+        };
+        log_result(&log, &result);
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec![
+                "tier 1 skipped: structural pre-filter: no deployment",
+                "discovery cache: hit",
+                "skipped 1 finding(s) already authored at this repo state: t5-a",
+                "discovery cache write failed (x): denied",
+                "idle",
+            ]
+        );
     }
 
     fn host_with(dir: &TempDir, policy_body: &str) -> FakeHost {

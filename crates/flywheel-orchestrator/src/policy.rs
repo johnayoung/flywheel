@@ -56,6 +56,30 @@ pub const DEFAULT_AUTOPILOT_TARGET_DEPTH: i64 = 5;
 /// Default landing posture for autopilot-authored work (FF-merge autonomy).
 pub const DEFAULT_AUTOPILOT_LANDING: &str = "merge";
 
+/// Default number of autopilot authoring sessions run concurrently per
+/// refill pass (`[autopilot] authoring_concurrency`; 1 = serial).
+pub const DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY: i64 = 3;
+
+/// Default lifetime (seconds) of a cached autopilot discovery verdict
+/// (`[autopilot] discovery_cache_ttl_seconds`; 0 disables the cache).
+pub const DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS: f64 = 21_600.0;
+
+fn is_default_authoring_concurrency(value: &i64) -> bool {
+    *value == DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY
+}
+
+fn default_authoring_concurrency() -> i64 {
+    DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY
+}
+
+fn is_default_discovery_cache_ttl(value: &f64) -> bool {
+    *value == DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS
+}
+
+fn default_discovery_cache_ttl() -> f64 {
+    DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS
+}
+
 /// Landing postures autopilot work can take.
 pub const AUTOPILOT_LANDINGS: [&str; 2] = ["merge", "pr"];
 
@@ -483,7 +507,10 @@ impl Default for AutopilotWeights {
 ///   a default would silently activate gating on upgrade).
 /// * **deadlines** -- the core [`DeadlineConfig`] (spec 00066).
 /// * **autopilot** -- `autopilot_target_depth`, `autopilot_landing`,
-///   `autopilot_interval_seconds`, `autopilot_weights`.
+///   `autopilot_interval_seconds`, `autopilot_weights`,
+///   `autopilot_authoring_concurrency`,
+///   `autopilot_discovery_cache_ttl_seconds` (the last two serialize only
+///   when set off their defaults).
 /// * **triage** -- the three board labels, `triage_interval_seconds`,
 ///   `triage_max_per_pass` (`None` = uncapped).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +555,16 @@ pub struct WorkPolicy {
     pub autopilot_landing: String,
     pub autopilot_interval_seconds: f64,
     pub autopilot_weights: Option<AutopilotWeights>,
+    #[serde(
+        default = "default_authoring_concurrency",
+        skip_serializing_if = "is_default_authoring_concurrency"
+    )]
+    pub autopilot_authoring_concurrency: i64,
+    #[serde(
+        default = "default_discovery_cache_ttl",
+        skip_serializing_if = "is_default_discovery_cache_ttl"
+    )]
+    pub autopilot_discovery_cache_ttl_seconds: f64,
     pub triage_intake_label: String,
     pub triage_ready_label: String,
     pub triage_needs_detail_label: String,
@@ -582,6 +619,8 @@ impl Default for WorkPolicy {
             autopilot_landing: DEFAULT_AUTOPILOT_LANDING.to_string(),
             autopilot_interval_seconds: DEFAULT_AUTOPILOT_INTERVAL_SECONDS,
             autopilot_weights: None,
+            autopilot_authoring_concurrency: DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY,
+            autopilot_discovery_cache_ttl_seconds: DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
             triage_intake_label: DEFAULT_TRIAGE_INTAKE_LABEL.to_string(),
             triage_ready_label: DEFAULT_TRIAGE_READY_LABEL.to_string(),
             triage_needs_detail_label: DEFAULT_TRIAGE_NEEDS_DETAIL_LABEL.to_string(),
@@ -770,6 +809,8 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
     let autopilot = ctx.section(data, "autopilot")?;
     let (autopilot_target_depth, autopilot_landing, autopilot_interval_seconds, autopilot_weights) =
         ctx.optional_autopilot(autopilot)?;
+    let (autopilot_authoring_concurrency, autopilot_discovery_cache_ttl_seconds) =
+        ctx.optional_autopilot_cost_controls(autopilot)?;
 
     let triage = ctx.section(data, "triage")?;
     let (
@@ -833,6 +874,8 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
         autopilot_landing,
         autopilot_interval_seconds,
         autopilot_weights,
+        autopilot_authoring_concurrency,
+        autopilot_discovery_cache_ttl_seconds,
         triage_intake_label,
         triage_ready_label,
         triage_needs_detail_label,
@@ -1306,6 +1349,30 @@ impl Ctx<'_> {
             interrupt_base: weight("interrupt_base", base.interrupt_base)?,
         };
         Ok((target_depth, landing, interval, Some(weights)))
+    }
+
+    /// Validate the `[autopilot]` cycle-cost knobs:
+    /// `(authoring_concurrency, discovery_cache_ttl_seconds)`.
+    fn optional_autopilot_cost_controls(&self, table: &Table) -> Result<(i64, f64), PolicyError> {
+        let concurrency = self.override_int(
+            table,
+            "authoring_concurrency",
+            DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY,
+            "autopilot.authoring_concurrency",
+        )?;
+        if concurrency <= 0 {
+            return Err(self.err("autopilot.authoring_concurrency must be a positive integer"));
+        }
+        let ttl = self.override_float(
+            table,
+            "discovery_cache_ttl_seconds",
+            DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
+            "autopilot.discovery_cache_ttl_seconds",
+        )?;
+        if !ttl.is_finite() || ttl < 0.0 {
+            return Err(self.err("autopilot.discovery_cache_ttl_seconds must be >= 0"));
+        }
+        Ok((concurrency, ttl))
     }
 
     /// Validate the optional `[triage]` table: `(intake_label, ready_label,
@@ -2742,6 +2809,32 @@ mod tests {
         assert_eq!(
             err_dir("[autopilot]\nweights = 1\n"),
             format!("{FILE}: [autopilot.weights] must be a table")
+        );
+    }
+
+    #[test]
+    fn autopilot_cost_controls_parse_and_validate() {
+        let absent = ok_dir("");
+        assert_eq!(absent.autopilot_authoring_concurrency, 3);
+        assert_eq!(absent.autopilot_discovery_cache_ttl_seconds, 21_600.0);
+        let set =
+            ok_dir("[autopilot]\nauthoring_concurrency = 1\ndiscovery_cache_ttl_seconds = 0\n");
+        assert_eq!(set.autopilot_authoring_concurrency, 1);
+        assert_eq!(set.autopilot_discovery_cache_ttl_seconds, 0.0);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["autopilot_authoring_concurrency"], 1);
+        assert_eq!(json["autopilot_discovery_cache_ttl_seconds"], 0.0);
+        // At the defaults the keys stay out of the serialized policy.
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(json.get("autopilot_authoring_concurrency").is_none());
+        assert!(json.get("autopilot_discovery_cache_ttl_seconds").is_none());
+        assert_eq!(
+            err_dir("[autopilot]\nauthoring_concurrency = 0\n"),
+            format!("{FILE}: autopilot.authoring_concurrency must be a positive integer")
+        );
+        assert_eq!(
+            err_dir("[autopilot]\ndiscovery_cache_ttl_seconds = -1\n"),
+            format!("{FILE}: autopilot.discovery_cache_ttl_seconds must be >= 0")
         );
     }
 

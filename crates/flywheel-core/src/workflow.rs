@@ -3009,6 +3009,26 @@ mod tests {
             settings["sandbox"]["autoAllowBashIfSandboxed"],
             json!(false)
         );
+        // The configured server names reach the CLI as an inline
+        // --mcp-config selected from the sandbox's project .mcp.json.
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join(".mcp.json"),
+            json!({"mcpServers": {"serena": {"command": "serena"}, "other": {"command": "x"}}})
+                .to_string(),
+        )
+        .unwrap();
+        let plan = flywheel_agents::claude_code::build_cli_plan(&flywheel_agents::RunRequest {
+            prompt: "p".into(),
+            working_directory: sandbox.path().to_path_buf(),
+            configuration,
+            timeout_seconds: None,
+        })
+        .unwrap();
+        let at = plan.argv.iter().position(|a| a == "--mcp-config").unwrap();
+        let mcp: Value = serde_json::from_str(&plan.argv[at + 1]).unwrap();
+        assert_eq!(mcp, json!({"mcpServers": {"serena": {"command": "serena"}}}));
+        assert!(plan.argv.contains(&"--strict-mcp-config".to_owned()));
     }
 
     // --- Stranded recovery -----------------------------------------------------------

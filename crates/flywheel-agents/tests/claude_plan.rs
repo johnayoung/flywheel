@@ -306,6 +306,44 @@ fn mcp_server_names_select_from_the_project_mcp_json() {
 }
 
 #[test]
+fn stream_json_routes_permission_prompts_over_stdio() {
+    let argv = argv(&options(&[]));
+    assert_eq!(
+        value_after(&argv, "--permission-prompt-tool").as_deref(),
+        Some("stdio")
+    );
+    // Text input closes stdin: there is no control channel to answer on.
+    let text = self::argv(&options(&[("input_mode", json!("text"))]));
+    assert!(!text.iter().any(|a| a == "--permission-prompt-tool"));
+}
+
+/// The real `claude` CLI (when installed) accepts the flag pair the plan
+/// emits. Empty stream-json input makes it exit before any API call, so
+/// this spends no credits; an unknown option is rejected up front.
+#[test]
+fn real_cli_accepts_permission_prompt_tool_stdio() {
+    let Ok(output) = std::process::Command::new("claude")
+        .args([
+            "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        eprintln!("skipping: claude CLI not on PATH");
+        return;
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("unknown option"), "{stderr}");
+}
+
+#[test]
 fn session_resume_flags_use_equals_form() {
     let argv = argv(&options(&[
         ("resume", json!("-abc")),

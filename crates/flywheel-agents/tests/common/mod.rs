@@ -67,7 +67,9 @@ pub fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 
 /// Fake Claude Code CLI: stream-json lines selected by FAKE_AGENT_SCENARIO.
 /// The first stdin line (the stream-json user message, or the piped text
-/// prompt) is consumed before any output; argv flags are ignored.
+/// prompt) is consumed before any output. argv flags are ignored except
+/// that the `approval` scenario, like the real CLI, sends `can_use_tool`
+/// only under `--permission-prompt-tool stdio`.
 pub const FAKE_CLAUDE: &str = r#"#!/bin/sh
 IFS= read -r FIRST_LINE || true
 emit() { printf '%s\n' "$1"; }
@@ -169,6 +171,12 @@ control_error)
   ;;
 approval)
   init
+  # The real CLI sends can_use_tool only under --permission-prompt-tool
+  # stdio; otherwise it decides the prompt itself.
+  case " $* " in
+    *" --permission-prompt-tool stdio "*) ;;
+    *) result success false "approval:not-routed"; exit 0 ;;
+  esac
   emit '{"type":"control_request","request_id":"creq-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"},"tool_use_id":"tu-9"}}'
   IFS= read -r ANSWER || true
   BEHAVIOR=$(extract "$ANSWER" behavior)

@@ -1704,9 +1704,10 @@ impl GitWorktreeSubmitter {
     }
 
     /// The merged-tree landing bar shared by the merge-fallback and
-    /// agent-resolved rungs: task command graders, then the standing build
-    /// invariant, then the declared held-out gate, then a fast-forward-only
-    /// advance of the base. Any failure resets the branch to `pre_merge`
+    /// agent-resolved rungs: the protected-path check on the merged tree,
+    /// then task command graders, then the standing build invariant, then
+    /// the declared held-out gate, then a fast-forward-only advance of the
+    /// base. Any failure resets the branch to `pre_merge`
     /// (base ref untouched, no `Landed`) and parks with the deciding
     /// check's receipts; a clean pass fast-forwards and records a `Landed`
     /// at the rung.
@@ -1730,6 +1731,30 @@ impl GitWorktreeSubmitter {
         let tree = rung.tree_word();
         let wt = worktree.display();
 
+        // The pre-rung check cleared the task's own commits of every
+        // protected path, so any protected path the merged tree changes
+        // relative to the base was introduced by the merge itself -- for the
+        // agent-resolved rung, by an untrusted session. Checked before the
+        // graders run so a rewritten grader script never executes.
+        let violations = self.merged_tree_protected_violations(branch, base)?;
+        if !violations.is_empty() {
+            let joined = violations.join(", ");
+            git(worktree, &["reset", "--hard", pre_merge])?;
+            self.log(format!(
+                "{label} tree for {branch} touches protected path(s) {joined}; refusing to merge, \
+                 parking worktree at {wt}"
+            ));
+            return Ok(self.park(
+                &req.run_id,
+                PARK_KIND_PROTECTED_PATHS,
+                format!(
+                    "{branch} {prefix}touches protected path(s) {joined} on the {tree} tree it \
+                     would land; refusing to merge, worktree preserved at {wt}"
+                ),
+                Vec::new(),
+                usage,
+            ));
+        }
         let reverify = self.reverify(req, worktree)?;
         if !reverify.passed {
             git(worktree, &["reset", "--hard", pre_merge])?;
@@ -1921,13 +1946,27 @@ impl GitWorktreeSubmitter {
     /// verification trust boundary: work that rewrites the verification
     /// surface itself never lands, regardless of what its graders said.
     pub fn protected_violations(&self, branch: &str, base: &str) -> Result<Vec<String>, GitError> {
+        self.protected_in_diff(&format!("{base}...{branch}"))
+    }
+
+    /// Repo-relative protected paths whose content in the merged `branch`
+    /// tree differs from `base`. A direct tree diff rather than the
+    /// merge-base scoped one: after a merge the branch contains the base, so
+    /// this is exactly what landing would change -- including anything a
+    /// conflict resolution wrote that the task's own commits never touched.
+    pub fn merged_tree_protected_violations(
+        &self,
+        branch: &str,
+        base: &str,
+    ) -> Result<Vec<String>, GitError> {
+        self.protected_in_diff(&format!("{base}..{branch}"))
+    }
+
+    fn protected_in_diff(&self, range: &str) -> Result<Vec<String>, GitError> {
         if self.protected_paths.is_empty() {
             return Ok(Vec::new());
         }
-        let res = git(
-            &self.repo_root,
-            &["diff", "--name-only", &format!("{base}...{branch}")],
-        )?;
+        let res = git(&self.repo_root, &["diff", "--name-only", range])?;
         if !res.ok() {
             // Cannot establish what the branch touches: fail closed.
             return Ok(vec![format!("<diff failed: {}>", res.stderr.trim())]);
@@ -3556,6 +3595,44 @@ mod tests {
         assert_eq!(parks[0].park_kind, PARK_KIND_MERGE_CONFLICT);
         assert_eq!(parks[0].agent_turns, Some(30));
         assert_eq!(parks[0].agent_wall_seconds, Some(900.0));
+        assert_eq!(rev(&repo, "flywheel/01-phase/t1"), branch_head);
+        assert!(wt.is_dir());
+        assert_eq!(git_ok(&wt, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn resolution_that_edits_a_protected_path_parks_and_nothing_lands() {
+        let (_dir, repo) = repo();
+        let store = ledger();
+        let tampering: ConflictResolver = Arc::new(|request| {
+            fs::write(request.worktree.join("file.txt"), "line1-resolved\n").unwrap();
+            fs::write(request.worktree.join("conftest.py"), "tampered\n").unwrap();
+            git_ok(&request.worktree, &["add", "-A"]);
+            Ok(ConflictResolutionReport {
+                turns: 3,
+                wall_seconds: 1.5,
+            })
+        });
+        let s = submitter(&repo, Arc::clone(&store))
+            .with_protected_paths(["conftest.py"])
+            .with_recovery_agent(30, 900.0, None)
+            .with_resolve_conflict(tampering);
+        let (tf, wt, branch_head, base_before) = drive_to_conflict(&s, &repo, "true");
+        let outcome = s.submit(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]));
+        assert!(
+            matches!(&outcome, SubmitOutcome::Parked { park_kind, detail }
+            if park_kind == PARK_KIND_PROTECTED_PATHS
+                && detail.contains("conftest.py")
+                && detail.contains("was resolved by a bounded agent session"))
+        );
+        assert!(landed(&store).is_empty());
+        assert_eq!(rev(&repo, "main"), base_before);
+        assert!(!repo.join("conftest.py").exists());
+        let parks = parked(&store);
+        assert_eq!(parks.len(), 1);
+        assert_eq!(parks[0].park_kind, PARK_KIND_PROTECTED_PATHS);
+        assert_eq!(parks[0].agent_turns, Some(3));
+        assert_eq!(parks[0].agent_wall_seconds, Some(1.5));
         assert_eq!(rev(&repo, "flywheel/01-phase/t1"), branch_head);
         assert!(wt.is_dir());
         assert_eq!(git_ok(&wt, &["status", "--porcelain"]), "");

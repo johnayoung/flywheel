@@ -8,7 +8,7 @@ use crate::claims::{
     REASON_NO_PROGRESS, REASON_PREREQUISITE_MISSING, REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
     STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET, STOP_RETRIES_ESCALATED,
 };
-use crate::held_out_gate::{GateOptions, HeldOutGraderSource, gate_landing};
+use crate::held_out_gate::{GateOptions, HeldOutGraderSource, LandingDecision, gate_landing};
 use crate::sources::LogSink;
 use crate::strategy::{
     LandabilityVerdict, SubmitOutcome, SubmitRequest, SubmitStrategy, panic_message, submit_guarded,
@@ -16,7 +16,7 @@ use crate::strategy::{
 use crate::work_graph::GraphValidationIssue;
 use flywheel_core::events::{
     DomainEvent, DomainEventPayload, LANDING_PARK_KINDS, LandingParked, LandingRedriven,
-    REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED,
+    PARK_KIND_HELD_OUT_GATE, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED,
 };
 use flywheel_core::harness::BUDGET_CEILING_ERROR_PREFIX;
 use flywheel_core::invoker_client::Clock;
@@ -247,9 +247,16 @@ pub async fn redrive_parked_landings(
             continue;
         }
         let mut made = parks.len() as u32 - 1;
+        let baseline = made;
         let mut attempts = 0u32;
         let mut landed = false;
         let mut no_op = false;
+        // The cause of the latest re-attempt's park when its own
+        // `LandingParked` write never reached the ledger (a swallowed witness
+        // write, a logged-only gate park, a panic converted by
+        // `submit_guarded`); `None` while the ledger's last park is current.
+        let mut unrecorded: Option<(String, String)> = None;
+        let mut unrecorded_count = 0u32;
         while made < ctx.bound {
             let Some(claim) = super::acquire_with_grace(
                 ctx.claims.as_ref(),
@@ -280,16 +287,17 @@ pub async fn redrive_parked_landings(
                 &mut log_line,
             )
             .await;
-            let submit_outcome = if decision.lands() {
-                Some(submit_guarded(ctx.strategy, request))
-            } else {
-                None
+            let submit_outcome = match &decision {
+                LandingDecision::Land { .. } => submit_guarded(ctx.strategy, request),
+                LandingDecision::Park { detail, .. } => {
+                    SubmitOutcome::parked(PARK_KIND_HELD_OUT_GATE, detail.clone())
+                }
             };
             let latest = heartbeat.stop();
             ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
             attempts += 1;
             match submit_outcome {
-                Some(SubmitOutcome::Landed { .. }) => {
+                SubmitOutcome::Landed { .. } => {
                     landed = true;
                     record_landing_redrive(
                         ctx.control.as_ref(),
@@ -305,7 +313,7 @@ pub async fn redrive_parked_landings(
                     );
                     break;
                 }
-                Some(SubmitOutcome::NoOp { reason }) => {
+                SubmitOutcome::NoOp { reason } => {
                     // Nothing landed and nothing parked: there is no witness
                     // to pair a redrive record with, so record nothing and
                     // leave the run for the probe to classify next pass.
@@ -318,17 +326,38 @@ pub async fn redrive_parked_landings(
                     no_op = true;
                     break;
                 }
-                Some(SubmitOutcome::Parked { .. }) | None => {
+                SubmitOutcome::Parked { park_kind, detail } => {
+                    let recorded_before = parks.len();
                     parks = landing_parks(ctx.control.as_ref(), &run_id)?;
-                    made = parks.len() as u32 - 1;
+                    if parks.len() > recorded_before {
+                        unrecorded = None;
+                    } else {
+                        emit(
+                            ctx.log,
+                            format!(
+                                "[orchestrate] {task_id}: landing re-attempt parked ({park_kind}) but no landing-parked event was recorded; counting it against the re-drive bound"
+                            ),
+                        );
+                        unrecorded_count += 1;
+                        unrecorded = Some((park_kind, detail));
+                    }
+                    // Every re-attempt spends the bound whether or not its
+                    // park reached the ledger: deriving `made` from the
+                    // ledger alone would never advance past an unrecorded
+                    // park and the loop would spin without sleeping.
+                    made = (parks.len() as u32 - 1).max(baseline + attempts);
+                    let kind = match &unrecorded {
+                        Some((kind, _)) => kind.clone(),
+                        None => parks
+                            .last()
+                            .map(|p| p.park_kind.clone())
+                            .unwrap_or_default(),
+                    };
                     record_landing_redrive(
                         ctx.control.as_ref(),
                         &run_id,
                         REDRIVE_RESULT_REPARKED,
-                        &parks
-                            .last()
-                            .map(|p| p.park_kind.clone())
-                            .unwrap_or_default(),
+                        &kind,
                         &task_id,
                         ctx.now,
                         ctx.log,
@@ -352,26 +381,33 @@ pub async fn redrive_parked_landings(
             });
             continue;
         }
+        let (park_kind, last_detail) = match unrecorded {
+            Some(cause) => cause,
+            None => parks
+                .last()
+                .map(|p| (p.park_kind.clone(), p.detail.clone()))
+                .unwrap_or_default(),
+        };
         if no_op {
             outcomes.push(RedriveOutcome {
                 run_id,
                 task_id,
                 result: RedriveResult::Skipped,
                 attempts,
-                park_kind: parks
-                    .last()
-                    .map(|p| p.park_kind.clone())
-                    .unwrap_or_default(),
+                park_kind,
             });
             continue;
         }
         if made >= ctx.bound {
-            let last = parks.last().cloned().unwrap_or_default();
-            let park_kind = last.park_kind.clone();
-            let detail = format!(
+            let mut detail = format!(
                 "landing re-drive exhausted {} re-attempt(s) without landing; last park cause {:?}: {}",
-                ctx.bound, park_kind, last.detail
+                ctx.bound, park_kind, last_detail
             );
+            if unrecorded_count > 0 {
+                detail = format!(
+                    "{detail} ({unrecorded_count} re-attempt(s) parked without a recorded landing-parked event)"
+                );
+            }
             ctx.claims
                 .record_human_review(&park_kind, &task_id, (ctx.now)(), &run_id, &detail)?;
             record_landing_redrive(
@@ -403,10 +439,7 @@ pub async fn redrive_parked_landings(
             task_id,
             result: RedriveResult::InProgress,
             attempts,
-            park_kind: parks
-                .last()
-                .map(|p| p.park_kind.clone())
-                .unwrap_or_default(),
+            park_kind,
         });
     }
     Ok(outcomes)

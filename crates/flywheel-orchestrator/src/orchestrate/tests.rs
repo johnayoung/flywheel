@@ -552,6 +552,9 @@ struct ScriptedStrategy {
     /// lands).
     parks: Mutex<HashMap<String, VecDeque<Option<String>>>>,
     landable: Mutex<HashMap<String, bool>>,
+    /// Tasks whose parks after the first return `Parked` without appending
+    /// a `LandingParked` event (a swallowed witness write).
+    unrecorded_reparks: Mutex<HashSet<String>>,
 }
 
 impl ScriptedStrategy {
@@ -566,6 +569,7 @@ impl ScriptedStrategy {
             teardowns: Arc::new(AtomicUsize::new(0)),
             parks: Mutex::new(HashMap::new()),
             landable: Mutex::new(HashMap::new()),
+            unrecorded_reparks: Mutex::new(HashSet::new()),
         })
     }
 
@@ -579,6 +583,14 @@ impl ScriptedStrategy {
             task_id.to_owned(),
             parks.into_iter().map(|p| p.map(str::to_owned)).collect(),
         );
+        self.clone()
+    }
+
+    fn unrecorded_reparks(self: &Arc<Self>, task_id: &str) -> Arc<Self> {
+        self.unrecorded_reparks
+            .lock()
+            .unwrap()
+            .insert(task_id.to_owned());
         self.clone()
     }
 
@@ -665,6 +677,17 @@ impl SubmitStrategy for ScriptedStrategy {
             });
         match next {
             Some(Some(kind)) => {
+                if self
+                    .unrecorded_reparks
+                    .lock()
+                    .unwrap()
+                    .contains(&request.task_id)
+                    && !landing_parks(self.control.as_ref(), &request.run_id)
+                        .unwrap()
+                        .is_empty()
+                {
+                    return SubmitOutcome::parked(kind, "scripted unrecorded park");
+                }
                 self.append(
                     &request.run_id,
                     DomainEventPayload::LandingParked(LandingParked {
@@ -1733,6 +1756,104 @@ async fn landing_redrive_lands_when_the_cause_clears_and_skips_unparked_runs() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn landing_redrive_terminates_when_reparks_are_never_recorded() {
+    let f = Fixture::new();
+    // The first land records its park; every re-attempt then parks without
+    // writing one, so the ledger's park count never advances.
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)])
+        .unrecorded_reparks("parked");
+    let mut req = f.request(MemorySource::new(vec![item("parked")]));
+    req.strategy = Some(strategy.clone());
+    req.landing_redrive_bound = Some(2);
+    let report = tokio::time::timeout(Duration::from_secs(30), run(req.clone()))
+        .await
+        .expect("the re-drive loop must terminate within its bound");
+    let run_id = report.runs[0].run_id.clone();
+    assert_eq!(landing_parks(f.control.as_ref(), &run_id).unwrap().len(), 1);
+    // First land + exactly `bound` re-attempts, never more.
+    assert_eq!(strategy.submits().len(), 3);
+    let events = f.control.list_domain_events(&run_id).unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.payload, DomainEventPayload::Landed(_))),
+        "nothing landed"
+    );
+    let redriven: Vec<String> = events
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            DomainEventPayload::LandingRedriven(r) => Some(r.result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(redriven, ["re-parked", "re-parked", "routed"]);
+    let queue = f.claims.list_human_review_queue().unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].reason, PARK_KIND_DIVERGENT_BASE);
+    assert!(
+        queue[0]
+            .detail
+            .contains("2 re-attempt(s) parked without a recorded landing-parked event")
+    );
+    assert!(f.log.contains("no landing-parked event was recorded"));
+    assert!(!f.log.contains("re-drove parked landing to a merge"));
+    // A later session sees the queue entry and makes no further attempt.
+    run(req).await;
+    assert_eq!(strategy.submits().len(), 3);
+}
+
+#[tokio::test]
+async fn landing_redrive_reports_parked_not_landed_for_an_unrecorded_repark() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)])
+        .unrecorded_reparks("parked");
+    let mut req = f.request(MemorySource::new(vec![item("parked")]));
+    req.strategy = Some(strategy.clone());
+    req.landing_redrive_bound = Some(0);
+    let report = run(req).await;
+    let run_id = report.runs[0].run_id.clone();
+    let control: Arc<dyn HarnessStore> = f.control.clone();
+    let claims: Arc<dyn ClaimStore> = f.claims.clone();
+    let clock = fixed(t0());
+    let gate_options = GateOptions::default();
+    let ctx = LandingRedriveContext {
+        control: &control,
+        claims: &claims,
+        strategy: strategy.as_ref(),
+        worker_id: "worker-a",
+        bound: 2,
+        held_out_source: None,
+        gate_options: &gate_options,
+        lease_seconds: 60.0,
+        heartbeat_interval: 20.0,
+        steal_grace_seconds: 0.0,
+        now: &clock,
+        log: None,
+    };
+    let request = SubmitRequest::new(
+        task("parked"),
+        run_id.clone(),
+        Status::Done,
+        f.sandbox_root().join("parked"),
+    );
+    let outcomes = tokio::time::timeout(
+        Duration::from_secs(30),
+        redrive_parked_landings(&ctx, &[request], &mut BTreeSet::new()),
+    )
+    .await
+    .expect("the re-drive loop must terminate within its bound")
+    .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result, RedriveResult::Queued);
+    assert_eq!(outcomes[0].attempts, 2);
+    assert_eq!(outcomes[0].park_kind, PARK_KIND_DIVERGENT_BASE);
 }
 
 #[tokio::test]

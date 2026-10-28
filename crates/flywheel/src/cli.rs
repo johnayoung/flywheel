@@ -22,10 +22,17 @@
 //! * audit: `audit RUN_ID` -> the core audit stream
 //! * docs: `docs [TOPIC]` -> the curated operator docs
 //!
-//! `run`, `next`, and bare `orchestrate` are intentionally NOT routed as
-//! product verbs -- the spec keeps them as plumbing and `worker --once` as
-//! the only blessed headless drain; the orchestrator's own parser still
-//! reaches `orchestrate` through the `orchestrate` runner the shell binds.
+//! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
+//! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
+//! spec keeps `worker --once` as the only blessed headless drain. They were
+//! reachable in Python as `python -m flywheel_orchestrator.workflow` /
+//! `python -m flywheel_core.workflow`; this build routes them as hidden verbs
+//! (absent from [`USAGE`]) so no surface is lost:
+//!
+//! * `flywheel next` / `flywheel orchestrate` -> the orchestrator CLI (the
+//!   latter through the `orchestrate` runner the shell binds)
+//! * `flywheel workflow <run|is-done|interrupt|steer|set-model|approve|reject>`
+//!   -> the core single-task CLI
 //!
 //! The two bindings that live in the worktree crate -- the `worker` verb
 //! and the orchestrator's `orchestrate` runner -- are injected through
@@ -115,6 +122,14 @@ pub const AUTOPILOT_VERB: &str = "autopilot";
 pub const AUTOPILOT_SUPERVISED_VERB: &str = "autopilot-supervised";
 pub const TRIAGE_VERB: &str = "triage";
 pub const AUDIT_VERB: &str = "audit";
+/// Hidden orchestrator plumbing verbs (the Python reached them as
+/// `python -m flywheel_orchestrator.workflow next|orchestrate`). Routed but
+/// kept out of the operator usage text.
+pub const HIDDEN_ORCHESTRATOR_VERBS: [&str; 2] = ["next", "orchestrate"];
+/// The hidden core single-task CLI (the Python's
+/// `python -m flywheel_core.workflow`): `flywheel workflow run GOAL_OR_FILE`,
+/// `is-done`, `set-model`, and the producer verbs under their core names.
+pub const WORKFLOW_VERB: &str = "workflow";
 pub const DOCS_VERB: &str = "docs";
 
 /// The `fw --help` text, byte-identical to the Python router's.
@@ -250,8 +265,17 @@ pub fn route(
     let verb = first.as_str();
     let rest = &args[1..];
 
-    if ORCHESTRATOR_VERBS.contains(&verb) {
+    if ORCHESTRATOR_VERBS.contains(&verb) || HIDDEN_ORCHESTRATOR_VERBS.contains(&verb) {
         return orchestrator_workflow::main(args, &bindings.verbs());
+    }
+    if verb == WORKFLOW_VERB {
+        // The core CLI's own top level (`--help`, or no sub-verb) needs no
+        // store; a sub-verb goes through the store-injecting delegate so a
+        // postgres [store] policy is honoured exactly as for `fw say`.
+        return match rest.first() {
+            Some(sub) if !sub.starts_with('-') => delegate_producer(rest.to_vec(), err),
+            _ => core_workflow::main(rest),
+        };
     }
     if CORE_VERBS.contains(&verb) {
         // Producer verbs enqueue a control command; route through the
@@ -1250,6 +1274,66 @@ mod tests {
         assert_eq!(
             format!("{bindings:?}"),
             "ShellBindings { worker: true, orchestrate: true }"
+        );
+    }
+
+    #[test]
+    fn hidden_plumbing_verbs_route_but_stay_out_of_usage() {
+        for verb in ["next", "orchestrate", "workflow"] {
+            assert!(!USAGE.contains(&format!("\n  {verb}")), "{verb} leaked");
+        }
+        assert_eq!(run(&["next", "--help"], &unbound()).0, 0);
+        assert_eq!(run(&["orchestrate", "--help"], &unbound()).0, 0);
+        assert_eq!(run(&["workflow", "--help"], &unbound()).0, 0);
+        for sub in ["run", "is-done", "set-model", "steer"] {
+            assert_eq!(run(&["workflow", sub, "--help"], &unbound()).0, 0, "{sub}");
+        }
+        // Bare `workflow` is the core parser's own missing-sub-verb error.
+        assert_eq!(run(&["workflow"], &unbound()).0, 2);
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        let tasks = tmp.path().join("tasks");
+        fs::create_dir_all(tasks.join("active")).unwrap();
+        fresh_store(&db);
+        let db_str = db.to_str().unwrap();
+        assert_eq!(
+            run(
+                &["next", "--db", db_str, "--tasks-dir", tasks.to_str().unwrap()],
+                &unbound()
+            )
+            .0,
+            1,
+            "an empty queue has no next task"
+        );
+        // `workflow set-model` enqueues a set_model control command.
+        let run_id = seed_running(&db, "gamma");
+        assert_eq!(
+            run(
+                &["workflow", "set-model", "--db", db_str, &run_id, "claude-x"],
+                &unbound()
+            )
+            .0,
+            0
+        );
+        assert_eq!(
+            claimed(&db, &run_id),
+            vec![("set_model".to_owned(), serde_json::json!({"model": "claude-x"}))]
+        );
+        // `workflow is-done` on a task with no done lifecycle exits 1.
+        let task_file = tmp.path().join("t.json");
+        fs::write(
+            &task_file,
+            r#"{"id": "never-run", "goal": "g", "graders": [{"type": "command", "run": "true"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            run(
+                &["workflow", "is-done", "--db", db_str, task_file.to_str().unwrap()],
+                &unbound()
+            )
+            .0,
+            1
         );
     }
 

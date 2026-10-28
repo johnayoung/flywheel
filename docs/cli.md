@@ -1,6 +1,6 @@
 # CLI and operator console
 
-The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's single entry point for driving the loop day to day. It is a thin verb router over the layers below it (core, orchestrator, worktree) plus a Textual operator console and a `--json` snapshot mode. This doc is the canonical reference for every verb, flag, key binding, and slash command.
+The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's single entry point for driving the loop day to day. It is a thin verb router over the layers below it (core, orchestrator, worktree) plus a terminal (ratatui) operator console and a `--json` snapshot mode. This doc is the canonical reference for every verb, flag, key binding, and slash command.
 
 ## At a glance
 
@@ -14,20 +14,20 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
 
-`flywheel` and `fw` are byte-identical console scripts on one implementation (`flywheel._cli:main`, `packages/flywheel/pyproject.toml:23-25`). Use either; this doc writes `fw` for brevity.
+`flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
 ## Entry points and the verb router
 
-The router (`flywheel._cli.main`, `_cli.py:105`) dispatches by the first argv token:
+The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv token:
 
-- No args open the Textual console on a TTY, or print one `--json` snapshot when stdout is not a TTY (`_cli.py:117-118`).
-- `-h` / `--help` print the verb list and exit 0 (`_cli.py:122-124`).
-- A leading-`-` first token (`fw --json`, `fw --db ...`) is treated as a console flag and handed to the TUI (`_cli.py:128-129`).
+- No args open the console on a TTY, or print one `--json` snapshot when stdout is not a TTY.
+- `-h` / `--help` print the verb list and exit 0.
+- A leading-`-` first token (`fw --json`, `fw --db ...`) is treated as a console flag and handed to the TUI.
 - Otherwise the first token is the verb and the remaining argv is forwarded verbatim to the delegated implementation.
 
-`fw <verb> --help` forwards `--help` to that verb's own parser, so each verb's specific flags come from the delegated parser, not from the router (`_cli.py:99-101`).
+`fw <verb> --help` forwards `--help` to that verb's own parser, so each verb's specific flags come from the delegated parser, not from the router.
 
-**`run`, `next`, and bare `orchestrate` are intentionally not routed.** Spec 00021 FR-4 keeps them as `python -m` plumbing; `worker --once` is the only blessed headless single-task drain (`_cli.py:21-23`). An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2 (`_cli.py:153-155`).
+**`run`, `next`, and bare `orchestrate` are intentionally not routed.** Spec 00021 FR-4 keeps them as plumbing (the single-task `run` / `is-done` / `set-model` core verbs are reachable only through the hidden `flywheel workflow ...` verb); `worker --once` is the only blessed headless single-task drain. An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2.
 
 ### Resolution precedence
 
@@ -35,15 +35,17 @@ Every delegated verb resolves its inputs the same way: **explicit flag wins, the
 
 | Input | Explicit flag | Policy key | Built-in default | Anchor |
 |---|---|---|---|---|
-| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd | none (`.flywheel/` defaults) | `_workflow.py:779` |
-| DB path | `--db PATH` | `[paths] db` | `.flywheel/flywheel.sqlite` | `_workflow.py:822` |
-| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `.flywheel/tasks` | `_workflow.py:807` |
+| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd, else the nearest parent (re-anchors cwd there) | none (`.flywheel/` defaults) | `load_effective_policy` |
+| DB path | `--db PATH` | `[paths] db` | `.flywheel/flywheel.sqlite` | `resolve_db_path` |
+| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `.flywheel/tasks` | `resolve_work_source` |
 
-The Postgres DSN is never stored in `flywheel.toml`. It is read only from the environment: `FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL` (`_store_factory.py:33-35`). See [configuration.md](configuration.md) for the full policy schema.
+Anchors are in `crates/flywheel-orchestrator/src/workflow/mod.rs`.
+
+The Postgres DSN is never stored in `flywheel.toml`. It is read only from the environment: `FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL` (`resolve_postgres_dsn`, `crates/flywheel-orchestrator/src/store_factory.rs`). See [configuration.md](configuration.md) for the full policy schema.
 
 ## Read verbs
 
-Delegated to `flywheel_orchestrator._workflow.main`. On a load/policy/work-source error these print `error: ...` to stderr and exit 2 (`_workflow.py:3527-3532`).
+Delegated to the orchestrator CLI (`main`, `crates/flywheel-orchestrator/src/workflow/mod.rs`). On a load/policy/work-source error these print `error: ...` to stderr and exit 2.
 
 | Verb | What it does | Key flags |
 |---|---|---|
@@ -62,7 +64,7 @@ Delegated to `flywheel_orchestrator._workflow.main`. On a load/policy/work-sourc
 
 ## Steering verbs
 
-Delegated to `flywheel_core.workflow.main`. Each enqueues exactly one row into the `control_commands` table keyed by `run_id` (`_enqueue_control_command`, `workflow.py:~1103-1165`): it validates the run exists, prints `enqueued #<id> kind=<k> run_id=<id>`, and warns when the run is not in-flight.
+Delegated to the core CLI (`crates/flywheel-core/src/workflow.rs`). Each enqueues exactly one row into the `control_commands` table keyed by `run_id` (`enqueue_control_command`): it validates the run exists, prints `enqueued #<id> kind=<k> run_id=<id>`, and warns when the run is not in-flight.
 
 **Agent claims are untrusted; the harness owns every lifecycle transition.** These verbs are permitted only in the matching lifecycle state — the store records the command, the harness applies it. See [task-lifecycle.md](task-lifecycle.md).
 
@@ -73,13 +75,13 @@ Delegated to `flywheel_core.workflow.main`. Each enqueues exactly one row into t
 | `approve RUN_ID` | Approve a parked manual gate: writes a `passed=True` manual receipt, then re-parks on the next gate or transitions to DONE. | AWAITING_APPROVAL | positional `run_id`; `--db` |
 | `reject RUN_ID` | Reject a parked manual gate: writes a `passed=False` receipt, transitions to FAILED_VALIDATION. `--feedback` flows into the next attempt's reviewer-feedback section (absent renders `(no feedback provided)`). | AWAITING_APPROVAL | positional `run_id`; `--feedback TEXT`; `--db` |
 
-The shell's `say` is a surface rename of core's `steer` verb; the underlying core CLI is unchanged (`_cli.py:138-140`). Core's `set_model` verb exists but is not routed on the product shell.
+The shell's `say` is a surface rename of core's `steer` verb; the underlying core CLI is unchanged. Core's `set-model` verb exists but is not a product verb; it is reachable only as the hidden `flywheel workflow set-model`.
 
 ## Daemons and audit
 
 ### `worker [--once]`
 
-The blessed headless drain, delegated in-process to `flywheel_worktree.worker.main` (`worker.py:2335`). It drives tasks under active phase dirs, each in its own git worktree, fast-forward-merging on done and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
+The blessed headless drain, delegated in-process to the worktree daemon (`main`, `crates/flywheel-worktree/src/daemon.rs`). It drives tasks under active phase dirs, each in its own git worktree, fast-forward-merging on done and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
 
 | Flag | Controls |
 |---|---|
@@ -97,7 +99,7 @@ The blessed headless drain, delegated in-process to `flywheel_worktree.worker.ma
 
 ### `autopilot [--once]`
 
-Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to `flywheel_orchestrator._autopilot_run.main` (`_autopilot_run.py:209`). **Neverending daemon by default**; `--once` runs one refill pass and exits. The daemon loop never terminates on an idle cycle — it exits only on SIGTERM/SIGINT (`run_daemon_loop`, `_autopilot_run.py:136`).
+Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to `main` in `crates/flywheel-orchestrator/src/autopilot_run.rs`. **Neverending daemon by default**; `--once` runs one refill pass and exits. The daemon loop never terminates on an idle cycle — it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
 
 | Flag | Controls |
 |---|---|
@@ -110,7 +112,7 @@ Landing strategy and scoring weights come from policy (`autopilot_landing` defau
 
 ### `triage [--once]`
 
-Triages the GitHub intake board: authors a fail-first spec+grader for each candidate issue, then labels well-specified issues ready and under-specified ones needs-detail, each with a receipt. Delegated to `flywheel_orchestrator._triage_run.main`. **Neverending label-polling daemon by default**; `--once` runs one triage pass and exits 0. The daemon loop never terminates on an idle cycle — an empty board writes nothing and the next cycle is scheduled; it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
+Triages the GitHub intake board: authors a fail-first spec+grader for each candidate issue, then labels well-specified issues ready and under-specified ones needs-detail, each with a receipt. Delegated to `main` in `crates/flywheel-orchestrator/src/triage_run.rs`. **Neverending label-polling daemon by default**; `--once` runs one triage pass and exits 0. The daemon loop never terminates on an idle cycle — an empty board writes nothing and the next cycle is scheduled; it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
 
 The policy is resolved and validated **before** the repo root or any `gh` call: a malformed `[triage]` value prints to stderr and exits 2 having issued no GitHub write. Triage requires `[source] kind = "github"` with a `repo`; any other source exits 2. The board labels and cadence come from the optional `[triage]` table (`intake_label` default `flywheel`, `ready_label` default `flywheel:ready`, `needs_detail_label` default `flywheel:needs-detail`, `interval_seconds` default `300.0`, `max_per_pass` uncapped); see [configuration.md](configuration.md).
 
@@ -122,7 +124,7 @@ The policy is resolved and validated **before** the repo root or any `gh` call: 
 
 ### `audit RUN_ID`
 
-Streams the totally-ordered audit records for one run, delegated to `flywheel_core.audit._cli.main` (`_cli.py:478`). **Redaction is ON by default** — `--raw` disables it only for authorized forensics.
+Streams the totally-ordered audit records for one run, routed by the shell (`audit_main`, `crates/flywheel/src/cli.rs`) onto the core audit stream (`run_audit`, `crates/flywheel-core/src/audit.rs`). **Redaction is ON by default** — `--raw` disables it only for authorized forensics.
 
 | Flag | Controls |
 |---|---|
@@ -132,15 +134,15 @@ Streams the totally-ordered audit records for one run, delegated to `flywheel_co
 | `--follow` | tail until terminal status (Ctrl-C exits 130) |
 | `--poll-interval` | tail cadence |
 | `--redact` | explicit opt-in (already default) |
-| `--redact-policy NAME\|module:factory`, `--redact-salt SALT` | redaction tuning |
+| `--redact-policy NAME`, `--redact-salt SALT` | redaction tuning; `NAME` is a built-in (`default`, `strict`) |
 | `--raw` | disable redaction (authorized forensics) |
 | `--dry-run` | coverage report only |
 
 ## The operator console (TUI)
 
-Entry: `flywheel._tui.main` (`_tui.py:75`). Bare `fw` on a TTY opens it; `fw --json` or any non-TTY stdout prints one `DashboardSnapshot` and exits 0 with no ANSI.
+Entry: `main_with` (`crates/flywheel/src/tui.rs`). Bare `fw` on a TTY opens it; `fw --json` or any non-TTY stdout prints one `DashboardSnapshot` and exits 0 with no ANSI.
 
-The console fails fast on a missing store before launching: a missing sqlite file exits 2 with the remedy `run 'fw init' ...`; a Postgres backend with no resolvable DSN env exits 2 (`_tui.py:86-97`).
+The console fails fast on a missing store before launching: a missing sqlite file exits 2 with the remedy `run 'fw init' ...`; a Postgres backend with no resolvable DSN env exits 2.
 
 ### Console flags
 
@@ -154,29 +156,29 @@ The console fails fast on a missing store before launching: a missing sqlite fil
 | `--model ID` | model forwarded to the spawned worker (overrides `[agent] model`) |
 | `--no-worker` | do not spawn a supervised worker on launch (status bar shows `worker: none`) |
 
-On launch the console opens the store, constructs a `WorkerSupervisor` and spawns it unless `--no-worker`, and constructs an `AutopilotSupervisor` that is **never auto-spawned** — autopilot starts only via `/autopilot start` because it writes to the base branch unattended (decision D-6, `_tui.py:367-544`). On exit both supervisors detach by default: the child keeps running so a SIGINT on the console never silently kills it.
+On launch the console opens the store, constructs a `WorkerSupervisor` and spawns it unless `--no-worker`, and constructs an `AutopilotSupervisor` that is **never auto-spawned** — autopilot starts only via `/autopilot start` because it writes to the base branch unattended (decision D-6). On exit both supervisors detach by default: the child keeps running so a SIGINT on the console never silently kills it.
 
 ### Dashboard
 
-`flywheel._dashboard.DashboardApp` (`_dashboard.py:170`) polls a `DashboardSnapshot` roughly once a second. Layout: a summary header (`active= queued= done= failed= tokens= cost= runtime=`), a worker/autopilot status bar, a table of active runs (task / status / attempt-iter / age / tokens / cost / last action), an empty-state line, a last-error status bar, and a persistent input bar. Rows that leave the active set linger dimmed for 30 seconds before dropping; a poll failure leaves the last good frame plus a warning rather than crashing.
+`DashboardApp` (`crates/flywheel/src/dashboard.rs`) polls a `DashboardSnapshot` roughly once a second. Layout: a summary header (`active= queued= done= failed= tokens= cost= runtime=`), a worker/autopilot status bar, a table of active runs (task / status / attempt-iter / age / tokens / cost / last action), an empty-state line, a last-error status bar, and a persistent input bar. Rows that leave the active set linger dimmed for 30 seconds before dropping; a poll failure leaves the last good frame plus a warning rather than crashing.
 
 The input bar live-filters rows by case-insensitive substring; a leading `/` switches it to slash-command mode.
 
-Worker status-bar vocabulary: `worker: supervised pid=N` / `detached (this console did not spawn it)` / `none -- type '/worker start' to spawn one` / `dead ... (exit=N)` / `error: <reason>`. Autopilot status has no `detached` state (it writes no lease): `autopilot: supervised pid=N` / `none ...` / `dead ...` / `error ...`.
+Worker status-bar vocabulary: `worker: supervised pid=N` / `detached (this console did not spawn it)` / `none -- type '/worker start' to spawn one` / `dead ... (exit=N)` / `dead (crash-loop budget exhausted) ...` / `error: <reason>`. Autopilot uses the same states; its `detached` comes from a live activity record (pid + freshness deadline) rather than a lease: `autopilot: supervised pid=N` / `detached pid=N ...` / `none ...` / `dead ...` / `error ...`.
 
 ### Session screen
 
-`flywheel._session_screen.SessionScreen` (`_session_screen.py:166`), opened by Enter on a dashboard row. It renders one run's merged audit transcript chat-style via a `TranscriptTailer` (~250ms poll) and tail-follows until you scroll up (follow pauses, new-activity indicator) or the run reaches a terminal status (banner pins the state, steering disabled).
+`SessionScreen` (`crates/flywheel/src/session_screen.rs`), opened by Enter on a dashboard row. It renders one run's merged audit transcript chat-style via a `TranscriptTailer` (~250ms poll) and tail-follows until you scroll up (follow pauses, new-activity indicator) or the run reaches a terminal status (banner pins the state, steering disabled).
 
-The compose box doubles as input: plain text is a `say`; a leading `/` is a slash command. A submit-time status re-check enforces the lifecycle rule — say/interrupt only in RUNNING/VALIDATING, approve/reject only in AWAITING_APPROVAL; outside the set it shows an inline notice and leaves the store untouched (`_session_screen.py:923`).
+The compose box doubles as input: plain text is a `say`; a leading `/` is a slash command. A submit-time status re-check enforces the lifecycle rule — say/interrupt only in RUNNING/VALIDATING, approve/reject only in AWAITING_APPROVAL; outside the set it shows an inline notice and leaves the store untouched.
 
 ### History screen
 
-`flywheel._history_screen.HistoryScreen` (`_history_screen.py:86`), opened via `h` or `/history`. One row per task, newest-finished first — same grouping as `fw history` (columns: phase / task / status / finished / runs / tokens / cost). Enter drills into the run's session screen; `r` reloads. No polling timer — finished runs do not change.
+`HistoryScreen` (`crates/flywheel/src/history_screen.rs`), opened via `h` or `/history`. One row per task, newest-finished first — same grouping as `fw history` (columns: phase / task / status / finished / runs / tokens / cost). Enter drills into the run's session screen; `r` reloads. No polling timer — finished runs do not change.
 
 ### Quit-handoff prompt
 
-`flywheel._quit_prompt.QuitPromptScreen` (`_quit_prompt.py:41`) is shown only when the console owns a supervised worker (`request_quit` short-circuits otherwise). A dismiss with no value is treated as cancel — the child is never silently killed.
+`QuitPrompt` (`crates/flywheel/src/quit_prompt.rs`) is shown only when the console owns a supervised worker and/or autopilot daemon (`request_quit` short-circuits otherwise). Only `s` signals a child; the child is never silently killed.
 
 | Key | Action |
 |---|---|
@@ -207,13 +209,13 @@ The compose box doubles as input: plain text is a `say`; a leading `/` is a slas
 
 ### Worker and autopilot supervisors
 
-`WorkerSupervisor` (`_worker_supervisor.py:191`) spawns `python -m flywheel_worktree.worker --db <path> [--tasks-dir ..] [--model ..]` with `start_new_session=True`, so a console Ctrl-C never reaches the child; only `stop()` (SIGTERM + 10s wait) signals it. It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under `.flywheel/logs/worker/`.
+`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under `.flywheel/logs/worker/`.
 
-`AutopilotSupervisor` (`_autopilot_supervisor.py:89`) spawns `python -m flywheel_orchestrator._autopilot_run [--tasks-dir ..] [--model ..]` without `--once` (the neverending daemon). It writes no lease, so it has no DETACHED state. Logs land under `.flywheel/logs/autopilot/`. Same spawn/detach/stop shape, independent of the worker.
+`AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under `.flywheel/logs/autopilot/`. Same spawn/detach/stop shape, independent of the worker.
 
 ## Slash commands
 
-`flywheel._slash` is the shared command vocabulary for the dashboard and session screens — an alternate input surface, not a new channel: each slash verb reuses the exact store-mediated semantics of its CLI or key twin.
+`crates/flywheel/src/slash.rs` is the shared command vocabulary for the dashboard and session screens — an alternate input surface, not a new channel: each slash verb reuses the exact store-mediated semantics of its CLI or key twin.
 
 | Command | Action | Notes |
 |---|---|---|
@@ -228,13 +230,13 @@ The compose box doubles as input: plain text is a `say`; a leading `/` is a slas
 | `/autopilot start\|stop` | Spawn / stop the supervised autopilot daemon | spawns the neverending daemon (no `--once`); idempotent start |
 | `/quit` | Exit the console | routes through the quit prompt |
 
-An unknown verb leaves the typed line populated for editing rather than erroring (`_slash.py:112`).
+An unknown verb leaves the typed line populated for editing rather than erroring.
 
 ## `init`
 
-Scaffolds `.flywheel/` and a `flywheel.toml` work policy (`_cmd_init`, `_workflow.py:2991`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`_ensure_dockerignore_covers_flywheel`, `_workflow.py:2028`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
+Scaffolds `.flywheel/` and a `flywheel.toml` work policy (`cmd_init`, `crates/flywheel-orchestrator/src/workflow/init.rs`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`ensure_dockerignore_covers_flywheel`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
 
-**Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`_workflow.py:2876`). The state `init` produces must be one the worker's own preconditions accept.
+**Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`init_git_preflight_error`). The state `init` produces must be one the worker's own preconditions accept.
 
 | Flag | Effect |
 |---|---|
@@ -254,7 +256,7 @@ For the resulting `flywheel.toml` schema see [configuration.md](configuration.md
 
 ## The `--json` snapshot
 
-`fw --json` (or any non-TTY stdout) prints one `DashboardSnapshot` — the same shape the Textual dashboard renders (`flywheel._snapshot`). The key set is stable; scripts piping `fw --json` depend on it.
+`fw --json` (or any non-TTY stdout) prints one `DashboardSnapshot` — the same shape the console dashboard renders (`crates/flywheel/src/snapshot.rs`). The key set is stable; scripts piping `fw --json` depend on it.
 
 ```json
 {
@@ -286,4 +288,4 @@ For the resulting `flywheel.toml` schema see [configuration.md](configuration.md
 }
 ```
 
-A work source that raises degrades the summary's task counts to empty rather than crashing the frame (`_snapshot.py:97`).
+A work source that raises degrades the summary's task counts to empty rather than crashing the frame.

@@ -44,9 +44,9 @@ stateDiagram-v2
     failed --> [*]
 ```
 
-This diagram is the exact set of legal edges the harness enforces (`_VALID_EDGES` in `flywheel_core.lifecycle`); any other transition raises `LifecycleTransitionError`.
+This diagram is the exact set of legal edges the harness enforces (`VALID_EDGES` in `crates/flywheel-core/src/lifecycle.rs`); any other transition returns `LifecycleTransitionError`.
 
-`validating -> internal_error` covers rubric-judge infrastructure failures (SDK crash, parse failure, missing/duplicate/truncated verdict envelope); the existing retry budget applies just as it does for `running -> internal_error`.
+`validating -> internal_error` covers rubric-judge infrastructure failures (judge agent crash, parse failure, missing/duplicate/truncated verdict envelope); the existing retry budget applies just as it does for `running -> internal_error`.
 
 Key rules:
 - `done` and `failed` are terminal — no transitions out
@@ -86,7 +86,7 @@ Each execution attempt is recorded as an `Attempt` with:
 - `started_at` / `ended_at` — wall clock duration
 - `outcome` — one of: `succeeded`, `validation_failed`, `agent_error`, `cancelled`, `internal_error`, `recovered`
 - `agent_output`, `error` — context for debugging
-- `agent_context` — model id, model version, agent-SDK version, prompt-template hash; lets later analysis distinguish model swaps from regressions
+- `agent_context` — model id, model version, agent version, prompt-template hash; lets later analysis distinguish model swaps from regressions
 - `run_id` — groups attempts within the same run
 
 Per-grader pass/fail detail lives in `grader_results`, keyed by `(run_id, attempt_number)`. Each row snapshots the grader's spec at run time and records its result, so the audit trail survives later task edits.

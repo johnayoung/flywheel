@@ -1,6 +1,6 @@
 # Persistence Tables
 
-Reference for the flywheel core store (schema_version **12**). Canonical DDL: `packages/flywheel-core/src/flywheel_core/_schema/persistence-schema.sql` (Postgres mirror alongside). An empty table means "nothing exercised it on this database," not "deprecated."
+Reference for the flywheel core store (schema_version **12**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside). An empty table means "nothing exercised it on this database," not "deprecated."
 
 Flywheel core owns the lifecycle of a **single task**. The catalog therefore records only what defines and verifies one task; cross-task concerns (the dependency DAG) live in the orchestration layer built on top, not here.
 
@@ -21,7 +21,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 - **Recovering "the exact task a run executed"** is `lifecycles.task_content_hash` → `task_versions(task_id, content_hash)` (`load_task_for_run`). The harness saves the definition before seeding the run, so the pinned version is always present.
 - **The content hash covers the full definition** — goal, graders, tags, context. Editing any of them mints a new immutable version; a run pins exactly the version it executed, so historical truth survives later edits.
 - **`prerequisites` is not persisted by core.** The inter-task dependency DAG is an orchestration-layer concept; flywheel core records only the single-task definition. The orchestration layer keeps its own scheduling state.
-- **Multi-worker mutual exclusion lives outside core.** The `task_claims` lease is transient coordination, not audit history, and only the orchestration layer uses it — so it lives in `flywheel_orchestrator`'s own store (its own `task_claims` + `orchestrator_schema_version` tables), which can share this database file but owns its own tables. The single-task loop has no notion of competing workers.
-- **Telemetry is not in the DB.** Since schema_version 11 the verbatim SDK message stream and `harness.*` telemetry stream to per-run append-only JSONL files under `.flywheel/logs/runs/` via the telemetry sink, not the store (see [vision.md](vision.md), "Audit stream"). The relational store holds state only.
+- **Multi-worker mutual exclusion lives outside core.** The `task_claims` lease is transient coordination, not audit history, and only the orchestration layer uses it — so it lives in the `flywheel-orchestrator` crate's own store (`crates/flywheel-orchestrator/src/claims.rs`) (its own `task_claims` + `orchestrator_schema_version` tables), which can share this database file but owns its own tables. The single-task loop has no notion of competing workers.
+- **Telemetry is not in the DB.** Since schema_version 11 the verbatim agent message stream and `harness.*` telemetry stream to per-run append-only JSONL files under `.flywheel/logs/runs/` via the telemetry sink, not the store (see [vision.md](vision.md), "Audit stream"). The relational store holds state only.
 - Store contents are sensitive-by-default: payloads are persisted verbatim and unredacted. Treat the file as confidential.
 - The store applies the supported forward migration on open (currently v11 -> v12, adding the nullable `lifecycles.source` column); any other version mismatch is refused with a `StoreSchemaError` ("must be re-created") rather than silently coerced.

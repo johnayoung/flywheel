@@ -60,11 +60,11 @@ The loop is not merely a reporter. It is the controller for a single task’s ex
 
 #### Audit stream
 
-Persistence follows the data taxonomy split (`docs/data-taxonomy.md`): the relational store holds state — lifecycles, attempts (with rolled-up token/iteration aggregates), the domain-event ledger, grader receipts — while telemetry (every SDK message the agent emits, every `harness.*` telemetry event, and a `domain.*` mirror of each ledger append) streams to one append-only JSONL file per run at `<logs root>/runs/<run_id>.jsonl` (default logs root `.flywheel/logs`). File write order is the canonical observability ordering; the ledger row stays authoritative for state. Telemetry loss is non-fatal by design — a sink failure is recorded once and the run continues — while ledger and lifecycle write failures keep strict, fatal semantics.
+Persistence follows the data taxonomy split (`docs/data-taxonomy.md`): the relational store holds state — lifecycles, attempts (with rolled-up token/iteration aggregates), the domain-event ledger, grader receipts — while telemetry (every agent stream message the agent emits, every `harness.*` telemetry event, and a `domain.*` mirror of each ledger append) streams to one append-only JSONL file per run at `<logs root>/runs/<run_id>.jsonl` (default logs root `.flywheel/logs`). File write order is the canonical observability ordering; the ledger row stays authoritative for state. Telemetry loss is non-fatal by design — a sink failure is recorded once and the run continues — while ledger and lifecycle write failures keep strict, fatal semantics.
 
-The run file is exposed through `flywheel_core.audit.stream(run_id, store=..., logs_root=..., follow=...)` as the programmatic API and `python -m flywheel_core.audit` as the operator CLI. The reader tails the file (cursor = byte offset + line count; a missing file reads as empty; a partial trailing line is withheld until complete) and reconstructs the same record shapes consumers always saw; the lifecycle row remains the terminal-status oracle that ends a live follow. Replay and live tailing share one iterator; this is the canonical inspection surface for "what did the agent actually do?".
+The run file is exposed through `audit::stream(run_id, store, options)` (`crates/flywheel-core/src/audit.rs`; logs root and follow mode ride on `StreamOptions`) as the programmatic API and `flywheel audit` / `fw audit` as the operator CLI. The reader tails the file (cursor = byte offset + line count; a missing file reads as empty; a partial trailing line is withheld until complete) and reconstructs the same record shapes consumers always saw; the lifecycle row remains the terminal-status oracle that ends a live follow. Replay and live tailing share one iterator; this is the canonical inspection surface for "what did the agent actually do?".
 
-The run files are sensitive-by-default: payloads are captured verbatim with no truncation, so they may contain prompts, tool inputs, and tool outputs in the clear (they are covered by `.flywheel/.gitignore`). A read-time redaction layer (`flywheel_core.redaction.Redactor`) sits on top of the stream and is applied by `flywheel_core.audit.stream(redactor=...)`, `subscribe`, `attach_logger`, and the `python -m flywheel_core.audit` CLI (`--redact-policy`, `--raw`, `--dry-run`). Redaction is best-effort — unmatched secrets can still pass through, and the run file remains the unredacted, sensitive-by-default source of record for telemetry.
+The run files are sensitive-by-default: payloads are captured verbatim with no truncation, so they may contain prompts, tool inputs, and tool outputs in the clear (they are covered by `.flywheel/.gitignore`). A read-time redaction layer (the `Redactor` trait, `crates/flywheel-core/src/redaction.rs`) sits on top of the stream and is applied by `audit::stream` (`StreamOptions.redactor`), `subscribe`, `attach_logger`, and the `flywheel audit` CLI (`--redact-policy default|strict`, `--raw`, `--dry-run`). Redaction is best-effort — unmatched secrets can still pass through, and the run file remains the unredacted, sensitive-by-default source of record for telemetry.
 
 Write-time redaction at the sink seam is a designed-for follow-up that reuses the same `Redactor` abstraction — not built in this feature. It trades forensic completeness for no-cleartext-at-rest and is the consumer's deliberate opt-in; the MVP ships the read-time wiring only. Retention, rotation, and archival of run files are operator-owned: flywheel emits them and never deletes them.
 
@@ -89,7 +89,7 @@ These signals are surfaced through the same observability pipeline as other loop
 
 ### Programmatic
 
-The loop is a Python library.
+The loop is a Rust library (the `flywheel-core` crate).
 
 It is designed to be embedded into larger systems such as CI pipelines, task queues, orchestration services, and review workflows. The core loop ships no operator UI of its own; rich operational surfaces — the `flywheel`/`fw` shell and operator console — are built above it. 
 
@@ -211,17 +211,17 @@ The agent emitted malformed, missing, duplicate, truncated, or contradictory ite
 
 ### Infrastructure failure
 
-The agent subprocess, SDK layer, verifier infrastructure, storage system, or other execution dependency failed.
+The agent subprocess, agent transport, verifier infrastructure, storage system, or other execution dependency failed.
 
 These distinctions matter for telemetry, retry policy, escalation, and operator understanding. Even if the externally visible lifecycle remains compact, the internal outcome model should preserve these categories. 
 
 ## Where this fits
 
-The single-task loop is flywheel's foundation, shipped as the embeddable `flywheel-core` package. It implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, and preserve execution history. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth — everything in the loop exists to move a task through those states correctly, observably, and reliably.
+The single-task loop is flywheel's foundation, shipped as the embeddable `flywheel-core` crate. It implements the [lifecycle](task-lifecycle.md): run the agent, validate protocol signals, verify completion claims, manage retries, and preserve execution history. The [task schema](task-schema.md) and [lifecycle](task-lifecycle.md) are the source of truth — everything in the loop exists to move a task through those states correctly, observably, and reliably.
 
-Its first agent backend targets the [`claude-agent-sdk`](https://github.com/anthropics/claude-agent-sdk-python), wired in as an optional extra (`flywheel-core[claude]`) behind a single lazy boundary, so the data and lifecycle surface need no SDK at all.
+Agents are driven only through their CLIs (`claude` in headless stream-json mode, `codex`) by the `flywheel-agents` crate, which sits below core and depends on no other flywheel crate; the data and lifecycle surface need no agent at all.
 
-The building blocks that depend on a correct, trustworthy loop are built on top of it, one workspace package per layer: multi-task orchestration over a prerequisite DAG plus the autopilot intake daemon that authors fresh `Task`s into the backlog (`flywheel_orchestrator.run_refill_pass`) live in `flywheel-orchestrator`; the git-worktree landing strategies and worker daemon that drain that backlog live in `flywheel-worktree`; the Docker sandbox execution backend — a third `SubmitStrategy` (`flywheel_container.ContainerSubmitStrategy`) — lives in `flywheel-container`; and the `flywheel`/`fw` product shell sits at the top, owning the operator console and the spec-driven `fw-*` authoring skills installed by `flywheel init --skills`. Task decomposition and richer intervention policy continue to build on the same foundation. 
+The building blocks that depend on a correct, trustworthy loop are built on top of it, one workspace crate per layer: multi-task orchestration over a prerequisite DAG plus the autopilot intake daemon that authors fresh `Task`s into the backlog (`run_refill_pass`, `crates/flywheel-orchestrator/src/autopilot.rs`) live in `flywheel-orchestrator`; the git-worktree landing strategies and worker daemon that drain that backlog live in `flywheel-worktree`; the Docker sandbox execution backend — a third `SubmitStrategy` (`ContainerSubmitStrategy`, `crates/flywheel-container/src/submit.rs`) — lives in `flywheel-container`; and the `flywheel`/`fw` product shell sits at the top, owning the operator console and the spec-driven `fw-*` authoring skills installed by `flywheel init --skills`. Task decomposition and richer intervention policy continue to build on the same foundation. 
 
 ## Glossary
 

@@ -82,7 +82,7 @@ The skills/tools/MCP surface (`SandboxCapabilities`), translated into claude CLI
 | `allowed_tools` | list | `[]` | tool allowlist (list-replace), `--allowedTools` | host agent CLI flags |
 | `denied_tools` | list | `[]` | tool denylist (list-replace), `--disallowedTools` | host agent CLI flags |
 | `setting_sources` | list \| unset | unset | settings origins (`hardened` = `["project"]`); unset lets the adapter derive `user,project` when skills are enabled | host agent CLI flags |
-| `mcp_servers` | list | `[]` | MCP server names (list-replace); a name list is not translated into `--mcp-config` -- load servers via the repo's `.mcp.json` | not enforced |
+| `mcp_servers` | list | `[]` | MCP server names (list-replace), each looked up in the sandbox's `.mcp.json` and passed inline via `--mcp-config`; an undeclared name fails the run | enforced |
 | `mcp_strict` | bool | `false` | only load declared servers, `--strict-mcp-config` (on under `balanced`/`hardened`) | host agent CLI flags |
 
 **Capabilities are enforced only on the host (worktree) path.** The container backend builds its agent configuration from model and permission policy alone, so these primitives do not reach the in-container agent — see the v1 gap below.

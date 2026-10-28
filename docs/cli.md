@@ -27,7 +27,7 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 `fw <verb> --help` forwards `--help` to that verb's own parser, so each verb's specific flags come from the delegated parser, not from the router.
 
-**`run`, `next`, and bare `orchestrate` are intentionally not routed.** Spec 00021 FR-4 keeps them as plumbing (the single-task `run` / `is-done` / `set-model` core verbs are reachable only through the hidden `flywheel workflow ...` verb); `worker --once` is the only blessed headless single-task drain. An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2.
+**Plumbing verbs are hidden.** Spec 00021 FR-4 keeps `next`, bare `orchestrate`, and the single-task core verbs as plumbing: they route (`flywheel next`, `flywheel orchestrate`, `flywheel workflow run|is-done|set-model|...`) but never appear in `fw --help`. `worker --once` is the only blessed headless single-task drain. An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2.
 
 ### Resolution precedence
 
@@ -134,7 +134,7 @@ Streams the totally-ordered audit records for one run, routed by the shell (`aud
 | `--follow` | tail until terminal status (Ctrl-C exits 130) |
 | `--poll-interval` | tail cadence |
 | `--redact` | explicit opt-in (already default) |
-| `--redact-policy NAME`, `--redact-salt SALT` | redaction tuning; `NAME` is a built-in (`default`, `strict`) |
+| `--redact-policy NAME`, `--redact-salt SALT` | redaction tuning; `NAME` is a built-in (`default`, `strict`; `strict` also blanks Read/Bash/`command_execution` tool inputs and results) |
 | `--raw` | disable redaction (authorized forensics) |
 | `--dry-run` | coverage report only |
 

@@ -97,6 +97,10 @@ The harness hang-watchdog is also live on this path: every stream-json line the 
 exec_timeout = 1800   # seconds; 0 = unbounded (not recommended)
 ```
 
+## Container lifecycle and orphan reap
+
+Containers are started without `--rm` so a dead sandbox stays inspectable (`docker logs`, exit code) until teardown (`stop` + `rm`) or the exit-time registry removes it. Each container carries owner labels: host, pid, and (Linux) process start time. At worker boot, `reap_container_orphans` removes only flywheel containers whose owner is provably dead **on this host** (pid gone, or pid reused by another process); live owners and other hosts' containers are never touched. Containers without owner labels (pre-0.6.0) are treated as orphans.
+
 ## Limitations operators must know
 
 1. **Policy-declared `[sandbox.env]` does not reach the in-container agent.** `[sandbox.env]` (`pass`/`set`) resolves into the **host** agent environment; the policy bridge builds the container config with an empty `env` (`container_config_from_policy`), so only an operator-constructed `ContainerConfig.env` reaches the container. Likewise `[sandbox.capabilities]` does not reach it: the in-container agent configuration carries only model and permission policy (`container_agent_configuration`, `crates/flywheel-worktree/src/daemon.rs`). Closing this is a follow-on, not shipped.

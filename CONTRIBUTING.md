@@ -11,47 +11,40 @@ opening a pull request. Feature work follows the spec-driven pipeline in
 
 ## Dev setup
 
-Python 3.13 is required. [uv](https://docs.astral.sh/uv/getting-started/installation/)
-is the package manager and task runner -- do not invoke `pip` or `python`
-directly.
+Stable Rust (`rust-version` 1.91, edition 2024) via [rustup](https://rustup.rs/).
 
 ```bash
 git clone https://github.com/johnayoung/flywheel
 cd flywheel
-uv sync
+cargo build                          # all six crates under crates/
+cargo install --path crates/flywheel # optional: put flywheel + fw on PATH
 ```
 
 ## Running tests
 
-Each package keeps its own `tests/` under `packages/<pkg>/tests/`.
-
-Run the full suite through `scripts/run_silent.sh`, a context-efficient
-backpressure wrapper: it suppresses output on success (one `ok` line) and dumps
-the full output only on failure, so a green run stays quiet.
+Unit tests live in-module (`#[cfg(test)]`); integration tests in
+`crates/<name>/tests/`. Docker-backed tests (Postgres, container backend) skip
+themselves when no Docker daemon is reachable.
 
 ```bash
-scripts/run_silent.sh "tests" uv run pytest               # full suite, quiet on success
-uv run pytest packages/flywheel-core/tests/test_task.py   # one file (iterating)
-uv run pytest -k transcript                                # one keyword (iterating)
-uv run pytest -x -vv                                       # stop on first failure, verbose (iterating)
+cargo test -p flywheel-core --test module_purity   # one integration-test file (iterating)
+cargo test -p flywheel-core harness                # one crate, one name filter (iterating)
+cargo test -p flywheel-core -- --nocapture         # show test output (iterating)
 ```
 
-Use the bare `uv run pytest -k ...` forms while iterating on a single test; set
-`RUN_SILENT_VERBOSE=1` to stream output live.
+## The gate
 
-## Lint and types
-
-CI gates every change on ruff and pyright in addition to the test suite. Run
-all three before opening a PR with `scripts/check.sh`, which runs them in CI
-order (ruff -> pyright -> pytest), each through the backpressure wrapper:
+CI gates every change on rustfmt, clippy (`-D warnings`), and the test suite.
+Run all three before opening a PR:
 
 ```bash
 scripts/check.sh
 ```
 
-A clean tree prints three `ok` lines; the first failing gate dumps only its own
-output and stops. Treat pyright errors as build failures; the test suite does
-not surface type errors.
+Each gate runs through `scripts/run_silent.sh`, a context-efficient
+backpressure wrapper: a clean tree prints one `ok` line per gate; the first
+failing gate dumps only its own output and stops. Set `RUN_SILENT_VERBOSE=1`
+to stream output live. Treat clippy warnings as build failures.
 
 ## Commit style
 

@@ -619,7 +619,7 @@ mod tests {
         assert!(handle.teardown.is_some());
 
         let run = run_call(&h.log);
-        assert_eq!(&run[..3], ["run", "-d", "--rm"]);
+        assert_eq!(&run[..3], ["run", "-d", "--name"]);
         assert_eq!(flag_values(&run, "--user"), vec!["1000:1000"]);
         assert_eq!(
             flag_values(&run, "-v")[0],

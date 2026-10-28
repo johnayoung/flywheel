@@ -273,15 +273,17 @@ impl RunSpec {
 ///
 /// Flag order is deterministic (env, volumes, workdir, user, network,
 /// groups, devices, cpus, labels) so it is assertable in tests. The
-/// container is detached and `--rm`: it stays alive for subsequent
-/// `docker exec` calls via the image's `sleep infinity` entrypoint (or the
-/// explicit `command` override) and the daemon removes it on its own the
-/// moment that process exits, so a stopped sandbox never lingers as an
-/// exited container. Labels emit `--label key=value`; the flywheel-owner
+/// container is detached: it stays alive for subsequent `docker exec` calls
+/// via the image's `sleep infinity` entrypoint (or the explicit `command`
+/// override). It is deliberately not auto-removed: a container whose
+/// process died stays inspectable (`docker inspect` / `docker logs`) for
+/// the post-mortem, and removal is owned by the explicit teardown
+/// ([`Docker::remove_container`]), the exit-time [`CleanupRegistry`], and
+/// the startup orphan reap, which all `docker rm` it. Labels emit `--label key=value`; the flywheel-owner
 /// marker is threaded through here by [`Docker::start_container`] so every
 /// real container carries it. No label is added when `labels` is empty.
 pub fn build_run_argv(spec: &RunSpec) -> Vec<String> {
-    let mut argv: Vec<String> = ["docker", "run", "-d", "--rm", "--name"]
+    let mut argv: Vec<String> = ["docker", "run", "-d", "--name"]
         .into_iter()
         .map(String::from)
         .collect();
@@ -766,7 +768,7 @@ impl Docker {
     ///
     /// `timeout` bounds each stop/rm so a hung `dockerd` cannot wedge
     /// teardown while the worker holds its lease; an ordinary failure (e.g.
-    /// the `--rm` container already vanished after `stop`) is swallowed, but
+    /// the container is already gone) is swallowed, but
     /// a timeout propagates so it is not mistaken for a clean removal.
     pub fn remove_container(
         &self,
@@ -971,7 +973,14 @@ pub fn flush_cleanup_registry() {
 /// the daemon is absent, or wedged) is logged and swallowed so the worker
 /// still starts.
 pub fn reap_container_orphans(log: &dyn Fn(&str)) {
-    let docker = Docker::new();
+    reap_container_orphans_with(&Docker::new(), log);
+}
+
+/// [`reap_container_orphans`] against an explicit client. A host with no
+/// docker binary or no reachable daemon is silent (the scan's ordinary
+/// failure reads as "no containers"); only a wedged daemon's timeout is
+/// logged.
+fn reap_container_orphans_with(docker: &Docker, log: &dyn Fn(&str)) {
     match docker.reap_orphan_containers(&active_container_names(), default_management_timeout()) {
         Ok(reaped) => {
             for name in reaped {
@@ -1094,7 +1103,7 @@ mod tests {
     fn build_run_argv_minimal() {
         assert_eq!(
             build_run_argv(&RunSpec::new("box", "img")),
-            sv(&["docker", "run", "-d", "--rm", "--name", "box", "img"])
+            sv(&["docker", "run", "-d", "--name", "box", "img"])
         );
     }
 
@@ -1115,7 +1124,6 @@ mod tests {
                 "docker",
                 "run",
                 "-d",
-                "--rm",
                 "--name",
                 "box",
                 "-e",
@@ -1157,9 +1165,21 @@ mod tests {
         assert_eq!(
             build_run_argv(&spec),
             sv(&[
-                "docker", "run", "-d", "--rm", "--name", "box", "alpine", "sleep", "infinity"
+                "docker", "run", "-d", "--name", "box", "alpine", "sleep", "infinity"
             ])
         );
+    }
+
+    #[test]
+    fn orphan_reap_is_silent_without_a_docker_binary_or_daemon() {
+        let lines = Mutex::new(Vec::<String>::new());
+        let log = |line: &str| lines.lock().unwrap().push(line.to_owned());
+        let missing = Docker::with_program(sv(&["/nonexistent/flywheel-test/docker"]));
+        reap_container_orphans_with(&missing, &log);
+        // A docker CLI whose daemon is unreachable exits non-zero.
+        let no_daemon = Docker::with_program(sv(&["/bin/sh", "-c", "exit 1", "docker"]));
+        reap_container_orphans_with(&no_daemon, &log);
+        assert!(lines.lock().unwrap().is_empty(), "{:?}", lines.lock().unwrap());
     }
 
     #[test]
@@ -1879,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn live_remove_container_stops_and_the_rm_flag_cleans_up() {
+    fn live_remove_container_stops_and_removes_a_running_container() {
         require_docker!();
         let _daemon = live_lock();
         let docker = Docker::new();
@@ -1891,6 +1911,45 @@ mod tests {
                 Some(DEFAULT_START_TIMEOUT),
             )
             .unwrap();
+        docker.remove_container(&name, timeout).unwrap();
+        let gone = docker
+            .run(
+                sv(&["docker", "inspect", &name, "--format", "{{.Id}}"]),
+                timeout,
+            )
+            .is_err();
+        assert!(gone, "container {name} survived remove_container");
+    }
+
+    #[test]
+    fn live_dead_container_stays_inspectable_until_teardown_removes_it() {
+        require_docker!();
+        let _daemon = live_lock();
+        let docker = Docker::new();
+        let timeout = default_management_timeout();
+        let name = unique_name("flywheel-test");
+        docker
+            .start_container(
+                &RunSpec::new(&name, ALPINE).with_command(sv(&["sh", "-c", "echo died; exit 3"])),
+                Some(DEFAULT_START_TIMEOUT),
+            )
+            .unwrap();
+        // The process exits on its own; the container lingers as an exited,
+        // inspectable record of what happened.
+        let format = "{{.State.Status}} {{.State.ExitCode}}";
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let state = loop {
+            let state = docker
+                .run(sv(&["docker", "inspect", &name, "--format", format]), timeout)
+                .unwrap();
+            if state.trim() == "exited 3" || Instant::now() > deadline {
+                break state;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_eq!(state.trim(), "exited 3");
+        let logs = docker.run(sv(&["docker", "logs", &name]), timeout).unwrap();
+        assert_eq!(logs.trim(), "died");
         docker.remove_container(&name, timeout).unwrap();
         let gone = docker
             .run(

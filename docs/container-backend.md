@@ -90,6 +90,8 @@ policy = "deny"
 
 `[sandbox.container] exec_timeout` (default `1800` seconds) is the hard wall-clock ceiling for the **whole in-container run**: it becomes the flywheel-agents run ceiling (`RunRequest.timeout_seconds`), so on expiry the runtime terminates the agent's in-container process group (SIGTERM, grace, SIGKILL -- each a `docker exec kill` against the pgid the agent wrapper recorded under `/tmp`) and then the `docker exec` client, and the run surfaces as a structured `IterationResult.failure` with `error_type = "timeout"` (no exception; a nonzero agent exit surfaces as `error_type = "agent_exit"`). `0` means unbounded (not recommended); `build_container_config` maps `0` to no ceiling.
 
+Non-agent in-container commands (`Docker::exec_in_container`, e.g. setup hooks) use the same mechanism: the command runs under a wrapper that records its pgid in `/tmp/flywheel-exec-<uuid>.pgid` (removed on a normal exit); on `ExecOptions.timeout` the group gets SIGTERM, `kill_grace` (default 5s), then SIGKILL (which also removes the file), and only then is the client killed. SIGTERM-ignoring grandchildren do not survive.
+
 The harness hang-watchdog is also live on this path: every stream-json line the agent emits is normalized into events forwarded to `InvocationRequest.on_message`, so `hang_timeout_seconds` sees container liveness and can be used alongside `exec_timeout`.
 
 ```toml

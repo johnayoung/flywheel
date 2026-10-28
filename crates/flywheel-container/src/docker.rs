@@ -18,6 +18,10 @@
 //! a bounded tail, UID/GID alignment for bind mounts, and a pre-flight
 //! image+UID check.
 
+use flywheel_agents::hosts::{
+    DEFAULT_KILL_GRACE, container_group_signal_argv, container_pgid_file, pgid_scoped_command,
+    run_signal_blocking,
+};
 use flywheel_core::deadline_config::{DeadlineClass, resolve_deadlines};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -489,11 +493,15 @@ pub fn build_run_argv(spec: &RunSpec) -> Vec<String> {
 ///
 /// `interactive` adds `-i` so a prompt can be piped on stdin (avoiding the
 /// Linux per-arg `ARG_MAX` limit). `cwd` sets the working directory.
+/// `pgid_file` runs the command under the flywheel-agents process-group
+/// wrapper ([`pgid_scoped_command`]) that records the in-container group id
+/// there, so a timeout can signal the whole in-container tree.
 pub fn build_exec_argv(
     name: &str,
     command: &str,
     interactive: bool,
     cwd: Option<&str>,
+    pgid_file: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec!["docker".into(), "exec".into()];
     if interactive {
@@ -504,9 +512,11 @@ pub fn build_exec_argv(
         argv.push(cwd.into());
     }
     argv.push(name.into());
-    argv.push("sh".into());
-    argv.push("-c".into());
-    argv.push(command.into());
+    let shell: Vec<String> = vec!["sh".into(), "-c".into(), command.into()];
+    match pgid_file {
+        Some(pgid_file) => argv.extend(pgid_scoped_command(pgid_file, &shell)),
+        None => argv.extend(shell),
+    }
     argv
 }
 
@@ -519,10 +529,14 @@ pub struct ExecOptions {
     pub cwd: Option<String>,
     /// Retained tail per stream; `None` is [`DEFAULT_MAX_TAIL_CHARS`].
     pub max_tail_chars: Option<usize>,
-    /// Wall-clock ceiling for the whole exec; expiry kills the client and
-    /// surfaces [`DockerError::ExecTimeout`]. `None` is unbounded (the
-    /// caller passes the resolved `exec_timeout`).
+    /// Wall-clock ceiling for the whole exec; expiry terminates the
+    /// in-container process group (SIGTERM, `kill_grace`, SIGKILL), kills
+    /// the client, and surfaces [`DockerError::ExecTimeout`]. `None` is
+    /// unbounded (the caller passes the resolved `exec_timeout`).
     pub timeout: Option<Duration>,
+    /// SIGTERM-to-SIGKILL grace for the in-container group on a timeout;
+    /// `None` is [`DEFAULT_KILL_GRACE`].
+    pub kill_grace: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -559,6 +573,35 @@ fn wait_until(child: &Mutex<Child>, deadline: Option<Instant>) -> Option<ExitSta
         drop(guard);
         thread::sleep(WAIT_POLL);
     }
+}
+
+/// Stop a timed-out `docker exec` and everything it started in the
+/// container: SIGTERM the recorded in-container group, give the client
+/// `grace` to exit with it, SIGKILL-sweep the group (survivors that ignore
+/// SIGTERM; also removes the pgid file), then kill the local client.
+fn terminate_in_container_tree(
+    child: &Mutex<Child>,
+    term_argv: &[String],
+    kill_argv: &[String],
+    grace: Duration,
+) {
+    run_signal_blocking(term_argv);
+    let grace_deadline = Instant::now() + grace;
+    loop {
+        let mut guard = child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(guard.try_wait(), Ok(None)) || Instant::now() >= grace_deadline {
+            break;
+        }
+        drop(guard);
+        thread::sleep(WAIT_POLL);
+    }
+    run_signal_blocking(kill_argv);
+    let mut guard = child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _ = guard.kill();
 }
 
 /// Read a pipe to its end on a thread, returning the bytes.
@@ -776,6 +819,14 @@ impl Docker {
     /// operation is bounded by `options.timeout`, not just the final wait: a
     /// child that holds stdout open and silent is killed on expiry, which
     /// closes stdout and ends the read loop.
+    ///
+    /// Killing the local `docker exec` client does not stop the process it
+    /// started in the container, so the command runs under the
+    /// flywheel-agents process-group wrapper (the same mechanism as
+    /// `DockerExecHost`): on expiry the recorded in-container group gets
+    /// SIGTERM through a second `docker exec`, then SIGKILL after
+    /// `options.kill_grace` (which also removes the per-exec `/tmp` file),
+    /// and only then is the client killed. A normal exit removes the file.
     pub fn exec_in_container(
         &self,
         name: &str,
@@ -783,12 +834,17 @@ impl Docker {
         options: ExecOptions,
         mut on_line: Option<&mut dyn FnMut(&str)>,
     ) -> Result<ExecResult, DockerError> {
+        let pgid_file = container_pgid_file("exec");
         let argv = self.rebase(build_exec_argv(
             name,
             command,
             options.stdin.is_some(),
             options.cwd.as_deref(),
+            Some(&pgid_file),
         ));
+        let term_argv = container_group_signal_argv(&self.program, name, &pgid_file, "TERM");
+        let kill_argv = container_group_signal_argv(&self.program, name, &pgid_file, "KILL");
+        let kill_grace = options.kill_grace.unwrap_or(DEFAULT_KILL_GRACE);
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(if options.stdin.is_some() {
@@ -830,11 +886,12 @@ impl Docker {
         });
         let stdout = child.stdout.take();
         let child = Arc::new(Mutex::new(child));
-        let deadline = options.timeout.map(|timeout| Instant::now() + timeout);
 
-        // Watchdog for the read phase: a child that never closes stdout would
-        // block the line loop forever; on expiry it is killed, which closes
-        // stdout. The sender is dropped after the loop to retire the watchdog.
+        // Watchdog for the whole exec: a child that never closes stdout would
+        // block the line loop forever. On expiry the in-container group is
+        // terminated (TERM, grace, KILL sweep) and the client killed, which
+        // closes stdout. The sender is dropped once the client is reaped to
+        // retire the watchdog.
         let timed_out = Arc::new(AtomicBool::new(false));
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         let watchdog = options.timeout.map(|timeout| {
@@ -843,10 +900,7 @@ impl Docker {
             thread::spawn(move || {
                 if let Err(mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(timeout) {
                     timed_out.store(true, Ordering::SeqCst);
-                    let mut guard = child
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let _ = guard.kill();
+                    terminate_in_container_tree(&child, &term_argv, &kill_argv, kill_grace);
                 }
             })
         });
@@ -873,8 +927,8 @@ impl Docker {
                 }
             }
         }
+        let status = wait_until(&child, None);
         drop(cancel_tx);
-        let status = wait_until(&child, deadline);
         if let Some(handle) = watchdog {
             let _ = handle.join();
         }
@@ -1409,11 +1463,11 @@ mod tests {
     #[test]
     fn build_exec_argv_buffered_vs_stdin() {
         assert_eq!(
-            build_exec_argv("box", "ls", false, None),
+            build_exec_argv("box", "ls", false, None, None),
             sv(&["docker", "exec", "box", "sh", "-c", "ls"])
         );
         assert_eq!(
-            build_exec_argv("box", "claude -p -", true, Some("/s")),
+            build_exec_argv("box", "claude -p -", true, Some("/s"), None),
             sv(&[
                 "docker",
                 "exec",
@@ -1426,6 +1480,66 @@ mod tests {
                 "claude -p -"
             ])
         );
+    }
+
+    #[test]
+    fn build_exec_argv_wraps_the_command_in_a_recorded_process_group() {
+        let argv = build_exec_argv("box", "make setup", false, None, Some("/tmp/x.pgid"));
+        let mut expected = sv(&["docker", "exec", "box"]);
+        expected.extend(pgid_scoped_command(
+            "/tmp/x.pgid",
+            &sv(&["sh", "-c", "make setup"]),
+        ));
+        assert_eq!(argv, expected);
+        assert_eq!(argv[3..5], ["/bin/sh", "-c"]);
+        assert_eq!(
+            argv[argv.len() - 4..],
+            ["/tmp/x.pgid", "sh", "-c", "make setup"]
+        );
+    }
+
+    #[test]
+    fn exec_timeout_signals_the_in_container_group_before_killing_the_client() {
+        let dir = tempfile::tempdir().unwrap();
+        // `exec` hangs (a silent in-container command); the signal execs
+        // return at once.
+        let body = r#"case "$1" in exec) case "$*" in *flywheel-signal*) ;; *) exec sleep 30 ;; esac ;; esac"#;
+        let (docker, log) = scripted_docker(dir.path(), body);
+        let started = Instant::now();
+        let err = docker
+            .exec_in_container(
+                "box",
+                "make setup",
+                ExecOptions {
+                    timeout: Some(Duration::from_millis(300)),
+                    kill_grace: Some(Duration::from_millis(100)),
+                    ..ExecOptions::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DockerError::ExecTimeout { .. }));
+        assert!(started.elapsed() < WALL_BUDGET);
+        // The signal script spans several lines, so the log is matched on
+        // each call's first line and its trailing `<pgid file> <signal>`.
+        let calls = recorded_calls(&log);
+        let execs: Vec<_> = calls.iter().filter(|call| call[0] == "exec").collect();
+        assert_eq!(execs.len(), 3, "{calls:?}");
+        assert!(execs.iter().all(|call| call[1] == "box"));
+        let pgid_file = execs[0]
+            .iter()
+            .find(|arg| arg.starts_with("/tmp/flywheel-exec-"))
+            .expect("the exec records its process group")
+            .clone();
+        let signals: Vec<&str> = calls
+            .iter()
+            .filter(|call| call.len() >= 3 && call[call.len() - 3] == "flywheel-signal")
+            .map(|call| {
+                assert_eq!(call[call.len() - 2], pgid_file);
+                call[call.len() - 1].as_str()
+            })
+            .collect();
+        assert_eq!(signals, ["TERM", "KILL"]);
     }
 
     #[test]
@@ -1978,6 +2092,65 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DockerError::ExecTimeout { .. }));
         assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn live_exec_timeout_terminates_the_in_container_tree() {
+        require_docker!();
+        let _daemon = live_lock();
+        let container = LiveContainer::alpine();
+        let started = Instant::now();
+        // A setup-hook stand-in whose grandchild ignores SIGTERM and holds
+        // stdout open; it records its pid so the probe can find it.
+        let err = container
+            .docker
+            .exec_in_container(
+                &container.name,
+                "(trap '' TERM; exec sleep 300) & echo $! > /tmp/exec-grandchild.pid; wait",
+                ExecOptions {
+                    timeout: Some(Duration::from_secs(2)),
+                    kill_grace: Some(Duration::from_secs(1)),
+                    ..ExecOptions::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DockerError::ExecTimeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(30));
+        let grandchild = container.exec("cat /tmp/exec-grandchild.pid", ExecOptions::default());
+        let grandchild = grandchild.stdout.trim().to_owned();
+        assert!(!grandchild.is_empty());
+        // Killing only the local client would leave the tree running.
+        assert!(container_pid_gone(&container, &grandchild));
+        let survivors = container.exec(
+            "ps -o pid,args | grep -c '[s]leep 300' || true",
+            ExecOptions::default(),
+        );
+        assert_eq!(survivors.stdout.trim(), "0");
+        // The KILL sweep removed the timed-out exec's pgid file; the only
+        // one left is the probe's own (removed when the probe exits).
+        let leftover = container.exec(
+            "ls /tmp | grep -c '^flywheel-exec-' || true",
+            ExecOptions::default(),
+        );
+        assert_eq!(leftover.stdout.trim(), "1");
+    }
+
+    #[test]
+    fn live_exec_normal_exit_removes_its_pgid_file() {
+        require_docker!();
+        let _daemon = live_lock();
+        let container = LiveContainer::alpine();
+        assert_eq!(
+            container.exec("exit 4", ExecOptions::default()).exit_code,
+            4
+        );
+        // Only the probe's own pgid file exists while it runs.
+        let leftover = container.exec(
+            "ls /tmp | grep -c '^flywheel-exec-' || true",
+            ExecOptions::default(),
+        );
+        assert_eq!(leftover.stdout.trim(), "1");
     }
 
     /// Whether container pid `pid` is gone (or a zombie: the alpine

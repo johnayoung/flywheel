@@ -517,6 +517,60 @@ pub const CONTAINER_SIGNAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// written never blocks the agent; it only loses in-container cancellation.
 const PGID_WRAPPER: &str = r#"{ printf '%s\n' "$$" > "$0"; } 2>/dev/null; exec "$@""#;
 
+/// The scoped wrapper for a one-shot command: record `$$` like
+/// [`PGID_WRAPPER`] but stay resident as the group leader so the file is
+/// removed when the command finishes, preserving its exit status. A command
+/// killed by a signal leaves the file for the KILL sweep to remove.
+const PGID_SCOPED_WRAPPER: &str =
+    r#"{ printf '%s\n' "$$" > "$0"; } 2>/dev/null; "$@"; rc=$?; rm -f "$0"; exit "$rc""#;
+
+/// A fresh in-container process-group file path under
+/// [`CONTAINER_PGID_DIR`]; `kind` names the caller (`agent`, `exec`).
+pub fn container_pgid_file(kind: &str) -> String {
+    format!(
+        "{CONTAINER_PGID_DIR}/flywheel-{kind}-{}.pgid",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// The in-container argv that runs `command` as the leader of its own
+/// process group with the group id recorded in `pgid_file` (removed again
+/// on a normal exit). Append it after `docker exec [flags] <container>`;
+/// the group is then signalled with [`container_group_signal_argv`].
+pub fn pgid_scoped_command(pgid_file: &str, command: &[String]) -> Vec<String> {
+    let mut argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PGID_SCOPED_WRAPPER.to_string(),
+        pgid_file.to_string(),
+    ];
+    argv.extend(command.iter().cloned());
+    argv
+}
+
+/// The `docker exec` argv (`docker_argv` is the docker program prefix) that
+/// sends `signal` (`TERM` / `KILL`) to the process group recorded in
+/// `pgid_file` inside `container`. The KILL form also removes the file.
+pub fn container_group_signal_argv(
+    docker_argv: &[String],
+    container: &str,
+    pgid_file: &str,
+    signal: &str,
+) -> Vec<String> {
+    let mut argv = docker_argv.to_vec();
+    argv.extend([
+        "exec".to_string(),
+        container.to_string(),
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        PGID_SIGNAL_SCRIPT.to_string(),
+        "flywheel-signal".to_string(),
+        pgid_file.to_string(),
+        signal.to_string(),
+    ]);
+    argv
+}
+
 /// Signal the recorded group: `$1` is the file, `$2` the signal name. A
 /// missing or malformed file is a no-op; the KILL sweep removes the file.
 const PGID_SIGNAL_SCRIPT: &str = r#"f=$1; s=$2
@@ -543,10 +597,7 @@ impl DockerExecHost {
 
     /// A fresh in-container process-group file path for one spawn.
     pub fn new_pgid_file() -> String {
-        format!(
-            "{CONTAINER_PGID_DIR}/flywheel-agent-{}.pgid",
-            uuid::Uuid::new_v4().simple()
-        )
+        container_pgid_file("agent")
     }
 
     /// The full `docker exec` argv for `plan`, the agent wrapped so it
@@ -579,18 +630,7 @@ impl DockerExecHost {
     /// The `docker exec` argv that sends `signal` (`TERM` / `KILL`) to the
     /// process group recorded in `pgid_file`.
     pub fn signal_argv(&self, pgid_file: &str, signal: &str) -> Vec<String> {
-        let mut argv = self.docker_argv.clone();
-        argv.extend([
-            "exec".to_string(),
-            self.container_name.clone(),
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            PGID_SIGNAL_SCRIPT.to_string(),
-            "flywheel-signal".to_string(),
-            pgid_file.to_string(),
-            signal.to_string(),
-        ]);
-        argv
+        container_group_signal_argv(&self.docker_argv, &self.container_name, pgid_file, signal)
     }
 }
 
@@ -715,8 +755,11 @@ impl Drop for DockerExecProcess {
     }
 }
 
-/// [`run_signal`] for a caller with no async context (a `Drop`).
-fn run_signal_blocking(argv: &[String]) {
+/// Run one in-container signal `docker exec` (a
+/// [`container_group_signal_argv`]) to completion from a caller with no
+/// async context (a `Drop`, a synchronous exec watchdog), bounded by
+/// [`CONTAINER_SIGNAL_TIMEOUT`]. Best effort, like the async form.
+pub fn run_signal_blocking(argv: &[String]) {
     let Some((program, rest)) = argv.split_first() else {
         return;
     };
@@ -832,6 +875,48 @@ mod tests {
         let recorded = std::fs::read_to_string(&file).unwrap();
         assert_eq!(recorded.trim(), exec_pid);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pgid_scoped_wrapper_records_its_group_keeps_the_exit_code_and_cleans_up() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("fw-scoped-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("run.pgid");
+        let file_arg = file.to_string_lossy().into_owned();
+        let command = [
+            "sh",
+            "-c",
+            "cat \"$0\"; cut -d' ' -f5 /proc/$$/stat; exit 3",
+            &file_arg,
+        ];
+        let argv = pgid_scoped_command(&file_arg, &command.map(String::from));
+        assert_eq!(argv[..2], ["/bin/sh", "-c"]);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .process_group(0)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines().map(str::trim);
+        let recorded = lines.next().unwrap();
+        let group = lines.next().unwrap();
+        // The recorded id is the wrapper's pid, the group the command runs in.
+        assert_eq!(recorded, group);
+        assert!(!file.exists(), "the scoped wrapper removes its pgid file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn container_signal_argv_and_pgid_file_shapes() {
+        let argv =
+            container_group_signal_argv(&["docker".to_string()], "box", "/tmp/x.pgid", "KILL");
+        assert_eq!(argv[..3], ["docker", "exec", "box"]);
+        assert_eq!(argv[argv.len() - 2..], ["/tmp/x.pgid", "KILL"]);
+        let file = container_pgid_file("exec");
+        assert!(file.starts_with("/tmp/flywheel-exec-") && file.ends_with(".pgid"));
     }
 
     #[test]

@@ -45,7 +45,7 @@ use flywheel_orchestrator::strategy::{
     LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
     SubmitStrategy,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -571,14 +571,8 @@ pub fn archive_completed_phases(
         for path in &task_files {
             loaded_tasks.push(load_task_file(path)?);
         }
-        let mut all_done = true;
-        for task in &loaded_tasks {
-            if !has_done_lifecycle(store, &task.id)? {
-                all_done = false;
-                break;
-            }
-        }
-        if !all_done {
+        let done = done_task_ids(store, &loaded_tasks)?;
+        if !loaded_tasks.iter().all(|task| done.contains(&task.id)) {
             continue;
         }
         let phase_name = dir_name(&phase_dir);
@@ -791,6 +785,19 @@ fn has_done_lifecycle(store: &dyn ArchiveStore, task_id: &str) -> Result<bool, S
         .with_statuses([Status::Done])
         .with_task_id(task_id);
     Ok(!store.list_lifecycles(&filter)?.is_empty())
+}
+
+/// The subset of `tasks` holding a DONE lifecycle, in one store read rather
+/// than one per task.
+fn done_task_ids(store: &dyn ArchiveStore, tasks: &[Task]) -> Result<HashSet<String>, StoreError> {
+    let filter = LifecycleFilter::default()
+        .with_statuses([Status::Done])
+        .with_task_ids(tasks.iter().map(|task| task.id.as_str()));
+    Ok(store
+        .list_lifecycles(&filter)?
+        .into_iter()
+        .map(|lc| lc.task_id)
+        .collect())
 }
 
 /// The most-recently-updated lifecycle's run id for `task_id`.

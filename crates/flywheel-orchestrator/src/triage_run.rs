@@ -590,7 +590,9 @@ pub fn run_main(argv: &[String], host: &dyn TriageHost) -> i32 {
     let spec = SinglePassSpec {
         repo_root,
         board: board.clone(),
-        per_pass_cap: policy.triage_max_per_pass.map(|n| n.max(1) as usize),
+        per_pass_cap: policy
+            .triage_max_per_pass
+            .map(|n| usize::try_from(n.max(1)).unwrap_or(usize::MAX)),
         agent,
     };
     let mut run_cycle = || host.run_cycle(&spec, runner.clone(), log.clone());

@@ -263,7 +263,7 @@ where
         )?;
         snapshot(store, out)?;
         out.flush()?;
-        if stop.wait(std::time::Duration::from_secs(interval as u64)) {
+        if stop.wait(std::time::Duration::from_secs(interval.unsigned_abs())) {
             break;
         }
     }

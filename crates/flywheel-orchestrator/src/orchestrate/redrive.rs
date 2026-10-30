@@ -246,7 +246,7 @@ pub async fn redrive_parked_landings(
             });
             continue;
         }
-        let mut made = parks.len() as u32 - 1;
+        let mut made = saturating_count(parks.len() - 1);
         let baseline = made;
         let mut attempts = 0u32;
         let mut landed = false;
@@ -367,7 +367,7 @@ pub async fn redrive_parked_landings(
                     // park reached the ledger: deriving `made` from the
                     // ledger alone would never advance past an unrecorded
                     // park and the loop would spin without sleeping.
-                    made = (parks.len() as u32 - 1).max(baseline + attempts);
+                    made = saturating_count(parks.len() - 1).max(baseline.saturating_add(attempts));
                     let kind = match &unrecorded {
                         Some((kind, _)) => kind.clone(),
                         None => parks
@@ -521,12 +521,19 @@ pub fn is_retry_exhausted(lifecycle: &Lifecycle, max_retries: u32) -> bool {
         .is_some_and(|outcome| RETRY_EXHAUSTION_OUTCOMES.contains(&outcome))
 }
 
+/// A collection length as the `u32` the ledgers count in; a length past
+/// `u32::MAX` saturates rather than wrapping to a small count.
+fn saturating_count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 fn escalation_count(claims: &dyn ClaimStore, task_id: &str) -> Result<u32, ClaimStoreError> {
-    Ok(claims
+    let count = claims
         .list_subject_stop_events(task_id)?
         .iter()
         .filter(|event| event.kind == STOP_RETRIES_ESCALATED)
-        .count() as u32)
+        .count();
+    Ok(saturating_count(count))
 }
 
 fn already_queued_after_escalation(
@@ -706,11 +713,12 @@ fn prereq_dangling_cycles(
     missing_id: &str,
 ) -> Result<u32, ClaimStoreError> {
     let needle = needle(missing_id);
-    Ok(claims
+    let count = claims
         .list_subject_stop_events(referencing_id)?
         .iter()
         .filter(|event| event.kind == STOP_DANGLING_PREREQUISITE && event.detail.contains(&needle))
-        .count() as u32)
+        .count();
+    Ok(saturating_count(count))
 }
 
 fn prereq_already_queued(

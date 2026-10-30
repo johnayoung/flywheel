@@ -409,7 +409,7 @@ pub fn build_transcript_result(
 ) -> GraderResultRecord {
     let started = Instant::now();
     let breached = first_breach(grader, observation);
-    let duration_ms = started.elapsed().as_millis() as u64;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     GraderResultRecord {
         run_id: run_id.to_owned(),
         attempt_number,

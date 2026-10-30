@@ -871,7 +871,7 @@ where
             }
         };
 
-        let duration_ms = started.elapsed().as_millis() as u64;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let resolved_model = grader.judge_model.as_deref().or(run.judge_model.as_deref());
         let record = build_rubric_result(
             grader,

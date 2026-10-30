@@ -162,7 +162,7 @@ pub fn python_float_repr(x: f64) -> String {
         }
         out.push_str(&digits);
     } else {
-        let decpt = decpt as usize;
+        let decpt = decpt.unsigned_abs() as usize;
         if decpt < digits.len() {
             out.push_str(&digits[..decpt]);
             out.push('.');

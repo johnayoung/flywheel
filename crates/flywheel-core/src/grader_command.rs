@@ -586,7 +586,7 @@ where
                     Termination::SpawnFailure,
                 );
                 payload.insert("spawn_error".into(), json!(err.to_string()));
-                let duration_ms = started.elapsed().as_millis() as u64;
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let row = scope.record(false, duration_ms, payload);
                 persisted.push(store.append_grader_result(&row)?);
                 break;
@@ -595,7 +595,7 @@ where
 
         let deadline = Deadline::from_ceiling(options.per_grader_timeout);
         let execution = supervise(child, &deadline, capture_cap).await;
-        let duration_ms = started.elapsed().as_millis() as u64;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let mut payload = base_payload(
             &grader.run,

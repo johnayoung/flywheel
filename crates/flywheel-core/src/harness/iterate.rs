@@ -81,6 +81,12 @@ fn usage_field(usage: &Value, key: &str) -> Option<i64> {
     }
 }
 
+/// A usage field as a token count: absent and negative readings count as
+/// zero (a negative token count carries no usable signal).
+fn non_negative_usage_field(usage: &Value, key: &str) -> u64 {
+    usage_field(usage, key).map_or(0, |v| u64::try_from(v).unwrap_or(0))
+}
+
 /// Sum the input-side token fields of an iteration's usage payload.
 ///
 /// The latest iteration's input-side tokens *are* the current context sent
@@ -97,15 +103,14 @@ fn occupancy_from_value(usage: &Value) -> u64 {
     OCCUPANCY_USAGE_KEYS
         .iter()
         .filter_map(|key| usage_field(usage, key))
-        .filter(|v| *v > 0)
-        .map(|v| v as u64)
+        .filter_map(|v| u64::try_from(v).ok())
         .sum()
 }
 
 fn breakdown_from_value(usage: &Value) -> Usage {
     let mut out = Usage::new();
     for key in USAGE_TOKEN_KEYS {
-        let value = usage_field(usage, key).unwrap_or(0).max(0) as u64;
+        let value = non_negative_usage_field(usage, key);
         out.insert(key.to_owned(), value);
     }
     out
@@ -132,7 +137,7 @@ pub fn build_usage_breakdown(messages: &[Value]) -> Usage {
         match message_kind(msg) {
             MessageKind::Assistant | MessageKind::Usage => {
                 for key in USAGE_TOKEN_KEYS {
-                    let add = usage_field(usage, key).unwrap_or(0).max(0) as u64;
+                    let add = non_negative_usage_field(usage, key);
                     *breakdown.entry(key.to_owned()).or_insert(0) += add;
                 }
             }

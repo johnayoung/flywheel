@@ -119,7 +119,7 @@ fn python_float_repr(value: f64) -> String {
     }
     if (-4..16).contains(&exp) {
         if exp >= 0 {
-            let int_len = (exp + 1) as usize;
+            let int_len = (exp + 1).unsigned_abs() as usize;
             if digits.len() <= int_len {
                 out.push_str(&digits);
                 out.extend(std::iter::repeat_n('0', int_len - digits.len()));
@@ -131,7 +131,7 @@ fn python_float_repr(value: f64) -> String {
             }
         } else {
             out.push_str("0.");
-            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+            out.extend(std::iter::repeat_n('0', (-exp - 1).unsigned_abs() as usize));
             out.push_str(&digits);
         }
     } else {

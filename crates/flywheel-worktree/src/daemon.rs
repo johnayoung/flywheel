@@ -246,7 +246,7 @@ impl Heartbeat {
     pub fn start(mut self) -> Self {
         if self.interval > 0 && self.thread.is_none() {
             let db_path = self.db_path.clone();
-            let interval = Duration::from_secs(self.interval as u64);
+            let interval = Duration::from_secs(self.interval.unsigned_abs());
             let log = Arc::clone(&self.log);
             let policy = self.policy.clone();
             let stop = self.stop.clone();

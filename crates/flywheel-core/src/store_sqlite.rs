@@ -150,7 +150,10 @@ impl fmt::Debug for SqliteStoreOptions {
 impl SqliteStoreOptions {
     /// The capped wait for 0-based retry `attempt`.
     pub fn delay_for(&self, attempt: u32) -> Duration {
-        let scaled = self.backoff_base.as_secs_f64() * self.backoff_factor.powi(attempt as i32);
+        // An exponent past i32::MAX saturates (the result is capped below);
+        // a wrapping cast would turn it negative and collapse the delay.
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        let scaled = self.backoff_base.as_secs_f64() * self.backoff_factor.powi(exponent);
         let capped = scaled.min(self.backoff_cap.as_secs_f64()).max(0.0);
         Duration::from_secs_f64(capped)
     }
@@ -1900,6 +1903,14 @@ mod tests {
         assert_eq!(options.delay_for(3), Duration::from_secs(4));
         assert_eq!(options.delay_for(30), DEFAULT_BACKOFF_CAP);
         assert!(format!("{options:?}").contains("busy_timeout"));
+    }
+
+    #[test]
+    fn backoff_past_i32_exponent_range_stays_at_the_cap() {
+        let options = SqliteStoreOptions::default();
+        let past_i32 = u32::try_from(i32::MAX).unwrap() + 1;
+        assert_eq!(options.delay_for(past_i32), DEFAULT_BACKOFF_CAP);
+        assert_eq!(options.delay_for(u32::MAX), DEFAULT_BACKOFF_CAP);
     }
 
     #[test]

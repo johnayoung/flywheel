@@ -537,14 +537,17 @@ fn schema_version_verdict(
     };
     let observed_text = observed.map_or_else(|| "None".to_owned(), |v| v.to_string());
 
-    if observed == Some(CURRENT_SCHEMA_VERSION as i32) {
+    // Compare in the constants' unsigned domain: a negative stored version
+    // matches nothing instead of wrapping onto a known one.
+    let observed_version = observed.and_then(|v| u32::try_from(v).ok());
+    if observed_version == Some(CURRENT_SCHEMA_VERSION) {
         return Ok(PreflightCheck::new(
             "schema version",
             CheckStatus::Ok,
             format!("schema '{schema}' is at version {observed_text} (current)"),
         ));
     }
-    if observed.is_some_and(|v| IN_PLACE_MIGRATABLE_FROM.iter().any(|m| *m as i32 == v)) {
+    if observed_version.is_some_and(|v| IN_PLACE_MIGRATABLE_FROM.contains(&v)) {
         return Ok(PreflightCheck::new(
             "schema version",
             CheckStatus::Warn,

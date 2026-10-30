@@ -7,6 +7,7 @@
 # Usage:
 #   scripts/scorecard.sh [--skip-coverage] [--skip-build] [--skip-tests]
 #                        [--skip-clippy] [--skip-bench] [--fast]
+#                        [--list-unwrap-sites]
 #
 #   --fast   = --skip-coverage --skip-build --skip-bench (static metrics,
 #              clippy, and test time only). Default runs every section.
@@ -15,16 +16,22 @@
 # Metrics and method:
 #   coverage_line_pct      cargo llvm-cov --workspace --summary-only --json,
 #                          totals.lines.percent (needs cargo-llvm-cov).
-#   unwrap_expect_nontest  occurrences of `.unwrap()` and `.expect(` in
-#                          crates/*/src/**/*.rs, excluding: files named
-#                          tests.rs or *_tests.rs, any file under a `tests`
-#                          directory, and every item annotated #[cfg(test)]
-#                          (the attribute's following item is skipped up to
-#                          its terminating `;` or its balanced closing `}`).
-#                          Line comments and string-literal contents are
-#                          blanked before matching and brace counting; raw
-#                          strings are not parsed, so the count is a close
-#                          approximation that is stable run to run.
+#   unwrap_expect_nontest  `.unwrap()` and `.expect(` method calls in
+#                          crates/*/src/**/*.rs, excluding test-only code.
+#                          Each file is lexed into Rust tokens (line, nested
+#                          block and doc comments dropped; string, raw string
+#                          r#"..."#, byte/C-string and char literals made
+#                          opaque, multi-line included; lifetimes told apart
+#                          from chars), so braces or calls inside literals
+#                          never count. Excluded: files named tests.rs or
+#                          *_tests.rs or under a `tests` directory; every item
+#                          carrying #[test], #[cfg(test)] or
+#                          #[cfg(all(.., test, ..))] (skipped to its `;` at
+#                          depth 0 or the balanced close of its first `{`);
+#                          files with an inner #![cfg(test)]; and the file /
+#                          directory of every out-of-line `#[cfg(test)] mod
+#                          x;`. --list-unwrap-sites prints each counted
+#                          file:line to stderr for auditing.
 #   largest_module_loc     max line count over the same non-test file set,
 #                          with its path (largest_module_path).
 #   clippy_pedantic_warnings  distinct (file, line, col, lint) clippy
@@ -52,6 +59,7 @@ skip_build=0
 skip_tests=0
 skip_clippy=0
 skip_bench=0
+list_unwrap_sites=0
 for arg in "$@"; do
   case "$arg" in
     --skip-coverage) skip_coverage=1 ;;
@@ -60,7 +68,8 @@ for arg in "$@"; do
     --skip-clippy) skip_clippy=1 ;;
     --skip-bench) skip_bench=1 ;;
     --fast) skip_coverage=1; skip_build=1; skip_bench=1 ;;
-    -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --list-unwrap-sites) list_unwrap_sites=1 ;;
+    -h|--help) sed -n '2,51p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "scorecard: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -78,13 +87,203 @@ elapsed() { python3 -c "import sys; print(round(float(sys.argv[2]) - float(sys.a
 
 # --- static metrics ----------------------------------------------------------------
 log "static source metrics"
-python3 - "$REPO_ROOT" > "$tmp/static.json" <<'PY'
+python3 - "$REPO_ROOT" "$list_unwrap_sites" > "$tmp/static.json" <<'PY'
 import json, pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
-STRING = re.compile(r'"(?:\\.|[^"\\])*"')
-CHAR = re.compile(r"'(?:\\.|[^'\\])'")
-PATTERN = re.compile(r"\.unwrap\(\)|\.expect\(")
+LIST_SITES = sys.argv[2] == "1"
+IDENT_START = re.compile(r"[A-Za-z_]")
+IDENT = re.compile(r"[A-Za-z0-9_]*")
+NUMBER = re.compile(r"[0-9][0-9A-Za-z_]*(?:\.[0-9][0-9A-Za-z_]*)?")
+RAW_PREFIX = re.compile(r'(?:br|cr|r)(#*)"')
+STR_PREFIX = re.compile(r'(?:b|c)?"')
+CHAR_LIT = re.compile(r"b?'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|.)|[^\\'\n])'")
+OPEN, CLOSE = "([{", ")]}"
+
+
+def tokenize(text):
+    """Lex Rust source into (kind, value, line) tokens.
+
+    Comments (line, nested block, doc) are dropped; string, raw-string,
+    byte/C-string and char literals become one opaque 'lit' token, so
+    nothing inside a literal can ever be mistaken for code.
+    """
+    toks = []
+    i, n, line = 0, len(text), 1
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+            i += 1
+        elif c.isspace():
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            line += text.count("\n", i, j)
+            i = j
+        elif m := RAW_PREFIX.match(text, i):
+            close = '"' + m.group(1)
+            j = text.find(close, m.end())
+            j = n if j < 0 else j + len(close)
+            toks.append(("lit", "", line))
+            line += text.count("\n", i, j)
+            i = j
+        elif m := STR_PREFIX.match(text, i):
+            j = m.end()
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            j += 1
+            toks.append(("lit", "", line))
+            line += text.count("\n", i, j)
+            i = j
+        elif m := CHAR_LIT.match(text, i):
+            toks.append(("lit", "", line))
+            i = m.end()
+        elif c == "'":
+            # Lifetime or label: `'a`, `'static`.
+            m = IDENT.match(text, i + 1)
+            toks.append(("lifetime", text[i : m.end()], line))
+            i = m.end()
+        elif IDENT_START.match(c):
+            m = IDENT.match(text, i)
+            toks.append(("ident", text[i : m.end()], line))
+            i = m.end()
+        elif c.isdigit():
+            m = NUMBER.match(text, i)
+            toks.append(("lit", "", line))
+            i = m.end()
+        else:
+            toks.append(("punct", c, line))
+            i += 1
+    return toks
+
+
+def matching(toks, k):
+    """Index of the delimiter closing the group opened at toks[k]."""
+    depth = 0
+    for j in range(k, len(toks)):
+        kind, val, _ = toks[j]
+        if kind == "punct" and val in OPEN:
+            depth += 1
+        elif kind == "punct" and val in CLOSE:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(toks) - 1
+
+
+def is_test_only_cfg(attr):
+    """attr = token values inside #[...]. True for `test`, `cfg(test)`,
+    and `cfg(all(.., test, ..))` -- predicates that imply a test build."""
+    if attr == ["test"]:
+        return True
+    if attr[:2] != ["cfg", "("]:
+        return False
+    pred = attr[2:-1]
+
+    def implies_test(p):
+        if p == ["test"]:
+            return True
+        if p[:2] == ["all", "("]:
+            inner, depth, cur = p[2:-1], 0, []
+            parts = []
+            for v in inner:
+                if v == "," and depth == 0:
+                    parts.append(cur)
+                    cur = []
+                    continue
+                depth += v in OPEN
+                depth -= v in CLOSE
+                cur.append(v)
+            parts.append(cur)
+            return any(implies_test(part) for part in parts if part)
+        return False
+
+    return implies_test(pred)
+
+
+def item_end(toks, k):
+    """Given toks[k] = first token after a test-only attribute, return the
+    index of the item's last token: further outer attributes are skipped,
+    then the item runs to a `;` at nesting depth 0 or to the close of the
+    first `{` opened at depth 0."""
+    n = len(toks)
+    while k + 1 < n and toks[k][1] == "#" and toks[k + 1][1] == "[":
+        k = matching(toks, k + 1) + 1
+    depth = 0
+    j = k
+    while j < n:
+        kind, val, _ = toks[j]
+        if kind == "punct":
+            if val == "{" and depth == 0:
+                return matching(toks, j)
+            if val in OPEN:
+                depth += 1
+            elif val in CLOSE:
+                if depth == 0:
+                    return j - 1  # enclosing group closed: item ended
+                depth -= 1
+            elif val == ";" and depth == 0:
+                return j
+        j += 1
+    return n - 1
+
+
+def analyse(text):
+    """Return (sites, test_mod_decls, whole_file_test) for one file.
+
+    sites: line numbers of non-test `.unwrap()` / `.expect(` calls.
+    test_mod_decls: names of out-of-line `#[cfg(test)] mod x;` declarations.
+    """
+    toks = tokenize(text)
+    vals = [t[1] for t in toks]
+    n = len(toks)
+    sites, test_mods = [], []
+    k = 0
+    while k < n:
+        kind, val, line = toks[k]
+        if val == "#" and k + 2 < n and vals[k + 1] in ("[", "!"):
+            inner_attr = vals[k + 1] == "!"
+            open_idx = k + 2 if inner_attr else k + 1
+            if open_idx < n and vals[open_idx] == "[":
+                close_idx = matching(toks, open_idx)
+                attr = vals[open_idx + 1 : close_idx]
+                if is_test_only_cfg(attr):
+                    if inner_attr:
+                        return [], [], True
+                    end = item_end(toks, close_idx + 1)
+                    item = vals[close_idx + 1 : end + 1]
+                    if "mod" in item and item and item[-1] == ";":
+                        name = item[item.index("mod") + 1]
+                        test_mods.append(name)
+                    k = end + 1
+                    continue
+                k = close_idx + 1
+                continue
+        if (
+            val == "."
+            and k + 2 < n
+            and toks[k + 1][0] == "ident"
+            and vals[k + 2] == "("
+            and (
+                vals[k + 1] == "expect"
+                or (vals[k + 1] == "unwrap" and k + 3 < n and vals[k + 3] == ")")
+            )
+        ):
+            sites.append(line)
+        k += 1
+    return sites, test_mods, False
+
 
 def is_test_file(path):
     rel = path.relative_to(root)
@@ -94,60 +293,48 @@ def is_test_file(path):
         or path.name.endswith("_tests.rs")
     )
 
-def clean(line):
-    # Blank string/char literal contents, then drop a trailing line comment.
-    line = STRING.sub('""', line)
-    line = CHAR.sub("' '", line)
-    idx = line.find("//")
-    return line if idx < 0 else line[:idx]
 
-def count_nontest(lines):
-    total = 0
-    i = 0
-    n = len(lines)
-    while i < n:
-        code = clean(lines[i])
-        if code.strip().startswith("#[cfg(test)]"):
-            # Skip the annotated item: up to `;` before any `{`, or the
-            # balanced close of the first `{`.
-            depth = 0
-            opened = False
-            rest = code.strip()[len("#[cfg(test)]"):]
-            j = i
-            while j < n:
-                seg = rest if j == i else clean(lines[j])
-                done = False
-                for ch in seg:
-                    if ch == "{":
-                        depth += 1
-                        opened = True
-                    elif ch == "}":
-                        depth -= 1
-                        if opened and depth == 0:
-                            done = True
-                            break
-                    elif ch == ";" and not opened:
-                        done = True
-                        break
-                if done:
-                    break
-                j += 1
-            i = j + 1
-            continue
-        total += len(PATTERN.findall(code))
-        i += 1
-    return total
+all_files = sorted(root.glob("crates/*/src/**/*.rs"))
+results = {p: analyse(p.read_text(encoding="utf-8")) for p in all_files}
 
-files = sorted(
-    p for p in root.glob("crates/*/src/**/*.rs") if not is_test_file(p)
-)
-unwraps = 0
+# Out-of-line test modules: `#[cfg(test)] mod x;` in a/b.rs -> a/b/x.rs or
+# a/b/x/mod.rs (in lib.rs/main.rs/mod.rs: sibling x.rs or x/mod.rs), and
+# everything beneath that module's directory.
+test_paths = set()
+for path, (_, mods, whole) in results.items():
+    if whole:
+        test_paths.add(path)
+    base = (
+        path.parent
+        if path.name in ("lib.rs", "main.rs", "mod.rs")
+        else path.parent / path.stem
+    )
+    for name in mods:
+        test_paths.add(base / f"{name}.rs")
+        test_paths.add(base / name)
+
+
+def under_test_module(path):
+    return any(path == t or t in path.parents for t in test_paths)
+
+
+files = [p for p in all_files if not is_test_file(p)]
+SITES = [
+    (str(p.relative_to(root)), ln)
+    for p in files
+    if not under_test_module(p)
+    for ln in results[p][0]
+]
+unwraps = len(SITES)
 largest = (0, "")
 for path in files:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    unwraps += count_nontest(lines)
-    if len(lines) > largest[0]:
-        largest = (len(lines), str(path.relative_to(root)))
+    count = len(path.read_text(encoding="utf-8").splitlines())
+    if count > largest[0]:
+        largest = (count, str(path.relative_to(root)))
+
+if LIST_SITES:
+    for rel, ln in SITES:
+        print(f"{rel}:{ln}", file=sys.stderr)
 
 json.dump(
     {

@@ -555,6 +555,8 @@ struct ScriptedStrategy {
     /// Tasks whose parks after the first return `Parked` without appending
     /// a `LandingParked` event (a swallowed witness write).
     unrecorded_reparks: Mutex<HashSet<String>>,
+    /// Tasks whose read-only landability probe panics.
+    panicking_probes: Mutex<HashSet<String>>,
 }
 
 impl ScriptedStrategy {
@@ -570,6 +572,7 @@ impl ScriptedStrategy {
             parks: Mutex::new(HashMap::new()),
             landable: Mutex::new(HashMap::new()),
             unrecorded_reparks: Mutex::new(HashSet::new()),
+            panicking_probes: Mutex::new(HashSet::new()),
         })
     }
 
@@ -592,6 +595,19 @@ impl ScriptedStrategy {
             .unwrap()
             .insert(task_id.to_owned());
         self.clone()
+    }
+
+    fn panic_probe(self: &Arc<Self>, task_id: &str) -> Arc<Self> {
+        self.panicking_probes
+            .lock()
+            .unwrap()
+            .insert(task_id.to_owned());
+        self.clone()
+    }
+
+    /// Drop the task's park script: later submits are `NoOp`.
+    fn clear_park_sequence(&self, task_id: &str) {
+        self.parks.lock().unwrap().remove(task_id);
     }
 
     fn set_landable(self: &Arc<Self>, task_id: &str, landable: bool) -> Arc<Self> {
@@ -723,6 +739,15 @@ impl SubmitStrategy for ScriptedStrategy {
     }
 
     fn is_landable(&self, request: &SubmitRequest) -> LandabilityVerdict {
+        assert!(
+            !self
+                .panicking_probes
+                .lock()
+                .unwrap()
+                .contains(&request.task_id),
+            "scripted probe panic for {}",
+            request.task_id
+        );
         match self.landable.lock().unwrap().get(&request.task_id) {
             Some(false) => LandabilityVerdict::not_landable("scripted: not landable"),
             _ => LandabilityVerdict::landable(),
@@ -1878,6 +1903,166 @@ async fn landing_redrive_skips_a_run_the_probe_reports_not_landable() {
         "no re-attempt for a not-landable run"
     );
     assert!(f.claims.list_human_review_queue().unwrap().is_empty());
+}
+
+/// Run [`redrive_parked_landings`] once for the DONE run of `task_id` on a
+/// fixed clock, logging into the fixture's log.
+async fn redrive_directly(
+    f: &Fixture,
+    strategy: &ScriptedStrategy,
+    task_id: &str,
+    run_id: &str,
+    bound: u32,
+) -> Vec<RedriveOutcome> {
+    let control: Arc<dyn HarnessStore> = f.control.clone();
+    let claims: Arc<dyn ClaimStore> = f.claims.clone();
+    let clock = fixed(t0());
+    let gate_options = GateOptions::default();
+    let sink = f.log.sink();
+    let ctx = LandingRedriveContext {
+        control: &control,
+        claims: &claims,
+        strategy,
+        worker_id: "worker-a",
+        bound,
+        held_out_source: None,
+        gate_options: &gate_options,
+        lease_seconds: 60.0,
+        heartbeat_interval: 20.0,
+        steal_grace_seconds: 0.0,
+        now: &clock,
+        log: Some(&sink),
+    };
+    let request = SubmitRequest::new(
+        task(task_id),
+        run_id.to_owned(),
+        Status::Done,
+        f.sandbox_root().join(task_id),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        redrive_parked_landings(&ctx, &[request], &mut BTreeSet::new()),
+    )
+    .await
+    .expect("the re-drive loop must terminate within its bound")
+    .unwrap()
+}
+
+fn redriven_results(f: &Fixture, run_id: &str) -> Vec<String> {
+    f.control
+        .list_domain_events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            DomainEventPayload::LandingRedriven(r) => Some(r.result),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Park the first land of `parked` and return its run id; no re-drive yet.
+async fn parked_run(f: &Fixture, strategy: &Arc<ScriptedStrategy>) -> String {
+    let mut req = f.request(MemorySource::new(vec![item("parked")]));
+    req.strategy = Some(strategy.clone());
+    req.landing_redrive_bound = Some(0);
+    let report = run(req).await;
+    let run_id = report.runs[0].run_id.clone();
+    assert_eq!(landing_parks(f.control.as_ref(), &run_id).unwrap().len(), 1);
+    assert_eq!(strategy.submits().len(), 1);
+    run_id
+}
+
+#[tokio::test]
+async fn landing_redrive_defers_a_peer_claimed_run_without_attempting_it() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)]);
+    let run_id = parked_run(&f, &strategy).await;
+    let peer = f
+        .claims
+        .acquire_claim("parked", "worker-b", t0(), 600.0, &BTreeSet::new())
+        .unwrap()
+        .expect("the peer takes the free claim");
+
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 2).await;
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result, RedriveResult::InProgress);
+    assert_eq!(outcomes[0].attempts, 0);
+    assert_eq!(outcomes[0].park_kind, PARK_KIND_DIVERGENT_BASE);
+    assert_eq!(strategy.submits().len(), 1, "no land under a peer's claim");
+    assert!(redriven_results(&f, &run_id).is_empty());
+    assert!(f.claims.list_human_review_queue().unwrap().is_empty());
+    assert_eq!(
+        f.claims.load_claim("parked").unwrap().map(|c| c.worker_id),
+        Some("worker-b".to_owned()),
+        "the peer's claim is left untouched"
+    );
+
+    // Deferred, not dropped: once the peer lets go the bound is spent.
+    f.claims.release_claim(&peer, Some(t0())).unwrap();
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 2).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Queued);
+    assert_eq!(outcomes[0].attempts, 2);
+    assert_eq!(strategy.submits().len(), 3);
+    assert_eq!(
+        redriven_results(&f, &run_id),
+        ["re-parked", "re-parked", "routed"]
+    );
+}
+
+#[tokio::test]
+async fn landing_redrive_skips_a_run_whose_landability_probe_panics() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)]);
+    let run_id = parked_run(&f, &strategy).await;
+    strategy.panic_probe("parked");
+
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 2).await;
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result, RedriveResult::Skipped);
+    assert_eq!(outcomes[0].attempts, 0);
+    assert_eq!(outcomes[0].park_kind, PARK_KIND_DIVERGENT_BASE);
+    assert_eq!(strategy.submits().len(), 1, "a panicking probe never lands");
+    assert!(redriven_results(&f, &run_id).is_empty());
+    assert!(f.claims.list_human_review_queue().unwrap().is_empty());
+    assert!(f.claims.list_claims().unwrap().is_empty());
+    assert!(f.log.contains(
+        "parked: landability probe failed during re-drive (panic: scripted probe panic for parked); skipping"
+    ));
+}
+
+#[tokio::test]
+async fn landing_redrive_records_nothing_for_a_no_op_reattempt() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)]);
+    let run_id = parked_run(&f, &strategy).await;
+    // The re-attempt neither lands nor parks.
+    strategy.clear_park_sequence("parked");
+
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result, RedriveResult::Skipped);
+    assert_eq!(outcomes[0].attempts, 1, "a no-op stops the loop at once");
+    assert_eq!(outcomes[0].park_kind, PARK_KIND_DIVERGENT_BASE);
+    assert_eq!(strategy.submits().len(), 2);
+    assert_eq!(
+        strategy.submits()[1].claim_held_by.as_deref(),
+        Some("worker-a"),
+        "the re-attempt ran under the re-driver's claim"
+    );
+    assert!(redriven_results(&f, &run_id).is_empty());
+    assert_eq!(landing_parks(f.control.as_ref(), &run_id).unwrap().len(), 1);
+    assert!(f.claims.list_human_review_queue().unwrap().is_empty());
+    assert!(f.claims.list_claims().unwrap().is_empty(), "claim released");
+    assert!(
+        f.log
+            .contains("parked: landing re-drive was a no-op (nothing scripted); nothing recorded")
+    );
 }
 
 // --- session pause ------------------------------------------------------------------

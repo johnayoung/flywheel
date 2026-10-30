@@ -9,11 +9,15 @@
 //!   `SqliteClaimStore` already holding `HELD_CLAIMS` live peer claims with
 //!   conflict keys: a winning acquire+release round trip and a refused
 //!   acquire on a peer-held task.
+//! * `work_source/*` -- `DirectoryWorkSource::list_work` (every scheduling
+//!   pass's first step) over `SOURCE_PHASES` active phase directories of
+//!   `SOURCE_TASKS_PER_PHASE` task files each.
 //!
 //! Sample sizes and measurement windows are tuned so the whole file runs in
 //! well under a minute; the improvement-loop scorecard reads the medians.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -26,7 +30,7 @@ use flywheel_core::store::{LifecycleStore, TaskStore};
 use flywheel_core::store_sqlite::SqliteStore;
 use flywheel_core::task::{CommandGrader, Grader, Task};
 use flywheel_orchestrator::claims::{ClaimStore, SqliteClaimStore};
-use flywheel_orchestrator::sources::WorkItem;
+use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkItem, WorkSource};
 use flywheel_orchestrator::work_graph::{ReadySetQuery, WorkGraph};
 use flywheel_orchestrator::workflow::select::{SelectOptions, select_next_task, status_rows};
 
@@ -38,6 +42,10 @@ const LAYER_WIDTH: usize = 50;
 const DONE_LAYERS: usize = 3;
 /// Live peer claims present while measuring claim acquisition.
 const HELD_CLAIMS: usize = 200;
+/// Active phase directories listed by the work-source bench.
+const SOURCE_PHASES: usize = 5;
+/// Task files per active phase directory in the work-source bench.
+const SOURCE_TASKS_PER_PHASE: usize = 100;
 
 fn t(second: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(1_779_969_600 + second, 0).expect("in-range timestamp")
@@ -209,5 +217,40 @@ fn bench_claims(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_dag, bench_claims);
+fn bench_work_source(c: &mut Criterion) {
+    let dir = TempDir::new().expect("tempdir");
+    let tasks_dir = dir.path().join(".flywheel").join("tasks");
+    for phase in 0..SOURCE_PHASES {
+        let phase_dir = tasks_dir.join("active").join(format!("{phase:02}-phase"));
+        fs::create_dir_all(&phase_dir).expect("create phase dir");
+        for index in 0..SOURCE_TASKS_PER_PHASE {
+            let id = format!("p{phase:02}-{}", task_id(index));
+            let body = serde_json::json!({
+                "id": id,
+                "goal": format!("Implement {id}."),
+                "graders": [{"type": "command", "run": "cargo test --workspace"}],
+                "priority": index % 3,
+                "conflict_keys": [format!("crate-{}", index % 7)],
+            });
+            fs::write(phase_dir.join(format!("{id}.json")), body.to_string())
+                .expect("write task file");
+        }
+    }
+    let source = DirectoryWorkSource::new(&tasks_dir);
+    let listed = source.list_work().expect("list work");
+    assert_eq!(listed.len(), SOURCE_PHASES * SOURCE_TASKS_PER_PHASE);
+    assert_eq!(listed[0].phase.as_deref(), Some("00-phase"));
+
+    let mut group = c.benchmark_group("work_source");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3));
+    group.bench_function("directory_list_work_500", |b| {
+        b.iter(|| black_box(&source).list_work().expect("list work").len());
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_dag, bench_claims, bench_work_source);
 criterion_main!(benches);

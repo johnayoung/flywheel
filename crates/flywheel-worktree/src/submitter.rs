@@ -1070,12 +1070,16 @@ impl GitWorktreeSubmitter {
         Ok(false)
     }
 
+    /// Commits in `range`. An unresolvable range (a renamed or deleted base,
+    /// a missing branch) is an error, never zero: callers read zero as "the
+    /// branch is contained in the base" and force-delete it.
     fn count_commits(&self, range: &str) -> Result<u64, GitError> {
-        let res = git(&self.repo_root, &["rev-list", "--count", range])?;
-        Ok(if res.ok() {
-            res.trimmed().parse().unwrap_or(0)
-        } else {
-            0
+        let args = ["rev-list", "--count", range];
+        let res = git_checked(&self.repo_root, &args)?;
+        res.trimmed().parse().map_err(|err| GitError::Failed {
+            cwd: self.repo_root.clone(),
+            args: args.join(" "),
+            stderr: format!("unparseable commit count {:?}: {err}", res.trimmed()),
         })
     }
 
@@ -3017,6 +3021,33 @@ mod tests {
         assert!(!branch_exists(&repo, "flywheel/01-phase/t1"));
         assert!(landed(&store).is_empty());
         assert!(parked(&store).is_empty());
+    }
+
+    #[test]
+    fn unresolvable_base_parks_instead_of_deleting_committed_work() {
+        let (_dir, repo) = repo();
+        let store = ledger();
+        let s = submitter(&repo, Arc::clone(&store));
+        let (tf, wt) = prepared(&s, &repo, "01-phase", "t1", "true");
+        let work = commit(&wt, "feature.txt", "x", "work");
+        // The operator renames the configured base mid-run: `main..branch`
+        // no longer resolves, so the commit count is unknown, not zero.
+        git_ok(&repo, &["branch", "-m", "main", "trunk"]);
+        let outcome = s.submit(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]));
+        assert!(
+            matches!(&outcome, SubmitOutcome::Parked { park_kind, .. }
+            if park_kind == PARK_KIND_SUBMIT_ERROR),
+            "expected a submit-error park, got {outcome:?}"
+        );
+        assert!(wt.exists());
+        assert!(branch_exists(&repo, "flywheel/01-phase/t1"));
+        assert_eq!(rev(&repo, "flywheel/01-phase/t1"), work);
+        assert!(landed(&store).is_empty());
+        let verdict = s.landability(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]));
+        assert!(
+            verdict.is_err(),
+            "landability must not report an empty diff"
+        );
     }
 
     #[test]

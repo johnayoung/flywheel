@@ -76,18 +76,25 @@ pub fn build_cli_plan(request: &RunRequest) -> Result<ProcessPlan, AgentError> {
 /// Project codex usage onto flywheel's four canonical counters.
 ///
 /// `None` when the native usage mapping is absent (the payload then omits
-/// its `usage` key). `cached_input_tokens` maps to
-/// `cache_read_input_tokens`; codex reports no cache-creation counter, so
-/// that key is always 0. Bools are excluded.
+/// its `usage` key). Codex's `input_tokens` INCLUDES its
+/// `cached_input_tokens` (codex's own `total_tokens` is input + output),
+/// whereas flywheel's canonical counters are disjoint (Claude semantics:
+/// `input_tokens` excludes cache reads, and the four keys sum to the run
+/// total). So `cached_input_tokens` maps to `cache_read_input_tokens` and
+/// `input_tokens` carries only the uncached remainder (saturating at 0).
+/// Codex reports no cache-creation counter, so that key is always 0. Bools
+/// are excluded.
 fn coerce_usage(raw: Option<&Value>) -> Option<Usage> {
     let Some(Value::Object(map)) = raw else {
         return None;
     };
     let int = |key: &str| map.get(key).and_then(number_as_i64).unwrap_or(0);
+    let cached = int("cached_input_tokens");
+    let uncached = int("input_tokens").saturating_sub(cached).max(0);
     let mut usage = Usage::new();
-    usage.insert("input_tokens".into(), int("input_tokens"));
+    usage.insert("input_tokens".into(), uncached);
     usage.insert("output_tokens".into(), int("output_tokens"));
-    usage.insert("cache_read_input_tokens".into(), int("cached_input_tokens"));
+    usage.insert("cache_read_input_tokens".into(), cached);
     usage.insert("cache_creation_input_tokens".into(), 0);
     Some(usage)
 }

@@ -317,7 +317,7 @@ fn turn_completed_usage_coercion_and_counting() {
     assert_eq!(payload["result_text"], Value::Null);
     assert_eq!(
         payload["usage"],
-        json!({"input_tokens": 11, "output_tokens": 3, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 0})
+        json!({"input_tokens": 7, "output_tokens": 3, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 0})
     );
     let second = normalizer.feed_line(&turn_completed_line(None));
     assert!(!second.events[0].payload.contains_key("usage"));
@@ -349,4 +349,47 @@ fn turn_failed_emits_error_then_finished() {
     assert_eq!(payload["session_id"], json!("codex-9"));
     assert!(!payload.contains_key("usage"));
     assert!(outcome.finished);
+}
+
+/// Codex's `input_tokens` includes `cached_input_tokens` (its own
+/// `total_tokens` is input + output; record shape taken from a real codex
+/// session log). Flywheel's four canonical counters are disjoint and are
+/// summed for token totals and the `max_tokens` budget, so the projection
+/// must not count cached input twice.
+#[test]
+fn turn_completed_usage_counts_cached_input_once() {
+    let native = json!({
+        "input_tokens": 87207,
+        "cached_input_tokens": 86912,
+        "output_tokens": 53,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 87260
+    });
+    let outcome = CodexStreamNormalizer::new().feed_line(&turn_completed_line(Some(native)));
+    let usage = &outcome.events[0].payload["usage"];
+    assert_eq!(
+        *usage,
+        json!({"input_tokens": 295, "output_tokens": 53, "cache_read_input_tokens": 86912, "cache_creation_input_tokens": 0})
+    );
+    let canonical_sum: i64 = [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ]
+    .iter()
+    .map(|k| usage[*k].as_i64().unwrap())
+    .sum();
+    assert_eq!(canonical_sum, 87260, "must equal codex's own total_tokens");
+
+    // A malformed record whose cached count exceeds input saturates the
+    // uncached remainder at zero rather than going negative.
+    let skewed = CodexStreamNormalizer::new().feed_line(&turn_completed_line(Some(
+        json!({"input_tokens": 3, "cached_input_tokens": 5, "output_tokens": 1}),
+    )));
+    assert_eq!(skewed.events[0].payload["usage"]["input_tokens"], json!(0));
+    assert_eq!(
+        skewed.events[0].payload["usage"]["cache_read_input_tokens"],
+        json!(5)
+    );
 }

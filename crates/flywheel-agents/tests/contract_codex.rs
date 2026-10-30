@@ -43,7 +43,7 @@ async fn happy_path_fold() {
     assert!(!run.stop.is_error);
     assert!(!run.stop.pending_tool_use);
     let usage = run.usage.clone().unwrap();
-    assert_eq!(usage["input_tokens"], 11);
+    assert_eq!(usage["input_tokens"], 7);
     assert_eq!(usage["output_tokens"], 3);
     assert_eq!(usage["cache_read_input_tokens"], 4);
     assert_eq!(usage["cache_creation_input_tokens"], 0);

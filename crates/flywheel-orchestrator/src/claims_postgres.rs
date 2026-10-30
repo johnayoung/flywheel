@@ -42,8 +42,15 @@
 //!   `ADD COLUMN IF NOT EXISTS`, which takes an `ACCESS EXCLUSIVE` lock on
 //!   the table even when it then no-ops;
 //! * `idx_orchestrator_stop_events_kind` backs the human-review queue read,
-//!   matching the index the SQLite port adds.
+//!   matching the index the SQLite port adds;
+//! * free-form text -- stop-event `detail` and `source_syncs.error` -- is
+//!   written with every U+0000 replaced by U+FFFD ([`nul_free_text`]), as the
+//!   core Postgres store does for run data: `TEXT` cannot hold NUL, and those
+//!   strings carry lossily decoded process output (setup-hook stderr tails,
+//!   grader excerpts) whose refusal would roll back the claim release the
+//!   stop row commits with. Identity columns are bound verbatim.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -525,6 +532,15 @@ fn query_one<C: GenericClient, T>(
         .transpose()
 }
 
+/// `value` with every U+0000 replaced by U+FFFD; borrowed when it holds none.
+fn nul_free_text(value: &str) -> Cow<'_, str> {
+    if value.contains('\0') {
+        Cow::Owned(value.replace('\0', "\u{fffd}"))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
 // --- Ledger writers (shared by every transition) --------------------------------------------
 
 /// Append one ledger row on the caller's transaction, so the event commits
@@ -557,7 +573,7 @@ fn append_event<C: GenericClient>(
 }
 
 /// Append one stop row on the caller's transaction. Never dedupes:
-/// recurrence is the signal.
+/// recurrence is the signal. `detail` is stored NUL-free ([`nul_free_text`]).
 fn insert_stop_event<C: GenericClient>(
     c: &mut C,
     kind: &str,
@@ -573,7 +589,7 @@ fn insert_stop_event<C: GenericClient>(
         &[
             &kind,
             &subject,
-            &detail,
+            &nul_free_text(detail),
             &to_micros(occurred_at),
             &run_id,
             &attribution,
@@ -1482,6 +1498,7 @@ impl ClaimStore for PostgresClaimStore {
     ) -> Result<(), ClaimStoreError> {
         let now = to_micros(now);
         let observed_count = int4(observed_count, "source_syncs.observed_count")?;
+        let error = error.map(nul_free_text);
         self.write(|tx| {
             tx.execute(
                 "UPDATE source_syncs SET status = $1, observed_count = $2, error = $3, \

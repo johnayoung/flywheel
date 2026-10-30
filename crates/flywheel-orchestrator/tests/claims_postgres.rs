@@ -32,7 +32,8 @@ use flywheel_core::store::{CURRENT_SCHEMA_VERSION, LifecycleStore};
 use flywheel_core::store_postgres::PostgresStore;
 use flywheel_orchestrator::claims::{
     CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, EVENT_ACQUIRED, EVENT_EXPIRED,
-    REASON_AWAITING_APPROVAL, SqliteClaimStore, WorkItemObservation, conflict_keys,
+    REASON_AWAITING_APPROVAL, REASON_PREREQUISITE_MISSING, STOP_PREPARE_SKIP, SqliteClaimStore,
+    WorkItemObservation, conflict_keys,
 };
 use flywheel_orchestrator::claims_postgres::{
     CLAIM_ACQUIRE_LOCK_KEY, POSTGRES_BACKEND, PostgresClaimStore, register_postgres_backends,
@@ -648,6 +649,61 @@ fn non_ascii_set_columns_read_back_as_the_canonical_encoding() {
             .map(|e| e.event_type.as_str())
             .collect::<Vec<_>>(),
         vec![EVENT_ACQUIRED]
+    );
+}
+
+#[test]
+fn nul_bytes_in_free_form_text_are_stored_as_replacement_characters() {
+    // TEXT cannot hold U+0000; the store substitutes U+FFFD in free-form
+    // detail/error text instead of refusing (and rolling back) the write.
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let store = open(&pg, &pg.fresh_schema("fw_nul"));
+    let claim = store
+        .acquire_claim("task-a", "w1", t(0), 30.0, &none())
+        .unwrap()
+        .unwrap();
+    store
+        .record_prepare_skip(&claim, "setup failed: a\0b", t(1))
+        .unwrap();
+    assert_eq!(store.load_claim("task-a").unwrap(), None);
+    store
+        .record_stop_event(STOP_PREPARE_SKIP, "task-b", "\0\0", t(2), "probe")
+        .unwrap();
+    store
+        .record_human_review(REASON_PREREQUISITE_MISSING, "task-c", t(3), "r1", "x\0")
+        .unwrap();
+    let details: Vec<String> = store
+        .list_stop_events()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.detail)
+        .collect();
+    assert_eq!(
+        details,
+        vec![
+            "setup failed: a\u{fffd}b".to_owned(),
+            "\u{fffd}\u{fffd}".to_owned(),
+            "x\u{fffd}".to_owned(),
+        ]
+    );
+    let stop = &store.list_subject_stop_events("task-b").unwrap()[0];
+    assert_eq!(stop.attribution, "probe");
+    let sync = store
+        .record_source_sync_start("github", "o/r", t(4))
+        .unwrap();
+    store
+        .record_source_sync_finish(sync, "error", 0, Some("gh\0"), t(5))
+        .unwrap();
+    assert_eq!(
+        store
+            .load_source_sync(sync)
+            .unwrap()
+            .unwrap()
+            .error
+            .as_deref(),
+        Some("gh\u{fffd}")
     );
 }
 

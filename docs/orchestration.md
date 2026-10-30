@@ -91,6 +91,8 @@ The loop passes keys wherever a claim gates repo work: the fresh-dispatch and bl
 
 `sweep_expired_claims` batch-releases every lapsed claim — including all of one dead worker's claims — in a single pass, leaving still-valid claims untouched, and emits one `expired` event per reaped claim. SQLite compares ISO-timestamp strings lexically; Postgres compares `TIMESTAMPTZ` temporally.
 
+Postgres `TEXT` cannot hold U+0000: `PostgresClaimStore` writes NULs in free-form text (stop-event `detail`, `source_syncs.error`) as U+FFFD; SQLite and memory keep them verbatim.
+
 The loop runs it in-process (spec 00069): with `OrchestrateRequest.sweep_seconds` set, a background task ticks `sweep_expired_leases` (`orchestrate/sweep.rs`) every interval — it first finalizes claimable stranded lifecycles, then reaps the remaining lapsed rows — under a distinct `<worker-id>-sweeper` id. `flywheel worker` sets it to `DEFAULT_SWEEP_SECONDS = 15.0`; a bare `orchestrate` call leaves it off. Independently, another worker can still steal an individual lapsed lease via `acquire_claim`.
 
 ### The orchestrator's own store

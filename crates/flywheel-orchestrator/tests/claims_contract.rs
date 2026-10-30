@@ -720,6 +720,65 @@ fn record_prepare_skip_releases_the_claim_and_records_the_stop_together() {
     });
 }
 
+/// `stored` is `written` verbatim, or (Postgres, whose TEXT cannot hold
+/// U+0000) with every NUL replaced by U+FFFD -- never refused.
+fn assert_nul_preserved_or_replaced(stored: &str, written: &str) {
+    assert!(
+        stored == written || stored == written.replace('\0', "\u{fffd}"),
+        "{stored:?} is neither {written:?} nor its NUL-replaced form"
+    );
+}
+
+#[test]
+fn nul_bytes_in_free_form_stop_and_sync_text_never_refuse_the_write() {
+    // Setup-hook stderr tails and grader excerpts are lossily decoded
+    // process output that keeps NULs; they reach these columns verbatim.
+    each(|store| {
+        let claim = store
+            .acquire_claim("task-a", "worker-1", t(0), 30.0, &none())
+            .unwrap()
+            .unwrap();
+        let skip = "PrepareError: sandbox setup failed (exit 1): bin\0ary";
+        store.record_prepare_skip(&claim, skip, t(1)).unwrap();
+        assert_eq!(
+            store.load_claim("task-a").unwrap(),
+            None,
+            "the release commits with the stop row"
+        );
+        assert_eq!(types(store, "task-a"), vec![EVENT_ACQUIRED, EVENT_RELEASED]);
+        store
+            .record_stop_event(STOP_NO_OP_CYCLE, "/repo", "\0", t(2), "")
+            .unwrap();
+        store
+            .record_human_review(
+                REASON_PREREQUISITE_MISSING,
+                "task-b",
+                t(3),
+                "run-1",
+                "tail: x\0y",
+            )
+            .unwrap();
+        let stops = store.list_stop_events().unwrap();
+        assert_eq!(stops.len(), 3);
+        assert_eq!(stops[0].kind, STOP_PREPARE_SKIP);
+        assert_nul_preserved_or_replaced(&stops[0].detail, skip);
+        assert_nul_preserved_or_replaced(&stops[1].detail, "\0");
+        let queue = store.list_human_review_queue().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_nul_preserved_or_replaced(&queue[0].detail, "tail: x\0y");
+
+        let sync = store
+            .record_source_sync_start("github", "owner/repo", t(4))
+            .unwrap();
+        store
+            .record_source_sync_finish(sync, "error", 0, Some("gh: \0"), t(5))
+            .unwrap();
+        let row = store.load_source_sync(sync).unwrap().unwrap();
+        assert_eq!(row.status, "error");
+        assert_nul_preserved_or_replaced(row.error.as_deref().unwrap(), "gh: \0");
+    });
+}
+
 #[test]
 fn human_review_queue_projects_only_review_reasons() {
     each(|store| {

@@ -134,9 +134,25 @@ impl ContainerConfig {
 }
 
 /// The per-run container name: `flywheel-<task_id>-<8 hex>`.
+///
+/// Docker names must match `[a-zA-Z0-9][a-zA-Z0-9_.-]+`, but a task id may
+/// be a nested path (`phase1/login`, see
+/// `flywheel_core::task::validate_id_path_safe`), so every character
+/// outside that set is mapped to `_`. The random suffix keeps two ids that
+/// sanitize alike (`a/b`, `a_b`) from colliding.
 pub fn new_container_name(task_id: &str) -> String {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    format!("flywheel-{task_id}-{}", &suffix[..8])
+    let id: String = task_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("flywheel-{id}-{}", &suffix[..8])
 }
 
 fn host_uid() -> u32 {
@@ -632,6 +648,40 @@ mod tests {
         assert!(flag_values(&run, "--label").contains(&"flywheel.owner=1"));
         assert_eq!(*run.last().unwrap(), "flywheel/agent:test");
         assert_eq!(h.registry.active_names().len(), 1);
+    }
+
+    /// Docker's container-name grammar: `[a-zA-Z0-9][a-zA-Z0-9_.-]+`.
+    fn is_valid_docker_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && name.len() > 1
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    }
+
+    #[test]
+    fn nested_task_id_yields_a_valid_docker_container_name() {
+        // `validate_id_path_safe` admits `/`-separated ids; docker rejects
+        // `/` in --name ("Invalid container name"), so the run never starts.
+        let name = new_container_name("phase1/login");
+        assert!(is_valid_docker_name(&name), "invalid docker name {name:?}");
+        assert!(name.starts_with("flywheel-phase1_login-"), "{name}");
+        assert_eq!(name.len(), "flywheel-phase1_login-".len() + 8);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, root) = plain(dir.path());
+        let h = harness(dir.path(), inner, config(), HAPPY_BODY);
+        let handle = h
+            .strategy
+            .prepare_sandbox(&request("phase1/login"))
+            .unwrap();
+        assert_eq!(handle.path, root.join("phase1/login"));
+        let run = run_call(&h.log);
+        let name = flag_values(&run, "--name")[0];
+        assert!(is_valid_docker_name(name), "invalid docker name {name:?}");
+        assert_eq!(
+            h.registry.active_names(),
+            std::collections::BTreeSet::from([name.to_owned()])
+        );
     }
 
     #[test]

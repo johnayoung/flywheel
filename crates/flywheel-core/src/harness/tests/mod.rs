@@ -4,6 +4,7 @@
 
 mod graders;
 mod guards;
+mod mirroring;
 mod ops;
 mod recovery;
 mod run;

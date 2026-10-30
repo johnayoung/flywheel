@@ -204,7 +204,7 @@ Execute-time held-out landing gate. See [held-out-gate.md](held-out-gate.md).
 |-----|------|---------|----------|
 | `root` | path | unset (no gate) | directory of operator-declared held-out grader registrations (one `<task_id>.json` per gated task) the gate reads |
 
-**There is deliberately no default `root`.** Unset means the worker builds no held-out source and landing is byte-identical to today; a default would silently activate gating on upgrade. A relative `root` resolves against the repo root (`build_held_out_source`, `crates/flywheel-worktree/src/daemon.rs`).
+**There is deliberately no default `root`.** Unset means the worker builds no held-out source and landing is byte-identical to today; a default would silently activate gating on upgrade. A relative `root` resolves against the repo root (`build_held_out_source`, `crates/flywheel-worktree/src/daemon.rs`). A set `root` must be an existing directory: the worker refuses to start if it is missing, and the gate fails closed if it disappears mid-run.
 
 ## `[autopilot]` and `[autopilot.weights]` (optional)
 

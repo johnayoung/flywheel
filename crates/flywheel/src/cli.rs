@@ -872,6 +872,10 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
+        if let Err(failure) = source.check_root() {
+            let _ = writeln!(err, "error: held-out gate misconfigured: {failure}");
+            return 1;
+        }
         log(&format!(
             "held-out gate active root={}",
             source.root.display()

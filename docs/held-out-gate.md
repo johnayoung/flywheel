@@ -27,7 +27,7 @@ The gate is strategy-agnostic: `merge`, `pr`, and any future strategy all flow t
 Four properties an operator must internalize:
 
 - **Fail closed.** A registered grader that cannot be located, parsed, or executed yields `Fail`, never a silent skip. The absence of a *parseable* check is never treated as the absence of a check.
-- **`NoGate` is distinct from `Fail`.** A task that never registered an oracle lands unchanged. Only tasks you explicitly opt in are gated.
+- **`NoGate` is distinct from `Fail`.** A task that never registered an oracle lands unchanged. `NoGate` requires the configured root to exist; a missing root is a `Fail` for every task. Only tasks you explicitly opt in are gated.
 - **The verdict is the grader exit code, never the agent's self-report.** The engine is not given the agent's terminal status. An agent reporting done while a held-out grader exits non-zero yields `Fail`.
 - **Command graders only.** A non-command held-out registration is a misconfiguration and fails closed (D-5). The committed tree is passed as `cwd` to every grader, so each observes the agent's committed changes.
 
@@ -85,7 +85,7 @@ root = ".flywheel/verification/held-out"
 
 **There is deliberately no default root.** A default would silently activate gating on upgrade (spec 00051 #2). When `[held_out] root` is absent, `WorkPolicy.held_out_root` is `None` (`crates/flywheel-orchestrator/src/policy.rs`) and the gate runs for no task. A typo never leaves the gate silently inert: a non-string or empty value raises `PolicyError`.
 
-The worker resolves the root via `build_held_out_source(policy, repo_root)` (`crates/flywheel-worktree/src/daemon.rs`): a relative root resolves against the repo root (`<repo_root>/<root>`, independent of the worker's cwd or any sandbox path); an absolute root is honored as written. When a source is built, `flywheel worker` logs `held-out gate active root=<...>` on startup and forwards the source into every `run_once` cycle. See [configuration.md](configuration.md) and [cli.md](cli.md).
+The worker resolves the root via `build_held_out_source(policy, repo_root)` (`crates/flywheel-worktree/src/daemon.rs`): a relative root resolves against the repo root (`<repo_root>/<root>`, independent of the worker's cwd or any sandbox path); an absolute root is honored as written. When a source is built, the worker first checks the resolved root is an existing directory: if it is missing (a typo, or a `git clean -X` that removed the git-ignored payload) or not a directory, `flywheel worker` refuses to start (`held-out gate misconfigured: ...`, exit 1) rather than landing every task ungated. Otherwise it logs `held-out gate active root=<...>` and forwards the source into every `run_once` cycle. The source re-checks the root at every evaluation, so a root that disappears mid-run yields `Fail`, never `NoGate`. Create the root (`mkdir -p`) before the first worker run, or remove `[held_out] root` to disable the gate. See [configuration.md](configuration.md) and [cli.md](cli.md).
 
 This repo's committed config sets `root = ".flywheel/verification/held-out"`, so the gate is live here.
 

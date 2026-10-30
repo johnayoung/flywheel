@@ -1825,6 +1825,13 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
+        if let Err(failure) = source.check_root() {
+            let _ = writeln!(
+                err,
+                "flywheel worker: held-out gate misconfigured: {failure}"
+            );
+            return 1;
+        }
         log(&format!(
             "held-out gate active root={}",
             source.root.display()
@@ -3343,6 +3350,53 @@ esac
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(repo.join(".flywheel").join("flywheel.sqlite").exists());
         assert!(repo.join(".flywheel").join("worktrees").is_dir());
+    }
+
+    #[test]
+    fn main_refuses_to_start_when_the_configured_held_out_root_is_missing() {
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        fs::write(
+            repo.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-oot\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
+        let _cwd = enter(&repo);
+        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        assert_eq!(code, 1, "{err}");
+        assert!(
+            err.starts_with("flywheel worker: held-out gate misconfigured: "),
+            "{err}"
+        );
+        assert!(
+            err.contains("held-oot: held-out root does not exist"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn main_starts_with_an_existing_held_out_root() {
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        fs::write(
+            repo.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
+        fs::create_dir_all(repo.join(".flywheel/verification/held-out")).unwrap();
+        let _cwd = enter(&repo);
+        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        assert_eq!((code, err.as_str()), (0, ""));
     }
 
     #[test]

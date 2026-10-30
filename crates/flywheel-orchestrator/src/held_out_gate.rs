@@ -211,7 +211,10 @@ pub trait HeldOutGraderSource: Send + Sync {
 ///
 /// Fail-closed posture: only a definitely absent entry for the task id
 /// yields `None`; an entry that is unreadable (including a dangling symlink
-/// or a directory), malformed, non-command, or empty errors.
+/// or a directory), malformed, non-command, or empty errors. A `root` that
+/// is not an existing directory errors for every task ([`Self::check_root`]):
+/// a configured gate whose root is missing (a typo, or a `git clean -X` of
+/// the git-ignored payload) must never read as "nothing registered".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemHeldOutGraderSource {
     pub root: PathBuf,
@@ -226,6 +229,35 @@ impl FilesystemHeldOutGraderSource {
     /// `root` (treated as unregistered rather than read from elsewhere).
     pub fn registration_path(&self, task_id: &str) -> Option<PathBuf> {
         registration_file_name(task_id).map(|name| self.root.join(name))
+    }
+
+    /// Errors unless `root` is an existing directory (a symlink to one is
+    /// fine). A configured source whose root is missing or not a directory
+    /// cannot tell an unregistered task from a lost registration, so it
+    /// fails closed instead of degrading to `NoGate`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeldOutGraderError`] when `root` does not exist, is not a
+    /// directory, or cannot be inspected.
+    pub fn check_root(&self) -> Result<(), HeldOutGraderError> {
+        match std::fs::metadata(&self.root) {
+            Ok(meta) if meta.is_dir() => Ok(()),
+            Ok(_) => Err(HeldOutGraderError::new(format!(
+                "{}: held-out root is not a directory",
+                self.root.display()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(HeldOutGraderError::new(format!(
+                    "{}: held-out root does not exist (create it, or remove [held_out] root to disable the gate)",
+                    self.root.display()
+                )))
+            }
+            Err(err) => Err(HeldOutGraderError::new(format!(
+                "{}: held-out root cannot be inspected: {err}",
+                self.root.display()
+            ))),
+        }
     }
 
     fn standing_dir(&self) -> PathBuf {
@@ -257,6 +289,7 @@ impl FilesystemHeldOutGraderSource {
 
 impl HeldOutGraderSource for FilesystemHeldOutGraderSource {
     fn graders_for(&self, task_id: &str) -> Result<Option<Vec<CommandGrader>>, HeldOutGraderError> {
+        self.check_root()?;
         let Some(path) = self.registration_path(task_id) else {
             return Ok(None);
         };
@@ -272,6 +305,7 @@ impl HeldOutGraderSource for FilesystemHeldOutGraderSource {
     }
 
     fn standing_graders_for(&self, task: &Task) -> Result<Vec<CommandGrader>, HeldOutGraderError> {
+        self.check_root()?;
         let dir = self.standing_dir();
         if !entry_exists(&dir, "standing oracle directory")? {
             return Ok(Vec::new());
@@ -1063,6 +1097,58 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let source = FilesystemHeldOutGraderSource::new(tmp.path());
         assert_eq!(source.graders_for("nobody-home"), Ok(None));
+    }
+
+    // --- a configured root that is missing never degrades to NoGate --------------
+
+    #[test]
+    fn missing_root_fails_closed_for_registrations_and_standing_oracles() {
+        let tmp = TempDir::new().unwrap();
+        let source = FilesystemHeldOutGraderSource::new(tmp.path().join("held-oot"));
+        let err = source.graders_for("task-alpha").unwrap_err();
+        assert!(err.0.contains("held-out root does not exist"), "{err}");
+        let err = source
+            .standing_graders_for(&task("task-alpha"))
+            .unwrap_err();
+        assert!(err.0.contains("held-out root does not exist"), "{err}");
+        assert!(source.check_root().is_err());
+    }
+
+    #[test]
+    fn root_that_is_a_file_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("held-out");
+        std::fs::write(&root, "not a directory").unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let err = source.graders_for("task-alpha").unwrap_err();
+        assert!(err.0.contains("held-out root is not a directory"), "{err}");
+    }
+
+    #[test]
+    fn root_symlinked_to_a_directory_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&link);
+        assert_eq!(source.check_root(), Ok(()));
+        assert_eq!(source.graders_for("task-alpha"), Ok(None));
+    }
+
+    #[tokio::test]
+    async fn missing_root_blocks_landing_instead_of_no_gate() {
+        let tmp = TempDir::new().unwrap();
+        let committed = tree(&tmp, "tree");
+        let root = tmp.path().join("held-oot");
+        let verdict = evaluate(&task("task-alpha"), &root, &committed, "run-1").await;
+        assert_eq!(verdict.outcome, GateOutcome::Fail);
+        assert!(verdict.blocks_landing());
+        assert!(
+            verdict.reason.contains("held-out root does not exist"),
+            "{}",
+            verdict.reason
+        );
     }
 
     // --- pass path ---------------------------------------------------------------

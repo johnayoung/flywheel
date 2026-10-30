@@ -138,7 +138,7 @@ Worker pool size, checkpoint-nudge threshold, and session-pause ceiling for a si
 |-----|------|---------|----------|
 | `concurrency` | int (>=1 once resolved) | `1` | how many tasks one `flywheel worker` invocation drives concurrently |
 | `checkpoint_nudge_seconds` | float (>= 0) | `300.0` | remaining wall time to a task's `AGENT_ITERATION` deadline at which the harness nudges the agent to commit work-in-progress, when its branch has gained no new commit; `0` disables |
-| `session_pause_ceiling_seconds` | float (>= 0) | `21600.0` | ceiling (seconds) clamping a session-limit-driven pool-wide claim pause; `0` disables pausing entirely |
+| `session_pause_ceiling_seconds` | finite float (>= 0; `inf`/`nan` rejected) | `21600.0` | ceiling (seconds) clamping a session-limit-driven pool-wide claim pause; `0` disables pausing entirely |
 
 `--concurrency` overrides this value per-run (flag wins). An absent `[worker]` table means `concurrency = 1` — single serial worker, today's behavior byte-for-byte. A resolved value below `1` (e.g. `--concurrency 0`, a negative, or a non-integer flag) is a hard error: the worker exits non-zero naming the setting and claims no task (`resolve_concurrency`, `crates/flywheel-worktree/src/daemon.rs`). The `< 1` range is *not* checked at load time because the flag can override the config, so a config of `0` with `--concurrency 3` is valid.
 

@@ -840,6 +840,13 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
         DEFAULT_SESSION_PAUSE_CEILING_SECONDS,
         "worker.session_pause_ceiling_seconds",
     )?;
+    // `inf`/`nan` are valid TOML floats; an infinite ceiling defeats the
+    // bound the knob exists for and NaN means nothing (0 disables pausing).
+    if !worker_session_pause_ceiling_seconds.is_finite() {
+        return Err(ctx.err(format!(
+            "worker.session_pause_ceiling_seconds must be a finite number, got {worker_session_pause_ceiling_seconds}"
+        )));
+    }
 
     let mut policy = WorkPolicy {
         source_kind: kind.to_string(),
@@ -2542,6 +2549,15 @@ mod tests {
             err_dir("[worker]\nsession_pause_ceiling_seconds = \"x\"\n")
                 .contains("worker.session_pause_ceiling_seconds must be a number")
         );
+        for bad in ["inf", "-inf", "nan"] {
+            assert!(
+                err_dir(&format!(
+                    "[worker]\nsession_pause_ceiling_seconds = {bad}\n"
+                ))
+                .contains("worker.session_pause_ceiling_seconds must be a finite number"),
+                "{bad}"
+            );
+        }
         assert_eq!(
             err_top("worker = 1\n"),
             format!("{FILE}: [worker] must be a table")

@@ -233,6 +233,15 @@ pub enum ClaimStoreError {
     /// is recorded.
     #[error("graph snapshot names task {task_id:?} more than once")]
     DuplicateSnapshotItem { task_id: String },
+    /// A lease of `lease_seconds` from `now` lands outside the representable
+    /// timestamp range (or is not a number); nothing is recorded.
+    #[error(
+        "lease of {lease_seconds} seconds from {now} is outside the representable timestamp range"
+    )]
+    LeaseOutOfRange {
+        lease_seconds: f64,
+        now: DateTime<Utc>,
+    },
     /// A persisted timestamp column could not be parsed.
     #[error(transparent)]
     Timestamp(#[from] TimestampParseError),
@@ -491,6 +500,27 @@ fn to_micros(ts: DateTime<Utc>) -> DateTime<Utc> {
 fn lease_duration(lease_seconds: f64) -> Duration {
     let micros = (lease_seconds * 1_000_000.0).round();
     Duration::microseconds(micros as i64)
+}
+
+/// `now + lease_seconds` truncated to micros, or `None` when the seconds are
+/// NaN or the sum leaves the representable timestamp range. `lease_duration`
+/// saturates out-of-range values to `i64` micros (~292k years), which is
+/// already past chrono's range, so the checked add catches every overflow.
+pub(crate) fn lease_expiry(now: DateTime<Utc>, lease_seconds: f64) -> Option<DateTime<Utc>> {
+    if lease_seconds.is_nan() {
+        return None;
+    }
+    now.checked_add_signed(lease_duration(lease_seconds))
+        .map(to_micros)
+}
+
+/// [`lease_expiry`] as a store error, so an out-of-range lease is refused
+/// before anything is written instead of panicking on `DateTime` overflow.
+pub(crate) fn checked_lease_expiry(
+    now: DateTime<Utc>,
+    lease_seconds: f64,
+) -> Result<DateTime<Utc>, ClaimStoreError> {
+    lease_expiry(now, lease_seconds).ok_or(ClaimStoreError::LeaseOutOfRange { lease_seconds, now })
 }
 
 fn disjoint(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
@@ -852,6 +882,7 @@ impl ClaimStore for InMemoryClaimStore {
         conflict_keys: &BTreeSet<String>,
     ) -> Result<Option<TaskClaim>, ClaimStoreError> {
         let now = to_micros(now);
+        let lease_expires_at = checked_lease_expiry(now, lease_seconds)?;
         let mut state = self.lock()?;
         let existing = state.claims.get(task_id).cloned();
         let free = existing
@@ -874,7 +905,7 @@ impl ClaimStore for InMemoryClaimStore {
             task_id: task_id.to_owned(),
             worker_id: worker_id.to_owned(),
             claimed_at: now,
-            lease_expires_at: to_micros(now + lease_duration(lease_seconds)),
+            lease_expires_at,
             version,
         };
         state.claims.insert(task_id.to_owned(), claim.clone());
@@ -899,6 +930,7 @@ impl ClaimStore for InMemoryClaimStore {
         lease_seconds: f64,
     ) -> Result<TaskClaim, ClaimStoreError> {
         let now = to_micros(now);
+        let lease_expires_at = checked_lease_expiry(now, lease_seconds)?;
         let mut state = self.lock()?;
         let existing = state.claims.get(&claim.task_id).cloned();
         let Some(existing) =
@@ -913,7 +945,7 @@ impl ClaimStore for InMemoryClaimStore {
             task_id: claim.task_id.clone(),
             worker_id: claim.worker_id.clone(),
             claimed_at: existing.claimed_at,
-            lease_expires_at: to_micros(now + lease_duration(lease_seconds)),
+            lease_expires_at,
             version: existing.version + 1,
         };
         state.claims.insert(claim.task_id.clone(), renewed.clone());
@@ -1326,12 +1358,14 @@ fn clamp_pause(
     now: DateTime<Utc>,
     ceiling_seconds: f64,
 ) -> Option<DateTime<Utc>> {
-    if ceiling_seconds <= 0.0 {
+    // NaN is disabled too, matching the old saturating behavior.
+    if ceiling_seconds.is_nan() || ceiling_seconds <= 0.0 {
         return None;
     }
     let reset_at = to_micros(reset_at);
     let now = to_micros(now);
-    let pause_until = reset_at.min(to_micros(now + lease_duration(ceiling_seconds)));
+    // A horizon past the timestamp range cannot bind; the reset wins.
+    let pause_until = lease_expiry(now, ceiling_seconds).map_or(reset_at, |c| reset_at.min(c));
     (pause_until > now).then_some(pause_until)
 }
 
@@ -1882,7 +1916,7 @@ impl ClaimStore for SqliteClaimStore {
         conflict_keys: &BTreeSet<String>,
     ) -> Result<Option<TaskClaim>, ClaimStoreError> {
         let now = to_micros(now);
-        let lease_expires = to_micros(now + lease_duration(lease_seconds));
+        let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         let keys_json = encode_str_set(conflict_keys);
         self.write(|tx| {
             let existing: Option<(String, String, i64)> = tx
@@ -1964,7 +1998,7 @@ impl ClaimStore for SqliteClaimStore {
         lease_seconds: f64,
     ) -> Result<TaskClaim, ClaimStoreError> {
         let now = to_micros(now);
-        let lease_expires = to_micros(now + lease_duration(lease_seconds));
+        let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         let new_version = claim.version + 1;
         // The UPDATE and its `renewed` event commit together: a stale token
         // updates no row, the error rolls the transaction back, no event.
@@ -2622,6 +2656,45 @@ mod tests {
     fn lease_duration_handles_fractional_seconds() {
         assert_eq!(lease_duration(0.5), Duration::milliseconds(500));
         assert_eq!(lease_duration(30.0), Duration::seconds(30));
+    }
+
+    #[test]
+    fn clamp_pause_with_an_unrepresentable_ceiling_falls_back_to_reset_at() {
+        // A ceiling whose horizon is past the timestamp range cannot bind, so
+        // the reported reset wins; it must never overflow `now + ceiling`.
+        assert_eq!(clamp_pause(t(50), t(0), f64::INFINITY), Some(t(50)));
+        assert_eq!(clamp_pause(t(50), t(0), 1e30), Some(t(50)));
+        assert_eq!(clamp_pause(t(50), t(0), f64::NAN), None);
+        assert_eq!(clamp_pause(t(50), t(0), -5.0), None);
+    }
+
+    #[test]
+    fn unrepresentable_lease_is_refused_without_recording_a_claim() {
+        let mem = InMemoryClaimStore::new();
+        let sqlite = SqliteClaimStore::in_memory().unwrap();
+        let stores: [&dyn ClaimStore; 2] = [&mem, &sqlite];
+        for store in stores {
+            for lease in [1e30, f64::INFINITY, f64::NAN] {
+                let err = store
+                    .acquire_claim("task-a", "worker-1", t(0), lease, &BTreeSet::new())
+                    .unwrap_err();
+                assert!(
+                    matches!(err, ClaimStoreError::LeaseOutOfRange { .. }),
+                    "{err}"
+                );
+            }
+            assert!(store.load_claim("task-a").unwrap().is_none());
+            let claim = store
+                .acquire_claim("task-a", "worker-1", t(0), 30.0, &BTreeSet::new())
+                .unwrap()
+                .unwrap();
+            let err = store.renew_claim(&claim, t(1), 1e30).unwrap_err();
+            assert!(
+                matches!(err, ClaimStoreError::LeaseOutOfRange { .. }),
+                "{err}"
+            );
+            assert_eq!(store.load_claim("task-a").unwrap().unwrap(), claim);
+        }
     }
 
     #[test]

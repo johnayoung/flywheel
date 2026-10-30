@@ -285,6 +285,24 @@ fn lease_duration(lease_seconds: f64) -> Duration {
     Duration::microseconds(micros as i64)
 }
 
+/// `now + lease_seconds` truncated to micros, or `None` when the seconds are
+/// NaN or the sum leaves the representable timestamp range (mirrors
+/// `claims::lease_expiry`).
+fn lease_expiry(now: DateTime<Utc>, lease_seconds: f64) -> Option<DateTime<Utc>> {
+    if lease_seconds.is_nan() {
+        return None;
+    }
+    now.checked_add_signed(lease_duration(lease_seconds))
+        .map(to_micros)
+}
+
+fn checked_lease_expiry(
+    now: DateTime<Utc>,
+    lease_seconds: f64,
+) -> Result<DateTime<Utc>, ClaimStoreError> {
+    lease_expiry(now, lease_seconds).ok_or(ClaimStoreError::LeaseOutOfRange { lease_seconds, now })
+}
+
 /// `min(reset_at, now + ceiling)` when pausing is enabled and the horizon is
 /// strictly after `now`; `None` otherwise (the same clamp every backend
 /// applies, so the unbounded-pause failure mode is unreachable here too).
@@ -293,12 +311,14 @@ fn clamp_pause(
     now: DateTime<Utc>,
     ceiling_seconds: f64,
 ) -> Option<DateTime<Utc>> {
-    if ceiling_seconds <= 0.0 {
+    // NaN is disabled too, matching the old saturating behavior.
+    if ceiling_seconds.is_nan() || ceiling_seconds <= 0.0 {
         return None;
     }
     let reset_at = to_micros(reset_at);
     let now = to_micros(now);
-    let pause_until = reset_at.min(to_micros(now + lease_duration(ceiling_seconds)));
+    // A horizon past the timestamp range cannot bind; the reset wins.
+    let pause_until = lease_expiry(now, ceiling_seconds).map_or(reset_at, |c| reset_at.min(c));
     (pause_until > now).then_some(pause_until)
 }
 
@@ -781,7 +801,7 @@ impl ClaimStore for PostgresClaimStore {
         conflict_keys: &BTreeSet<String>,
     ) -> Result<Option<TaskClaim>, ClaimStoreError> {
         let now = to_micros(now);
-        let lease_expires = to_micros(now + lease_duration(lease_seconds));
+        let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         let keys_value = set_value(conflict_keys);
         let keys: Vec<&str> = conflict_keys.iter().map(String::as_str).collect();
         self.write(|tx| {
@@ -876,7 +896,7 @@ impl ClaimStore for PostgresClaimStore {
         lease_seconds: f64,
     ) -> Result<TaskClaim, ClaimStoreError> {
         let now = to_micros(now);
-        let lease_expires = to_micros(now + lease_duration(lease_seconds));
+        let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         // The UPDATE and its `renewed` event commit together: a stale token
         // updates no row, the error rolls the transaction back, no event.
         self.write(|tx| {
@@ -1763,6 +1783,10 @@ mod tests {
         assert_eq!(clamp_pause(t(10), t(0), 30.0), Some(t(10)));
         assert_eq!(clamp_pause(t(0), t(5), 30.0), None);
         assert_eq!(clamp_pause(t(50), t(0), 0.0), None);
+        assert_eq!(clamp_pause(t(50), t(0), f64::INFINITY), Some(t(50)));
+        assert_eq!(clamp_pause(t(50), t(0), f64::NAN), None);
+        assert!(lease_expiry(t(0), 1e30).is_none());
+        assert_eq!(lease_expiry(t(0), 30.0), Some(t(30)));
         assert!(require_review_reason("the build was flaky").is_err());
         assert!(require_review_reason("awaiting-approval").is_ok());
         let dup = [

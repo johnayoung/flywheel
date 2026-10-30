@@ -393,6 +393,12 @@ pub async fn orchestrate(
         )));
     }
     let clock: Clock = request.now.clone().unwrap_or_else(|| Arc::new(Utc::now));
+    if crate::claims::lease_expiry(clock(), request.lease_seconds).is_none() {
+        return Err(OrchestrateError::Config(format!(
+            "lease_seconds {} puts the lease expiry past the representable timestamp range",
+            request.lease_seconds
+        )));
+    }
     let wid = request
         .worker_id
         .clone()

@@ -2925,3 +2925,19 @@ fn default_constants_match_the_python_module() {
     assert_eq!(RunMode::Resume.to_string(), "resume");
     assert_eq!(RedriveResult::InProgress.as_str(), "in-progress");
 }
+
+#[tokio::test]
+async fn lease_past_the_timestamp_range_is_a_config_error_not_a_panic() {
+    let f = Fixture::new();
+    let source = MemorySource::new(vec![item("solo")]);
+    let mut req = f.request(source);
+    req.lease_seconds = 1e30;
+    let Err(err) = orchestrate(req).await else {
+        panic!("a lease past the timestamp range must be refused");
+    };
+    assert!(
+        matches!(&err, OrchestrateError::Config(msg) if msg.contains("lease_seconds")),
+        "{err}"
+    );
+    assert!(f.claims.load_claim("solo").unwrap().is_none());
+}

@@ -243,13 +243,29 @@ pub(super) async fn drive_under_lease(
     };
     let invoke = handle.wrap_invoke(ctx.invoke.clone());
 
-    let heartbeat = ClaimHeartbeat::start(
+    let heartbeat = match ClaimHeartbeat::start(
         ctx.claims.clone(),
-        claim,
+        claim.clone(),
         ctx.lease_seconds,
         ctx.heartbeat_interval,
         ctx.now.clone(),
-    );
+    ) {
+        Ok(heartbeat) => heartbeat,
+        Err(err) => {
+            // No renewal thread means no RunGuard: tear the sandbox down and
+            // release the lease here so neither leaks.
+            if let Err(teardown) = handle.run_teardown() {
+                emit(
+                    ctx.log.as_ref(),
+                    format!(
+                        "[orchestrate] {task_id}: sandbox teardown failed ({teardown}); continuing"
+                    ),
+                );
+            }
+            ctx.claims.release_claim(&claim, Some((ctx.now)()))?;
+            return Err(OrchestrateError::Io(err).into());
+        }
+    };
     let guard = RunGuard {
         claims: ctx.claims.clone(),
         handle,

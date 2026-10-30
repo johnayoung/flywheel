@@ -45,13 +45,18 @@ impl ClaimHeartbeat {
     /// Start renewing `claim` against `claims` every `interval` seconds,
     /// extending the lease by `lease_seconds` each time, stamping renewals
     /// with the injected `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error when the renewal thread cannot be spawned (thread
+    /// or memory limits); the caller still owns the lease and must release it.
     pub fn start(
         claims: Arc<dyn ClaimStore>,
         claim: TaskClaim,
         lease_seconds: f64,
         interval: f64,
         now: Clock,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let interval = Duration::from_secs_f64(interval.max(0.001));
         let claim = Arc::new(Mutex::new(claim));
         let lost = Arc::new(AtomicBool::new(false));
@@ -65,52 +70,49 @@ impl ClaimHeartbeat {
                 "flywheel-lease-{}",
                 claim.lock().map(|c| c.task_id.clone()).unwrap_or_default()
             );
-            thread::Builder::new()
-                .name(name)
-                .spawn(move || {
-                    loop {
-                        match stop_rx.recv_timeout(interval) {
-                            // Stopped, or the heartbeat handle was dropped.
-                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
-                            Err(RecvTimeoutError::Timeout) => {}
-                        }
-                        let current = match claim.lock() {
-                            Ok(guard) => guard.clone(),
-                            Err(_) => break,
-                        };
-                        match claims.renew_claim(&current, now(), lease_seconds) {
-                            Ok(renewed) => {
-                                if let Ok(mut guard) = claim.lock() {
-                                    *guard = renewed;
-                                }
-                            }
-                            Err(ClaimStoreError::ClaimLost(_)) => {
-                                // Signal the driving future that the lease was
-                                // stolen so it stops before writing a terminal
-                                // result against a stale version.
-                                lost.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            // Transient store error: retry on the next tick.
-                            Err(_) => continue,
-                        }
+            thread::Builder::new().name(name).spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(interval) {
+                        // Stopped, or the heartbeat handle was dropped.
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {}
                     }
-                    let (done, cv) = &*finished;
-                    if let Ok(mut guard) = done.lock() {
-                        *guard = true;
+                    let current = match claim.lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => break,
+                    };
+                    match claims.renew_claim(&current, now(), lease_seconds) {
+                        Ok(renewed) => {
+                            if let Ok(mut guard) = claim.lock() {
+                                *guard = renewed;
+                            }
+                        }
+                        Err(ClaimStoreError::ClaimLost(_)) => {
+                            // Signal the driving future that the lease was
+                            // stolen so it stops before writing a terminal
+                            // result against a stale version.
+                            lost.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        // Transient store error: retry on the next tick.
+                        Err(_) => continue,
                     }
-                    cv.notify_all();
-                })
-                .expect("spawn heartbeat thread")
+                }
+                let (done, cv) = &*finished;
+                if let Ok(mut guard) = done.lock() {
+                    *guard = true;
+                }
+                cv.notify_all();
+            })?
         };
-        Self {
+        Ok(Self {
             claim,
             lost,
             finished,
             stop: Some(stop_tx),
             thread: Some(thread),
             interval,
-        }
+        })
     }
 
     /// True once renewal has observed the lease was stolen by a peer.

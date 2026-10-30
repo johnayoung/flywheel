@@ -834,12 +834,16 @@ fn dispatch<H: EventHandler + ?Sized>(
 ///
 /// Plugins register here without touching the harness and cannot corrupt
 /// lifecycle state: they only read committed lines.
+///
+/// # Errors
+///
+/// Returns the OS error when the dispatcher thread cannot be spawned.
 pub fn subscribe<S, H>(
     handler: H,
     run_id: &str,
     store: Arc<S>,
     options: &StreamOptions,
-) -> Subscription
+) -> std::io::Result<Subscription>
 where
     S: LifecycleStore + DomainEventStore + Send + Sync + ?Sized + 'static,
     H: EventHandler + 'static,
@@ -878,13 +882,12 @@ where
                     return;
                 }
             }
-        })
-        .expect("spawn audit subscription thread");
-    Subscription {
+        })?;
+    Ok(Subscription {
         run_id: run_id.to_owned(),
         stop,
         thread: Some(thread),
-    }
+    })
 }
 
 /// One emission of [`attach_logger`]: a short human-readable `message` of
@@ -976,12 +979,16 @@ impl AuditLoggerHandle {
 /// effects: calling `attach_logger` twice returns distinct handles, each
 /// owning its own thread. Equivalent to [`subscribe`] with a logging
 /// handler.
+///
+/// # Errors
+///
+/// Returns the OS error when the emitter thread cannot be spawned.
 pub fn attach_logger<S, L>(
     logger: L,
     run_id: &str,
     store: Arc<S>,
     options: &StreamOptions,
-) -> AuditLoggerHandle
+) -> std::io::Result<AuditLoggerHandle>
 where
     S: LifecycleStore + DomainEventStore + Send + Sync + ?Sized + 'static,
     L: AuditLogger + 'static,
@@ -990,9 +997,9 @@ where
         run_id: run_id.to_owned(),
         logger,
     };
-    AuditLoggerHandle {
-        subscription: subscribe(handler, run_id, store, options),
-    }
+    Ok(AuditLoggerHandle {
+        subscription: subscribe(handler, run_id, store, options)?,
+    })
 }
 
 /// The `kind=<k>` label shared by the logger emitter and the CLI's text
@@ -2387,7 +2394,8 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 10),
-        );
+        )
+        .unwrap();
         wait_until(Duration::from_secs(2), || {
             entries.lock().unwrap().len() >= 3
         });
@@ -2427,13 +2435,15 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 20),
-        );
+        )
+        .unwrap();
         let mut h2 = attach_logger(
             make(Arc::clone(&counter)),
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 20),
-        );
+        )
+        .unwrap();
         assert!(h1.is_alive() && h2.is_alive());
         let sink = FileTelemetrySink::new(dir.path());
         append_event(&sink, "r1", "harness.x");
@@ -2464,7 +2474,8 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 10),
-        );
+        )
+        .unwrap();
         wait_until(Duration::from_secs(2), || seen.load(Ordering::SeqCst) >= 1);
         let start = Instant::now();
         handle.detach();
@@ -2520,7 +2531,8 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 10),
-        );
+        )
+        .unwrap();
         wait_until(Duration::from_secs(2), || seen.lock().unwrap().len() >= 4);
         store.set_status("r1", Status::Done);
         wait_until(Duration::from_secs(2), || !subscription.is_alive());
@@ -2579,7 +2591,8 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &options,
-        );
+        )
+        .unwrap();
         wait_until(Duration::from_secs(2), || !texts.lock().unwrap().is_empty());
         assert_eq!(*texts.lock().unwrap(), vec!["[REDACTED:anthropic_key]"]);
         *store.fail_reads.lock().unwrap() = true;
@@ -2595,7 +2608,8 @@ mod tests {
             "r1",
             Arc::clone(&store),
             &follow_opts(dir.path(), 5000),
-        );
+        )
+        .unwrap();
         let flag = live.stop.clone();
         drop(live);
         assert!(flag.is_set());

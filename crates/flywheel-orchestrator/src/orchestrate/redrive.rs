@@ -270,13 +270,19 @@ pub async fn redrive_parked_landings(
             else {
                 break; // a peer holds the claim; retry on a later pass
             };
-            let heartbeat = ClaimHeartbeat::start(
+            let heartbeat = match ClaimHeartbeat::start(
                 ctx.claims.clone(),
-                claim,
+                claim.clone(),
                 ctx.lease_seconds,
                 ctx.heartbeat_interval,
                 ctx.now.clone(),
-            );
+            ) {
+                Ok(heartbeat) => heartbeat,
+                Err(err) => {
+                    ctx.claims.release_claim(&claim, Some((ctx.now)()))?;
+                    return Err(err.into());
+                }
+            };
             let mut log_line = |line: &str| emit(ctx.log, line);
             let decision = gate_landing(
                 ctx.control.as_ref(),

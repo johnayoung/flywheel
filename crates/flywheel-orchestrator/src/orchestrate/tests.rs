@@ -2139,7 +2139,8 @@ async fn heartbeat_renews_the_lease_and_signals_a_stolen_lease() {
         .unwrap()
         .unwrap();
     let heartbeat =
-        ClaimHeartbeat::start(store.clone(), claim.clone(), 10.0, 0.02, Arc::new(Utc::now));
+        ClaimHeartbeat::start(store.clone(), claim.clone(), 10.0, 0.02, Arc::new(Utc::now))
+            .unwrap();
     std::thread::sleep(Duration::from_millis(120));
     assert!(!heartbeat.lost());
     let latest = heartbeat.stop();
@@ -2166,7 +2167,8 @@ async fn heartbeat_renews_the_lease_and_signals_a_stolen_lease() {
         10.0,
         0.02,
         Arc::new(move || start + ChronoDuration::seconds(61)),
-    );
+    )
+    .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !heartbeat.lost() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));

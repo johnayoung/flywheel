@@ -830,13 +830,19 @@ pub async fn orchestrate(
                 // Land the parked branch under the claim we already hold,
                 // heartbeat-renewed so a long rebase/re-verify cannot outlive
                 // the lease, through the standard gate + submit ladder.
-                let heartbeat = ClaimHeartbeat::start(
+                let heartbeat = match ClaimHeartbeat::start(
                     claims.clone(),
-                    claim,
+                    claim.clone(),
                     request.lease_seconds,
                     heartbeat_interval,
                     clock.clone(),
-                );
+                ) {
+                    Ok(heartbeat) => heartbeat,
+                    Err(err) => {
+                        claims.release_claim(&claim, Some(clock()))?;
+                        return Err(err.into());
+                    }
+                };
                 let land_request = SubmitRequest::new(
                     item.task.clone(),
                     run_id.clone(),

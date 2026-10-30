@@ -48,6 +48,7 @@ toml = "0.9"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 regex = "1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 lto = "thin"

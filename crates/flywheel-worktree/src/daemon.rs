@@ -59,7 +59,9 @@ use flywheel_core::workflow::{
 };
 use flywheel_orchestrator::claims::ClaimStoreError;
 use flywheel_orchestrator::github::GhRunner;
-use flywheel_orchestrator::held_out_gate::{FilesystemHeldOutGraderSource, HeldOutGraderSource};
+use flywheel_orchestrator::held_out_gate::{
+    FilesystemHeldOutGraderSource, HeldOutGraderError, HeldOutGraderSource,
+};
 use flywheel_orchestrator::orchestrate::{
     DEFAULT_LANDING_REDRIVE_BOUND, DEFAULT_PREREQ_REDRIVE_BOUND,
     DEFAULT_SESSION_PAUSE_CEILING_SECONDS, DEFAULT_SWEEP_SECONDS, DEFAULT_WORKER_CONCURRENCY,
@@ -565,6 +567,46 @@ pub fn build_held_out_source(
 ) -> Option<FilesystemHeldOutGraderSource> {
     let root = policy?.held_out_root.as_ref()?;
     Some(FilesystemHeldOutGraderSource::new(repo_root.join(root)))
+}
+
+/// The conventional `[held_out] root`, relative to the repo root: the
+/// git-ignored payload directory `/fw-verify` writes registrations into.
+pub const CONVENTIONAL_HELD_OUT_ROOT: &str = ".flywheel/verification/held-out";
+
+/// Make `source`'s root ready for the worker, or say why it cannot be.
+///
+/// The payload tree is git-ignored, so a fresh clone never has it. When the
+/// configured root resolves to exactly [`CONVENTIONAL_HELD_OUT_ROOT`] under
+/// `repo_root` and is missing, it is created (empty, so every task reads as
+/// unregistered until an oracle is written). Any other missing root -- a
+/// typo, or an operator-chosen location -- is left alone and reported, so a
+/// misspelled root still refuses to start instead of gating nothing.
+/// Returns `true` when the conventional root was created.
+///
+/// # Errors
+///
+/// The root (after any creation) is missing, not a directory, or cannot
+/// be inspected or created.
+pub fn prepare_held_out_root(
+    source: &FilesystemHeldOutGraderSource,
+    repo_root: &Path,
+) -> Result<bool, HeldOutGraderError> {
+    let conventional = repo_root.join(CONVENTIONAL_HELD_OUT_ROOT);
+    let created = source.root.components().eq(conventional.components())
+        && matches!(
+            std::fs::symlink_metadata(&source.root),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        );
+    if created {
+        std::fs::create_dir_all(&source.root).map_err(|err| {
+            HeldOutGraderError::new(format!(
+                "{}: cannot create the conventional held-out root: {err}",
+                source.root.display()
+            ))
+        })?;
+    }
+    source.check_root()?;
+    Ok(created)
 }
 
 // --- The RunTask binding ---------------------------------------------------------------
@@ -1825,12 +1867,19 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
-        if let Err(failure) = source.check_root() {
-            let _ = writeln!(
-                err,
-                "flywheel worker: held-out gate misconfigured: {failure}"
-            );
-            return 1;
+        match prepare_held_out_root(source, &repo_root) {
+            Ok(true) => log(&format!(
+                "created the conventional held-out root {}",
+                source.root.display()
+            )),
+            Ok(false) => {}
+            Err(failure) => {
+                let _ = writeln!(
+                    err,
+                    "flywheel worker: held-out gate misconfigured: {failure}"
+                );
+                return 1;
+            }
         }
         log(&format!(
             "held-out gate active root={}",
@@ -3397,6 +3446,70 @@ esac
         let _cwd = enter(&repo);
         let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
         assert_eq!((code, err.as_str()), (0, ""));
+    }
+
+    #[test]
+    fn main_starts_on_a_fresh_clone_by_creating_the_conventional_held_out_root() {
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        fs::write(
+            repo.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
+        assert!(!repo.join(".flywheel/verification").exists());
+        let _cwd = enter(&repo);
+        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert!(repo.join(".flywheel/verification/held-out").is_dir());
+    }
+
+    #[test]
+    fn prepare_held_out_root_creates_only_the_missing_conventional_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let source = |root: &str| FilesystemHeldOutGraderSource::new(repo.join(root));
+
+        let typo = source(".flywheel/verification/held-oot");
+        let failure = prepare_held_out_root(&typo, repo).unwrap_err();
+        assert!(
+            failure.0.contains("held-out root does not exist"),
+            "{failure:?}"
+        );
+        assert!(!typo.root.exists());
+        let elsewhere = source("oracles");
+        assert!(prepare_held_out_root(&elsewhere, repo).is_err());
+        assert!(!elsewhere.root.exists());
+
+        let dotted = source("./.flywheel/verification/held-out");
+        assert_eq!(prepare_held_out_root(&dotted, repo), Ok(true));
+        assert!(repo.join(CONVENTIONAL_HELD_OUT_ROOT).is_dir());
+        assert_eq!(prepare_held_out_root(&dotted, repo), Ok(false));
+        let absolute = FilesystemHeldOutGraderSource::new(repo.join(CONVENTIONAL_HELD_OUT_ROOT));
+        assert_eq!(prepare_held_out_root(&absolute, repo), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_held_out_root_never_replaces_a_conventional_path_that_is_not_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let root = repo.join(CONVENTIONAL_HELD_OUT_ROOT);
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, "not a dir").unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let failure = prepare_held_out_root(&source, repo).unwrap_err();
+        assert!(failure.0.contains("not a directory"), "{failure:?}");
+        fs::remove_file(&root).unwrap();
+        std::os::unix::fs::symlink(repo.join("gone"), &root).unwrap();
+        let failure = prepare_held_out_root(&source, repo).unwrap_err();
+        assert!(failure.0.contains("does not exist"), "{failure:?}");
+        assert!(!repo.join("gone").exists());
     }
 
     #[test]

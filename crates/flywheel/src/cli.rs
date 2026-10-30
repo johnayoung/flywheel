@@ -76,8 +76,8 @@ use flywheel_orchestrator::workflow::{
 };
 use flywheel_worktree::daemon::{
     self, LandingLayout, RunOnceError, RunOnceRequest, arm_signals, build_held_out_source,
-    make_agents_resolve_conflict, make_logger, resolve_landing_base, resolve_model, run_once,
-    strategy_name_for, worker_registry, wrap_for_backend,
+    make_agents_resolve_conflict, make_logger, prepare_held_out_root, resolve_landing_base,
+    resolve_model, run_once, strategy_name_for, worker_registry, wrap_for_backend,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use flywheel_worktree::submit_registry::SubmitBuildRequest;
@@ -872,9 +872,16 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
-        if let Err(failure) = source.check_root() {
-            let _ = writeln!(err, "error: held-out gate misconfigured: {failure}");
-            return 1;
+        match prepare_held_out_root(source, &repo_root) {
+            Ok(true) => log(&format!(
+                "created the conventional held-out root {}",
+                source.root.display()
+            )),
+            Ok(false) => {}
+            Err(failure) => {
+                let _ = writeln!(err, "error: held-out gate misconfigured: {failure}");
+                return 1;
+            }
         }
         log(&format!(
             "held-out gate active root={}",

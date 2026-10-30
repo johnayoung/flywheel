@@ -209,8 +209,9 @@ pub trait HeldOutGraderSource: Send + Sync {
 /// standing oracles, each `{"match": {...}, "graders": [...]}`. The
 /// directory lives outside every agent worktree.
 ///
-/// Fail-closed posture: no file for the task id yields `None`; a file that
-/// is unreadable, malformed, non-command, or empty errors.
+/// Fail-closed posture: only a definitely absent entry for the task id
+/// yields `None`; an entry that is unreadable (including a dangling symlink
+/// or a directory), malformed, non-command, or empty errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemHeldOutGraderSource {
     pub root: PathBuf,
@@ -259,7 +260,7 @@ impl HeldOutGraderSource for FilesystemHeldOutGraderSource {
         let Some(path) = self.registration_path(task_id) else {
             return Ok(None);
         };
-        if !path.is_file() {
+        if !entry_exists(&path, "held-out grader registration")? {
             return Ok(None);
         }
         let data = read_json(&path, "held-out grader registration")?;
@@ -272,20 +273,22 @@ impl HeldOutGraderSource for FilesystemHeldOutGraderSource {
 
     fn standing_graders_for(&self, task: &Task) -> Result<Vec<CommandGrader>, HeldOutGraderError> {
         let dir = self.standing_dir();
-        if !dir.is_dir() {
+        if !entry_exists(&dir, "standing oracle directory")? {
             return Ok(Vec::new());
         }
-        let entries = std::fs::read_dir(&dir).map_err(|err| {
+        let listing_error = |err: std::io::Error| {
             HeldOutGraderError::new(format!(
                 "{}: standing oracle directory cannot be listed: {err}",
                 dir.display()
             ))
-        })?;
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json") && path.is_file())
-            .collect();
+        };
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(listing_error)? {
+            let path = entry.map_err(listing_error)?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
         files.sort();
         let mut out = Vec::new();
         for path in files {
@@ -310,6 +313,22 @@ pub fn registration_file_name(task_id: &str) -> Option<String> {
         return None;
     }
     Some(format!("{task_id}.json"))
+}
+
+/// Whether a directory entry exists at `path`, without following a final
+/// symlink. Only a definite `NotFound` means "nothing registered"; any other
+/// stat failure errors, and an entry that exists but cannot be read as the
+/// expected kind (a dangling symlink, a directory) fails closed at read time
+/// rather than being mistaken for an absent registration.
+fn entry_exists(path: &Path, what: &str) -> Result<bool, HeldOutGraderError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(HeldOutGraderError::new(format!(
+            "{}: {what} cannot be inspected: {err}",
+            path.display()
+        ))),
+    }
 }
 
 fn read_json(path: &Path, what: &str) -> Result<Value, HeldOutGraderError> {
@@ -1362,6 +1381,77 @@ mod tests {
         if let Err(err) = result {
             assert!(err.to_string().contains("cannot be read"));
         }
+    }
+
+    // A registration entry that exists but whose body cannot be located is
+    // not "unregistered": treating it as NoGate would land ungated work.
+    #[tokio::test]
+    async fn dangling_symlink_registration_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("held_out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("moved-oracle-store/task-alpha.json"),
+            root.join("task-alpha.json"),
+        )
+        .unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let err = source.graders_for("task-alpha").unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+
+        let committed = tree(&tmp, "tree");
+        let verdict = evaluate(&task("task-alpha"), &root, &committed, "run-1").await;
+        assert_eq!(verdict.outcome, GateOutcome::Fail);
+        assert!(verdict.blocks_landing());
+    }
+
+    #[test]
+    fn directory_registration_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("held_out");
+        std::fs::create_dir_all(root.join("task-alpha.json")).unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let err = source.graders_for("task-alpha").unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dangling_symlink_standing_oracle_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("held_out");
+        let dir = root.join(STANDING_SUBDIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("moved-oracle-store/invariant.json"),
+            dir.join("invariant.json"),
+        )
+        .unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let err = source
+            .standing_graders_for(&task("task-alpha"))
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+
+        let committed = tree(&tmp, "tree");
+        let verdict = evaluate(&task("task-alpha"), &root, &committed, "run-1").await;
+        assert_eq!(verdict.outcome, GateOutcome::Fail);
+    }
+
+    #[test]
+    fn dangling_symlink_standing_dir_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("held_out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("moved-standing"),
+            root.join(STANDING_SUBDIR),
+        )
+        .unwrap();
+        let source = FilesystemHeldOutGraderSource::new(&root);
+        let err = source
+            .standing_graders_for(&task("task-alpha"))
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be listed"), "{err}");
     }
 
     #[test]

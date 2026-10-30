@@ -834,6 +834,14 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
         DEFAULT_CHECKPOINT_NUDGE_SECONDS,
         "worker.checkpoint_nudge_seconds",
     )?;
+    if worker_checkpoint_nudge_seconds < 0.0 {
+        return Err(ctx.err("worker.checkpoint_nudge_seconds must be >= 0 (0 disables the nudge)"));
+    }
+    // An infinite threshold would nudge at the start of every iteration.
+    ctx.require_duration_seconds(
+        worker_checkpoint_nudge_seconds,
+        "worker.checkpoint_nudge_seconds",
+    )?;
     let worker_session_pause_ceiling_seconds = ctx.override_float(
         worker,
         "session_pause_ceiling_seconds",
@@ -1085,6 +1093,19 @@ impl Ctx<'_> {
         }
     }
 
+    /// Reject a seconds value that is not a representable [`Duration`]:
+    /// `inf`/`nan` (valid TOML floats) and finite values past ~1.8e19.
+    /// Callers check their own sign/zero rule first.
+    fn require_duration_seconds(&self, seconds: f64, path: &str) -> Result<(), PolicyError> {
+        if std::time::Duration::try_from_secs_f64(seconds).is_err() {
+            return Err(self.err(format!(
+                "{path} must be a finite number of seconds within the duration range, got {}",
+                py_float_repr(seconds)
+            )));
+        }
+        Ok(())
+    }
+
     /// A numeric override accepting an integer or a float; booleans rejected.
     fn override_float(
         &self,
@@ -1274,13 +1295,16 @@ impl Ctx<'_> {
         let max_wall = match table.get("recovery_agent_max_wall_seconds") {
             None => DEFAULT_RECOVERY_AGENT_MAX_WALL_SECONDS,
             Some(value) => match as_number(value) {
-                Some(wall) if wall > 0.0 => wall,
+                Some(wall) if wall > 0.0 || wall.is_nan() => wall,
                 _ => {
                     return Err(self
                         .err("submit.recovery_agent_max_wall_seconds must be a positive number"));
                 }
             },
         };
+        // The session timeout is a Duration: an infinite value silently
+        // dropped the ceiling and a huge finite one panicked converting it.
+        self.require_duration_seconds(max_wall, "submit.recovery_agent_max_wall_seconds")?;
         Ok((max_turns, max_wall))
     }
 
@@ -1331,6 +1355,8 @@ impl Ctx<'_> {
         if interval <= 0.0 {
             return Err(self.err("autopilot.interval_seconds must be positive"));
         }
+        // NaN skipped the sleep entirely (back-to-back cycles).
+        self.require_duration_seconds(interval, "autopilot.interval_seconds")?;
         let Some(weights_value) = table.get("weights") else {
             return Ok((target_depth, landing, interval, None));
         };
@@ -1417,6 +1443,8 @@ impl Ctx<'_> {
         if interval <= 0.0 {
             return Err(self.err("triage.interval_seconds must be positive"));
         }
+        // NaN skipped the sleep entirely (back-to-back passes against gh).
+        self.require_duration_seconds(interval, "triage.interval_seconds")?;
         if !table.contains_key("max_per_pass") {
             return Ok((
                 intake_label,
@@ -2561,6 +2589,42 @@ mod tests {
         assert_eq!(
             err_top("worker = 1\n"),
             format!("{FILE}: [worker] must be a table")
+        );
+    }
+
+    #[test]
+    fn duration_valued_knobs_reject_seconds_outside_the_duration_range() {
+        // `inf`/`nan` are valid TOML floats and 1e20 overflows `Duration`;
+        // each used to load and then hot-loop (NaN interval), nudge at
+        // iteration start (inf nudge), drop the ceiling (inf recovery wall)
+        // or panic converting to a Duration (1e20 recovery wall).
+        for bad in ["inf", "nan", "1e20"] {
+            for (table, key) in [
+                ("autopilot", "interval_seconds"),
+                ("triage", "interval_seconds"),
+                ("worker", "checkpoint_nudge_seconds"),
+                ("submit", "recovery_agent_max_wall_seconds"),
+            ] {
+                let err = err_dir(&format!("[{table}]\n{key} = {bad}\n"));
+                assert!(
+                    err.contains(&format!(
+                        "{table}.{key} must be a finite number of seconds within the duration range"
+                    )),
+                    "{table}.{key} = {bad}: {err}"
+                );
+            }
+        }
+        assert_eq!(
+            err_dir("[worker]\ncheckpoint_nudge_seconds = -1\n"),
+            format!("{FILE}: worker.checkpoint_nudge_seconds must be >= 0 (0 disables the nudge)")
+        );
+        assert_eq!(
+            ok_dir("[worker]\ncheckpoint_nudge_seconds = 0\n").worker_checkpoint_nudge_seconds,
+            0.0
+        );
+        assert_eq!(
+            ok_dir("[autopilot]\ninterval_seconds = 1e9\n").autopilot_interval_seconds,
+            1e9
         );
     }
 

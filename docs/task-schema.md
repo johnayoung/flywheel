@@ -39,7 +39,7 @@ A bundle of optional briefing fields. Provide none, one, or all. Use these to gi
 
 ## Budgets
 
-Harness knobs, not agent-facing context: a task that legitimately outgrows a repo-wide ceiling (e.g. a golden-record run longer than the default 3600s iteration deadline) declares its own budget instead of the operator loosening the ceiling for every task. Every field is optional; unset inherits the `[deadlines]`/harness value. Seconds fields follow the `[deadlines]` convention: positive = ceiling, `0` = unbounded opt-out for this task.
+Harness knobs, not agent-facing context: a task that legitimately outgrows a repo-wide ceiling (e.g. a golden-record run longer than the default 3600s iteration deadline) declares its own budget instead of the operator loosening the ceiling for every task. Every field is optional; unset inherits the `[deadlines]`/harness value. Seconds fields follow the `[deadlines]` convention: positive = ceiling, `0` = unbounded opt-out for this task. Negative, non-finite, or past-`Duration`-range (~1.8e19) seconds fail validation.
 
 | Field                     | Type   | Overrides                                             |
 | ------------------------- | ------ | ----------------------------------------------------- |

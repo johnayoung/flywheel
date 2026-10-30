@@ -126,12 +126,14 @@ pub struct DeadlineConfigError {
 /// Map a raw per-class override to a resolved ceiling.
 ///
 /// `None` and any value that is not a finite positive number are the
-/// unbounded opt-out and resolve to `None`; a finite positive value resolves
-/// to itself. This is the single place that distinguishes "operator opted
+/// unbounded opt-out and resolve to `None`, as is a value too large to be a
+/// [`Duration`] (past ~1.8e19 seconds -- unbounded in every practical sense,
+/// and converting it would panic); any other positive value resolves to
+/// itself. This is the single place that distinguishes "operator opted
 /// this class out" from "operator gave no override" -- the latter never
 /// reaches here (the caller keys on presence and uses the default instead).
 fn normalize_override(value: Option<f64>) -> Option<f64> {
-    value.filter(|v| v.is_finite() && *v > 0.0)
+    value.filter(|v| *v > 0.0 && Duration::try_from_secs_f64(*v).is_ok())
 }
 
 /// Resolved wall-clock ceilings for the five external-call classes.
@@ -177,9 +179,13 @@ impl DeadlineConfig {
     }
 
     /// The resolved ceiling as a [`Duration`], ready to hand to
-    /// [`crate::deadline::Deadline::new`]. `None` is the unbounded opt-out.
+    /// [`crate::deadline::Deadline::new`]. `None` is the unbounded opt-out,
+    /// which also covers a directly built or deserialized ceiling that is
+    /// not a representable duration.
+    #[must_use]
     pub fn duration_for_class(&self, deadline_class: DeadlineClass) -> Option<Duration> {
-        self.for_class(deadline_class).map(Duration::from_secs_f64)
+        self.for_class(deadline_class)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
     }
 
     fn set(&mut self, deadline_class: DeadlineClass, ceiling: Option<f64>) {
@@ -325,6 +331,26 @@ mod tests {
                 assert_ne!(config.for_class(class), Some(class.default_seconds()));
             }
         }
+    }
+
+    #[test]
+    fn override_past_the_duration_range_opts_out_instead_of_panicking() {
+        for class in DeadlineClass::ALL {
+            let config = resolve_deadlines([(class, Some(1e20))]);
+            assert_eq!(config.for_class(class), None, "{class}");
+            assert_eq!(config.duration_for_class(class), None, "{class}");
+        }
+        let mapped =
+            deadline_config_from_mapping(Some(&table(json!({"agent_iteration_seconds": 1e300}))))
+                .unwrap();
+        assert_eq!(mapped.agent_iteration_seconds, None);
+        // A directly built (or deserialized) config bypasses normalization;
+        // the Duration accessor still never panics.
+        let raw = DeadlineConfig {
+            rubric_judge_seconds: Some(1e300),
+            ..DeadlineConfig::default()
+        };
+        assert_eq!(raw.duration_for_class(DeadlineClass::RubricJudge), None);
     }
 
     #[test]

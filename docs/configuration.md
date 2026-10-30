@@ -137,7 +137,7 @@ Worker pool size, checkpoint-nudge threshold, and session-pause ceiling for a si
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `concurrency` | int (>=1 once resolved) | `1` | how many tasks one `flywheel worker` invocation drives concurrently |
-| `checkpoint_nudge_seconds` | float (>= 0) | `300.0` | remaining wall time to a task's `AGENT_ITERATION` deadline at which the harness nudges the agent to commit work-in-progress, when its branch has gained no new commit; `0` disables |
+| `checkpoint_nudge_seconds` | finite float (>= 0; negative/`inf`/`nan` rejected) | `300.0` | remaining wall time to a task's `AGENT_ITERATION` deadline at which the harness nudges the agent to commit work-in-progress, when its branch has gained no new commit; `0` disables |
 | `session_pause_ceiling_seconds` | finite float (>= 0; `inf`/`nan` rejected) | `21600.0` | ceiling (seconds) clamping a session-limit-driven pool-wide claim pause; `0` disables pausing entirely |
 
 `--concurrency` overrides this value per-run (flag wins). An absent `[worker]` table means `concurrency = 1` — single serial worker, today's behavior byte-for-byte. A resolved value below `1` (e.g. `--concurrency 0`, a negative, or a non-integer flag) is a hard error: the worker exits non-zero naming the setting and claims no task (`resolve_concurrency`, `crates/flywheel-worktree/src/daemon.rs`). The `< 1` range is *not* checked at load time because the flag can override the config, so a config of `0` with `--concurrency 3` is valid.
@@ -159,7 +159,7 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 | `base` | str | unset (checked-out branch) | explicit landing/phase-base branch |
 | `verify` | str (shell) | unset (no gate) | standing build invariant re-run under the merge lock against the exact tree about to become the base, on every land path; a non-zero exit refuses landing and parks the work (`park_kind="standing-verify"`) |
 | `recovery_agent_max_turns` | int (>= 0) | `30` | turn ceiling for the bounded conflict-resolution session on the `merge` strategy's fallback rung; `0` disables the rung (a merge conflict parks exactly as before) |
-| `recovery_agent_max_wall_seconds` | float (> 0) | `900.0` | wall-clock ceiling for that same session; the session is cancelled and the run parks preserved when it is exceeded |
+| `recovery_agent_max_wall_seconds` | finite float (> 0; `inf`/`nan` rejected) | `900.0` | wall-clock ceiling for that same session; the session is cancelled and the run parks preserved when it is exceeded |
 
 `protected_paths` is honored by both strategies; it protects the verification surface — grader configs, CI, harness state — from being rewritten by the work it judges.
 
@@ -214,7 +214,7 @@ Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.m
 |-----|------|---------|----------|
 | `target_depth` | int (>0) | `5` | how deep autopilot fills the queue |
 | `landing` | enum `merge`/`pr` | `merge` | landing posture for autopilot-authored work |
-| `interval_seconds` | float (>0) | `300.0` | seconds between daemon cycles |
+| `interval_seconds` | finite float (>0; `inf`/`nan` rejected) | `300.0` | seconds between daemon cycles |
 | `authoring_concurrency` | int (>0) | `3` | authoring sessions run at once per pass; `1` = serial. Emission order and the per-pass write cap are unchanged |
 | `discovery_cache_ttl_seconds` | float (>=0) | `21600.0` | lifetime of cached discovery verdicts (keyed on HEAD + working tree); `0` disables the cache |
 
@@ -240,7 +240,7 @@ Board labels and cadence for the `flywheel triage` intake daemon (`fw triage`). 
 | `intake_label` | string | `flywheel` | label whose issues are triage candidates |
 | `ready_label` | string | `flywheel:ready` | label applied to a well-specified (fail-first) issue |
 | `needs_detail_label` | string | `flywheel:needs-detail` | label applied to an under-specified issue |
-| `interval_seconds` | float (>0) | `300.0` | seconds between daemon cycles |
+| `interval_seconds` | finite float (>0; `inf`/`nan` rejected) | `300.0` | seconds between daemon cycles |
 | `max_per_pass` | int (>0) | unset (uncapped) | candidates processed per pass; the remainder defers to a later pass |
 
 The triage CLI flags `--interval`/`--model` override the corresponding `[triage]`/`[agent]` keys.
@@ -257,7 +257,7 @@ Default-on, per-class wall-clock ceilings (seconds) for the five external-call c
 | `docker_management_seconds` | float (`0` = unbounded) | `120` | docker management-call ceiling (container backend) |
 | `autopilot_agent_seconds` | float (`0` = unbounded) | `1800` | discovery/authoring agent ceiling (autopilot daemon) |
 
-Consumed only by those three layers; a negative value resolves to the same unbounded opt-out as `0`. A task's own `budgets` object (see [task-schema.md](task-schema.md)) overrides `agent_iteration_seconds` and `rubric_judge_seconds` for that task alone — the heavyweight tail declares its ceiling per task instead of the repo loosening a class-wide one.
+Consumed only by those three layers; a negative, non-finite, or out-of-range (past ~1.8e19) value resolves to the same unbounded opt-out as `0`. Every other seconds-valued knob in this file rejects a value outside the `Duration` range (`inf`, `nan`, past ~1.8e19) at load. A task's own `budgets` object (see [task-schema.md](task-schema.md)) overrides `agent_iteration_seconds` and `rubric_judge_seconds` for that task alone — the heavyweight tail declares its ceiling per task instead of the repo loosening a class-wide one.
 
 ## `[sandbox.*]`
 

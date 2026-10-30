@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Write as _};
+use std::time::Duration;
 
 /// Raised when a task or grader violates `docs/task-schema.md`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -429,6 +430,14 @@ impl TaskBudgets {
                      the ceiling entirely)"
                 )));
             }
+            // The harness converts the ceiling to a `Duration`, which panics
+            // past ~1.8e19 seconds; `0` is the spelling for "no ceiling".
+            if Duration::try_from_secs_f64(value).is_err() {
+                return Err(ValidationError::new(format!(
+                    "budgets.{name} is too large to be a duration (0 opts \
+                     this task out of the ceiling entirely)"
+                )));
+            }
         }
         if let Some(turns) = self.rubric_judge_max_turns
             && turns < 1
@@ -630,7 +639,15 @@ mod tests {
         b.validate().unwrap();
         b.agent_iteration_seconds = Some(Seconds::Float(-1.0));
         assert!(b.validate().is_err());
+        // Past the Duration range: the harness would panic converting it.
+        b.agent_iteration_seconds = Some(Seconds::Float(1e20));
+        assert!(b.validate().is_err());
         b.agent_iteration_seconds = None;
+        b.rubric_judge_seconds = Some(Seconds::Float(f64::MAX));
+        assert!(b.validate().is_err());
+        b.rubric_judge_seconds = Some(Seconds::Int(86_400 * 365));
+        b.validate().unwrap();
+        b.rubric_judge_seconds = None;
         b.rubric_judge_max_turns = Some(0);
         assert!(b.validate().is_err());
     }

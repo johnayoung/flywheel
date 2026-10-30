@@ -278,8 +278,7 @@ impl AgentRuntime {
 fn timeout_of(request: &RunRequest) -> Option<Duration> {
     request
         .timeout_seconds
-        .filter(|s| s.is_finite() && *s >= 0.0)
-        .map(Duration::from_secs_f64)
+        .and_then(|s| Duration::try_from_secs_f64(s).ok())
 }
 
 enum Halt {
@@ -399,6 +398,8 @@ mod tests {
         assert_eq!(timeout_of(&request(None)), None);
         assert_eq!(timeout_of(&request(Some(-1.0))), None);
         assert_eq!(timeout_of(&request(Some(f64::NAN))), None);
+        // Finite but past the Duration range: no ceiling, never a panic.
+        assert_eq!(timeout_of(&request(Some(1e20))), None);
         assert_eq!(
             timeout_of(&request(Some(2.5))),
             Some(Duration::from_millis(2500))

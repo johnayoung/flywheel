@@ -24,7 +24,7 @@ use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{GraderResultStore, LifecycleFilter, LifecycleStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -227,31 +227,53 @@ pub fn task_state<S: LifecycleStore + ?Sized>(
 /// Items come from any `WorkSource`; the row carries the item's
 /// `source_ref` and (for file-backed sources) its `local_path` so
 /// downstream consumers keep their path-derived behavior.
+///
+/// One cross-task read covers every item: the store's
+/// `(updated_at DESC, run_id DESC)` order survives grouping by task id, so
+/// each task's slice is exactly what [`task_state`] would have read.
 pub fn status_rows_for_items<S: LifecycleStore + ?Sized>(
     items: &[WorkItem],
     store: &S,
 ) -> Result<Vec<TaskStatusRow>, StoreError> {
-    items
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let task_ids: BTreeSet<&str> = items.iter().map(|item| item.task.id.as_str()).collect();
+    let filter = LifecycleFilter::default().with_task_ids(task_ids);
+    let mut by_task: HashMap<String, Vec<Lifecycle>> = HashMap::new();
+    for lifecycle in store.list_lifecycles(&filter)? {
+        by_task
+            .entry(lifecycle.task_id.clone())
+            .or_default()
+            .push(lifecycle);
+    }
+    Ok(items
         .iter()
         .map(|item| {
-            let mut row = task_state(store, &item.task.id)?;
+            let lifecycles = by_task.get(&item.task.id).map_or(&[][..], Vec::as_slice);
+            let mut row = classify_lifecycles(&item.task.id, lifecycles);
             row.task_file = item.local_path.clone();
             row.prerequisites = item.prerequisites.clone();
             row.source_ref = item.source_ref.clone();
-            Ok(row)
+            row
         })
-        .collect()
+        .collect())
 }
 
-/// Whether `store` holds a DONE lifecycle for `task_id`.
-fn has_done_lifecycle<S: LifecycleStore + ?Sized>(
+/// The subset of `task_ids` holding a DONE lifecycle in `store`, in one
+/// read.
+fn tasks_with_done_lifecycle<S: LifecycleStore + ?Sized>(
     store: &S,
-    task_id: &str,
-) -> Result<bool, StoreError> {
+    task_ids: &BTreeSet<&str>,
+) -> Result<BTreeSet<String>, StoreError> {
     let filter = LifecycleFilter::default()
         .with_statuses([Status::Done])
-        .with_task_id(task_id);
-    Ok(!store.list_lifecycles(&filter)?.is_empty())
+        .with_task_ids(task_ids.iter().copied());
+    Ok(store
+        .list_lifecycles(&filter)?
+        .into_iter()
+        .map(|lifecycle| lifecycle.task_id)
+        .collect())
 }
 
 /// The `archive/` sibling of the rows' `active/` tasks tree, if any.
@@ -317,9 +339,10 @@ pub fn satisfied_prerequisites_from_store<S: LifecycleStore + ?Sized>(
         return Ok(BTreeSet::new());
     }
     let archive_root = archive_root_for_rows(rows);
+    let done_in_store = tasks_with_done_lifecycle(store, &candidates)?;
     let mut satisfied = BTreeSet::new();
     for id in candidates {
-        let done = has_done_lifecycle(store, id)?
+        let done = done_in_store.contains(id)
             || archive_root
                 .as_deref()
                 .is_some_and(|root| archived_task_file_exists(root, id));
@@ -958,6 +981,137 @@ mod tests {
         assert_eq!(rows[1].state, TaskState::Done);
         assert_eq!(rows[1].latest_run_id.as_deref(), Some("run-d-fail"));
         assert_eq!(rows[1].task_file, item("d", "p", &[]).local_path);
+    }
+
+    #[test]
+    fn batched_classification_matches_per_task_reads_on_sqlite() {
+        use flywheel_core::store_sqlite::SqliteStore;
+        type Run<'a> = (&'a str, &'a str, &'a [(Status, &'a str)]);
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(dir.path().join("flywheel.db")).unwrap();
+        let runs: [Run; 6] = [
+            (
+                "done-then-failed",
+                "r1",
+                &[
+                    (Status::Ready, ""),
+                    (Status::Running, ""),
+                    (Status::Validating, ""),
+                    (Status::Done, ""),
+                ],
+            ),
+            (
+                "done-then-failed",
+                "r2",
+                &[
+                    (Status::Ready, ""),
+                    (Status::Running, ""),
+                    (Status::Failed, "late"),
+                ],
+            ),
+            (
+                "retryable",
+                "r3",
+                &[
+                    (Status::Ready, ""),
+                    (Status::Running, ""),
+                    (Status::Failed, "boom"),
+                ],
+            ),
+            (
+                "in-progress",
+                "r4",
+                &[(Status::Ready, ""), (Status::Running, "")],
+            ),
+            (
+                "interrupted",
+                "r5",
+                &[
+                    (Status::Ready, ""),
+                    (Status::Running, ""),
+                    (Status::Interrupted, ""),
+                ],
+            ),
+            ("not-listed", "r6", &[(Status::Ready, "")]),
+        ];
+        for (task_id, run_id, path) in runs {
+            store
+                .create_lifecycle(&lifecycle_through(task_id, run_id, path))
+                .unwrap();
+        }
+        let items = [
+            item("fresh", "p", &[]),
+            item("done-then-failed", "p", &[]),
+            item("retryable", "p", &["done-then-failed"]),
+            item("in-progress", "q", &[]),
+            item("interrupted", "q", &["retryable", "fresh"]),
+            item("retryable", "q", &[]),
+        ];
+        let batched = status_rows_for_items(&items, &store).unwrap();
+        let per_task: Vec<TaskStatusRow> = items
+            .iter()
+            .map(|item| {
+                let mut row = task_state(&store, &item.task.id).unwrap();
+                row.task_file = item.local_path.clone();
+                row.prerequisites = item.prerequisites.clone();
+                row.source_ref = item.source_ref.clone();
+                row
+            })
+            .collect();
+        assert_eq!(batched, per_task);
+        let states: Vec<TaskState> = batched.iter().map(|row| row.state).collect();
+        assert_eq!(
+            states,
+            [
+                TaskState::Fresh,
+                TaskState::Done,
+                TaskState::Retryable,
+                TaskState::InProgress,
+                TaskState::Interrupted,
+                TaskState::Retryable,
+            ]
+        );
+        assert!(status_rows_for_items(&[], &store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlisted_prerequisites_resolve_against_sqlite_in_one_read() {
+        use flywheel_core::store_sqlite::SqliteStore;
+        let dir = TempDir::new().unwrap();
+        let store = SqliteStore::open(dir.path().join("flywheel.db")).unwrap();
+        let done = [
+            (Status::Ready, ""),
+            (Status::Running, ""),
+            (Status::Validating, ""),
+            (Status::Done, ""),
+        ];
+        store
+            .create_lifecycle(&lifecycle_through("gone-done", "r1", &done))
+            .unwrap();
+        store
+            .create_lifecycle(&lifecycle_through(
+                "gone-failed",
+                "r2",
+                &[
+                    (Status::Ready, ""),
+                    (Status::Running, ""),
+                    (Status::Failed, "x"),
+                ],
+            ))
+            .unwrap();
+        let rows = status_rows_for_items(
+            &[item(
+                "dependent",
+                "p",
+                &["gone-done", "gone-failed", "gone-missing"],
+            )],
+            &store,
+        )
+        .unwrap();
+        assert_eq!(
+            satisfied_prerequisites_from_store(&rows, &store).unwrap(),
+            BTreeSet::from(["gone-done".to_owned()])
+        );
     }
 
     // --- prerequisites ------------------------------------------------------

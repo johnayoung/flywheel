@@ -1220,6 +1220,41 @@ fn list_lifecycles_filters_and_orders_by_most_recent_write(store: &dyn HarnessSt
     );
     assert!(run_ids(&LifecycleFilter::default().with_statuses([])).is_empty());
     assert!(run_ids(&LifecycleFilter::default().with_task_id("task-z")).is_empty());
+    // A task-id set keeps the global order across the member tasks.
+    assert_eq!(
+        run_ids(&LifecycleFilter::default().with_task_ids(["task-b", "task-a", "task-z"])),
+        vec!["r-a", "r-c", "r-b"]
+    );
+    assert_eq!(
+        run_ids(&LifecycleFilter::default().with_task_ids(["task-b"])),
+        vec!["r-b"]
+    );
+    assert_eq!(
+        run_ids(
+            &LifecycleFilter::default()
+                .with_statuses([Status::Ready, Status::Pending])
+                .with_task_ids(["task-a", "task-b"])
+        ),
+        vec!["r-c", "r-b"]
+    );
+    assert_eq!(
+        run_ids(
+            &LifecycleFilter::default()
+                .with_task_id("task-a")
+                .with_task_ids(["task-b"])
+        ),
+        Vec::<String>::new()
+    );
+    assert!(run_ids(&LifecycleFilter::default().with_task_ids(Vec::<String>::new())).is_empty());
+    // The set form attaches attempts exactly like the single-task form.
+    assert_eq!(
+        store
+            .list_lifecycles(&LifecycleFilter::default().with_task_ids(["task-a"]))
+            .unwrap(),
+        store
+            .list_lifecycles(&LifecycleFilter::default().with_task_id("task-a"))
+            .unwrap()
+    );
     // Each element is the fully folded lifecycle, attempts attached.
     let listed = store
         .list_lifecycles(&LifecycleFilter::default().with_task_id("task-a"))

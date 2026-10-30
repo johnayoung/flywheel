@@ -1029,6 +1029,13 @@ fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql 
         params.push(Box::new(task_id.clone()));
         clauses.push(format!("l.task_id = ${}", params.len()));
     }
+    if let Some(task_ids) = &filter.task_ids {
+        if task_ids.is_empty() {
+            return None;
+        }
+        params.push(Box::new(task_ids.clone()));
+        clauses.push(format!("l.task_id = ANY(${})", params.len()));
+    }
     let where_clause = if clauses.is_empty() {
         String::new()
     } else {
@@ -1954,6 +1961,18 @@ mod tests {
         .unwrap();
         assert_eq!(where_clause, "WHERE l.status = ANY($1) AND l.task_id = $2");
         assert_eq!(params.len(), 2);
+        let (where_clause, params) = filter_clause(
+            &LifecycleFilter::default()
+                .with_task_id("t")
+                .with_task_ids(["t", "u"]),
+        )
+        .unwrap();
+        assert_eq!(where_clause, "WHERE l.task_id = $1 AND l.task_id = ANY($2)");
+        assert_eq!(params.len(), 2);
+        assert!(
+            filter_clause(&LifecycleFilter::default().with_task_ids(Vec::<String>::new()))
+                .is_none()
+        );
         assert!(filter_clause(&LifecycleFilter::default().with_statuses([])).is_none());
         let (empty, none) = filter_clause(&LifecycleFilter::default()).unwrap();
         assert_eq!(empty, "");

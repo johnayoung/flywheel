@@ -614,6 +614,18 @@ fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql>
         clauses.push(format!("l.task_id = ?{}", params.len() + 1));
         params.push(Box::new(task_id.clone()));
     }
+    if let Some(task_ids) = &filter.task_ids {
+        if task_ids.is_empty() {
+            return None;
+        }
+        // One JSON-array parameter rather than one placeholder per id, so the
+        // set size is not bounded by SQLITE_MAX_VARIABLE_NUMBER.
+        clauses.push(format!(
+            "l.task_id IN (SELECT value FROM json_each(?{}))",
+            params.len() + 1
+        ));
+        params.push(Box::new(Value::from(task_ids.clone()).to_string()));
+    }
     let where_clause = if clauses.is_empty() {
         String::new()
     } else {

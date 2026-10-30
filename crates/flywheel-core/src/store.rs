@@ -502,7 +502,7 @@ impl SpendWindow {
     }
 }
 
-/// The optional filters for [`LifecycleStore::list_lifecycles`]. Both
+/// The optional filters for [`LifecycleStore::list_lifecycles`]. All
 /// compose with AND; the default applies no filter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleFilter {
@@ -510,16 +510,32 @@ pub struct LifecycleFilter {
     /// is a member (an empty set matches nothing).
     pub statuses: Option<Vec<Status>>,
     pub task_id: Option<String>,
+    /// `None` applies no task-set filter; `Some(set)` keeps rows whose task
+    /// id is a member (an empty set matches nothing). Lets a caller classify
+    /// many tasks with one read instead of one read per task.
+    pub task_ids: Option<Vec<String>>,
 }
 
 impl LifecycleFilter {
+    #[must_use]
     pub fn with_statuses(mut self, statuses: impl IntoIterator<Item = Status>) -> Self {
         self.statuses = Some(statuses.into_iter().collect());
         self
     }
 
+    #[must_use]
     pub fn with_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.task_id = Some(task_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_task_ids<I, T>(mut self, task_ids: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.task_ids = Some(task_ids.into_iter().map(Into::into).collect());
         self
     }
 
@@ -533,6 +549,11 @@ impl LifecycleFilter {
         }
         if let Some(task_id) = &self.task_id
             && task_id != &lifecycle.task_id
+        {
+            return false;
+        }
+        if let Some(task_ids) = &self.task_ids
+            && !task_ids.contains(&lifecycle.task_id)
         {
             return false;
         }

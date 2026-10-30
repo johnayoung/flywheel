@@ -293,6 +293,22 @@ pub async fn redrive_parked_landings(
                 &mut log_line,
             )
             .await;
+            // Landing is irreversible: confirm the lease synchronously first
+            // (the heartbeat flag only reflects its last tick). A peer that
+            // stole it owns the task now; retry on a later pass.
+            match heartbeat.confirm() {
+                Ok(true) => {}
+                Ok(false) => {
+                    let latest = heartbeat.stop();
+                    ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
+                    break;
+                }
+                Err(err) => {
+                    let latest = heartbeat.stop();
+                    ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
+                    return Err(err.into());
+                }
+            }
             let submit_outcome = match &decision {
                 LandingDecision::Land { .. } => submit_guarded(ctx.strategy, request),
                 LandingDecision::Park { detail, .. } => {

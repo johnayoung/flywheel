@@ -102,8 +102,13 @@ struct RunGuard {
 }
 
 impl RunGuard {
-    fn lost(&self) -> bool {
-        self.heartbeat.as_ref().is_some_and(ClaimHeartbeat::lost)
+    /// Synchronously confirm the lease is still ours (see
+    /// [`ClaimHeartbeat::confirm`]); a settled guard holds no lease.
+    fn confirm(&self) -> Result<bool, crate::claims::ClaimStoreError> {
+        match &self.heartbeat {
+            Some(heartbeat) => heartbeat.confirm(),
+            None => Ok(false),
+        }
     }
 
     fn settle(&mut self) {
@@ -328,7 +333,10 @@ pub(super) async fn drive_under_lease(
             }
         }
     }
-    if guard.lost() {
+    // Confirm ownership synchronously: the heartbeat's flag only reflects
+    // its last tick, so a lease stolen since then would otherwise go
+    // unnoticed and the gate below would record against a peer's task.
+    if !guard.confirm()? {
         guard.finish();
         return Err(DriveError::ClaimLost(task_id));
     }
@@ -375,6 +383,12 @@ pub(super) async fn drive_under_lease(
             (Some(verdict.outcome), verdict.reason.clone())
         }
     };
+    // Landing is irreversible: re-confirm the lease right before it (the
+    // held-out gate can run long enough for the lease to be stolen).
+    if !guard.confirm()? {
+        guard.finish();
+        return Err(DriveError::ClaimLost(task_id));
+    }
     if decision.lands() {
         submit_guarded(ctx.strategy.as_ref(), &submit_request);
     }

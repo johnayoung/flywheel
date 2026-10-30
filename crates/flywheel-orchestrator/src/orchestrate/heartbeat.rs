@@ -20,7 +20,10 @@ use std::time::Duration;
 
 /// Renews one claim every `interval` seconds until stopped.
 pub struct ClaimHeartbeat {
+    claims: Arc<dyn ClaimStore>,
     claim: Arc<Mutex<TaskClaim>>,
+    lease_seconds: f64,
+    now: Clock,
     lost: Arc<AtomicBool>,
     finished: Arc<(Mutex<bool>, Condvar)>,
     stop: Option<Sender<()>>,
@@ -63,6 +66,8 @@ impl ClaimHeartbeat {
         let finished = Arc::new((Mutex::new(false), Condvar::new()));
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let thread = {
+            let claims = Arc::clone(&claims);
+            let now = Arc::clone(&now);
             let claim = Arc::clone(&claim);
             let lost = Arc::clone(&lost);
             let finished = Arc::clone(&finished);
@@ -77,16 +82,14 @@ impl ClaimHeartbeat {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {}
                     }
-                    let current = match claim.lock() {
-                        Ok(guard) => guard.clone(),
-                        Err(_) => break,
+                    // Hold the token across the renew so a concurrent
+                    // `confirm` never renews the same version (which would
+                    // read as a spurious loss).
+                    let Ok(mut current) = claim.lock() else {
+                        break;
                     };
                     match claims.renew_claim(&current, now(), lease_seconds) {
-                        Ok(renewed) => {
-                            if let Ok(mut guard) = claim.lock() {
-                                *guard = renewed;
-                            }
-                        }
+                        Ok(renewed) => *current = renewed,
                         Err(ClaimStoreError::ClaimLost(_)) => {
                             // Signal the driving future that the lease was
                             // stolen so it stops before writing a terminal
@@ -106,7 +109,10 @@ impl ClaimHeartbeat {
             })?
         };
         Ok(Self {
+            claims,
             claim,
+            lease_seconds,
+            now,
             lost,
             finished,
             stop: Some(stop_tx),
@@ -118,6 +124,42 @@ impl ClaimHeartbeat {
     /// True once renewal has observed the lease was stolen by a peer.
     pub fn lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
+    }
+
+    /// Prove the lease is still ours at this instant by renewing it now.
+    ///
+    /// [`lost`](Self::lost) only reflects the most recent timer tick, so a
+    /// peer that stole the lease after that tick (the worker was suspended
+    /// past the window, or a peer's clock ran ahead) is invisible to it for
+    /// up to a full interval. Call this immediately before an irreversible
+    /// step (landing, reporting) so a stolen lease is observed
+    /// synchronously. Returns `Ok(false)` (and raises the `lost` flag) when a
+    /// peer now owns the claim; a successful renewal also extends the lease
+    /// across the step that follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error when ownership cannot be established either
+    /// way (the token mutex is poisoned, or the renew failed transiently).
+    pub fn confirm(&self) -> Result<bool, ClaimStoreError> {
+        if self.lost() {
+            return Ok(false);
+        }
+        let mut current = self.claim.lock().map_err(|_| ClaimStoreError::Poisoned)?;
+        match self
+            .claims
+            .renew_claim(&current, (self.now)(), self.lease_seconds)
+        {
+            Ok(renewed) => {
+                *current = renewed;
+                Ok(true)
+            }
+            Err(ClaimStoreError::ClaimLost(_)) => {
+                self.lost.store(true, Ordering::SeqCst);
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// The latest renewed token (for release).

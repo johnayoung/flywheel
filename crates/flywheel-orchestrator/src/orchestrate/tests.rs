@@ -2129,6 +2129,104 @@ async fn in_band_interrupt_is_contained_to_one_task() {
 }
 
 #[tokio::test]
+async fn lease_stolen_between_heartbeat_ticks_is_never_landed_or_reported() {
+    // The heartbeat interval (lease / 3 = 20 minutes) never elapses during
+    // the run, so its `lost` flag cannot observe the steal: only a
+    // synchronous ownership check before landing can.
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    let claims = f.claims.clone();
+    let thief: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        claims
+            .acquire_claim(
+                "solo",
+                "thief",
+                Utc::now() + ChronoDuration::hours(2),
+                3600.0,
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .expect("stolen");
+    });
+    f.runner.script(
+        "solo",
+        vec![Scripted::Hook {
+            hook: thief,
+            sleep_ms: 0,
+        }],
+    );
+    let source = MemorySource::new(vec![item("solo"), item("peer-work")]);
+    let mut req = f.request(source.clone());
+    req.strategy = Some(strategy.clone());
+    req.lease_seconds = 3600.0;
+    req.now = Some(Arc::new(Utc::now));
+    let report = run(req).await;
+    assert!(
+        strategy.submits().iter().all(|s| s.task_id != "solo"),
+        "a run whose lease a peer now owns must never land"
+    );
+    assert!(
+        source.reports().iter().all(|r| r.task_id != "solo"),
+        "never reported"
+    );
+    assert_eq!(ids(&report), ["peer-work"]);
+    assert!(
+        f.log
+            .contains("solo: claim lost mid-run (ClaimLostError); a peer took over, re-evaluating")
+    );
+    assert_eq!(
+        f.claims.load_claim("solo").unwrap().unwrap().worker_id,
+        "thief",
+        "stale release is a no-op"
+    );
+}
+
+#[test]
+fn heartbeat_confirm_renews_a_held_lease_and_reports_a_stolen_one() {
+    let store: Arc<dyn ClaimStore> = Arc::new(InMemoryClaimStore::new());
+    // Whole seconds: the store keeps microsecond precision.
+    let start = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+    let claim = store
+        .acquire_claim("t", "w", start, 10.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let heartbeat = ClaimHeartbeat::start(
+        store.clone(),
+        claim.clone(),
+        10.0,
+        3600.0,
+        Arc::new(move || start + ChronoDuration::seconds(5)),
+    )
+    .unwrap();
+    assert!(heartbeat.confirm().unwrap(), "held lease confirms");
+    let renewed = store.load_claim("t").unwrap().unwrap();
+    assert_eq!(renewed.version, claim.version + 1);
+    assert_eq!(
+        renewed.lease_expires_at,
+        start + ChronoDuration::seconds(15),
+        "confirm extends the lease"
+    );
+    assert_eq!(heartbeat.latest(), renewed);
+
+    store
+        .acquire_claim(
+            "t",
+            "w2",
+            start + ChronoDuration::seconds(60),
+            10.0,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .expect("stolen after lapse");
+    assert!(
+        !heartbeat.confirm().unwrap(),
+        "stolen lease does not confirm"
+    );
+    assert!(heartbeat.lost());
+    heartbeat.stop();
+}
+
+#[tokio::test]
 async fn heartbeat_renews_the_lease_and_signals_a_stolen_lease() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ClaimStore> =

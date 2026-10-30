@@ -925,6 +925,71 @@ fn landing_parked_round_trips_on_the_ledger(store: &dyn HarnessStore) {
     assert_eq!(replay(&events).unwrap(), folded);
 }
 
+fn latest_domain_event_of_kind_is_the_last_matching_ledger_row(store: &dyn HarnessStore) {
+    assert!(
+        store
+            .latest_domain_event_of_kind("ghost", DomainEventKind::LandingParked)
+            .unwrap()
+            .is_none()
+    );
+    drive_to_done(store, "r1");
+    drive_to_done(store, "r2");
+    assert!(
+        store
+            .latest_domain_event_of_kind("r1", DomainEventKind::LandingParked)
+            .unwrap()
+            .is_none(),
+        "a run with no event of the kind has none"
+    );
+    for (second, park_kind) in [(8, "divergent-base"), (9, "standing-verify")] {
+        let version = store.load_lifecycle("r1").unwrap().unwrap().version;
+        let parked = DomainEvent::new(
+            "r1",
+            t(second),
+            DomainEventPayload::LandingParked(LandingParked {
+                park_kind: park_kind.into(),
+                detail: format!("park at {second}"),
+                ..Default::default()
+            }),
+        );
+        store.append_domain_event(&parked, version).unwrap();
+    }
+    let events = store.list_domain_events("r1").unwrap();
+    for kind in [
+        DomainEventKind::LandingParked,
+        DomainEventKind::TransitionedTo,
+        DomainEventKind::LifecycleInitialized,
+    ] {
+        let expected = events.iter().rev().find(|e| e.kind() == kind).cloned();
+        assert!(expected.is_some(), "{kind:?} present on r1");
+        assert_eq!(
+            store.latest_domain_event_of_kind("r1", kind).unwrap(),
+            expected,
+            "{kind:?}"
+        );
+    }
+    let latest = store
+        .latest_domain_event_of_kind("r1", DomainEventKind::LandingParked)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.ts, t(9));
+    assert_eq!(latest.sequence, events.last().unwrap().sequence);
+    match &latest.payload {
+        DomainEventPayload::LandingParked(p) => {
+            assert_eq!(p.park_kind, "standing-verify");
+            assert_eq!(p.detail, "park at 9");
+        }
+        other => panic!("expected LandingParked, got {other:?}"),
+    }
+    assert!(
+        store
+            .latest_domain_event_of_kind("r2", DomainEventKind::LandingParked)
+            .unwrap()
+            .is_none(),
+        "scoped by run"
+    );
+}
+
 fn command_applied_round_trips_through_the_ledger(store: &dyn HarnessStore) {
     seed(store, "r1");
     let applied = DomainEvent::new(
@@ -1376,6 +1441,10 @@ const CASES: &[(&str, Case)] = &[
     (
         "landing_parked_round_trips_on_the_ledger",
         landing_parked_round_trips_on_the_ledger,
+    ),
+    (
+        "latest_domain_event_of_kind_is_the_last_matching_ledger_row",
+        latest_domain_event_of_kind_is_the_last_matching_ledger_row,
     ),
     (
         "command_applied_round_trips_through_the_ledger",

@@ -7,7 +7,9 @@ use std::io::Write;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use flywheel_core::events::{DomainEventPayload, LANDING_STRAND_KINDS, LandingParked};
+use flywheel_core::events::{
+    DomainEventKind, DomainEventPayload, LANDING_STRAND_KINDS, LandingParked,
+};
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, LifecycleFilter, StoreError};
 use flywheel_core::task::Grader;
@@ -110,10 +112,8 @@ fn landing_park_for_run(
     run_id: &str,
 ) -> Result<Option<Park>, StoreError> {
     Ok(store
-        .list_domain_events(run_id)?
-        .iter()
-        .rev()
-        .find_map(|event| match &event.payload {
+        .latest_domain_event_of_kind(run_id, DomainEventKind::LandingParked)?
+        .and_then(|event| match &event.payload {
             DomainEventPayload::LandingParked(parked) => Some(Park::from_event(event.ts, parked)),
             _ => None,
         }))

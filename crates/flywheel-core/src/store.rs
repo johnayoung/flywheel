@@ -20,7 +20,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::event_serde::EventSerdeError;
-use crate::events::{DomainEvent, EventReplayError};
+use crate::events::{DomainEvent, DomainEventKind, EventReplayError};
 use crate::lifecycle::{Attempt, Lifecycle, Status};
 use crate::task::{GraderType, Task};
 
@@ -697,6 +697,27 @@ pub trait DomainEventStore {
     /// The run's domain events in ascending `sequence` order, suitable for
     /// `crate::events::replay`. An unknown run yields an empty vector.
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError>;
+
+    /// The run's highest-`sequence` event of `kind`, or `None` (also for an
+    /// unknown run). Equivalent to the last `kind` event of
+    /// [`list_domain_events`](Self::list_domain_events); durable backends
+    /// override it with an indexed read that decodes only the one row, so
+    /// per-run probes ("is this run parked?") stay cheap on large ledgers.
+    ///
+    /// # Errors
+    ///
+    /// The backend's read failure, or a stored row that does not decode.
+    fn latest_domain_event_of_kind(
+        &self,
+        run_id: &str,
+        kind: DomainEventKind,
+    ) -> Result<Option<DomainEvent>, StoreError> {
+        Ok(self
+            .list_domain_events(run_id)?
+            .into_iter()
+            .rev()
+            .find(|event| event.kind() == kind))
+    }
 }
 
 /// Persistence contract for [`Attempt`] records, keyed by `(run_id, number)`.
@@ -897,6 +918,9 @@ macro_rules! forward_store_traits {
             }
             fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
                 (**self).list_domain_events(run_id)
+            }
+            fn latest_domain_event_of_kind(&self, run_id: &str, kind: DomainEventKind) -> Result<Option<DomainEvent>, StoreError> {
+                (**self).latest_domain_event_of_kind(run_id, kind)
             }
         }
 

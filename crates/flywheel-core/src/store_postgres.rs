@@ -71,7 +71,7 @@ use crate::event_serde::{
     EventSerdeError, event_kind, event_payload, format_timestamp, parse_timestamp,
     payload_from_value,
 };
-use crate::events::{DomainEvent, DomainEventPayload, apply};
+use crate::events::{DomainEvent, DomainEventKind, DomainEventPayload, apply};
 use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
@@ -1376,35 +1376,54 @@ fn insert_domain_event<C: GenericClient>(
     unsigned(sequence, "events.sequence")
 }
 
+const EVENT_COLUMNS: &str = "id, run_id, attempt_number, ts, kind, payload_json, sequence";
+
+fn decode_event_row(row: &Row) -> Result<DomainEvent, StoreError> {
+    let attempt_number: Option<i32> = col(row, 2)?;
+    let kind: String = col(row, 4)?;
+    let payload = json_object(col(row, 5)?)?;
+    let sequence: i64 = col(row, 6)?;
+    Ok(DomainEvent {
+        id: Some(col(row, 0)?),
+        run_id: col(row, 1)?,
+        attempt_number: attempt_number
+            .map(|n| unsigned(n, "events.attempt_number"))
+            .transpose()?,
+        ts: col(row, 3)?,
+        sequence: Some(unsigned(sequence, "events.sequence")?),
+        payload: payload_from_value(&kind, payload)?,
+    })
+}
+
 fn list_domain_event_rows<C: GenericClient>(
     c: &mut C,
     run_id: &str,
 ) -> Result<Vec<DomainEvent>, StoreError> {
     let rows = c
         .query(
-            "SELECT id, run_id, attempt_number, ts, kind, payload_json, sequence
-             FROM events WHERE run_id = $1 ORDER BY sequence",
+            &format!("SELECT {EVENT_COLUMNS} FROM events WHERE run_id = $1 ORDER BY sequence"),
             &[&run_id],
         )
         .map_err(db)?;
-    rows.iter()
-        .map(|row| {
-            let attempt_number: Option<i32> = col(row, 2)?;
-            let kind: String = col(row, 4)?;
-            let payload = json_object(col(row, 5)?)?;
-            let sequence: i64 = col(row, 6)?;
-            Ok(DomainEvent {
-                id: Some(col(row, 0)?),
-                run_id: col(row, 1)?,
-                attempt_number: attempt_number
-                    .map(|n| unsigned(n, "events.attempt_number"))
-                    .transpose()?,
-                ts: col(row, 3)?,
-                sequence: Some(unsigned(sequence, "events.sequence")?),
-                payload: payload_from_value(&kind, payload)?,
-            })
-        })
-        .collect()
+    rows.iter().map(decode_event_row).collect()
+}
+
+/// The run's highest-sequence `kind` row, decoding only that row.
+fn latest_domain_event_row_of_kind<C: GenericClient>(
+    c: &mut C,
+    run_id: &str,
+    kind: DomainEventKind,
+) -> Result<Option<DomainEvent>, StoreError> {
+    let row = c
+        .query_opt(
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = $1 AND kind = $2 \
+                 ORDER BY sequence DESC LIMIT 1"
+            ),
+            &[&run_id, &kind.as_str()],
+        )
+        .map_err(db)?;
+    row.as_ref().map(decode_event_row).transpose()
 }
 
 /// Maintain the attempts / grader_results read-model projections inside the
@@ -1700,6 +1719,15 @@ impl DomainEventStore for PostgresStore {
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
         let mut client = self.lock()?;
         list_domain_event_rows(&mut *client, run_id)
+    }
+
+    fn latest_domain_event_of_kind(
+        &self,
+        run_id: &str,
+        kind: DomainEventKind,
+    ) -> Result<Option<DomainEvent>, StoreError> {
+        let mut client = self.lock()?;
+        latest_domain_event_row_of_kind(&mut *client, run_id, kind)
     }
 }
 

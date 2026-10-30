@@ -11,7 +11,7 @@
 //! store row first, so the run file renders a self-contained timeline.
 
 use crate::event_serde::{event_kind, event_payload};
-use crate::events::DomainEvent;
+use crate::events::{DomainEvent, DomainEventKind};
 use crate::invoker_client::Clock;
 use crate::lifecycle::{Attempt, Lifecycle};
 use crate::store::{
@@ -251,6 +251,14 @@ impl DomainEventStore for MirroringStore {
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
         self.wrapped.list_domain_events(run_id)
+    }
+
+    fn latest_domain_event_of_kind(
+        &self,
+        run_id: &str,
+        kind: DomainEventKind,
+    ) -> Result<Option<DomainEvent>, StoreError> {
+        self.wrapped.latest_domain_event_of_kind(run_id, kind)
     }
 }
 

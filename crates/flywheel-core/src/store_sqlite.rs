@@ -54,7 +54,7 @@ use serde_json::{Map, Value};
 use crate::event_serde::{
     EventRow, EventSerdeError, event_from_row, event_to_row, format_timestamp, parse_timestamp,
 };
-use crate::events::{DomainEvent, DomainEventPayload, apply};
+use crate::events::{DomainEvent, DomainEventKind, DomainEventPayload, apply};
 use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
@@ -961,31 +961,56 @@ fn insert_domain_event(conn: &Connection, event: &DomainEvent) -> Result<u64, St
     Ok(sequence)
 }
 
+const EVENT_COLUMNS: &str = "id, run_id, attempt_number, ts, kind, payload_json, sequence";
+
+fn read_event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        attempt_number: row.get(2)?,
+        ts: row.get(3)?,
+        kind: row.get(4)?,
+        payload_json: row.get(5)?,
+        sequence: row.get(6)?,
+    })
+}
+
 fn list_domain_event_rows(conn: &Connection, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, run_id, attempt_number, ts, kind, payload_json, sequence
-             FROM events WHERE run_id = ?1 ORDER BY sequence",
-        )
+        .prepare_cached(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 ORDER BY sequence"
+        ))
         .map_err(db)?;
     let rows = stmt
-        .query_map(params![run_id], |row| {
-            Ok(EventRow {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                attempt_number: row.get(2)?,
-                ts: row.get(3)?,
-                kind: row.get(4)?,
-                payload_json: row.get(5)?,
-                sequence: row.get(6)?,
-            })
-        })
+        .query_map(params![run_id], read_event_row)
         .map_err(db)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db)?;
     rows.iter()
         .map(|row| event_from_row(row).map_err(StoreError::from))
         .collect()
+}
+
+/// The run's highest-sequence `kind` row, walking the `(run_id, sequence)`
+/// unique index backwards and decoding only the matching row.
+fn latest_domain_event_row_of_kind(
+    conn: &Connection,
+    run_id: &str,
+    kind: DomainEventKind,
+) -> Result<Option<DomainEvent>, StoreError> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 AND kind = ?2 \
+             ORDER BY sequence DESC LIMIT 1"
+        ))
+        .map_err(db)?;
+    let row = stmt
+        .query_row(params![run_id, kind.as_str()], read_event_row)
+        .optional()
+        .map_err(db)?;
+    row.as_ref()
+        .map(|row| event_from_row(row).map_err(StoreError::from))
+        .transpose()
 }
 
 /// Maintain the attempts / grader_results read-model projections inside the
@@ -1340,6 +1365,14 @@ impl DomainEventStore for SqliteStore {
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
         self.with_retry(|conn| list_domain_event_rows(conn, run_id))
+    }
+
+    fn latest_domain_event_of_kind(
+        &self,
+        run_id: &str,
+        kind: DomainEventKind,
+    ) -> Result<Option<DomainEvent>, StoreError> {
+        self.with_retry(|conn| latest_domain_event_row_of_kind(conn, run_id, kind))
     }
 }
 

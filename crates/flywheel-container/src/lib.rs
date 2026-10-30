@@ -27,9 +27,10 @@ pub use config::{
 pub use docker::{
     CleanupRegistry, DEFAULT_AGENT_HOME, DEFAULT_MAX_TAIL_CHARS, DEFAULT_START_TIMEOUT,
     DEFAULT_WORKDIR, Docker, DockerError, ExecOptions, ExecResult, OWNER_LABEL,
-    OWNER_LABEL_SELECTOR, OWNER_LABEL_VALUE, RunSpec, VolumeMount, active_container_names,
-    build_exec_argv, build_run_argv, default_management_timeout, flush_cleanup_registry,
-    reap_container_orphans, register_container_cleanup,
+    OWNER_LABEL_SELECTOR, OWNER_LABEL_VALUE, OrphanReap, RunSpec, VolumeMount,
+    active_container_names, build_exec_argv, build_run_argv, default_management_timeout,
+    flush_cleanup_registry, reap_container_orphans, register_container_cleanup,
+    spawn_container_orphan_reap,
 };
 pub use network::{DEFAULT_INTERNAL_NETWORK, NetworkError, ResolvedNetwork, resolve_network};
 pub use submit::{

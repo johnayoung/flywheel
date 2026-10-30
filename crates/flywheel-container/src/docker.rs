@@ -1265,6 +1265,67 @@ fn reap_container_orphans_with(docker: &Docker, log: &dyn Fn(&str)) {
     }
 }
 
+/// The startup orphan reap ([`reap_container_orphans`]) running on its own
+/// thread, so boot does not wait out a `docker ps` round-trip before the
+/// first cycle. Dropping the handle joins the thread, so the reap (and any
+/// `docker rm -f` it issued) finishes before the process exits.
+///
+/// Overlapping the reap with the first cycle is safe: it removes only
+/// containers whose owning process is provably dead, and every container
+/// this process starts carries this process's live pid and start time.
+/// Container names carry a random suffix, so a not-yet-reaped orphan never
+/// blocks a fresh `docker run --name`.
+#[must_use = "dropping the handle immediately waits for the reap to finish"]
+pub struct OrphanReap {
+    handle: Option<thread::JoinHandle<()>>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl std::fmt::Debug for OrphanReap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrphanReap")
+            .field("running", &self.handle.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OrphanReap {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            (self.log)("Container orphan reap panicked");
+        }
+    }
+}
+
+/// Start [`reap_container_orphans`] on a background thread; see
+/// [`OrphanReap`]. Keep the returned handle alive for the caller's run.
+pub fn spawn_container_orphan_reap(log: Arc<dyn Fn(&str) + Send + Sync>) -> OrphanReap {
+    spawn_container_orphan_reap_with(&Docker::new(), log)
+}
+
+/// [`spawn_container_orphan_reap`] against an explicit client. If the
+/// thread cannot be spawned the reap runs inline, exactly as before.
+fn spawn_container_orphan_reap_with(
+    docker: &Docker,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+) -> OrphanReap {
+    let thread_docker = docker.clone();
+    let thread_log = Arc::clone(&log);
+    let spawned = thread::Builder::new()
+        .name("flywheel-orphan-reap".to_owned())
+        .spawn(move || reap_container_orphans_with(&thread_docker, &*thread_log));
+    if let Ok(handle) = spawned {
+        return OrphanReap {
+            handle: Some(handle),
+            log,
+        };
+    }
+    reap_container_orphans_with(docker, &*log);
+    OrphanReap { handle: None, log }
+}
+
 #[cfg(test)]
 pub(crate) mod testing {
     //! Shared fixtures: a scripted `docker` stand-in that records every argv
@@ -1857,6 +1918,47 @@ mod tests {
         assert_eq!(calls[1], sv(&["rm", "-f", "reap-legacy"]));
         assert_eq!(calls[2], sv(&["rm", "-f", "reap-dead-owner"]));
         assert_eq!(calls.len(), 3);
+    }
+
+    #[test]
+    fn spawned_reap_returns_before_docker_answers_and_finishes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = local_pid_namespace().unwrap_or_default();
+        let listing_file = dir.path().join("ps.out");
+        std::fs::write(
+            &listing_file,
+            format!(
+                "reap-dead-owner\t{}\t{}\t\t{ns}\n",
+                local_hostname(),
+                dead_pid()
+            ),
+        )
+        .unwrap();
+        // `ps` answers only after a delay, standing in for a slow daemon.
+        let body = format!(
+            r#"case "$1" in ps) sleep 1; cat '{}' ;; esac"#,
+            listing_file.display()
+        );
+        let (docker, log) = scripted_docker(dir.path(), &body);
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let started = Instant::now();
+        let reap = spawn_container_orphan_reap_with(
+            &docker,
+            Arc::new(move |line: &str| sink.lock().unwrap().push(line.to_owned())),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "spawning the reap must not wait for docker ({:?})",
+            started.elapsed()
+        );
+        drop(reap);
+        let calls = recorded_calls(&log);
+        assert_eq!(calls.last().unwrap(), &sv(&["rm", "-f", "reap-dead-owner"]));
+        assert_eq!(
+            *lines.lock().unwrap(),
+            vec!["Reaped orphan container reap-dead-owner".to_owned()]
+        );
     }
 
     #[test]

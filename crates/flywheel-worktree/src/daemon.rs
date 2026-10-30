@@ -45,7 +45,7 @@ use flywheel_agents::{
 };
 use flywheel_container::{
     ConfigError, ContainerInvokeSpec, HostInvokeBuilder, maybe_wrap_for_backend,
-    reap_container_orphans,
+    spawn_container_orphan_reap,
 };
 use flywheel_core::agents_invoke::{AgentsInvoker, InvokeFn};
 use flywheel_core::audit::StopFlag;
@@ -1965,7 +1965,9 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
 
     // Reap any flywheel-owned container a prior killed worker left
     // orphaned (the SIGKILL/OOM case the exit-time registry cannot cover).
-    reap_container_orphans(&*log);
+    // The reap runs alongside the first cycle; the handle joins it when
+    // this function returns.
+    let _orphan_reap = spawn_container_orphan_reap(Arc::clone(&log));
     let mut heartbeat = Heartbeat::new(
         &db_path,
         args.heartbeat,

@@ -46,7 +46,7 @@ use crate::tui::{
     DaemonSpawnSpec, DaemonStatus, open_store_bundle, resolve_tasks_dir_for_worker,
 };
 use crate::worker_supervisor::{DEFAULT_STOP_TIMEOUT, WorkerSupervisor};
-use flywheel_container::reap_container_orphans;
+use flywheel_container::spawn_container_orphan_reap;
 use flywheel_core::audit::{
     AuditArgs, DEFAULT_POLL_INTERVAL, PolicyError as AuditPolicyError, StopFlag, logs_root_for_db,
     resolve_db_path as resolve_audit_db_path, resolve_policy, run_audit,
@@ -950,8 +950,9 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
         log: Arc::clone(&log),
     };
     // Reap any flywheel-owned container a prior killed worker left
-    // orphaned, exactly as the daemon does before its first cycle.
-    reap_container_orphans(&*log);
+    // orphaned, exactly as the daemon does alongside its first cycle; the
+    // handle joins the reap when this function returns.
+    let _orphan_reap = spawn_container_orphan_reap(Arc::clone(&log));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

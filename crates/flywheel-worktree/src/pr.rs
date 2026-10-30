@@ -4,7 +4,8 @@
 //! locally -- review and CI own the merge. Provisioning is identical to the
 //! merge strategy ([`GitWorktreeSubmitter`], which this wraps); only the
 //! landing differs. On `done` the task branch is pushed to the remote
-//! (`--force-with-lease`, covering rebase-on-retry) and a pull request is
+//! (`--force-with-lease`, covering rebase-on-retry and a remote branch deleted
+//! after its PR merged) and a pull request is
 //! opened -- or its body refreshed if one is already open for the branch --
 //! with the run's grader receipts rendered in the body, so reviewers see how
 //! "done" was decided before trusting it. Failed/interrupted work parks
@@ -44,7 +45,7 @@ use crate::submit_registry::{
     SubmitStrategySpec,
 };
 use crate::submitter::{
-    GitError, GitWorktreeSubmitter, Logger, SubmitError, build_merge_submitter, git,
+    GitError, GitOutput, GitWorktreeSubmitter, Logger, SubmitError, build_merge_submitter, git,
 };
 use flywheel_core::events::{
     DomainEventPayload, LANDING_STRATEGY_PR, Landed, LandingParked, PARK_KIND_PROTECTED_PATHS,
@@ -142,6 +143,38 @@ pub fn truncate_title(title: String) -> String {
     let mut cut: String = title.chars().take(TITLE_MAX - 1).collect();
     cut.push('\u{2026}');
     cut
+}
+
+/// Push `branch` to `remote` (as `refs/heads/<branch>`) under a lease.
+///
+/// The bare `--force-with-lease` expects the remote branch to sit where our
+/// remote-tracking ref says it does: that permits rewriting our own earlier
+/// push (rebase-on-retry) while refusing to clobber a branch someone else
+/// moved. When the remote branch has since been deleted -- GitHub
+/// auto-deletes a merged PR's head branch -- the surviving tracking ref is
+/// stale and the lease refuses every retry as `stale info`, forever. Nothing
+/// can be clobbered on a ref that does not exist, so a refused push probes
+/// the remote and, only when the branch is absent, retries with a lease that
+/// expects it absent (still atomic: a concurrent creator wins). Any other
+/// refusal is returned unchanged.
+fn push_with_lease(repo_root: &Path, remote: &str, branch: &str) -> Result<GitOutput, GitError> {
+    let refspec = format!("{branch}:{branch}");
+    let push = git(repo_root, &["push", "--force-with-lease", remote, &refspec])?;
+    if push.ok() {
+        return Ok(push);
+    }
+    let remote_ref = format!("refs/heads/{branch}");
+    // `--exit-code` exits 2 exactly when the remote answered and no ref
+    // matched; an unreachable remote exits 128 and keeps the first refusal.
+    let probe = git(
+        repo_root,
+        &["ls-remote", "--exit-code", remote, &remote_ref],
+    )?;
+    if probe.code != Some(2) {
+        return Ok(push);
+    }
+    let lease = format!("--force-with-lease={remote_ref}:");
+    git(repo_root, &["push", &lease, remote, &refspec])
 }
 
 /// Open a PR for `branch` onto `pr_base`, or refresh the body of the one
@@ -337,11 +370,7 @@ impl GitPullRequestSubmitter {
         self.inner
             .stamp_trailers(req, &worktree, &branch, &base, &phase)?;
 
-        let refspec = format!("{branch}:{branch}");
-        let push = git(
-            &self.inner.repo_root,
-            &["push", "--force-with-lease", &self.remote, &refspec],
-        )?;
+        let push = push_with_lease(&self.inner.repo_root, &self.remote, &branch)?;
         if !push.ok() {
             let stderr = push.stderr.trim();
             self.log(format!(
@@ -800,11 +829,7 @@ impl PhasePrPublisher {
             ));
             return Ok(());
         }
-        let refspec = format!("{branch}:{branch}");
-        let push = git(
-            &self.repo_root,
-            &["push", "--force-with-lease", &self.remote, &refspec],
-        )?;
+        let push = push_with_lease(&self.repo_root, &self.remote, branch)?;
         if !push.ok() {
             self.log(format!(
                 "push of {branch} to {} failed ({}); opening no PR, phase '{phase}' left active",
@@ -1462,6 +1487,95 @@ mod tests {
             matches!(outcome, SubmitOutcome::Parked { park_kind, .. } if park_kind == PARK_KIND_PUSH_FAILED)
         );
         assert!(landed(&store).is_empty());
+    }
+
+    /// The sha `branch` points at on the bare `remote`.
+    fn remote_rev(remote: &Path, branch: &str) -> String {
+        rev(remote, &format!("refs/heads/{branch}"))
+    }
+
+    #[test]
+    fn rerun_lands_after_the_remote_branch_was_deleted() {
+        // GitHub auto-deletes a merged PR's head branch. The local
+        // remote-tracking ref from the first push survives, so a bare
+        // `--force-with-lease` on the re-run compares against a ref the
+        // remote no longer has and is refused as `stale info` -- every time.
+        let (_dir, repo, remote) = repo_with_remote();
+        let gh = ScriptedGh::new("");
+        let store = ledger();
+        let s =
+            GitPullRequestSubmitter::new(submitter(&repo, Arc::clone(&store))).with_gh(gh.clone());
+        let (tf, wt) = prepare_with_commit(&s, &repo, "feature.txt", "feat");
+        assert_eq!(
+            s.submit(&done_req(&tf, &wt)),
+            SubmitOutcome::landed(LANDING_STRATEGY_PR, CREATED_URL)
+        );
+        git_ok(&remote, &["branch", "-D", BRANCH]);
+        assert!(!remote_branch_exists(&remote, BRANCH));
+
+        let (tf, wt) = prepare_with_commit(&s, &repo, "again.txt", "feat again");
+        let tree = rev(&wt, "HEAD^{tree}");
+        let outcome = s.submit(&done_req(&tf, &wt));
+
+        assert_eq!(
+            outcome,
+            SubmitOutcome::landed(LANDING_STRATEGY_PR, CREATED_URL)
+        );
+        // Stamping is message-only: the pushed tip carries the re-run's tree.
+        assert_eq!(rev(&remote, &format!("refs/heads/{BRANCH}^{{tree}}")), tree);
+        assert!(parked(&store).is_empty(), "{:?}", parked(&store));
+        assert_eq!(landed(&store).len(), 2);
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn push_still_refuses_to_clobber_a_branch_pushed_from_elsewhere() {
+        // The lease's job: a remote branch that moved since our last push
+        // (another clone pushed to it) is never overwritten, even though the
+        // re-run's history is unrelated to it.
+        let (dir, repo, remote) = repo_with_remote();
+        let gh = ScriptedGh::new("");
+        let store = ledger();
+        let s =
+            GitPullRequestSubmitter::new(submitter(&repo, Arc::clone(&store))).with_gh(gh.clone());
+        let (tf, wt) = prepare_with_commit(&s, &repo, "feature.txt", "feat");
+        assert_eq!(
+            s.submit(&done_req(&tf, &wt)),
+            SubmitOutcome::landed(LANDING_STRATEGY_PR, CREATED_URL)
+        );
+        let other = dir.path().join("other");
+        git_ok(
+            dir.path(),
+            &[
+                "clone",
+                "-q",
+                "-b",
+                BRANCH,
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        commit(&other, "theirs.txt", "y", "their fixup");
+        git_ok(&other, &["push", "-q", "origin", BRANCH]);
+        let theirs = remote_rev(&remote, BRANCH);
+
+        let (tf, wt) = prepare_with_commit(&s, &repo, "again.txt", "feat again");
+        let outcome = s.submit(&done_req(&tf, &wt));
+
+        assert!(
+            matches!(outcome, SubmitOutcome::Parked { ref park_kind, .. } if park_kind == PARK_KIND_PUSH_FAILED),
+            "{outcome:?}"
+        );
+        assert_eq!(remote_rev(&remote, BRANCH), theirs);
+        assert!(wt.exists());
+        let parks = parked(&store);
+        assert_eq!(parks.len(), 1);
+        assert!(
+            parks[0].detail.contains("stale info"),
+            "{}",
+            parks[0].detail
+        );
+        assert_eq!(landed(&store).len(), 1);
     }
 
     #[test]
@@ -2243,6 +2357,34 @@ mod tests {
                 .starts_with("push of flywheel/phase/01-foo to nonexistent failed (")
                 && m.ends_with("); opening no PR, phase '01-foo' left active")),
             "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn republish_pushes_after_the_remote_phase_branch_was_deleted() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let gh = phase_gh("");
+        let publisher = f.publisher(Arc::clone(&gh), quiet());
+        f.sweep(&publisher);
+        let branch = phase_branch(PHASE);
+        assert!(remote_branch_exists(&f.remote, &branch));
+        git_ok(&f.remote, &["branch", "-D", &branch]);
+
+        let (log, lines) = capture_log();
+        let publisher = f.publisher(Arc::clone(&gh), log);
+        f.sweep(&publisher);
+
+        assert!(remote_branch_exists(&f.remote, &branch));
+        assert_eq!(
+            rev(&f.remote, &format!("refs/heads/{branch}")),
+            rev(&f.repo, &branch)
+        );
+        assert_eq!(
+            lines.lock().unwrap().as_slice(),
+            [
+                "Phase '01-foo': pushed flywheel/phase/01-foo and ensured PR \
+                 https://example.test/phase-pr/1 (2 task(s)); merge is review/CI's call"
+            ]
         );
     }
 

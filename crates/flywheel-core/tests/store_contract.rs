@@ -859,6 +859,81 @@ fn happy_path_folds_to_done_with_projections(store: &dyn HarnessStore) {
     );
 }
 
+/// A store either keeps a NUL byte verbatim or, where the backend cannot
+/// hold one (Postgres TEXT/JSONB), substitutes U+FFFD; it never refuses the
+/// write.
+fn nul_kept_or_replaced(stored: &str, written: &str) -> bool {
+    stored == written || stored == written.replace('\0', "\u{fffd}")
+}
+
+fn nul_bytes_in_run_output_never_wedge_the_run(store: &dyn HarnessStore) {
+    // Grader stdout tails and agent output are arbitrary process bytes
+    // decoded lossily, so a NUL survives into the ledger. The append must
+    // still commit, or every later write for the run is refused against the
+    // stale version and the run stalls mid-flight.
+    let output = "binary\0tail";
+    seed(store, "r1");
+    store
+        .append_domain_event(&transition("r1", 1, Status::Ready), 1)
+        .unwrap();
+    store
+        .append_domain_event(&transition("r1", 2, Status::Running), 2)
+        .unwrap();
+    store
+        .append_domain_event(
+            &attempt_started("r1", 3, 1, &[("model_id", "model\0id")]),
+            3,
+        )
+        .unwrap();
+    store
+        .append_domain_event(&transition("r1", 4, Status::Validating), 4)
+        .unwrap();
+    let mut graded = grader_evaluated("r1", 5, 1);
+    if let DomainEventPayload::GraderEvaluated(g) = &mut graded.payload {
+        g.payload = obj(json!({"exit_code": 1, "stdout_tail": output, "k\u{0}ey": "v"}));
+        g.grader_spec = obj(json!({"type": "command", "run": "printf 'a\\0b'\0"}));
+    }
+    store
+        .append_domain_event(&graded, 5)
+        .expect("a NUL in a grader payload must not refuse the append");
+    let mut finalized = attempt_finalized("r1", 6, 1, output);
+    if let DomainEventPayload::AttemptFinalized(f) = &mut finalized.payload {
+        f.error = "agent\0stderr".into();
+    }
+    store
+        .append_domain_event(&finalized, 6)
+        .expect("a NUL in agent output must not refuse the append");
+    let done = store
+        .append_domain_event(&transition("r1", 7, Status::Done), 7)
+        .expect("the run keeps advancing after a NUL-bearing write");
+    assert_eq!(done.status, Status::Done);
+    assert_eq!(done.version, 8);
+
+    let loaded = store.load_lifecycle("r1").unwrap().unwrap();
+    assert_eq!(loaded.status, Status::Done);
+    assert_eq!(loaded.version, 8);
+    assert!(nul_kept_or_replaced(&loaded.agent_output, output));
+    let attempt = &loaded.attempts[0];
+    assert!(nul_kept_or_replaced(&attempt.agent_output, output));
+    assert!(nul_kept_or_replaced(&attempt.error, "agent\0stderr"));
+    assert!(nul_kept_or_replaced(
+        &attempt.agent_context["model_id"],
+        "model\0id"
+    ));
+    let results = store.list_grader_results("r1", 1).unwrap();
+    assert_eq!(results.len(), 1);
+    let tail = results[0].payload["stdout_tail"].as_str().unwrap();
+    assert!(nul_kept_or_replaced(tail, output));
+    assert!(
+        results[0].payload.contains_key("k\u{0}ey")
+            || results[0].payload.contains_key("k\u{fffd}ey")
+    );
+    // The ledger still folds to the projection it committed alongside.
+    let events = store.list_domain_events("r1").unwrap();
+    assert_eq!(events.len(), 8);
+    assert_eq!(replay(&events).unwrap(), loaded);
+}
+
 fn attempt_finalized_preserves_boundary_rolled_aggregates(store: &dyn HarnessStore) {
     seed(store, "r1");
     store
@@ -1437,6 +1512,10 @@ const CASES: &[(&str, Case)] = &[
     (
         "attempt_finalized_preserves_boundary_rolled_aggregates",
         attempt_finalized_preserves_boundary_rolled_aggregates,
+    ),
+    (
+        "nul_bytes_in_run_output_never_wedge_the_run",
+        nul_bytes_in_run_output_never_wedge_the_run,
     ),
     (
         "landing_parked_round_trips_on_the_ledger",

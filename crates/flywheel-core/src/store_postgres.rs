@@ -9,6 +9,13 @@
 //! / `outcome` / `grader_type` are their snake_case wire strings, and
 //! identity-style empty strings are persisted as `NULL`.
 //!
+//! Postgres `TEXT` and `JSONB` cannot hold U+0000, so free-form run data
+//! (agent output, errors, blocked-requires text, agent context, event,
+//! grader and control-command payloads) is written with every NUL replaced
+//! by U+FFFD ([`nul_free_text`], [`nul_free_json`]). Those strings carry
+//! lossily decoded process output; refusing the write would roll back the
+//! append and stall the run. Identity columns are bound verbatim.
+//!
 //! Schema isolation lets multiple flywheel deployments share one database
 //! under separate Postgres schemas. The schema name is validated against an
 //! identifier-safe pattern ([`validate_schema`]) and pinned on the session
@@ -53,6 +60,7 @@
 //! [`StoreConflictError::LifecycleNotFound`]: crate::store::StoreConflictError::LifecycleNotFound
 //! [`StoreConflictError::OptimisticConcurrency`]: crate::store::StoreConflictError::OptimisticConcurrency
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,6 +305,36 @@ fn ts(text: &str) -> Result<DateTime<Utc>, StoreError> {
 /// NULL for an empty string, matching the Python store's `value or None`.
 fn null_if_empty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+/// `value` with every U+0000 replaced by U+FFFD; borrowed when it holds none.
+fn nul_free_text(value: &str) -> Cow<'_, str> {
+    if value.contains('\0') {
+        Cow::Owned(value.replace('\0', "\u{fffd}"))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+/// [`null_if_empty`] for a free-form text column, made storable by
+/// [`nul_free_text`].
+fn free_text_or_null(value: &str) -> Option<Cow<'_, str>> {
+    null_if_empty(value).map(nul_free_text)
+}
+
+/// `value` with U+0000 replaced by U+FFFD in every string and object key, so
+/// JSONB accepts it.
+fn nul_free_json(value: Value) -> Value {
+    match value {
+        Value::String(text) if text.contains('\0') => Value::String(text.replace('\0', "\u{fffd}")),
+        Value::Array(items) => Value::Array(items.into_iter().map(nul_free_json).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (nul_free_text(&key).into_owned(), nul_free_json(item)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn json_object(value: Value) -> Result<JsonObject, StoreError> {
@@ -863,6 +901,10 @@ fn insert_lifecycle<C: GenericClient>(c: &mut C, lifecycle: &Lifecycle) -> Resul
     let now = Utc::now();
     ensure_task_identity(c, &lifecycle.task_id, now)?;
     let p = LifecycleParams::new(lifecycle)?;
+    let blocked_requires = lifecycle
+        .blocked_requires_json
+        .as_deref()
+        .map(nul_free_text);
     let result = c.execute(
         "INSERT INTO lifecycles (
             run_id, task_id, status, version, retries, error,
@@ -876,14 +918,14 @@ fn insert_lifecycle<C: GenericClient>(c: &mut C, lifecycle: &Lifecycle) -> Resul
             &p.status,
             &p.version,
             &p.retries,
-            &null_if_empty(&lifecycle.error),
-            &null_if_empty(&lifecycle.agent_output),
+            &free_text_or_null(&lifecycle.error),
+            &free_text_or_null(&lifecycle.agent_output),
             &null_if_empty(&lifecycle.session_id),
             &null_if_empty(&lifecycle.artifacts_dir),
             &null_if_empty(&lifecycle.worker_id),
             &p.timestamps_json,
             &p.updated_at,
-            &lifecycle.blocked_requires_json,
+            &blocked_requires,
             &null_if_empty(&lifecycle.task_content_hash),
             &p.awaiting_manual_ordinal,
             &null_if_empty(&lifecycle.source),
@@ -904,6 +946,10 @@ fn update_lifecycle_row<C: GenericClient>(
     expected_version: u64,
 ) -> Result<(), StoreError> {
     let p = LifecycleParams::new(lifecycle)?;
+    let blocked_requires = lifecycle
+        .blocked_requires_json
+        .as_deref()
+        .map(nul_free_text);
     let expected = int4(expected_version, "lifecycles.version")?;
     let affected = c
         .execute(
@@ -918,14 +964,14 @@ fn update_lifecycle_row<C: GenericClient>(
                 &p.status,
                 &p.version,
                 &p.retries,
-                &null_if_empty(&lifecycle.error),
-                &null_if_empty(&lifecycle.agent_output),
+                &free_text_or_null(&lifecycle.error),
+                &free_text_or_null(&lifecycle.agent_output),
                 &null_if_empty(&lifecycle.session_id),
                 &null_if_empty(&lifecycle.artifacts_dir),
                 &null_if_empty(&lifecycle.worker_id),
                 &p.timestamps_json,
                 &p.updated_at,
-                &lifecycle.blocked_requires_json,
+                &blocked_requires,
                 &null_if_empty(&lifecycle.task_content_hash),
                 &p.awaiting_manual_ordinal,
                 &null_if_empty(&lifecycle.source),
@@ -1231,7 +1277,7 @@ fn upsert_attempt<C: GenericClient>(
     // both the start and the finalization of an attempt through this verb.
     let number = int4(attempt.number, "attempts.number")?;
     let outcome = attempt.outcome.map(Outcome::as_str);
-    let agent_context = serde_json::to_value(&attempt.agent_context)?;
+    let agent_context = nul_free_json(serde_json::to_value(&attempt.agent_context)?);
     let input_tokens = int8(attempt.input_tokens, "attempts.input_tokens")?;
     let output_tokens = int8(attempt.output_tokens, "attempts.output_tokens")?;
     let cache_creation = int8(
@@ -1277,8 +1323,8 @@ fn upsert_attempt<C: GenericClient>(
             &attempt.started_at,
             &attempt.ended_at,
             &outcome,
-            &null_if_empty(&attempt.agent_output),
-            &null_if_empty(&attempt.error),
+            &free_text_or_null(&attempt.agent_output),
+            &free_text_or_null(&attempt.error),
             &agent_context,
             &input_tokens,
             &output_tokens,
@@ -1356,7 +1402,7 @@ fn insert_domain_event<C: GenericClient>(
     let sequence = next_domain_sequence(c, &event.run_id)?;
     let attempt_number = opt_int4(event.attempt_number, "events.attempt_number")?;
     let kind = event_kind(event);
-    let payload = Value::Object(event_payload(&event.payload)?);
+    let payload = nul_free_json(Value::Object(event_payload(&event.payload)?));
     c.execute(
         "INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
          VALUES ($1, $2, $3, $4, $5, $6)",
@@ -1457,8 +1503,8 @@ fn insert_grader_result<C: GenericClient>(
     let attempt_number = int4(result.attempt_number, "grader_results.attempt_number")?;
     let ordinal = int4(result.ordinal, "grader_results.ordinal")?;
     let duration_ms = int4(result.duration_ms, "grader_results.duration_ms")?;
-    let grader_spec = Value::Object(result.grader_spec.clone());
-    let payload = Value::Object(result.payload.clone());
+    let grader_spec = nul_free_json(Value::Object(result.grader_spec.clone()));
+    let payload = nul_free_json(Value::Object(result.payload.clone()));
     let row = c
         .query_one(
             "INSERT INTO grader_results (
@@ -1797,10 +1843,10 @@ impl ControlCommandStore for PostgresStore {
         payload: JsonObject,
         now: DateTime<Utc>,
     ) -> Result<ControlCommandRecord, StoreError> {
-        // Persist verbatim. claimed_at stays NULL so the row joins the
+        // Persist verbatim (NULs aside, see the module docs). claimed_at stays NULL so the row joins the
         // pending queue immediately; BIGSERIAL assigns id, the per-run
         // enqueue-order key claim_commands consumes.
-        let payload_json = Value::Object(payload.clone());
+        let payload_json = nul_free_json(Value::Object(payload.clone()));
         let id: i64 = {
             let mut client = self.lock()?;
             let row = client

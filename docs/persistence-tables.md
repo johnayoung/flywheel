@@ -2,6 +2,8 @@
 
 Reference for the flywheel core store (schema_version **12**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside). An empty table means "nothing exercised it on this database," not "deprecated."
 
+Postgres `TEXT`/`JSONB` cannot hold U+0000: the Postgres store writes NULs in free-form run data (agent output, errors, blocked-requires, agent context, event/grader/control-command payloads) as U+FFFD; SQLite keeps them verbatim.
+
 Flywheel core owns the lifecycle of a **single task**. The catalog therefore records only what defines and verifies one task; cross-task concerns (the dependency DAG) live in the orchestration layer built on top, not here.
 
 | Table              | Purpose                                                                                                                                                                          | Status                         |

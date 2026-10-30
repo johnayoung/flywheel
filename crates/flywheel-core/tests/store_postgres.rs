@@ -473,6 +473,72 @@ fn empty_identity_strings_persist_as_null_like_the_python_store() {
     assert_eq!(loaded.attempts[0].outcome, None);
 }
 
+#[test]
+fn nul_bytes_in_free_form_columns_are_stored_as_replacement_characters() {
+    // TEXT and JSONB cannot hold U+0000; the store substitutes U+FFFD in
+    // free-form run data instead of refusing (and rolling back) the write.
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_nul");
+    let store = open(&pg, &schema);
+    let mut lc = Lifecycle::new("t").with_run_id("r1");
+    lc.agent_output = "out\0put".into();
+    lc.error = "err\0or".into();
+    lc.blocked_requires_json = Some("[\"a\0b\"]".into());
+    store.create_lifecycle(&lc).unwrap();
+    let mut attempt = Attempt::new(1, at(0), "r1");
+    attempt.agent_output = "\0".into();
+    attempt.error = "e\0".into();
+    attempt.agent_context = [("k\0".to_owned(), "\0v".to_owned())].into();
+    store.save_attempt("r1", &attempt, None).unwrap();
+    store
+        .append_grader_result(&GraderResultRecord {
+            run_id: "r1".into(),
+            attempt_number: 1,
+            ordinal: 0,
+            grader_type: GraderType::Command,
+            grader_spec: obj(json!({"type": "command", "run": "printf '\0'"})),
+            passed: false,
+            duration_ms: 1,
+            payload: obj(json!({"stdout_tail": ["x\0y", {"n\0": "\0"}], "exit_code": 1})),
+            ts: at(0),
+            grader_name: None,
+            id: None,
+        })
+        .unwrap();
+    let command = store
+        .enqueue_command("r1", "message", obj(json!({"text": "hi\0"})), at(0))
+        .unwrap();
+    assert_eq!(command.payload, obj(json!({"text": "hi\0"})));
+
+    let loaded = store.load_lifecycle("r1").unwrap().unwrap();
+    assert_eq!(loaded.agent_output, "out\u{fffd}put");
+    assert_eq!(loaded.error, "err\u{fffd}or");
+    assert_eq!(
+        loaded.blocked_requires_json.as_deref(),
+        Some("[\"a\u{fffd}b\"]")
+    );
+    assert_eq!(loaded.attempts[0].agent_output, "\u{fffd}");
+    assert_eq!(loaded.attempts[0].error, "e\u{fffd}");
+    assert_eq!(
+        loaded.attempts[0].agent_context,
+        [("k\u{fffd}".to_owned(), "\u{fffd}v".to_owned())].into()
+    );
+    let results = store.list_grader_results("r1", 1).unwrap();
+    assert_eq!(
+        results[0].grader_spec,
+        obj(json!({"type": "command", "run": "printf '\u{fffd}'"}))
+    );
+    assert_eq!(
+        results[0].payload,
+        obj(json!({"stdout_tail": ["x\u{fffd}y", {"n\u{fffd}": "\u{fffd}"}], "exit_code": 1}))
+    );
+    let claimed = store.claim_commands("r1", at(1)).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].payload, obj(json!({"text": "hi\u{fffd}"})));
+}
+
 // --- Isolation and concurrency -------------------------------------------------------------------
 
 #[test]

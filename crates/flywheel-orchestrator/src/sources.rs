@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -443,11 +444,26 @@ pub fn load_active_tasks(
 pub fn phase_of_task_file(task_file: impl AsRef<Path>, tasks_dir: impl AsRef<Path>) -> String {
     let task_file = task_file.as_ref();
     let active_root = tasks_dir.as_ref().join("active");
-    let canonical_file = std::fs::canonicalize(task_file);
-    let canonical_root = std::fs::canonicalize(&active_root);
-    let rel = match (&canonical_file, &canonical_root) {
-        (Ok(file), Ok(root)) => file.strip_prefix(root).ok(),
-        _ => task_file.strip_prefix(&active_root).ok(),
+    phase_from_resolved(
+        task_file,
+        &active_root,
+        std::fs::canonicalize(task_file).ok().as_deref(),
+        std::fs::canonicalize(&active_root).ok().as_deref(),
+    )
+}
+
+/// The [`phase_of_task_file`] rule over already-resolved paths: strip the
+/// canonical active root from the canonical file when both resolved, else
+/// fall back to the lexical strip.
+fn phase_from_resolved(
+    task_file: &Path,
+    active_root: &Path,
+    canonical_file: Option<&Path>,
+    canonical_root: Option<&Path>,
+) -> String {
+    let rel = match (canonical_file, canonical_root) {
+        (Some(file), Some(root)) => file.strip_prefix(root).ok(),
+        _ => task_file.strip_prefix(active_root).ok(),
     };
     let Some(rel) = rel else {
         return ROOT_PHASE.to_string();
@@ -455,6 +471,62 @@ pub fn phase_of_task_file(task_file: impl AsRef<Path>, tasks_dir: impl AsRef<Pat
     match rel.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
         _ => ROOT_PHASE.to_string(),
+    }
+}
+
+/// [`phase_of_task_file`] for every file of one listing, without its two
+/// full `canonicalize` calls per file: the active root is resolved once per
+/// listing and each phase directory once per run of its files. A file that
+/// is not itself a symlink canonicalizes to its canonical parent joined
+/// with its name (realpath only rewrites symlink components), so the result
+/// is identical; a symlinked file, or any path this shortcut cannot
+/// resolve, takes the full `canonicalize`.
+struct PhaseResolver {
+    active_root: PathBuf,
+    canonical_root: io::Result<PathBuf>,
+    canonical_parent: Option<(PathBuf, io::Result<PathBuf>)>,
+}
+
+impl PhaseResolver {
+    fn new(tasks_dir: &Path) -> Self {
+        let active_root = tasks_dir.join("active");
+        let canonical_root = std::fs::canonicalize(&active_root);
+        Self {
+            active_root,
+            canonical_root,
+            canonical_parent: None,
+        }
+    }
+
+    fn phase_of(&mut self, task_file: &Path) -> String {
+        let canonical_file = self.canonical_file(task_file);
+        phase_from_resolved(
+            task_file,
+            &self.active_root,
+            canonical_file.ok().as_deref(),
+            self.canonical_root.as_deref().ok(),
+        )
+    }
+
+    fn canonical_file(&mut self, task_file: &Path) -> io::Result<PathBuf> {
+        let (Some(parent), Some(name)) = (task_file.parent(), task_file.file_name()) else {
+            return std::fs::canonicalize(task_file);
+        };
+        match std::fs::symlink_metadata(task_file) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            _ => return std::fs::canonicalize(task_file),
+        }
+        if self
+            .canonical_parent
+            .as_ref()
+            .is_none_or(|(cached, _)| cached != parent)
+        {
+            self.canonical_parent = Some((parent.to_path_buf(), std::fs::canonicalize(parent)));
+        }
+        match &self.canonical_parent {
+            Some((_, Ok(canonical))) => Ok(canonical.join(name)),
+            _ => std::fs::canonicalize(task_file),
+        }
     }
 }
 
@@ -545,6 +617,7 @@ impl WorkSource for DirectoryWorkSource {
     fn list_work(&self) -> Result<Vec<WorkItem>, WorkSourceError> {
         let mut items = Vec::new();
         let mut skipped = 0usize;
+        let mut phases = PhaseResolver::new(&self.tasks_dir);
         for path in iter_active_task_files(&self.tasks_dir)? {
             let (task, data) = match load_task_file_once(&path) {
                 Ok(loaded) => loaded,
@@ -570,7 +643,7 @@ impl WorkSource for DirectoryWorkSource {
                 task,
                 prerequisites: prerequisites_from_value(&data),
                 source_ref: source_ref.clone(),
-                phase: Some(phase_of_task_file(&path, &self.tasks_dir)),
+                phase: Some(phases.phase_of(&path)),
                 local_path: Some(path),
                 source_kind: Some(DIRECTORY_SOURCE_KIND.to_string()),
                 source_version: Some(source_version),
@@ -911,6 +984,63 @@ mod tests {
             phase_of_task_file("/virtual/tasks/active/09-x/t.json", "/virtual/tasks"),
             "09-x"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_work_phases_match_phase_of_task_file_across_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let active = tasks_dir.join("active");
+        write_task(&active.join("01-plain"), "plain-a", json!({}));
+        write_task(&active.join("01-plain"), "plain-b", json!({}));
+        // A phase directory that is a symlink to a tree outside active/.
+        let outside = tmp.path().join("outside-phase");
+        write_task(&outside, "via-dir-link", json!({}));
+        symlink(&outside, active.join("02-linked-dir")).unwrap();
+        // A task file that is a symlink, both into active/ and out of it.
+        let elsewhere = write_task(&tmp.path().join("elsewhere"), "via-file-link", json!({}));
+        std::fs::create_dir_all(active.join("03-file-links")).unwrap();
+        symlink(
+            &elsewhere,
+            active.join("03-file-links").join("via-file-link.json"),
+        )
+        .unwrap();
+        let inner = write_task(&active.join("04-target"), "inner-target", json!({}));
+        std::fs::create_dir_all(active.join("05-inner-link")).unwrap();
+        symlink(&inner, active.join("05-inner-link").join("inner-link.json")).unwrap();
+        // The tasks dir itself reached through a symlinked ancestor.
+        let linked_root = tmp.path().join("linked-root");
+        symlink(tmp.path(), &linked_root).unwrap();
+
+        for root in [tasks_dir.clone(), linked_root.join("tasks")] {
+            let items = DirectoryWorkSource::new(&root).list_work().unwrap();
+            assert_eq!(items.len(), 6);
+            for item in &items {
+                let path = item.local_path.as_ref().unwrap();
+                assert_eq!(
+                    item.phase.as_deref(),
+                    Some(phase_of_task_file(path, &root).as_str()),
+                    "{}",
+                    path.display()
+                );
+            }
+            let phases: Vec<&str> = items.iter().filter_map(|i| i.phase.as_deref()).collect();
+            // Links resolving outside active/ fall to the root phase; the
+            // in-tree file link takes its target's phase.
+            assert_eq!(
+                phases,
+                [
+                    "01-plain",
+                    "01-plain",
+                    ROOT_PHASE,
+                    ROOT_PHASE,
+                    "04-target",
+                    "04-target"
+                ]
+            );
+        }
     }
 
     #[test]

@@ -371,27 +371,39 @@ pub fn read_scheduling_metadata(path: impl AsRef<Path>) -> SchedulingMetadata {
 
 // --- The active/<phase>/<task>.json walk --------------------------------------
 
-/// One directory entry of the walk: its path, plus whether it is (after
+/// One directory entry of the walk: its path, whether it is (after
 /// following symlinks, exactly like [`Path::is_file`] / [`Path::is_dir`]) a
-/// regular file or a directory.
+/// regular file or a directory, and whether the listing proved the entry
+/// itself is not a symlink.
 struct WalkEntry {
     name: OsString,
     path: PathBuf,
     kind: Option<FileType>,
+    /// The entry's own (unfollowed) type was read and is not a symlink.
+    /// `false` when it is a symlink or its type could not be read.
+    not_symlink: bool,
 }
 
 impl WalkEntry {
-    /// The entry's type with symlinks followed, `None` when it cannot be
-    /// determined (the `Path::is_*` predicates read that as "neither").
+    /// Classify one listing entry.
     ///
     /// `DirEntry::file_type` comes from the directory listing itself on
     /// most filesystems, so a non-symlink entry costs no `stat`; only a
     /// symlink (or a filesystem that reports no type) pays the
     /// path-following `metadata` call `Path::is_file` would have made.
-    fn resolved_kind(entry: &std::fs::DirEntry) -> Option<FileType> {
-        match entry.file_type() {
-            Ok(kind) if !kind.is_symlink() => Some(kind),
-            _ => std::fs::metadata(entry.path()).ok().map(|m| m.file_type()),
+    /// `kind` is `None` when the followed type cannot be determined (the
+    /// `Path::is_*` predicates read that as "neither").
+    fn from_dir_entry(entry: &std::fs::DirEntry) -> Self {
+        let path = entry.path();
+        let (kind, not_symlink) = match entry.file_type() {
+            Ok(kind) if !kind.is_symlink() => (Some(kind), true),
+            _ => (std::fs::metadata(&path).ok().map(|m| m.file_type()), false),
+        };
+        Self {
+            name: entry.file_name(),
+            path,
+            kind,
+            not_symlink,
         }
     }
 
@@ -413,11 +425,7 @@ fn sorted_entries(dir: &Path) -> Result<Vec<WalkEntry>, WorkSourceError> {
     let mut entries = Vec::new();
     for entry in read {
         let entry = entry.map_err(|e| WorkSourceError::io(dir, e))?;
-        entries.push(WalkEntry {
-            kind: WalkEntry::resolved_kind(&entry),
-            name: entry.file_name(),
-            path: entry.path(),
-        });
+        entries.push(WalkEntry::from_dir_entry(&entry));
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
@@ -454,17 +462,22 @@ pub fn iter_active_phase_dirs(
 /// [`WorkSourceError::Io`] when `phase_dir` cannot be listed or one of its
 /// entries cannot be read.
 pub fn phase_task_files(phase_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, WorkSourceError> {
-    Ok(sorted_entries(phase_dir.as_ref())?
-        .into_iter()
-        .filter(|entry| {
-            let name = entry.name();
-            entry.is_file()
-                && entry.path.extension().is_some_and(|ext| ext == "json")
-                && !name.starts_with('_')
-                && !name.starts_with('.')
-        })
+    Ok(phase_task_entries(phase_dir.as_ref())?
         .map(|entry| entry.path)
         .collect())
+}
+
+/// [`phase_task_files`] keeping each file's walk classification.
+fn phase_task_entries(
+    phase_dir: &Path,
+) -> Result<impl Iterator<Item = WalkEntry>, WorkSourceError> {
+    Ok(sorted_entries(phase_dir)?.into_iter().filter(|entry| {
+        let name = entry.name();
+        entry.is_file()
+            && entry.path.extension().is_some_and(|ext| ext == "json")
+            && !name.starts_with('_')
+            && !name.starts_with('.')
+    }))
 }
 
 /// Every `active/<phase>/<task>.json` under `tasks_dir` in deterministic
@@ -478,9 +491,17 @@ pub fn phase_task_files(phase_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, Wor
 pub fn iter_active_task_files(
     tasks_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, WorkSourceError> {
+    Ok(active_task_entries(tasks_dir.as_ref())?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// [`iter_active_task_files`] keeping each file's walk classification.
+fn active_task_entries(tasks_dir: &Path) -> Result<Vec<WalkEntry>, WorkSourceError> {
     let mut files = Vec::new();
     for phase in iter_active_phase_dirs(tasks_dir)? {
-        files.extend(phase_task_files(&phase)?);
+        files.extend(phase_task_entries(&phase)?);
     }
     Ok(files)
 }
@@ -561,8 +582,12 @@ impl PhaseResolver {
         }
     }
 
-    fn phase_of(&mut self, task_file: &Path) -> String {
-        let canonical_file = self.canonical_file(task_file);
+    /// The phase of a walked task file. The walk already read the entry's
+    /// own type from the directory listing, so a non-symlink file needs no
+    /// further `lstat` here.
+    fn phase_of(&mut self, task_file: &WalkEntry) -> String {
+        let canonical_file = self.canonical_file(&task_file.path, task_file.not_symlink);
+        let task_file = &task_file.path;
         phase_from_resolved(
             task_file,
             &self.active_root,
@@ -571,14 +596,12 @@ impl PhaseResolver {
         )
     }
 
-    fn canonical_file(&mut self, task_file: &Path) -> io::Result<PathBuf> {
-        let (Some(parent), Some(name)) = (task_file.parent(), task_file.file_name()) else {
+    fn canonical_file(&mut self, task_file: &Path, not_symlink: bool) -> io::Result<PathBuf> {
+        let (true, Some(parent), Some(name)) =
+            (not_symlink, task_file.parent(), task_file.file_name())
+        else {
             return std::fs::canonicalize(task_file);
         };
-        match std::fs::symlink_metadata(task_file) {
-            Ok(meta) if !meta.file_type().is_symlink() => {}
-            _ => return std::fs::canonicalize(task_file),
-        }
         if self
             .canonical_parent
             .as_ref()
@@ -681,8 +704,9 @@ impl WorkSource for DirectoryWorkSource {
         let mut items = Vec::new();
         let mut skipped = 0usize;
         let mut phases = PhaseResolver::new(&self.tasks_dir);
-        for path in iter_active_task_files(&self.tasks_dir)? {
-            let (task, data) = match load_task_file_once(&path) {
+        for entry in active_task_entries(&self.tasks_dir)? {
+            let path = &entry.path;
+            let (task, data) = match load_task_file_once(path) {
                 Ok(loaded) => loaded,
                 Err(exc) => {
                     skipped += 1;
@@ -702,12 +726,13 @@ impl WorkSource for DirectoryWorkSource {
             } = scheduling_metadata_from_value(&data);
             let source_ref = path.display().to_string();
             let source_version = task_digest(&task);
+            let phase = phases.phase_of(&entry);
             items.push(WorkItem {
                 task,
                 prerequisites: prerequisites_from_value(&data),
                 source_ref: source_ref.clone(),
-                phase: Some(phases.phase_of(&path)),
-                local_path: Some(path),
+                phase: Some(phase),
+                local_path: Some(entry.path),
                 source_kind: Some(DIRECTORY_SOURCE_KIND.to_string()),
                 source_version: Some(source_version),
                 source_url: Some(source_ref),

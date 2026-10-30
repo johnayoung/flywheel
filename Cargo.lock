@@ -698,6 +698,7 @@ name = "flywheel-worktree"
 version = "0.6.1"
 dependencies = [
  "chrono",
+ "criterion",
  "flywheel-agents",
  "flywheel-container",
  "flywheel-core",

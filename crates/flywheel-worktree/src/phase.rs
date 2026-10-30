@@ -40,7 +40,7 @@ use flywheel_orchestrator::claims::{
     STOP_INDETERMINATE_LANDING, STOP_RESOLVED,
 };
 use flywheel_orchestrator::policy::WorkPolicy;
-use flywheel_orchestrator::sources::{WorkSourceError, iter_active_phase_dirs};
+use flywheel_orchestrator::sources::{WorkSourceError, iter_active_phase_dirs, phase_task_files};
 use flywheel_orchestrator::strategy::{
     LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
     SubmitStrategy,
@@ -759,26 +759,6 @@ impl std::fmt::Debug for ArchiveSweep<'_> {
 }
 
 // --- sweep helpers ------------------------------------------------------------------------------
-
-fn phase_task_files(phase_dir: &Path) -> Result<Vec<PathBuf>, ArchiveError> {
-    let mut files: Vec<PathBuf> = fs::read_dir(phase_dir)
-        .map_err(|source| ArchiveError::Io {
-            path: phase_dir.to_path_buf(),
-            source,
-        })?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = dir_name(path);
-            path.is_file()
-                && path.extension().is_some_and(|ext| ext == "json")
-                && !name.starts_with('_')
-                && !name.starts_with('.')
-        })
-        .collect();
-    files.sort();
-    Ok(files)
-}
 
 fn has_done_lifecycle(store: &dyn ArchiveStore, task_id: &str) -> Result<bool, StoreError> {
     let filter = LifecycleFilter::default()

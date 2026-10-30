@@ -29,7 +29,9 @@ use flywheel_core::task::{GraderType, Task};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fmt;
+use std::fs::FileType;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -369,24 +371,66 @@ pub fn read_scheduling_metadata(path: impl AsRef<Path>) -> SchedulingMetadata {
 
 // --- The active/<phase>/<task>.json walk --------------------------------------
 
-fn sorted_entries(dir: &Path) -> Result<Vec<PathBuf>, WorkSourceError> {
+/// One directory entry of the walk: its path, plus whether it is (after
+/// following symlinks, exactly like [`Path::is_file`] / [`Path::is_dir`]) a
+/// regular file or a directory.
+struct WalkEntry {
+    name: OsString,
+    path: PathBuf,
+    kind: Option<FileType>,
+}
+
+impl WalkEntry {
+    /// The entry's type with symlinks followed, `None` when it cannot be
+    /// determined (the `Path::is_*` predicates read that as "neither").
+    ///
+    /// `DirEntry::file_type` comes from the directory listing itself on
+    /// most filesystems, so a non-symlink entry costs no `stat`; only a
+    /// symlink (or a filesystem that reports no type) pays the
+    /// path-following `metadata` call `Path::is_file` would have made.
+    fn resolved_kind(entry: &std::fs::DirEntry) -> Option<FileType> {
+        match entry.file_type() {
+            Ok(kind) if !kind.is_symlink() => Some(kind),
+            _ => std::fs::metadata(entry.path()).ok().map(|m| m.file_type()),
+        }
+    }
+
+    fn is_file(&self) -> bool {
+        self.kind.is_some_and(|kind| kind.is_file())
+    }
+
+    fn is_dir(&self) -> bool {
+        self.kind.is_some_and(|kind| kind.is_dir())
+    }
+
+    fn name(&self) -> &str {
+        self.name.to_str().unwrap_or("")
+    }
+}
+
+fn sorted_entries(dir: &Path) -> Result<Vec<WalkEntry>, WorkSourceError> {
     let read = std::fs::read_dir(dir).map_err(|e| WorkSourceError::io(dir, e))?;
     let mut entries = Vec::new();
     for entry in read {
         let entry = entry.map_err(|e| WorkSourceError::io(dir, e))?;
-        entries.push(entry.path());
+        entries.push(WalkEntry {
+            kind: WalkEntry::resolved_kind(&entry),
+            name: entry.file_name(),
+            path: entry.path(),
+        });
     }
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
-}
-
-fn file_name_str(path: &Path) -> &str {
-    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
 }
 
 /// The `active/<phase>` subdirectories of `tasks_dir` in deterministic
 /// (name-sorted) order. Hidden directories are skipped; a missing
 /// `active/` yields the empty list.
+///
+/// # Errors
+///
+/// [`WorkSourceError::Io`] when `active/` cannot be listed or one of its
+/// entries cannot be read.
 pub fn iter_active_phase_dirs(
     tasks_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, WorkSourceError> {
@@ -396,28 +440,47 @@ pub fn iter_active_phase_dirs(
     }
     Ok(sorted_entries(&active)?
         .into_iter()
-        .filter(|entry| entry.is_dir() && !file_name_str(entry).starts_with('.'))
+        .filter(|entry| entry.is_dir() && !entry.name().starts_with('.'))
+        .map(|entry| entry.path)
+        .collect())
+}
+
+/// The task files directly inside one phase directory, name-sorted: regular
+/// files (symlinks followed) named `*.json` whose name does not start with
+/// `_` or `.`.
+///
+/// # Errors
+///
+/// [`WorkSourceError::Io`] when `phase_dir` cannot be listed or one of its
+/// entries cannot be read.
+pub fn phase_task_files(phase_dir: impl AsRef<Path>) -> Result<Vec<PathBuf>, WorkSourceError> {
+    Ok(sorted_entries(phase_dir.as_ref())?
+        .into_iter()
+        .filter(|entry| {
+            let name = entry.name();
+            entry.is_file()
+                && entry.path.extension().is_some_and(|ext| ext == "json")
+                && !name.starts_with('_')
+                && !name.starts_with('.')
+        })
+        .map(|entry| entry.path)
         .collect())
 }
 
 /// Every `active/<phase>/<task>.json` under `tasks_dir` in deterministic
 /// (phase-sorted, then name-sorted) walk order. Files whose name starts
 /// with `_` or `.`, and non-`.json` entries, are skipped.
+///
+/// # Errors
+///
+/// [`WorkSourceError::Io`] when `active/` or a phase directory cannot be
+/// listed or one of their entries cannot be read.
 pub fn iter_active_task_files(
     tasks_dir: impl AsRef<Path>,
 ) -> Result<Vec<PathBuf>, WorkSourceError> {
     let mut files = Vec::new();
     for phase in iter_active_phase_dirs(tasks_dir)? {
-        for entry in sorted_entries(&phase)? {
-            let name = file_name_str(&entry);
-            if entry.is_file()
-                && entry.extension().is_some_and(|ext| ext == "json")
-                && !name.starts_with('_')
-                && !name.starts_with('.')
-            {
-                files.push(entry);
-            }
-        }
+        files.extend(phase_task_files(&phase)?);
     }
     Ok(files)
 }
@@ -806,6 +869,37 @@ mod tests {
         );
         let items = DirectoryWorkSource::new(&tasks_dir).list_work().unwrap();
         assert_eq!(ids(&items), ["keep"]);
+    }
+
+    #[test]
+    fn walk_classifies_symlinks_by_their_target_like_path_is_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        let active = tasks_dir.join("active");
+        let phase = active.join("01-phase");
+        let real = write_task(&tmp.path().join("elsewhere"), "real", json!({}));
+        write_task(&phase, "keep", json!({}));
+        symlink(&real, phase.join("linked.json")).unwrap();
+        symlink(tmp.path().join("gone.json"), phase.join("dangling.json")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("a-dir")).unwrap();
+        symlink(tmp.path().join("a-dir"), phase.join("dir-link.json")).unwrap();
+        std::fs::create_dir_all(phase.join("subdir.json")).unwrap();
+        symlink(tmp.path().join("no-such-phase"), active.join("00-dangling")).unwrap();
+        symlink(&real, active.join("00-file-not-phase")).unwrap();
+
+        assert_eq!(
+            iter_active_phase_dirs(&tasks_dir).unwrap(),
+            vec![phase.clone()]
+        );
+        assert_eq!(
+            iter_active_task_files(&tasks_dir).unwrap(),
+            vec![phase.join("keep.json"), phase.join("linked.json")]
+        );
+        assert_eq!(
+            phase_task_files(&phase).unwrap(),
+            vec![phase.join("keep.json"), phase.join("linked.json")]
+        );
     }
 
     #[test]

@@ -126,8 +126,14 @@ pub fn strip_spec_block(body: &str) -> String {
 /// the drain side call this one function, so a receipt minted before the
 /// block was embedded hashes identically to the same issue re-read with
 /// the block present.
+///
+/// Line breaks are canonicalized to `\n` (every [`py_splitlines`] boundary,
+/// including `\r\n`) before hashing: stripping an embedded block rejoins the
+/// body's lines with `\n`, so without this a CRLF body (GitHub's web editor)
+/// would mint a receipt that reads as drifted the moment it is embedded.
 pub fn content_hash(title: &str, body: &str) -> String {
-    let material = format!("{}\n{}", title.trim(), strip_spec_block(body));
+    let human = strip_spec_block(body);
+    let material = format!("{}\n{}", title.trim(), py_splitlines(&human).join("\n"));
     hex::encode(Sha256::digest(material.as_bytes()))
 }
 

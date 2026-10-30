@@ -2103,6 +2103,47 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn crlf_issue_body_mints_a_receipt_that_stays_settled_once_embedded() {
+        // Bodies typed in GitHub's web editor arrive with CRLF line endings.
+        // The receipt is minted from the block-less body, then re-checked
+        // against the body carrying the embedded block; both reads must
+        // hash the same human content.
+        let title = "Fix the widget";
+        let prose = "Widget drops retries.\r\n\r\nRepro: run the load test.\r\n";
+        let gh = ScriptedGh::all(vec![issue(9, title, prose)]);
+        let ex = ScriptedExecutor::exiting(1);
+        let result = run(&pass(
+            gh.clone(),
+            ex,
+            ScriptedInvoke::fixed(ready_response("cmd")),
+        ));
+        assert_eq!(result.ready().len(), 1);
+        let edits = gh.edits();
+        assert_eq!(edits.len(), 1);
+        let written = body_of(&edits[0]).to_string();
+
+        assert!(
+            !ready_needs_retriage(title, &written),
+            "the freshly minted receipt must not read as drifted"
+        );
+        assert_eq!(
+            crate::github::triage_skip_reason(Some(&extract_block(&written)), title, &written),
+            None
+        );
+
+        // The next pass sees the issue ready and settled: no agent, no grader, no write.
+        let gh2 = ScriptedGh::by_label(vec![("ready", vec![issue(9, title, &written)])]);
+        let ex2 = ScriptedExecutor::exiting(1);
+        run(&pass(
+            gh2.clone(),
+            ex2.clone(),
+            ScriptedInvoke::fixed(ready_response("cmd")),
+        ));
+        assert!(ex2.commands().is_empty());
+        assert!(gh2.edits().is_empty());
+    }
+
     // --- drift: a drifted ready issue is re-triaged within the pass ---------------------------
 
     #[test]

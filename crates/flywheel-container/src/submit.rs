@@ -27,6 +27,7 @@ use crate::docker::{
     CleanupRegistry, DEFAULT_AGENT_HOME, DEFAULT_START_TIMEOUT, DEFAULT_WORKDIR, Docker,
     DockerError, RunSpec, VolumeMount, default_management_timeout,
 };
+use crate::gitdir::git_metadata_mounts;
 use crate::network::{DEFAULT_INTERNAL_NETWORK, resolve_network};
 use flywheel_agents::hosts::{DockerExecHost, ExecutionHost};
 use flywheel_orchestrator::strategy::{
@@ -346,6 +347,12 @@ impl ContainerSubmitStrategy {
             worktree.to_string_lossy().into_owned(),
             self.workdir.clone(),
         )];
+        // A linked worktree's `.git` file names host paths outside the
+        // worktree; without these the in-container agent cannot run git.
+        mounts.extend(
+            git_metadata_mounts(worktree, Path::new(&self.workdir))
+                .map_err(|err| PrepareError::with_source(err.to_string(), err))?,
+        );
         mounts.extend(self.mounts.iter().cloned());
         let spec = RunSpec {
             name: name.clone(),
@@ -648,6 +655,79 @@ mod tests {
         assert!(flag_values(&run, "--label").contains(&"flywheel.owner=1"));
         assert_eq!(*run.last().unwrap(), "flywheel/agent:test");
         assert_eq!(h.registry.active_names().len(), 1);
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// A repo whose `sandboxes/<task_id>` is a linked `git worktree` (the
+    /// shape the git-worktree landing strategy provisions), so the plain
+    /// inner strategy hands it straight back. Returns (common git dir, inner).
+    fn linked_worktree_inner(dir: &Path, task_id: &str) -> (PathBuf, Arc<dyn SubmitStrategy>) {
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        let root = repo.join(".flywheel/worktrees");
+        let wt = root.join(task_id);
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("flywheel/{task_id}"),
+                wt.to_str().unwrap(),
+            ],
+        );
+        let common = std::fs::canonicalize(repo.join(".git")).unwrap();
+        (common, Arc::new(PlainDirectoryStrategy::new(root)))
+    }
+
+    #[test]
+    fn prepare_mounts_a_linked_worktrees_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let (common, inner) = linked_worktree_inner(dir.path(), "alpha");
+        let h = harness(dir.path(), inner, config(), HAPPY_BODY);
+        h.strategy.prepare_sandbox(&request("alpha")).unwrap();
+
+        let run = run_call(&h.log);
+        let c = common.display();
+        assert_eq!(
+            flag_values(&run, "-v")[1..],
+            [
+                format!("{c}:{c}"),
+                format!("{c}/config:{c}/config:ro"),
+                format!("{c}/hooks:{c}/hooks:ro"),
+            ],
+            "the gitdir the worktree's .git file names must resolve in the container"
+        );
     }
 
     /// Docker's container-name grammar: `[a-zA-Z0-9][a-zA-Z0-9_.-]+`.
@@ -1152,16 +1232,10 @@ mod tests {
 
     // --- live: the whole seam against the daemon -------------------------------------
 
-    #[test]
-    fn live_prepare_runs_invoke_inside_the_container_and_tears_down() {
-        require_docker!();
-        let _daemon = live_lock();
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        let (inner, root) = plain(dir.path());
-        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&observed);
-        let builder: HostInvokeBuilder = Arc::new(move |host, spec| {
+    /// A builder whose invoke runs `sh -c script` through the execution host
+    /// (prompt on stdin), collecting stdout lines into `sink`.
+    fn shell_builder(script: &'static str, sink: Arc<Mutex<Vec<String>>>) -> HostInvokeBuilder {
+        Arc::new(move |host, spec| {
             let sink = Arc::clone(&sink);
             let cwd = spec.working_directory.clone();
             Arc::new(move |request: InvocationRequest| {
@@ -1169,11 +1243,7 @@ mod tests {
                 let sink = Arc::clone(&sink);
                 let cwd = cwd.clone();
                 Box::pin(async move {
-                    let mut plan = ProcessPlan::new(vec![
-                        "sh".into(),
-                        "-c".into(),
-                        "cat; echo; pwd; id -u; echo touched > marker.txt".into(),
-                    ]);
+                    let mut plan = ProcessPlan::new(vec!["sh".into(), "-c".into(), script.into()]);
                     plan.cwd = Some(cwd);
                     plan.stdin = StdinPlan::Payload(request.prompt.clone());
                     let mut process = host.spawn(plan).await.unwrap();
@@ -1198,7 +1268,21 @@ mod tests {
                     }
                 })
             })
-        });
+        })
+    }
+
+    #[test]
+    fn live_prepare_runs_invoke_inside_the_container_and_tears_down() {
+        require_docker!();
+        let _daemon = live_lock();
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, root) = plain(dir.path());
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let builder = shell_builder(
+            "cat; echo; pwd; id -u; echo touched > marker.txt",
+            Arc::clone(&observed),
+        );
         // SAFETY: getuid/getgid are always-safe libc queries.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let cfg = ContainerConfig {
@@ -1239,5 +1323,94 @@ mod tests {
         assert!(!docker.list_owned_containers(None).unwrap().contains(&name));
         assert!(registry.active_names().is_empty());
         let _ = docker.remove_container(&name, None);
+    }
+
+    /// An image with git on top of `alpine:latest`, built once and cached on
+    /// the daemon; `None` when it cannot be built (no network for `apk`).
+    fn git_image() -> Option<&'static str> {
+        const IMAGE: &str = "flywheel-test/alpine-git:latest";
+        let docker = |args: &[&str], stdin: Option<&str>| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("docker")
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            let mut pipe = child.stdin.take()?;
+            pipe.write_all(stdin.unwrap_or("").as_bytes()).ok()?;
+            drop(pipe);
+            child.wait().ok().map(|status| status.success())
+        };
+        if docker(&["image", "inspect", IMAGE], None) == Some(true) {
+            return Some(IMAGE);
+        }
+        let dockerfile = "FROM alpine:latest\nRUN apk add --no-cache git\n";
+        (docker(&["build", "-q", "-t", IMAGE, "-"], Some(dockerfile)) == Some(true))
+            .then_some(IMAGE)
+    }
+
+    #[test]
+    fn live_agent_commits_from_a_linked_worktree() {
+        require_docker!();
+        let _daemon = live_lock();
+        let Some(image) = git_image() else {
+            eprintln!("skipping: cannot build the alpine+git test image");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (common, inner) = linked_worktree_inner(dir.path(), "gitwt");
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let builder = shell_builder(
+            "cat >/dev/null; echo ok > DONE.txt && git add DONE.txt \
+             && git -c user.name=agent -c user.email=agent@flywheel.invalid \
+             commit -q -m 'chore: add DONE.txt' && git status --porcelain \
+             && if echo x >> \"$(git rev-parse --git-common-dir)/config\"; \
+             then echo config-writable; else echo config-readonly; fi",
+            Arc::clone(&observed),
+        );
+        // SAFETY: getuid/getgid are always-safe libc queries.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let cfg = ContainerConfig {
+            container_uid: Some(uid),
+            container_gid: Some(gid),
+            command: vec!["sleep".into(), "infinity".into()],
+            network_policy: Some("deny".into()),
+            preflight: false,
+            ..ContainerConfig::new(image, "claude-opus-4-8")
+        };
+        let registry = Arc::new(CleanupRegistry::new());
+        let strategy = ContainerSubmitStrategy::new(inner, cfg, builder)
+            .unwrap()
+            .with_registry(Arc::clone(&registry));
+        let handle = strategy.prepare_sandbox(&request("gitwt")).unwrap();
+        let name = registry.active_names().into_iter().next().unwrap();
+
+        let invoke = handle.wrap_invoke(None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(invoke(invocation()));
+        handle.run_teardown().unwrap();
+        let _ = Docker::new().remove_container(&name, None);
+        assert!(
+            result.failure.is_none(),
+            "in-container git failed: {:?}",
+            result.failure
+        );
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            ["config-readonly"],
+            "clean tree after commit, and the shared repo config is read-only"
+        );
+        let repo = common.parent().unwrap();
+        assert_eq!(
+            git_ok(repo, &["log", "-1", "--format=%s", "flywheel/gitwt"]),
+            "chore: add DONE.txt",
+            "the agent's commit landed on the task branch in the host repo"
+        );
+        assert_eq!(git_ok(repo, &["show", "flywheel/gitwt:DONE.txt"]), "ok");
     }
 }

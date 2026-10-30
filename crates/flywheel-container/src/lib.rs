@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod config;
 pub mod docker;
+pub mod gitdir;
 pub mod network;
 pub mod submit;
 
@@ -32,6 +33,7 @@ pub use docker::{
     flush_cleanup_registry, reap_container_orphans, register_container_cleanup,
     spawn_container_orphan_reap,
 };
+pub use gitdir::{GitDirError, git_metadata_mounts};
 pub use network::{DEFAULT_INTERNAL_NETWORK, NetworkError, ResolvedNetwork, resolve_network};
 pub use submit::{
     ContainerConfig, ContainerInvokeSpec, ContainerLog, ContainerSubmitStrategy, HostInvokeBuilder,

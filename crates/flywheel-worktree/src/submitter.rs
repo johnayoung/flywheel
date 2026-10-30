@@ -1038,6 +1038,11 @@ impl GitWorktreeSubmitter {
 
     /// Rebase a parked branch onto the current base. `true` if up to date
     /// or rebased cleanly, `false` on conflict (the rebase is aborted).
+    ///
+    /// `--autostash` carries uncommitted edits (an interrupted run's dirty
+    /// tree) across the rebase: without it git refuses to start on a dirty
+    /// worktree, which would read as a conflict and discard the branch's
+    /// committed work even though the rebase itself is clean.
     pub fn rebase_parked_branch(
         &self,
         worktree: &Path,
@@ -1054,7 +1059,7 @@ impl GitWorktreeSubmitter {
         self.log(format!(
             "Parked {branch} is {behind} commit(s) behind {base}; rebasing..."
         ));
-        if git(worktree, &["rebase", base])?.ok() {
+        if git(worktree, &["rebase", "--autostash", base])?.ok() {
             self.log("Rebase clean; prior commits carry forward.");
             return Ok(true);
         }
@@ -2789,6 +2794,36 @@ mod tests {
         assert!(
             !wt.join("setup-ran").exists(),
             "a reused worktree skips setup"
+        );
+    }
+
+    #[test]
+    fn dirty_parked_worktree_still_rebases_and_keeps_its_commits_and_edits() {
+        let (_dir, repo) = repo();
+        let s = submitter(&repo, ledger());
+        let (tf, wt) = prepared(&s, &repo, "01-phase", "t1", "true");
+        commit(&wt, "work.txt", "w\n", "agent work");
+        // An interrupted run leaves an uncommitted edit to a tracked file.
+        fs::write(wt.join("work.txt"), "w\nuncommitted\n").unwrap();
+        commit(&repo, "other.txt", "o", "base advances");
+        let again = s.prepare_worktree(&sandbox_req(&tf, "t1")).unwrap();
+        assert_eq!(again, wt);
+        assert!(
+            git(&repo, &["log", "--format=%s", "flywheel/01-phase/t1"])
+                .unwrap()
+                .stdout
+                .lines()
+                .any(|subject| subject == "agent work"),
+            "the parked branch's committed work must survive a dirty-tree rebase"
+        );
+        assert!(
+            wt.join("other.txt").exists(),
+            "rebased onto the advanced base"
+        );
+        assert_eq!(
+            fs::read_to_string(wt.join("work.txt")).unwrap(),
+            "w\nuncommitted\n",
+            "the uncommitted edit carries forward"
         );
     }
 

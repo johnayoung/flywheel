@@ -2460,6 +2460,119 @@ async fn heartbeat_renews_the_lease_and_signals_a_stolen_lease() {
     heartbeat.stop();
 }
 
+/// A clock that reads `DateTime::MAX_UTC` for its first `failing` calls (so
+/// the store refuses the renewal with a non-loss `LeaseOutOfRange` error, a
+/// real store-side failure that is not `ClaimLost`) and `then` afterwards.
+fn clock_failing_renewals_first(
+    failing: usize,
+    then: chrono::DateTime<Utc>,
+) -> (flywheel_core::invoker_client::Clock, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let clock: flywheel_core::invoker_client::Clock = Arc::new(move || {
+        if counter.fetch_add(1, Ordering::SeqCst) < failing {
+            chrono::DateTime::<Utc>::MAX_UTC
+        } else {
+            then
+        }
+    });
+    (clock, calls)
+}
+
+#[test]
+fn heartbeat_retries_a_non_loss_renew_error_on_the_next_tick() {
+    let store: Arc<dyn ClaimStore> = Arc::new(InMemoryClaimStore::new());
+    let start = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+    let claim = store
+        .acquire_claim("t", "w", start, 10.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let (clock, calls) = clock_failing_renewals_first(3, start + ChronoDuration::seconds(5));
+    let heartbeat =
+        ClaimHeartbeat::start(store.clone(), claim.clone(), 10.0, 0.005, clock).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while store.load_claim("t").unwrap().unwrap().version == claim.version
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        calls.load(Ordering::SeqCst) > 3,
+        "renewal kept ticking past the failed attempts"
+    );
+    assert!(
+        !heartbeat.lost(),
+        "a renew error that is not ClaimLost must not read as a stolen lease"
+    );
+    let latest = heartbeat.stop();
+    let stored = store.load_claim("t").unwrap().unwrap();
+    assert!(
+        stored.version > claim.version,
+        "renewal resumed once the store accepted it"
+    );
+    assert_eq!(stored.worker_id, "w");
+    assert_eq!(
+        stored.lease_expires_at,
+        start + ChronoDuration::seconds(15),
+        "the resumed renewal extends the lease from the recovered clock"
+    );
+    assert_eq!(latest, stored, "stop hands back the renewed token");
+}
+
+#[test]
+fn heartbeat_confirm_surfaces_a_non_loss_renew_error_without_flagging_loss() {
+    let store: Arc<dyn ClaimStore> = Arc::new(InMemoryClaimStore::new());
+    let start = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+    let claim = store
+        .acquire_claim("t", "w", start, 10.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    // The timer never fires during the test: only `confirm` renews.
+    let (clock, _) = clock_failing_renewals_first(1, start + ChronoDuration::seconds(5));
+    let heartbeat =
+        ClaimHeartbeat::start(store.clone(), claim.clone(), 10.0, 3600.0, clock).unwrap();
+    let err = heartbeat
+        .confirm()
+        .expect_err("ownership is unproven either way: an error, not a verdict");
+    assert!(
+        matches!(err, crate::claims::ClaimStoreError::LeaseOutOfRange { .. }),
+        "the store's error is propagated unchanged, got {err:?}"
+    );
+    assert!(
+        !heartbeat.lost(),
+        "an unproven renewal is not a stolen lease"
+    );
+    assert_eq!(
+        store.load_claim("t").unwrap().unwrap(),
+        claim,
+        "a refused renewal writes nothing"
+    );
+    assert_eq!(heartbeat.latest(), claim, "the held token is unchanged");
+
+    // The next confirm, once the store accepts the renewal, proves ownership.
+    assert!(heartbeat.confirm().unwrap());
+    assert_eq!(heartbeat.latest().version, claim.version + 1);
+    heartbeat.stop();
+}
+
+#[test]
+fn heartbeat_debug_names_the_task_and_loss_state() {
+    let store: Arc<dyn ClaimStore> = Arc::new(InMemoryClaimStore::new());
+    let start = Utc.timestamp_opt(1_800_000_000, 0).unwrap();
+    let claim = store
+        .acquire_claim("task-7", "w", start, 10.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let heartbeat =
+        ClaimHeartbeat::start(store, claim, 10.0, 3600.0, Arc::new(move || start)).unwrap();
+    let rendered = format!("{heartbeat:?}");
+    assert_eq!(
+        rendered,
+        "ClaimHeartbeat { task_id: Some(\"task-7\"), lost: false, interval: 3600s }"
+    );
+    heartbeat.stop();
+}
+
 // --- steering reconciler and lease sweep -----------------------------------------
 
 #[test]

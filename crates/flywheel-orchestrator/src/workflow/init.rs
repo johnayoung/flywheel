@@ -951,7 +951,8 @@ pub fn print_init_next_steps(
 /// section header and runs to the next. Concatenating the chunks reproduces
 /// the text byte-for-byte.
 pub fn split_toml_sections(text: &str) -> Vec<(Option<String>, String)> {
-    let mut chunks: Vec<(Option<String>, String)> = vec![(None, String::new())];
+    let mut chunks: Vec<(Option<String>, String)> = Vec::new();
+    let mut current: (Option<String>, String) = (None, String::new());
     let mut rest = text;
     while !rest.is_empty() {
         let (line, remainder) = match rest.find('\n') {
@@ -961,10 +962,14 @@ pub fn split_toml_sections(text: &str) -> Vec<(Option<String>, String)> {
         rest = remainder;
         let bare = line.trim_end_matches(['\n', '\r']);
         match TOML_HEADER_RE.captures(bare) {
-            Some(caps) => chunks.push((Some(caps["name"].to_owned()), line.to_owned())),
-            None => chunks.last_mut().expect("preamble chunk").1.push_str(line),
+            Some(caps) => chunks.push(std::mem::replace(
+                &mut current,
+                (Some(caps["name"].to_owned()), line.to_owned()),
+            )),
+            None => current.1.push_str(line),
         }
     }
+    chunks.push(current);
     chunks
 }
 
@@ -2173,5 +2178,31 @@ model = \"claude-opus-4-7\"
             github_repo_from_origin_url("https://gitlab.com/octo/widgets"),
             None
         );
+    }
+
+    #[test]
+    fn split_toml_sections_keeps_preamble_and_round_trips() {
+        let text = "# top\nkey = 1\n[store]\nbackend = \"sqlite\"\n\n[[submit.tiers]]\ntier = 1";
+        let chunks = split_toml_sections(text);
+        let names: Vec<Option<&str>> = chunks.iter().map(|(n, _)| n.as_deref()).collect();
+        assert_eq!(names, [None, Some("store"), Some("submit.tiers")]);
+        assert_eq!(chunks[0].1, "# top\nkey = 1\n");
+        assert_eq!(chunks[2].1, "[[submit.tiers]]\ntier = 1");
+        let joined: String = chunks.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(joined, text);
+
+        // A leading header still yields the (empty) preamble chunk first.
+        let chunks = split_toml_sections("[agent]\nmodel = \"x\"\n");
+        assert_eq!(
+            chunks,
+            [
+                (None, String::new()),
+                (
+                    Some("agent".to_owned()),
+                    "[agent]\nmodel = \"x\"\n".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(split_toml_sections(""), [(None, String::new())]);
     }
 }

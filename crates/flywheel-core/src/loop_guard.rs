@@ -342,15 +342,16 @@ impl LoopGuard {
         let threshold = enabled(self.config.thrash_repeat_threshold)?;
         let window = enabled(self.config.thrash_window)?;
 
-        self.recent.push_back(key);
-        while self.recent.len() > window as usize {
+        // Keep the trailing `window - 1` prior calls, count this call among
+        // them, then append it: the window is this call plus its
+        // predecessors (`window >= 1`, `enabled` filters zero).
+        while self.recent.len() >= window as usize {
             self.recent.pop_front();
         }
-        let key = self.recent.back().expect("just pushed");
-        let occurrences = self.recent.iter().filter(|entry| *entry == key).count();
-        if occurrences >= threshold as usize {
-            let (tool_name, digest) = key;
-            return Some(LoopGuardVerdict {
+        let occurrences = 1 + self.recent.iter().filter(|entry| **entry == key).count();
+        let verdict = (occurrences >= threshold as usize).then(|| {
+            let (tool_name, digest) = &key;
+            LoopGuardVerdict {
                 kind: LoopGuardVerdictKind::Thrash,
                 reason: format!(
                     "{occurrences} repeats of '{tool_name}' with identical input \
@@ -360,9 +361,10 @@ impl LoopGuard {
                 ),
                 tool_name: tool_name.clone(),
                 input_digest: digest.clone(),
-            });
-        }
-        None
+            }
+        });
+        self.recent.push_back(key);
+        verdict
     }
 }
 
@@ -694,6 +696,38 @@ mod tests {
         ];
         assert!(guard.observe(&stream).is_none());
         assert_eq!(guard.recent.len(), 3);
+    }
+
+    #[test]
+    fn thrash_window_counts_the_current_call_and_its_window_minus_one_predecessors() {
+        let target = json!({"cmd": "target"});
+        // window 3: target, decoy, target -> both targets share the window.
+        let mut guard = LoopGuard::new(config(None, Some(2), Some(3)));
+        let verdict = guard
+            .observe(&[
+                succeeding("u1", target.clone()),
+                succeeding("u2", json!({"cmd": "decoy"})),
+                succeeding("u3", target.clone()),
+            ])
+            .unwrap();
+        assert_eq!(verdict.kind, LoopGuardVerdictKind::Thrash);
+        assert!(verdict.reason.starts_with("2 repeats of 'Bash'"));
+
+        // window 3: the first target is the 4th-most-recent call -> no trip.
+        let mut guard = LoopGuard::new(config(None, Some(2), Some(3)));
+        let verdict = guard.observe(&[
+            succeeding("u1", target.clone()),
+            succeeding("u2", json!({"cmd": "decoy-a"})),
+            succeeding("u3", json!({"cmd": "decoy-b"})),
+            succeeding("u4", target.clone()),
+        ]);
+        assert!(verdict.is_none());
+        assert_eq!(guard.recent.len(), 3);
+
+        // window 1 holds only the current call: threshold 1 trips at once.
+        let mut guard = LoopGuard::new(config(None, Some(1), Some(1)));
+        assert!(guard.observe(&[succeeding("u1", target)]).is_some());
+        assert_eq!(guard.recent.len(), 1);
     }
 
     #[test]

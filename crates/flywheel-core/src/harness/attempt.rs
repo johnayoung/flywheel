@@ -309,9 +309,7 @@ async fn run_attempt_body(
             let run_started = prior
                 .iter()
                 .map(|a| a.started_at)
-                .chain(std::iter::once(attempt.started_at))
-                .min()
-                .expect("at least the current attempt");
+                .fold(attempt.started_at, std::cmp::min);
             let elapsed_seconds = (run.now() - run_started).as_seconds_f64();
             if elapsed_seconds >= config.wall_clock_seconds as f64 {
                 return finalize_budget_breach(

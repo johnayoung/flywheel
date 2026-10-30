@@ -721,9 +721,9 @@ pub(super) async fn drive_iterations(
         // Transient rate-limit retry: re-invoke the SAME iteration on the
         // separate bounded budget, backing off between tries.
         let mut transient_retries: u32 = 0;
-        let mut iteration_result: Option<IterationResult> = None;
-        let mut recovery_requested = false;
-        loop {
+        // `None` is the mid-turn recovery exit; every other exit carries
+        // the iteration's result.
+        let iteration_result: Option<IterationResult> = loop {
             let result = run_invocation(
                 run,
                 invoker,
@@ -747,8 +747,7 @@ pub(super) async fn drive_iterations(
                         trigger: RECOVERY_TRIGGER_MID_TURN,
                     });
                     driven.wall_seconds = run.monotonic() - started_monotonic;
-                    recovery_requested = true;
-                    break;
+                    break None;
                 }
                 if failure.error_type == FAILURE_OPERATOR_INTERRUPT {
                     // The store-routed operator interrupt is the twin of
@@ -787,12 +786,10 @@ pub(super) async fn drive_iterations(
                     Some(attempt_number),
                     Some(iteration_number),
                 );
-                iteration_result = Some(result);
-                break;
+                break Some(result);
             }
             let Some(transient_reason) = transient_reason else {
-                iteration_result = Some(result);
-                break;
+                break Some(result);
             };
             if transient_retries >= config.max_transient_retries {
                 driven.transient_exhausted = true;
@@ -808,8 +805,7 @@ pub(super) async fn drive_iterations(
                     Some(attempt_number),
                     Some(iteration_number),
                 );
-                iteration_result = Some(result);
-                break;
+                break Some(result);
             }
             let delay = config.transient_backoff.delay_for(transient_retries);
             transient_retries += 1;
@@ -830,13 +826,12 @@ pub(super) async fn drive_iterations(
                 Some(sleep) => sleep(delay).await,
                 None => tokio::time::sleep(Duration::from_secs_f64(delay)).await,
             }
-        }
+        };
 
-        if recovery_requested {
+        let Some(result) = iteration_result else {
             driven.result = None;
             break;
-        }
-        let result = iteration_result.expect("every non-recovery exit assigned a result");
+        };
         driven.wall_seconds = run.monotonic() - started_monotonic;
 
         // Context-pressure telemetry: token fields are per-iteration deltas;

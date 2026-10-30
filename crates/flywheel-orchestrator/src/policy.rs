@@ -1204,9 +1204,9 @@ impl Ctx<'_> {
         let Some(value) = table.get("tiers") else {
             return Ok(Vec::new());
         };
-        let items = value
+        let items: Vec<&Table> = value
             .as_array()
-            .filter(|items| items.iter().all(Value::is_table))
+            .and_then(|items| items.iter().map(Value::as_table).collect())
             .ok_or_else(|| {
                 self.err(
                     "submit.tiers must be an array of tables ([[submit.tiers]] entries with \
@@ -1214,8 +1214,7 @@ impl Ctx<'_> {
                 )
             })?;
         let mut rules = Vec::with_capacity(items.len());
-        for (index, item) in items.iter().enumerate() {
-            let item = item.as_table().expect("filtered to tables above");
+        for (index, item) in items.into_iter().enumerate() {
             let unknown: Vec<&String> = item
                 .keys()
                 .filter(|key| key.as_str() != "tier" && key.as_str() != "paths")
@@ -1444,12 +1443,11 @@ impl Ctx<'_> {
         let (preset_name, base) = match sandbox.get("preset") {
             None => ("fast".to_string(), SandboxPolicy::default()),
             Some(value) => {
-                let base = value.as_str().and_then(sandbox_preset);
-                match base {
-                    Some(base) => (
-                        value.as_str().expect("preset is a string").to_string(),
-                        base,
-                    ),
+                let named = value
+                    .as_str()
+                    .and_then(|name| sandbox_preset(name).map(|base| (name.to_string(), base)));
+                match named {
+                    Some(named) => named,
                     None => {
                         return Err(self.err(format!(
                             "sandbox.preset {} is not available (defined presets: {})",

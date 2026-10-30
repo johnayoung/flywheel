@@ -324,7 +324,7 @@ fn content_blocks(payload: &JsonObject) -> Option<Vec<&Value>> {
         None | Some(Value::Null) => Some(Vec::new()),
         Some(value) if !truthy(value) => Some(Vec::new()),
         Some(Value::Array(items)) => Some(items.iter().take(MAX_BLOCKS_PER_MESSAGE).collect()),
-        Some(Value::String(_)) => Some(vec![payload.get("content").unwrap()]),
+        Some(content @ Value::String(_)) => Some(vec![content]),
         Some(_) => None,
     }
 }

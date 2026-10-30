@@ -36,3 +36,7 @@ Thumbs.db
 .playwright*
 # Rust build output
 target/
+
+# SQLite WAL/shared-memory sidecars (tests opening fixture DBs leave these behind)
+*.sqlite-shm
+*.sqlite-wal

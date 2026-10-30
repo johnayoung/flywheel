@@ -58,7 +58,7 @@
 use crate::autopilot::{
     AgentsRepoInvoker, AutopilotInvoker, RepoInvokerOptions, build_repo_invoker,
 };
-use crate::github::{GhRunner, ISSUE_LIST_FIELDS, LIST_LIMIT, run_gh};
+use crate::github::{GhRunner, ISSUE_LIST_FIELDS, LIST_LIMIT, emit_truncation_warning, run_gh};
 use crate::sources::{LogSink, WorkSourceError};
 use crate::triage_receipt::{
     RECEIPT_KEY, SPEC_FENCE_CLOSE, SPEC_FENCE_OPEN, TriageReceipt, content_hash, is_fail_first,
@@ -92,9 +92,11 @@ const _: () = assert!(LIST_LIMIT == 200);
 
 /// A triage pass could not complete.
 ///
-/// Every variant aborts the pass (the daemon counts it as one failed cycle);
-/// a partially written board is re-read on the next pass, where the write
-/// discipline makes the remaining work idempotent.
+/// A board read error aborts the pass (the daemon counts it as one failed
+/// cycle). An error while triaging one candidate is contained to that
+/// candidate (see [`TriagePass::run`]) and fails the pass only when no
+/// candidate succeeded; a partially written board is re-read on the next
+/// pass, where the write discipline makes the remaining work idempotent.
 #[derive(Debug, thiserror::Error)]
 pub enum TriageError {
     /// `gh issue list` printed something that is not JSON.
@@ -235,15 +237,28 @@ pub struct TriageOutcome {
     pub missing_information: Vec<String>,
 }
 
+/// A candidate whose triage errored this pass: it reached no terminal
+/// decision and stays on the board for a later pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriageFailure {
+    pub number: i64,
+    /// [`TriageError::kind_name`] of the error.
+    pub kind: &'static str,
+    /// The error's display text.
+    pub message: String,
+}
+
 /// The outcomes of one triage pass, in board order.
 ///
 /// `deferred` counts the work candidates cut past this pass's
 /// `per_pass_cap` -- issues left untouched this pass (0 when uncapped or
-/// within the cap).
+/// within the cap). `failed` lists the candidates whose triage errored, in
+/// board order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TriagePassResult {
     pub outcomes: Vec<TriageOutcome>,
     pub deferred: usize,
+    pub failed: Vec<TriageFailure>,
 }
 
 impl TriagePassResult {
@@ -758,6 +773,14 @@ impl TriagePass {
     /// Settled ready issues are not candidates, so a pass over unchanged
     /// state writes nothing. Candidates are processed up to `per_pass_cap`;
     /// the remainder is deferred untouched, counted, and logged.
+    ///
+    /// A candidate whose triage errors (agent, executor, or board write) is
+    /// logged, recorded in [`TriagePassResult::failed`], and skipped, so a
+    /// permanently failing issue cannot starve the issues after it in board
+    /// order. The pass itself errors -- with the first candidate error --
+    /// only when candidates were attempted and every one failed, which keeps
+    /// a systemic fault (agent CLI missing, `gh` auth lost) visible to the
+    /// daemon's circuit breaker.
     pub async fn run(&self) -> Result<TriagePassResult, TriageError> {
         let intake = self.list_issues(&self.board.intake_label)?;
         let ready = self.list_issues(&self.board.ready_label)?;
@@ -775,10 +798,34 @@ impl TriagePass {
             _ => (&backlog[..], 0),
         };
         let mut outcomes = Vec::with_capacity(selected.len());
+        let mut failed = Vec::new();
+        let mut first_error = None;
         for candidate in selected {
-            outcomes.push(self.triage_candidate(candidate).await?);
+            match self.triage_candidate(candidate).await {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(err) => {
+                    self.log_line(&format!(
+                        "[triage] #{} failed ({}: {err}); skipped this pass",
+                        candidate.number,
+                        err.kind_name()
+                    ));
+                    failed.push(TriageFailure {
+                        number: candidate.number,
+                        kind: err.kind_name(),
+                        message: err.to_string(),
+                    });
+                    first_error.get_or_insert(err);
+                }
+            }
         }
-        Ok(TriagePassResult { outcomes, deferred })
+        match first_error {
+            Some(err) if outcomes.is_empty() => Err(err),
+            _ => Ok(TriagePassResult {
+                outcomes,
+                deferred,
+                failed,
+            }),
+        }
     }
 
     /// The ordered work backlog: intake issues plus drifted ready issues.
@@ -852,13 +899,21 @@ impl TriagePass {
         let issues: Value = serde_json::from_str(text)
             .map_err(|err| TriageError::InvalidListJson(err.to_string()))?;
         match issues {
-            Value::Array(items) => Ok(items
-                .into_iter()
-                .filter_map(|i| match i {
-                    Value::Object(map) => Some(map),
-                    _ => None,
-                })
-                .collect()),
+            Value::Array(items) => {
+                // `gh issue list` reports no `hasNextPage`; a page filled to
+                // the cap is the only truncation evidence, measured on the
+                // raw page before non-object entries are dropped.
+                if items.len() == LIST_LIMIT {
+                    emit_truncation_warning(self.log.as_ref(), "triage", &format!("{label} issue"));
+                }
+                Ok(items
+                    .into_iter()
+                    .filter_map(|i| match i {
+                        Value::Object(map) => Some(map),
+                        _ => None,
+                    })
+                    .collect())
+            }
             other => Err(TriageError::ListNotAList(py_type_name(&other).to_string())),
         }
     }
@@ -2464,6 +2519,215 @@ mod tests {
         let err = rt.block_on(build(failing).run()).unwrap_err();
         assert_eq!(err.kind_name(), "WorkSourceError");
         assert!(err.to_string().contains("failed (exit 1): boom"));
+    }
+
+    // --- per-candidate failure isolation --------------------------------------------------
+
+    /// An authoring agent that errors on any prompt naming `poison` and
+    /// answers every other prompt with a fail-first plan.
+    struct PoisonInvoke {
+        poison: &'static str,
+    }
+
+    impl TriageInvoke for PoisonInvoke {
+        fn invoke<'a>(&'a self, prompt: &'a str) -> TriageInvokeFuture<'a> {
+            Box::pin(async move {
+                if prompt.contains(self.poison) {
+                    Err(TriageError::Invoke(
+                        "prompt exceeds the context window".into(),
+                    ))
+                } else {
+                    Ok(ready_response("cargo test widget_retry"))
+                }
+            })
+        }
+    }
+
+    /// Delegates to [`ScriptedGh`] but refuses every `issue edit` of `number`
+    /// (e.g. a body GitHub rejects as too long).
+    struct EditRefusingGh {
+        inner: Arc<ScriptedGh>,
+        number: &'static str,
+    }
+
+    impl GhRunner for EditRefusingGh {
+        fn run_gh(&self, argv: &[String]) -> Result<crate::github::GhOutput, WorkSourceError> {
+            if argv.len() >= 3 && argv[0] == "issue" && argv[1] == "edit" && argv[2] == self.number
+            {
+                self.inner.calls.lock().unwrap().push(argv.to_vec());
+                return Ok(crate::github::GhOutput {
+                    stdout: String::new(),
+                    stderr: "body is too long (maximum is 65536 characters)".into(),
+                    exit_code: Some(1),
+                });
+            }
+            self.inner.run_gh(argv)
+        }
+    }
+
+    fn isolating_pass(gh: &Arc<ScriptedGh>, log: LogSink) -> TriagePass {
+        TriagePass::new(
+            board(),
+            BASE_SHA,
+            TriageSeams {
+                invoker: Arc::new(PoisonInvoke { poison: "POISON" }),
+                executor: ScriptedExecutor::exiting(1),
+                runner: Arc::new(EditRefusingGh {
+                    inner: Arc::clone(gh),
+                    number: "3",
+                }),
+            },
+        )
+        .unwrap()
+        .with_log(log)
+    }
+
+    #[test]
+    fn a_failing_candidate_does_not_starve_the_rest_of_the_board() {
+        // #1 (lowest number, processed first) fails at the authoring agent;
+        // #3 fails at its board write. Neither may abort the pass: #2 and #4
+        // are still triaged, and the failures are logged and left for a
+        // later pass instead of blocking every pass forever.
+        let gh = ScriptedGh::by_label(vec![(
+            "intake",
+            vec![
+                issue(4, "Fix 4", "widget 4 drops retries"),
+                issue(1, "Fix 1", "POISON widget 1 drops retries"),
+                issue(3, "Fix 3", "widget 3 drops retries"),
+                issue(2, "Fix 2", "widget 2 drops retries"),
+            ],
+        )]);
+        let (log, lines) = capture_log();
+        let result = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(isolating_pass(&gh, log).run())
+            .expect("per-candidate failures must not abort the pass");
+
+        let numbers: Vec<i64> = result.outcomes.iter().map(|o| o.number).collect();
+        assert_eq!(numbers, [2, 4]);
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|o| o.decision == Decision::Ready)
+        );
+        let edited: Vec<String> = gh.edits().iter().map(|e| e[2].clone()).collect();
+        assert_eq!(edited, ["2", "3", "4"]);
+        assert!(gh.comments().is_empty());
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "[triage] #1 failed (InvokeError: authoring agent failed: prompt exceeds the \
+             context window); skipped this pass"
+        );
+        assert!(
+            lines[1].starts_with("[triage] #3 failed (WorkSourceError: gh issue edit 3 ")
+                && lines[1].ends_with(
+                    "failed (exit 1): body is too long (maximum is 65536 characters)); \
+                     skipped this pass"
+                ),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn failed_candidates_are_recorded_and_retried_on_the_next_pass() {
+        let gh = ScriptedGh::by_label(vec![(
+            "intake",
+            vec![
+                issue(1, "Fix 1", "POISON widget 1 drops retries"),
+                issue(2, "Fix 2", "widget 2 drops retries"),
+            ],
+        )]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (log, _lines) = capture_log();
+        let result = rt.block_on(isolating_pass(&gh, log).run()).unwrap();
+        assert_eq!(
+            result.failed,
+            [TriageFailure {
+                number: 1,
+                kind: "InvokeError",
+                message: "authoring agent failed: prompt exceeds the context window".into(),
+            }]
+        );
+        assert_eq!(result.ready().len(), 1);
+        assert_eq!(result.deferred, 0);
+        // The failed issue was not written, so it is still an intake
+        // candidate: the next pass attempts it again.
+        let (log, lines) = capture_log();
+        rt.block_on(isolating_pass(&gh, log).run()).unwrap();
+        assert!(
+            lines.lock().unwrap()[0].starts_with("[triage] #1 failed (InvokeError: "),
+            "{:?}",
+            lines.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_pass_where_every_candidate_fails_errors_with_the_first_failure() {
+        // No candidate made progress: a systemic fault must still reach the
+        // daemon's circuit breaker as a failed cycle.
+        let gh = ScriptedGh::by_label(vec![(
+            "intake",
+            vec![
+                issue(3, "Fix 3", "widget 3 drops retries"),
+                issue(1, "Fix 1", "POISON widget 1 drops retries"),
+            ],
+        )]);
+        let (log, lines) = capture_log();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(isolating_pass(&gh, log).run())
+            .unwrap_err();
+        assert_eq!(err.kind_name(), "InvokeError");
+        assert_eq!(
+            err.to_string(),
+            "authoring agent failed: prompt exceeds the context window"
+        );
+        // Both candidates were still attempted and logged.
+        assert_eq!(lines.lock().unwrap().len(), 2);
+        let edited: Vec<String> = gh.edits().iter().map(|e| e[2].clone()).collect();
+        assert_eq!(edited, ["3"]);
+    }
+
+    #[test]
+    fn a_full_issue_page_warns_that_the_listing_was_truncated() {
+        // Entries the backlog skips (non-integer numbers), so the pass
+        // writes nothing and runs no agent: only the page size matters.
+        let full = vec![json!({"number": "n/a", "title": "t", "body": "b"}); LIST_LIMIT];
+        let short = full[..LIST_LIMIT - 1].to_vec();
+        for (issues, expect_warning) in [(full, true), (short, false)] {
+            let gh = ScriptedGh::by_label(vec![("intake", issues)]);
+            let (log, lines) = capture_log();
+            let triage =
+                pass(gh.clone(), ScriptedExecutor::boom(), ScriptedInvoke::boom()).with_log(log);
+            run(&triage);
+            let warnings: Vec<String> = lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("truncated"))
+                .cloned()
+                .collect();
+            if expect_warning {
+                assert_eq!(
+                    warnings,
+                    [
+                        "[triage] intake issue listing truncated at one page; some items were \
+                         not read this pass"
+                    ]
+                );
+            } else {
+                assert!(warnings.is_empty(), "{warnings:?}");
+            }
+            assert!(gh.writes().is_empty());
+        }
     }
 
     // --- production seams -----------------------------------------------------------------

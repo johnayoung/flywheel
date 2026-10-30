@@ -114,6 +114,8 @@ Landing strategy and scoring weights come from policy (`autopilot_landing` defau
 
 Triages the GitHub intake board: authors a fail-first spec+grader for each candidate issue, then labels well-specified issues ready and under-specified ones needs-detail, each with a receipt. Delegated to `main` in `crates/flywheel-orchestrator/src/triage_run.rs`. **Neverending label-polling daemon by default**; `--once` runs one triage pass and exits 0. The daemon loop never terminates on an idle cycle — an empty board writes nothing and the next cycle is scheduled; it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
 
+A candidate whose triage errors (agent, grader executor, or `gh` write) is logged as `#N failed (...)` and counted in the pass summary without blocking the remaining candidates; an issue it left unwritten is retried next pass. A pass fails only when every attempted candidate failed (or the board read fails). A full 200-issue listing page logs a truncation warning.
+
 The policy is resolved and validated **before** the repo root or any `gh` call: a malformed `[triage]` value prints to stderr and exits 2 having issued no GitHub write. Triage requires `[source] kind = "github"` with a `repo`; any other source exits 2. The board labels and cadence come from the optional `[triage]` table (`intake_label` default `flywheel`, `ready_label` default `flywheel:ready`, `needs_detail_label` default `flywheel:needs-detail`, `interval_seconds` default `300.0`, `max_per_pass` uncapped); see [configuration.md](configuration.md).
 
 | Flag | Controls |

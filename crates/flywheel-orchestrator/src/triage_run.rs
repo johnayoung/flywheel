@@ -164,8 +164,13 @@ pub fn py_float_repr(value: f64) -> String {
 }
 
 fn log_result(log: &LogSink, result: &TriagePassResult) {
+    let failed = if result.failed.is_empty() {
+        String::new()
+    } else {
+        format!(", {} failed", result.failed.len())
+    };
     log(&format!(
-        "pass complete: {} ready, {} needs-detail, {} deferred",
+        "pass complete: {} ready, {} needs-detail, {} deferred{failed}",
         result.ready().len(),
         result.needs_detail().len(),
         result.deferred
@@ -1113,6 +1118,7 @@ mod tests {
                 },
             ],
             deferred: 2,
+            failed: vec![],
         }));
         assert_eq!(run_main(&argv(&["--once", "--model", "m2"]), &host), 0);
         let passes = host.passes.lock().unwrap();
@@ -1127,6 +1133,37 @@ mod tests {
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         let passes = host.passes.lock().unwrap();
         assert_eq!(passes[1].agent.model.as_deref(), Some("claude-x"));
+    }
+
+    #[test]
+    fn once_summary_counts_failed_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = write_policy(dir.path(), GITHUB_SOURCE);
+        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        host.outcome.lock().unwrap().push_back(Ok(TriagePassResult {
+            outcomes: vec![TriageOutcome {
+                number: 8,
+                source_ref: "octo/repo#8".into(),
+                decision: Decision::Ready,
+                authoritative_command: Some("c".into()),
+                exit_code: Some(1),
+                receipt: None,
+                comment: None,
+                missing_information: vec![],
+            }],
+            deferred: 0,
+            failed: vec![crate::triage::TriageFailure {
+                number: 9,
+                kind: "InvokeError",
+                message: "authoring agent failed: x".into(),
+            }],
+        }));
+        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        let err = host.err_text();
+        assert!(
+            err.contains("[triage] pass complete: 1 ready, 0 needs-detail, 0 deferred, 1 failed\n[triage] #8: ready"),
+            "{err}"
+        );
     }
 
     #[test]

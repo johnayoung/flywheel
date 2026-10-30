@@ -381,8 +381,16 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BoxFuture;
+    use crate::capabilities::AgentCapabilities;
     use crate::config::AgentConfiguration;
+    use crate::events::{EventType, MemorySink};
+    use crate::models::{AdapterCompatibility, AgentDescriptor, AgentExit, AgentFault};
+    use serde_json::json;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     fn request(timeout: Option<f64>) -> RunRequest {
         RunRequest {
@@ -421,6 +429,310 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), handle.cancelled())
             .await
             .unwrap();
+    }
+
+    /// One scripted step of a [`ScriptedAgent`] stream.
+    enum Step {
+        Emit(AgentEvent),
+        Fail(AgentError),
+        Panic,
+    }
+
+    /// What a scripted run observed: how often the runtime terminated the
+    /// agent and the evidence it handed the fault classifier.
+    #[derive(Default)]
+    struct Observed {
+        cancels: AtomicUsize,
+        evidence: Mutex<Vec<FaultEvidence>>,
+    }
+
+    /// An adapter whose single run replays `steps` and exits with `exit`.
+    struct ScriptedAdapter {
+        descriptor: AgentDescriptor,
+        steps: Mutex<Option<Vec<Step>>>,
+        exit: AgentExit,
+        fault: Option<AgentFault>,
+        observed: Arc<Observed>,
+    }
+
+    impl ScriptedAdapter {
+        fn new(steps: Vec<Step>, exit: AgentExit, fault: Option<AgentFault>) -> Self {
+            Self {
+                descriptor: AgentDescriptor {
+                    id: "scripted".into(),
+                    display_name: "Scripted".into(),
+                    adapter_version: "0".into(),
+                    vendor: None,
+                    executable_names: Vec::new(),
+                    capabilities: AgentCapabilities::default(),
+                    compatibility: AdapterCompatibility::default(),
+                },
+                steps: Mutex::new(Some(steps)),
+                exit,
+                fault,
+                observed: Arc::new(Observed::default()),
+            }
+        }
+    }
+
+    struct ScriptedAgent {
+        steps: VecDeque<Step>,
+        exit: AgentExit,
+        observed: Arc<Observed>,
+    }
+
+    impl RunningAgent for ScriptedAgent {
+        fn native_session_id(&self) -> Option<String> {
+            None
+        }
+
+        fn next_event(&mut self) -> BoxFuture<'_, Result<Option<AgentEvent>, AgentError>> {
+            let step = self.steps.pop_front();
+            Box::pin(async move {
+                match step {
+                    Some(Step::Emit(event)) => Ok(Some(event)),
+                    Some(Step::Fail(err)) => Err(err),
+                    Some(Step::Panic) => panic!("scripted adapter panicked mid-stream"),
+                    None => Ok(None),
+                }
+            })
+        }
+
+        fn control(&self) -> Option<Arc<dyn AgentControl>> {
+            None
+        }
+
+        fn cancel(&mut self) -> BoxFuture<'_, ()> {
+            self.observed.cancels.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+
+        fn wait(&mut self) -> BoxFuture<'_, AgentExit> {
+            let exit = self.exit.clone();
+            Box::pin(async move { exit })
+        }
+    }
+
+    impl AgentAdapter for ScriptedAdapter {
+        fn descriptor(&self) -> &AgentDescriptor {
+            &self.descriptor
+        }
+
+        fn probe(&self) -> BoxFuture<'_, AgentProbeResult> {
+            Box::pin(async {
+                AgentProbeResult::not_installed("scripted adapter has no executable", Vec::new())
+            })
+        }
+
+        fn discover_options(&self, _context: DiscoveryContext) -> BoxFuture<'_, AgentOptions> {
+            Box::pin(async { AgentOptions::default() })
+        }
+
+        fn start(
+            &self,
+            _request: RunRequest,
+            _services: AdapterServices,
+        ) -> BoxFuture<'_, Result<Box<dyn RunningAgent>, AgentError>> {
+            let steps = self
+                .steps
+                .lock()
+                .unwrap()
+                .take()
+                .expect("scripted adapter started twice");
+            let agent: Box<dyn RunningAgent> = Box::new(ScriptedAgent {
+                steps: steps.into(),
+                exit: self.exit.clone(),
+                observed: self.observed.clone(),
+            });
+            Box::pin(async move { Ok(agent) })
+        }
+
+        fn classify_fault(&self, evidence: &FaultEvidence) -> Option<AgentFault> {
+            self.observed
+                .evidence
+                .lock()
+                .unwrap()
+                .push(evidence.clone());
+            self.fault.clone()
+        }
+    }
+
+    fn scripted_runtime(adapter: ScriptedAdapter) -> (AgentRuntime, Arc<Observed>) {
+        let observed = adapter.observed.clone();
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(adapter)).unwrap();
+        (AgentRuntime::with_registry(registry), observed)
+    }
+
+    fn scripted_request() -> RunRequest {
+        let mut req = request(None);
+        req.configuration.agent_id = "scripted".into();
+        req
+    }
+
+    fn assistant(text: &str) -> Step {
+        Step::Emit(AgentEvent::new(
+            EventType::AssistantMessage,
+            json!({"text": text}),
+        ))
+    }
+
+    #[tokio::test]
+    async fn transport_error_mid_stream_folds_into_a_run_failure_and_terminates_the_agent() {
+        let exit = AgentExit {
+            returncode: Some(-9),
+            stderr_tail: Some("killed".into()),
+            duration_seconds: None,
+        };
+        let (runtime, observed) = scripted_runtime(ScriptedAdapter::new(
+            vec![
+                assistant("partial work"),
+                Step::Fail(AgentError::AgentProtocol("line exceeds 1 MiB".into())),
+                assistant("never folded"),
+            ],
+            exit,
+            None,
+        ));
+        let sink = MemorySink::new();
+        let run = runtime
+            .run(
+                scripted_request(),
+                RunOptions::default().with_sink(Arc::new(sink.clone())),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            run.failure,
+            Some(RunFailure {
+                error_type: "agent_protocol_error".into(),
+                message: "line exceeds 1 MiB".into(),
+                exit_code: Some(-9),
+                stderr: Some("killed".into()),
+            })
+        );
+        // A failed stream is not a clean EOF: the process tree is torn down.
+        assert_eq!(observed.cancels.load(Ordering::SeqCst), 1);
+        // Events before the failure are folded and forwarded; nothing after.
+        assert_eq!(run.final_text, "partial work");
+        assert_eq!(run.event_count, 1);
+        assert_eq!(sink.events().len(), 1);
+        // An unfinished transport failure is not relabelled as a cancel.
+        assert_eq!(run.stop.reason, StopReason::Unknown);
+        assert!(!run.stop.finished);
+        assert_eq!(observed.evidence.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_eof_keeps_the_agent_and_hands_folded_stop_evidence_to_the_classifier() {
+        let fault = AgentFault {
+            kind: "session_limit".into(),
+            message: "scripted".into(),
+            resets_at_epoch: Some(42.0),
+        };
+        let exit = AgentExit {
+            returncode: Some(0),
+            stderr_tail: Some("stderr tail".into()),
+            duration_seconds: Some(1.5),
+        };
+        let (runtime, observed) = scripted_runtime(ScriptedAdapter::new(
+            vec![
+                assistant("hello "),
+                assistant("world"),
+                Step::Emit(AgentEvent::new(
+                    EventType::SessionFinished,
+                    json!({
+                        "normalized_stop": "error",
+                        "stop_reason": "end_turn",
+                        "subtype": "success",
+                        "is_error": true,
+                    }),
+                )),
+            ],
+            exit.clone(),
+            Some(fault.clone()),
+        ));
+        let run = runtime
+            .run(scripted_request(), RunOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(run.failure, None);
+        assert_eq!(observed.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(run.exit, exit);
+        assert_eq!(run.fault, Some(fault));
+        assert_eq!(
+            *observed.evidence.lock().unwrap(),
+            vec![FaultEvidence {
+                final_text: "hello world".into(),
+                stderr: Some("stderr tail".into()),
+                native_stop: Some("end_turn".into()),
+                native_subtype: Some("success".into()),
+                is_error: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_eof_with_a_nonzero_exit_is_an_agent_exit_failure() {
+        let (runtime, observed) = scripted_runtime(ScriptedAdapter::new(
+            vec![assistant("tried")],
+            AgentExit {
+                returncode: Some(3),
+                stderr_tail: Some("fatal".into()),
+                duration_seconds: None,
+            },
+            None,
+        ));
+        let run = runtime
+            .run(scripted_request(), RunOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            run.failure,
+            Some(RunFailure {
+                error_type: "agent_exit".into(),
+                message: "agent exited 3".into(),
+                exit_code: Some(3),
+                stderr: Some("fatal".into()),
+            })
+        );
+        assert_eq!(observed.cancels.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_driver_finishes_as_a_driver_panic_failure() {
+        let (runtime, observed) = scripted_runtime(ScriptedAdapter::new(
+            vec![assistant("before"), Step::Panic],
+            AgentExit::default(),
+            None,
+        ));
+        let mut active = runtime
+            .start(scripted_request(), RunOptions::default())
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), active.events.recv())
+            .await
+            .unwrap()
+            .expect("the event before the panic is forwarded");
+        assert_eq!(first.str_field("text"), Some("before"));
+        let run = tokio::time::timeout(Duration::from_secs(5), active.finish())
+            .await
+            .unwrap();
+        let failure = run.failure.expect("a panicked driver reports a failure");
+        assert_eq!(failure.error_type, "driver_panic");
+        assert!(
+            failure.message.starts_with("run driver task failed: ")
+                && failure.message.contains("panic"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(failure.exit_code, None);
+        assert_eq!(run.event_count, 0);
+        assert_eq!(run.final_text, "");
+        assert_eq!(run.fault, None);
+        // The driver died before classification: no evidence was taken.
+        assert!(observed.evidence.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

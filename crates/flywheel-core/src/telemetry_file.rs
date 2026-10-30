@@ -177,11 +177,42 @@ pub fn telemetry_record_to_json(record: &TelemetryRecord) -> JsonObject {
 
 /// The exact line (without the trailing newline) the sink appends for
 /// `record`: Python's `json.dumps(obj, ensure_ascii=False)`.
+///
+/// Written field by field, byte-identical to dumping
+/// [`telemetry_record_to_json`], without copying the payload into an
+/// intermediate object first (this runs once per agent event).
 pub fn telemetry_line(record: &TelemetryRecord) -> String {
-    python_json_dumps(
-        &Value::Object(telemetry_record_to_json(record)),
-        &JsonStyle::SINK_LINE,
-    )
+    let style = &JsonStyle::SINK_LINE;
+    let mut out = String::new();
+    let field = |out: &mut String, key: &str| {
+        out.push_str(if out.is_empty() {
+            "{"
+        } else {
+            style.item_separator
+        });
+        write_python_string(key, style.ensure_ascii, out);
+        out.push_str(style.key_separator);
+    };
+    let write_count = |out: &mut String, count: Option<u32>| match count {
+        Some(n) => {
+            let _ = write!(out, "{n}");
+        }
+        None => out.push_str("null"),
+    };
+    field(&mut out, "kind");
+    write_python_string(&record.kind, style.ensure_ascii, &mut out);
+    field(&mut out, "ts");
+    write_python_string(&format_timestamp(&record.ts), style.ensure_ascii, &mut out);
+    field(&mut out, "run_id");
+    write_python_string(&record.run_id, style.ensure_ascii, &mut out);
+    field(&mut out, "attempt_number");
+    write_count(&mut out, record.attempt_number);
+    field(&mut out, "iteration_number");
+    write_count(&mut out, record.iteration_number);
+    field(&mut out, "payload");
+    write_object(&record.payload, style, &mut out);
+    out.push('}');
+    out
 }
 
 // --- Python json.dumps parity ---------------------------------------------------
@@ -274,30 +305,63 @@ fn write_value(value: &Value, style: &JsonStyle, out: &mut String) {
             }
             out.push(']');
         }
-        Value::Object(obj) => {
-            out.push('{');
-            let mut entries: Vec<(&String, &Value)> = obj.iter().collect();
-            if style.sort_keys {
-                entries.sort_by(|a, b| a.0.cmp(b.0));
-            }
-            for (i, (key, item)) in entries.into_iter().enumerate() {
-                if i > 0 {
-                    out.push_str(style.item_separator);
-                }
-                write_python_string(key, style.ensure_ascii, out);
-                out.push_str(style.key_separator);
-                write_value(item, style, out);
-            }
-            out.push('}');
+        Value::Object(obj) => write_object(obj, style, out),
+    }
+}
+
+fn write_object(obj: &Map<String, Value>, style: &JsonStyle, out: &mut String) {
+    let member = |i: usize, key: &str, item: &Value, out: &mut String| {
+        if i > 0 {
+            out.push_str(style.item_separator);
+        }
+        write_python_string(key, style.ensure_ascii, out);
+        out.push_str(style.key_separator);
+        write_value(item, style, out);
+    };
+    out.push('{');
+    if style.sort_keys {
+        let mut entries: Vec<(&String, &Value)> = obj.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (i, (key, item)) in entries.into_iter().enumerate() {
+            member(i, key, item, out);
+        }
+    } else {
+        for (i, (key, item)) in obj.iter().enumerate() {
+            member(i, key, item, out);
         }
     }
+    out.push('}');
 }
 
 /// Python `json.dumps` string encoding (`py_encode_basestring` or its
 /// `_ascii` variant).
+///
+/// Runs of characters that print verbatim are copied as whole slices; only
+/// the characters Python escapes are handled one at a time.
 fn write_python_string(s: &str, ensure_ascii: bool, out: &mut String) {
     out.push('"');
-    for ch in s.chars() {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let verbatim = match b {
+            b'"' | b'\\' | 0x00..=0x1f => false,
+            0x20..=0x7e => true,
+            // DEL and every non-ASCII character print verbatim unless
+            // `ensure_ascii` asks for `\uXXXX` escapes.
+            _ => !ensure_ascii,
+        };
+        if verbatim {
+            i += 1;
+            continue;
+        }
+        out.push_str(&s[start..i]);
+        // Every byte before `i` is ASCII or part of a complete character
+        // already copied, so `i` is a character boundary.
+        let Some(ch) = s[i..].chars().next() else {
+            break;
+        };
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -309,8 +373,6 @@ fn write_python_string(s: &str, ensure_ascii: bool, out: &mut String) {
             '\u{00}'..='\u{1f}' => {
                 let _ = write!(out, "\\u{:04x}", ch as u32);
             }
-            ' '..='~' => out.push(ch),
-            _ if !ensure_ascii => out.push(ch),
             _ => {
                 let mut units = [0u16; 2];
                 for unit in ch.encode_utf16(&mut units) {
@@ -318,7 +380,10 @@ fn write_python_string(s: &str, ensure_ascii: bool, out: &mut String) {
                 }
             }
         }
+        i += ch.len_utf8();
+        start = i;
     }
+    out.push_str(&s[start..]);
     out.push('"');
 }
 
@@ -435,6 +500,47 @@ mod tests {
             r#"{"a": "\ud83d\ude00"}"#
         );
         assert_eq!(JsonStyle::default(), JsonStyle::PYTHON_DEFAULT);
+    }
+
+    #[test]
+    fn python_json_dumps_escapes_at_string_edges_and_between_verbatim_runs() {
+        // Escapes first, last, adjacent, and between verbatim runs of
+        // ASCII and multi-byte characters; expected strings from CPython.
+        let value = json!({
+            "s": "\"\"start\\\u{7f}\u{e9}\u{1F600}\u{0}\u{1f} end\n tail\u{1F600}",
+            "e": "",
+            "k\u{e9}\n": ["\u{7f}", "plain"],
+        });
+        assert_eq!(
+            python_json_dumps(&value, &JsonStyle::PYTHON_DEFAULT),
+            r#"{"s": "\"\"start\\\u007f\u00e9\ud83d\ude00\u0000\u001f end\n tail\ud83d\ude00", "e": "", "k\u00e9\n": ["\u007f", "plain"]}"#
+        );
+        assert_eq!(
+            python_json_dumps(&value, &JsonStyle::SINK_LINE),
+            "{\"s\": \"\\\"\\\"start\\\\\u{7f}\u{e9}\u{1F600}\\u0000\\u001f end\\n tail\u{1F600}\", \"e\": \"\", \"k\u{e9}\\n\": [\"\u{7f}\", \"plain\"]}"
+        );
+    }
+
+    #[test]
+    fn telemetry_line_equals_dumping_the_record_object() {
+        let mut with_counts = record(
+            "run-1",
+            "message.assistant",
+            json!({"text": "a \"quoted\"\nline \u{e9}\u{1F600}", "n": [1, 2.5, null], "o": {}}),
+        );
+        with_counts.attempt_number = Some(3);
+        with_counts.iteration_number = Some(0);
+        let mut empty = record("run-2", "k\u{e9}\t", json!({}));
+        empty.ts = ts("2026-06-11T12:00:01.123456+00:00");
+        for rec in [with_counts, empty] {
+            assert_eq!(
+                telemetry_line(&rec),
+                python_json_dumps(
+                    &Value::Object(telemetry_record_to_json(&rec)),
+                    &JsonStyle::SINK_LINE
+                )
+            );
+        }
     }
 
     // --- File layout --------------------------------------------------------

@@ -7,16 +7,30 @@
 //!   the harness makes per transition, against a temp database pre-populated
 //!   with `STORE_RUNS` runs (three attempts each) so index and page-cache
 //!   behaviour resembles a working store rather than an empty one.
+//! * `agent_ingest/*` -- the per-agent-event persistence path of a live
+//!   run: each normalized `AgentEvent` serialized to its recorded message
+//!   (`event_to_message`) and appended to the run's JSONL telemetry stream
+//!   (`RunTelemetry::sdk_message` -> `FileTelemetrySink`), for a realistic
+//!   mix of assistant text, tool calls, usage readings and multi-KB tool
+//!   results.
 //!
 //! Sample sizes and measurement windows are tuned so the whole file runs in
 //! well under a minute; the improvement-loop scorecard reads the medians.
 
+use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use flywheel_agents::{AgentEvent, EventType};
+use serde_json::json;
+use std::sync::Arc;
 use tempfile::TempDir;
+
+use flywheel_core::agents_invoke::event_to_message;
+use flywheel_core::harness::{RunTelemetry, SharedSink};
+use flywheel_core::telemetry_file::FileTelemetrySink;
 
 use flywheel_core::envelope::{CLOSING_FENCE, EnvelopeResult, OPENING_FENCE, parse_envelope};
 use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
@@ -215,5 +229,100 @@ fn bench_store(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_envelope, bench_store);
+/// Agent events ingested per measured iteration (a long multi-iteration run).
+const INGEST_EVENTS: usize = 2000;
+
+/// A realistic normalized event stream: per agent turn an assistant text
+/// block, a tool call, a usage reading, and the tool's multi-KB result.
+fn agent_event_stream(count: usize) -> Vec<AgentEvent> {
+    let prose = "Inspected the module and ran the focused tests; the change keeps the \
+                 public signature stable and threads the new field through the loader. "
+        .repeat(4);
+    let mut tool_output = String::new();
+    for line in 0..120 {
+        let _ = writeln!(
+            tool_output,
+            "crates/flywheel-core/src/module_{line}.rs:{line}: fn handler_{line}(input: &str) -> Result<(), Error> {{"
+        );
+    }
+    (0..count)
+        .map(|i| {
+            let turn = i / 4;
+            let mut event = match i % 4 {
+                0 => AgentEvent::with_native(
+                    EventType::AssistantMessage,
+                    "assistant",
+                    json!({"text": format!("Turn {turn}: {prose}")}),
+                ),
+                1 => AgentEvent::with_native(
+                    EventType::ToolCallStarted,
+                    "assistant",
+                    json!({
+                        "tool_use_id": format!("toolu_{turn:08}"),
+                        "tool_name": "Bash",
+                        "tool_input": {
+                            "command": format!("cargo test -p flywheel-core module_{turn} -- --nocapture"),
+                            "description": "Run the focused module tests",
+                        },
+                    }),
+                ),
+                2 => AgentEvent::with_native(
+                    EventType::ContextUsage,
+                    "assistant",
+                    json!({"usage": {
+                        "input_tokens": 12 + turn,
+                        "cache_creation_input_tokens": 1_800,
+                        "cache_read_input_tokens": 40_000 + 900 * turn,
+                        "output_tokens": 350,
+                    }}),
+                ),
+                _ => AgentEvent::with_native(
+                    EventType::ToolCallFinished,
+                    "user",
+                    json!({
+                        "tool_use_id": format!("toolu_{turn:08}"),
+                        "is_error": false,
+                        "content": tool_output,
+                    }),
+                ),
+            };
+            "claude-code".clone_into(&mut event.source);
+            event.sequence = i as u64;
+            event
+        })
+        .collect()
+}
+
+fn bench_agent_ingest(c: &mut Criterion) {
+    let events = agent_event_stream(INGEST_EVENTS);
+    let mut group = c.benchmark_group("agent_ingest");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(5));
+
+    // One fresh run file per measured iteration: the append-mode JSONL
+    // stream a live run writes as each event arrives.
+    group.bench_function("telemetry_file_2000_events", |b| {
+        b.iter_batched(
+            || {
+                let dir = TempDir::new().expect("tempdir");
+                let sink: SharedSink = Arc::new(FileTelemetrySink::new(dir.path()));
+                let telemetry = RunTelemetry::new(Some(sink), "run-ingest", Arc::new(Utc::now));
+                (dir, telemetry)
+            },
+            |(dir, telemetry)| {
+                for event in &events {
+                    let message = event_to_message(black_box(event));
+                    telemetry.sdk_message(&message, 1, 1);
+                }
+                (dir, telemetry)
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_envelope, bench_store, bench_agent_ingest);
 criterion_main!(benches);

@@ -2275,4 +2275,6 @@ mod tests {
         assert!(markers.contains(&(Status::Failed, None)));
         assert!(markers.contains(&(Status::Done, Some("fail"))));
     }
+
+    mod gate_invariants;
 }

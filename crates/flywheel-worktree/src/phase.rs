@@ -2259,4 +2259,446 @@ mod tests {
         assert!(moved.is_empty());
         assert!(lines.lock().unwrap()[0].contains("phase-verify command"));
     }
+
+    // --- mutation-survey kills (loop-base refs, sweep gates, destinations) -------------
+
+    fn write_task_json(path: &Path, task_id: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::json!({
+                "id": task_id,
+                "goal": "g",
+                "graders": [{"type": "command", "run": "true"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn phase_integration_materialize_never_moves_an_existing_branch() {
+        // A worker that resolved the true base before a sibling forked the
+        // integration branch must not reset the branch (and drop the
+        // sibling's landing) when it materializes.
+        let (_dir, repo) = repo();
+        let s = submitter(&repo, ledger());
+        git_ok(&repo, &["checkout", "-q", "-b", "flywheel/phase/01-phase"]);
+        let tip = commit(&repo, "landed.txt", "x", "sibling landing");
+        git_ok(&repo, &["checkout", "-q", "main"]);
+        let integration = PhaseIntegrationBase
+            .materialize(&s, "01-phase", "main")
+            .unwrap();
+        assert_eq!(integration, "flywheel/phase/01-phase");
+        assert_eq!(rev(&repo, "flywheel/phase/01-phase"), tip);
+    }
+
+    #[test]
+    fn an_empty_loop_base_dotfile_falls_back_to_the_ref() {
+        let f = Fixture::new();
+        let phase_dir = f.phase("01-phase");
+        assert!(write_phase_base_if_missing(&f.repo, &phase_dir));
+        let head = rev(&f.repo, "HEAD");
+        for blank in ["", " \n"] {
+            fs::write(phase_dir.join(LOOP_BASE_FILENAME), blank).unwrap();
+            assert_eq!(
+                read_phase_base(&phase_dir, Some(&f.repo)).as_deref(),
+                Some(head.as_str())
+            );
+            assert_eq!(read_phase_base(&phase_dir, None), None);
+        }
+    }
+
+    #[test]
+    fn a_phase_name_git_rejects_as_a_ref_records_no_base() {
+        let f = Fixture::new();
+        let phase_dir = f.phase("bad..name");
+        assert!(!write_phase_base_if_missing(&f.repo, &phase_dir));
+        let (log, lines) = capture_log();
+        let lock_path = f.repo.join(".flywheel").join(".merge.lock");
+        assert_eq!(
+            record_phase_bases(&f.repo, &f.tasks_dir, &lock_path, &log).unwrap(),
+            0
+        );
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn record_phase_bases_waits_for_the_merge_lock() {
+        let f = Fixture::new();
+        let phase_dir = f.phase("01-phase");
+        let lock_path = f.repo.join(".flywheel").join(".merge.lock");
+        let held = merge_lock(&lock_path).unwrap();
+        let (repo, tasks_dir, thread_lock) = (f.repo.clone(), f.tasks_dir.clone(), lock_path);
+        let recorder = std::thread::spawn(move || {
+            let (log, _) = capture_log();
+            record_phase_bases(&repo, &tasks_dir, &thread_lock, &log).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            read_phase_base(&phase_dir, Some(&f.repo)),
+            None,
+            "a base was recorded while another worker held the merge lock"
+        );
+        drop(held);
+        assert_eq!(recorder.join().unwrap(), 1);
+        assert!(read_phase_base(&phase_dir, Some(&f.repo)).is_some());
+    }
+
+    #[test]
+    fn materialize_keeps_a_committed_dotfile_and_retries_a_failed_write() {
+        let f = Fixture::new();
+        let head = rev(&f.repo, "HEAD");
+        let reference = format!("{LOOP_BASE_REF_PREFIX}01-phase");
+        let dest = f.tasks_dir.join("archive").join("01-phase");
+        fs::create_dir_all(&dest).unwrap();
+
+        // The dotfile cannot be written (a directory squats its path): the
+        // ref survives so a later sweep can retry.
+        git_ok(&f.repo, &["update-ref", &reference, &head]);
+        fs::create_dir(dest.join(LOOP_BASE_FILENAME)).unwrap();
+        materialize_loop_base(&f.repo, "01-phase", &dest);
+        assert_eq!(rev(&f.repo, &reference), head);
+
+        // Writable again: the dotfile carries the SHA plus a newline and the
+        // ref is dropped.
+        fs::remove_dir(dest.join(LOOP_BASE_FILENAME)).unwrap();
+        materialize_loop_base(&f.repo, "01-phase", &dest);
+        assert_eq!(
+            fs::read_to_string(dest.join(LOOP_BASE_FILENAME)).unwrap(),
+            format!("{head}\n")
+        );
+        assert!(!branch_or_ref_exists(&f.repo, &reference));
+
+        // A phase that already carries a committed dotfile keeps it verbatim.
+        fs::write(dest.join(LOOP_BASE_FILENAME), "legacy-sha\n").unwrap();
+        git_ok(&f.repo, &["update-ref", &reference, &head]);
+        materialize_loop_base(&f.repo, "01-phase", &dest);
+        assert_eq!(
+            fs::read_to_string(dest.join(LOOP_BASE_FILENAME)).unwrap(),
+            "legacy-sha\n"
+        );
+    }
+
+    fn branch_or_ref_exists(repo: &Path, reference: &str) -> bool {
+        git(repo, &["rev-parse", "--verify", "--quiet", reference])
+            .unwrap()
+            .ok()
+    }
+
+    #[test]
+    fn a_phase_with_any_unfinished_task_stays_active() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.task("01-phase", "t2", &[]);
+        f.done("t1", "run-t1");
+        f.running("t2", "run-t2");
+        let (moved, _) = f.sweep(ArchiveOptions::default());
+        assert!(moved.is_empty());
+        assert!(f.tasks_dir.join("active").join("01-phase").is_dir());
+    }
+
+    #[test]
+    fn a_determinate_strand_is_logged_but_not_surfaced_as_indeterminate() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        git_ok(&f.repo, &["branch", "flywheel/01-phase/t1", "main"]);
+        git_ok(&f.repo, &["checkout", "-q", "flywheel/01-phase/t1"]);
+        commit(&f.repo, "work.txt", "w", "task work");
+        git_ok(&f.repo, &["checkout", "-q", "main"]);
+        let (moved, logged) = f.sweep(ArchiveOptions {
+            repo_root: Some(&f.repo),
+            landing_base: Some("main"),
+            claims: Some(&f.claims),
+            ..ArchiveOptions::default()
+        });
+        assert!(moved.is_empty());
+        assert!(logged[0].contains("is not landed"), "{logged:?}");
+        assert!(f.claims.list_subject_stop_events("t1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_partly_absorbed_branch_is_not_landed() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        git_ok(&f.repo, &["checkout", "-q", "-b", "flywheel/01-phase/t1"]);
+        let first = commit(&f.repo, "a.txt", "a", "first half");
+        commit(&f.repo, "b.txt", "b", "second half");
+        git_ok(&f.repo, &["checkout", "-q", "main"]);
+        // Diverge first so the pick is a patch-identical copy, not `first`.
+        commit(&f.repo, "main.txt", "m", "main moves on");
+        git_ok(&f.repo, &["cherry-pick", &first]);
+        assert!(!git_is_ancestor(&f.repo, &first, "main"));
+        let (moved, logged) = f.sweep(ArchiveOptions {
+            repo_root: Some(&f.repo),
+            landing_base: Some("main"),
+            ..ArchiveOptions::default()
+        });
+        assert!(moved.is_empty());
+        assert!(logged[0].contains("is not landed"), "{logged:?}");
+    }
+
+    fn armed_landing(f: &Fixture, with_claims: bool) -> ArchiveOptions<'_> {
+        ArchiveOptions {
+            repo_root: Some(&f.repo),
+            landing_base: Some("main"),
+            claims: with_claims.then_some(&f.claims as &dyn ClaimStore),
+            ..ArchiveOptions::default()
+        }
+    }
+
+    #[test]
+    fn the_landed_receipt_is_read_from_the_latest_run_only() {
+        // A retry landed: the newest run's receipt counts, the older run
+        // carrying none does not mask it.
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-a");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.done("t1", "run-b");
+        f.landed_receipt("run-b");
+        let (moved, logged) = f.sweep(armed_landing(&f, false));
+        assert_eq!(moved.len(), 1, "{logged:?}");
+
+        // A domain event that is not a `Landed` receipt proves nothing.
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        let lc = f.store.load_lifecycle("run-t1").unwrap().unwrap();
+        let parked = DomainEvent::new(
+            "run-t1",
+            Utc::now(),
+            DomainEventPayload::LandingParked(flywheel_core::events::LandingParked {
+                park_kind: PARK_KIND_DIVERGENT_BASE.into(),
+                ..flywheel_core::events::LandingParked::default()
+            }),
+        );
+        f.store.append_domain_event(&parked, lc.version).unwrap();
+        let (moved, logged) = f.sweep(armed_landing(&f, false));
+        assert!(moved.is_empty());
+        assert!(logged[0].contains("cannot be determined"), "{logged:?}");
+    }
+
+    #[test]
+    fn only_the_latest_operator_resolution_skips_the_landing_probe() {
+        // A resolution stamped by archival or the probe is not the operator
+        // abandoning the strand.
+        for attribution in ["", RESOLUTION_ATTRIBUTION_PROBE] {
+            let f = Fixture::new();
+            f.task("01-phase", "t1", &[]);
+            f.done("t1", "run-t1");
+            f.claims
+                .record_stop_event(STOP_RESOLVED, "t1", "earlier", Utc::now(), attribution)
+                .unwrap();
+            let (moved, logged) = f.sweep(armed_landing(&f, true));
+            assert!(moved.is_empty(), "attribution {attribution:?}");
+            assert!(logged[0].contains("cannot be determined"), "{logged:?}");
+        }
+        // An operator resolution superseded by a newer strand no longer
+        // applies.
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        f.claims
+            .record_stop_event(
+                STOP_RESOLVED,
+                "t1",
+                "abandoned",
+                Utc::now(),
+                RESOLUTION_ATTRIBUTION_OPERATOR,
+            )
+            .unwrap();
+        f.claims
+            .record_stop_event(PARK_KIND_DIVERGENT_BASE, "t1", "parked", Utc::now(), "")
+            .unwrap();
+        let (moved, logged) = f.sweep(armed_landing(&f, true));
+        assert!(moved.is_empty());
+        assert!(logged[0].contains("cannot be determined"), "{logged:?}");
+    }
+
+    #[test]
+    fn an_already_resolved_stop_is_not_stamped_again_on_archive() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        f.claims
+            .record_stop_event(STOP_DANGLING_PREREQUISITE, "t1", "stranded", Utc::now(), "")
+            .unwrap();
+        f.claims
+            .record_stop_event(STOP_RESOLVED, "t1", "handled", Utc::now(), "")
+            .unwrap();
+        let (moved, _) = f.sweep(ArchiveOptions {
+            claims: Some(&f.claims),
+            ..ArchiveOptions::default()
+        });
+        assert_eq!(moved.len(), 1);
+        assert_eq!(f.claims.list_subject_stop_events("t1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn phase_verify_fails_closed_on_a_signal_and_runs_in_the_repo_root() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        let (moved, logged) = f.sweep(ArchiveOptions {
+            repo_root: Some(&f.repo),
+            phase_verify: Some("kill -9 $$"),
+            ..ArchiveOptions::default()
+        });
+        assert!(moved.is_empty());
+        assert!(logged[0].contains("(exit signal)"), "{logged:?}");
+
+        // The refusal quotes the output's tail, not its head.
+        let noisy = "printf START; i=0; while [ $i -lt 700 ]; do printf xyz; i=$((i+1)); done; \
+                     printf END; exit 3";
+        let (moved, logged) = f.sweep(ArchiveOptions {
+            repo_root: Some(&f.repo),
+            phase_verify: Some(noisy),
+            ..ArchiveOptions::default()
+        });
+        assert!(moved.is_empty());
+        let tail = logged[0].split_once("(exit 3): ").unwrap().1;
+        assert_eq!(tail.chars().count(), 2000);
+        assert!(tail.ends_with("xyzEND"), "{tail}");
+        assert!(!tail.contains("START"), "{tail}");
+
+        // The command runs against the repo root.
+        fs::write(f.repo.join("verify-marker"), "").unwrap();
+        let (moved, logged) = f.sweep(ArchiveOptions {
+            repo_root: Some(&f.repo),
+            phase_verify: Some("test -f verify-marker"),
+            ..ArchiveOptions::default()
+        });
+        assert_eq!(moved.len(), 1, "{logged:?}");
+    }
+
+    #[test]
+    fn a_resurrected_duplicate_is_matched_by_task_id_or_by_file_stem() {
+        let f = Fixture::new();
+        let archive = f.tasks_dir.join("archive");
+        let active = f.tasks_dir.join("active");
+        // (phase, archived file, archived id, active file, active id)
+        let cases = [
+            ("p1", "old-name", "t1", "t1", "t1"),
+            ("p2", "t2", "renamed", "t2", "t2-new"),
+            ("p3", "t3", "t3", "new-file", "t3"),
+        ];
+        for (phase, archived_file, archived_id, active_file, active_id) in cases {
+            write_task_json(
+                &archive.join(phase).join(format!("{archived_file}.json")),
+                archived_id,
+            );
+            write_task_json(
+                &active.join(phase).join(format!("{active_file}.json")),
+                active_id,
+            );
+            f.done(active_id, &format!("run-{phase}"));
+        }
+        let (moved, logged) = f.sweep(ArchiveOptions::default());
+        assert!(moved.is_empty(), "{moved:?}");
+        assert_eq!(logged.len(), 3, "{logged:?}");
+        for (line, phase) in logged.iter().zip(["p1", "p2", "p3"]) {
+            assert!(
+                line.starts_with(&format!("Refusing to archive phase {phase}: task ")),
+                "{line}"
+            );
+            assert!(active.join(phase).is_dir());
+        }
+    }
+
+    #[test]
+    fn a_non_directory_generation_name_is_skipped_not_scanned_or_reused() {
+        let f = Fixture::new();
+        let archive = f.tasks_dir.join("archive");
+        write_task_json(&archive.join("auto").join("a.json"), "a");
+        fs::write(archive.join("auto-2"), "not a phase").unwrap();
+        f.task("auto", "b", &[]);
+        f.done("b", "run-b");
+        let (moved, logged) = f.sweep(ArchiveOptions::default());
+        assert_eq!(moved, vec![archive.join("auto-3")], "{logged:?}");
+        assert!(archive.join("auto-2").is_file());
+    }
+
+    #[test]
+    fn archive_phases_wrapper_prefers_the_explicit_true_base() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        git_ok(
+            &f.repo,
+            &["checkout", "-q", "-b", "flywheel/phase/01-phase"],
+        );
+        commit(&f.repo, "phase.txt", "p", "phase work");
+        git_ok(&f.repo, &["checkout", "-q", "-b", "release", "main"]);
+        git_ok(
+            &f.repo,
+            &["merge", "--no-ff", "-m", "merge", "flywheel/phase/01-phase"],
+        );
+        git_ok(&f.repo, &["checkout", "-q", "main"]);
+        let (log, _) = capture_log();
+        let policy = WorkPolicy {
+            submit_base: Some("main".into()),
+            ..WorkPolicy::default()
+        };
+        let sweep = ArchiveSweep {
+            repo_root: Some(&f.repo),
+            true_base: Some("release"),
+            policy: Some(&policy),
+            ..ArchiveSweep::default()
+        };
+        let moved = archive_phases(&f.tasks_dir, &f.store, None, &log, &sweep).unwrap();
+        assert_eq!(moved.len(), 1);
+    }
+
+    #[test]
+    fn archive_phases_wrapper_suppresses_phase_verify_only_for_the_pure_phase_strategy() {
+        let completion = |_: &Path, _: &[Task]| {};
+        let tiered = WorkPolicy {
+            phase_verify: Some("exit 9".into()),
+            submit_strategy: "phase".into(),
+            submit_tiers: vec![flywheel_orchestrator::policy::SubmitTierRule {
+                tier: 1,
+                paths: vec!["src/**".into()],
+            }],
+            ..WorkPolicy::default()
+        };
+        let merge = WorkPolicy {
+            phase_verify: Some("exit 9".into()),
+            submit_strategy: "merge".into(),
+            ..WorkPolicy::default()
+        };
+        for policy in [&tiered, &merge] {
+            let f = Fixture::new();
+            f.task("01-phase", "t1", &[]);
+            f.done("t1", "run-t1");
+            let (log, lines) = capture_log();
+            let sweep = ArchiveSweep {
+                repo_root: Some(&f.repo),
+                policy: Some(policy),
+                phase_completion: Some(&completion),
+                ..ArchiveSweep::default()
+            };
+            let moved = archive_phases(&f.tasks_dir, &f.store, None, &log, &sweep).unwrap();
+            assert!(moved.is_empty(), "{}", policy.submit_strategy);
+            assert!(lines.lock().unwrap()[0].contains("phase-verify command"));
+        }
+    }
+
+    #[test]
+    fn archive_phases_wrapper_arms_the_landed_predicate() {
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        let (log, lines) = capture_log();
+        let sweep = ArchiveSweep {
+            repo_root: Some(&f.repo),
+            landing_base: Some("main"),
+            ..ArchiveSweep::default()
+        };
+        let moved = archive_phases(&f.tasks_dir, &f.store, None, &log, &sweep).unwrap();
+        assert!(moved.is_empty());
+        assert!(lines.lock().unwrap()[0].contains("cannot be determined"));
+    }
 }

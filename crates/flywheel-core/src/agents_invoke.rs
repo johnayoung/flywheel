@@ -1132,6 +1132,7 @@ mod tests {
             rate_limit_events: vec![RateLimitInfo {
                 resets_at_epoch: Some(1751990400.0),
                 detail: JsonObject::new(),
+                ..RateLimitInfo::default()
             }],
             fault: None,
             failure: None,

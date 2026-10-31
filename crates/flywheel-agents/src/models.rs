@@ -206,8 +206,17 @@ pub struct PermissionDenial {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RateLimitInfo {
+    /// When the limit resets, as epoch seconds (UTC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_epoch: Option<f64>,
+    /// The vendor's limit state: `allowed`, `allowed_warning`, or
+    /// `rejected` (a hard block until `resets_at_epoch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Which window tripped (e.g. `five_hour`, `seven_day`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_type: Option<String>,
+    /// The full normalized `rate.limited` payload (native info under `detail`).
     #[serde(default)]
     pub detail: serde_json::Map<String, Value>,
 }

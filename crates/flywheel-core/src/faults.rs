@@ -22,6 +22,7 @@
 
 use crate::store::{StoreConflictError, StoreError, StoreSchemaError};
 use chrono::{DateTime, Days, FixedOffset, Timelike, Utc};
+use flywheel_agents::RateLimitInfo;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -353,10 +354,11 @@ fn clock_time_re() -> &'static Regex {
 ///
 /// The ladder, in order:
 ///
-/// 1. A `rejected` rate-limit event's `rate_limit_info.resets_at` (epoch
-///    seconds, UTC). Events are the opaque JSON values the invoker carries
-///    in `InvocationSignals::rate_limit_events`; an `allowed_warning` event
-///    is ignored on purpose.
+/// 1. A `rejected` rate-limit event's `resets_at_epoch` (epoch seconds,
+///    UTC). Events are the serialized `flywheel_agents::RateLimitInfo`
+///    values the invoker carries in `InvocationSignals::rate_limit_events`
+///    (see [`rejected_rate_limit`]); an `allowed_warning` event is ignored
+///    on purpose.
 /// 2. A parseable refusal in `transcript`: the pipe-epoch form
 ///    (`...usage limit reached|<epoch>`) or the human clock-time form
 ///    (`resets 6pm`). The clock time is read in `now`'s offset with
@@ -376,15 +378,25 @@ pub fn derive_session_limit_reset(
         .or_else(|| reset_from_refusal_text(transcript, now))
 }
 
+/// The normalized rate-limit info in `event` when it is a hard `rejected`
+/// block, else `None`.
+///
+/// `event` is one entry of `InvocationSignals::rate_limit_events`: the
+/// serialized `flywheel_agents::RateLimitInfo` the agents bridge emits
+/// (`status`, `limit_type`, `resets_at_epoch`, native `detail`). Any other
+/// shape, and every `allowed`/`allowed_warning` event, yields `None`.
+#[must_use]
+pub fn rejected_rate_limit(event: &Value) -> Option<RateLimitInfo> {
+    RateLimitInfo::deserialize(event)
+        .ok()
+        .filter(|info| info.status.as_deref() == Some("rejected"))
+}
+
 fn reset_from_rate_limit_events(events: &[Value]) -> Option<SessionLimitReset> {
     events.iter().find_map(|event| {
-        let info = event.get("rate_limit_info")?;
         // Only a hard `rejected` block names a reset worth acting on; an
         // `allowed_warning` must never drive the fast-abort.
-        if info.get("status").and_then(Value::as_str) != Some("rejected") {
-            return None;
-        }
-        let resets_at = info.get("resets_at")?.as_f64()?;
+        let resets_at = rejected_rate_limit(event)?.resets_at_epoch?;
         epoch_to_utc(resets_at).map(|reset_at| SessionLimitReset {
             reset_at,
             source: ResetSource::RateLimitEvent,
@@ -582,16 +594,15 @@ mod tests {
         utc(2026, 7, 9, 12, 0).fixed_offset()
     }
 
+    /// A rejected event in the agents bridge's serialized
+    /// `flywheel_agents::RateLimitInfo` shape (`resets_at` may be any JSON
+    /// value so malformed resets can be exercised).
     fn rejected_event(resets_at: Value) -> Value {
         json!({
-            "rate_limit_info": {
-                "status": "rejected",
-                "resets_at": resets_at,
-                "rate_limit_type": "five_hour",
-                "utilization": 1.0,
-            },
-            "uuid": "evt-reject",
-            "session_id": "sess-1",
+            "resets_at_epoch": resets_at,
+            "status": "rejected",
+            "limit_type": "five_hour",
+            "detail": {"status": "rejected", "rateLimitType": "five_hour"},
         })
     }
 
@@ -622,9 +633,7 @@ mod tests {
 
     #[test]
     fn session_reset_allowed_warning_event_ignored() {
-        let event = json!({
-            "rate_limit_info": {"status": "allowed_warning", "resets_at": 1_800_000_000i64},
-        });
+        let event = json!({"status": "allowed_warning", "resets_at_epoch": 1_800_000_000i64});
         assert_eq!(derive_session_limit_reset(&[event], "", now_utc()), None);
     }
 

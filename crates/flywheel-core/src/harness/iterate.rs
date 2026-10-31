@@ -11,7 +11,9 @@ use crate::deadline::Deadline;
 use crate::deadline_config::DeadlineClass;
 use crate::envelope::{EnvelopeResult, Intent};
 use crate::event_serde::format_timestamp;
-use crate::faults::{FaultClass, classify_status, derive_session_limit_reset_utc};
+use crate::faults::{
+    FaultClass, classify_status, derive_session_limit_reset_utc, rejected_rate_limit,
+};
 use crate::grader_transcript::{
     MessageKind, TranscriptCounter, TranscriptObservation, USAGE_TOKEN_KEYS, message_kind,
     message_usage, total_tokens_from_usage_map,
@@ -246,17 +248,16 @@ fn transient_rate_limit_reason(signals: &InvocationSignals) -> Option<String> {
     {
         return Some(format!("api_error_status={status}"));
     }
-    for event in &signals.rate_limit_events {
-        let info = event.get("rate_limit_info")?;
-        if info.get("status").and_then(Value::as_str) == Some("rejected") {
-            let rl_type = info
-                .get("rate_limit_type")
-                .and_then(Value::as_str)
-                .unwrap_or("None");
-            return Some(format!("rate_limit_rejected:{rl_type}"));
-        }
-    }
-    None
+    signals
+        .rate_limit_events
+        .iter()
+        .find_map(rejected_rate_limit)
+        .map(|info| {
+            format!(
+                "rate_limit_rejected:{}",
+                info.limit_type.as_deref().unwrap_or("None")
+            )
+        })
 }
 
 /// The transient reason when `result` is a rate-limited iteration. A valid

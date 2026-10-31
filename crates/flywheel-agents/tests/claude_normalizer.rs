@@ -500,3 +500,33 @@ fn sdk_shaped_exchange_folds_to_completed_run() {
         Some(json!("ok"))
     );
 }
+
+#[test]
+fn rejected_rate_limit_event_folds_status_and_limit_type() {
+    // Native line as the CLI emitted it in a recorded session-limit run.
+    let line = json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected", "resetsAt": 1_783_620_000i64, "rateLimitType": "five_hour",
+            "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled_until",
+            "isUsingOverage": false,
+        },
+        "uuid": "e9a4f1fb-2a40-410c-a878-64562f409996", "session_id": "sess-1",
+    })
+    .to_string();
+    let mut normalizer = ClaudeStreamNormalizer::new();
+    let outcome = normalizer.feed_line(&line);
+    assert_eq!(outcome.events.len(), 1);
+    let event = &outcome.events[0];
+    assert_eq!(event.payload["status"], json!("rejected"));
+    assert_eq!(event.payload["limit_type"], json!("five_hour"));
+    let mut folder = EventFolder::new();
+    folder.feed(event);
+    let run = folder.completed(AgentExit::default(), None, None);
+    assert_eq!(run.rate_limit_events.len(), 1);
+    let info = &run.rate_limit_events[0];
+    assert_eq!(info.status.as_deref(), Some("rejected"));
+    assert_eq!(info.limit_type.as_deref(), Some("five_hour"));
+    assert_eq!(info.resets_at_epoch, Some(1_783_620_000.0));
+    assert_eq!(info.detail["detail"]["overageStatus"], json!("rejected"));
+}

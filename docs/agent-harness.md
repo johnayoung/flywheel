@@ -280,9 +280,11 @@ tool.started      tool.updated   tool.finished      # tool.finished payload carr
 file.changed      command.started  command.finished
 plan.updated
 approval.requested  approval.resolved  permission.denied
-context.usage     rate.limited  (payload carries resets_at)   mode.changed
+context.usage     rate.limited  (payload: resets_at_epoch, status, limit_type, native detail)   mode.changed
 warning  error  raw
 ```
+
+`rate.limited` folds into `RateLimitInfo { resets_at_epoch, status, limit_type, detail }`; `status` is `allowed`, `allowed_warning`, or `rejected`. Core consumes only this normalized shape (serialized into `InvocationSignals::rate_limit_events`): a `rejected` event drives the transient retry and the session-limit fast-abort (`rejected_rate_limit`, `crates/flywheel-core/src/faults.rs`).
 
 `rate.limited`, `permission.denied`, and error-carrying `tool.finished` are the inputs `docs/loop.md`'s detection table requires (rate-limit ETA, blocked_implicit counter, stuck counter).
 

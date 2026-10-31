@@ -138,6 +138,14 @@ impl EventFolder {
             EventType::RateLimited => {
                 self.rate_limits.push(RateLimitInfo {
                     resets_at_epoch: payload.get("resets_at_epoch").and_then(number_as_f64),
+                    status: payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    limit_type: payload
+                        .get("limit_type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     detail: payload.clone(),
                 });
             }

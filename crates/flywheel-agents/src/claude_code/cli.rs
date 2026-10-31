@@ -683,12 +683,14 @@ impl ClaudeStreamNormalizer {
     fn rate_limit(&mut self, obj: &Map<String, Value>) -> LineOutcome {
         let info = obj.get("rate_limit_info").cloned().unwrap_or(Value::Null);
         let resets_at = info.get("resetsAt").and_then(number_as_f64);
+        let status = info.get("status").cloned().unwrap_or(Value::Null);
+        let limit_type = info.get("rateLimitType").cloned().unwrap_or(Value::Null);
         LineOutcome::events(
             Some("rate_limit_event".into()),
             vec![AgentEvent::with_native(
                 EventType::RateLimited,
                 "rate_limit_event",
-                json!({"resets_at_epoch": resets_at, "status": info.get("status").cloned().unwrap_or(Value::Null), "detail": info}),
+                json!({"resets_at_epoch": resets_at, "status": status, "limit_type": limit_type, "detail": info}),
             )],
         )
     }

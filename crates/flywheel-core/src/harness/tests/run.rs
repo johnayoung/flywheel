@@ -581,30 +581,26 @@ async fn stale_caller_lifecycle_is_reconciled_from_the_persisted_row() {
 
 // --- Rate limits ----------------------------------------------------------
 
-fn rejected_event(resets_at: i64) -> Value {
-    json!({
-        "rate_limit_info": {
-            "status": "rejected",
-            "resets_at": resets_at,
-            "rate_limit_type": "five_hour",
-            "utilization": 1.0,
-        },
-        "uuid": "evt-reject",
-        "session_id": "sess-1",
+/// A rate-limit event as the agents bridge carries it: a serialized
+/// `flywheel_agents::RateLimitInfo`.
+fn rate_limit_event(status: &str, resets_at: i64) -> Value {
+    #[allow(clippy::cast_precision_loss)]
+    let resets_at_epoch = Some(resets_at as f64);
+    serde_json::to_value(flywheel_agents::RateLimitInfo {
+        resets_at_epoch,
+        status: Some(status.to_owned()),
+        limit_type: Some("five_hour".to_owned()),
+        detail: serde_json::Map::new(),
     })
+    .unwrap()
+}
+
+fn rejected_event(resets_at: i64) -> Value {
+    rate_limit_event("rejected", resets_at)
 }
 
 fn warning_event() -> Value {
-    json!({
-        "rate_limit_info": {
-            "status": "allowed_warning",
-            "resets_at": 1_700_000_000,
-            "rate_limit_type": "five_hour",
-            "utilization": 0.5,
-        },
-        "uuid": "evt-1",
-        "session_id": "sess-1",
-    })
+    rate_limit_event("allowed_warning", 1_700_000_000)
 }
 
 fn rate_limited_iteration(api_error_status: Option<u16>, rejected: bool) -> IterationResult {
@@ -791,6 +787,146 @@ async fn session_limit_rejected_event_future_reset_fast_aborts() {
     assert_eq!(session[0].payload["classification"], "transient");
     assert_eq!(
         session[0].payload["reason"],
+        "rate_limit_rejected:five_hour"
+    );
+}
+
+/// One Claude Code session-limit iteration, driven through the real
+/// claude-code stream normalizer, the agents fold, and the bridge fold
+/// (`completed_run_to_iteration_result`) -- the exact path a live
+/// invocation takes. The native lines are the ones the CLI emitted in a
+/// recorded run (`run-928e21003adf49fe9be85ff2fbf88e3e`, 2026-07-09): a
+/// `rejected` five-hour `rate_limit_event` resetting at 1783620000
+/// (2026-07-09T18:00:00Z), the synthetic refusal text, and the error result.
+/// `api_error_status` is omitted from the result line when `with_429` is
+/// false, leaving the rate-limit event as the only transient signal.
+fn recorded_claude_session_limit_iteration(with_429: bool, refusal: &str) -> IterationResult {
+    use flywheel_agents::claude_code::ClaudeStreamNormalizer;
+    use flywheel_agents::{AgentExit, EventFolder};
+    let session = "31a4b1ab-1689-4b19-9aec-6020b5820b76";
+    let mut result_line = json!({
+        "type": "result", "subtype": "success", "duration_ms": 834, "duration_api_ms": 0,
+        "is_error": true, "num_turns": 1, "session_id": session, "stop_reason": "stop_sequence",
+        "total_cost_usd": 0, "result": refusal, "permission_denials": [],
+        "uuid": "6f5ce867-141b-4ba9-97f3-ab875ea9139f",
+    });
+    if with_429 {
+        result_line["api_error_status"] = json!(429);
+    }
+    let lines = [
+        json!({"type": "system", "subtype": "init", "session_id": session}),
+        json!({
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": "rejected", "resetsAt": 1_783_620_000i64, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled_until",
+                "isUsingOverage": false,
+            },
+            "uuid": "e9a4f1fb-2a40-410c-a878-64562f409996", "session_id": session,
+        }),
+        json!({
+            "type": "assistant", "error": "rate_limit", "session_id": session,
+            "message": {"model": "<synthetic>", "content": [{"type": "text", "text": refusal}]},
+        }),
+        result_line,
+    ];
+    let mut normalizer = ClaudeStreamNormalizer::new();
+    let mut folder = EventFolder::new();
+    let mut messages = Vec::new();
+    for line in &lines {
+        for event in normalizer.feed_line(&line.to_string()).events {
+            folder.feed(&event);
+            messages.push(crate::agents_invoke::event_to_message(&event));
+        }
+    }
+    let completed = folder.completed(
+        AgentExit {
+            returncode: Some(1),
+            stderr_tail: None,
+            duration_seconds: Some(0.8),
+        },
+        None,
+        None,
+    );
+    crate::agents_invoke::completed_run_to_iteration_result(&completed, messages)
+}
+
+#[tokio::test]
+async fn session_limit_fast_abort_uses_a_recorded_claude_rejected_event() {
+    let h = Harness::new();
+    let task = passing_task();
+    let mut lc = lifecycle("run-session-recorded");
+    let result = recorded_claude_session_limit_iteration(
+        true,
+        "You've hit your session limit \u{b7} resets 2pm (America/New_York)",
+    );
+    let (invoke, calls) = scripted_invoker(vec![result]);
+    let config = HarnessConfig {
+        max_transient_retries: 3,
+        transient_sleep: Some(no_sleep()),
+        ..HarnessConfig::default()
+    };
+    // The recorded refusal arrived at 16:42:29Z; 2pm America/New_York that
+    // day is 18:00Z, exactly the event's resetsAt.
+    let now = utc(2026, 7, 9, 16, 42);
+    let outcome = h
+        .run_with(
+            &task,
+            &mut lc,
+            &config,
+            invoke,
+            h.options().with_now(fixed_clock(now)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(call_count(&calls), 1);
+    assert_eq!(outcome.session_limit_reset, Some(utc(2026, 7, 9, 18, 0)));
+    let session = h
+        .sink
+        .of_kind("run-session-recorded", "harness.session_limit");
+    assert_eq!(session.len(), 1);
+    assert_eq!(session[0].payload["source"], "rate_limit_event");
+    assert_eq!(session[0].payload["reset_at"], "2026-07-09T18:00:00+00:00");
+}
+
+#[tokio::test]
+async fn recorded_claude_rejected_event_alone_drives_the_transient_retry() {
+    let h = Harness::new();
+    let task = passing_task();
+    let mut lc = lifecycle("run-rl-recorded");
+    // No api_error_status and no parseable refusal text: the rejected
+    // rate-limit event is the only transient signal. The clock is past its
+    // reset, so the session-limit fast-abort stands down and the transient
+    // retry budget applies.
+    let (invoke, calls) = scripted_invoker(vec![
+        recorded_claude_session_limit_iteration(false, "rate limited"),
+        verify_iteration(),
+    ]);
+    let (sleep, delays) = recording_sleep();
+    let config = HarnessConfig {
+        max_retries: 0,
+        max_transient_retries: 3,
+        transient_sleep: Some(sleep),
+        ..HarnessConfig::default()
+    };
+    let outcome = h
+        .run_with(
+            &task,
+            &mut lc,
+            &config,
+            invoke,
+            h.options().with_now(fixed_clock(utc(2026, 7, 9, 19, 0))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.lifecycle.status, Status::Done);
+    assert_eq!(outcome.attempts.len(), 1);
+    assert_eq!(call_count(&calls), 2);
+    assert_eq!(delays.lock().unwrap().len(), 1);
+    let retries = h.sink.of_kind("run-rl-recorded", "harness.transient_retry");
+    assert_eq!(retries.len(), 1);
+    assert_eq!(
+        retries[0].payload["reason"],
         "rate_limit_rejected:five_hour"
     );
 }

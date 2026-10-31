@@ -35,7 +35,7 @@ use clap::Parser;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use flywheel_core::audit::run_file_path;
 use flywheel_core::invoker_client::{
-    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, enqueue_gate_decision,
+    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, GateBinding, enqueue_gate_decision,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, JsonObject};
@@ -953,7 +953,8 @@ pub fn build_dashboard(
                 }
                 _ => None,
             };
-            Ok(SessionStatus::new(Some(lifecycle.status), instruction))
+            Ok(SessionStatus::new(Some(lifecycle.status), instruction)
+                .with_gate(GateBinding::of_parked(&lifecycle)))
         };
         let enqueue_store = Arc::clone(&session_store);
         let enqueue_run = run_id.to_owned();

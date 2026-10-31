@@ -855,7 +855,7 @@ impl DashboardApp {
     /// notices cover the failure shapes: no enqueue seam, nothing
     /// selected, a run that left the active set, a status that does not
     /// permit the command, and a store failure.
-    fn dispatch_run_command(&mut self, kind: &str, payload: JsonObject, permitted: &[Status]) {
+    fn dispatch_run_command(&mut self, kind: &str, mut payload: JsonObject, permitted: &[Status]) {
         if self.enqueue.is_none() {
             self.set_notice(format!("/{kind} is not wired on this screen"));
             return;
@@ -869,6 +869,7 @@ impl DashboardApp {
             return;
         };
         let status_value = memo.snapshot.status.clone();
+        let displayed_gate = memo.snapshot.awaiting_gate;
         let steerable = status_value
             .parse::<Status>()
             .is_ok_and(|status| permitted.contains(&status));
@@ -877,6 +878,14 @@ impl DashboardApp {
                 "run is not steerable for '{kind}' (status={status_value})"
             ));
             return;
+        }
+        if kind == CONTROL_COMMAND_APPROVE || kind == CONTROL_COMMAND_REJECT {
+            // Pin the decision to the gate this row displayed: if it resolved
+            // and the next gate parked since the last frame, the enqueue is
+            // refused instead of deciding a gate the operator never saw.
+            if let Some(gate) = displayed_gate {
+                gate.stamp(&mut payload);
+            }
         }
         let outcome = self
             .enqueue
@@ -1576,6 +1585,7 @@ mod tests {
     use crate::session_screen::SessionStatus;
     use crate::tui::test_support::{buffer_text, ctrl, key, terminal};
     use chrono::TimeZone;
+    use flywheel_core::invoker_client::GateBinding;
     use flywheel_orchestrator::history::{HistoryRow, HistoryRun};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1596,6 +1606,7 @@ mod tests {
             last_kind: "ASSISTANT".to_owned(),
             last_detail: "Edit(file_path=README.md)".to_owned(),
             awaiting_instruction: None,
+            awaiting_gate: None,
         }
     }
 
@@ -2233,6 +2244,39 @@ mod tests {
         assert_eq!(recorded[1].1, "reject");
         assert_eq!(recorded[1].2["feedback"], "needs more tests");
         assert_eq!(recorded[2].1, "approve");
+    }
+
+    #[test]
+    fn gate_decisions_are_pinned_to_the_gate_the_row_displayed() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let probe = Rc::clone(&calls);
+        let mut gated = row("gated");
+        gated.status = "awaiting_approval".to_owned();
+        gated.awaiting_instruction = Some("Confirm it.".to_owned());
+        gated.awaiting_gate = Some(GateBinding {
+            awaiting_ordinal: 3,
+            attempt_number: 2,
+        });
+        let snap = snapshot(&[gated]);
+        let mut app = DashboardApp::new(move || Ok(snap.clone())).with_enqueue(
+            move |_run_id, kind, payload| {
+                probe.borrow_mut().push((kind.to_owned(), payload));
+                Ok(1)
+            },
+        );
+        app.refresh_now();
+        app.handle_key(ctrl('i'));
+        type_line(&mut app, "/approve");
+        type_line(&mut app, "/reject not yet");
+        let pinned = serde_json::json!({"awaiting_ordinal": 3, "attempt_number": 2});
+        let recorded = calls.borrow();
+        assert_eq!(recorded[0].0, "approve");
+        assert_eq!(serde_json::Value::Object(recorded[0].1.clone()), pinned);
+        assert_eq!(recorded[1].0, "reject");
+        assert_eq!(
+            serde_json::Value::Object(recorded[1].1.clone()),
+            serde_json::json!({"feedback": "not yet", "awaiting_ordinal": 3, "attempt_number": 2})
+        );
     }
 
     #[test]

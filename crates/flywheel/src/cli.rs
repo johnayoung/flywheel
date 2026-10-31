@@ -1529,6 +1529,64 @@ mod tests {
         assert_eq!(run(&["approve", "--help"], &unbound()).0, 0);
     }
 
+    #[test]
+    fn a_gate_pinned_decision_is_refused_once_that_gate_has_resolved() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        let db_arg = db.to_str().unwrap();
+        let run_id = seed_awaiting(&db, "task-g");
+        let approve_gate_1 = ["approve", &run_id, "--gate", "1", "--db", db_arg];
+        assert_eq!(run(&approve_gate_1, &unbound()).0, 0);
+        let bound_1 = json!({"awaiting_ordinal": 1, "attempt_number": 1});
+        assert_eq!(claimed(&db, &run_id), vec![("approve".to_owned(), bound_1)]);
+
+        // The resolver applied it and re-parked on the next manual gate.
+        let store = SqliteStore::open(&db).unwrap();
+        let mut lc = store.load_lifecycle(&run_id).unwrap().unwrap();
+        let version = lc.version;
+        lc.awaiting_manual_ordinal = Some(2);
+        store.update_lifecycle(&lc, version).unwrap();
+        drop(store);
+
+        // The same command re-run (shell history) names gate 1, which is no
+        // longer parked: refused, nothing enqueued, gate 2 untouched.
+        assert_eq!(run(&approve_gate_1, &unbound()).0, 1);
+        let reject_stale = [
+            "reject",
+            &run_id,
+            "--gate",
+            "2",
+            "--attempt",
+            "7",
+            "--db",
+            db_arg,
+        ];
+        assert_eq!(run(&reject_stale, &unbound()).0, 1);
+        assert!(claimed(&db, &run_id).is_empty());
+
+        // Naming the gate actually parked still decides it.
+        let approve_gate_2 = [
+            "approve",
+            &run_id,
+            "--gate",
+            "2",
+            "--attempt",
+            "1",
+            "--db",
+            db_arg,
+        ];
+        assert_eq!(run(&approve_gate_2, &unbound()).0, 0);
+        assert_eq!(
+            claimed(&db, &run_id),
+            vec![(
+                "approve".to_owned(),
+                json!({"awaiting_ordinal": 2, "attempt_number": 1})
+            )]
+        );
+        let bad = ["approve", &run_id, "--gate", "two", "--db", db_arg];
+        assert_eq!(run(&bad, &unbound()).0, 2);
+    }
+
     // --- audit ------------------------------------------------------------------
 
     #[test]

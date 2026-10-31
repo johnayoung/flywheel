@@ -30,7 +30,8 @@ use crate::slash::{
 use crate::tui::{InputBar, InputEvent};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use flywheel_core::invoker_client::{
-    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT, CONTROL_COMMAND_SAY,
+    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT,
+    CONTROL_COMMAND_SAY, GateBinding,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::JsonObject;
@@ -78,11 +79,13 @@ pub type ArchiveAction = Box<dyn FnMut() -> Result<Vec<String>, String>>;
 ///
 /// `missing` is the "lifecycle row gone" sentinel; `awaiting_instruction`
 /// is the parked manual gate's instruction when the run is at
-/// AWAITING_APPROVAL.
+/// AWAITING_APPROVAL, and `awaiting_gate` the gate instance it belongs to
+/// (an approve/reject submitted from this screen is pinned to it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStatus {
     pub status: Option<Status>,
     pub awaiting_instruction: Option<String>,
+    pub awaiting_gate: Option<GateBinding>,
     pub missing: bool,
 }
 
@@ -91,14 +94,22 @@ impl SessionStatus {
         Self {
             status,
             awaiting_instruction,
+            awaiting_gate: None,
             missing: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_gate(mut self, gate: Option<GateBinding>) -> Self {
+        self.awaiting_gate = gate;
+        self
     }
 
     pub fn missing() -> Self {
         Self {
             status: None,
             awaiting_instruction: None,
+            awaiting_gate: None,
             missing: true,
         }
     }
@@ -906,7 +917,7 @@ impl SessionScreen {
     fn enqueue_steering(
         &mut self,
         kind: &str,
-        payload: JsonObject,
+        mut payload: JsonObject,
         summary: String,
         permitted: &[Status],
     ) -> Option<i64> {
@@ -921,6 +932,14 @@ impl SessionScreen {
                 ));
                 return None;
             }
+        }
+        if (kind == CONTROL_COMMAND_APPROVE || kind == CONTROL_COMMAND_REJECT)
+            && let Some(gate) = self.last_status.as_ref().and_then(|s| s.awaiting_gate)
+        {
+            // Pin the decision to the gate on screen: if it resolved and the
+            // next gate parked since the last tick, the enqueue is refused
+            // instead of deciding a gate the operator never saw.
+            gate.stamp(&mut payload);
         }
         let enqueue = self.enqueue.as_mut()?;
         let command_id = match enqueue(kind, payload) {
@@ -1631,6 +1650,70 @@ mod tests {
             vec!["interrupt", "interrupt"]
         );
         assert!(claimed[0].payload.is_empty());
+    }
+
+    #[test]
+    fn a_decision_from_the_screen_is_refused_once_the_displayed_gate_resolved() {
+        use flywheel_core::invoker_client::enqueue_gate_decision;
+        use flywheel_core::lifecycle::{Attempt, Outcome};
+        use flywheel_core::store::AttemptStore;
+        let store = Arc::new(InMemoryStore::new());
+        let run_id = "run-two-gates";
+        let mut lc = Lifecycle::new("two-gates").with_run_id(run_id);
+        for s in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            lc.transition_to(s, "", Some(now())).unwrap();
+        }
+        lc.awaiting_manual_ordinal = Some(1);
+        store.create_lifecycle(&lc).unwrap();
+        let mut attempt = Attempt::new(1, now(), run_id);
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt(run_id, &attempt, None).unwrap();
+        let gate = |ordinal| {
+            awaiting("Confirm it.").with_gate(Some(GateBinding {
+                awaiting_ordinal: ordinal,
+                attempt_number: 1,
+            }))
+        };
+        let (statuses, status) = scripted_status(gate(1));
+        let enqueue_store = Arc::clone(&store);
+        let mut screen = SessionScreen::new(run_id, "two-gates", || Ok(Vec::new()), status)
+            .with_enqueue(move |kind, payload| {
+                enqueue_gate_decision(enqueue_store.as_ref(), run_id, kind, payload, now())
+                    .map(|(record, _)| record.id.unwrap())
+                    .map_err(|err| err.to_string())
+            });
+        screen.refresh_now();
+
+        // Gate 1 resolved and gate 2 parked before the screen's next tick:
+        // the approve the operator pressed was about gate 1.
+        let mut moved = store.load_lifecycle(run_id).unwrap().unwrap();
+        let version = moved.version;
+        moved.awaiting_manual_ordinal = Some(2);
+        store.update_lifecycle(&moved, version).unwrap();
+        assert_eq!(screen.submit_approve(), None);
+        assert!(
+            screen
+                .notice()
+                .is_some_and(|n| n.contains("awaiting_ordinal=2")),
+            "{:?}",
+            screen.notice()
+        );
+        assert!(store.claim_commands(run_id, now()).unwrap().is_empty());
+
+        // Once the screen shows gate 2, a decision binds to it.
+        statuses.borrow_mut().push_back(gate(2));
+        screen.refresh_now();
+        assert!(screen.submit_approve().is_some());
+        let claimed = store.claim_commands(run_id, now()).unwrap();
+        assert_eq!(
+            Value::Object(claimed[0].payload.clone()),
+            serde_json::json!({"awaiting_ordinal": 2, "attempt_number": 1})
+        );
     }
 
     #[test]

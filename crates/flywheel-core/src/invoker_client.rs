@@ -359,9 +359,51 @@ impl GateBinding {
         })
     }
 
-    fn stamp(self, payload: &mut JsonObject) {
-        payload.insert(GATE_BINDING_ORDINAL.into(), json!(self.awaiting_ordinal));
-        payload.insert(GATE_BINDING_ATTEMPT.into(), json!(self.attempt_number));
+    /// Write this binding into a decision payload. A caller that pins the
+    /// gate it displayed stamps it before [`enqueue_gate_decision`], which
+    /// then refuses unless that exact gate is still parked.
+    pub fn stamp(self, payload: &mut JsonObject) {
+        GatePin::from(self).stamp(payload);
+    }
+}
+
+impl std::fmt::Display for GateBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "awaiting_ordinal={} attempt_number={}",
+            self.awaiting_ordinal, self.attempt_number
+        )
+    }
+}
+
+/// The gate an operator says a decision is for: each `Some` field must
+/// match the parked [`GateBinding`] or the decision is refused. An empty pin
+/// binds to whatever gate is parked at enqueue time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GatePin {
+    pub awaiting_ordinal: Option<u32>,
+    pub attempt_number: Option<u32>,
+}
+
+impl GatePin {
+    /// Write the pinned fields into a decision payload under the binding keys.
+    pub fn stamp(self, payload: &mut JsonObject) {
+        if let Some(ordinal) = self.awaiting_ordinal {
+            payload.insert(GATE_BINDING_ORDINAL.into(), json!(ordinal));
+        }
+        if let Some(attempt) = self.attempt_number {
+            payload.insert(GATE_BINDING_ATTEMPT.into(), json!(attempt));
+        }
+    }
+}
+
+impl From<GateBinding> for GatePin {
+    fn from(binding: GateBinding) -> Self {
+        Self {
+            awaiting_ordinal: Some(binding.awaiting_ordinal),
+            attempt_number: Some(binding.attempt_number),
+        }
     }
 }
 
@@ -375,6 +417,15 @@ pub enum GateDecisionError {
          approve/reject apply only to a gate parked at awaiting_approval, nothing enqueued"
     )]
     NotParked { run_id: String, status: String },
+    #[error(
+        "run {run_id:?} is parked on manual gate {parked}, not the gate this decision \
+         names ({requested}); nothing enqueued"
+    )]
+    GateMismatch {
+        run_id: String,
+        parked: GateBinding,
+        requested: String,
+    },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -389,12 +440,21 @@ pub enum GateDecisionError {
 /// resolved) refuses with [`GateDecisionError::NotParked`] and enqueues
 /// nothing, so a decision can never queue ahead of a gate nobody has seen.
 ///
+/// A caller pins the gate it showed the operator by pre-stamping
+/// `awaiting_ordinal` and/or `attempt_number` in `payload` (see
+/// [`GatePin::stamp`]): every pinned key must equal the parked gate, else
+/// [`GateDecisionError::GateMismatch`] and nothing is enqueued. This is what
+/// stops one stale intent (a re-run `approve --gate N`, a console keypress
+/// against a gate that has since resolved) from deciding the next gate.
+///
 /// # Errors
 ///
 /// [`GateDecisionError::UnknownRun`] when the store has no lifecycle for
 /// `run_id`, [`GateDecisionError::NotParked`] when it is not parked at a
-/// manual gate, and [`GateDecisionError::Store`] when loading the lifecycle
-/// or enqueueing the command fails.
+/// manual gate, [`GateDecisionError::GateMismatch`] when a pinned key names a
+/// different gate or attempt (or is not an integer), and
+/// [`GateDecisionError::Store`] when loading the lifecycle or enqueueing the
+/// command fails.
 pub fn enqueue_gate_decision<S: LifecycleStore + ControlCommandStore + ?Sized>(
     store: &S,
     run_id: &str,
@@ -410,6 +470,24 @@ pub fn enqueue_gate_decision<S: LifecycleStore + ControlCommandStore + ?Sized>(
             run_id: run_id.to_owned(),
             status: lifecycle.status.as_str().to_owned(),
         })?;
+    let mut requested = Vec::new();
+    let mut admitted = true;
+    for (key, parked) in [
+        (GATE_BINDING_ORDINAL, binding.awaiting_ordinal),
+        (GATE_BINDING_ATTEMPT, binding.attempt_number),
+    ] {
+        if let Some(value) = payload.get(key) {
+            requested.push(format!("{key}={value}"));
+            admitted &= value.as_u64() == Some(u64::from(parked));
+        }
+    }
+    if !admitted {
+        return Err(GateDecisionError::GateMismatch {
+            run_id: run_id.to_owned(),
+            parked: binding,
+            requested: requested.join(" "),
+        });
+    }
     binding.stamp(&mut payload);
     Ok((store.enqueue_command(run_id, kind, payload, now)?, binding))
 }

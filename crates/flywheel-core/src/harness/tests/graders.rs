@@ -1029,6 +1029,59 @@ async fn an_approve_bound_to_one_gate_does_not_approve_the_next() {
 }
 
 #[tokio::test]
+async fn a_repeated_approve_pinned_to_a_resolved_gate_is_refused_not_applied_to_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let run_id = "run-approve-pinned-gate";
+    let (task, mut lc) = park(
+        &h,
+        &dir,
+        run_id,
+        vec![("review-migration", "x"), ("review-rollout", "y")],
+    )
+    .await;
+    // The operator saw gate ordinal 2 on attempt 1 and pins the approve to it.
+    let seen = json!({"awaiting_ordinal": 2, "attempt_number": 1})
+        .as_object()
+        .unwrap()
+        .clone();
+    crate::invoker_client::enqueue_gate_decision(
+        h.store.as_ref(),
+        run_id,
+        CONTROL_COMMAND_APPROVE,
+        seen.clone(),
+        Utc::now(),
+    )
+    .unwrap();
+    assert_eq!(resolve(&h, &mut lc, &task, 0).reason, "approved_next_gate");
+    assert_eq!(lc.awaiting_manual_ordinal, Some(3));
+
+    // The same intent re-issued (shell history, a retried script) after
+    // `review-rollout` parked: it names the gate the operator saw, which is
+    // no longer parked, so it is refused and nothing is queued.
+    let err = crate::invoker_client::enqueue_gate_decision(
+        h.store.as_ref(),
+        run_id,
+        CONTROL_COMMAND_APPROVE,
+        seen,
+        Utc::now(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("awaiting_ordinal=3"), "{err}");
+    assert_eq!(resolve(&h, &mut lc, &task, 0).reason, "no_pending_command");
+    assert_eq!(lc.status, Status::AwaitingApproval);
+    assert_eq!(lc.awaiting_manual_ordinal, Some(3));
+    assert_eq!(
+        manual_rows(&h, run_id, 1)
+            .iter()
+            .map(|r| r.ordinal)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[tokio::test]
 async fn commands_the_resolver_does_not_apply_are_recorded_not_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::new();

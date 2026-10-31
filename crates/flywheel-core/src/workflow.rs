@@ -19,8 +19,8 @@
 //! interrupt RUN_ID [--db PATH]
 //! steer RUN_ID MESSAGE [--db PATH]
 //! set-model RUN_ID MODEL [--db PATH]
-//! approve RUN_ID [--db PATH]
-//! reject RUN_ID [--feedback TEXT] [--db PATH]
+//! approve RUN_ID [--gate ORDINAL] [--attempt N] [--db PATH]
+//! reject RUN_ID [--feedback TEXT] [--gate ORDINAL] [--attempt N] [--db PATH]
 //! ```
 //!
 //! `run` accepts either an inline goal string or a task-file path; an inline
@@ -45,8 +45,8 @@ use crate::harness::{
 };
 use crate::invoker_client::{
     CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT,
-    CONTROL_COMMAND_SAY, CONTROL_COMMAND_SET_MODEL, ControlPlane, GateDecisionError, ProgressProbe,
-    enqueue_gate_decision,
+    CONTROL_COMMAND_SAY, CONTROL_COMMAND_SET_MODEL, ControlPlane, GateDecisionError, GatePin,
+    ProgressProbe, enqueue_gate_decision,
 };
 use crate::lifecycle::{Lifecycle, Status};
 use crate::loaders::{TaskLoadError, load_task_file};
@@ -1326,7 +1326,8 @@ pub async fn run_task_file(
 /// [`SqliteStore`] at `db_path` (creating its parent directory) and closes
 /// it on exit. `approve` / `reject` go through
 /// [`enqueue_gate_decision`]: bound to the gate parked right now, and refused
-/// with exit `1` (nothing enqueued) when the run has no parked gate. Every
+/// with exit `1` (nothing enqueued) when the run has no parked gate or a
+/// `--gate` / `--attempt` pin names a different one. Every
 /// other verb uses the standard `running` / `validating` in-flight note.
 pub fn enqueue_control_command(
     db_path: &Path,
@@ -1370,8 +1371,9 @@ fn enqueue_control_command_inner(
         if gate_decision {
             // approve/reject bind to the gate parked right now; a run with no
             // parked gate refuses rather than queueing a decision ahead of it.
-            let (record, _) =
+            let (record, binding) =
                 enqueue_gate_decision(backend.as_ref(), run_id, kind, payload, Utc::now())?;
+            eprintln!("  bound to manual gate {binding}");
             return Ok((Status::AwaitingApproval, record.id));
         }
         let lifecycle = backend
@@ -1392,7 +1394,9 @@ fn enqueue_control_command_inner(
             eprintln!("error: run {run_id:?} is unknown to this store; no command enqueued");
             return Ok(2);
         }
-        Err(err @ GateDecisionError::NotParked { .. }) => {
+        Err(
+            err @ (GateDecisionError::NotParked { .. } | GateDecisionError::GateMismatch { .. }),
+        ) => {
             eprintln!("error: {err}");
             return Ok(1);
         }
@@ -1546,21 +1550,28 @@ options:
   -h, --help  show this help message and exit
   --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const APPROVE_USAGE: &str = "usage: flywheel workflow approve [-h] [--db DB] RUN_ID";
+const APPROVE_USAGE: &str =
+    "usage: flywheel workflow approve [-h] [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID";
 
-const APPROVE_HELP: &str = "usage: flywheel workflow approve [-h] [--db DB] RUN_ID
+const APPROVE_HELP: &str =
+    "usage: flywheel workflow approve [-h] [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID
 
 positional arguments:
-  RUN_ID      Lifecycle run_id of the AWAITING_APPROVAL run to approve.
+  RUN_ID            Lifecycle run_id of the AWAITING_APPROVAL run to approve.
 
 options:
-  -h, --help  show this help message and exit
-  --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
+  -h, --help        show this help message and exit
+  --gate ORDINAL    Refuse unless the parked gate is this awaiting_ordinal
+                    (from harness.awaiting_approval). Without it the
+                    decision binds to whatever gate is parked now.
+  --attempt N       Refuse unless the gate is parked on this attempt.
+  --db DB           SQLite database path (default: .flywheel/flywheel.sqlite).";
 
-const REJECT_USAGE: &str =
-    "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID";
+const REJECT_USAGE: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] \
+                            [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID";
 
-const REJECT_HELP: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] [--db DB] RUN_ID
+const REJECT_HELP: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] \
+                           [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID
 
 positional arguments:
   RUN_ID           Lifecycle run_id of the AWAITING_APPROVAL run to reject.
@@ -1571,6 +1582,8 @@ options:
                    Renders in the next attempt's # Reviewer feedback section
                    so the agent can address it. Absent feedback is recorded as
                    \"(no feedback provided)\".
+  --gate ORDINAL   Refuse unless the parked gate is this awaiting_ordinal.
+  --attempt N      Refuse unless the gate is parked on this attempt.
   --db DB          SQLite database path (default: .flywheel/flywheel.sqlite).";
 
 const COMMANDS: [&str; 7] = [
@@ -1649,7 +1662,7 @@ const APPROVE_SPEC: SubSpec = SubSpec {
     usage: APPROVE_USAGE,
     help: APPROVE_HELP,
     positionals: &["RUN_ID"],
-    options: &[("--db", true)],
+    options: &[("--gate", true), ("--attempt", true), ("--db", true)],
 };
 
 const REJECT_SPEC: SubSpec = SubSpec {
@@ -1657,7 +1670,12 @@ const REJECT_SPEC: SubSpec = SubSpec {
     usage: REJECT_USAGE,
     help: REJECT_HELP,
     positionals: &["RUN_ID"],
-    options: &[("--feedback", true), ("--db", true)],
+    options: &[
+        ("--feedback", true),
+        ("--gate", true),
+        ("--attempt", true),
+        ("--db", true),
+    ],
 };
 
 /// How a parse ended short of a dispatchable command: argparse's help exit
@@ -1741,11 +1759,13 @@ pub enum Command {
     },
     Approve {
         run_id: String,
+        pin: GatePin,
         db: Option<String>,
     },
     Reject {
         run_id: String,
         feedback: Option<String>,
+        pin: GatePin,
         db: Option<String>,
     },
 }
@@ -1922,6 +1942,19 @@ fn parse_int(spec: &SubSpec, long: &str, raw: &str) -> Result<u32, CliExit> {
     })
 }
 
+/// The optional `--gate` / `--attempt` pin of an `approve` / `reject`.
+fn parse_gate_pin(spec: &SubSpec, parsed: &SubParsed) -> Result<GatePin, CliExit> {
+    let int = |long: &str| {
+        last_value(parsed, long)
+            .map(|raw| parse_int(spec, long, &raw))
+            .transpose()
+    };
+    Ok(GatePin {
+        awaiting_ordinal: int("--gate")?,
+        attempt_number: int("--attempt")?,
+    })
+}
+
 fn last_value(parsed: &SubParsed, long: &str) -> Option<String> {
     parsed
         .values
@@ -2078,6 +2111,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliExit> {
             (
                 Command::Approve {
                     run_id: parsed.positionals[0].clone(),
+                    pin: parse_gate_pin(&APPROVE_SPEC, &parsed)?,
                     db: last_value(&parsed, "--db"),
                 },
                 parsed.extras,
@@ -2089,6 +2123,7 @@ pub fn parse_args(argv: &[String]) -> Result<Command, CliExit> {
                 Command::Reject {
                     run_id: parsed.positionals[0].clone(),
                     feedback: last_value(&parsed, "--feedback"),
+                    pin: parse_gate_pin(&REJECT_SPEC, &parsed)?,
                     db: last_value(&parsed, "--db"),
                 },
                 parsed.extras,
@@ -2280,19 +2315,25 @@ pub fn dispatch(command: Command, store: Option<Arc<dyn RunStore>>) -> i32 {
                 store,
             )
         }
-        Command::Approve { run_id, db } => enqueue_control_command(
-            &resolve_db(db.as_deref()),
-            &run_id,
-            CONTROL_COMMAND_APPROVE,
-            JsonObject::new(),
-            store,
-        ),
+        Command::Approve { run_id, pin, db } => {
+            let mut payload = JsonObject::new();
+            pin.stamp(&mut payload);
+            enqueue_control_command(
+                &resolve_db(db.as_deref()),
+                &run_id,
+                CONTROL_COMMAND_APPROVE,
+                payload,
+                store,
+            )
+        }
         Command::Reject {
             run_id,
             feedback,
+            pin,
             db,
         } => {
             let mut payload = JsonObject::new();
+            pin.stamp(&mut payload);
             if let Some(feedback) = feedback {
                 payload.insert("feedback".into(), json!(feedback));
             }
@@ -3920,6 +3961,7 @@ mod tests {
             parse_args(&argv(&["approve", "r1"])).unwrap(),
             Command::Approve {
                 run_id: "r1".into(),
+                pin: GatePin::default(),
                 db: None
             }
         );
@@ -3928,6 +3970,7 @@ mod tests {
             Command::Reject {
                 run_id: "r1".into(),
                 feedback: Some("needs tests".into()),
+                pin: GatePin::default(),
                 db: None
             }
         );

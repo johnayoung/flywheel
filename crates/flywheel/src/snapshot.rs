@@ -14,6 +14,7 @@
 //! consecutive snapshots over the same store are stable.
 
 use chrono::{DateTime, Utc};
+use flywheel_core::invoker_client::GateBinding;
 use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{LifecycleFilter, LifecycleStore, StoreError, TaskStore};
 use flywheel_core::task::Grader;
@@ -60,6 +61,9 @@ pub struct LiveRunRow {
     pub turns_total: u64,
     pub iterations_completed: u64,
     pub awaiting_instruction: Option<String>,
+    /// The parked gate instance (ordinal + attempt) the instruction belongs
+    /// to; a console decision on this row is pinned to it.
+    pub awaiting_gate: Option<GateBinding>,
     pub started_at: Option<DateTime<Utc>>,
     pub worker_id: Option<String>,
 }
@@ -145,6 +149,7 @@ fn live_row_from_lifecycle<S: TaskStore + ?Sized>(
     let worker_id = (!lc.worker_id.is_empty()).then(|| lc.worker_id.clone());
     let awaiting_instruction =
         resolve_awaiting_instruction(store, &lc.run_id, lc.status, lc.awaiting_manual_ordinal)?;
+    let awaiting_gate = GateBinding::of_parked(lc);
     Ok(LiveRunRow {
         run_id: lc.run_id.clone(),
         task_id: lc.task_id.clone(),
@@ -159,6 +164,7 @@ fn live_row_from_lifecycle<S: TaskStore + ?Sized>(
         turns_total: turns,
         iterations_completed: iters_completed,
         awaiting_instruction,
+        awaiting_gate,
         started_at,
         worker_id,
     })
@@ -188,6 +194,7 @@ pub struct RowSnapshot {
     pub last_kind: String,
     pub last_detail: String,
     pub awaiting_instruction: Option<String>,
+    pub awaiting_gate: Option<GateBinding>,
 }
 
 /// Summary header fields aggregated across the snapshot.
@@ -266,6 +273,7 @@ fn row_snapshot(row: &LiveRunRow, now: DateTime<Utc>) -> RowSnapshot {
         last_kind: row.last_kind.clone(),
         last_detail: row.last_detail.clone(),
         awaiting_instruction: row.awaiting_instruction.clone(),
+        awaiting_gate: row.awaiting_gate,
     }
 }
 

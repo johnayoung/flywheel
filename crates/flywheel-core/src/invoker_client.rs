@@ -331,6 +331,7 @@ pub struct GateBinding {
 impl GateBinding {
     /// The gate instance `lifecycle` is parked on, or `None` when it is not
     /// parked at `awaiting_approval` with a pending gate and an attempt.
+    #[must_use]
     pub fn of_parked(lifecycle: &Lifecycle) -> Option<Self> {
         if lifecycle.status != Status::AwaitingApproval {
             return None;
@@ -343,6 +344,7 @@ impl GateBinding {
 
     /// The binding a queued command carries, or `None` when it carries none
     /// (or a malformed one).
+    #[must_use]
     pub fn of_command(command: &ControlCommandRecord) -> Option<Self> {
         let field = |key: &str| {
             command
@@ -386,6 +388,13 @@ pub enum GateDecisionError {
 /// park. A run not parked at a gate (still running or validating, already
 /// resolved) refuses with [`GateDecisionError::NotParked`] and enqueues
 /// nothing, so a decision can never queue ahead of a gate nobody has seen.
+///
+/// # Errors
+///
+/// [`GateDecisionError::UnknownRun`] when the store has no lifecycle for
+/// `run_id`, [`GateDecisionError::NotParked`] when it is not parked at a
+/// manual gate, and [`GateDecisionError::Store`] when loading the lifecycle
+/// or enqueueing the command fails.
 pub fn enqueue_gate_decision<S: LifecycleStore + ControlCommandStore + ?Sized>(
     store: &S,
     run_id: &str,

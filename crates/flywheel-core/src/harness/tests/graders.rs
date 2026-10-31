@@ -14,7 +14,7 @@ use crate::invoker_client::{
 use crate::lifecycle::{Lifecycle, Outcome, Status};
 use crate::store::{
     AttemptStore, ControlCommandStore, DomainEventStore, GraderResultStore, HarnessStore,
-    LifecycleStore,
+    JsonObject, LifecycleStore,
 };
 use crate::task::{Grader, GraderType, ManualGrader, RubricGrader, Task, TranscriptGrader};
 use chrono::Utc;
@@ -966,7 +966,7 @@ async fn an_approve_queued_before_the_park_does_not_approve_the_gate() {
         .enqueue_command(
             run_id,
             CONTROL_COMMAND_APPROVE,
-            Default::default(),
+            JsonObject::new(),
             Utc::now(),
         )
         .unwrap();

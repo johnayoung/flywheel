@@ -1303,3 +1303,40 @@ async fn store_is_the_harness_store_trait_object() {
     let store: Arc<dyn HarnessStore> = h.store.clone();
     assert!(store.load_lifecycle("nope").unwrap().is_none());
 }
+
+// --- Validation routing pins (mutation survey, iteration 53) ---------------
+
+#[tokio::test]
+async fn judge_infra_failure_walks_through_internal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let task = task(vec![ok_command(), rubric("rcrash", true)]);
+    let mut lc = lifecycle("run-rubric-crash-walk");
+    let judge = ScriptedJudge::new(vec![Err(RubricJudgeError::new("rcrash", "boom"))]);
+    let (invoke, _) = scripted_invoker(vec![verify_iteration()]);
+    let config = HarnessConfig {
+        rubric_judge_retries: 0,
+        ..judge_config(&dir, judge, 0)
+    };
+    let outcome = h.run(&task, &mut lc, &config, invoke).await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    let timestamps = &outcome.lifecycle.timestamps;
+    assert!(timestamps.contains_key(&Status::InternalError));
+    assert!(!timestamps.contains_key(&Status::FailedValidation));
+}
+
+#[tokio::test]
+async fn an_empty_landability_reason_does_not_block_done() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-gate-empty");
+    let (invoke, _) = scripted_invoker(vec![verify_iteration()]);
+    let gate: crate::harness::LandabilityGate = Arc::new(|| Some(String::new()));
+    let outcome = h.run(&task, &mut lc, &gate_config(0, gate), invoke).await;
+    assert_eq!(outcome.lifecycle.status, Status::Done);
+    assert!(
+        h.sink
+            .of_kind("run-gate-empty", "harness.landability_gate_blocked")
+            .is_empty()
+    );
+}

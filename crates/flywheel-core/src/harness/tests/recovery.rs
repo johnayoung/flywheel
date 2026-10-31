@@ -1023,3 +1023,28 @@ async fn append_failure_retains_queue_row() {
             .all(|e| !matches!(e.payload, DomainEventPayload::CommandApplied(_)))
     );
 }
+
+#[tokio::test]
+async fn summarizer_failure_walks_through_retryable_internal_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let task = task(vec![]);
+    let mut lc = lifecycle("run-recover-summ-walk");
+    let (invoke, _) = scripted_invoker(vec![continue_at(95, "over-ratio")]);
+    let summarizer = ScriptedSummarizer::failing("summarizer crashed");
+    let outcome = h
+        .run(
+            &task,
+            &mut lc,
+            &recovery_config(&dir, summarizer, 1),
+            invoke,
+        )
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert!(
+        outcome
+            .lifecycle
+            .timestamps
+            .contains_key(&Status::InternalError)
+    );
+}

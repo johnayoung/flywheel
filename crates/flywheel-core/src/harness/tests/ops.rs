@@ -708,3 +708,103 @@ async fn wall_clock_breach_is_terminal_and_zero_ceilings_are_unenforced() {
             .is_empty()
     );
 }
+
+/// A clock that only moves when the agent is invoked: every invocation
+/// advances it by `step_secs`, so run elapsed time is exact.
+fn stepping_invoker(
+    results: Vec<IterationResult>,
+    step_secs: i64,
+) -> (crate::harness::InvokeFn, crate::invoker_client::Clock) {
+    let now = Arc::new(Mutex::new(utc(2026, 1, 1, 0, 0)));
+    let (inner, _) = scripted_invoker(results);
+    let advance = now.clone();
+    let invoke: crate::harness::InvokeFn = Arc::new(move |request| {
+        *advance.lock().unwrap() += ChronoDuration::seconds(step_secs);
+        inner(request)
+    });
+    let clock: crate::invoker_client::Clock = Arc::new(move || *now.lock().unwrap());
+    (invoke, clock)
+}
+
+#[tokio::test]
+async fn ceilings_are_inclusive_at_the_limit() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+
+    let mut lc = lifecycle("run-eq-cost");
+    let (invoke, _) = scripted_invoker(vec![cost_iteration(0.05)]);
+    let outcome = h
+        .run(&task, &mut lc, &ceiling_config(0.05, 0, 0), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(breaches(&h, "run-eq-cost", "cost_usd").len(), 1);
+
+    let mut lc = lifecycle("run-eq-tok");
+    let (invoke, _) = scripted_invoker(vec![token_iteration(1500)]);
+    let outcome = h
+        .run(&task, &mut lc, &ceiling_config(0.0, 1500, 0), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(breaches(&h, "run-eq-tok", "tokens").len(), 1);
+
+    let mut lc = lifecycle("run-eq-wall");
+    let (invoke, clock) = stepping_invoker(vec![token_iteration(1)], 100);
+    let outcome = h
+        .run_with(
+            &task,
+            &mut lc,
+            &ceiling_config(0.0, 0, 100),
+            invoke,
+            h.options().with_now(clock),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    let found = breaches(&h, "run-eq-wall", "wall_clock_seconds");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].payload["observed"], 100.0);
+}
+
+#[tokio::test]
+async fn wall_clock_ceiling_is_measured_from_the_first_attempt() {
+    let h = Harness::new();
+    let task = task(vec![fail_command()]);
+    let mut lc = lifecycle("run-wall-run");
+    let (invoke, clock) = stepping_invoker(vec![token_iteration(1), token_iteration(1)], 60);
+    let outcome = h
+        .run_with(
+            &task,
+            &mut lc,
+            &ceiling_config(0.0, 0, 100),
+            invoke,
+            h.options().with_now(clock),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(outcome.attempts.len(), 2);
+    let found = breaches(&h, "run-wall-run", "wall_clock_seconds");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].payload["observed"], 120.0);
+}
+
+#[tokio::test]
+async fn a_protocol_failure_attempt_still_hits_the_ceiling() {
+    // A breached budget ends the run even when the envelope was unusable;
+    // it must not be retried as an ordinary protocol failure.
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-ceiling-missing");
+    let missing = |cost| {
+        let mut result = iteration(crate::envelope::EnvelopeResult::Missing, vec![]);
+        result.signals.total_cost_usd = Some(cost);
+        result
+    };
+    let (invoke, _) = scripted_invoker(vec![missing(0.10), missing(0.10)]);
+    let outcome = h
+        .run(&task, &mut lc, &ceiling_config(0.05, 0, 0), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(outcome.attempts.len(), 1);
+    assert_eq!(breaches(&h, "run-ceiling-missing", "cost_usd").len(), 1);
+}

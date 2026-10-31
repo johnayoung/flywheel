@@ -558,6 +558,76 @@ mod tests {
     }
 
     #[test]
+    fn a_second_closing_fence_is_malformed() {
+        let payload = r#"{"intent":"verify"}"#;
+        for output in [
+            format!("{OPENING_FENCE}{payload}{CLOSING_FENCE}{CLOSING_FENCE}"),
+            format!("{OPENING_FENCE}{payload}{CLOSING_FENCE} prose {CLOSING_FENCE}"),
+        ] {
+            assert_eq!(
+                parse_envelope(&output),
+                EnvelopeResult::Malformed {
+                    reason: "multiple closing fences for a single opening fence".into(),
+                    offending: None
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn intent_matching_is_exact() {
+        for payload in [r#"{"intent":"VERIFY"}"#, r#"{"intent":"Verify"}"#] {
+            assert!(
+                matches!(
+                    parse_envelope(&wrap(payload)),
+                    EnvelopeResult::Malformed { ref reason, .. } if reason.contains("must be one of")
+                ),
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_reason_is_absent() {
+        let r = parse_envelope(&wrap(r#"{"intent":"verify","reason":null}"#));
+        assert_eq!(
+            r,
+            EnvelopeResult::Valid(ValidEnvelope {
+                intent: Intent::Verify,
+                reason: None,
+                requires: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn file_exists_requires_a_non_empty_path() {
+        let payload = r#"{"intent":"blocked","requires":[{"type":"file_exists","path":""}]}"#;
+        match parse_envelope(&wrap(payload)) {
+            EnvelopeResult::Malformed { reason, .. } => {
+                assert!(
+                    reason.contains("'path' must be a non-empty string"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_persisted_file_exists_predicate_defaults_to_present() {
+        let req: BlockedRequirement =
+            serde_json::from_str(r#"{"type":"file_exists","path":"p"}"#).unwrap();
+        assert_eq!(
+            req,
+            BlockedRequirement::FileExists {
+                path: "p".into(),
+                present: true
+            }
+        );
+    }
+
+    #[test]
     fn deep_nesting_is_malformed_not_a_crash() {
         let deep = "[".repeat(100_000);
         let r = parse_envelope(&wrap(&deep));

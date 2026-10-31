@@ -569,6 +569,75 @@ mod tests {
     }
 
     #[test]
+    fn terminal_statuses_are_exactly_the_ones_without_outgoing_edges() {
+        for s in Status::ALL {
+            assert_eq!(s.is_terminal(), s.valid_targets().is_empty(), "{s}");
+        }
+        assert!(Status::Done.is_terminal());
+        assert!(Status::Failed.is_terminal());
+    }
+
+    #[test]
+    fn a_rejected_transition_leaves_the_lifecycle_untouched() {
+        let mut lc = Lifecycle::new("t");
+        lc.transition_to(Status::Ready, "", Some(at(1))).unwrap();
+        let before = lc.clone();
+        assert!(lc.transition_to(Status::Done, "", Some(at(2))).is_err());
+        assert!(lc.transition_to(Status::Failed, "x", Some(at(3))).is_err());
+        lc.transition_to(Status::Running, "", Some(at(4))).unwrap();
+        let running = lc.clone();
+        assert!(lc.transition_to(Status::Failed, "", Some(at(5))).is_err());
+        assert_eq!(lc, running);
+        assert_eq!(before.version + 1, running.version);
+    }
+
+    #[test]
+    fn an_edge_without_an_error_keeps_the_current_error() {
+        // Only the retry edge clears the error; a resume from INTERRUPTED
+        // (no retry) or a later error-free edge must not erase it.
+        let mut lc = Lifecycle::new("t");
+        for s in [Status::Ready, Status::Running, Status::Validating] {
+            lc.transition_to(s, "", None).unwrap();
+        }
+        lc.transition_to(Status::Interrupted, "rubric r0 failed", None)
+            .unwrap();
+        assert_eq!(lc.error, "rubric r0 failed");
+        lc.transition_to(Status::Ready, "", None).unwrap();
+        assert_eq!(lc.error, "rubric r0 failed");
+        assert_eq!(lc.retries, 0);
+        lc.transition_to(Status::Running, "", None).unwrap();
+        assert_eq!(lc.error, "rubric r0 failed");
+    }
+
+    #[test]
+    fn replace_from_copies_every_mutable_field() {
+        let mut live = Lifecycle::new("t").with_run_id("r1");
+        let mut persisted = Lifecycle::new("t").with_run_id("r1");
+        persisted.status = Status::AwaitingApproval;
+        persisted.version = 7;
+        persisted.retries = 1;
+        persisted.error = "e".into();
+        persisted.timestamps.insert(Status::Ready, at(5));
+        persisted.blocked_requires_json = Some("[]".into());
+        persisted.awaiting_manual_ordinal = Some(2);
+        persisted.agent_output = "out".into();
+        persisted.session_id = "sess".into();
+        persisted.artifacts_dir = "/a".into();
+        persisted.worker_id = "w".into();
+        live.replace_from(&persisted);
+        assert_eq!(live, persisted);
+    }
+
+    #[test]
+    fn only_retry_source_statuses_are_retry_eligible() {
+        for s in Status::ALL {
+            let mut lc = Lifecycle::new("t");
+            lc.status = s;
+            assert_eq!(lc.is_retry_eligible(3), s.is_retry_source(), "{s}");
+        }
+    }
+
+    #[test]
     fn status_strings_round_trip() {
         for s in Status::ALL {
             assert_eq!(s.as_str().parse::<Status>().unwrap(), s);

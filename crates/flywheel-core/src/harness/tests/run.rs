@@ -2180,3 +2180,159 @@ async fn wall_clock_elapsed_uses_the_injected_clock() {
             .starts_with("budget ceiling breached: wall_clock_seconds")
     );
 }
+
+// --- Attempt routing pins (mutation survey, iteration 53) -----------------
+
+#[tokio::test]
+async fn abort_with_an_empty_reason_fails_with_the_default_reason() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-abort-empty");
+    let (invoke, _) = scripted_invoker(vec![iteration(
+        valid_reason(Intent::Abort, ""),
+        vec![assistant()],
+    )]);
+    let outcome = h
+        .run(&task, &mut lc, &HarnessConfig::default(), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(outcome.lifecycle.error, "agent reported abort intent");
+    assert_eq!(outcome.attempts[0].error, "agent reported abort intent");
+}
+
+#[tokio::test]
+async fn blocked_with_an_empty_reason_records_the_default_reason() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-blocked-empty");
+    let envelope = EnvelopeResult::Valid(ValidEnvelope {
+        intent: Intent::Blocked,
+        reason: Some(String::new()),
+        requires: vec![BlockedRequirement::EnvVarSet {
+            name: "MISSING_KEY".into(),
+        }],
+    });
+    let (invoke, _) = scripted_invoker(vec![iteration(envelope, vec![assistant()])]);
+    let outcome = h
+        .run(&task, &mut lc, &HarnessConfig::default(), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Interrupted);
+    assert_eq!(outcome.attempts[0].error, "agent reported blocked intent");
+    let blocked = h.sink.of_kind("run-blocked-empty", "harness.blocked");
+    assert_eq!(
+        blocked[0].payload["reason"],
+        "agent reported blocked intent"
+    );
+}
+
+#[tokio::test]
+async fn invalid_blocked_requires_is_a_retryable_validation_failure() {
+    let h = Harness::new();
+    let task = task(vec![command("true", Some("other"))]);
+    let mut lc = lifecycle("run-bad-blocked-retry");
+    let envelope = EnvelopeResult::Valid(ValidEnvelope {
+        intent: Intent::Blocked,
+        reason: Some("need help".into()),
+        requires: vec![BlockedRequirement::CommandGrader {
+            name: "not-on-task".into(),
+        }],
+    });
+    let (invoke, _) = scripted_invoker(vec![
+        iteration(envelope, vec![assistant()]),
+        verify_iteration(),
+    ]);
+    let config = HarnessConfig {
+        max_retries: 1,
+        ..HarnessConfig::default()
+    };
+    let outcome = h.run(&task, &mut lc, &config, invoke).await;
+    assert_eq!(outcome.lifecycle.status, Status::Done);
+    assert_eq!(outcome.lifecycle.retries, 1);
+    let timestamps = &outcome.lifecycle.timestamps;
+    assert!(timestamps.contains_key(&Status::FailedValidation));
+    assert!(!timestamps.contains_key(&Status::InternalError));
+}
+
+#[tokio::test]
+async fn a_crash_wins_over_a_valid_verify_envelope() {
+    // The agent's verify claim is untrusted: a crashed invocation never
+    // reaches the graders, whatever envelope it carried.
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-crash-verify");
+    let mut result = verify_iteration();
+    result.failure = Some(failure("ProcessError", "cli exited 137"));
+    let (invoke, _) = scripted_invoker(vec![result]);
+    let outcome = h
+        .run(&task, &mut lc, &HarnessConfig::default(), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert_eq!(outcome.attempts[0].outcome, Some(Outcome::InternalError));
+    let timestamps = &outcome.lifecycle.timestamps;
+    assert!(timestamps.contains_key(&Status::InternalError));
+    assert!(!timestamps.contains_key(&Status::Validating));
+    assert!(
+        h.store
+            .list_grader_results("run-crash-verify", 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(h.sink.of_kind("run-crash-verify", "harness.crash").len(), 1);
+}
+
+#[tokio::test]
+async fn transient_exhaustion_walks_through_the_retryable_internal_error() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-rl-internal");
+    let (invoke, _) = scripted_invoker(vec![rate_limited_iteration(Some(429), false)]);
+    let config = HarnessConfig {
+        max_retries: 0,
+        max_transient_retries: 0,
+        transient_sleep: Some(no_sleep()),
+        ..HarnessConfig::default()
+    };
+    let outcome = h.run(&task, &mut lc, &config, invoke).await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert!(
+        outcome
+            .lifecycle
+            .timestamps
+            .contains_key(&Status::InternalError)
+    );
+}
+
+#[tokio::test]
+async fn zero_iteration_cap_walks_through_failed_validation() {
+    let h = Harness::new();
+    let task = task(vec![ok_command()]);
+    let mut lc = lifecycle("run-cap-zero-walk");
+    let (invoke, _) = scripted_invoker(vec![]);
+    let config = HarnessConfig {
+        max_iterations_per_attempt: 0,
+        ..HarnessConfig::default()
+    };
+    let outcome = h.run(&task, &mut lc, &config, invoke).await;
+    let timestamps = &outcome.lifecycle.timestamps;
+    assert!(timestamps.contains_key(&Status::FailedValidation));
+    assert!(!timestamps.contains_key(&Status::InternalError));
+}
+
+#[tokio::test]
+async fn one_failing_command_grader_fails_the_attempt() {
+    let h = Harness::new();
+    let task = task(vec![
+        command("true", Some("a")),
+        command("false", Some("b")),
+        command("true", Some("c")),
+    ]);
+    let mut lc = lifecycle("run-one-fails");
+    let (invoke, _) = scripted_invoker(vec![verify_iteration()]);
+    let outcome = h
+        .run(&task, &mut lc, &HarnessConfig::default(), invoke)
+        .await;
+    assert_eq!(outcome.lifecycle.status, Status::Failed);
+    assert!(!outcome.lifecycle.timestamps.contains_key(&Status::Done));
+    assert_eq!(outcome.attempts[0].outcome, Some(Outcome::ValidationFailed));
+    assert_eq!(outcome.attempts[0].error, "command grader \"b\" failed");
+}

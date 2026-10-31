@@ -1296,6 +1296,57 @@ mod tests {
         assert_eq!(subs, ["image", "network", "network", "run", "stop", "rm"]);
     }
 
+    // --- config reaches the run, failed-start cleanup is bounded ------------------
+
+    #[test]
+    fn configured_uid_gid_and_cpus_reach_docker_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        let mut cfg = config();
+        cfg.container_uid = Some(host_uid() + 4242);
+        cfg.container_gid = Some(host_gid() + 4343);
+        cfg.cpus = Some(1.5);
+        let h = harness(dir.path(), inner, cfg, HAPPY_BODY);
+        h.strategy.prepare_sandbox(&request("t")).unwrap();
+        let run = run_call(&h.log);
+        assert_eq!(
+            flag_values(&run, "--user"),
+            vec![format!("{}:{}", host_uid() + 4242, host_gid() + 4343)]
+        );
+        assert_eq!(flag_values(&run, "--cpus"), vec!["1.5"]);
+    }
+
+    #[test]
+    fn every_character_docker_rejects_in_a_name_is_mapped() {
+        let name = new_container_name("fix:bug @home+1\u{e9}");
+        assert!(is_valid_docker_name(&name), "invalid docker name {name:?}");
+        assert!(name.starts_with("flywheel-fix_bug__home_1_-"), "{name}");
+    }
+
+    #[test]
+    fn failed_start_cleanup_honors_the_management_ceiling() {
+        // A failed `docker run` whose cleanup `rm -f` hangs must not wedge
+        // prepare (the worker holds its lease); the timeout is logged.
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        let body = r#"case "$1" in run) exit 125 ;; rm) exec sleep 30 ;; esac"#;
+        let mut cfg = config();
+        cfg.management_timeout = Some(Duration::from_millis(200));
+        let h = harness(dir.path(), inner, cfg, body);
+        let started = Instant::now();
+        h.strategy.prepare_sandbox(&request("t")).unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        let lines = h.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(
+                "could not be removed after a failed start (docker rm timed out after 0.2s)"
+            ),
+            "{lines:?}"
+        );
+        assert!(h.registry.active_names().is_empty());
+    }
+
     // --- live: the whole seam against the daemon -------------------------------------
 
     /// A builder whose invoke runs `sh -c script` through the execution host

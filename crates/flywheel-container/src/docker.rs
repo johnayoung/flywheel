@@ -2332,6 +2332,318 @@ mod tests {
         assert!(!active_container_names().contains("global-probe"));
     }
 
+    // --- leak and liveness guards (mutation survey, iteration 61) --------------
+
+    /// A scripted body that records `ls -l` of every `--env-file` it is
+    /// handed into `out`, then answers `run` with `run_tail`.
+    fn env_file_mode_body(out: &Path, run_tail: &str) -> String {
+        format!(
+            "prev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '--env-file' ]; then \
+             ls -l \"$arg\" | cut -c1-10 > '{}'; fi\n  prev=\"$arg\"\ndone\n\
+             case \"$1\" in run) {run_tail} ;; esac",
+            out.display()
+        )
+    }
+
+    #[test]
+    fn start_container_env_file_is_readable_by_its_owner_only() {
+        // The env file carries the agent credentials; a group- or
+        // world-readable file would hand them to every local user for as
+        // long as `docker run` takes.
+        let dir = tempfile::tempdir().unwrap();
+        let mode = dir.path().join("mode");
+        let (docker, _) = scripted_docker(dir.path(), &env_file_mode_body(&mode, "echo cid-1"));
+        let mut spec = RunSpec::new("flywheel-task-mode", "img");
+        spec.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-x".into());
+        docker.start_container(&spec, FAST).unwrap();
+        assert_eq!(std::fs::read_to_string(&mode).unwrap().trim(), "-rw-------");
+    }
+
+    #[test]
+    fn start_container_removes_the_env_file_when_docker_run_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = dir.path().join("mode");
+        let (docker, log) = scripted_docker(
+            dir.path(),
+            &env_file_mode_body(&mode, "echo 'no such image' >&2; exit 125"),
+        );
+        let mut spec = RunSpec::new("flywheel-task-fail", "img");
+        spec.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-x".into());
+        let err = docker.start_container(&spec, FAST).unwrap_err();
+        assert!(
+            matches!(err, DockerError::Failed { exit_code: 125, .. }),
+            "{err:?}"
+        );
+        let calls = recorded_calls(&log);
+        let file = flag_values_of(&calls[0], "--env-file");
+        assert_eq!(file.len(), 1, "{:?}", calls[0]);
+        assert!(mode.exists(), "the client saw the env file");
+        assert!(
+            !Path::new(file[0]).exists(),
+            "the env file outlived a failed docker run"
+        );
+    }
+
+    #[test]
+    fn start_container_without_env_passes_no_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) = scripted_docker(dir.path(), HAPPY_BODY);
+        docker
+            .start_container(&RunSpec::new("flywheel-task-noenv", "img"), FAST)
+            .unwrap();
+        let calls = recorded_calls(&log);
+        assert!(
+            flag_values_of(&calls[0], "--env-file").is_empty(),
+            "{:?}",
+            calls[0]
+        );
+    }
+
+    #[test]
+    fn owner_labels_carry_the_start_time_and_namespace_when_observable() {
+        // The start time is what tells a recycled pid from the live owner;
+        // without it the reap cannot tell them apart.
+        let me = OwnerIdentity::current();
+        let labels = me.labels();
+        assert_eq!(labels.get(OWNER_START_LABEL), me.start.as_ref());
+        assert_eq!(labels.get(OWNER_PIDNS_LABEL), me.pid_namespace.as_ref());
+        let identity = OwnerIdentity {
+            host: "h".into(),
+            pid: 7,
+            start: Some("1234".into()),
+            pid_namespace: Some("pid:[1]".into()),
+        };
+        assert_eq!(
+            identity.labels(),
+            BTreeMap::from([
+                (OWNER_HOST_LABEL.to_owned(), "h".to_owned()),
+                (OWNER_PID_LABEL.to_owned(), "7".to_owned()),
+                (OWNER_START_LABEL.to_owned(), "1234".to_owned()),
+                (OWNER_PIDNS_LABEL.to_owned(), "pid:[1]".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn process_start_time_reads_past_a_parenthesised_command_name() {
+        use std::os::unix::process::CommandExt;
+        // The command name in /proc/<pid>/stat may itself contain `)` and
+        // spaces; misparsing it would read a time-varying field, so a live
+        // owner's recorded start would stop matching and its container be
+        // reaped.
+        if !Path::new("/proc/self/stat").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tricky = dir.path().join("x) 1 2 3 4 5 6");
+        std::os::unix::fs::symlink("/bin/sleep", &tricky).unwrap();
+        let mut plain = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut paren = std::process::Command::new(&tricky)
+            .arg0("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Wait until the exec has replaced the forked image's command name.
+        let deadline = Instant::now() + WALL_BUDGET;
+        while !std::fs::read_to_string(format!("/proc/{}/stat", paren.id()))
+            .unwrap_or_default()
+            .contains("(x) 1 2 3 4 5 6)")
+        {
+            assert!(Instant::now() < deadline, "exec never took effect");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let ticks = |pid: u32| -> u64 { process_start_time(pid).unwrap().parse().unwrap() };
+        let mine = ticks(std::process::id());
+        let plain_start = ticks(plain.id());
+        let paren_start = ticks(paren.id());
+        let _ = plain.kill();
+        let _ = paren.kill();
+        let _ = plain.wait();
+        let _ = paren.wait();
+        assert!(mine <= plain_start, "{mine} > {plain_start}");
+        assert!(plain_start <= paren_start, "{plain_start} > {paren_start}");
+    }
+
+    #[test]
+    fn pid_alive_counts_a_process_it_may_not_signal_and_never_pid_zero() {
+        // pid 1 always exists; for an unprivileged caller kill(1, 0) is
+        // EPERM, which still proves it is alive. Treating EPERM as dead would
+        // reap the container of a live owner running as another user.
+        assert!(pid_alive(1));
+        // kill(0, 0) probes the caller's own process group; it is no owner.
+        assert!(!pid_alive(0));
+        assert!(!pid_alive(u32::MAX));
+    }
+
+    #[test]
+    fn owner_liveness_keeps_partial_identities_and_unreadable_start_times() {
+        let container = |host: &str, pid: &str, start: &str, ns: &str| OwnedContainer {
+            name: "c".to_owned(),
+            owner_host: host.to_owned(),
+            owner_pid: pid.to_owned(),
+            owner_start: start.to_owned(),
+            owner_pid_namespace: ns.to_owned(),
+        };
+        let alive = |pid: u32| pid == 42;
+        let unreadable = |_pid: u32| None;
+        // Only a container with no host AND no pid is legacy.
+        assert!(!container("", "7", "", "").owner_is_dead("h", "", &alive, &unreadable));
+        assert!(!container("h", "", "", "ns").owner_is_dead("h", "ns", &alive, &unreadable));
+        // A live pid whose start time cannot be read is not proof of death.
+        assert!(!container("h", "42", "1000", "ns").owner_is_dead("h", "ns", &alive, &unreadable));
+    }
+
+    #[test]
+    fn is_timeout_covers_both_timeout_shapes_only() {
+        assert!(
+            DockerError::ExecTimeout {
+                timeout: Duration::from_secs(1)
+            }
+            .is_timeout()
+        );
+        assert!(
+            DockerError::Timeout {
+                subcommand: "rm".into(),
+                timeout: Duration::from_secs(1)
+            }
+            .is_timeout()
+        );
+        assert!(
+            !DockerError::Failed {
+                subcommand: "rm".into(),
+                exit_code: 1,
+                detail: String::new()
+            }
+            .is_timeout()
+        );
+    }
+
+    #[test]
+    fn ensure_internal_network_surfaces_a_failed_create() {
+        // A deny policy must never proceed as if its isolated network existed.
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) = scripted_docker(
+            dir.path(),
+            r#"case "$1 $2" in
+  "network inspect") exit 1 ;;
+  "network create") echo 'permission denied' >&2; exit 1 ;;
+esac"#,
+        );
+        let err = docker
+            .ensure_internal_network("flywheel-internal", FAST)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("docker network failed (exit 1): permission denied"),
+            "{err}"
+        );
+        assert_eq!(
+            recorded_calls(&log)[1],
+            sv(&["network", "create", "--internal", "flywheel-internal"])
+        );
+    }
+
+    #[test]
+    fn remove_container_propagates_a_rm_timeout() {
+        // A stopped container whose `docker rm` hung is still on the daemon;
+        // reporting success would drop it from the exit-time registry.
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) =
+            scripted_docker(dir.path(), r#"case "$1" in rm) exec sleep 30 ;; esac"#);
+        let started = Instant::now();
+        let err = docker.remove_container("box", TINY).unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert!(err.is_timeout());
+        assert!(err.to_string().starts_with("docker rm timed out"), "{err}");
+        assert_eq!(
+            recorded_calls(&log),
+            vec![sv(&["stop", "box"]), sv(&["rm", "box"])]
+        );
+    }
+
+    #[test]
+    fn reap_propagates_a_force_remove_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let listing_file = dir.path().join("ps.out");
+        std::fs::write(&listing_file, "reap-legacy\t\t\t\t\n").unwrap();
+        let body = format!(
+            r#"case "$1" in ps) cat '{}' ;; rm) exec sleep 30 ;; esac"#,
+            listing_file.display()
+        );
+        let (docker, log) = scripted_docker(dir.path(), &body);
+        let started = Instant::now();
+        let err = docker
+            .reap_orphan_containers(&BTreeSet::new(), TINY)
+            .unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert!(err.is_timeout(), "{err}");
+        assert_eq!(recorded_calls(&log)[1], sv(&["rm", "-f", "reap-legacy"]));
+    }
+
+    /// Set (to a log path) only in the child process
+    /// [`global_registry_is_flushed_at_process_exit`] re-executes.
+    const EXIT_FLUSH_CHILD_ENV: &str = "FLYWHEEL_TEST_EXIT_FLUSH_LOG";
+
+    #[test]
+    fn exit_flush_child_registers_a_container() {
+        // In the re-executed child: register on the global registry and
+        // return; the process exit must force-remove it. A no-op in the
+        // ordinary test run.
+        if std::env::var_os(EXIT_FLUSH_CHILD_ENV).is_some() {
+            register_container_cleanup("exit-flush-probe", FAST);
+        }
+    }
+
+    #[test]
+    fn global_registry_is_flushed_at_process_exit() {
+        // A container still registered when the process exits (a run that
+        // never reached its teardown) is force-removed by the exit hook.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = dir.path().join("docker.log");
+        let script = bin.join("docker");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &script,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "docker::tests::exit_flush_child_registers_a_container",
+                "--test-threads=1",
+            ])
+            .env(EXIT_FLUSH_CHILD_ENV, &log)
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "rm -f exit-flush-probe\n"
+        );
+    }
+
     // --- live daemon -------------------------------------------------------------
 
     struct LiveContainer {

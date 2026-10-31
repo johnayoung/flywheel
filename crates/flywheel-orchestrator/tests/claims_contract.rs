@@ -1206,6 +1206,137 @@ fn source_syncs_open_running_and_settle_ok_or_error() {
     });
 }
 
+// --- The (version, worker_id) token, re-acquired keys, lease arithmetic ----------------------
+
+/// Versions restart at 1 once a row is released or reaped, so the version
+/// alone does not identify a lease: a slow worker's stale token can carry the
+/// same version as the claim another worker now holds. Only the worker half
+/// of the token tells them apart; renew and release must both honour it or
+/// the stale holder silently takes over (or frees) the new holder's lease.
+#[test]
+fn a_recycled_version_never_lets_a_stale_holder_renew_or_release_the_new_claim() {
+    each(|store| {
+        let stale = store
+            .acquire_claim("task-a", "worker-1", t(0), 30.0, &none())
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.sweep_expired_claims(t(30)).unwrap(), vec!["task-a"]);
+        let current = store
+            .acquire_claim("task-a", "worker-2", t(31), 30.0, &none())
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, stale.version, "row was recreated at v1");
+
+        let err = store.renew_claim(&stale, t(32), 30.0).err().unwrap();
+        assert!(err.is_claim_lost(), "stale renew must be lost, got {err:?}");
+        store.release_claim(&stale, Some(t(33))).unwrap();
+
+        assert_eq!(store.load_claim("task-a").unwrap(), Some(current));
+        assert_eq!(
+            types(store, "task-a"),
+            vec![EVENT_ACQUIRED, EVENT_EXPIRED, EVENT_ACQUIRED]
+        );
+        store
+            .record_prepare_skip(&stale, "stale holder dead-end", t(34))
+            .unwrap();
+        assert_eq!(
+            store.load_claim("task-a").unwrap().unwrap().worker_id,
+            "worker-2"
+        );
+    });
+}
+
+/// A steal or re-acquire replaces the row's conflict keys with the incoming
+/// set: the old keys stop blocking and the new ones start.
+#[test]
+fn reacquiring_a_task_replaces_its_conflict_keys() {
+    each(|store| {
+        store
+            .acquire_claim("task-a", "worker-1", t(0), 30.0, &conflict_keys(["old"]))
+            .unwrap()
+            .unwrap();
+        store
+            .acquire_claim("task-a", "worker-2", t(31), 30.0, &conflict_keys(["new"]))
+            .unwrap()
+            .expect("lapsed lease is stolen");
+        let freed = store
+            .acquire_claim("task-b", "worker-3", t(32), 30.0, &conflict_keys(["old"]))
+            .unwrap();
+        assert!(freed.is_some(), "the stolen row no longer holds 'old'");
+        let blocked = store
+            .acquire_claim("task-c", "worker-4", t(32), 30.0, &conflict_keys(["new"]))
+            .unwrap();
+        assert!(blocked.is_none(), "the stolen row now holds 'new'");
+
+        // A same-worker re-acquire replaces them too.
+        store
+            .acquire_claim("task-a", "worker-2", t(33), 30.0, &conflict_keys(["newer"]))
+            .unwrap()
+            .unwrap();
+        let unblocked = store
+            .acquire_claim("task-c", "worker-4", t(34), 30.0, &conflict_keys(["new"]))
+            .unwrap();
+        assert!(unblocked.is_some(), "'new' was replaced by 'newer'");
+    });
+}
+
+/// Lease seconds convert to whole microseconds by rounding, not truncation:
+/// `1.005 * 1e6` is `1004999.999...` in binary floating point.
+#[test]
+fn fractional_lease_seconds_round_to_the_nearest_microsecond() {
+    each(|store| {
+        let claim = store
+            .acquire_claim("task-a", "worker-1", t(0), 1.005, &none())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            claim.lease_expires_at,
+            t(0) + Duration::microseconds(1_005_000)
+        );
+        assert_eq!(
+            store
+                .load_claim("task-a")
+                .unwrap()
+                .unwrap()
+                .lease_expires_at,
+            claim.lease_expires_at
+        );
+        let renewed = store.renew_claim(&claim, t(1), 1.005).unwrap();
+        assert_eq!(
+            renewed.lease_expires_at,
+            t(1) + Duration::microseconds(1_005_000)
+        );
+    });
+}
+
+/// A NaN lease is refused before anything is written, on acquire and renew.
+#[test]
+fn a_nan_lease_is_refused_without_writing_anything() {
+    each(|store| {
+        let err = store
+            .acquire_claim("task-a", "worker-1", t(0), f64::NAN, &none())
+            .expect_err("NaN lease refused");
+        assert!(
+            matches!(err, ClaimStoreError::LeaseOutOfRange { .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.load_claim("task-a").unwrap(), None);
+        assert!(store.list_events().unwrap().is_empty());
+
+        let claim = store
+            .acquire_claim("task-a", "worker-1", t(0), 30.0, &none())
+            .unwrap()
+            .unwrap();
+        let err = store.renew_claim(&claim, t(5), f64::NAN).err().unwrap();
+        assert!(
+            matches!(err, ClaimStoreError::LeaseOutOfRange { .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.load_claim("task-a").unwrap(), Some(claim));
+        assert_eq!(types(store, "task-a"), vec![EVENT_ACQUIRED]);
+    });
+}
+
 // --- SQLite-only: concurrency, persistence, migration ----------------------------------------
 
 #[test]
@@ -1248,6 +1379,41 @@ fn concurrent_acquire_on_one_file_admits_exactly_one_winner() {
     assert_eq!(store.list_task_events("task-hot").unwrap().len(), 1);
     assert_eq!(store.list_events().unwrap().len(), 2);
     assert_eq!(store.list_claims().unwrap().len(), 2);
+}
+
+/// A transition whose ledger write fails rolls back its claim write too: the
+/// row never outlives the failed transition. A trigger in the same file makes
+/// the ledger insert abort after the claim row was written.
+#[test]
+fn a_failed_ledger_write_rolls_back_the_claim_it_journals() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claims.db");
+    let store = SqliteClaimStore::open(&path).unwrap();
+    let held = store
+        .acquire_claim("task-held", "worker-1", t(0), 30.0, &none())
+        .unwrap()
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_ledger BEFORE INSERT ON orchestrator_events \
+             BEGIN SELECT RAISE(ABORT, 'ledger refused'); END;",
+        )
+        .unwrap();
+
+    let err = store
+        .acquire_claim("task-a", "worker-1", t(1), 30.0, &none())
+        .expect_err("ledger failure surfaces");
+    assert!(err.to_string().contains("ledger refused"), "{err}");
+    assert_eq!(store.load_claim("task-a").unwrap(), None);
+
+    assert!(store.renew_claim(&held, t(2), 30.0).is_err());
+    assert_eq!(store.load_claim("task-held").unwrap(), Some(held.clone()));
+
+    assert!(store.release_claim(&held, Some(t(3))).is_err());
+    assert!(store.sweep_expired_claims(t(59)).is_err());
+    assert_eq!(store.load_claim("task-held").unwrap(), Some(held));
+    assert_eq!(store.list_events().unwrap().len(), 1);
 }
 
 #[test]

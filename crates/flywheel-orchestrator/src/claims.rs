@@ -2851,4 +2851,20 @@ mod tests {
         assert_eq!(observation.task_content_hash, task_digest(&task));
         assert_eq!(observation.priority, 0);
     }
+
+    fn busy() -> ClaimStoreError {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None)
+            .into()
+    }
+
+    #[test]
+    fn a_locked_error_past_the_busy_timeout_is_retried_until_the_verb_succeeds() {
+        assert!(is_locked(&busy()));
+        let mut calls = 0;
+        let outcome = with_locked_retry(|| {
+            calls += 1;
+            if calls == 1 { Err(busy()) } else { Ok(calls) }
+        });
+        assert_eq!(outcome.unwrap(), 2);
+    }
 }

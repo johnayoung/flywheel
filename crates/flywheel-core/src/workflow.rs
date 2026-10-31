@@ -45,7 +45,8 @@ use crate::harness::{
 };
 use crate::invoker_client::{
     CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_REJECT,
-    CONTROL_COMMAND_SAY, CONTROL_COMMAND_SET_MODEL, ControlPlane, ProgressProbe,
+    CONTROL_COMMAND_SAY, CONTROL_COMMAND_SET_MODEL, ControlPlane, GateDecisionError, ProgressProbe,
+    enqueue_gate_decision,
 };
 use crate::lifecycle::{Lifecycle, Status};
 use crate::loaders::{TaskLoadError, load_task_file};
@@ -1376,9 +1377,10 @@ pub async fn run_task_file(
 ///
 /// `store` injects the backend the command lands in; `None` opens the
 /// [`SqliteStore`] at `db_path` (creating its parent directory) and closes
-/// it on exit. `approve` / `reject` target a parked `awaiting_approval`
-/// lifecycle, so the in-flight check accepts that status for those verbs
-/// and the standard `running` / `validating` set for everything else.
+/// it on exit. `approve` / `reject` go through
+/// [`enqueue_gate_decision`]: bound to the gate parked right now, and refused
+/// with exit `1` (nothing enqueued) when the run has no parked gate. Every
+/// other verb uses the standard `running` / `validating` in-flight note.
 pub fn enqueue_control_command(
     db_path: &Path,
     run_id: &str,
@@ -1416,19 +1418,20 @@ fn enqueue_control_command_inner(
             store
         }
     };
-    let outcome = (|| -> Result<Option<(Lifecycle, bool, Option<i64>)>, StoreError> {
-        let Some(lifecycle) = backend.load_lifecycle(run_id)? else {
-            return Ok(None);
-        };
-        let in_flight_statuses: &[Status] =
-            if kind == CONTROL_COMMAND_APPROVE || kind == CONTROL_COMMAND_REJECT {
-                &[Status::AwaitingApproval]
-            } else {
-                &[Status::Running, Status::Validating]
-            };
-        let in_flight = in_flight_statuses.contains(&lifecycle.status);
+    let gate_decision = kind == CONTROL_COMMAND_APPROVE || kind == CONTROL_COMMAND_REJECT;
+    let outcome = (|| -> Result<(Status, Option<i64>), GateDecisionError> {
+        if gate_decision {
+            // approve/reject bind to the gate parked right now; a run with no
+            // parked gate refuses rather than queueing a decision ahead of it.
+            let (record, _) =
+                enqueue_gate_decision(backend.as_ref(), run_id, kind, payload, Utc::now())?;
+            return Ok((Status::AwaitingApproval, record.id));
+        }
+        let lifecycle = backend
+            .load_lifecycle(run_id)?
+            .ok_or_else(|| GateDecisionError::UnknownRun(run_id.to_owned()))?;
         let record = backend.enqueue_command(run_id, kind, payload, Utc::now())?;
-        Ok(Some((lifecycle, in_flight, record.id)))
+        Ok((lifecycle.status, record.id))
     })();
     drop(backend);
     if let Some(store) = owned
@@ -1436,17 +1439,25 @@ fn enqueue_control_command_inner(
     {
         store.close()?;
     }
-    let Some((lifecycle, in_flight, id)) = outcome? else {
-        eprintln!("error: run {run_id:?} is unknown to this store; no command enqueued");
-        return Ok(2);
+    let (status, id) = match outcome {
+        Ok(enqueued) => enqueued,
+        Err(GateDecisionError::UnknownRun(_)) => {
+            eprintln!("error: run {run_id:?} is unknown to this store; no command enqueued");
+            return Ok(2);
+        }
+        Err(err @ GateDecisionError::NotParked { .. }) => {
+            eprintln!("error: {err}");
+            return Ok(1);
+        }
+        Err(GateDecisionError::Store(err)) => return Err(err.into()),
     };
     let id = id.map_or_else(|| "None".to_owned(), |id| id.to_string());
     println!("enqueued #{id} kind={kind} run_id={run_id}");
-    if !in_flight {
+    if !gate_decision && !matches!(status, Status::Running | Status::Validating) {
         eprintln!(
             "  note: run {run_id} is not in-flight (status={}); the command stays pending \
              and is recorded as stale per claim semantics",
-            lifecycle.status.as_str()
+            status.as_str()
         );
     }
     Ok(0)
@@ -4070,7 +4081,11 @@ mod tests {
         ] {
             parked.transition_to(status, "", Some(now)).unwrap();
         }
+        parked.awaiting_manual_ordinal = Some(1);
         store.create_lifecycle(&parked).unwrap();
+        let mut attempt = Attempt::new(1, now, "run-parked");
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt("run-parked", &attempt, None).unwrap();
         let injected: Arc<dyn RunStore> = store.clone();
         let unused = Path::new("/nonexistent/never-created.sqlite");
 
@@ -4093,12 +4108,12 @@ mod tests {
             (
                 &["approve", "run-parked"],
                 CONTROL_COMMAND_APPROVE,
-                json!({}),
+                json!({"awaiting_ordinal": 1, "attempt_number": 1}),
             ),
             (
                 &["reject", "run-parked", "--feedback", "no"],
                 CONTROL_COMMAND_REJECT,
-                json!({"feedback": "no"}),
+                json!({"feedback": "no", "awaiting_ordinal": 1, "attempt_number": 1}),
             ),
         ];
         for (items, kind, payload) in verbs {
@@ -4118,7 +4133,10 @@ mod tests {
             0
         );
         let claimed = store.claim_commands("run-parked", Utc::now()).unwrap();
-        assert!(claimed.last().unwrap().payload.is_empty());
+        assert_eq!(
+            Value::Object(claimed.last().unwrap().payload.clone()),
+            json!({"awaiting_ordinal": 1, "attempt_number": 1})
+        );
         assert_eq!(
             main_with_store(&argv(&["approve", "run-none"]), Some(injected)),
             2

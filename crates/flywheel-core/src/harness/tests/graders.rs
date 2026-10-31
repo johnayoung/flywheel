@@ -943,6 +943,128 @@ async fn resolver_picks_the_oldest_approve_or_reject_and_ignores_other_kinds() {
     let _ = CONTROL_COMMAND_APPROVE;
 }
 
+fn not_applicable_ids(h: &Harness, run_id: &str) -> Vec<serde_json::Value> {
+    h.sink
+        .of_kind(run_id, crate::invoker_client::EVENT_CONTROL_NOT_APPLICABLE)
+        .into_iter()
+        .map(|r| r.payload["command_id"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_approve_queued_before_the_park_does_not_approve_the_gate() {
+    // The pre-park decision: an `approve` row carrying no gate binding, the
+    // exact row an operator's `approve` enqueued while the run was still
+    // VALIDATING (no watcher drains during command graders). Nobody has
+    // seen this gate yet, so it must not approve it.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let run_id = "run-approve-before-park";
+    let (task, mut lc) = park(&h, &dir, run_id, vec![("confirm", "Confirm.")]).await;
+    let early = h
+        .store
+        .enqueue_command(
+            run_id,
+            CONTROL_COMMAND_APPROVE,
+            Default::default(),
+            Utc::now(),
+        )
+        .unwrap();
+
+    let result = resolve(&h, &mut lc, &task, 0);
+    assert!(!result.applied, "{result:?}");
+    assert_eq!(lc.status, Status::AwaitingApproval);
+    assert_eq!(lc.awaiting_manual_ordinal, Some(2));
+    assert!(manual_rows(&h, run_id, 1).is_empty());
+    assert!(h.sink.of_kind(run_id, "harness.manual_approved").is_empty());
+    assert_eq!(not_applicable_ids(&h, run_id), vec![json!(early.id)]);
+    assert_eq!(
+        h.store.load_lifecycle(run_id).unwrap().unwrap().status,
+        Status::AwaitingApproval
+    );
+}
+
+#[tokio::test]
+async fn an_approve_bound_to_one_gate_does_not_approve_the_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let run_id = "run-approve-stale-gate";
+    let (task, mut lc) = park(
+        &h,
+        &dir,
+        run_id,
+        vec![("review-migration", "x"), ("review-rollout", "y")],
+    )
+    .await;
+    enqueue_approve(h.store.as_ref(), run_id, Utc::now()).unwrap();
+    assert_eq!(resolve(&h, &mut lc, &task, 0).reason, "approved_next_gate");
+    assert_eq!(lc.awaiting_manual_ordinal, Some(3));
+
+    // A second decision issued against the gate the operator saw (ordinal
+    // 2, attempt 1) that only reaches the queue after that gate resolved:
+    // the operator never saw `review-rollout`.
+    let late = h
+        .store
+        .enqueue_command(
+            run_id,
+            CONTROL_COMMAND_APPROVE,
+            json!({"awaiting_ordinal": 2, "attempt_number": 1})
+                .as_object()
+                .unwrap()
+                .clone(),
+            Utc::now(),
+        )
+        .unwrap();
+    let result = resolve(&h, &mut lc, &task, 0);
+    assert!(!result.applied, "{result:?}");
+    assert_eq!(lc.status, Status::AwaitingApproval);
+    assert_eq!(lc.awaiting_manual_ordinal, Some(3));
+    let rows = manual_rows(&h, run_id, 1);
+    assert_eq!(rows.iter().map(|r| r.ordinal).collect::<Vec<_>>(), [2]);
+    assert_eq!(not_applicable_ids(&h, run_id), vec![json!(late.id)]);
+
+    // A decision bound to the gate now parked still applies.
+    enqueue_approve(h.store.as_ref(), run_id, Utc::now()).unwrap();
+    assert_eq!(resolve(&h, &mut lc, &task, 0).reason, "approved_done");
+}
+
+#[tokio::test]
+async fn commands_the_resolver_does_not_apply_are_recorded_not_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::new();
+    let run_id = "run-resolver-leftovers";
+    let (task, mut lc) = park(&h, &dir, run_id, vec![("g", "x")]).await;
+    let say =
+        crate::invoker_client::enqueue_say(h.store.as_ref(), run_id, "hello", Utc::now()).unwrap();
+    let model = crate::invoker_client::enqueue_set_model(
+        h.store.as_ref(),
+        run_id,
+        Some("opus"),
+        Utc::now(),
+    )
+    .unwrap();
+    let approve = enqueue_approve(h.store.as_ref(), run_id, Utc::now()).unwrap();
+    let duplicate = enqueue_approve(h.store.as_ref(), run_id, Utc::now()).unwrap();
+
+    let result = resolve(&h, &mut lc, &task, 0);
+    assert_eq!(result.reason, "approved_done");
+    assert_eq!(result.command_id, approve.id);
+    let not_applicable = h
+        .sink
+        .of_kind(run_id, crate::invoker_client::EVENT_CONTROL_NOT_APPLICABLE);
+    assert_eq!(
+        not_applicable
+            .iter()
+            .map(|r| (r.payload["command_id"].clone(), r.payload["kind"].clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (json!(say.id), json!("say")),
+            (json!(model.id), json!("set_model")),
+            (json!(duplicate.id), json!("approve")),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn retry_after_manual_reject_carries_operator_feedback_into_prompt() {
     let dir = tempfile::tempdir().unwrap();

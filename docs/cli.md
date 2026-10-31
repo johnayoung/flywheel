@@ -64,7 +64,7 @@ Delegated to the orchestrator CLI (`main`, `crates/flywheel-orchestrator/src/wor
 
 ## Steering verbs
 
-Delegated to the core CLI (`crates/flywheel-core/src/workflow.rs`). Each enqueues exactly one row into the `control_commands` table keyed by `run_id` (`enqueue_control_command`): it validates the run exists, prints `enqueued #<id> kind=<k> run_id=<id>`, and warns when the run is not in-flight.
+Delegated to the core CLI (`crates/flywheel-core/src/workflow.rs`). Each enqueues exactly one row into the `control_commands` table keyed by `run_id` (`enqueue_control_command`): it validates the run exists, prints `enqueued #<id> kind=<k> run_id=<id>`, and warns when the run is not in-flight. `approve` / `reject` instead bind to the gate parked right now (payload `awaiting_ordinal` + `attempt_number`) and refuse with exit 1, enqueuing nothing, when the run has no parked gate; the resolver applies a decision only to the exact park it was bound to, and records every other claimed row (stale or unbound decisions, duplicates, `say`/`set_model` sent while parked) as `harness.control_command_not_applicable` with a `reason`.
 
 **Agent claims are untrusted; the harness owns every lifecycle transition.** These verbs are permitted only in the matching lifecycle state — the store records the command, the harness applies it. See [task-lifecycle.md](task-lifecycle.md).
 
@@ -72,7 +72,7 @@ Delegated to the core CLI (`crates/flywheel-core/src/workflow.rs`). Each enqueue
 |---|---|---|---|
 | `say RUN_ID MSG` | Inject one operator message as a user turn into the live session. The task definition is not mutated. Empty message exits 2. | RUNNING / VALIDATING | positional `run_id`, `message`; `--db` |
 | `interrupt RUN_ID` | Drive the live run to INTERRUPTED via in-band finalization; records `harness.control_command_applied`. | RUNNING / VALIDATING | positional `run_id`; `--db` |
-| `approve RUN_ID` | Approve a parked manual gate: writes a `passed=True` manual receipt, then re-parks on the next gate or transitions to DONE. | AWAITING_APPROVAL | positional `run_id`; `--db` |
+| `approve RUN_ID` | Approve the manual gate parked now: writes a `passed=True` manual receipt, then re-parks on the next gate (which needs its own `approve`) or transitions to DONE. | AWAITING_APPROVAL | positional `run_id`; `--db` |
 | `reject RUN_ID` | Reject a parked manual gate: writes a `passed=False` receipt, transitions to FAILED_VALIDATION. `--feedback` flows into the next attempt's reviewer-feedback section (absent renders `(no feedback provided)`). | AWAITING_APPROVAL | positional `run_id`; `--feedback TEXT`; `--db` |
 
 The shell's `say` is a surface rename of core's `steer` verb; the underlying core CLI is unchanged. Core's `set-model` verb exists but is not a product verb; it is reachable only as the hidden `flywheel workflow set-model`.

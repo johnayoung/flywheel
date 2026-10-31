@@ -34,6 +34,9 @@ use chrono::Utc;
 use clap::Parser;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use flywheel_core::audit::run_file_path;
+use flywheel_core::invoker_client::{
+    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, enqueue_gate_decision,
+};
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, JsonObject};
 use flywheel_core::store_sqlite::SqliteStore;
@@ -670,6 +673,30 @@ pub fn store_registries() -> StoreRegistries {
     registries
 }
 
+/// Enqueue one console-submitted control command. `approve` / `reject` go
+/// through [`enqueue_gate_decision`] so the decision binds to the gate parked
+/// at submit time (and refuses when none is); every other verb is enqueued
+/// as-is.
+fn enqueue_operator_command(
+    store: &dyn HarnessStore,
+    run_id: &str,
+    kind: &str,
+    payload: JsonObject,
+) -> Result<i64, String> {
+    let record = if kind == CONTROL_COMMAND_APPROVE || kind == CONTROL_COMMAND_REJECT {
+        enqueue_gate_decision(store, run_id, kind, payload, Utc::now())
+            .map(|(record, _)| record)
+            .map_err(|err| err.to_string())?
+    } else {
+        store
+            .enqueue_command(run_id, kind, payload, Utc::now())
+            .map_err(|err| err.to_string())?
+    };
+    record
+        .id
+        .ok_or_else(|| "store returned a command without an id".to_owned())
+}
+
 /// Open the core + claim stores the policy selects at `db_path`.
 pub fn open_store_bundle(
     policy: Option<&WorkPolicy>,
@@ -857,12 +884,7 @@ pub fn build_dashboard(
 
     let enqueue_store = Arc::clone(&store);
     let enqueue = move |run_id: &str, kind: &str, payload: JsonObject| -> Result<i64, String> {
-        let record = enqueue_store
-            .enqueue_command(run_id, kind, payload, Utc::now())
-            .map_err(|err| err.to_string())?;
-        record
-            .id
-            .ok_or_else(|| "store returned a command without an id".to_owned())
+        enqueue_operator_command(enqueue_store.as_ref(), run_id, kind, payload)
     };
 
     let landing_base = policy
@@ -936,12 +958,7 @@ pub fn build_dashboard(
         let enqueue_store = Arc::clone(&session_store);
         let enqueue_run = run_id.to_owned();
         let enqueue = move |kind: &str, payload: JsonObject| -> Result<i64, String> {
-            let record = enqueue_store
-                .enqueue_command(&enqueue_run, kind, payload, Utc::now())
-                .map_err(|err| err.to_string())?;
-            record
-                .id
-                .ok_or_else(|| "store returned a command without an id".to_owned())
+            enqueue_operator_command(enqueue_store.as_ref(), &enqueue_run, kind, payload)
         };
         let archive = Arc::clone(&archive_for_sessions);
         let archive_action = move || -> Result<Vec<String>, String> {
@@ -1153,6 +1170,52 @@ mod tests {
             model: model.map(str::to_owned),
             ..WorkPolicy::default()
         }
+    }
+
+    #[test]
+    fn console_gate_decisions_bind_to_the_parked_gate_and_refuse_without_one() {
+        use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome};
+        use flywheel_core::store::{AttemptStore, ControlCommandStore};
+        use flywheel_core::store_memory::InMemoryStore;
+        let store = InMemoryStore::new();
+        let now = Utc::now();
+        let mut running = Lifecycle::new("t").with_run_id("run-live");
+        running.transition_to(Status::Ready, "", Some(now)).unwrap();
+        running
+            .transition_to(Status::Running, "", Some(now))
+            .unwrap();
+        store.create_lifecycle(&running).unwrap();
+        let mut parked = running.clone().with_run_id("run-parked");
+        parked
+            .transition_to(Status::Validating, "", Some(now))
+            .unwrap();
+        parked
+            .transition_to(Status::AwaitingApproval, "", Some(now))
+            .unwrap();
+        parked.awaiting_manual_ordinal = Some(4);
+        store.create_lifecycle(&parked).unwrap();
+        let mut attempt = Attempt::new(1, now, "run-parked");
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt("run-parked", &attempt, None).unwrap();
+
+        let err =
+            enqueue_operator_command(&store, "run-live", "approve", JsonObject::new()).unwrap_err();
+        assert!(err.contains("status=running"), "{err}");
+        let say = serde_json::json!({"text": "hi"})
+            .as_object()
+            .unwrap()
+            .clone();
+        enqueue_operator_command(&store, "run-live", "say", say.clone()).unwrap();
+        let live = store.claim_commands("run-live", now).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].payload, say);
+
+        enqueue_operator_command(&store, "run-parked", "approve", JsonObject::new()).unwrap();
+        let parked_rows = store.claim_commands("run-parked", now).unwrap();
+        assert_eq!(
+            serde_json::Value::Object(parked_rows[0].payload.clone()),
+            serde_json::json!({"awaiting_ordinal": 4, "attempt_number": 1})
+        );
     }
 
     #[test]

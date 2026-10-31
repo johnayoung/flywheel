@@ -16,7 +16,7 @@ use crate::grader_manual::{
     ManualGate, build_approve_result, build_reject_result, next_pending_manual_gate,
 };
 use crate::invoker_client::{
-    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, Clock, command_applied_event,
+    CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, Clock, GateBinding, command_applied_event,
 };
 use crate::lifecycle::{Lifecycle, Outcome, Status};
 use crate::store::{
@@ -556,8 +556,35 @@ fn emit_control_applied(run: &Run, command: &ControlCommandRecord, attempt_numbe
     );
 }
 
-/// Apply the oldest pending `approve` / `reject` command to a lifecycle
-/// parked at `AWAITING_APPROVAL`.
+/// Record a claimed command the resolver did not apply via
+/// `harness.control_command_not_applicable`, with the reason.
+fn emit_control_not_applicable(
+    run: &Run,
+    command: &ControlCommandRecord,
+    reason: &str,
+    attempt_number: Option<u32>,
+) {
+    run.emit(
+        crate::invoker_client::EVENT_CONTROL_NOT_APPLICABLE,
+        object(json!({
+            "command_id": command.id,
+            "kind": command.kind,
+            "payload": command.payload,
+            "reason": reason,
+        })),
+        attempt_number,
+    );
+}
+
+/// Apply the oldest pending `approve` / `reject` command bound to the gate
+/// a lifecycle is parked on at `AWAITING_APPROVAL`.
+///
+/// A decision applies only to the park it was issued against: its payload
+/// must carry the pending gate's `awaiting_ordinal` and the current
+/// `attempt_number` (see [`crate::invoker_client::enqueue_gate_decision`]).
+/// Every other claimed row -- an unbound or differently-bound decision, a
+/// second decision after the applied one, a `say` / `set_model` -- is
+/// recorded as `harness.control_command_not_applicable` with a `reason`.
 ///
 /// * approve: a `passed=true` manual receipt keyed to the finalized
 ///   `SUCCEEDED` attempt; re-park on the next gate (with a fresh
@@ -616,19 +643,40 @@ fn resolve_on_run(
     max_retries: u32,
 ) -> Result<ResolveApprovalOutcome, StoreError> {
     let ordinal = gate.ordinal;
-    // Claim every pending row; apply the first approve/reject in id order.
-    let claimed = store.claim_commands(&run.run_id, run.now())?;
-    let Some(target) = claimed
-        .into_iter()
-        .find(|cmd| cmd.kind == CONTROL_COMMAND_APPROVE || cmd.kind == CONTROL_COMMAND_REJECT)
-    else {
-        return Ok(ResolveApprovalOutcome::skipped("no_pending_command"));
-    };
-
     // The receipt is keyed to the attempt finalized SUCCEEDED at gate entry.
     let attempts = store.list_attempts(&run.run_id)?;
     let Some(attempt_number) = attempts.last().map(|a| a.number) else {
         return Ok(ResolveApprovalOutcome::skipped("no_attempt"));
+    };
+    let parked = GateBinding {
+        awaiting_ordinal: ordinal,
+        attempt_number,
+    };
+
+    // Claim every pending row; apply the first approve/reject bound to this
+    // exact park, in id order. Every other claimed row is recorded as not
+    // applicable, never dropped silently: a say/set_model has no live
+    // session to reach while parked, and a decision issued against another
+    // gate (or carrying no binding) was not made about this one.
+    let claimed = store.claim_commands(&run.run_id, run.now())?;
+    let mut target = None;
+    for command in claimed {
+        let decision =
+            command.kind == CONTROL_COMMAND_APPROVE || command.kind == CONTROL_COMMAND_REJECT;
+        let reason = if !decision {
+            "not_a_gate_decision"
+        } else if target.is_some() {
+            "superseded"
+        } else if GateBinding::of_command(&command) == Some(parked) {
+            target = Some(command);
+            continue;
+        } else {
+            "not_bound_to_this_gate"
+        };
+        emit_control_not_applicable(run, &command, reason, Some(attempt_number));
+    }
+    let Some(target) = target else {
+        return Ok(ResolveApprovalOutcome::skipped("no_pending_command"));
     };
     let steering = SteeringRun {
         store: store.clone(),

@@ -1140,8 +1140,8 @@ mod tests {
     use crate::tui::DaemonState;
     use crate::worker_supervisor::test_support::sleep_argv;
     use chrono::Utc;
-    use flywheel_core::lifecycle::Lifecycle;
-    use flywheel_core::store::{ControlCommandStore, LifecycleStore};
+    use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome};
+    use flywheel_core::store::{AttemptStore, ControlCommandStore, LifecycleStore};
     use serde_json::json;
     use std::fs;
     use std::path::Path;
@@ -1189,19 +1189,26 @@ mod tests {
         run_id
     }
 
+    /// A run parked the way the harness parks one: at `awaiting_approval`
+    /// on manual gate ordinal 1, after a succeeded attempt 1.
     fn seed_awaiting(db: &Path, task_id: &str) -> String {
         let run_id = format!("run-{task_id}-awaiting");
-        seed(
-            db,
-            task_id,
-            &run_id,
-            &[
-                Status::Ready,
-                Status::Running,
-                Status::Validating,
-                Status::AwaitingApproval,
-            ],
-        );
+        let store = SqliteStore::open(db).unwrap();
+        let now = Utc::now();
+        let mut lc = Lifecycle::new(task_id).with_run_id(&run_id);
+        for status in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            lc.transition_to(status, "", Some(now)).unwrap();
+        }
+        lc.awaiting_manual_ordinal = Some(1);
+        store.create_lifecycle(&lc).unwrap();
+        let mut attempt = Attempt::new(1, now, &run_id);
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt(&run_id, &attempt, None).unwrap();
         run_id
     }
 
@@ -1458,6 +1465,29 @@ mod tests {
     }
 
     #[test]
+    fn approve_and_reject_refuse_a_run_still_validating() {
+        // Nothing is parked yet: a decision now would be about a gate nobody
+        // has seen, so it is refused and never queued.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("db.sqlite");
+        let run_id = "run-task-v-validating";
+        seed(
+            &db,
+            "task-v",
+            run_id,
+            &[Status::Ready, Status::Running, Status::Validating],
+        );
+        let db_arg = db.to_str().unwrap();
+        for verb in [
+            &["approve", run_id, "--db", db_arg][..],
+            &["reject", run_id, "--feedback", "no", "--db", db_arg][..],
+        ] {
+            assert_eq!(run(verb, &unbound()).0, 1, "{verb:?}");
+        }
+        assert!(claimed(&db, run_id).is_empty());
+    }
+
+    #[test]
     fn approve_and_reject_enqueue_against_a_parked_gate() {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("db.sqlite");
@@ -1491,7 +1521,10 @@ mod tests {
         );
         assert_eq!(
             claimed(&db, &reject_run),
-            vec![("reject".to_owned(), json!({"feedback": feedback}))]
+            vec![(
+                "reject".to_owned(),
+                json!({"feedback": feedback, "awaiting_ordinal": 1, "attempt_number": 1})
+            )]
         );
         assert_eq!(run(&["approve", "--help"], &unbound()).0, 0);
     }

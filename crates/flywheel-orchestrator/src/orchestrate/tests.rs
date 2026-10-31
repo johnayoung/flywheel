@@ -1743,9 +1743,8 @@ async fn pending_approve_resolves_in_place_and_lands_through_the_strategy() {
     assert_eq!(strategy.submits().len(), 1);
     assert_eq!(strategy.submits()[0].status, Status::AwaitingApproval);
 
-    f.control
-        .enqueue_command(&run_id, "approve", serde_json::Map::new(), t0())
-        .unwrap();
+    // The operator's approve, bound to the gate parked now.
+    flywheel_core::invoker_client::enqueue_approve(f.control.as_ref(), &run_id, t0()).unwrap();
     let second = run(req.clone()).await;
     assert!(
         second.runs.is_empty(),
@@ -1811,8 +1810,7 @@ async fn empty_approval_mark_expires_and_is_reswept_in_the_same_session() {
             )
             .unwrap();
         let now = *state.lock().unwrap();
-        control
-            .enqueue_command(&parked[0].run_id, "approve", serde_json::Map::new(), now)
+        flywheel_core::invoker_client::enqueue_approve(control.as_ref(), &parked[0].run_id, now)
             .unwrap();
         *state.lock().unwrap() =
             now + ChronoDuration::seconds(APPROVAL_SWEEP_MARK_TTL_SECONDS as i64 + 5);

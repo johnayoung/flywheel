@@ -34,7 +34,10 @@
 //! [`InvocationFailure`]: crate::invoker::InvocationFailure
 
 use crate::events::CommandApplied;
-use crate::store::{ControlCommandRecord, ControlCommandStore, JsonObject, StoreError};
+use crate::lifecycle::{Lifecycle, Status};
+use crate::store::{
+    ControlCommandRecord, ControlCommandStore, JsonObject, LifecycleStore, StoreError,
+};
 use chrono::{DateTime, Utc};
 use flywheel_agents::runtime::CancelHandle;
 use flywheel_agents::{AgentControl, AgentError};
@@ -310,27 +313,128 @@ pub fn enqueue_set_model<S: ControlCommandStore + ?Sized>(
     store.enqueue_command(run_id, CONTROL_COMMAND_SET_MODEL, payload, now)
 }
 
-/// Enqueue an `approve` for a lifecycle parked at `awaiting_approval`.
-pub fn enqueue_approve<S: ControlCommandStore + ?Sized>(
+/// Payload key binding an `approve` / `reject` to the manual gate it was
+/// issued against: the lifecycle's `awaiting_manual_ordinal` at enqueue time.
+pub const GATE_BINDING_ORDINAL: &str = "awaiting_ordinal";
+/// Payload key binding an `approve` / `reject` to the attempt whose park it
+/// was issued against, so a decision on one attempt's gate never resolves a
+/// later attempt's re-park of the same gate.
+pub const GATE_BINDING_ATTEMPT: &str = "attempt_number";
+
+/// One parked manual-gate instance: which gate, on which attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateBinding {
+    pub awaiting_ordinal: u32,
+    pub attempt_number: u32,
+}
+
+impl GateBinding {
+    /// The gate instance `lifecycle` is parked on, or `None` when it is not
+    /// parked at `awaiting_approval` with a pending gate and an attempt.
+    pub fn of_parked(lifecycle: &Lifecycle) -> Option<Self> {
+        if lifecycle.status != Status::AwaitingApproval {
+            return None;
+        }
+        Some(Self {
+            awaiting_ordinal: lifecycle.awaiting_manual_ordinal?,
+            attempt_number: lifecycle.attempts.iter().map(|a| a.number).max()?,
+        })
+    }
+
+    /// The binding a queued command carries, or `None` when it carries none
+    /// (or a malformed one).
+    pub fn of_command(command: &ControlCommandRecord) -> Option<Self> {
+        let field = |key: &str| {
+            command
+                .payload
+                .get(key)
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        Some(Self {
+            awaiting_ordinal: field(GATE_BINDING_ORDINAL)?,
+            attempt_number: field(GATE_BINDING_ATTEMPT)?,
+        })
+    }
+
+    fn stamp(self, payload: &mut JsonObject) {
+        payload.insert(GATE_BINDING_ORDINAL.into(), json!(self.awaiting_ordinal));
+        payload.insert(GATE_BINDING_ATTEMPT.into(), json!(self.attempt_number));
+    }
+}
+
+/// Why an `approve` / `reject` was not enqueued.
+#[derive(Debug, thiserror::Error)]
+pub enum GateDecisionError {
+    #[error("run {0:?} is unknown to this store; no command enqueued")]
+    UnknownRun(String),
+    #[error(
+        "run {run_id:?} has no parked manual gate to decide (status={status}); \
+         approve/reject apply only to a gate parked at awaiting_approval, nothing enqueued"
+    )]
+    NotParked { run_id: String, status: String },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Enqueue an `approve` / `reject` bound to the gate `run_id` is parked on
+/// right now.
+///
+/// A decision binds to the gate instance the operator is looking at: the
+/// payload is stamped with the lifecycle's pending `awaiting_ordinal` and
+/// current `attempt_number`, and the resolver applies it only to that same
+/// park. A run not parked at a gate (still running or validating, already
+/// resolved) refuses with [`GateDecisionError::NotParked`] and enqueues
+/// nothing, so a decision can never queue ahead of a gate nobody has seen.
+pub fn enqueue_gate_decision<S: LifecycleStore + ControlCommandStore + ?Sized>(
+    store: &S,
+    run_id: &str,
+    kind: &str,
+    mut payload: JsonObject,
+    now: DateTime<Utc>,
+) -> Result<(ControlCommandRecord, GateBinding), GateDecisionError> {
+    let lifecycle = store
+        .load_lifecycle(run_id)?
+        .ok_or_else(|| GateDecisionError::UnknownRun(run_id.to_owned()))?;
+    let binding =
+        GateBinding::of_parked(&lifecycle).ok_or_else(|| GateDecisionError::NotParked {
+            run_id: run_id.to_owned(),
+            status: lifecycle.status.as_str().to_owned(),
+        })?;
+    binding.stamp(&mut payload);
+    Ok((store.enqueue_command(run_id, kind, payload, now)?, binding))
+}
+
+/// Enqueue an `approve` bound to the gate the lifecycle is parked on.
+pub fn enqueue_approve<S: LifecycleStore + ControlCommandStore + ?Sized>(
     store: &S,
     run_id: &str,
     now: DateTime<Utc>,
-) -> Result<ControlCommandRecord, StoreError> {
-    store.enqueue_command(run_id, CONTROL_COMMAND_APPROVE, JsonObject::new(), now)
+) -> Result<ControlCommandRecord, GateDecisionError> {
+    enqueue_gate_decision(
+        store,
+        run_id,
+        CONTROL_COMMAND_APPROVE,
+        JsonObject::new(),
+        now,
+    )
+    .map(|(record, _)| record)
 }
 
-/// Enqueue a `reject` with optional operator feedback.
-pub fn enqueue_reject<S: ControlCommandStore + ?Sized>(
+/// Enqueue a `reject` with optional operator feedback, bound to the gate the
+/// lifecycle is parked on.
+pub fn enqueue_reject<S: LifecycleStore + ControlCommandStore + ?Sized>(
     store: &S,
     run_id: &str,
     feedback: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<ControlCommandRecord, StoreError> {
+) -> Result<ControlCommandRecord, GateDecisionError> {
     let mut payload = JsonObject::new();
     if let Some(feedback) = feedback {
         payload.insert("feedback".into(), json!(feedback));
     }
-    store.enqueue_command(run_id, CONTROL_COMMAND_REJECT, payload, now)
+    enqueue_gate_decision(store, run_id, CONTROL_COMMAND_REJECT, payload, now)
+        .map(|(record, _)| record)
 }
 
 // --- Checkpoint nudge ------------------------------------------------------------
@@ -977,9 +1081,52 @@ mod tests {
         assert_eq!(CONTROL_COMMAND_REJECT, "reject");
     }
 
+    /// Seed `run_id` parked the way the harness parks one: at
+    /// `awaiting_approval` on gate ordinal 2 after a succeeded attempt 1.
+    fn seed_parked(store: &InMemoryStore, run_id: &str) {
+        use crate::lifecycle::{Attempt, Outcome};
+        use crate::store::AttemptStore;
+        let mut lc = Lifecycle::new("t").with_run_id(run_id);
+        for status in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            lc.transition_to(status, "", Some(now())).unwrap();
+        }
+        lc.awaiting_manual_ordinal = Some(2);
+        store.create_lifecycle(&lc).unwrap();
+        let mut attempt = Attempt::new(1, now(), run_id);
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt(run_id, &attempt, None).unwrap();
+    }
+
+    #[test]
+    fn gate_decisions_refuse_a_run_with_no_parked_gate() {
+        let store = InMemoryStore::new();
+        assert!(matches!(
+            enqueue_approve(&store, "run-x", now()),
+            Err(GateDecisionError::UnknownRun(_))
+        ));
+        let mut lc = Lifecycle::new("t").with_run_id("run-v");
+        for status in [Status::Ready, Status::Running, Status::Validating] {
+            lc.transition_to(status, "", Some(now())).unwrap();
+        }
+        store.create_lifecycle(&lc).unwrap();
+        match enqueue_reject(&store, "run-v", Some("no"), now()) {
+            Err(GateDecisionError::NotParked { status, .. }) => assert_eq!(status, "validating"),
+            other => panic!("expected NotParked, got {other:?}"),
+        }
+        assert!(store.claim_commands("run-v", now()).unwrap().is_empty());
+        assert!(store.claim_commands("run-x", now()).unwrap().is_empty());
+    }
+
     #[test]
     fn enqueue_helpers_persist_the_documented_payloads() {
         let store = InMemoryStore::new();
+        seed_parked(&store, "run-1");
+        let bound = json!({"awaiting_ordinal": 2, "attempt_number": 1});
         let say = enqueue_say(&store, "run-1", "focus", now()).unwrap();
         assert_eq!(say.kind, "say");
         assert_eq!(say.payload.get("text"), Some(&json!("focus")));
@@ -990,11 +1137,14 @@ mod tests {
         let reset = enqueue_set_model(&store, "run-1", None, now()).unwrap();
         assert_eq!(reset.payload.get("model"), Some(&Value::Null));
         let approve = enqueue_approve(&store, "run-1", now()).unwrap();
-        assert!(approve.payload.is_empty());
+        assert_eq!(Value::Object(approve.payload), bound);
         let reject = enqueue_reject(&store, "run-1", Some("nope"), now()).unwrap();
-        assert_eq!(reject.payload.get("feedback"), Some(&json!("nope")));
+        assert_eq!(
+            Value::Object(reject.payload),
+            json!({"feedback": "nope", "awaiting_ordinal": 2, "attempt_number": 1})
+        );
         let bare_reject = enqueue_reject(&store, "run-1", None, now()).unwrap();
-        assert!(bare_reject.payload.is_empty());
+        assert_eq!(Value::Object(bare_reject.payload), bound);
         assert_eq!(store.claim_commands("run-1", now()).unwrap().len(), 7);
     }
 
@@ -1217,6 +1367,7 @@ mod tests {
     #[tokio::test]
     async fn approve_and_reject_are_not_dispatched() {
         let store = Arc::new(InMemoryStore::new());
+        seed_parked(&store, "run-1");
         enqueue_approve(store.as_ref(), "run-1", now()).unwrap();
         enqueue_reject(store.as_ref(), "run-1", None, now()).unwrap();
         enqueue_reject(store.as_ref(), "run-1", Some("missing tests"), now()).unwrap();

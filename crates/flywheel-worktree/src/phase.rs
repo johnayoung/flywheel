@@ -186,8 +186,9 @@ fn dir_name(path: &Path) -> String {
 }
 
 /// The git ref recording `phase_dir`'s base SHA while it is active. Keyed by
-/// directory name; phase names are sequential (`NN-<name>`), so collisions
-/// across a repo's lifetime do not occur in practice.
+/// directory name. A recurring name (autopilot's `active/autopilot`) reuses
+/// the ref across generations safely: archiving materializes it into the
+/// archived dir and drops it, so the next generation records a fresh base.
 pub fn loop_base_ref(phase_dir: &Path) -> String {
     format!("{LOOP_BASE_REF_PREFIX}{}", dir_name(phase_dir))
 }
@@ -258,14 +259,17 @@ pub fn write_phase_base_if_missing(repo_root: &Path, phase_dir: &Path) -> bool {
     git_capture(repo_root, &["update-ref", &loop_base_ref(phase_dir), sha]).0
 }
 
-/// Carry an archived phase's loop-base ref into `dest` as the legacy
-/// `.loop-base` dotfile, then drop the ref. A phase that already carries a
-/// committed dotfile is left as-is.
-fn materialize_loop_base(repo_root: &Path, dest: &Path) {
+/// Carry the archived `phase_name`'s loop-base ref into `dest` as the
+/// legacy `.loop-base` dotfile, then drop the ref (so a recurring phase name
+/// records a fresh base for its next generation). `dest` may be a
+/// generation-suffixed `archive/<phase>-<n>`, so the ref is keyed by the
+/// active phase name, not `dest`. A phase that already carries a committed
+/// dotfile is left as-is.
+fn materialize_loop_base(repo_root: &Path, phase_name: &str, dest: &Path) {
     if dest.join(LOOP_BASE_FILENAME).is_file() {
         return;
     }
-    let reference = loop_base_ref(dest);
+    let reference = format!("{LOOP_BASE_REF_PREFIX}{phase_name}");
     let (ok, out) = git_capture(repo_root, &["rev-parse", "--verify", "--quiet", &reference]);
     if !ok {
         return;
@@ -537,8 +541,12 @@ pub enum ArchiveError {
 ///    hits a watched signal needs a DONE `in-loop-verification` task or a
 ///    valid `loop-path-exempt.md`;
 /// 5. the phase-verify gate (`repo_root` + `phase_verify`);
-/// 6. a same-named archive already present is refused loudly (never a
-///    silent skip: that is how resurrected duplicate phases hid).
+/// 6. the destination: `archive/<phase>`, or for a recurring phase name
+///    (autopilot's fixed `active/autopilot`) the next free
+///    `archive/<phase>-<n>`; a phase sharing a task with an archived
+///    generation is a resurrected duplicate and is refused loudly (never a
+///    silent skip: that is how resurrected duplicate phases hid), as is an
+///    `archive/<phase>` that holds no task file.
 ///
 /// After the move the loop-base ref is materialized into the archived dir,
 /// the move is committed when the queue was git-tracked, and `claims`
@@ -648,22 +656,20 @@ pub fn archive_completed_phases(
             }
         }
 
-        let dest = archive_root.join(&phase_name);
-        if dest.exists() {
-            log(format!(
-                "Refusing to archive phase {phase_name}: {} already exists; resolve the duplicate \
-                 by hand (an earlier archive whose active/ deletion was never committed \
-                 resurrects on the next checkout)",
-                dest.display()
-            ));
-            continue;
-        }
+        let dest =
+            match archive_destination(&archive_root, &phase_name, &task_files, &loaded_tasks)? {
+                Ok(dest) => dest,
+                Err(refusal) => {
+                    log(refusal);
+                    continue;
+                }
+            };
         fs::rename(&phase_dir, &dest).map_err(|source| ArchiveError::Io {
             path: phase_dir.clone(),
             source,
         })?;
         if let Some(repo_root) = options.repo_root {
-            materialize_loop_base(repo_root, &dest);
+            materialize_loop_base(repo_root, &phase_name, &dest);
             commit_archive_move(repo_root, &phase_dir, &dest, &log);
         }
         if let Some(claims) = options.claims {
@@ -679,6 +685,105 @@ pub fn archive_completed_phases(
         moved.push(dest);
     }
     Ok(moved)
+}
+
+/// Task ids an archived phase dir defines: each task file's stem and its
+/// `id` field (the `archive/*/<id>.json` rule the prerequisite resolver and
+/// autopilot's emission dedupe use).
+fn archived_task_ids(dir: &Path) -> Result<BTreeSet<String>, ArchiveError> {
+    let mut ids = BTreeSet::new();
+    for path in phase_task_files(dir)? {
+        if let Some(stem) = path.file_stem() {
+            ids.insert(stem.to_string_lossy().into_owned());
+        }
+        if let Some(id) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|data| data.get("id").and_then(|id| id.as_str().map(str::to_owned)))
+        {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Where the done phase `phase_name` archives, or the refusal to log.
+///
+/// `archive/<phase>` when free. A phase name can recur -- autopilot always
+/// emits into `active/autopilot` -- so when earlier generations already
+/// occupy `archive/<phase>` (and `archive/<phase>-<n>`), the phase archives
+/// to the next free `archive/<phase>-<n>` (`n >= 2`). Refused instead when
+/// the active phase shares a task (file stem or id) with any archived
+/// generation -- an archival whose `active/` deletion was never committed
+/// resurrects exactly those files on the next checkout -- or when
+/// `archive/<phase>` holds no task file, so it cannot be told apart from
+/// such a leftover.
+fn archive_destination(
+    archive_root: &Path,
+    phase_name: &str,
+    task_files: &[PathBuf],
+    tasks: &[Task],
+) -> Result<Result<PathBuf, String>, ArchiveError> {
+    let base = archive_root.join(phase_name);
+    if !base.exists() {
+        return Ok(Ok(base));
+    }
+    let resurrected = |dest: &Path| {
+        format!(
+            "Refusing to archive phase {phase_name}: {} already exists; resolve the duplicate \
+             by hand (an earlier archive whose active/ deletion was never committed \
+             resurrects on the next checkout)",
+            dest.display()
+        )
+    };
+    let active_ids: BTreeSet<String> = tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .chain(task_files.iter().filter_map(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        }))
+        .collect();
+    let mut generations = vec![base.clone()];
+    let prefix = format!("{phase_name}-");
+    for entry in fs::read_dir(archive_root).map_err(|source| ArchiveError::Io {
+        path: archive_root.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ArchiveError::Io {
+            path: archive_root.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_generation = name
+            .strip_prefix(&prefix)
+            .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n >= 2) && !n.starts_with('0'));
+        if is_generation && entry.path().is_dir() {
+            generations.push(entry.path());
+        }
+    }
+    for generation in &generations {
+        let archived = archived_task_ids(generation)?;
+        if generation == &base && archived.is_empty() {
+            return Ok(Err(resurrected(&base)));
+        }
+        if let Some(shared) = active_ids.intersection(&archived).next() {
+            return Ok(Err(format!(
+                "Refusing to archive phase {phase_name}: task {shared} is already archived under \
+                 {}; resolve the duplicate by hand (an earlier archive whose active/ deletion \
+                 was never committed resurrects on the next checkout)",
+                generation.display()
+            )));
+        }
+    }
+    let mut n: u32 = 2;
+    loop {
+        let dest = archive_root.join(format!("{phase_name}-{n}"));
+        if !dest.exists() {
+            return Ok(Ok(dest));
+        }
+        n += 1;
+    }
 }
 
 /// The worker-side archive sweep: resolves the phase-merge predicate's true
@@ -1617,6 +1722,148 @@ mod tests {
             logged[0]
         );
         assert!(logged[0].contains("already exists"));
+    }
+
+    /// Emit one autopilot task into the fixed `active/autopilot` phase, mark
+    /// it DONE, and record the phase's loop-base ref at the current HEAD.
+    fn emit_autopilot_generation(f: &Fixture, task_id: &str) -> String {
+        use flywheel_core::task::{CommandGrader, Grader};
+        use flywheel_orchestrator::autopilot::{
+            AUTOPILOT_PHASE, EmittedTask, Finding, GraderSource, ScoreBreakdown, Tier,
+            emit_emitted_task,
+        };
+        let task = Task::new(
+            format!("Goal for {task_id}."),
+            vec![Grader::Command(CommandGrader::new("true").unwrap())],
+        )
+        .with_id(task_id);
+        let emitted = EmittedTask::new(
+            Finding::new(format!("find-{task_id}"), Tier::TestCoverage, task_id),
+            task,
+            "true",
+            GraderSource::RepoCommand,
+            "Cargo.toml",
+        );
+        let breakdown = ScoreBreakdown {
+            tier: Tier::TestCoverage,
+            tier_weight: 1,
+            urgency: 1,
+            importance: 1,
+            blocks: 0,
+            effort: 1,
+            final_score: 10.0,
+            preemptive: false,
+        };
+        let written = emit_emitted_task(&emitted, &breakdown, &f.tasks_dir, AUTOPILOT_PHASE)
+            .unwrap()
+            .expect("a fresh id is emitted");
+        assert_eq!(
+            written.parent().unwrap(),
+            f.tasks_dir.join("active").join(AUTOPILOT_PHASE)
+        );
+        let phase = written.parent().unwrap().to_path_buf();
+        assert!(write_phase_base_if_missing(&f.repo, &phase));
+        f.done(task_id, &format!("run-{task_id}"));
+        rev(&f.repo, "HEAD")
+    }
+
+    #[test]
+    fn a_recurring_phase_name_archives_each_generation_to_its_own_destination() {
+        // Autopilot always emits into `active/autopilot`; once the first
+        // generation archives, every later one must archive too (never a
+        // permanent "already exists" refusal) without touching the earlier
+        // archive.
+        let f = Fixture::new();
+        let armed = ArchiveOptions {
+            repo_root: Some(&f.repo),
+            ..ArchiveOptions::default()
+        };
+        let archive = f.tasks_dir.join("archive");
+        let mut bases = Vec::new();
+        for (generation, task_id) in ["add-retry", "add-parser-tests", "fix-timeout"]
+            .into_iter()
+            .enumerate()
+        {
+            commit(
+                &f.repo,
+                &format!("gen{generation}.txt"),
+                "x\n",
+                &format!("generation {generation}"),
+            );
+            bases.push(emit_autopilot_generation(&f, task_id));
+            let (moved, logged) = f.sweep(armed);
+            assert!(logged.is_empty(), "generation {generation}: {logged:?}");
+            let dest = if generation == 0 {
+                archive.join("autopilot")
+            } else {
+                archive.join(format!("autopilot-{}", generation + 1))
+            };
+            assert_eq!(moved, vec![dest.clone()]);
+            assert!(!f.tasks_dir.join("active").join("autopilot").exists());
+            assert!(dest.join(format!("{task_id}.json")).is_file());
+            // Each generation keeps its own recorded base, and the shared
+            // loop-base ref is dropped so the next generation records afresh.
+            assert_eq!(
+                fs::read_to_string(dest.join(LOOP_BASE_FILENAME))
+                    .unwrap()
+                    .trim(),
+                bases[generation]
+            );
+            assert!(
+                !git(
+                    &f.repo,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "refs/flywheel/loop-base/autopilot"
+                    ]
+                )
+                .unwrap()
+                .ok()
+            );
+        }
+        // Earlier generations are untouched.
+        assert!(archive.join("autopilot/add-retry.json").is_file());
+        assert!(archive.join("autopilot-2/add-parser-tests.json").is_file());
+        assert!(!archive.join("autopilot/add-parser-tests.json").exists());
+    }
+
+    #[test]
+    fn a_resurrected_copy_of_any_archived_generation_is_still_refused() {
+        // An archival whose active/ deletion was never committed resurrects
+        // the same task files on the next checkout: that is a duplicate of
+        // the archived generation, not a new one, and stays refused loudly.
+        let f = Fixture::new();
+        f.task("autopilot", "add-retry", &[]);
+        f.done("add-retry", "run-add-retry");
+        assert_eq!(f.sweep(ArchiveOptions::default()).0.len(), 1);
+        f.task("autopilot", "add-parser-tests", &[]);
+        f.done("add-parser-tests", "run-add-parser-tests");
+        assert_eq!(
+            f.sweep(ArchiveOptions::default()).0,
+            vec![f.tasks_dir.join("archive").join("autopilot-2")]
+        );
+        for resurrected in ["add-retry", "add-parser-tests"] {
+            f.task("autopilot", resurrected, &[]);
+            let (moved, logged) = f.sweep(ArchiveOptions::default());
+            assert!(moved.is_empty(), "{resurrected}: {moved:?}");
+            assert_eq!(logged.len(), 1);
+            assert!(
+                logged[0].starts_with("Refusing to archive phase autopilot:"),
+                "{}",
+                logged[0]
+            );
+            assert!(logged[0].contains(resurrected), "{}", logged[0]);
+            assert!(
+                f.tasks_dir
+                    .join("active/autopilot")
+                    .join(format!("{resurrected}.json"))
+                    .is_file()
+            );
+            fs::remove_dir_all(f.tasks_dir.join("active/autopilot")).unwrap();
+        }
+        assert!(!f.tasks_dir.join("archive/autopilot-3").exists());
     }
 
     #[test]

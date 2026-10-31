@@ -1051,6 +1051,10 @@ impl TriagePass {
     /// The body is rewritten with its `flywheel` spec block removed so the
     /// stale receipt does not survive the demotion; the ready label is
     /// dropped, the needs-detail label added, and exactly one comment left.
+    ///
+    /// The comment is posted BEFORE the label flip (see
+    /// [`Self::apply_needs_detail`]): a refused comment leaves the issue
+    /// ready and drifted, so the next pass re-triages it.
     fn demote_to_needs_detail(
         &self,
         number: i64,
@@ -1058,6 +1062,7 @@ impl TriagePass {
         comment: &str,
     ) -> Result<(), TriageError> {
         let number = number.to_string();
+        self.comment(&number, comment)?;
         self.gh(&[
             "issue",
             "edit",
@@ -1070,14 +1075,21 @@ impl TriagePass {
             &self.board.needs_detail_label,
             "--remove-label",
             &self.board.ready_label,
-        ])?;
-        self.comment(&number, comment)
+        ])
     }
 
-    /// Route an intake issue to needs-detail: label flip plus one comment,
+    /// Route an intake issue to needs-detail: one comment plus label flip,
     /// body untouched.
+    ///
+    /// The comment is posted BEFORE the label flip. No pass lists the
+    /// needs-detail label, so a flip whose comment then failed would strand
+    /// the issue labeled needs-detail with no explanation, forever. In this
+    /// order a refused comment leaves the issue on intake for the next pass,
+    /// and a refused flip after a posted comment at worst re-posts the
+    /// explanation on the retry.
     fn apply_needs_detail(&self, number: i64, comment: &str) -> Result<(), TriageError> {
         let number = number.to_string();
+        self.comment(&number, comment)?;
         self.gh(&[
             "issue",
             "edit",
@@ -1088,8 +1100,7 @@ impl TriagePass {
             &self.board.needs_detail_label,
             "--remove-label",
             &self.board.intake_label,
-        ])?;
-        self.comment(&number, comment)
+        ])
     }
 
     fn comment(&self, number: &str, comment: &str) -> Result<(), TriageError> {
@@ -2519,6 +2530,209 @@ mod tests {
         let err = rt.block_on(build(failing).run()).unwrap_err();
         assert_eq!(err.kind_name(), "WorkSourceError");
         assert!(err.to_string().contains("failed (exit 1): boom"));
+    }
+
+    // --- needs-detail write atomicity across a failed comment --------------------------
+
+    /// One issue on a stateful board: its labels, body, and posted comments.
+    struct BoardIssue {
+        number: i64,
+        title: String,
+        body: String,
+        labels: Vec<String>,
+        comments: Vec<String>,
+    }
+
+    /// A stateful `gh` board: `issue list` answers from the issues' current
+    /// labels, `issue edit` applies `--body`/`--add-label`/`--remove-label`,
+    /// and `issue comment` appends -- except the first `failing_comments`
+    /// comments, which GitHub refuses (a transient API/rate-limit error).
+    struct StatefulBoardGh {
+        issues: Mutex<Vec<BoardIssue>>,
+        failing_comments: Mutex<usize>,
+    }
+
+    impl StatefulBoardGh {
+        fn new(number: i64, title: &str, body: &str, label: &str, failing_comments: usize) -> Self {
+            Self {
+                issues: Mutex::new(vec![BoardIssue {
+                    number,
+                    title: title.to_string(),
+                    body: body.to_string(),
+                    labels: vec![label.to_string()],
+                    comments: Vec::new(),
+                }]),
+                failing_comments: Mutex::new(failing_comments),
+            }
+        }
+
+        /// The single issue's `(labels, body, comments)`.
+        fn state(&self) -> (Vec<String>, String, Vec<String>) {
+            let issues = self.issues.lock().unwrap();
+            let issue = &issues[0];
+            (
+                issue.labels.clone(),
+                issue.body.clone(),
+                issue.comments.clone(),
+            )
+        }
+    }
+
+    impl GhRunner for StatefulBoardGh {
+        fn run_gh(&self, argv: &[String]) -> Result<crate::github::GhOutput, WorkSourceError> {
+            let mut issues = self.issues.lock().unwrap();
+            match (argv[0].as_str(), argv[1].as_str()) {
+                ("issue", "list") => {
+                    let label = arg_after(argv, "--label");
+                    let listed: Vec<Value> = issues
+                        .iter()
+                        .filter(|i| i.labels.iter().any(|l| l == label))
+                        .map(|i| issue(i.number, &i.title, &i.body))
+                        .collect();
+                    Ok(crate::github::GhOutput::ok(
+                        Value::Array(listed).to_string(),
+                    ))
+                }
+                ("issue", "edit") => {
+                    let target = issues
+                        .iter_mut()
+                        .find(|i| i.number.to_string() == argv[2])
+                        .expect("edit of a known issue");
+                    if has_flag(argv, "--body") {
+                        target.body = arg_after(argv, "--body").to_string();
+                    }
+                    if has_flag(argv, "--remove-label") {
+                        let removed = arg_after(argv, "--remove-label");
+                        target.labels.retain(|l| l != removed);
+                    }
+                    if has_flag(argv, "--add-label") {
+                        let added = arg_after(argv, "--add-label").to_string();
+                        if !target.labels.contains(&added) {
+                            target.labels.push(added);
+                        }
+                    }
+                    Ok(crate::github::GhOutput::ok(""))
+                }
+                ("issue", "comment") => {
+                    let mut failing = self.failing_comments.lock().unwrap();
+                    if *failing > 0 {
+                        *failing -= 1;
+                        return Ok(crate::github::GhOutput {
+                            stdout: String::new(),
+                            stderr: "HTTP 502: Server Error".into(),
+                            exit_code: Some(1),
+                        });
+                    }
+                    let target = issues
+                        .iter_mut()
+                        .find(|i| i.number.to_string() == argv[2])
+                        .expect("comment on a known issue");
+                    target.comments.push(arg_after(argv, "--body").to_string());
+                    Ok(crate::github::GhOutput::ok(""))
+                }
+                other => panic!("unexpected gh call {other:?}"),
+            }
+        }
+    }
+
+    fn board_pass(
+        gh: &Arc<StatefulBoardGh>,
+        executor: Arc<ScriptedExecutor>,
+        response: &str,
+    ) -> TriagePass {
+        TriagePass::new(
+            board(),
+            BASE_SHA,
+            TriageSeams {
+                invoker: ScriptedInvoke::fixed(response),
+                executor,
+                runner: Arc::clone(gh) as Arc<dyn GhRunner>,
+            },
+        )
+        .unwrap()
+    }
+
+    fn run_tolerating_failure(pass: &TriagePass) -> Result<TriagePassResult, TriageError> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pass.run())
+    }
+
+    #[test]
+    fn needs_detail_explanation_survives_a_failed_comment_on_an_intake_issue() {
+        // GitHub refuses the explanation comment once. The issue must not be
+        // left labeled needs-detail with no explanation: nothing lists the
+        // needs-detail label, so such an issue is never revisited and the
+        // author never learns what is missing. The next pass must post it.
+        let gap = "which module owns the retry logic -- src/widget.py or src/net.py";
+        let response = fenced(json!({"authoritative_grader": "", "missing_information": [gap]}));
+        let gh = Arc::new(StatefulBoardGh::new(
+            4,
+            "Make it better",
+            "please improve retries",
+            "intake",
+            1,
+        ));
+
+        let first =
+            run_tolerating_failure(&board_pass(&gh, ScriptedExecutor::exiting(1), &response));
+        assert_eq!(first.unwrap_err().kind_name(), "WorkSourceError");
+        let (labels, _, comments) = gh.state();
+        assert!(comments.is_empty());
+        assert_eq!(
+            labels,
+            ["intake"],
+            "a needs-detail label without its explanation is never revisited"
+        );
+
+        let second =
+            run_tolerating_failure(&board_pass(&gh, ScriptedExecutor::exiting(1), &response))
+                .expect("the retry pass succeeds");
+        assert_eq!(second.needs_detail().len(), 1);
+        let (labels, body, comments) = gh.state();
+        assert_eq!(labels, ["needs-detail"]);
+        assert_eq!(body, "please improve retries");
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains(gap));
+
+        // Settled: a third pass writes nothing more.
+        let third = run_tolerating_failure(&board_pass(&gh, ScriptedExecutor::boom(), &response))
+            .expect("an idle pass succeeds");
+        assert_eq!(third, TriagePassResult::default());
+        assert_eq!(gh.state().2.len(), 1);
+    }
+
+    #[test]
+    fn demotion_explanation_survives_a_failed_comment_on_a_drifted_ready_issue() {
+        let prose = "Widget drops retries.";
+        let drifted_body = body_with_receipt(prose, &stale_receipt("old-cmd"));
+        let gh = Arc::new(StatefulBoardGh::new(
+            8,
+            "Fix the widget",
+            &drifted_body,
+            "ready",
+            1,
+        ));
+        let response = ready_response("true");
+
+        let first =
+            run_tolerating_failure(&board_pass(&gh, ScriptedExecutor::exiting(0), &response));
+        assert_eq!(first.unwrap_err().kind_name(), "WorkSourceError");
+        let (labels, body, comments) = gh.state();
+        assert!(comments.is_empty());
+        assert_eq!(labels, ["ready"]);
+        assert_eq!(body, drifted_body);
+
+        let second =
+            run_tolerating_failure(&board_pass(&gh, ScriptedExecutor::exiting(0), &response))
+                .expect("the retry pass succeeds");
+        assert_eq!(second.needs_detail().len(), 1);
+        let (labels, body, comments) = gh.state();
+        assert_eq!(labels, ["needs-detail"]);
+        assert_eq!(body, prose);
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].to_lowercase().contains("vacuous"));
     }
 
     // --- per-candidate failure isolation --------------------------------------------------

@@ -877,6 +877,19 @@ pub(crate) fn build_error(kind: &str, source: WorkSourceError) -> SourceRegistry
 pub fn build_github_source(
     context: &SourceBuildContext,
 ) -> Result<Box<dyn WorkSource>, SourceRegistryError> {
+    Ok(Box::new(github_source_from_context(context)?))
+}
+
+/// The concrete source [`build_github_source`] boxes, so the parsed
+/// `[source]` knobs stay observable.
+///
+/// # Errors
+///
+/// A missing or mistyped `[source]` key, or a source that fails
+/// construction.
+pub(crate) fn github_source_from_context(
+    context: &SourceBuildContext,
+) -> Result<GithubWorkSource, SourceRegistryError> {
     let repo = context.required_string(GITHUB_KIND, "repo")?;
     let label = context.required_string(GITHUB_KIND, "label")?;
     let done_action = optional_string(context, GITHUB_KIND, "done_action", "comment")?
@@ -897,7 +910,7 @@ pub fn build_github_source(
     if let Some(sink) = &context.stop_sink {
         source = source.with_stop_sink(Arc::clone(sink));
     }
-    Ok(Box::new(source))
+    Ok(source)
 }
 
 /// Register the three GitHub kinds (`github`, `github_ci`,
@@ -1995,5 +2008,66 @@ More prose after the block.
         assert!(err.starts_with("gh issue list failed to start"), "{err}");
         // The shipped runner is a unit value that can be constructed freely.
         let _runner: Arc<dyn GhRunner> = Arc::new(ProcessGhRunner);
+    }
+
+    // --- mutation-survey pins (graders fallback, goal shape, close errors,
+    // factory wiring) -------------------------------------------------------
+
+    #[test]
+    fn null_spec_graders_fall_back_to_the_default_policy() {
+        let body = block(json!({"goal": "Fix it", "graders": null}));
+        let gh = FakeGh::new(json!([issue(3, "Fix the widget", body)]).to_string());
+        let items = with_defaults(&gh).list_work().unwrap();
+        assert_eq!(ids(&items), ["gh-3"]);
+        let runs: Vec<&str> = items[0].task.graders.iter().map(grader_run).collect();
+        assert_eq!(runs, ["true"]);
+    }
+
+    #[test]
+    fn goal_is_trimmed_from_the_spec_block_and_from_the_title() {
+        let spec_body = block(json!({"goal": "  Retry flaky fetches.\n"}));
+        let gh = FakeGh::new(
+            json!([
+                issue(1, "ignored title", spec_body),
+                issue(2, "  Fix the widget  ", "")
+            ])
+            .to_string(),
+        );
+        let items = with_defaults(&gh).list_work().unwrap();
+        let goals: Vec<&str> = items.iter().map(|i| i.task.goal.as_str()).collect();
+        assert_eq!(goals, ["Retry flaky fetches.", "Fix the widget"]);
+    }
+
+    #[test]
+    fn report_close_propagates_gh_failure() {
+        let gh = FakeGh::failing("issue already locked");
+        let err = source(&gh)
+            .with_done_action(DoneAction::Close)
+            .report(&report(Status::Done, vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh issue close 12"), "{err}");
+        assert!(err.contains("issue already locked"), "{err}");
+    }
+
+    #[test]
+    fn factory_wires_done_action_and_trust_flag_from_settings() {
+        let ctx = SourceBuildContext::new(settings(&[
+            ("repo", s("octo/widgets")),
+            ("label", s("flywheel")),
+            ("done_action", s("close")),
+            ("require_triage_receipt", toml::Value::Boolean(true)),
+        ]));
+        let built = github_source_from_context(&ctx).unwrap();
+        assert_eq!(built.done_action(), DoneAction::Close);
+        assert!(built.require_triage_receipt());
+
+        let ctx = SourceBuildContext::new(settings(&[
+            ("repo", s("octo/widgets")),
+            ("label", s("flywheel")),
+        ]));
+        let built = github_source_from_context(&ctx).unwrap();
+        assert_eq!(built.done_action(), DoneAction::Comment);
+        assert!(!built.require_triage_receipt());
     }
 }

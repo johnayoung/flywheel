@@ -1117,4 +1117,90 @@ mod tests {
             "cannot build github_review source: [source] repo is required"
         );
     }
+
+    // --- mutation-survey pins (thread url, version seed, compile failures,
+    // report errors) -----------------------------------------------------------
+
+    #[test]
+    fn thread_url_is_the_first_comment_url() {
+        let first = json!({
+            "body": "please add a test",
+            "createdAt": "2026-06-25T00:00:00Z",
+            "url": "https://github.com/octo/widgets/pull/7#discussion_r1",
+            "author": {"login": "alice"},
+        });
+        let reply = json!({
+            "body": "done?",
+            "createdAt": "2026-06-26T00:00:00Z",
+            "url": "https://github.com/octo/widgets/pull/7#discussion_r2",
+            "author": {"login": "bob"},
+        });
+        let gh = FakeGh::new(payload(vec![thread_with(
+            "RT_x",
+            false,
+            vec![first, reply],
+            false,
+        )]));
+        let items = source(&gh).list_work().unwrap();
+        assert_eq!(
+            items[0].source_url.as_deref(),
+            Some("https://github.com/octo/widgets/pull/7#discussion_r1")
+        );
+        assert_eq!(
+            items[0].task.context.references,
+            ["https://github.com/octo/widgets/pull/7#discussion_r1"]
+        );
+    }
+
+    #[test]
+    fn source_version_seed_uses_the_latest_timestamp_and_the_outdated_flag() {
+        let mut node = thread_with(
+            "RT_x",
+            false,
+            vec![
+                comment("later", "alice", "2026-06-26T00:00:00Z"),
+                comment("earlier", "bob", "2026-06-25T00:00:00Z"),
+            ],
+            false,
+        );
+        node["isOutdated"] = json!(true);
+        let gh = FakeGh::new(payload(vec![node]));
+        let items = source(&gh).list_work().unwrap();
+        let seed = "later\u{0}earlier\u{0}False\u{0}True\u{0}2026-06-26T00:00:00Z";
+        assert_eq!(
+            items[0].source_version.as_deref(),
+            Some(sha256_hex(seed).as_str())
+        );
+    }
+
+    #[test]
+    fn invalid_default_grader_is_a_per_node_skip() {
+        let bad = Grader::Command(flywheel_core::task::CommandGrader {
+            run: String::new(),
+            name: None,
+        });
+        let gh = FakeGh::new(payload(vec![thread("RT_x")]));
+        let (log, lines) = capture_log();
+        let src = source(&gh).with_default_graders(vec![bad]).with_log(log);
+        assert!(src.list_work().unwrap().is_empty());
+        assert_eq!(src.last_skipped_count(), 1);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("\"RT_x\"") && l.contains("non-empty 'run'"))
+        );
+    }
+
+    #[test]
+    fn report_propagates_gh_failure() {
+        let gh = FakeGh::failing("pull request is locked");
+        let err = source(&gh)
+            .report(&report("octo/widgets#7#RT_x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh pr comment 7"), "{err}");
+        assert!(err.contains("pull request is locked"), "{err}");
+    }
 }

@@ -465,6 +465,18 @@ impl WorkSource for GithubCiWorkSource {
 pub fn build_github_ci_source(
     context: &SourceBuildContext,
 ) -> Result<Box<dyn WorkSource>, SourceRegistryError> {
+    Ok(Box::new(github_ci_source_from_context(context)?))
+}
+
+/// The concrete source [`build_github_ci_source`] boxes, so the parsed
+/// `[source]` knobs stay observable.
+///
+/// # Errors
+///
+/// A missing or mistyped `[source]` key, or an empty `failure_filter`.
+pub(crate) fn github_ci_source_from_context(
+    context: &SourceBuildContext,
+) -> Result<GithubCiWorkSource, SourceRegistryError> {
     let repo = context.required_string(GITHUB_CI_KIND, "repo")?;
     let failure_filter = optional_string(
         context,
@@ -482,7 +494,7 @@ pub fn build_github_ci_source(
     if let Some(sink) = &context.stop_sink {
         source = source.with_stop_sink(Arc::clone(sink));
     }
-    Ok(Box::new(source))
+    Ok(source)
 }
 
 #[cfg(test)]
@@ -1003,5 +1015,83 @@ mod tests {
             err.to_string()
                 .contains("failure_filter must be a non-empty")
         );
+    }
+
+    // --- mutation-survey pins (identity keying, dedup order, compile
+    // failures, report errors, factory wiring) --------------------------------
+
+    #[test]
+    fn id_digest_separates_workflow_from_branch() {
+        assert_ne!(ci_item_id("ab", "c"), ci_item_id("a", "bc"));
+        let gh = FakeGh::new(page(vec![run_on("ab", "c"), run_on("a", "bc")]));
+        let items = source(&gh).list_work().unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn empty_identity_field_is_a_counted_skip() {
+        let gh = FakeGh::new(page(vec![run_on("CI", ""), run_on("Lint", "main")]));
+        let src = source(&gh);
+        let items = src.list_work().unwrap();
+        assert_eq!(
+            goals(&items),
+            ["Fix the failing CI workflow 'Lint' on branch 'main'."]
+        );
+        assert_eq!(src.last_skipped_count(), 1);
+    }
+
+    #[test]
+    fn dedup_keeps_the_most_recent_run_when_gh_lists_newest_first() {
+        let gh = FakeGh::new(page(vec![
+            run(RunSpec {
+                head_sha: "new".into(),
+                created_at: "2026-06-25T00:00:00Z",
+                ..RunSpec::default()
+            }),
+            run(RunSpec {
+                head_sha: "old".into(),
+                created_at: "2026-06-24T00:00:00Z",
+                ..RunSpec::default()
+            }),
+        ]));
+        let items = source(&gh).list_work().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source_ref, "octo/widgets@new");
+    }
+
+    #[test]
+    fn invalid_default_grader_is_a_counted_skip_and_an_all_dropped_page_raises() {
+        let bad = Grader::Command(flywheel_core::task::CommandGrader {
+            run: String::new(),
+            name: None,
+        });
+        let gh = FakeGh::new(page(vec![run_on("CI", "main")]));
+        let src = source(&gh).with_default_graders(vec![bad]);
+        let err = src.list_work().unwrap_err().to_string();
+        assert!(err.contains("non-empty 'run'"), "{err}");
+        assert_eq!(src.last_skipped_count(), 1);
+    }
+
+    #[test]
+    fn report_propagates_gh_failure() {
+        let gh = FakeGh::failing("HTTP 403");
+        let err = source(&gh)
+            .report(&report("octo/widgets@abc123"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gh api --method POST"), "{err}");
+        assert!(err.contains("HTTP 403"), "{err}");
+    }
+
+    #[test]
+    fn factory_wires_the_configured_failure_filter() {
+        let mut settings = toml::Table::new();
+        settings.insert("repo".into(), toml::Value::String("octo/widgets".into()));
+        settings.insert(
+            "failure_filter".into(),
+            toml::Value::String("timed_out".into()),
+        );
+        let built = github_ci_source_from_context(&SourceBuildContext::new(settings)).unwrap();
+        assert_eq!(built.failure_filter(), "timed_out");
     }
 }

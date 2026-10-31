@@ -22,7 +22,9 @@
 //! Every mutation runs under the single lock, so a domain-event append
 //! (version check, projection write, event row) is atomic with respect to
 //! every other caller exactly as the SQLite store's `BEGIN IMMEDIATE`
-//! transaction makes it.
+//! transaction makes it. It is also all-or-nothing: every fallible step
+//! (fold, version check, projection build) runs before the first write, so a
+//! rejected append leaves no partial state, matching the durable rollback.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -336,29 +338,43 @@ impl Inner {
         sequence
     }
 
-    /// Maintain the attempts / grader_results read-model projections for a
-    /// non-seed event, under the same lock as the lifecycle row write.
-    fn project_domain_event(
-        &mut self,
-        event: &DomainEvent,
-        folded: &Lifecycle,
-    ) -> Result<(), StoreError> {
-        match &event.payload {
-            DomainEventPayload::AttemptStarted(a) => {
-                let attempt = projected_attempt(folded, a.number)?.clone();
-                self.upsert_attempt(&folded.run_id, &attempt);
-            }
-            DomainEventPayload::AttemptFinalized(f) => {
-                let attempt = projected_attempt(folded, f.number)?.clone();
-                self.upsert_attempt(&folded.run_id, &attempt);
-            }
-            DomainEventPayload::GraderEvaluated(g) => {
-                let record = grader_result_from_event(event, g)?;
+    /// Apply a prepared read-model projection, under the same lock as the
+    /// lifecycle row write. Infallible: every check ran in
+    /// [`Projection::for_event`] before any state changed.
+    fn apply_projection(&mut self, run_id: &str, projection: Projection) {
+        match projection {
+            Projection::Attempt(attempt) => self.upsert_attempt(run_id, &attempt),
+            Projection::GraderResult(record) => {
                 self.append_grader_result(&record);
             }
-            _ => {}
+            Projection::Nothing => {}
         }
-        Ok(())
+    }
+}
+
+/// The attempts / grader_results read-model write a non-seed event implies.
+/// Built before the lifecycle row changes so a projection that cannot be
+/// built rejects the whole append, matching the durable backends' rollback.
+enum Projection {
+    Attempt(Attempt),
+    GraderResult(GraderResultRecord),
+    Nothing,
+}
+
+impl Projection {
+    fn for_event(event: &DomainEvent, folded: &Lifecycle) -> Result<Self, StoreError> {
+        Ok(match &event.payload {
+            DomainEventPayload::AttemptStarted(a) => {
+                Self::Attempt(projected_attempt(folded, a.number)?.clone())
+            }
+            DomainEventPayload::AttemptFinalized(f) => {
+                Self::Attempt(projected_attempt(folded, f.number)?.clone())
+            }
+            DomainEventPayload::GraderEvaluated(g) => {
+                Self::GraderResult(grader_result_from_event(event, g)?)
+            }
+            _ => Self::Nothing,
+        })
     }
 }
 
@@ -509,8 +525,9 @@ impl DomainEventStore for InMemoryStore {
                         ));
                     }
                     let folded = apply(Some(&current), event)?;
+                    let projection = Projection::for_event(event, &folded)?;
                     inner.update_lifecycle(&folded, expected_version)?;
-                    inner.project_domain_event(event, &folded)?;
+                    inner.apply_projection(&folded.run_id, projection);
                     folded
                 }
             };

@@ -1404,6 +1404,217 @@ fn list_lifecycles_filters_and_orders_by_most_recent_write(store: &dyn HarnessSt
     assert!(listed[0].attempts.is_empty());
 }
 
+fn update_lifecycle_persists_every_mutable_column(store: &dyn HarnessStore) {
+    let mut lc = lifecycle("t", "r1");
+    store.create_lifecycle(&lc).unwrap();
+    lc.transition_to(Status::Ready, "", Some(t(1))).unwrap();
+    lc.worker_id = "worker-b".into();
+    lc.session_id = "session-2".into();
+    lc.artifacts_dir = "/artifacts/r1".into();
+    lc.retries = 3;
+    lc.error = "agent\0crashed".into();
+    lc.agent_output = "partial output".into();
+    lc.blocked_requires_json = Some("[\"needs\0review\"]".into());
+    lc.task_content_hash = "abc123".into();
+    lc.source = "owner/repo#7".into();
+    store.update_lifecycle(&lc, 1).unwrap();
+
+    let loaded = store.load_lifecycle("r1").unwrap().unwrap();
+    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.status, Status::Ready);
+    assert_eq!(loaded.worker_id, "worker-b");
+    assert_eq!(loaded.session_id, "session-2");
+    assert_eq!(loaded.artifacts_dir, "/artifacts/r1");
+    assert_eq!(loaded.retries, 3);
+    assert!(nul_kept_or_replaced(&loaded.error, "agent\0crashed"));
+    assert_eq!(loaded.agent_output, "partial output");
+    assert!(nul_kept_or_replaced(
+        loaded.blocked_requires_json.as_deref().unwrap(),
+        "[\"needs\0review\"]"
+    ));
+    assert_eq!(loaded.task_content_hash, "abc123");
+    assert_eq!(loaded.source, "owner/repo#7");
+    assert_eq!(loaded.timestamps, lc.timestamps);
+    // The listed row carries the same columns as the point read.
+    let listed = store
+        .list_lifecycles(&LifecycleFilter::default().with_task_id("t"))
+        .unwrap();
+    assert_eq!(listed, vec![loaded]);
+}
+
+fn stale_append_is_a_conflict_even_when_the_event_would_not_fold(store: &dyn HarnessStore) {
+    // The version check precedes the fold: a stale writer learns it lost the
+    // race (and must reload) rather than seeing a replay error computed
+    // against state it never observed.
+    seed(store, "r1");
+    store
+        .append_domain_event(&transition("r1", 1, Status::Ready), 1)
+        .unwrap();
+    let err = store
+        .append_domain_event(&transition("r1", 2, Status::Done), 1)
+        .unwrap_err();
+    assert_eq!(
+        conflict(&err),
+        &StoreConflictError::OptimisticConcurrency {
+            run_id: "r1".into(),
+            expected_version: 1,
+            actual_version: 2,
+        }
+    );
+    assert_eq!(store.load_lifecycle("r1").unwrap().unwrap().version, 2);
+    assert_eq!(store.list_domain_events("r1").unwrap().len(), 2);
+}
+
+fn append_whose_projection_fails_writes_nothing(store: &dyn HarnessStore) {
+    seed(store, "r1");
+    store
+        .append_domain_event(&transition("r1", 1, Status::Ready), 1)
+        .unwrap();
+    store
+        .append_domain_event(&transition("r1", 2, Status::Running), 2)
+        .unwrap();
+    store
+        .append_domain_event(&attempt_started("r1", 3, 1, &[]), 3)
+        .unwrap();
+    let before = store.load_lifecycle("r1").unwrap().unwrap();
+    assert_eq!(before.version, 4);
+
+    // The fold accepts a grader_evaluated row (identity fold), but its
+    // grader_results projection cannot be built without an attempt number,
+    // so the whole append (lifecycle row, projection, ledger row) must roll
+    // back together.
+    let mut unattributed = grader_evaluated("r1", 4, 1);
+    unattributed.attempt_number = None;
+    store
+        .append_domain_event(&unattributed, 4)
+        .expect_err("a grader_evaluated row without an attempt cannot project");
+    assert_eq!(store.load_lifecycle("r1").unwrap().unwrap(), before);
+    assert_eq!(store.list_domain_events("r1").unwrap().len(), 4);
+    assert!(store.list_grader_results("r1", 1).unwrap().is_empty());
+
+    // The run is not wedged: the same version accepts the next valid append
+    // and the ledger stays dense.
+    let after = store
+        .append_domain_event(&grader_evaluated("r1", 5, 1), 4)
+        .unwrap();
+    assert_eq!(after.version, 5);
+    let events = store.list_domain_events("r1").unwrap();
+    assert_eq!(
+        sequences(&events),
+        vec![Some(1), Some(2), Some(3), Some(4), Some(5)]
+    );
+    assert_eq!(replay(&events).unwrap(), after);
+    assert_eq!(store.list_grader_results("r1", 1).unwrap().len(), 1);
+}
+
+fn list_lifecycles_attaches_every_attempt_in_number_order(store: &dyn HarnessStore) {
+    ensure_lifecycle(store, "r1", "t");
+    ensure_lifecycle(store, "r2", "t");
+    for n in [3, 1, 2] {
+        store
+            .save_attempt("r1", &Attempt::new(n, t(i64::from(n)), "r1"), None)
+            .unwrap();
+    }
+    store
+        .save_attempt("r2", &Attempt::new(1, t(0), "r2"), None)
+        .unwrap();
+    let listed = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+    assert_eq!(listed.len(), 2);
+    for lc in &listed {
+        assert_eq!(lc, &store.load_lifecycle(&lc.run_id).unwrap().unwrap());
+    }
+    let r1 = listed.iter().find(|lc| lc.run_id == "r1").unwrap();
+    assert_eq!(
+        r1.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+fn save_attempt_upsert_replaces_agent_context(store: &dyn HarnessStore) {
+    ensure_lifecycle(store, "r1", "t");
+    let mut first = Attempt::new(1, t(0), "r1");
+    first
+        .agent_context
+        .insert("model_id".into(), "model-a".into());
+    store.save_attempt("r1", &first, None).unwrap();
+    let mut second = Attempt::new(1, t(0), "r1");
+    second
+        .agent_context
+        .insert("transport".into(), "cli".into());
+    store.save_attempt("r1", &second, None).unwrap();
+    assert_eq!(store.load_attempt("r1", 1).unwrap().unwrap(), second);
+    assert_eq!(store.list_attempts("r1").unwrap(), vec![second]);
+}
+
+fn one_sided_spend_windows_sum_every_counter_and_skip_unknown_activity(store: &dyn HarnessStore) {
+    ensure_lifecycle(store, "r1", "t");
+    let mut active = Attempt::new(1, t(10), "r1");
+    active.input_tokens = 100;
+    active.output_tokens = 20;
+    active.cache_creation_input_tokens = 3;
+    active.cache_read_input_tokens = 4;
+    active.total_cost_usd = 0.25;
+    active.last_activity_at = Some(t(10));
+    // No activity instant: never placed inside a bounded window.
+    let mut unknown = Attempt::new(2, t(10), "r1");
+    unknown.input_tokens = 1_000;
+    unknown.output_tokens = 1_000;
+    unknown.cache_creation_input_tokens = 1_000;
+    unknown.cache_read_input_tokens = 1_000;
+    unknown.total_cost_usd = 9.0;
+    store.save_attempt("r1", &active, None).unwrap();
+    store.save_attempt("r1", &unknown, None).unwrap();
+
+    let expected = SpendSummary {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_tokens: 3,
+        cache_read_tokens: 4,
+        total_cost_usd: 0.25,
+    };
+    for window in [
+        SpendWindow {
+            since: None,
+            until: Some(t(11)),
+        },
+        SpendWindow {
+            since: Some(t(10)),
+            until: None,
+        },
+    ] {
+        assert_eq!(
+            store.summarize_spend(&window).unwrap(),
+            expected,
+            "{window:?}"
+        );
+    }
+}
+
+fn resaving_an_older_definition_keeps_its_original_created_at(store: &dyn HarnessStore) {
+    let original = command_task("t", "Original goal.");
+    let edited = command_task("t", "Edited goal.");
+    let h_original = store.save_task(&original, t(0)).unwrap();
+    store.save_task(&edited, t(10)).unwrap();
+    // Re-saving the original content is idempotent: its version row (and
+    // created_at) is never rewritten, so the latest version stays the edit.
+    assert_eq!(store.save_task(&original, t(20)).unwrap(), h_original);
+    assert_eq!(store.load_task("t", None).unwrap(), Some(edited));
+    assert_eq!(
+        store.load_task("t", Some(&h_original)).unwrap(),
+        Some(original)
+    );
+}
+
+fn latest_task_version_tie_breaks_by_insertion_across_many_versions(store: &dyn HarnessStore) {
+    let tasks: Vec<Task> = (0..12)
+        .map(|n| command_task("t", &format!("Goal number {n}.")))
+        .collect();
+    for task in &tasks {
+        store.save_task(task, t(0)).unwrap();
+    }
+    assert_eq!(store.load_task("t", None).unwrap().as_ref(), tasks.last());
+}
+
 const CASES: &[(&str, Case)] = &[
     (
         "load_missing_lifecycle_returns_none",
@@ -1564,6 +1775,38 @@ const CASES: &[(&str, Case)] = &[
     (
         "list_lifecycles_filters_and_orders_by_most_recent_write",
         list_lifecycles_filters_and_orders_by_most_recent_write,
+    ),
+    (
+        "update_lifecycle_persists_every_mutable_column",
+        update_lifecycle_persists_every_mutable_column,
+    ),
+    (
+        "stale_append_is_a_conflict_even_when_the_event_would_not_fold",
+        stale_append_is_a_conflict_even_when_the_event_would_not_fold,
+    ),
+    (
+        "append_whose_projection_fails_writes_nothing",
+        append_whose_projection_fails_writes_nothing,
+    ),
+    (
+        "list_lifecycles_attaches_every_attempt_in_number_order",
+        list_lifecycles_attaches_every_attempt_in_number_order,
+    ),
+    (
+        "save_attempt_upsert_replaces_agent_context",
+        save_attempt_upsert_replaces_agent_context,
+    ),
+    (
+        "one_sided_spend_windows_sum_every_counter_and_skip_unknown_activity",
+        one_sided_spend_windows_sum_every_counter_and_skip_unknown_activity,
+    ),
+    (
+        "resaving_an_older_definition_keeps_its_original_created_at",
+        resaving_an_older_definition_keeps_its_original_created_at,
+    ),
+    (
+        "latest_task_version_tie_breaks_by_insertion_across_many_versions",
+        latest_task_version_tie_breaks_by_insertion_across_many_versions,
     ),
 ];
 

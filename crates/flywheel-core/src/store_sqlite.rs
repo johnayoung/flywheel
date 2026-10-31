@@ -1970,4 +1970,54 @@ mod tests {
             4
         );
     }
+
+    #[test]
+    fn list_breaks_updated_at_ties_by_descending_run_id() {
+        let store = SqliteStore::in_memory().unwrap();
+        for run_id in ["r-a", "r-c", "r-b"] {
+            store
+                .create_lifecycle(&Lifecycle::new("t").with_run_id(run_id))
+                .unwrap();
+        }
+        // Writes inside one microsecond share an updated_at; the documented
+        // order then falls back to the greater run_id first.
+        store.with_connection(|conn| {
+            conn.execute(
+                "UPDATE lifecycles SET updated_at = '2026-05-28T12:00:00.000000+00:00'",
+                [],
+            )
+            .unwrap();
+        });
+        let listed: Vec<String> = store
+            .list_lifecycles(&LifecycleFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|lc| lc.run_id)
+            .collect();
+        assert_eq!(listed, vec!["r-c", "r-b", "r-a"]);
+    }
+
+    #[test]
+    fn resave_bumps_task_updated_at_and_keeps_first_seen_at() {
+        let store = SqliteStore::in_memory().unwrap();
+        let task = Task::new(
+            "Goal.",
+            vec![crate::task::Grader::Command(
+                crate::task::CommandGrader::new("true").unwrap(),
+            )],
+        )
+        .with_id("t");
+        store.save_task(&task, at(0)).unwrap();
+        store.save_task(&task, at(30)).unwrap();
+        let (first_seen, updated): (String, String) = store.with_connection(|conn| {
+            conn.query_row(
+                "SELECT first_seen_at, updated_at FROM tasks WHERE id = 't'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        });
+        assert_eq!(first_seen, format_timestamp(&at(0)));
+        assert_eq!(updated, format_timestamp(&at(30)));
+    }
 }

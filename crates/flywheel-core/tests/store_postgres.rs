@@ -984,3 +984,133 @@ fn listener_resubscribes_after_its_connection_is_terminated() {
     }
     assert!(consumer.listener_alive());
 }
+
+#[test]
+fn list_breaks_updated_at_ties_by_descending_run_id() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_tie");
+    let store = open(&pg, &schema);
+    for run_id in ["r-a", "r-c", "r-b"] {
+        store
+            .create_lifecycle(&Lifecycle::new("t").with_run_id(run_id))
+            .unwrap();
+    }
+    // Writes inside one microsecond share an updated_at; the documented
+    // order then falls back to the greater run_id first.
+    pg.admin_in(&schema)
+        .execute(
+            "UPDATE lifecycles SET updated_at = '2026-05-28T12:00:00Z'",
+            &[],
+        )
+        .unwrap();
+    let listed: Vec<String> = store
+        .list_lifecycles(&LifecycleFilter::default())
+        .unwrap()
+        .into_iter()
+        .map(|lc| lc.run_id)
+        .collect();
+    assert_eq!(listed, vec!["r-c", "r-b", "r-a"]);
+}
+
+#[test]
+fn versioned_save_attempt_waits_for_an_in_flight_lifecycle_write() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_rowlock");
+    let store = Arc::new(open(&pg, &schema));
+    store
+        .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+        .unwrap();
+    // Another writer advances the run and has not committed yet.
+    let mut writer = pg.admin_in(&schema);
+    let mut tx = writer.transaction().unwrap();
+    tx.execute(
+        "UPDATE lifecycles SET version = version + 1 WHERE run_id = 'r1'",
+        &[],
+    )
+    .unwrap();
+    let saver = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let mut rolled = Attempt::new(1, at(0), "r1");
+            rolled.input_tokens = 42;
+            store.save_attempt("r1", &rolled, Some(1))
+        })
+    };
+    // The versioned write must block on the row rather than check the
+    // pre-commit snapshot and land a stale rollup.
+    std::thread::sleep(Duration::from_millis(500));
+    tx.commit().unwrap();
+    let err = saver.join().unwrap().unwrap_err();
+    assert_eq!(
+        err.as_conflict(),
+        Some(&StoreConflictError::OptimisticConcurrency {
+            run_id: "r1".into(),
+            expected_version: 1,
+            actual_version: 2,
+        })
+    );
+    assert!(store.load_attempt("r1", 1).unwrap().is_none());
+}
+
+#[test]
+fn listen_bridge_watermark_is_the_exact_committed_sequence() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_watermark");
+    let writer = open(&pg, &schema);
+    let consumer = PostgresStore::connect_with(
+        &pg.dsn(),
+        PostgresStoreOptions {
+            schema: schema.clone(),
+            listen: true,
+            notifier: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        consumer.wait_listener(Duration::from_secs(5)),
+        Some(ListenerState::Listening)
+    );
+    let seed = DomainEvent::new(
+        "run-wm",
+        at(0),
+        DomainEventPayload::LifecycleInitialized(LifecycleInitialized {
+            task_id: "t".into(),
+            ..Default::default()
+        }),
+    );
+    writer.append_domain_event(&seed, 0).unwrap();
+    // A watermark past the ledger would let a consumer skip a real row.
+    assert_eq!(
+        consumer
+            .notifier()
+            .wait("run-wm", 0, Duration::from_secs(5)),
+        1
+    );
+    writer
+        .append_domain_event(
+            &DomainEvent::new(
+                "run-wm",
+                at(1),
+                DomainEventPayload::TransitionedTo(flywheel_core::events::TransitionedTo {
+                    target: Status::Ready,
+                    error: String::new(),
+                }),
+            ),
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        consumer
+            .notifier()
+            .wait("run-wm", 1, Duration::from_secs(5)),
+        2
+    );
+    assert_eq!(consumer.notifier().watermark("run-wm"), 2);
+    consumer.close().unwrap();
+}

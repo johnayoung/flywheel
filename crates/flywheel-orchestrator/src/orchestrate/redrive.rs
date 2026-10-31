@@ -6,7 +6,8 @@
 use crate::claims::{
     ClaimStore, ClaimStoreError, REASON_ABORTED, REASON_AWAITING_APPROVAL, REASON_BUDGET_CEILING,
     REASON_NO_PROGRESS, REASON_PREREQUISITE_MISSING, REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
-    STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET, STOP_RETRIES_ESCALATED,
+    RESOLUTION_ATTRIBUTIONS, STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET,
+    STOP_RESOLVED, STOP_RETRIES_ESCALATED,
 };
 use crate::held_out_gate::{GateOptions, HeldOutGraderSource, LandingDecision, gate_landing};
 use crate::sources::LogSink;
@@ -15,8 +16,9 @@ use crate::strategy::{
 };
 use crate::work_graph::GraphValidationIssue;
 use flywheel_core::events::{
-    DomainEvent, DomainEventPayload, LANDING_PARK_KINDS, LandingParked, LandingRedriven,
-    PARK_KIND_HELD_OUT_GATE, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED,
+    DomainEvent, DomainEventKind, DomainEventPayload, LANDING_PARK_KINDS, LandingParked,
+    LandingRedriven, PARK_KIND_HELD_OUT_GATE, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED,
+    REDRIVE_RESULT_ROUTED,
 };
 use flywheel_core::harness::BUDGET_CEILING_ERROR_PREFIX;
 use flywheel_core::invoker_client::Clock;
@@ -72,7 +74,8 @@ pub enum RedriveResult {
     /// A re-attempt was made but the run neither landed nor hit the bound
     /// (a peer held the claim); left for a later pass.
     InProgress,
-    /// No longer a landable parked change; neither re-driven nor queued.
+    /// No longer a landable parked change, or the strand was resolved after
+    /// its latest park; neither re-driven nor queued.
     Skipped,
 }
 
@@ -123,6 +126,34 @@ fn landing_already_queued(
         .list_subject_stop_events(task_id)?
         .iter()
         .any(|event| event.run_id == run_id && LANDING_PARK_KINDS.contains(&event.kind.as_str())))
+}
+
+/// True when an attributed `stop-resolved` marker for `task_id` (the
+/// operator's `resolve` abandoning the strand, or the archive probe
+/// confirming it landed) is at least as recent as the run's latest landing
+/// park -- the recency rule `status` and `resolve` apply. A park appended
+/// after the marker is a fresh strand and is re-driven as usual.
+fn resolved_since_latest_park(
+    control: &dyn HarnessStore,
+    claims: &dyn ClaimStore,
+    task_id: &str,
+    run_id: &str,
+) -> Result<bool, OrchestrateError> {
+    let Some(resolved_at) = claims
+        .list_subject_stop_events(task_id)?
+        .into_iter()
+        .filter(|event| {
+            event.kind == STOP_RESOLVED
+                && RESOLUTION_ATTRIBUTIONS.contains(&event.attribution.as_str())
+        })
+        .map(|event| event.occurred_at)
+        .next_back()
+    else {
+        return Ok(false);
+    };
+    Ok(control
+        .latest_domain_event_of_kind(run_id, DomainEventKind::LandingParked)?
+        .is_some_and(|park| park.ts <= resolved_at))
 }
 
 /// Append a `LandingRedriven` record pairing one re-drive disposition with
@@ -180,7 +211,8 @@ pub struct LandingRedriveContext<'a> {
 /// Bounded re-drive of runs parked unlanded (spec 00069, criteria #3/#4).
 ///
 /// For each request describing a DONE run: skips one that never parked,
-/// short-circuits one already routed, confirms it is still a landable
+/// short-circuits one already routed, leaves alone one whose strand was
+/// resolved (`fw resolve`) after its latest park, confirms it is still a landable
 /// parked change via the strategy's read-only probe, then re-attempts the
 /// land up to `bound` times under a freshly acquired (heartbeat-renewed,
 /// keyless) claim. Each re-attempt first clears a FRESH held-out landing
@@ -213,6 +245,26 @@ pub async fn redrive_parked_landings(
                 run_id,
                 task_id,
                 result: RedriveResult::Queued,
+                attempts: 0,
+                park_kind: parks
+                    .last()
+                    .map(|p| p.park_kind.clone())
+                    .unwrap_or_default(),
+            });
+            continue;
+        }
+        if resolved_since_latest_park(ctx.control.as_ref(), ctx.claims.as_ref(), &task_id, &run_id)?
+        {
+            emit(
+                ctx.log,
+                format!(
+                    "[orchestrate] {task_id}: parked landing was resolved after its latest park; not re-driving"
+                ),
+            );
+            outcomes.push(RedriveOutcome {
+                run_id,
+                task_id,
+                result: RedriveResult::Skipped,
                 attempts: 0,
                 park_kind: parks
                     .last()

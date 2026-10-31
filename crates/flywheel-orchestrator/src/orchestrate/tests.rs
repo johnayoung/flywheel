@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::claims::{
-    EVENT_ACQUIRED, EVENT_RELEASED, EVENT_RENEWED, InMemoryClaimStore, STOP_PREPARE_SKIP,
-    SqliteClaimStore,
+    EVENT_ACQUIRED, EVENT_RELEASED, EVENT_RENEWED, InMemoryClaimStore,
+    RESOLUTION_ATTRIBUTION_OPERATOR, STOP_PREPARE_SKIP, STOP_RESOLVED, SqliteClaimStore,
 };
 use crate::held_out_gate::FilesystemHeldOutGraderSource;
 use crate::sources::{WorkReport, WorkSourceError};
@@ -2215,6 +2215,70 @@ async fn landing_redrive_records_nothing_for_a_no_op_reattempt() {
         f.log
             .contains("parked: landing re-drive was a no-op (nothing scripted); nothing recorded")
     );
+}
+
+#[tokio::test]
+async fn landing_redrive_never_lands_a_strand_the_operator_resolved_after_its_park() {
+    let f = Fixture::new();
+    // First land parks; any re-attempt would land.
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    let run_id = parked_run(&f, &strategy).await;
+    // A stale marker (older than the park) does not stop the re-driver ...
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "parked",
+            "operator abandoned an earlier strand",
+            Utc::now() - ChronoDuration::hours(1),
+            RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+    // ... but `fw resolve` after the park abandons it.
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "parked",
+            "operator abandoned the strand: superseded by hand",
+            Utc::now(),
+            RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result, RedriveResult::Skipped);
+    assert_eq!(outcomes[0].attempts, 0);
+    assert_eq!(outcomes[0].park_kind, PARK_KIND_DIVERGENT_BASE);
+    assert_eq!(
+        strategy.submits().len(),
+        1,
+        "an abandoned strand is never re-landed"
+    );
+    assert!(redriven_results(&f, &run_id).is_empty());
+    assert!(f.claims.list_human_review_queue().unwrap().is_empty());
+    assert!(f.claims.list_claims().unwrap().is_empty());
+    assert!(
+        f.log
+            .contains("parked: parked landing was resolved after its latest park; not re-driving")
+    );
+
+    // A park appended after the marker is a fresh strand: re-driven again.
+    std::thread::sleep(Duration::from_millis(5));
+    strategy.append(
+        &run_id,
+        DomainEventPayload::LandingParked(LandingParked {
+            park_kind: PARK_KIND_DIVERGENT_BASE.to_owned(),
+            detail: "re-parked after the resolution".to_owned(),
+            ..LandingParked::default()
+        }),
+    );
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Landed);
+    assert_eq!(outcomes[0].attempts, 1);
+    assert_eq!(strategy.submits().len(), 2);
+    assert_eq!(redriven_results(&f, &run_id), ["landed"]);
 }
 
 // --- session pause ------------------------------------------------------------------

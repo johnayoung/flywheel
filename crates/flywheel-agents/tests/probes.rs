@@ -17,8 +17,11 @@ fn environment(bin: Option<&Path>, home: &Path) -> ProbeEnvironment {
 }
 
 /// Install `name` as a symlink to a system binary (never exec a freshly
-/// written file: parallel spawns can briefly hold its write fd). `env
-/// --version` prints a version line and exits 0; `false` exits non-zero.
+/// written file: parallel spawns can briefly hold its write fd). The target
+/// must not dispatch on argv[0]: multicall coreutils (uutils, the default on
+/// Ubuntu 26.04) refuse to run under the fake name, so `env` cannot stand in.
+/// `bash --version` prints a version line and exits 0 under any name; `false`
+/// exits non-zero either way.
 fn install(dir: &Path, name: &str, target: &str) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -44,12 +47,15 @@ async fn claude_probe_not_installed() {
 #[tokio::test]
 async fn claude_probe_installation_only_reads_version() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "claude", "env");
+    let bin = install(dir.path(), "claude", "bash");
     let result = probe_claude_code_in(&environment(Some(&bin), dir.path())).await;
     assert!(result.installed);
     assert_eq!(result.executable_path, Some(bin.join("claude")));
     assert!(
-        result.version.as_deref().is_some_and(|v| v.contains("env")),
+        result
+            .version
+            .as_deref()
+            .is_some_and(|v| v.contains("bash")),
         "{:?}",
         result.version
     );
@@ -80,7 +86,7 @@ async fn claude_probe_version_failure_is_a_warning() {
 #[tokio::test]
 async fn claude_probe_oauth_token_means_account_session() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "claude", "env");
+    let bin = install(dir.path(), "claude", "bash");
     let mut env = environment(Some(&bin), dir.path());
     env.vars.insert(
         "CLAUDE_CODE_OAUTH_TOKEN".into(),
@@ -100,7 +106,7 @@ async fn claude_probe_oauth_token_means_account_session() {
 #[tokio::test]
 async fn claude_probe_api_key_only() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "claude", "env");
+    let bin = install(dir.path(), "claude", "bash");
     let mut env = environment(Some(&bin), dir.path());
     env.vars
         .insert("ANTHROPIC_API_KEY".into(), "sk-test-api-secret".into());
@@ -115,7 +121,7 @@ async fn claude_probe_api_key_only() {
 #[tokio::test]
 async fn claude_probe_mixed_with_strand_warning_and_no_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "claude", "env");
+    let bin = install(dir.path(), "claude", "bash");
     let claude_dir = dir.path().join(".claude");
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(claude_dir.join(".credentials.json"), "{}").unwrap();
@@ -157,10 +163,15 @@ async fn codex_probe_not_installed() {
 #[tokio::test]
 async fn codex_probe_installation_only() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "codex", "env");
+    let bin = install(dir.path(), "codex", "bash");
     let result = probe_codex_in(&environment(Some(&bin), dir.path())).await;
     assert!(result.installed);
-    assert!(result.version.as_deref().is_some_and(|v| v.contains("env")));
+    assert!(
+        result
+            .version
+            .as_deref()
+            .is_some_and(|v| v.contains("bash"))
+    );
     assert_eq!(
         result.authentication_kind,
         AuthenticationKind::InstallationOnly
@@ -172,7 +183,7 @@ async fn codex_probe_installation_only() {
 #[tokio::test]
 async fn codex_probe_api_key_only() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "codex", "env");
+    let bin = install(dir.path(), "codex", "bash");
     let mut env = environment(Some(&bin), dir.path());
     env.vars
         .insert("OPENAI_API_KEY".into(), "sk-test-api-secret".into());
@@ -187,7 +198,7 @@ async fn codex_probe_api_key_only() {
 #[tokio::test]
 async fn codex_probe_auth_json_means_account_session() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "codex", "env");
+    let bin = install(dir.path(), "codex", "bash");
     let codex_dir = dir.path().join(".codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(
@@ -210,7 +221,7 @@ async fn codex_probe_auth_json_means_account_session() {
 #[tokio::test]
 async fn codex_probe_mixed_with_shadow_warning_and_no_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = install(dir.path(), "codex", "env");
+    let bin = install(dir.path(), "codex", "bash");
     let codex_dir = dir.path().join(".codex");
     std::fs::create_dir_all(&codex_dir).unwrap();
     std::fs::write(

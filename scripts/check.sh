@@ -20,4 +20,4 @@ cd "$REPO_ROOT"
 
 scripts/run_silent.sh "rustfmt"    cargo fmt --all --check
 scripts/run_silent.sh "clippy"     cargo clippy --workspace --all-targets -- -D warnings
-scripts/run_silent.sh "cargo test" cargo test --workspace
+scripts/run_silent.sh "cargo test" cargo test --workspace --no-fail-fast

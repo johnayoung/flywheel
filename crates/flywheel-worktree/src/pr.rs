@@ -1555,6 +1555,14 @@ mod tests {
                 other.to_str().unwrap(),
             ],
         );
+        // A clone carries no repo-local identity; set one so the commit does
+        // not depend on the host's global git config (CI runners have none).
+        git_ok(
+            &other,
+            &["config", "user.email", "landing-test@example.com"],
+        );
+        git_ok(&other, &["config", "user.name", "landing test"]);
+        git_ok(&other, &["config", "commit.gpgsign", "false"]);
         commit(&other, "theirs.txt", "y", "their fixup");
         git_ok(&other, &["push", "-q", "origin", BRANCH]);
         let theirs = remote_rev(&remote, BRANCH);
@@ -2762,10 +2770,14 @@ mod tests {
         assert!(f.phase_active());
         let logged = lines.lock().unwrap().clone();
         assert_eq!(logged.len(), 1, "{logged:?}");
+        // Git's reason is carried verbatim; newer git versions print a
+        // "Preparing worktree" progress line before the fatal one, so pin the
+        // fatal reason's presence rather than its position.
         assert!(
             logged[0].starts_with(&format!(
-                "pre-PR sync of {branch} with origin/main failed (fatal: "
-            )) && logged[0].contains("already")
+                "pre-PR sync of {branch} with origin/main failed ("
+            )) && logged[0].contains("fatal: ")
+                && logged[0].contains("already")
                 && !logged[0].contains("could not check out"),
             "{logged:?}"
         );

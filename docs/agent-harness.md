@@ -404,7 +404,7 @@ The seam is the harness `InvokeFn` (one `InvocationRequest` in, one `IterationRe
 
 | `InvocationSignals` field | Source |
 | --- | --- |
-| `stop_reason` / `result_subtype` | `StopInfo` (native + native subtype) |
+| `stop_reason` / `result_subtype` | `StopInfo` (native + native subtype); claude: the `result` envelope's `stop_reason`, else the last non-null assistant one |
 | `num_turns`, `total_cost_usd` | `CompletedRun` |
 | `result_is_error` | `StopInfo.is_error` (only when `finished`) |
 | `api_error_status` | recorded `session.finished` message |

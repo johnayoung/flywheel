@@ -636,11 +636,17 @@ impl ClaudeStreamNormalizer {
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let native_stop = self.last_stop_reason.clone().or_else(|| {
-            obj.get("stop_reason")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
+        // The terminal envelope's own stop reason describes how the session
+        // ended; the last non-null assistant value is only a fallback for
+        // CLIs that omit it. Assistant values are sticky across turns, so a
+        // first turn's `tool_use` would otherwise outlive later `null`
+        // frames and misreport an `end_turn` session.
+        let native_stop = obj
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.last_stop_reason.clone());
         let mut payload = json!({
             "normalized_stop": normalize_stop(subtype, native_stop.as_deref(), is_error).as_str(),
             "stop_reason": native_stop,

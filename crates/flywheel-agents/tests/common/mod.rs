@@ -194,6 +194,59 @@ first_line)
   text "$(extract "$FIRST_LINE" content)"
   result success false "echoed"
   ;;
+control_echo)
+  init
+  text "working"
+  IFS= read -r CONTROL || true
+  REQ=$(extract "$CONTROL" request_id)
+  emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$REQ"'","response":{}}}'
+  text "$(extract "$CONTROL" subtype):$(extract "$CONTROL" mode)"
+  result success false "echoed"
+  ;;
+control_silent)
+  init
+  text "working"
+  IFS= read -r CONTROL || true
+  sleep 300
+  ;;
+control_exit)
+  init
+  text "working"
+  IFS= read -r CONTROL || true
+  exit 0
+  ;;
+approval_echo)
+  init
+  emit '{"type":"control_request","request_id":"creq-2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"},"tool_use_id":"tu-9"}}'
+  IFS= read -r ANSWER || true
+  case "$ANSWER" in *'"interrupt":true'*) INT=interrupt ;; *) INT=no-interrupt ;; esac
+  result success false "approval:$(extract "$ANSWER" behavior):$INT:$(extract "$ANSWER" command)"
+  ;;
+approval_after_result)
+  init
+  result success false "done"
+  sleep 0.5
+  emit '{"type":"control_request","request_id":"creq-4","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{},"tool_use_id":"tu-1"}}'
+  ;;
+unsupported_control)
+  init
+  emit '{"type":"control_request","request_id":"creq-3","request":{"subtype":"hook_callback","callback_id":"cb-1"}}'
+  IFS= read -r ANSWER || true
+  result success false "control:$(extract "$ANSWER" subtype):$(extract "$ANSWER" request_id)"
+  ;;
+wait_stdin_eof)
+  init
+  text "done"
+  result success false "done"
+  cat >/dev/null
+  ;;
+linger)
+  init
+  text "done"
+  result success false "done"
+  exec >/dev/null 2>&1
+  sleep 300
+  ;;
 *)
   echo "fake_agent: unknown scenario ${FAKE_AGENT_SCENARIO}" >&2
   exit 64

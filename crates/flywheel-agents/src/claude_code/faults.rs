@@ -70,6 +70,16 @@ mod tests {
     }
 
     #[test]
+    fn pipe_epoch_tolerates_whitespace_around_the_pipe() {
+        let fault = classify_claude_fault(&evidence(
+            "Claude AI usage limit reached | 1751990400",
+            None,
+        ))
+        .unwrap();
+        assert_eq!(fault.resets_at_epoch, Some(1_751_990_400.0));
+    }
+
+    #[test]
     fn marker_without_epoch_has_no_reset() {
         let fault = classify_claude_fault(&evidence(
             "Claude AI usage limit reached -- resets 6pm",

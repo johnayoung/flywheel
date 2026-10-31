@@ -1,14 +1,15 @@
 //! The out-of-loop operator verbs: `recheck-blocked`, `recover`, and
 //! `resolve`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flywheel_core::harness::{
-    RecheckOptions, RecheckOutcome, SharedSink, recheck_blocked_lifecycle,
+    FinalizeStrandedOptions, RecheckOptions, RecheckOutcome, SharedSink,
+    finalize_stranded_lifecycle, recheck_blocked_lifecycle,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, JsonObject, LifecycleFilter, StoreError};
@@ -18,6 +19,7 @@ pub use flywheel_core::workflow::recover_stranded_lifecycles;
 use serde_json::Value;
 
 use crate::claims::{ClaimStore, RESOLUTION_ATTRIBUTION_OPERATOR, STOP_RESOLVED};
+use crate::orchestrate::stranded_run_ids;
 use crate::sources::WorkItem;
 
 use super::args::{RecheckBlockedArgs, RecoverArgs, ResolveArgs};
@@ -164,18 +166,73 @@ pub fn cmd_recheck_blocked(
     Ok(0)
 }
 
+/// Worker identity on the short bookkeeping claim `recover` holds while it
+/// finalizes one strand.
+pub const RECOVER_WORKER_ID: &str = "operator-recover";
+
+/// Lease on that bookkeeping claim: finalizing one lifecycle is a handful
+/// of store writes, and the claim is released right after.
+const RECOVER_LEASE_SECONDS: f64 = 60.0;
+
 /// Finalize stranded lifecycles and print each transitioned run id, or
 /// `(no stranded lifecycles)`.
+///
+/// A lifecycle in running/validating is stranded only when no worker is
+/// running it; a live worker's in-flight run looks identical in the store.
+/// As in the orchestrator's own lease sweep, the task claim is the liveness
+/// signal: recover finalizes a run only under that task's claim, and a run
+/// whose claim a live worker holds is skipped with a stderr note instead of
+/// being finalized out from under the worker. A lapsed lease is acquirable,
+/// so a dead or lease-lost worker's run is recovered.
 pub fn cmd_recover(
     args: &RecoverArgs,
-    store: Arc<dyn HarnessStore>,
+    store: &Arc<dyn HarnessStore>,
+    claims: &dyn ClaimStore,
+    now: DateTime<Utc>,
     logs_root: &Path,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
-    let finalized =
-        recover_stranded_lifecycles(store, args.task_id.as_deref(), Some(file_sink(logs_root)))?;
+    let sink = file_sink(logs_root);
+    let no_keys = BTreeSet::new();
+    let mut finalized = Vec::new();
+    let mut skipped = false;
+    for run_id in stranded_run_ids(store.as_ref(), args.task_id.as_deref())? {
+        let Some(lifecycle) = store.load_lifecycle(&run_id)? else {
+            continue;
+        };
+        let task_id = &lifecycle.task_id;
+        let Some(claim) = claims.acquire_claim(
+            task_id,
+            RECOVER_WORKER_ID,
+            now,
+            RECOVER_LEASE_SECONDS,
+            &no_keys,
+        )?
+        else {
+            let holder = match claims.load_claim(task_id)? {
+                Some(held) => format!("live worker {}", py_repr(&held.worker_id)),
+                None => "a conflicting live claim".to_owned(),
+            };
+            writeln!(
+                err,
+                "skipped {run_id}: task {} is claimed by {holder}; a live run is not stranded",
+                py_repr(task_id)
+            )?;
+            skipped = true;
+            continue;
+        };
+        let options = FinalizeStrandedOptions::default().with_sink(sink.clone());
+        let result = finalize_stranded_lifecycle(store.clone(), &run_id, options);
+        claims.release_claim(&claim, Some(now))?;
+        if result? {
+            finalized.push(run_id);
+        }
+    }
     if finalized.is_empty() {
-        writeln!(out, "(no stranded lifecycles)")?;
+        if !skipped {
+            writeln!(out, "(no stranded lifecycles)")?;
+        }
         return Ok(0);
     }
     for run_id in finalized {
@@ -582,6 +639,8 @@ mod tests {
         let a = seed_running(&store, "task-a");
         let b = seed_running(&store, "task-b");
         let logs = tmp.path().join("logs");
+        let claims = InMemoryClaimStore::new();
+        let mut err = Vec::new();
         let args = RecoverArgs {
             task_id: Some("task-a".into()),
             ..RecoverArgs::default()
@@ -589,7 +648,7 @@ mod tests {
         let mut out = Vec::new();
         let dyn_store: Arc<dyn HarnessStore> = store.clone();
         assert_eq!(
-            cmd_recover(&args, dyn_store.clone(), &logs, &mut out).unwrap(),
+            cmd_recover(&args, &dyn_store, &claims, t0(), &logs, &mut out, &mut err).unwrap(),
             0
         );
         assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", a.run_id));
@@ -599,19 +658,39 @@ mod tests {
         );
         let mut out = Vec::new();
         assert_eq!(
-            cmd_recover(&RecoverArgs::default(), dyn_store.clone(), &logs, &mut out).unwrap(),
+            cmd_recover(
+                &RecoverArgs::default(),
+                &dyn_store,
+                &claims,
+                t0(),
+                &logs,
+                &mut out,
+                &mut err
+            )
+            .unwrap(),
             0
         );
         assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", b.run_id));
         let mut out = Vec::new();
         assert_eq!(
-            cmd_recover(&RecoverArgs::default(), dyn_store, &logs, &mut out).unwrap(),
+            cmd_recover(
+                &RecoverArgs::default(),
+                &dyn_store,
+                &claims,
+                t0(),
+                &logs,
+                &mut out,
+                &mut err
+            )
+            .unwrap(),
             0
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "(no stranded lifecycles)\n"
         );
+        assert_eq!(String::from_utf8(err).unwrap(), "");
+        assert!(claims.list_claims().unwrap().is_empty());
     }
 
     #[test]

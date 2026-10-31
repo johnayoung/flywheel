@@ -784,7 +784,15 @@ pub fn dispatch(
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
             let logs_root = db_path.parent().unwrap_or(Path::new("")).join("logs");
-            cmd_recover(&args, stores.core.clone(), &logs_root, out)
+            cmd_recover(
+                &args,
+                &stores.core,
+                &*stores.claims,
+                chrono::Utc::now(),
+                &logs_root,
+                out,
+                err,
+            )
         }
         Command::Resolve(args) => {
             if args.reason.trim().is_empty() {
@@ -1223,6 +1231,79 @@ mod tests {
         assert_eq!(
             err,
             "error: task 'a' has no unresolved stop event to abandon (no stop event)\n"
+        );
+    }
+
+    /// `recover` is the operator's verb for a run whose worker died or lost
+    /// its lease. A running lifecycle whose task claim is still held by a
+    /// live worker is that worker's in-flight run, not a strand: recover
+    /// must leave it alone (and say so) rather than finalize it out from
+    /// under the worker. A lapsed lease is recovered, and recover's own
+    /// bookkeeping claim is released afterwards.
+    #[test]
+    fn recover_skips_a_run_whose_task_claim_a_live_worker_holds() {
+        let tmp = TempDir::new().unwrap();
+        let tasks = tmp.path().join("tasks");
+        test_support::write_task(&tasks.join("active/01-phase/a.json"), "a", &[]);
+        test_support::write_task(&tasks.join("active/01-phase/b.json"), "b", &[]);
+        let db = tmp.path().join("state").join("db.sqlite");
+        let policy = write_policy(tmp.path(), &tasks, &db);
+        let recover = argv(&[
+            "recover".to_owned(),
+            "--policy".to_owned(),
+            policy.display().to_string(),
+        ]);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let registries = default_store_registries();
+        let bundle = open_stores_for(None, &db, &registries, &Environ::new()).unwrap();
+        test_support::seed_running_dyn(&*bundle.core, "a");
+        test_support::seed_running_dyn(&*bundle.core, "b");
+        let now = chrono::Utc::now();
+        let keys = std::collections::BTreeSet::new();
+        bundle
+            .claims
+            .acquire_claim("a", "worker-live", now, 3600.0, &keys)
+            .unwrap()
+            .unwrap();
+        bundle
+            .claims
+            .acquire_claim(
+                "b",
+                "worker-dead",
+                now - chrono::Duration::seconds(600),
+                60.0,
+                &keys,
+            )
+            .unwrap()
+            .unwrap();
+        drop(bundle);
+
+        let (code, out, err) = run_capture(&recover);
+        assert_eq!(code, 0);
+        assert_eq!(out, "run-b-running\n");
+        assert_eq!(
+            err,
+            "skipped run-a-running: task 'a' is claimed by live worker 'worker-live'; \
+             a live run is not stranded\n"
+        );
+
+        let bundle = open_stores_for(None, &db, &registries, &Environ::new()).unwrap();
+        let status = |run_id: &str| bundle.core.load_lifecycle(run_id).unwrap().unwrap().status;
+        assert_eq!(
+            status("run-a-running"),
+            flywheel_core::lifecycle::Status::Running
+        );
+        assert_eq!(
+            status("run-b-running"),
+            flywheel_core::lifecycle::Status::Interrupted
+        );
+        assert_eq!(
+            bundle.claims.load_claim("a").unwrap().unwrap().worker_id,
+            "worker-live"
+        );
+        assert!(
+            bundle.claims.load_claim("b").unwrap().is_none(),
+            "recover releases the claim it took to finalize the strand"
         );
     }
 

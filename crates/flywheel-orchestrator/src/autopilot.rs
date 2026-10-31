@@ -1415,6 +1415,15 @@ pub async fn run_refill_pass(
                 if let Some(path) = path {
                     emitted.push(task);
                     emitted_paths.push(path);
+                } else {
+                    dropped.push(DroppedFinding {
+                        finding: scored.finding.clone(),
+                        reason: format!(
+                            "authored task id {} is already defined by an active or archived \
+                             task; not re-emitted",
+                            task.task.id
+                        ),
+                    });
                 }
             }
             if emitted_paths.len() >= slots {
@@ -3006,6 +3015,37 @@ mod tests {
             events[0]
                 .detail
                 .ends_with("(observed queue depth 2, target 4)")
+        );
+    }
+
+    #[tokio::test]
+    async fn refill_pass_records_an_already_defined_task_id_as_a_drop() {
+        let tmp = TempDir::new().unwrap();
+        let repo = seed_repo(&tmp);
+        let tasks_dir = tmp.path().join("tasks");
+        let archived = tasks_dir.join("archive").join("00-old");
+        std::fs::create_dir_all(&archived).unwrap();
+        let old = json!({"id": "task-t5", "goal": "Old.", "graders": [{"type": "command", "run": "true"}]});
+        std::fs::write(archived.join("task-t5.json"), old.to_string()).unwrap();
+        let discovery = library_invoker(Arc::new(Mutex::new(Vec::new())));
+        let author = tier_task_author();
+        let result = run_refill_pass(RefillPassOptions {
+            target_depth: 1,
+            discovery_invoker: Some(&discovery),
+            authoring_invoker: Some(&author),
+            ..RefillPassOptions::new(&tasks_dir, &repo)
+        })
+        .await
+        .unwrap();
+        // The top finding's task id is archived: skipped, recorded as a drop
+        // with its reason, and the open slot goes to the next finding.
+        assert_eq!(task_ids_in(&tasks_dir), vec!["task-t6"]);
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].finding.tier.value(), 5);
+        assert_eq!(
+            result.dropped[0].reason,
+            "authored task id task-t5 is already defined by an active or archived task; not \
+             re-emitted"
         );
     }
 

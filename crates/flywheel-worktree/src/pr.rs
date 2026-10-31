@@ -2581,4 +2581,240 @@ mod tests {
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert!(logged[0].contains("03-bar"));
     }
+
+    // --- mutation-survey pins (gh refresh, titles, evidence, true base, sync, verify) -------
+
+    #[test]
+    fn a_failed_pr_body_refresh_parks_instead_of_landing() {
+        // The open PR's body carries the receipts reviewers trust; a refresh
+        // that failed leaves the previous run's verdict on display, so the
+        // land is suppressed exactly like a failed create.
+        let (_dir, repo, remote) = repo_with_remote();
+        let gh = ScriptedGh::with_responder(Box::new(|argv: &[String]| match argv[1].as_str() {
+            "list" => GhOutput::ok("https://example.test/pr/3\n"),
+            "edit" => GhOutput {
+                stdout: String::new(),
+                stderr: "HTTP 502: Bad Gateway\n".into(),
+                exit_code: Some(1),
+            },
+            _ => GhOutput::ok(""),
+        }));
+        let store = ledger();
+        let s =
+            GitPullRequestSubmitter::new(submitter(&repo, Arc::clone(&store))).with_gh(gh.clone());
+        let (tf, wt) = prepare_with_commit(&s, &repo, "feature.txt", "feat");
+
+        let outcome = s.submit(&done_req(&tf, &wt));
+
+        assert_eq!(gh.commands(), ["pr list", "pr edit"]);
+        assert!(remote_branch_exists(&remote, BRANCH));
+        assert!(wt.exists());
+        let parks = parked(&store);
+        assert_eq!(parks.len(), 1);
+        assert_eq!(parks[0].park_kind, PARK_KIND_PUSH_FAILED);
+        assert!(
+            parks[0].detail.starts_with(&format!(
+                "opening a PR for {BRANCH} failed: gh pr edit https://example.test/pr/3 --body"
+            )),
+            "{}",
+            parks[0].detail
+        );
+        assert!(
+            parks[0]
+                .detail
+                .contains("failed (exit 1): HTTP 502: Bad Gateway; worktree preserved at"),
+            "{}",
+            parks[0].detail
+        );
+        assert!(landed(&store).is_empty());
+        assert_eq!(
+            outcome,
+            SubmitOutcome::parked(PARK_KIND_PUSH_FAILED, parks[0].detail.clone())
+        );
+    }
+
+    #[test]
+    fn a_long_goal_is_truncated_in_the_pr_title() {
+        let (_dir, repo, _remote) = repo_with_remote();
+        let gh = ScriptedGh::new("");
+        let s = pr_submitter(&repo, Arc::clone(&gh));
+        let (tf, wt) = prepare_with_commit(&s, &repo, "feature.txt", "feat");
+        let mut req = done_req(&tf, &wt);
+        req.task.goal = "g".repeat(200);
+
+        assert!(s.submit(&req).is_landed());
+
+        let title = arg_after(&gh.call("create"), "--title");
+        assert_eq!(title, format!("t1: {}\u{2026}", "g".repeat(85)));
+        assert_eq!(title.chars().count(), TITLE_MAX);
+    }
+
+    /// Record one command-grader result for `run_id` attempt `number`.
+    fn seed_attempt(store: &InMemoryStore, run_id: &str, number: u32, name: &str, passed: bool) {
+        let mut attempt = Attempt::new(number, now(), run_id);
+        attempt.ended_at = Some(now());
+        attempt.outcome = Some(if passed {
+            Outcome::Succeeded
+        } else {
+            Outcome::ValidationFailed
+        });
+        attempt.iterations_completed = 1;
+        attempt.turns = 1;
+        store.save_attempt(run_id, &attempt, None).unwrap();
+        let mut spec = flywheel_core::store::JsonObject::new();
+        spec.insert("type".into(), "command".into());
+        spec.insert("run".into(), "true".into());
+        store
+            .append_grader_result(&GraderResultRecord {
+                run_id: run_id.into(),
+                attempt_number: number,
+                ordinal: 0,
+                grader_type: GraderType::Command,
+                grader_spec: spec,
+                passed,
+                duration_ms: 1,
+                payload: flywheel_core::store::JsonObject::new(),
+                ts: now(),
+                grader_name: Some(name.to_owned()),
+                id: None,
+            })
+            .unwrap();
+    }
+
+    fn seed_held_out(store: &InMemoryStore, run_id: &str, outcome: &str) {
+        let version = store.load_lifecycle(run_id).unwrap().unwrap().version;
+        let event = DomainEvent::new(
+            run_id,
+            now(),
+            DomainEventPayload::HeldOutGateEvaluated(HeldOutGateEvaluated {
+                outcome: outcome.into(),
+                ..HeldOutGateEvaluated::default()
+            }),
+        );
+        store.append_domain_event(&event, version).unwrap();
+    }
+
+    #[test]
+    fn phase_evidence_is_the_latest_runs_final_attempt_and_latest_verdict() {
+        // A retried task: an older run, then a newer run whose first attempt
+        // failed its grader and whose held-out gate first failed, then
+        // passed. The body must show what decided DONE -- the newest run's
+        // final attempt and most recent gate verdict.
+        let store = InMemoryStore::new();
+        seed_done_task(
+            &store,
+            "t1",
+            "run-old",
+            Some(&[(Some("stale"), false)]),
+            Some("fail"),
+        );
+        seed_done_task(&store, "t1", "run-new", None, None);
+        seed_attempt(&store, "run-new", 1, "tests", false);
+        seed_attempt(&store, "run-new", 2, "tests", true);
+        seed_held_out(&store, "run-new", "fail");
+        seed_held_out(&store, "run-new", "pass");
+        let task = Task::new("Goal for t1.", Vec::new()).with_id("t1");
+
+        let section = collect_phase_task_receipts(&store, &task).unwrap();
+
+        assert_eq!(section.receipts, vec![receipt(0, Some("tests"), true)]);
+        assert_eq!(section.held_out_outcome.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn the_phase_pr_targets_the_configured_true_base() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        git_ok(&f.repo, &["branch", "trunk", "main"]);
+        let gh = phase_gh("");
+        let mut publisher = f.publisher(Arc::clone(&gh), quiet());
+        publisher.pr_base = "trunk".into();
+
+        f.sweep(&publisher);
+
+        assert_eq!(gh.commands(), ["pr list", "pr create"]);
+        assert_eq!(arg_after(&gh.call("list"), "--base"), "trunk");
+        assert_eq!(arg_after(&gh.call("create"), "--base"), "trunk");
+    }
+
+    #[test]
+    fn a_phase_branch_checked_out_elsewhere_refuses_the_sync_with_gits_reason() {
+        // An operator inspecting the phase branch in their own worktree
+        // blocks the scratch checkout; the refusal must be the logged gate
+        // path carrying git's own reason, with nothing pushed or opened.
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let branch = phase_branch(PHASE);
+        commit(&f.repo, "extra.txt", "mainline\n", "feat: base advanced");
+        let held = f.repo.parent().unwrap().join("held");
+        git_ok(
+            &f.repo,
+            &["worktree", "add", held.to_str().unwrap(), &branch],
+        );
+        let head_before = rev(&f.repo, &branch);
+        let gh = phase_gh("");
+        let (log, lines) = capture_log();
+        let publisher = f.publisher(Arc::clone(&gh), log);
+
+        f.sweep(&publisher);
+
+        assert!(gh.calls().is_empty());
+        assert!(!remote_branch_exists(&f.remote, &branch));
+        assert_eq!(rev(&f.repo, &branch), head_before);
+        assert!(f.phase_active());
+        let logged = lines.lock().unwrap().clone();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].starts_with(&format!(
+                "pre-PR sync of {branch} with origin/main failed (fatal: "
+            )) && logged[0].contains("already")
+                && !logged[0].contains("could not check out"),
+            "{logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_phase_verify_killed_by_a_signal_opens_no_pr() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let gh = phase_gh("");
+        let (log, lines) = capture_log();
+        let publisher = f
+            .publisher(Arc::clone(&gh), log)
+            .with_phase_verify(Some("kill -9 $$".into()));
+
+        f.sweep(&publisher);
+
+        assert!(gh.calls().is_empty());
+        assert!(!remote_branch_exists(&f.remote, &phase_branch(PHASE)));
+        assert!(f.phase_active());
+        let logged = lines.lock().unwrap().clone();
+        assert_eq!(
+            logged,
+            [
+                "[phase] verify failed against the flywheel/phase/01-foo tree (exit signal); \
+              opening no PR, phase '01-foo' left active"
+            ]
+        );
+    }
+
+    #[test]
+    fn scratch_deregisters_and_deletes_its_checkout_on_drop() {
+        let (_dir, repo, _remote) = repo_with_remote();
+        let scratch = Scratch::new("flywheel-scratch-test-", &repo).unwrap();
+        let parent = scratch.parent.clone();
+        git_ok(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                scratch.checkout.to_str().unwrap(),
+                "main",
+            ],
+        );
+        assert!(scratch.checkout.join(".git").exists());
+
+        drop(scratch);
+
+        assert!(!parent.exists());
+        assert!(!git_ok(&repo, &["worktree", "list"]).contains("flywheel-scratch-test-"));
+    }
 }

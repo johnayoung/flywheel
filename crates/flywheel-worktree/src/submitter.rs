@@ -3876,4 +3876,6 @@ mod tests {
         assert_eq!(recorder.list_grader_results("other", 0).unwrap().len(), 0);
         assert_eq!(recorder.records().len(), 2);
     }
+
+    mod landing_invariants;
 }

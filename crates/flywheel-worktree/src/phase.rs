@@ -29,7 +29,7 @@ use crate::submitter::{
     merge_lock,
 };
 use chrono::{DateTime, Utc};
-use flywheel_core::events::{DomainEventPayload, LANDING_STRAND_KINDS};
+use flywheel_core::events::{DomainEventKind, DomainEventPayload, LANDING_STRAND_KINDS};
 use flywheel_core::lifecycle::Status;
 use flywheel_core::loaders::{TaskLoadError, load_task_file};
 use flywheel_core::loop_path_marker::{LoopPathSignal, detect_loop_path_signals};
@@ -591,7 +591,7 @@ pub fn archive_completed_phases(
             let mut blocking = false;
             for task in &loaded_tasks {
                 if let Some(claims) = options.claims
-                    && has_operator_resolution(claims, &task.id)?
+                    && has_operator_resolution(claims, store, &task.id)?
                 {
                     continue;
                 }
@@ -1037,18 +1037,40 @@ fn record_indeterminate_landing(
 }
 
 /// True when `task_id`'s latest stop event is an operator resolution (the
-/// `resolve` verb deliberately abandoning a strand). Read off the record's
-/// own `attribution` column, never parsed from the detail prose.
+/// `resolve` verb deliberately abandoning a strand) that no landing strand
+/// postdates. Read off the record's own `attribution` column, never parsed
+/// from the detail prose. A landing-strand park on the task's latest DONE run
+/// appended after the resolution (the landing re-driver re-parking the run)
+/// is a fresh strand -- the rule `status` and `resolve` apply -- so the
+/// stale marker no longer exempts the task from the landing probe.
 fn has_operator_resolution(
     claims: &dyn ClaimStore,
+    store: &dyn ArchiveStore,
     task_id: &str,
-) -> Result<bool, ClaimStoreError> {
-    Ok(claims
-        .list_subject_stop_events(task_id)?
-        .last()
-        .is_some_and(|latest| {
-            latest.kind == STOP_RESOLVED && latest.attribution == RESOLUTION_ATTRIBUTION_OPERATOR
-        }))
+) -> Result<bool, ArchiveError> {
+    let events = claims.list_subject_stop_events(task_id)?;
+    let Some(latest) = events.last() else {
+        return Ok(false);
+    };
+    if latest.kind != STOP_RESOLVED || latest.attribution != RESOLUTION_ATTRIBUTION_OPERATOR {
+        return Ok(false);
+    }
+    let filter = LifecycleFilter::default()
+        .with_task_id(task_id)
+        .with_statuses([Status::Done]);
+    let Some(latest_done) = store.list_lifecycles(&filter)?.into_iter().next() else {
+        return Ok(true);
+    };
+    let newer_strand = store
+        .latest_domain_event_of_kind(&latest_done.run_id, DomainEventKind::LandingParked)?
+        .is_some_and(|event| match &event.payload {
+            DomainEventPayload::LandingParked(parked) => {
+                LANDING_STRAND_KINDS.contains(&parked.park_kind.as_str())
+                    && event.ts > latest.occurred_at
+            }
+            _ => false,
+        });
+    Ok(!newer_strand)
 }
 
 fn resolve_surfaced_stops(
@@ -2516,6 +2538,112 @@ mod tests {
         let (moved, logged) = f.sweep(armed_landing(&f, true));
         assert!(moved.is_empty());
         assert!(logged[0].contains("cannot be determined"), "{logged:?}");
+    }
+
+    /// Append a `LandingParked` of `park_kind` at `ts` to `run_id`'s ledger.
+    fn park(f: &Fixture, run_id: &str, park_kind: &str, ts: DateTime<Utc>) {
+        let lc = f.store.load_lifecycle(run_id).unwrap().unwrap();
+        let parked = DomainEvent::new(
+            run_id,
+            ts,
+            DomainEventPayload::LandingParked(flywheel_core::events::LandingParked {
+                park_kind: park_kind.into(),
+                ..flywheel_core::events::LandingParked::default()
+            }),
+        );
+        f.store.append_domain_event(&parked, lc.version).unwrap();
+    }
+
+    #[test]
+    fn an_operator_resolution_older_than_the_latest_landing_park_does_not_skip_the_probe() {
+        // `status` and `resolve` treat a landing park appended after the
+        // operator's resolution (the re-driver re-parking the run) as a fresh
+        // strand; the sweep must not archive the phase on the stale marker.
+        let t0 = Utc::now();
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        park(&f, "run-t1", PARK_KIND_DIVERGENT_BASE, t0);
+        f.claims
+            .record_stop_event(
+                STOP_RESOLVED,
+                "t1",
+                "abandoned",
+                t0 + chrono::Duration::seconds(1),
+                RESOLUTION_ATTRIBUTION_OPERATOR,
+            )
+            .unwrap();
+        park(
+            &f,
+            "run-t1",
+            PARK_KIND_DIVERGENT_BASE,
+            t0 + chrono::Duration::seconds(2),
+        );
+        let (moved, logged) = f.sweep(armed_landing(&f, true));
+        assert!(moved.is_empty(), "{logged:?}");
+        assert!(logged[0].contains("cannot be determined"), "{logged:?}");
+
+        // The operator resolves the fresh strand: the phase archives.
+        f.claims
+            .record_stop_event(
+                STOP_RESOLVED,
+                "t1",
+                "abandoned again",
+                t0 + chrono::Duration::seconds(3),
+                RESOLUTION_ATTRIBUTION_OPERATOR,
+            )
+            .unwrap();
+        let (moved, logged) = f.sweep(armed_landing(&f, true));
+        assert_eq!(moved.len(), 1, "{logged:?}");
+
+        // A newer park that is not a landing strand (merge conflict) keeps
+        // the plain operator-resolution contract.
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-t1");
+        f.claims
+            .record_stop_event(
+                STOP_RESOLVED,
+                "t1",
+                "abandoned",
+                t0,
+                RESOLUTION_ATTRIBUTION_OPERATOR,
+            )
+            .unwrap();
+        park(
+            &f,
+            "run-t1",
+            flywheel_core::events::PARK_KIND_MERGE_CONFLICT,
+            t0 + chrono::Duration::seconds(1),
+        );
+        let (moved, logged) = f.sweep(armed_landing(&f, true));
+        assert_eq!(moved.len(), 1, "{logged:?}");
+
+        // Only the latest DONE run's park counts: a superseded run's newer
+        // park does not re-open the strand.
+        let f = Fixture::new();
+        f.task("01-phase", "t1", &[]);
+        f.done("t1", "run-a");
+        park(
+            &f,
+            "run-a",
+            PARK_KIND_DIVERGENT_BASE,
+            t0 + chrono::Duration::seconds(5),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        f.done("t1", "run-b");
+        park(&f, "run-b", PARK_KIND_DIVERGENT_BASE, t0);
+        f.claims
+            .record_stop_event(
+                STOP_RESOLVED,
+                "t1",
+                "abandoned",
+                t0 + chrono::Duration::seconds(1),
+                RESOLUTION_ATTRIBUTION_OPERATOR,
+            )
+            .unwrap();
+        let (moved, logged) = f.sweep(armed_landing(&f, true));
+        assert_eq!(moved.len(), 1, "{logged:?}");
     }
 
     #[test]

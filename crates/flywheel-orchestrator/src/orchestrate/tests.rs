@@ -205,6 +205,10 @@ enum Scripted {
     /// Record `RUNNING`, then poll control commands until an `interrupt`
     /// arrives; park `INTERRUPTED` and re-raise.
     PollInterrupt,
+    /// Consult the landability gate the drive wired into the harness config
+    /// (as the harness does at the VALIDATING -> DONE edge), record its
+    /// verdict, then finish DONE.
+    ConsultGate { seen: GateVerdicts },
     /// Run an arbitrary hook mid-run (after recording RUNNING), then finish
     /// DONE.
     Hook {
@@ -212,6 +216,10 @@ enum Scripted {
         sleep_ms: u64,
     },
 }
+
+/// Per task: `None` when no gate was wired, else the gate's answer
+/// (`Some(None)` landable, `Some(Some(reason))` refused).
+type GateVerdicts = Arc<Mutex<Vec<(String, Option<Option<String>>)>>>;
 
 fn done() -> Scripted {
     Scripted::Finish {
@@ -510,6 +518,14 @@ impl RunTask for ScriptedRunner {
                     req.store.update_lifecycle(&lc, prev).unwrap();
                     Err(RunTaskError::Interrupted)
                 }
+                Scripted::ConsultGate { seen } => {
+                    let verdict = req.config.landability_gate.as_ref().map(|gate| gate());
+                    seen.lock().unwrap().push((req.task.id.clone(), verdict));
+                    Ok(outcome_of(
+                        finalize(&req, Status::Done, "", Some(Outcome::Succeeded)),
+                        None,
+                    ))
+                }
                 Scripted::Hook { hook, sleep_ms } => {
                     finalize(&req, Status::Running, "", None);
                     hook();
@@ -557,6 +573,10 @@ struct ScriptedStrategy {
     unrecorded_reparks: Mutex<HashSet<String>>,
     /// Tasks whose read-only landability probe panics.
     panicking_probes: Mutex<HashSet<String>>,
+    /// Tasks whose probe refuses with an empty reason.
+    blank_refusals: Mutex<HashSet<String>>,
+    /// Tasks whose sandbox teardown panics (after counting).
+    panicking_teardowns: Mutex<HashSet<String>>,
 }
 
 impl ScriptedStrategy {
@@ -573,7 +593,25 @@ impl ScriptedStrategy {
             landable: Mutex::new(HashMap::new()),
             unrecorded_reparks: Mutex::new(HashSet::new()),
             panicking_probes: Mutex::new(HashSet::new()),
+            blank_refusals: Mutex::new(HashSet::new()),
+            panicking_teardowns: Mutex::new(HashSet::new()),
         })
+    }
+
+    fn refuse_blank(self: &Arc<Self>, task_id: &str) -> Arc<Self> {
+        self.blank_refusals
+            .lock()
+            .unwrap()
+            .insert(task_id.to_owned());
+        self.clone()
+    }
+
+    fn panic_teardown(self: &Arc<Self>, task_id: &str) -> Arc<Self> {
+        self.panicking_teardowns
+            .lock()
+            .unwrap()
+            .insert(task_id.to_owned());
+        self.clone()
     }
 
     fn fail_prepare(self: &Arc<Self>, task_id: &str) -> Arc<Self> {
@@ -653,8 +691,15 @@ impl SubmitStrategy for ScriptedStrategy {
         let path = self.root.join(&request.task_id);
         std::fs::create_dir_all(&path)?;
         let counter = self.teardowns.clone();
+        let panics = self
+            .panicking_teardowns
+            .lock()
+            .unwrap()
+            .contains(&request.task_id);
+        let task_id = request.task_id.clone();
         let teardown: Teardown = Arc::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
+            assert!(!panics, "scripted teardown panic for {task_id}");
         });
         Ok(SandboxHandle::new(path)
             .with_env(BTreeMap::from([(
@@ -748,6 +793,14 @@ impl SubmitStrategy for ScriptedStrategy {
             "scripted probe panic for {}",
             request.task_id
         );
+        if self
+            .blank_refusals
+            .lock()
+            .unwrap()
+            .contains(&request.task_id)
+        {
+            return LandabilityVerdict::not_landable("");
+        }
         match self.landable.lock().unwrap().get(&request.task_id) {
             Some(false) => LandabilityVerdict::not_landable("scripted: not landable"),
             _ => LandabilityVerdict::landable(),
@@ -1374,6 +1427,107 @@ async fn teardown_runs_when_the_runner_fails_and_the_error_propagates() {
         f.claims.load_claim("crashy").unwrap().is_none(),
         "lease released on the error path"
     );
+}
+
+#[tokio::test]
+async fn a_panicking_sandbox_teardown_is_logged_and_the_lease_is_still_released() {
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    strategy.panic_teardown("leaky");
+    let source = MemorySource::new(vec![item("leaky"), item("next")]);
+    let mut req = f.request(source.clone());
+    req.strategy = Some(strategy.clone());
+    let report = run(req).await;
+    assert_eq!(ids(&report), ["leaky", "next"]);
+    assert_eq!(report.runs[0].status, Status::Done);
+    assert_eq!(
+        strategy.teardowns(),
+        2,
+        "each sandbox is torn down exactly once"
+    );
+    assert!(f.log.contains(
+        "[orchestrate] leaky: sandbox teardown failed (sandbox teardown panicked: scripted teardown panic for leaky); continuing"
+    ));
+    assert!(
+        !f.log.contains("next: sandbox teardown failed"),
+        "only the panicking teardown is reported"
+    );
+    assert!(
+        f.claims.list_claims().unwrap().is_empty(),
+        "the lease is released despite the teardown panic"
+    );
+    let releases: Vec<String> = f
+        .claims
+        .list_events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.event_type == EVENT_RELEASED)
+        .map(|e| e.task_id)
+        .collect();
+    assert_eq!(releases, ["leaky", "next"]);
+    assert_eq!(
+        source.reports().len(),
+        2,
+        "the report still reached the source"
+    );
+}
+
+#[tokio::test]
+async fn drive_wires_the_landability_probe_into_the_harness_gate() {
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    strategy.set_landable("stale", false);
+    strategy.refuse_blank("blank");
+    strategy.panic_probe("panicky");
+    let seen: GateVerdicts = Arc::default();
+    let tasks = ["fresh", "stale", "blank", "panicky"];
+    for id in tasks {
+        f.runner
+            .script(id, vec![Scripted::ConsultGate { seen: seen.clone() }]);
+    }
+    let mut req = f.request(MemorySource::new(tasks.iter().map(|id| item(id)).collect()));
+    req.strategy = Some(strategy.clone());
+    let report = run(req).await;
+    assert_eq!(ids(&report), tasks);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            ("fresh".to_owned(), Some(None)),
+            (
+                "stale".to_owned(),
+                Some(Some("scripted: not landable".to_owned()))
+            ),
+            (
+                "blank".to_owned(),
+                Some(Some("no landable change".to_owned()))
+            ),
+            ("panicky".to_owned(), Some(None)),
+        ],
+        "landable -> pass; refusal -> its reason (or a fallback); probe panic -> fail open"
+    );
+    let probe_failures: Vec<String> = f
+        .log
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("landability probe failed"))
+        .collect();
+    assert_eq!(
+        probe_failures,
+        [
+            "[orchestrate] panicky: landability probe failed (panic: scripted probe panic for panicky); treating as landable"
+        ]
+    );
+
+    // Without a wired strategy the harness's DONE edge stays ungated.
+    let g = Fixture::new();
+    let seen: GateVerdicts = Arc::default();
+    g.runner.script(
+        "ungated",
+        vec![Scripted::ConsultGate { seen: seen.clone() }],
+    );
+    let report = run(g.request(MemorySource::new(vec![item("ungated")]))).await;
+    assert_eq!(ids(&report), ["ungated"]);
+    assert_eq!(*seen.lock().unwrap(), [("ungated".to_owned(), None)]);
 }
 
 #[tokio::test]
@@ -2363,6 +2517,91 @@ async fn lease_stolen_between_heartbeat_ticks_is_never_landed_or_reported() {
         f.claims.load_claim("solo").unwrap().unwrap().worker_id,
         "thief",
         "stale release is a no-op"
+    );
+}
+
+/// A held-out source that, when consulted for `victim`, lets a peer steal
+/// that task's lease (as a gate long enough to outlive the lease would),
+/// then reports no held-out graders so the gate itself would land.
+struct StealingHeldOutSource {
+    claims: Arc<InMemoryClaimStore>,
+    victim: &'static str,
+    consulted: AtomicUsize,
+}
+
+impl HeldOutGraderSource for StealingHeldOutSource {
+    fn graders_for(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<Vec<CommandGrader>>, crate::held_out_gate::HeldOutGraderError> {
+        self.consulted.fetch_add(1, Ordering::SeqCst);
+        if task_id == self.victim {
+            self.claims
+                .acquire_claim(
+                    task_id,
+                    "thief",
+                    Utc::now() + ChronoDuration::hours(2),
+                    3600.0,
+                    &BTreeSet::new(),
+                )
+                .unwrap()
+                .expect("stolen");
+        }
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn lease_stolen_during_the_held_out_gate_is_never_landed_or_reported() {
+    // The run finishes with the lease held (the first ownership check
+    // passes); the steal happens inside the held-out gate, so only the
+    // re-confirm right before the irreversible land can observe it.
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    let held_out = Arc::new(StealingHeldOutSource {
+        claims: f.claims.clone(),
+        victim: "solo",
+        consulted: AtomicUsize::new(0),
+    });
+    let source = MemorySource::new(vec![item("solo"), item("peer-work")]);
+    let mut req = f.request(source.clone());
+    req.strategy = Some(strategy.clone());
+    req.held_out_source = Some(held_out.clone());
+    req.lease_seconds = 3600.0;
+    req.now = Some(Arc::new(Utc::now));
+    let report = run(req).await;
+    assert_eq!(
+        held_out.consulted.load(Ordering::SeqCst),
+        2,
+        "both runs reached the gate"
+    );
+    assert_eq!(
+        strategy
+            .submits()
+            .iter()
+            .map(|s| s.task_id.as_str())
+            .collect::<Vec<_>>(),
+        ["peer-work"],
+        "a run whose lease a peer took during the gate must never land"
+    );
+    assert!(
+        source.reports().iter().all(|r| r.task_id != "solo"),
+        "never reported"
+    );
+    assert_eq!(ids(&report), ["peer-work"]);
+    assert!(
+        f.log
+            .contains("solo: claim lost mid-run (ClaimLostError); a peer took over, re-evaluating")
+    );
+    assert_eq!(
+        f.claims.load_claim("solo").unwrap().unwrap().worker_id,
+        "thief",
+        "stale release is a no-op"
+    );
+    assert_eq!(
+        strategy.teardowns(),
+        2,
+        "the relinquished sandbox is torn down"
     );
 }
 

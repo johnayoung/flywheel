@@ -836,6 +836,68 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_row_carries_the_gate_instance_the_dashboard_pins_decisions_to() {
+        use flywheel_core::lifecycle::{Attempt, Outcome};
+        use flywheel_core::store::AttemptStore;
+        let store = InMemoryStore::new();
+        let now = at(0, 0);
+        let mut parked = Lifecycle::new("task-gated");
+        parked.run_id = "run-gated".to_owned();
+        for status in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            parked.transition_to(status, "", Some(now)).unwrap();
+        }
+        parked.awaiting_manual_ordinal = Some(3);
+        store.create_lifecycle(&parked).unwrap();
+        for number in [1, 2] {
+            let mut attempt = Attempt::new(number, now, "run-gated");
+            attempt.outcome = Some(Outcome::Succeeded);
+            store.save_attempt("run-gated", &attempt, None).unwrap();
+        }
+        let mut running = Lifecycle::new("task-live");
+        running.run_id = "run-live".to_owned();
+        running.transition_to(Status::Ready, "", Some(now)).unwrap();
+        running
+            .transition_to(Status::Running, "", Some(now))
+            .unwrap();
+        store.create_lifecycle(&running).unwrap();
+        store
+            .save_attempt("run-live", &Attempt::new(1, now, "run-live"), None)
+            .unwrap();
+
+        let gate = GateBinding {
+            awaiting_ordinal: 3,
+            attempt_number: 2,
+        };
+        let live = collect_live_rows(&store).unwrap();
+        let by_run = |rows: &[LiveRunRow], run: &str| {
+            rows.iter()
+                .find(|row| row.run_id == run)
+                .unwrap()
+                .awaiting_gate
+        };
+        assert_eq!(by_run(&live, "run-gated"), Some(gate));
+        assert_eq!(by_run(&live, "run-live"), None);
+        let snap = build_snapshot(&store, None, now, now).unwrap();
+        let gated = snap
+            .rows
+            .iter()
+            .find(|row| row.run_id == "run-gated")
+            .unwrap();
+        assert_eq!(gated.awaiting_gate, Some(gate));
+        let live_row = snap
+            .rows
+            .iter()
+            .find(|row| row.run_id == "run-live")
+            .unwrap();
+        assert_eq!(live_row.awaiting_gate, None);
+    }
+
+    #[test]
     fn json_emits_full_schema_in_python_indent_format() {
         let store = InMemoryStore::new();
         let now = at(0, 0);

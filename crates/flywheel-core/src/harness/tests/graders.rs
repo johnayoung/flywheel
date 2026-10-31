@@ -21,6 +21,8 @@ use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 
+mod gate_binding;
+
 fn rubric(name: &str, retry_on_fail: bool) -> Grader {
     Grader::Rubric(RubricGrader {
         assertions: vec!["a".into()],

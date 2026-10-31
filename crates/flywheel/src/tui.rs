@@ -852,6 +852,48 @@ pub fn run_snapshot(store: &dyn HarnessStore, work_source: &dyn WorkSource) -> i
     }
 }
 
+/// The session screen's status probe for `run_id`: the lifecycle status, the
+/// parked gate's instruction, and the parked [`GateBinding`] a console
+/// approve / reject pins itself to.
+fn session_status_probe(
+    status_store: Arc<dyn HarnessStore>,
+    status_run: String,
+) -> impl FnMut() -> Result<SessionStatus, String> + Send + 'static {
+    // The gate instruction is resolved once per ordinal, not once per
+    // 250ms tick: a parked run's task definition does not change.
+    let mut instruction_cache: Option<(u32, Option<String>)> = None;
+    move || -> Result<SessionStatus, String> {
+        let Some(lifecycle) = status_store
+            .load_lifecycle(&status_run)
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(SessionStatus::missing());
+        };
+        let instruction = match (lifecycle.status, lifecycle.awaiting_manual_ordinal) {
+            (Status::AwaitingApproval, Some(ordinal)) => {
+                if let Some((cached, text)) = &instruction_cache
+                    && *cached == ordinal
+                {
+                    text.clone()
+                } else {
+                    let text = resolve_awaiting_instruction(
+                        status_store.as_ref(),
+                        &status_run,
+                        lifecycle.status,
+                        Some(ordinal),
+                    )
+                    .map_err(|err| err.to_string())?;
+                    instruction_cache = Some((ordinal, text.clone()));
+                    text
+                }
+            }
+            _ => None,
+        };
+        Ok(SessionStatus::new(Some(lifecycle.status), instruction)
+            .with_gate(GateBinding::of_parked(&lifecycle)))
+    }
+}
+
 /// Wire the dashboard's seams over the opened stores.
 ///
 /// Every closure the screens call is bound here: the poll, the per-run
@@ -921,41 +963,7 @@ pub fn build_dashboard(
     let open_session = move |run_id: &str, task_id: &str| -> Option<SessionScreen> {
         let mut tailer = TranscriptTailer::new(run_file_path(&logs_root, run_id), run_id);
         let fetch = move || tailer.fetch().map_err(|err| err.to_string());
-        let status_store = Arc::clone(&session_store);
-        let status_run = run_id.to_owned();
-        // The gate instruction is resolved once per ordinal, not once per
-        // 250ms tick: a parked run's task definition does not change.
-        let mut instruction_cache: Option<(u32, Option<String>)> = None;
-        let status = move || -> Result<SessionStatus, String> {
-            let Some(lifecycle) = status_store
-                .load_lifecycle(&status_run)
-                .map_err(|err| err.to_string())?
-            else {
-                return Ok(SessionStatus::missing());
-            };
-            let instruction = match (lifecycle.status, lifecycle.awaiting_manual_ordinal) {
-                (Status::AwaitingApproval, Some(ordinal)) => {
-                    if let Some((cached, text)) = &instruction_cache
-                        && *cached == ordinal
-                    {
-                        text.clone()
-                    } else {
-                        let text = resolve_awaiting_instruction(
-                            status_store.as_ref(),
-                            &status_run,
-                            lifecycle.status,
-                            Some(ordinal),
-                        )
-                        .map_err(|err| err.to_string())?;
-                        instruction_cache = Some((ordinal, text.clone()));
-                        text
-                    }
-                }
-                _ => None,
-            };
-            Ok(SessionStatus::new(Some(lifecycle.status), instruction)
-                .with_gate(GateBinding::of_parked(&lifecycle)))
-        };
+        let status = session_status_probe(Arc::clone(&session_store), run_id.to_owned());
         let enqueue_store = Arc::clone(&session_store);
         let enqueue_run = run_id.to_owned();
         let enqueue = move |kind: &str, payload: JsonObject| -> Result<i64, String> {
@@ -1216,6 +1224,68 @@ mod tests {
         assert_eq!(
             serde_json::Value::Object(parked_rows[0].payload.clone()),
             serde_json::json!({"awaiting_ordinal": 4, "attempt_number": 1})
+        );
+    }
+
+    #[test]
+    fn a_console_session_decision_is_pinned_to_the_gate_its_probe_last_showed() {
+        use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome};
+        use flywheel_core::store::{AttemptStore, ControlCommandStore};
+        use flywheel_core::store_memory::InMemoryStore;
+        let store = Arc::new(InMemoryStore::new());
+        let now = Utc::now();
+        let run_id = "run-console-gate";
+        let mut lc = Lifecycle::new("t").with_run_id(run_id);
+        for status in [
+            Status::Ready,
+            Status::Running,
+            Status::Validating,
+            Status::AwaitingApproval,
+        ] {
+            lc.transition_to(status, "", Some(now)).unwrap();
+        }
+        lc.awaiting_manual_ordinal = Some(2);
+        store.create_lifecycle(&lc).unwrap();
+        let mut attempt = Attempt::new(1, now, run_id);
+        attempt.outcome = Some(Outcome::Succeeded);
+        store.save_attempt(run_id, &attempt, None).unwrap();
+
+        let core: Arc<dyn HarnessStore> = store.clone();
+        let mut probe = session_status_probe(Arc::clone(&core), run_id.to_owned());
+        assert_eq!(
+            probe().unwrap().awaiting_gate,
+            Some(GateBinding {
+                awaiting_ordinal: 2,
+                attempt_number: 1,
+            })
+        );
+        let enqueue_core = Arc::clone(&core);
+        let mut screen = SessionScreen::new(run_id, "t", || Ok(Vec::new()), probe).with_enqueue(
+            move |kind: &str, payload: JsonObject| {
+                enqueue_operator_command(enqueue_core.as_ref(), run_id, kind, payload)
+            },
+        );
+        screen.refresh_now();
+
+        // Gate 2 resolved and gate 3 parked before the screen's next tick:
+        // neither decision the operator presses was made about gate 3.
+        let mut moved = store.load_lifecycle(run_id).unwrap().unwrap();
+        let version = moved.version;
+        moved.awaiting_manual_ordinal = Some(3);
+        store.update_lifecycle(&moved, version).unwrap();
+        assert_eq!(screen.submit_approve(), None);
+        assert_eq!(screen.submit_reject(Some("not yet")), None);
+        assert!(store.claim_commands(run_id, now).unwrap().is_empty());
+
+        // Once the probe shows gate 3, a decision binds to it.
+        screen.refresh_now();
+        assert!(screen.submit_reject(Some("not yet")).is_some());
+        let rows = store.claim_commands(run_id, now).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "reject");
+        assert_eq!(
+            serde_json::Value::Object(rows[0].payload.clone()),
+            serde_json::json!({"feedback": "not yet", "awaiting_ordinal": 3, "attempt_number": 1})
         );
     }
 

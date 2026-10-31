@@ -25,6 +25,7 @@ use flywheel_agents::hosts::{
 use flywheel_core::deadline_config::{DeadlineClass, resolve_deadlines};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -277,6 +278,16 @@ pub enum DockerError {
     /// A `docker exec` exceeded its wall-clock ceiling and was killed.
     #[error("docker exec timed out after {}s", timeout.as_secs_f64())]
     ExecTimeout { timeout: Duration },
+    /// A container env entry cannot be carried in a Docker env file. Names
+    /// the key and the reason only; the value may be a secret.
+    #[error("container env {key:?} cannot be passed to docker: {reason}")]
+    InvalidEnv { key: String, reason: &'static str },
+    /// The private env file for `docker run` could not be written.
+    #[error("could not write the docker env file: {source}")]
+    EnvFile {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl DockerError {
@@ -429,9 +440,59 @@ impl RunSpec {
     }
 }
 
+/// Render `env` as the contents of a Docker `--env-file`. Pure.
+///
+/// One `KEY=VALUE` line per entry; Docker reads each value verbatim after the
+/// first `=`. A key the format cannot carry (empty, containing `=`,
+/// whitespace or a control character, or starting with `#` or a byte-order
+/// mark, which Docker would skip or reject) and a value containing a line
+/// break or NUL are refused, naming only the key, never the value.
+///
+/// # Errors
+///
+/// [`DockerError::InvalidEnv`] for the first entry the format cannot carry.
+pub fn render_env_file(env: &BTreeMap<String, String>) -> Result<String, DockerError> {
+    let mut text = String::new();
+    for (key, value) in env {
+        let invalid = |reason| DockerError::InvalidEnv {
+            key: key.clone(),
+            reason,
+        };
+        if key.is_empty() {
+            return Err(invalid("empty name"));
+        }
+        if key.starts_with('#') || key.starts_with('\u{feff}') {
+            return Err(invalid("name starts with '#' or a byte-order mark"));
+        }
+        if key
+            .chars()
+            .any(|c| c == '=' || c.is_whitespace() || c.is_control())
+        {
+            return Err(invalid(
+                "name contains '=', whitespace, or a control character",
+            ));
+        }
+        if value.contains(['\n', '\r', '\0']) {
+            return Err(invalid("value contains a line break or NUL"));
+        }
+        text.push_str(key);
+        text.push('=');
+        text.push_str(value);
+        text.push('\n');
+    }
+    Ok(text)
+}
+
 /// Build the `docker run -d` argv. Pure, no subprocess.
 ///
-/// Flag order is deterministic (env, volumes, workdir, user, network,
+/// `spec.env` values never appear on the argv: a process command line is
+/// readable by every local user (`ps`, `/proc/<pid>/cmdline`), and the env
+/// carries the agent's credentials. They travel in `env_file`, the path of a
+/// private file holding [`render_env_file`]'s output, passed as
+/// `--env-file`; [`Docker::start_container`] writes and removes it. With
+/// `env_file` `None` no env is passed.
+///
+/// Flag order is deterministic (env file, volumes, workdir, user, network,
 /// groups, devices, cpus, labels) so it is assertable in tests. The
 /// container is detached: it stays alive for subsequent `docker exec` calls
 /// via the image's `sleep infinity` entrypoint (or the explicit `command`
@@ -442,15 +503,15 @@ impl RunSpec {
 /// the startup orphan reap, which all `docker rm` it. Labels emit `--label key=value`; the flywheel-owner
 /// marker is threaded through here by [`Docker::start_container`] so every
 /// real container carries it. No label is added when `labels` is empty.
-pub fn build_run_argv(spec: &RunSpec) -> Vec<String> {
+pub fn build_run_argv(spec: &RunSpec, env_file: Option<&Path>) -> Vec<String> {
     let mut argv: Vec<String> = ["docker", "run", "-d", "--name"]
         .into_iter()
         .map(String::from)
         .collect();
     argv.push(spec.name.clone());
-    for (key, value) in &spec.env {
-        argv.push("-e".into());
-        argv.push(format!("{key}={value}"));
+    if let Some(env_file) = env_file {
+        argv.push("--env-file".into());
+        argv.push(env_file.to_string_lossy().into_owned());
     }
     for mount in &spec.mounts {
         argv.push("-v".into());
@@ -806,7 +867,29 @@ impl Docker {
         if !identity.keys().any(|key| labelled.labels.contains_key(key)) {
             labelled.labels.extend(identity);
         }
-        let out = self.run(build_run_argv(&labelled), timeout)?;
+        // The env (agent credentials included) goes through a private file
+        // (created 0600 in the temp dir), never the argv. It is removed when
+        // `env_file` drops, after the client has exited: Docker reads it
+        // client-side before contacting the daemon.
+        let env_file = if labelled.env.is_empty() {
+            None
+        } else {
+            let contents = render_env_file(&labelled.env)?;
+            let mut file = tempfile::Builder::new()
+                .prefix("flywheel-docker-env-")
+                .tempfile()
+                .map_err(|source| DockerError::EnvFile { source })?;
+            file.write_all(contents.as_bytes())
+                .and_then(|()| file.flush())
+                .map_err(|source| DockerError::EnvFile { source })?;
+            Some(file)
+        };
+        let argv = build_run_argv(
+            &labelled,
+            env_file.as_ref().map(tempfile::NamedTempFile::path),
+        );
+        let out = self.run(argv, timeout)?;
+        drop(env_file);
         Ok(out.trim().to_owned())
     }
 
@@ -1350,9 +1433,14 @@ pub(crate) mod testing {
     pub(crate) fn scripted_docker(dir: &Path, body: &str) -> (Docker, PathBuf) {
         let log = dir.join("docker.log");
         let script = dir.join("docker.sh");
+        // Any `--env-file` is copied aside while it still exists: the client
+        // deletes it once `docker run` returns.
         let text = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}\nexit 0\n",
-            log.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprev=''\nfor arg in \"$@\"; do\n  \
+             if [ \"$prev\" = '--env-file' ]; then cat \"$arg\" >> '{}'; fi\n  prev=\"$arg\"\ndone\n\
+             {body}\nexit 0\n",
+            log.display(),
+            env_file_copy(&log).display()
         );
         std::fs::write(&script, text).unwrap();
         // Run via `/bin/sh <script>` rather than exec'ing the file: a sibling
@@ -1377,6 +1465,24 @@ esac"#;
 
     /// A body that hangs on every subcommand (a wedged `dockerd`).
     pub(crate) const HANG_BODY: &str = "exec sleep 30";
+
+    /// Where [`scripted_docker`] copies the contents of every `--env-file`
+    /// it is handed (next to `log`).
+    pub(crate) fn env_file_copy(log: &Path) -> PathBuf {
+        log.with_extension("envfile")
+    }
+
+    /// The `KEY=VALUE` pairs the scripted client read from `--env-file`.
+    pub(crate) fn recorded_env(log: &Path) -> BTreeMap<String, String> {
+        std::fs::read_to_string(env_file_copy(log))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (key, value) = line.split_once('=').unwrap();
+                (key.to_owned(), value.to_owned())
+            })
+            .collect()
+    }
 
     pub(crate) fn recorded_calls(log: &Path) -> Vec<Vec<String>> {
         std::fs::read_to_string(log)
@@ -1423,11 +1529,12 @@ esac"#;
 #[cfg(test)]
 mod tests {
     use super::testing::{
-        HANG_BODY, HAPPY_BODY, live_lock, recorded_calls, require_docker, scripted_docker,
-        unique_name,
+        HANG_BODY, HAPPY_BODY, live_lock, recorded_calls, recorded_env, require_docker,
+        scripted_docker, unique_name,
     };
     use super::*;
     use flywheel_core::deadline_config::DEFAULT_DOCKER_MANAGEMENT_SECONDS;
+    use std::path::Path;
 
     /// The ceiling for the hang tests: a hung child must be cut off well
     /// within the wall budget.
@@ -1447,7 +1554,7 @@ mod tests {
     #[test]
     fn build_run_argv_minimal() {
         assert_eq!(
-            build_run_argv(&RunSpec::new("box", "img")),
+            build_run_argv(&RunSpec::new("box", "img"), None),
             sv(&["docker", "run", "-d", "--name", "box", "img"])
         );
     }
@@ -1464,15 +1571,15 @@ mod tests {
         spec.devices = sv(&["/dev/kvm"]);
         spec.cpus = Some(1.5);
         assert_eq!(
-            build_run_argv(&spec),
+            build_run_argv(&spec, Some(Path::new("/tmp/env"))),
             sv(&[
                 "docker",
                 "run",
                 "-d",
                 "--name",
                 "box",
-                "-e",
-                "ANTHROPIC_API_KEY=x",
+                "--env-file",
+                "/tmp/env",
                 "-v",
                 "/h:/s",
                 "-w",
@@ -1497,10 +1604,59 @@ mod tests {
     }
 
     #[test]
+    fn render_env_file_writes_one_verbatim_line_per_entry() {
+        let env = BTreeMap::from([
+            ("B".to_owned(), " spaced = value ".to_owned()),
+            ("A".to_owned(), String::new()),
+            ("C".to_owned(), "a=b#c'\"$HOME".to_owned()),
+        ]);
+        assert_eq!(
+            render_env_file(&env).unwrap(),
+            "A=\nB= spaced = value \nC=a=b#c'\"$HOME\n"
+        );
+        assert_eq!(render_env_file(&BTreeMap::new()).unwrap(), "");
+    }
+
+    #[test]
+    fn render_env_file_refuses_what_docker_cannot_read_back_without_echoing_values() {
+        for (key, value) in [
+            ("", "v"),
+            ("#K", "v"),
+            ("\u{feff}K", "v"),
+            ("A=B", "v"),
+            ("A B", "v"),
+            ("A\tB", "v"),
+            ("A\u{1}", "v"),
+            ("K", "secret\nline"),
+            ("K", "secret\r"),
+            ("K", "secret\0"),
+        ] {
+            let env = BTreeMap::from([(key.to_owned(), value.to_owned())]);
+            let err = render_env_file(&env).unwrap_err();
+            assert!(
+                matches!(&err, DockerError::InvalidEnv { key: k, .. } if k == key),
+                "{key:?}: {err:?}"
+            );
+            assert!(!err.to_string().contains("secret"), "{err}");
+        }
+    }
+
+    #[test]
+    fn start_container_refuses_an_unrepresentable_env_before_running_docker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) = scripted_docker(dir.path(), HAPPY_BODY);
+        let mut spec = RunSpec::new("flywheel-task-bad-env", "img");
+        spec.env.insert("K".into(), "two\nlines".into());
+        let err = docker.start_container(&spec, FAST).unwrap_err();
+        assert!(matches!(err, DockerError::InvalidEnv { .. }), "{err:?}");
+        assert!(recorded_calls(&log).is_empty());
+    }
+
+    #[test]
     fn build_run_argv_whole_cpus_keep_a_decimal_point() {
         let mut spec = RunSpec::new("box", "img");
         spec.cpus = Some(2.0);
-        let argv = build_run_argv(&spec);
+        let argv = build_run_argv(&spec, None);
         assert_eq!(argv[argv.len() - 2], "2.0");
     }
 
@@ -1508,7 +1664,7 @@ mod tests {
     fn build_run_argv_appends_command_override() {
         let spec = RunSpec::new("box", "alpine").with_command(sv(&["sleep", "infinity"]));
         assert_eq!(
-            build_run_argv(&spec),
+            build_run_argv(&spec, None),
             sv(&[
                 "docker", "run", "-d", "--name", "box", "alpine", "sleep", "infinity"
             ])
@@ -1655,6 +1811,14 @@ mod tests {
         assert!(OWNER_LABEL.starts_with("flywheel."));
     }
 
+    fn flag_values_of<'a>(argv: &'a [String], flag: &str) -> Vec<&'a str> {
+        argv.iter()
+            .enumerate()
+            .filter(|(_, token)| *token == flag)
+            .map(|(index, _)| argv[index + 1].as_str())
+            .collect()
+    }
+
     fn labels_from_argv(argv: &[String]) -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         for (index, token) in argv.iter().enumerate() {
@@ -1681,7 +1845,7 @@ mod tests {
             OWNER_LABEL.into(),
             OWNER_LABEL_VALUE.into(),
         )]));
-        let argv = build_run_argv(&spec);
+        let argv = build_run_argv(&spec, None);
         let label_at = argv.iter().position(|t| t == "--label").unwrap();
         let image_at = argv.iter().position(|t| t == "img").unwrap();
         assert!(label_at < image_at);
@@ -1726,16 +1890,55 @@ mod tests {
     }
 
     #[test]
+    fn start_container_keeps_env_values_off_the_command_line() {
+        // A secret on the `docker run` argv is readable by every local user
+        // (`ps`, /proc/<pid>/cmdline) while the client runs; values must
+        // reach the client through a private env file instead.
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) = scripted_docker(dir.path(), HAPPY_BODY);
+        let mut spec = RunSpec::new("flywheel-task-env", "img");
+        spec.env
+            .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into());
+        spec.env.insert("HOME".into(), "/home/agent".into());
+        docker.start_container(&spec, FAST).unwrap();
+        let calls = recorded_calls(&log);
+        assert_eq!(calls.len(), 1);
+        for token in &calls[0] {
+            assert!(
+                !token.contains("sk-ant-oat-secret") && !token.contains("/home/agent"),
+                "env value on the docker argv: {token:?} in {:?}",
+                calls[0]
+            );
+        }
+        assert_eq!(
+            recorded_env(&log),
+            BTreeMap::from([
+                (
+                    "CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+                    "sk-ant-oat-secret".to_owned()
+                ),
+                ("HOME".to_owned(), "/home/agent".to_owned()),
+            ])
+        );
+        let file = flag_values_of(&calls[0], "--env-file");
+        assert_eq!(file.len(), 1, "{:?}", calls[0]);
+        assert!(
+            !Path::new(file[0]).exists(),
+            "the env file is removed once docker run returns"
+        );
+    }
+
+    #[test]
     fn unmarked_and_foreign_labelled_containers_are_not_selected() {
         assert!(!selects(
             OWNER_LABEL_SELECTOR,
-            &labels_from_argv(&build_run_argv(&RunSpec::new("other", "img")))
+            &labels_from_argv(&build_run_argv(&RunSpec::new("other", "img"), None))
         ));
         let foreign = RunSpec::new("foreign", "img")
             .with_labels(BTreeMap::from([("com.example.owner".into(), "x".into())]));
         assert!(!selects(
             OWNER_LABEL_SELECTOR,
-            &labels_from_argv(&build_run_argv(&foreign))
+            &labels_from_argv(&build_run_argv(&foreign, None))
         ));
     }
 
@@ -2187,6 +2390,23 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert_eq!(lines, vec!["a", "b", "c"]);
         assert_eq!(result.stdout, "a\nb\nc");
+    }
+
+    #[test]
+    fn live_env_file_delivers_values_verbatim_into_the_container() {
+        require_docker!();
+        let _daemon = live_lock();
+        let mut spec = RunSpec::new(unique_name("flywheel-test"), ALPINE)
+            .with_command(sv(&["sleep", "infinity"]));
+        spec.env
+            .insert("FW_SECRET".into(), " a=b #c '$HOME\" ".into());
+        spec.env.insert("FW_EMPTY".into(), String::new());
+        let container = LiveContainer::start(spec);
+        let result = container.exec(
+            "printf '[%s][%s][%s]' \"$FW_SECRET\" \"$FW_EMPTY\" \"${FW_EMPTY+set}\"",
+            ExecOptions::default(),
+        );
+        assert_eq!(result.stdout, "[ a=b #c '$HOME\" ][][set]");
     }
 
     #[test]

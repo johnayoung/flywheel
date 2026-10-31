@@ -54,7 +54,7 @@ See [cli.md](cli.md) for `flywheel worker` / `fw worker`.
 
 ## Auth modes
 
-`[sandbox.container] auth` selects how the in-container CLI authenticates (`ClaudeAuth`, `crates/flywheel-container/src/auth.rs`, resolved by `resolve_auth`, `crates/flywheel-container/src/config.rs`). The token is read from a named env var **at run time** and never written to the config file.
+`[sandbox.container] auth` selects how the in-container CLI authenticates (`ClaudeAuth`, `crates/flywheel-container/src/auth.rs`, resolved by `resolve_auth`, `crates/flywheel-container/src/config.rs`). The token is read from a named env var **at run time** and never written to the config file. The container env (the token included) reaches `docker run` through a private `--env-file` (mode 0600, removed once the client exits; `Docker::start_container`, `crates/flywheel-container/src/docker.rs`), never as `-e KEY=VALUE` on the argv, which every local user can read via `ps`. An env entry the env-file format cannot carry (a value with a line break or NUL, a malformed name) fails the container start with `DockerError::InvalidEnv`, naming only the key.
 
 | Mode | How | Subscription | Notes |
 | --- | --- | --- | --- |

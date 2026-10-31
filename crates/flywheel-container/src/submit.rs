@@ -476,7 +476,8 @@ mod tests {
     use super::*;
     use crate::auth::{API_KEY_ENV, OAUTH_TOKEN_ENV};
     use crate::docker::testing::{
-        HANG_BODY, HAPPY_BODY, live_lock, recorded_calls, require_docker, scripted_docker,
+        HANG_BODY, HAPPY_BODY, live_lock, recorded_calls, recorded_env, require_docker,
+        scripted_docker,
     };
     use flywheel_agents::hosts::{ProcessPlan, StdinPlan};
     use flywheel_core::envelope::EnvelopeResult;
@@ -620,14 +621,11 @@ mod tests {
             .collect()
     }
 
-    fn env_of(argv: &[String]) -> BTreeMap<String, String> {
-        flag_values(argv, "-e")
-            .into_iter()
-            .map(|pair| {
-                let (k, v) = pair.split_once('=').unwrap();
-                (k.to_owned(), v.to_owned())
-            })
-            .collect()
+    /// The container env the recorded `docker run` received: read from its
+    /// `--env-file` (values never ride the argv).
+    fn env_of(log: &Path) -> BTreeMap<String, String> {
+        assert_eq!(flag_values(&run_call(log), "--env-file").len(), 1);
+        recorded_env(log)
     }
 
     // --- prepare / teardown over a real inner strategy ------------------------
@@ -774,7 +772,7 @@ mod tests {
         let (inner, _) = plain(dir.path());
         let h = harness(dir.path(), inner, config(), HAPPY_BODY);
         h.strategy.prepare_sandbox(&request("t")).unwrap();
-        assert_eq!(env_of(&run_call(&h.log))["HOME"], DEFAULT_AGENT_HOME);
+        assert_eq!(env_of(&h.log)["HOME"], DEFAULT_AGENT_HOME);
     }
 
     #[test]
@@ -785,7 +783,7 @@ mod tests {
         cfg.env.insert("HOME".into(), "/custom/home".into());
         let h = harness(dir.path(), inner, cfg, HAPPY_BODY);
         h.strategy.prepare_sandbox(&request("t")).unwrap();
-        assert_eq!(env_of(&run_call(&h.log))["HOME"], "/custom/home");
+        assert_eq!(env_of(&h.log)["HOME"], "/custom/home");
     }
 
     #[test]
@@ -1025,8 +1023,14 @@ mod tests {
         cfg.auth = Some(ClaudeAuth::oauth_token("tok-xyz").unwrap());
         let h = harness(dir.path(), inner, cfg, HAPPY_BODY);
         h.strategy.prepare_sandbox(&request("t")).unwrap();
-        let env = env_of(&run_call(&h.log));
+        let env = env_of(&h.log);
         assert_eq!(env[OAUTH_TOKEN_ENV], "tok-xyz");
+        assert!(
+            run_call(&h.log)
+                .iter()
+                .all(|token| !token.contains("tok-xyz")),
+            "the token never rides the docker argv"
+        );
         assert!(!env.contains_key(API_KEY_ENV));
     }
 
@@ -1045,7 +1049,7 @@ mod tests {
             mounts[1],
             format!("/host/creds:{DEFAULT_AGENT_HOME}/.claude")
         );
-        assert_eq!(env_of(&run)["HOME"], DEFAULT_AGENT_HOME);
+        assert_eq!(env_of(&h.log)["HOME"], DEFAULT_AGENT_HOME);
     }
 
     #[test]

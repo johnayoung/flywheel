@@ -989,12 +989,22 @@ impl Docker {
     /// teardown while the worker holds its lease; an ordinary failure (e.g.
     /// the container is already gone) is swallowed, but
     /// a timeout propagates so it is not mistaken for a clean removal.
+    ///
+    /// A `stop` that times out leaves the container running, so removal
+    /// falls through to `docker rm -f` (kill + remove in one call) instead of
+    /// abandoning it; only when that also times out does the stop timeout
+    /// propagate.
     pub fn remove_container(
         &self,
         name: &str,
         timeout: Option<Duration>,
     ) -> Result<(), DockerError> {
-        self.run_best_effort(strings(&["docker", "stop", name]), timeout)?;
+        if let Err(stop_err) = self.run_best_effort(strings(&["docker", "stop", name]), timeout) {
+            return match self.force_remove_container(name, timeout) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(stop_err),
+            };
+        }
         self.run_best_effort(strings(&["docker", "rm", name]), timeout)?;
         Ok(())
     }
@@ -2026,6 +2036,38 @@ mod tests {
         assert_eq!(
             recorded_calls(&log),
             vec![sv(&["stop", "box"]), sv(&["rm", "box"])]
+        );
+    }
+
+    #[test]
+    fn remove_container_force_removes_when_the_stop_times_out() {
+        // A `docker stop` that outlives the management ceiling leaves the
+        // container running; the removal must still be attempted (`rm -f`
+        // kills and removes in one call) rather than abandoning it.
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) =
+            scripted_docker(dir.path(), r#"case "$1" in stop) exec sleep 30 ;; esac"#);
+        let started = Instant::now();
+        docker.remove_container("box", TINY).unwrap();
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert_eq!(
+            recorded_calls(&log),
+            vec![sv(&["stop", "box"]), sv(&["rm", "-f", "box"])]
+        );
+    }
+
+    #[test]
+    fn remove_container_reports_the_stop_timeout_when_the_force_remove_also_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (docker, log) = scripted_docker(dir.path(), HANG_BODY);
+        let started = Instant::now();
+        let err = docker.remove_container("box", TINY).unwrap_err();
+        assert!(started.elapsed() < WALL_BUDGET);
+        assert!(err.is_timeout());
+        assert!(err.to_string().contains("docker stop"), "{err}");
+        assert_eq!(
+            recorded_calls(&log),
+            vec![sv(&["stop", "box"]), sv(&["rm", "-f", "box"])]
         );
     }
 

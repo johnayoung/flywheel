@@ -405,12 +405,16 @@ impl ContainerSubmitStrategy {
         let timeout = self.management_timeout;
         let log = Arc::clone(&self.log);
         Arc::new(move || {
-            if let Err(err) = docker.remove_container(&container_name, timeout) {
-                log(&format!(
+            // Only a removed container leaves the registry: one whose removal
+            // failed stays registered so the exit-time flush retries it (the
+            // startup orphan reap skips containers of a live owner, so it
+            // would never be collected while this worker runs).
+            match docker.remove_container(&container_name, timeout) {
+                Ok(()) => registry.unregister(&container_name),
+                Err(err) => log(&format!(
                     "Container {container_name} teardown failed ({err})"
-                ));
+                )),
             }
-            registry.unregister(&container_name);
             // The inner strategy's own teardown (if any) runs after the
             // container is gone, since the container mounted its path.
             if let Err(panic) = inner_handle.run_teardown() {
@@ -1175,12 +1179,16 @@ mod tests {
         let h = harness(dir.path(), inner, cfg.clone(), body);
         let started = Instant::now();
         let handle = h.strategy.prepare_sandbox(&request("t")).unwrap();
+        let name = h.registry.active_names().into_iter().next().unwrap();
         handle.run_teardown().unwrap();
         assert!(started.elapsed() < WALL_BUDGET);
         let lines = h.lines.lock().unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("teardown failed (docker stop timed out after 0.2s)"));
-        assert!(h.registry.active_names().is_empty());
+        assert_eq!(
+            h.registry.active_names(),
+            std::collections::BTreeSet::from([name])
+        );
         drop(lines);
 
         let (inner2, _) = plain(dir.path());
@@ -1190,6 +1198,60 @@ mod tests {
         let err = h2.strategy.prepare_sandbox(&request("t")).unwrap_err();
         assert!(started.elapsed() < WALL_BUDGET);
         assert!(err.message.contains("docker network timed out"));
+    }
+
+    #[test]
+    fn teardown_force_removes_a_container_whose_stop_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        // run succeeds; stop hangs past the ceiling; rm answers normally.
+        let body = r#"case "$1" in run) echo cid ;; stop) exec sleep 30 ;; esac"#;
+        let mut cfg = config();
+        cfg.management_timeout = Some(Duration::from_millis(200));
+        let h = harness(dir.path(), inner, cfg, body);
+        let handle = h.strategy.prepare_sandbox(&request("t")).unwrap();
+        let name = h.registry.active_names().into_iter().next().unwrap();
+        handle.run_teardown().unwrap();
+        let calls = recorded_calls(&h.log);
+        assert_eq!(
+            calls[calls.len() - 2..],
+            [
+                vec!["stop".to_owned(), name.clone()],
+                vec!["rm".to_owned(), "-f".to_owned(), name.clone()],
+            ]
+        );
+        assert!(h.registry.active_names().is_empty());
+        assert!(h.lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_container_whose_teardown_failed_stays_registered_for_the_exit_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inner, _) = plain(dir.path());
+        // run succeeds; stop and rm both hang (a wedged daemon).
+        let body = r#"case "$1" in run) echo cid ;; *) exec sleep 30 ;; esac"#;
+        let mut cfg = config();
+        cfg.management_timeout = Some(Duration::from_millis(200));
+        let h = harness(dir.path(), inner, cfg, body);
+        let handle = h.strategy.prepare_sandbox(&request("t")).unwrap();
+        let name = h.registry.active_names().into_iter().next().unwrap();
+        handle.run_teardown().unwrap();
+        assert_eq!(
+            h.registry.active_names(),
+            std::collections::BTreeSet::from([name.clone()])
+        );
+        // The daemon recovers: the exit-time flush removes the survivor.
+        let flush_dir = dir.path().join("flush");
+        std::fs::create_dir(&flush_dir).unwrap();
+        let (docker, flush_log) = scripted_docker(&flush_dir, "");
+        let outcomes = h.registry.flush(&docker);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, name);
+        assert!(outcomes[0].1.is_ok());
+        assert_eq!(
+            recorded_calls(&flush_log),
+            vec![vec!["rm".to_owned(), "-f".to_owned(), name]]
+        );
     }
 
     #[test]

@@ -42,7 +42,9 @@
 //! to compile (malformed comments substructure, an invalid compiled task)
 //! is dropped one at a time: it is counted and logged by node id, and the
 //! surviving valid threads on the page still return, so one bad node never
-//! blanks the whole listing.
+//! blanks the whole listing. If the page listed threads yet *every* one was
+//! dropped, the listing fails with the first dropped node's error instead
+//! of returning an empty list (same rule as the issue and CI sources).
 //!
 //! Outbound: [`GithubReviewWorkSource::report`] posts the run's grader
 //! receipts as a PR comment via `gh pr comment` (the PR parsed back out of
@@ -448,6 +450,7 @@ impl WorkSource for GithubReviewWorkSource {
 
         let mut items = Vec::new();
         let mut skipped = 0usize;
+        let mut first_skip: Option<WorkSourceError> = None;
         for pr in pr_nodes {
             let pr_obj = require_object(Some(pr), "pullRequest")?;
             let Some(number) = pr_obj.get("number").and_then(Value::as_i64) else {
@@ -480,10 +483,14 @@ impl WorkSource for GithubReviewWorkSource {
                     Ok(None) => {}
                     Err(exc) => {
                         skipped += 1;
+                        let detail =
+                            format!("review thread node {node_id:?} on PR #{number}: {exc}");
                         self.log(&format!(
-                            "[github_review] skipping malformed review thread node: \
-                             review thread node {node_id:?} on PR #{number}: {exc}"
+                            "[github_review] skipping malformed review thread node: {detail}"
                         ));
+                        if first_skip.is_none() {
+                            first_skip = Some(WorkSourceError::new(detail));
+                        }
                     }
                 }
             }
@@ -494,6 +501,15 @@ impl WorkSource for GithubReviewWorkSource {
                 "[github_review] skipped {skipped} malformed review thread node(s) this pass on {}",
                 self.repo
             ));
+        }
+        // A parse break must never masquerade as "every thread is resolved":
+        // if threads were listed yet nothing compiled because nodes were
+        // dropped, surface the first skip's error rather than an empty list
+        // (an empty list would let the reconciler interrupt every live run).
+        if items.is_empty()
+            && let Some(exc) = first_skip
+        {
+            return Err(exc);
         }
         Ok(items)
     }
@@ -989,11 +1005,16 @@ mod tests {
     }
 
     #[test]
-    fn all_nodes_bad_yields_empty_but_does_not_raise() {
+    fn all_nodes_bad_reraises_so_a_parse_break_never_reads_as_empty() {
         let gh = FakeGh::new(payload(vec![bad_thread("RT_x"), bad_thread("RT_y")]));
         let (log, lines) = capture_log();
         let src = source(&gh).with_log(log);
-        assert!(src.list_work().unwrap().is_empty());
+        let err = src.list_work().unwrap_err().to_string();
+        assert!(
+            err.starts_with("review thread node \"RT_x\" on PR #7: "),
+            "{err}"
+        );
+        assert!(err.contains("reviewThread.comments"), "{err}");
         assert_eq!(src.last_skipped_count(), 2);
         assert!(
             lines
@@ -1174,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_default_grader_is_a_per_node_skip() {
+    fn invalid_default_grader_is_a_counted_skip_and_an_all_dropped_page_raises() {
         let bad = Grader::Command(flywheel_core::task::CommandGrader {
             run: String::new(),
             name: None,
@@ -1182,7 +1203,11 @@ mod tests {
         let gh = FakeGh::new(payload(vec![thread("RT_x")]));
         let (log, lines) = capture_log();
         let src = source(&gh).with_default_graders(vec![bad]).with_log(log);
-        assert!(src.list_work().unwrap().is_empty());
+        let err = src.list_work().unwrap_err().to_string();
+        assert!(
+            err.contains("\"RT_x\"") && err.contains("non-empty 'run'"),
+            "{err}"
+        );
         assert_eq!(src.last_skipped_count(), 1);
         assert!(
             lines

@@ -2946,6 +2946,68 @@ async fn reconciler_interrupts_a_vanished_item_end_to_end() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_listing_whose_every_thread_fails_to_parse_never_interrupts_a_live_run() {
+    use crate::github::GhRunner;
+    use crate::github::test_support::{FakeGh, command_grader};
+    use crate::github_review::{GithubReviewWorkSource, review_item_id};
+
+    let f = Fixture::new();
+    // A review-sourced task is mid-run when GitHub changes the GraphQL
+    // `comments` shape: the thread is still open and still listed, but its
+    // node no longer compiles.
+    let task_id = review_item_id("RT_live");
+    f.seed(&task_id, "run-review", Status::Running, "");
+    let listing = serde_json::json!({
+        "data": {"repository": {"pullRequests": {
+            "nodes": [{
+                "number": 7,
+                "reviewThreads": {
+                    "nodes": [{
+                        "id": "RT_live",
+                        "isResolved": false,
+                        "isOutdated": false,
+                        "comments": "not-an-object",
+                    }],
+                    "pageInfo": {"hasNextPage": false},
+                },
+            }],
+            "pageInfo": {"hasNextPage": false},
+        }}}
+    });
+    let gh = FakeGh::new(listing.to_string());
+    let source: Arc<dyn WorkSource> = Arc::new(
+        GithubReviewWorkSource::new("octo/widgets")
+            .unwrap()
+            .with_default_graders(vec![command_grader("cargo test")])
+            .with_runner(gh.clone() as Arc<dyn GhRunner>),
+    );
+    let control: Arc<dyn HarnessStore> = f.control.clone();
+    let reconciler = tokio::spawn(sweep::source_reconcile_loop(
+        source,
+        control,
+        0.01,
+        fixed(t0()),
+        Some(f.log.sink()),
+    ));
+    // Wait until the reconciler has observed the broken listing a few times.
+    while gh.calls.lock().unwrap().len() < 3 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    reconciler.abort();
+    let _ = reconciler.await;
+    assert!(
+        f.control
+            .claim_commands("run-review", t0())
+            .unwrap()
+            .is_empty(),
+        "a parse break must read as 'could not observe', not 'all work vanished'"
+    );
+    assert!(f.log.contains("steering: work-source listing failed"));
+    assert!(f.log.contains("review thread node \"RT_live\" on PR #7"));
+    assert!(!f.log.contains("interrupt enqueued"));
+}
+
 #[test]
 fn sweep_finalizes_claimable_strands_and_reaps_orphans_but_never_a_live_claim() {
     let f = Fixture::new();

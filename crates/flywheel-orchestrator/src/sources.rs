@@ -506,6 +506,39 @@ fn active_task_entries(tasks_dir: &Path) -> Result<Vec<WalkEntry>, WorkSourceErr
     Ok(files)
 }
 
+/// Whether a task file under `tasks_dir` already defines `task_id`: any
+/// `active/<phase>/*.json` the listing walks, or any `archive/<phase>/*.json`
+/// of a completed phase. A file defines the id its `id` field names, and
+/// also its file stem (the `archive/*/<id>.json` rule prerequisite
+/// resolution uses; it also covers a file whose JSON cannot be read).
+///
+/// # Errors
+///
+/// [`WorkSourceError::Io`] when `active/`, `archive/`, or a phase directory
+/// cannot be listed.
+pub fn task_id_defined(
+    tasks_dir: impl AsRef<Path>,
+    task_id: &str,
+) -> Result<bool, WorkSourceError> {
+    let tasks_dir = tasks_dir.as_ref();
+    let mut files = iter_active_task_files(tasks_dir)?;
+    let archive = tasks_dir.join("archive");
+    if archive.is_dir() {
+        for phase in sorted_entries(&archive)? {
+            if phase.is_dir() && !phase.name().starts_with('.') {
+                files.extend(phase_task_files(&phase.path)?);
+            }
+        }
+    }
+    Ok(files.iter().any(|path| {
+        path.file_stem().is_some_and(|stem| stem == task_id)
+            || std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .is_some_and(|data| data.get("id").and_then(Value::as_str) == Some(task_id))
+    }))
+}
+
 /// Load every active task; fail on the first bad file.
 ///
 /// The list is in deterministic walk order so selection ties break by

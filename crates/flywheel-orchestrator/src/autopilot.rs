@@ -71,7 +71,9 @@ use crate::policy::{
     DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS,
     DEFAULT_AUTOPILOT_LANDING, DEFAULT_AUTOPILOT_TARGET_DEPTH,
 };
-use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError, load_active_tasks};
+use crate::sources::{
+    DirectoryWorkSource, WorkSource, WorkSourceError, load_active_tasks, task_id_defined,
+};
 use crate::surface_lint::conflict_key_for_path;
 use chrono::{DateTime, Utc};
 use flywheel_agents::hosts::DEFAULT_KILL_GRACE;
@@ -978,15 +980,19 @@ pub fn emitted_task_file(emitted: &EmittedTask, breakdown: &ScoreBreakdown) -> V
 ///
 /// Lands the file under `<tasks_dir>/active/<phase>/<task_id>.json` so the
 /// existing worker drains it (the directory adapter lists it on its next
-/// pass). Returns `Ok(None)` without overwriting when a file for that task
-/// id already exists, so re-running autopilot does not duplicate or clobber
-/// in-flight work.
+/// pass). Returns `Ok(None)` without writing when any active or archived
+/// task file already defines that task id ([`task_id_defined`]): a second
+/// listed copy would isolate every copy from scheduling, and a copy of an
+/// archived id would be satisfied by the earlier DONE record and never run.
 pub fn emit_emitted_task(
     emitted: &EmittedTask,
     breakdown: &ScoreBreakdown,
     tasks_dir: &Path,
     phase: &str,
 ) -> std::io::Result<Option<PathBuf>> {
+    if task_id_defined(tasks_dir, &emitted.task.id).map_err(std::io::Error::other)? {
+        return Ok(None);
+    }
     let phase_dir = tasks_dir.join("active").join(phase);
     std::fs::create_dir_all(&phase_dir)?;
     let target = phase_dir.join(format!("{}.json", emitted.task.id));

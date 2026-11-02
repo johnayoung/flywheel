@@ -324,20 +324,25 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   .session.active .session-state { display: none; }
 }
 
+/* A workspace's folders: one inline list, each chip marked by kind --
+   a filled dot for a git repo, a hollow one for a plain folder (repo-only
+   features do not apply), struck through in alert red when missing. */
 .ws-repos {
   display: flex;
   flex-wrap: wrap;
-  gap: .25rem .5rem;
+  gap: .2rem .65rem;
   padding: .05rem 1rem .45rem 2.05rem;
   font-size: 10px;
-  color: var(--ink-3);
+  color: var(--ink-2);
 }
 
 .ws-repos span { white-space: nowrap; }
-.ws-repos span::before { content: "\2514\2500 "; color: var(--rule-2); }
-/* A plain folder (no git): repo-only features do not apply. */
-.ws-repos span.plain { font-style: italic; opacity: .85; }
-.ws-repos span.plain::before { content: "\2514\2504 "; }
+.ws-repos span::before { margin-right: .3em; font-size: 8px; vertical-align: 1px; }
+.ws-repos span.git::before { content: "\25CF"; color: var(--brass); }
+.ws-repos span.plain { color: var(--ink-3); }
+.ws-repos span.plain::before { content: "\25CB"; color: var(--ink-3); }
+.ws-repos span.missing { color: var(--alert); text-decoration: line-through; }
+.ws-repos span.missing::before { content: "\25CB"; color: var(--alert); }
 
 .sessions { list-style: none; margin: 0; padding: 0; }
 
@@ -976,7 +981,20 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .sheet-body { margin: 0; color: var(--ink-2); line-height: 1.6; }
 .sheet-body strong { color: var(--ink); font-weight: 600; }
 
-.sheet-foot { display: flex; justify-content: flex-end; gap: .55rem; padding-top: .3rem; }
+/* Stuck to the bottom of a dialog taller than the screen, so its actions
+   never need a scroll to reach. */
+.sheet-foot {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: flex-end;
+  gap: .55rem;
+  margin: 0 -1.4rem -1.3rem;
+  padding: .75rem 1.4rem 1.3rem;
+  border-top: 1px solid var(--rule);
+  background: var(--bg-3);
+}
 
 .field { display: grid; gap: .4rem; margin: 0; padding: 0; border: 0; min-width: 0; }
 
@@ -1011,8 +1029,8 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .repo-row {
   display: grid;
-  grid-template-columns: 1.4rem 1fr 1.55rem;
-  grid-template-areas: "n input x" ". note note";
+  grid-template-columns: 1.4rem 1fr 7.5rem 1.55rem;
+  grid-template-areas: "n input label x" ". note note note";
   align-items: center;
   gap: .15rem .4rem;
   counter-increment: repo;
@@ -1121,6 +1139,20 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   background: var(--bg-3);
 }
 .import-file.broken { border-left-color: var(--alert); opacity: .8; }
+.import-confirm {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: .45rem;
+  padding-top: .45rem;
+  border-top: 1px dashed var(--rule-2);
+  font-size: 10.5px;
+  color: var(--ink-2);
+}
+.import-confirm > span { flex: 1 1 14rem; overflow-wrap: anywhere; }
+.import-confirm b { color: var(--brass); font-weight: 600; }
 .import-what { display: grid; gap: .1rem; min-width: 0; }
 .import-what b { font-weight: 600; font-size: 12.5px; }
 .import-what small {
@@ -1238,6 +1270,25 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .repo-choice b { font-weight: 600; font-size: 12px; }
 .repo-choice small { font-size: 10px; color: var(--ink-3); overflow-wrap: anywhere; }
 .repo-choice:has(input:checked) { border-color: var(--signal); }
+.repo-choice[hidden] { display: none; }
+.repo-choice.missing { cursor: not-allowed; opacity: .6; }
+.repo-choice.missing .folder-tag { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, transparent); }
+.repo-list { display: grid; gap: .3rem; }
+/* Many folders: compact rows in a bounded list (the filter narrows it). */
+.repo-list.long { max-height: 14.5rem; overflow: auto; padding-right: .2rem; }
+.repo-list.long .repo-choice { padding: .3rem .55rem; }
+.repo-filter { font-family: var(--term) !important; font-stretch: normal !important; }
+
+/* Folder labels beside their paths in the workspace dialog. */
+.repo-row .folder-label { grid-area: label; min-width: 0; }
+@media (max-width: 520px) {
+  .repo-row { grid-template-columns: 1.4rem 1fr 1.55rem; grid-template-areas: "n input x" ". label label" ". note note"; }
+}
+
+/* Phone: one scroller (the dialog), not lists scrolling inside it. */
+@media (max-width: 600px) {
+  .import-files, .import-folders, .repo-list.long { max-height: none; overflow: visible; }
+}
 
 /* --- palette ------------------------------------------------------------- */
 

@@ -434,19 +434,20 @@ impl Hub {
 
     // --- workspaces ---------------------------------------------------------
 
-    /// Every workspace, each folder's git flag read from disk now (a
-    /// folder may have been `git init`ed or had its `.git` removed).
+    /// Every workspace, each folder's `git`/`missing` flags read from disk
+    /// now (a folder may have been `git init`ed, or moved away). Blocking
+    /// filesystem I/O: call off the async executor.
     pub fn workspaces(&self) -> Vec<Workspace> {
         let mut workspaces = self.store().workspaces().to_vec();
         for workspace in &mut workspaces {
-            workspace.refresh_git();
+            workspace.refresh_disk();
         }
         workspaces
     }
 
     pub fn workspace(&self, id: &str) -> Result<Workspace, HubError> {
         let mut workspace = self.store().workspace(id)?.clone();
-        workspace.refresh_git();
+        workspace.refresh_disk();
         Ok(workspace)
     }
 
@@ -487,14 +488,25 @@ impl Hub {
         let parsed = vscode::read(&file, &env).map_err(StateError::Invalid)?;
         let mut skipped = parsed.skipped;
         let mut specs = Vec::new();
+        // Canonical path -> the entry that brought it in.
+        let mut seen: HashMap<PathBuf, String> = HashMap::new();
         for folder in parsed.folders {
             match validate_folder(&folder.path) {
-                Ok(path) => specs.push(FolderSpec::Labeled {
-                    path,
-                    // Explicit, so an update drops a label the file no
-                    // longer has.
-                    name: Some(folder.name.unwrap_or_default()),
+                Ok(path) if seen.contains_key(&path) => skipped.push(vscode::Skipped {
+                    index: folder.index,
+                    reason: format!("the same folder as {}", seen[&path]),
+                    entry: folder.entry,
+                    path: Some(path),
                 }),
+                Ok(path) => {
+                    seen.insert(path.clone(), folder.entry);
+                    specs.push(FolderSpec::Labeled {
+                        path,
+                        // Explicit, so an update drops a label the file no
+                        // longer has.
+                        name: Some(folder.name.unwrap_or_default()),
+                    });
+                }
                 Err(_) if !folder.path.exists() => skipped.push(vscode::Skipped {
                     index: folder.index,
                     entry: folder.entry,
@@ -619,6 +631,7 @@ impl Hub {
         let workspace = self.workspace(&request.workspace_id)?;
         let cwd = match &request.repo {
             None => workspace.first_folder().to_path_buf(),
+            Some(repo) if workspace.has_folder(repo) => repo.clone(),
             Some(repo) => {
                 let canonical = repo
                     .canonicalize()
@@ -634,6 +647,14 @@ impl Hub {
                 canonical
             }
         };
+        if !cwd.is_dir() {
+            return Err(StateError::Invalid(format!(
+                "folder {} of workspace {} no longer exists (moved or deleted?); restore it or edit the workspace",
+                cwd.display(),
+                workspace.name
+            ))
+            .into());
+        }
         let command = match (request.kind, request.command) {
             (SessionKind::Shell, Some(argv)) if argv.is_empty() || argv[0].trim().is_empty() => {
                 return Err(StateError::Invalid("command must not be empty".into()).into());

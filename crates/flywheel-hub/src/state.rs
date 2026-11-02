@@ -39,13 +39,30 @@ pub struct Folder {
     /// features (worktrees, branch badges) key off it.
     #[serde(default)]
     pub git: bool,
+    /// The directory is gone (deleted, moved, or an unmounted volume) as
+    /// of the last check. Recomputed like `git`; sessions cannot open
+    /// there until it is back.
+    #[serde(default)]
+    pub missing: bool,
 }
 
 impl Folder {
-    /// A folder at canonical `path`, its git flag read from disk.
+    /// A folder at canonical `path`, its flags read from disk.
     pub fn at(path: PathBuf, name: Option<String>) -> Self {
-        let git = is_git_root(&path);
-        Self { path, name, git }
+        let mut folder = Self {
+            path,
+            name,
+            git: false,
+            missing: false,
+        };
+        folder.refresh();
+        folder
+    }
+
+    /// Re-read the `git` and `missing` flags from disk.
+    pub fn refresh(&mut self) {
+        self.missing = !self.path.is_dir();
+        self.git = !self.missing && is_git_root(&self.path);
     }
 }
 
@@ -76,10 +93,10 @@ impl Workspace {
         &self.folders[0].path
     }
 
-    /// Re-read every folder's git flag from disk.
-    pub fn refresh_git(&mut self) {
+    /// Re-read every folder's `git` and `missing` flags from disk.
+    pub fn refresh_disk(&mut self) {
         for folder in &mut self.folders {
-            folder.git = is_git_root(&folder.path);
+            folder.refresh();
         }
     }
 }
@@ -107,6 +124,7 @@ impl From<WorkspaceRepr> for Workspace {
                     path,
                     name: None,
                     git: false,
+                    missing: false,
                 })
                 .collect(),
             (None, None) => Vec::new(),
@@ -320,9 +338,10 @@ impl HubStore {
                 doc.version
             )));
         }
-        // A folder may have become (or stopped being) a git repo since.
+        // A folder may have become (or stopped being) a git repo, or
+        // disappeared, since.
         for workspace in &mut doc.workspaces {
-            workspace.refresh_git();
+            workspace.refresh_disk();
         }
         let now = Utc::now();
         let mut demoted = false;
@@ -463,7 +482,7 @@ impl HubStore {
         match self.workspace_named(&name).map(|w| w.id.clone()) {
             Some(id) if update => Ok((self.update_workspace(&id, input(None))?, false)),
             Some(_) => Err(StateError::Conflict(format!(
-                "a workspace named {name:?} already exists; import it with update to replace its folders"
+                "a workspace named {name:?} already exists; update it (fw hub import --update) to replace its folders"
             ))),
             None => Ok((self.create_workspace(input(Some(name)))?, true)),
         }
@@ -810,8 +829,8 @@ fn validate_label(raw: &str) -> Result<Option<String>, StateError> {
 }
 
 /// Canonicalize and check folder specs: 1..=MAX_FOLDERS paths passing
-/// [`validate_folder`], duplicates dropped (the first keeps its place and
-/// label). A spec without a label keeps the one its path has in
+/// [`validate_folder`] (or already in `previous`, kept even while
+/// missing), duplicates dropped (the first keeps its place and label). A spec without a label keeps the one its path has in
 /// `previous` (the folders being replaced).
 pub fn validate_folders(
     specs: &[FolderSpec],
@@ -830,7 +849,13 @@ pub fn validate_folders(
     let mut seen = HashSet::new();
     let mut folders = Vec::with_capacity(specs.len());
     for spec in specs {
-        let path = validate_folder(spec.path())?;
+        // A folder the workspace already has may stay while it is missing
+        // (an unmounted volume, a directory moved for a moment): editing
+        // the rest of the list must not force it out.
+        let path = match previous.iter().find(|f| f.path == spec.path()) {
+            Some(kept) if !kept.path.is_dir() => kept.path.clone(),
+            _ => validate_folder(spec.path())?,
+        };
         if !seen.insert(path.clone()) {
             continue;
         }
@@ -1091,12 +1116,14 @@ mod tests {
                 Folder {
                     path: repo.clone(),
                     name: Some("Main".into()),
-                    git: true
+                    git: true,
+                    missing: false,
                 },
                 Folder {
                     path: plain.clone(),
                     name: None,
-                    git: false
+                    git: false,
+                    missing: false,
                 },
             ]
         );
@@ -1137,6 +1164,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cleared.folders[0].name, None);
+    }
+
+    #[test]
+    fn a_folder_gone_from_disk_is_flagged_missing_and_may_stay_in_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = git_repo(dir.path(), "a").canonicalize().unwrap();
+        let plain = dir.path().join("b");
+        fs::create_dir(&plain).unwrap();
+        let b = plain.canonicalize().unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![a.clone(), b.clone()]))
+            .unwrap();
+        assert!(ws.folders.iter().all(|f| !f.missing));
+        fs::rename(&b, dir.path().join("b-moved")).unwrap();
+        // Not mistaken for a plain folder: flagged on load and on refresh.
+        let mut listed = ws.clone();
+        listed.refresh_disk();
+        assert!(listed.folders[1].missing && !listed.folders[1].git);
+        let mut store2 = HubStore::open(dir.path()).unwrap();
+        assert!(store2.workspaces()[0].folders[1].missing);
+        assert!(!store2.workspaces()[0].folders[0].missing);
+        // An edit that keeps it (and changes the rest) is accepted; adding
+        // a different missing path is not.
+        let kept = store2
+            .update_workspace(&ws.id, input("w2", vec![b.clone()]))
+            .unwrap();
+        assert!(kept.folders[0].missing);
+        assert!(matches!(
+            store2.update_workspace(&ws.id, input("w2", vec![dir.path().join("nope")])),
+            Err(StateError::Invalid(_))
+        ));
+        drop(store);
     }
 
     #[test]

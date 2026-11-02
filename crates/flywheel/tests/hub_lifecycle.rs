@@ -703,7 +703,12 @@ fn import_vscode_workspaces_and_open_a_signed_in_browser() {
     // An existing name needs --update, which replaces the folders.
     let again = env.fw(&["import", life.to_str().unwrap()]);
     assert_eq!(again.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+    let refusal = String::from_utf8_lossy(&again.stderr).into_owned();
+    assert!(
+        refusal.contains("already exists") && refusal.contains("--update"),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("(409)"), "{refusal}");
     let updated = env.ok(&["import", life.to_str().unwrap(), "--update"]);
     assert!(updated.contains("updated workspace \"life\""), "{updated}");
     let named = env.ok(&["import", team.to_str().unwrap(), "--name", "team two"]);
@@ -721,6 +726,27 @@ fn import_vscode_workspaces_and_open_a_signed_in_browser() {
         ls.contains(&format!("{} (no git)", notes.display())),
         "{ls}"
     );
+    assert!(ls.contains(&format!("{} (App)", app.display())), "{ls}");
+
+    // `--folder` also takes a folder's label or directory name.
+    let by_label = env.ok(&["new", "life", "--folder", "App", "--name", "by-label"]);
+    let by_dir = env.ok(&["new", "life", "--folder", "notes", "--name", "by-dir"]);
+    let listed = env.ok(&["ls", "--json"]);
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    let cwd_of = |id: &str| -> String {
+        listed["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|w| w["sessions"].as_array().unwrap().iter())
+            .find(|s| s["id"] == id.trim())
+            .map(|s| s["cwd"].as_str().unwrap().to_owned())
+            .unwrap()
+    };
+    assert_eq!(cwd_of(&by_label), app.to_str().unwrap());
+    assert_eq!(cwd_of(&by_dir), notes.to_str().unwrap());
+    env.ok(&["kill", "by-label"]);
+    env.ok(&["kill", "by-dir"]);
 
     // Sessions open in a plain folder by its path.
     let session = env
@@ -735,7 +761,8 @@ fn import_vscode_workspaces_and_open_a_signed_in_browser() {
         .trim()
         .to_owned();
 
-    // `open` prints the URL and hands it to $BROWSER.
+    // `open` prints the URL and hands $BROWSER a private page that
+    // forwards to it (the code stays off every command line).
     let opened = env.root.join("opened");
     let browser = env.root.join("bin/record-browser");
     std::fs::create_dir_all(browser.parent().unwrap()).unwrap();
@@ -762,7 +789,28 @@ fn import_vscode_workspaces_and_open_a_signed_in_browser() {
     assert!(url.starts_with("http://127.0.0.1:"), "{url}");
     assert!(url.contains("/login?code="), "{url}");
     assert!(url.ends_with(&format!("#session={session}")), "{url}");
-    assert_eq!(std::fs::read_to_string(&opened).unwrap(), url);
+    let handed = std::fs::read_to_string(&opened).unwrap();
+    assert!(!handed.contains("code="), "{handed}");
+    let page = std::path::PathBuf::from(handed.strip_prefix("file://").unwrap());
+    assert!(page.starts_with(&env.state), "{handed}");
+    let html = std::fs::read_to_string(&page).unwrap();
+    assert!(
+        html.contains(&format!("location.replace(\"{url}\")")),
+        "{html}"
+    );
+    // An opener that ran and failed is not followed by another that would
+    // open a second tab on a spent code.
+    let output = env
+        .command(&["open"])
+        .env("BROWSER", "false")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("false exited"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // The code signs a browser in (once).
     let get = |url: &str| -> String {

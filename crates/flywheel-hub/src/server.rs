@@ -709,12 +709,16 @@ async fn blocking<T: Send + 'static>(
 
 // --- workspaces -------------------------------------------------------------
 
-async fn list_workspaces(State(app): State<AppState>) -> Response {
-    Json(json!({ "workspaces": app.hub.workspaces() })).into_response()
+// Both stat every folder (git/missing flags): off the executor.
+async fn list_workspaces(State(app): State<AppState>) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let workspaces = blocking(move || Ok(hub.workspaces())).await?;
+    Ok(Json(json!({ "workspaces": workspaces })).into_response())
 }
 
 async fn get_workspace(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
-    Ok(Json(app.hub.workspace(&id)?).into_response())
+    let hub = Arc::clone(&app.hub);
+    Ok(Json(blocking(move || hub.workspace(&id)).await?).into_response())
 }
 
 async fn create_workspace(

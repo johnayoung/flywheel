@@ -8,7 +8,7 @@
 "use strict";
 
 window.FwHubImport = function (ctx) {
-  const { $, el, api, refresh, rememberWorkspace, basename } = ctx;
+  const { $, el, api, refresh, rememberWorkspace, basename, workspaceById } = ctx;
 
   const ui = {
     root: "", // the search root last scanned (as the hub resolved it)
@@ -95,9 +95,9 @@ window.FwHubImport = function (ctx) {
           title: file.workspace_id
             ? `Replace the folders of workspace ${file.name} with this file's`
             : `Create workspace ${file.name}`,
-          onclick: () => importFile(file.path, !!file.workspace_id),
+          onclick: () => (file.workspace_id ? confirmUpdate(file, row) : importFile(file.path, false)),
         });
-      return el(
+      const row = el(
         "li",
         { className: `import-file${file.error ? " broken" : ""}` },
         el(
@@ -109,11 +109,43 @@ window.FwHubImport = function (ctx) {
         ),
         action,
       );
+      return row;
     });
     if (found.truncated) {
       rows.push(el("li", { className: "import-empty", textContent: "Stopped early: too many directories. Narrow the search root." }));
     }
     list.replaceChildren(...rows);
+  }
+
+  // Update replaces a workspace's folders and labels: say what changes
+  // and ask first.
+  function confirmUpdate(file, row) {
+    list.querySelectorAll(".import-confirm").forEach((c) => c.remove());
+    const ws = workspaceById(file.workspace_id);
+    const now = ws ? ws.folders.map((f) => f.path) : [];
+    const next = file.paths || [];
+    const added = next.filter((p) => !now.includes(p));
+    const removed = ws ? ws.folders.filter((f) => !next.includes(f.path)) : [];
+    const names = (paths) => paths.map((p) => basename(p)).join(", ");
+    const lines = [];
+    if (added.length) lines.push(`adds ${names(added)}`);
+    if (removed.length) lines.push(`drops ${removed.map((f) => f.name || basename(f.path)).join(", ")}`);
+    if (!lines.length) lines.push("same folders");
+    lines.push("labels come from the file");
+    const confirm = el(
+      "div",
+      { className: "import-confirm", role: "group", "aria-label": `Update ${file.name}?` },
+      el("span", {}, el("b", { textContent: `Replace ${file.name}'s ${plural(now.length, "folder")}?` }), ` ${lines.join(" · ")}.`),
+      el("button", { type: "button", className: "slab ghost", textContent: "Keep", onclick: () => confirm.remove() }),
+      el("button", {
+        type: "button",
+        className: "slab",
+        textContent: "Replace",
+        onclick: () => importFile(file.path, true),
+      }),
+    );
+    row.append(confirm);
+    confirm.querySelector(".slab:not(.ghost)").focus();
   }
 
   async function importFile(path, update) {

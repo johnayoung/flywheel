@@ -2016,6 +2016,7 @@ async fn vscode_workspaces_import_list_and_update() {
         "folders": [
             {"name": "The App", "path": "../app"},
             {"path": "../../notes"},
+            {"name": "Again", "path": "../app/"},
             {"path": "../gone"},
             {"uri": "vscode-remote://ssh-remote+box/srv"},
         ],
@@ -2052,12 +2053,15 @@ async fn vscode_workspaces_import_list_and_update() {
     assert_eq!(folders[1]["path"], notes.to_str().unwrap());
     assert_eq!(folders[1]["git"], false);
     let skipped = report["skipped"].as_array().unwrap();
-    assert_eq!(skipped.len(), 2, "{report}");
-    assert_eq!(skipped[0]["entry"], "../gone");
-    assert_eq!(skipped[0]["reason"], "does not exist");
-    assert_eq!(skipped[0]["path"], code.join("gone").to_str().unwrap());
+    assert_eq!(skipped.len(), 3, "{report}");
+    // A second entry for the same folder is reported, not lost.
+    assert_eq!(skipped[0]["entry"], "../app/");
+    assert_eq!(skipped[0]["reason"], "the same folder as ../app");
+    assert_eq!(skipped[1]["entry"], "../gone");
+    assert_eq!(skipped[1]["reason"], "does not exist");
+    assert_eq!(skipped[1]["path"], code.join("gone").to_str().unwrap());
     assert!(
-        skipped[1]["reason"]
+        skipped[2]["reason"]
             .as_str()
             .unwrap()
             .contains("ssh-remote+box")
@@ -2082,7 +2086,10 @@ async fn vscode_workspaces_import_list_and_update() {
     assert_eq!(found[0]["name"], "broken");
     assert!(found[0]["error"].as_str().unwrap().contains("invalid JSON"));
     assert_eq!(found[1]["path"], file.to_str().unwrap());
-    assert_eq!(found[1]["folders"], 3);
+    assert_eq!(found[1]["folders"], 4);
+    // Resolved as the hub stores them (for the UI's update preview).
+    assert_eq!(found[1]["paths"][0], repo.to_str().unwrap());
+    assert_eq!(found[1]["paths"][1], notes.to_str().unwrap());
     assert_eq!(found[1]["skipped"], 1);
     assert_eq!(found[1]["workspace_id"], ws["id"]);
     let elsewhere = hub
@@ -2140,5 +2147,32 @@ async fn vscode_workspaces_import_list_and_update() {
     );
     let (status, _) = import(json!({ "path": "personal.code-workspace" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A folder moved away after import is listed as missing (not as a
+    // plain folder), and a session there is refused saying so.
+    std::fs::rename(&repo, code.join("app-moved")).unwrap();
+    let listed: Value = hub
+        .authed(reqwest::Method::GET, "/api/workspaces")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let moved = &listed["workspaces"][0]["folders"][0];
+    assert_eq!(moved["missing"], true, "{listed}");
+    assert_eq!(moved["git"], false);
+    let refused = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": ws["id"], "command": ["/bin/sh"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("no longer exists"),
+        "{body}"
+    );
     hub.shutdown().await;
 }

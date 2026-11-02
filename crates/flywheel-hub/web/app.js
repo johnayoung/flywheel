@@ -109,6 +109,9 @@
     noticeTitle: "", // headline for that notice (e.g. "Session removed")
     attachedMeta: null, // {name, workspaceId, workspaceName} of the attached session, kept to explain its removal
     closing: new Set(), // session ids this browser is removing (no "removed elsewhere" notice)
+    refreshSeq: 0, // refreshes started (each response is tagged with its number)
+    refreshApplied: 0, // the newest refresh whose response was applied
+    attachedSeq: 0, // refreshSeq when the current session was attached
     dropped: 0, // keystrokes typed while the link was down
     tick: null, // repaints the reconnect banner
     painted: false, // first sidebar paint done (entry animation plays once)
@@ -252,16 +255,24 @@
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
   // half-typed rename is never torn down under the user.
+  // Refreshes overlap (events, the poller, actions); each response is
+  // tagged so one answered after a newer one is dropped, and only a list
+  // fetched after the attach may declare the attached session gone.
   async function refresh(force = true) {
+    const seq = ++state.refreshSeq;
     let ws;
     let ss;
     try {
       [ws, ss] = await Promise.all([api("GET", "/api/workspaces"), api("GET", "/api/sessions")]);
     } catch (error) {
+      if (seq < state.refreshApplied) return;
       state.offline += 1;
       $("#offline").hidden = state.offline < 2;
       throw error;
     }
+    if (seq < state.refreshApplied) return;
+    state.refreshApplied = seq;
+    const current = seq > state.attachedSeq;
     state.offline = 0;
     $("#offline").hidden = true;
     state.workspaces = ws.workspaces;
@@ -269,7 +280,7 @@
     // The attached session was removed (closed in another browser or by
     // the CLI, or its workspace was deleted): there is nothing to relaunch
     // or reconnect to, so detach and say what happened.
-    if (state.attached && !sessionById(state.attached)) {
+    if (state.attached && current && !sessionById(state.attached)) {
       const gone = state.attachedMeta;
       const ours = state.closing.has(state.attached);
       state.snapshot = JSON.stringify([ws, ss]);
@@ -285,7 +296,7 @@
     rememberAttached();
     // A lost link whose session is gone will never come back: stop waiting.
     const attached = sessionById(state.attached);
-    if (state.attached && !state.socket && !state.exited && (!attached || !attached.live)) {
+    if (state.attached && current && !state.socket && !state.exited && (!attached || !attached.live)) {
       state.snapshot = JSON.stringify([ws, ss]);
       if (attached) showGone(attached.id, true);
       else detach("That session was closed.");
@@ -298,6 +309,8 @@
     state.snapshot = snapshot;
     render();
   }
+
+  const STALE_LINK = "The session this link points to no longer exists (it was closed, or its workspace deleted).";
 
   // --- theme -----------------------------------------------------------
 
@@ -547,6 +560,7 @@
     if (!session || !session.live) return;
     closeSocket();
     state.attached = id;
+    state.attachedSeq = state.refreshSeq;
     state.exited = null;
     state.retry = 0;
     state.dropped = 0;
@@ -572,6 +586,7 @@
     if (!session) return;
     closeSocket();
     state.attached = id;
+    state.attachedSeq = state.refreshSeq;
     state.exited = { gone: true };
     state.notice = "";
     state.noticeTitle = "";
@@ -1228,9 +1243,11 @@
           { className: "ws-repos" },
           workspace.folders.map((f) =>
             el("span", {
-              className: f.git ? "git" : "plain",
+              className: f.missing ? "missing" : f.git ? "git" : "plain",
               textContent: folderLabel(f),
-              title: f.git ? f.path : `${f.path} (plain folder, no git)`,
+              title: f.missing
+                ? `${f.path} (missing: moved or deleted?)`
+                : f.git ? `${f.path} (git repo)` : `${f.path} (plain folder, no git)`,
             })),
         ),
         error
@@ -1404,18 +1421,31 @@
 
   const wsForm = $("#workspace-form");
   // "Import VS Code workspace" (import.js), inside this dialog.
-  const importer = window.FwHubImport({ $, el, api, refresh, rememberWorkspace, basename });
+  const importer = window.FwHubImport({ $, el, api, refresh, rememberWorkspace, basename, workspaceById });
   let wsEditing = null; // workspace being edited, or null for create
   let checkSeq = 0;
 
+  // `value`: a path, or a workspace folder {path, name}.
   function repoRow(value) {
+    const folder = typeof value === "object" && value ? value : { path: value || "" };
     const input = el("input", {
       type: "text",
-      value: value || "",
+      value: folder.path || "",
       placeholder: "~/code/project",
       autocomplete: "off",
       spellcheck: false,
       "aria-label": "Folder path",
+    });
+    const label = el("input", {
+      type: "text",
+      className: "folder-label",
+      value: folder.name || "",
+      placeholder: "label",
+      maxLength: 100,
+      autocomplete: "off",
+      spellcheck: false,
+      "aria-label": "Folder label (optional; shown instead of the directory name)",
+      title: "Label (optional): shown instead of the directory name",
     });
     const verdict = icon("check");
     verdict.classList.add("verdict");
@@ -1424,6 +1454,7 @@
       "li",
       { className: "repo-row", dataset: { state: "empty" } },
       el("span", { className: "input-wrap" }, input, verdict),
+      label,
       iconButton("x", "Remove folder", () => {
         row.remove();
         if (!$("#repo-rows").children.length) addRepoRow("");
@@ -1460,8 +1491,9 @@
       }
     });
     row.input = input;
+    row.label = label;
     row.note = note;
-    if (value) {
+    if (folder.path) {
       row.dataset.state = "checking";
       row.check();
     }
@@ -1488,6 +1520,12 @@
     row.pending = api("GET", `/api/folders/check?path=${encodeURIComponent(raw)}`)
       .then((result) => {
         if (row.seq !== seq) return row.pending;
+        // A folder the workspace already has may stay while it is gone
+        // from disk (the hub keeps it, flagged missing).
+        const kept = wsEditing && wsEditing.folders.find((f) => f.path === raw);
+        if (!result.ok && kept && kept.missing) {
+          result = { ok: true, path: raw, git: false, missing: true };
+        }
         row.result = { ...result, raw };
         row.dataset.state = result.ok ? "ok" : "bad";
         setVerdict(row, result.ok);
@@ -1519,6 +1557,7 @@
   // A good path's note: where it resolved to, and whether it is a plain
   // folder (repo-only features such as worktrees will not apply).
   function okNote(result, raw) {
+    if (result.missing) return "missing on disk (moved or deleted?); kept until you remove it";
     const where = result.path !== raw ? result.path : "";
     if (result.git !== false) return where;
     return where ? `${where} · plain folder (no git)` : "plain folder (no git)";
@@ -1553,7 +1592,7 @@
     $("#workspace-submit").textContent = workspace ? "Save" : "Create";
     wsForm.name.value = workspace ? workspace.name : "";
     $("#repo-rows").replaceChildren();
-    if (workspace) workspace.folders.forEach((f) => addRepoRow(f.path));
+    if (workspace) workspace.folders.forEach((f) => addRepoRow(f));
     else addRepoRow("");
     importer.reset(!workspace);
     $("#dlg-workspace").showModal();
@@ -1592,8 +1631,8 @@
         bad.input.focus();
         return;
       }
-      // Paths only: the hub keeps the labels folders already have.
-      const folders = results.map((r) => r.path);
+      // An empty label clears it (the directory name shows).
+      const folders = results.map((r, i) => ({ path: r.path, name: rows[i].label.value.trim() }));
       const saved = wsEditing
         ? await api("PATCH", `/api/workspaces/${wsEditing.id}`, { name, folders })
         : await api("POST", "/api/workspaces", { name, folders });
@@ -1666,17 +1705,64 @@
       attached && attached.workspace_id === workspace.id ? attached.cwd : null,
       state.repoChoice[workspace.id],
     ].find((path) => path && paths.includes(path)) || paths[0];
-    picker.replaceChildren(
-      legend,
-      ...workspace.folders.map((folder) =>
-        el(
-          "label",
-          { className: "repo-choice" },
-          el("input", { type: "radio", name: "repo", value: folder.path, checked: folder.path === chosen }),
-          el("b", {}, folderLabel(folder), folder.git ? null : el("span", { className: "folder-tag", textContent: "no git" })),
-          el("small", { textContent: folder.path }),
-        )),
-    );
+    // Missing folders cannot be opened; they stay listed, disabled.
+    const usable = workspace.folders.filter((f) => !f.missing).map((f) => f.path);
+    const pick = usable.includes(chosen) ? chosen : usable[0];
+    const choices = workspace.folders.map((folder) => {
+      const tag = folder.missing ? "missing" : folder.git ? null : "no git";
+      const choice = el(
+        "label",
+        { className: `repo-choice${folder.missing ? " missing" : ""}`, title: folder.path },
+        el("input", {
+          type: "radio",
+          name: "repo",
+          value: folder.path,
+          checked: folder.path === pick,
+          disabled: !!folder.missing,
+        }),
+        el("b", {}, folderLabel(folder), tag ? el("span", { className: "folder-tag", textContent: tag }) : null),
+        el("small", { textContent: folder.path }),
+      );
+      choice.dataset.match = `${folderLabel(folder)} ${folder.path}`.toLowerCase();
+      return choice;
+    });
+    const list = el("div", { className: "repo-list" }, choices);
+    // Many folders (an imported workspace): a filter, and the list scrolls
+    // so the Name field and Launch stay in view.
+    const filter = workspace.folders.length > 5
+      ? el("input", {
+        type: "search",
+        className: "repo-filter",
+        placeholder: `filter ${workspace.folders.length} folders`,
+        autocomplete: "off",
+        spellcheck: false,
+        "aria-label": "Filter folders",
+        oninput: (event) => {
+          const q = event.target.value.trim().toLowerCase();
+          let first = null;
+          for (const choice of choices) {
+            const shown = !q || choice.dataset.match.includes(q);
+            choice.hidden = !shown;
+            const radio = choice.querySelector("input");
+            if (shown && !radio.disabled && !first) first = radio;
+          }
+          // Keep the pick among what is shown.
+          const checked = choices.find((c) => c.querySelector("input").checked);
+          if (first && (!checked || checked.hidden)) first.checked = true;
+        },
+        onkeydown: (event) => {
+          // Enter launches (the form submits); it must not clear the filter.
+          if (event.key === "Escape" && event.target.value) {
+            event.preventDefault();
+            event.stopPropagation();
+            event.target.value = "";
+            event.target.dispatchEvent(new Event("input"));
+          }
+        },
+      })
+      : null;
+    list.classList.toggle("long", !!filter);
+    picker.replaceChildren(legend, ...(filter ? [filter] : []), list);
     updateSessionPlaceholder();
   }
 
@@ -2080,7 +2166,7 @@
     const match = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
     if (match) {
       if (sessionById(match[1])) openSession(match[1]);
-      else history.replaceState(null, "", window.location.pathname);
+      else detach(STALE_LINK, "Session removed.");
     }
     // Follow an edited or navigated #session= (replaceState fires no
     // hashchange, so this sees only the user's own changes).
@@ -2093,7 +2179,7 @@
       if (target[1] === state.attached) return;
       if (sessionById(target[1])) openSession(target[1]);
       else if (state.attached) history.replaceState(null, "", `#session=${state.attached}`);
-      else history.replaceState(null, "", window.location.pathname);
+      else detach(STALE_LINK, "Session removed.");
     });
     startPolling();
     connectEvents();

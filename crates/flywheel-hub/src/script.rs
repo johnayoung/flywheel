@@ -72,11 +72,7 @@ impl HubConn {
             )
         })?;
         if !(200..300).contains(&response.status) {
-            return Err(format!(
-                "{} ({})",
-                response.error_message(),
-                response.status
-            ));
+            return Err(api_error(response.status, &response.error_message()));
         }
         if response.body.is_empty() {
             return Ok(Value::Null);
@@ -100,6 +96,16 @@ impl HubConn {
 
     pub fn sessions(&self) -> Result<Vec<Value>, String> {
         self.list("sessions")
+    }
+}
+
+/// An API failure for humans: a request the hub refused (4xx) says why
+/// in its own words; anything else keeps the HTTP status to go on.
+fn api_error(status: u16, message: &str) -> String {
+    match (status, message.is_empty()) {
+        (400..500, false) => message.to_owned(),
+        (_, true) => format!("the hub answered HTTP {status}"),
+        _ => format!("{message} (HTTP {status})"),
     }
 }
 
@@ -210,19 +216,55 @@ fn live_cwd(session: &Value) -> &str {
         .unwrap_or_else(|| str_field(session, "cwd"))
 }
 
-/// A workspace's folders for `ls`: paths, plain (non-git) directories
-/// marked. Reads the legacy `repos` list from a hub that predates folders.
-fn folder_list(workspace: &Value) -> Vec<String> {
+/// One workspace folder as the API lists it.
+struct FolderRow {
+    path: PathBuf,
+    label: Option<String>,
+    /// `None` from a hub that predates folders (`repos` only).
+    git: Option<bool>,
+    missing: bool,
+}
+
+impl FolderRow {
+    fn dir_name(&self) -> Option<&str> {
+        self.path.file_name().and_then(|n| n.to_str())
+    }
+
+    /// The label, when it says more than the directory's name.
+    fn distinct_label(&self) -> Option<&str> {
+        self.label
+            .as_deref()
+            .filter(|l| Some(*l) != self.dir_name())
+    }
+
+    /// `path`, with its label and plain/missing marks, for `ls`.
+    fn shown(&self) -> String {
+        let mut notes: Vec<&str> = self.distinct_label().into_iter().collect();
+        if self.missing {
+            notes.push("missing");
+        } else if self.git == Some(false) {
+            notes.push("no git");
+        }
+        let path = self.path.display();
+        if notes.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path} ({})", notes.join(", "))
+        }
+    }
+}
+
+/// A workspace's folders; reads the legacy `repos` list from a hub that
+/// predates folders.
+fn folders_of(workspace: &Value) -> Vec<FolderRow> {
     if let Some(folders) = workspace.get("folders").and_then(Value::as_array) {
         return folders
             .iter()
-            .map(|f| {
-                let path = str_field(f, "path");
-                if f.get("git").and_then(Value::as_bool) == Some(false) {
-                    format!("{path} (no git)")
-                } else {
-                    path.to_owned()
-                }
+            .map(|f| FolderRow {
+                path: PathBuf::from(str_field(f, "path")),
+                label: f.get("name").and_then(Value::as_str).map(str::to_owned),
+                git: f.get("git").and_then(Value::as_bool),
+                missing: f.get("missing").and_then(Value::as_bool) == Some(true),
             })
             .collect();
     }
@@ -232,10 +274,21 @@ fn folder_list(workspace: &Value) -> Vec<String> {
         .map(|r| {
             r.iter()
                 .filter_map(Value::as_str)
-                .map(str::to_owned)
+                .map(|path| FolderRow {
+                    path: PathBuf::from(path),
+                    label: None,
+                    git: None,
+                    missing: false,
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A workspace's folders for `ls`: paths (with labels), plain (non-git)
+/// and missing directories marked.
+fn folder_list(workspace: &Value) -> Vec<String> {
+    folders_of(workspace).iter().map(FolderRow::shown).collect()
 }
 
 fn fail(err: &mut dyn Write, message: &str) -> i32 {
@@ -366,9 +419,10 @@ pub(crate) struct NewArgs {
     /// shell (default), claude, or codex.
     #[arg(long, default_value = "shell", value_parser = ["shell", "claude", "codex"])]
     kind: String,
-    /// One of the workspace's folders (default: its first). Relative
-    /// paths are taken from the current directory.
-    #[arg(long, visible_alias = "folder", value_name = "PATH")]
+    /// One of the workspace's folders (default: its first): a path
+    /// (relative to the current directory), or a folder's label or
+    /// directory name.
+    #[arg(long, visible_alias = "folder", value_name = "FOLDER")]
     repo: Option<PathBuf>,
     /// Session name (default: program and number).
     #[arg(long)]
@@ -425,14 +479,21 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
             ));
         }
     }
-    let repo = args.repo.as_deref().map(absolute).transpose()?;
     let workspaces = conn.workspaces()?;
-    let workspace_id = match resolve(&workspaces, &args.workspace, "workspace") {
-        Ok(workspace) => str_field(workspace, "id").to_owned(),
+    let (workspace_id, repo) = match resolve(&workspaces, &args.workspace, "workspace") {
+        Ok(workspace) => {
+            let repo = args
+                .repo
+                .as_deref()
+                .map(|query| pick_folder(workspace, query))
+                .transpose()?;
+            (str_field(workspace, "id").to_owned(), repo)
+        }
         Err(message) if !args.create || message.contains("ambiguous") => {
             return Err(message);
         }
         Err(_) => {
+            let repo = args.repo.as_deref().map(absolute).transpose()?;
             let created = conn.call(
                 "POST",
                 "/api/workspaces",
@@ -444,7 +505,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
                 str_field(&created, "name"),
                 str_field(&created, "id")
             );
-            str_field(&created, "id").to_owned()
+            (str_field(&created, "id").to_owned(), repo)
         }
     };
     let mut body = json!({ "workspace_id": workspace_id, "kind": args.kind });
@@ -458,6 +519,44 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         body["command"] = json!(args.command);
     }
     conn.call("POST", "/api/sessions", Some(&body))
+}
+
+/// The folder of `workspace` that `query` names: a path (relative to this
+/// directory) that is one of its folders, else a folder's label or
+/// directory name (unique). A path naming none of them is passed on for
+/// the hub to refuse.
+fn pick_folder(workspace: &Value, query: &Path) -> Result<PathBuf, String> {
+    let folders = folders_of(workspace);
+    let path = absolute(query)?;
+    if folders.iter().any(|f| f.path == path) {
+        return Ok(path);
+    }
+    let wanted = query.to_string_lossy();
+    let matches: Vec<&FolderRow> = folders
+        .iter()
+        .filter(|f| f.label.as_deref() == Some(&*wanted) || f.dir_name() == Some(&*wanted))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one.path.clone()),
+        [] if path.exists() => Ok(path),
+        [] => Err(format!(
+            "workspace {:?} has no folder {wanted:?}; its folders: {}",
+            str_field(workspace, "name"),
+            folders
+                .iter()
+                .map(FolderRow::shown)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        many => Err(format!(
+            "folder {wanted:?} is ambiguous in workspace {:?}: {}; give the path",
+            str_field(workspace, "name"),
+            many.iter()
+                .map(|f| f.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 // --- import -----------------------------------------------------------------
@@ -493,7 +592,8 @@ pub(crate) fn import(args: &ImportArgs, out: &mut dyn Write, err: &mut dyn Write
     };
     let mut failed = false;
     for file in &args.files {
-        let report = absolute(file).and_then(|path| {
+        let path = absolute(file);
+        let report = path.as_ref().map_err(Clone::clone).and_then(|path| {
             let mut body = json!({ "path": path, "update": args.update });
             if let Some(name) = &args.name {
                 body["name"] = json!(name);
@@ -507,7 +607,15 @@ pub(crate) fn import(args: &ImportArgs, out: &mut dyn Write, err: &mut dyn Write
             Ok(report) => print_import(&report, out, err),
             Err(message) => {
                 failed = true;
-                let _ = writeln!(err, "fw hub: {}: {message}", file.display());
+                // Most refusals already name the file.
+                let named = path
+                    .as_ref()
+                    .is_ok_and(|p| message.contains(&*p.to_string_lossy()));
+                if named {
+                    let _ = writeln!(err, "fw hub: {message}");
+                } else {
+                    let _ = writeln!(err, "fw hub: {}: {message}", file.display());
+                }
             }
         }
     }
@@ -857,8 +965,46 @@ mod tests {
             {"path": "/code/app", "git": true},
             {"path": "/notes", "git": false, "name": "Notes"}
         ]});
-        assert_eq!(folder_list(&ws), ["/code/app", "/notes (no git)"]);
+        assert_eq!(folder_list(&ws), ["/code/app", "/notes (Notes, no git)"]);
         assert_eq!(folder_list(&json!({"repos": ["/r"]})), ["/r"]);
+        // A deleted folder is not mistaken for a plain one; a label that
+        // repeats the directory's name is not shown.
+        let gone = json!({"folders": [
+            {"path": "/code/gone", "git": false, "missing": true, "name": "gone"}
+        ]});
+        assert_eq!(folder_list(&gone), ["/code/gone (missing)"]);
+    }
+
+    #[test]
+    fn new_picks_a_folder_by_path_label_or_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("john-finances");
+        let b = dir.path().join("pickem");
+        let c = dir.path().join("other").join("pickem");
+        let ws = json!({"name": "personal", "folders": [
+            {"path": a, "git": false, "name": "Money"},
+            {"path": b, "git": false},
+        ]});
+        assert_eq!(pick_folder(&ws, Path::new("Money")).unwrap(), a);
+        assert_eq!(pick_folder(&ws, Path::new("john-finances")).unwrap(), a);
+        assert_eq!(pick_folder(&ws, Path::new("pickem")).unwrap(), b);
+        assert_eq!(pick_folder(&ws, &b).unwrap(), b);
+        let missing = pick_folder(&ws, Path::new("nope")).unwrap_err();
+        assert!(missing.contains("no folder \"nope\""), "{missing}");
+        assert!(missing.contains("Money"), "{missing}");
+        let twice = json!({"name": "w", "folders": [{"path": b}, {"path": c}]});
+        assert!(
+            pick_folder(&twice, Path::new("pickem"))
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn api_refusals_read_without_http_codes() {
+        assert_eq!(api_error(409, "taken"), "taken");
+        assert_eq!(api_error(500, "boom"), "boom (HTTP 500)");
+        assert_eq!(api_error(502, ""), "the hub answered HTTP 502");
     }
 
     #[test]

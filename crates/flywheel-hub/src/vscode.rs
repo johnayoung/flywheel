@@ -116,9 +116,18 @@ pub fn default_name(file: &Path) -> Option<String> {
 /// Read and parse the workspace file at `file` (absolute).
 pub fn read(file: &Path, env: &ResolveEnv) -> Result<CodeWorkspace, String> {
     let shown = file.display();
-    let opened = fs::File::open(file).map_err(|e| format!("{shown}: {e}"))?;
-    let meta = opened.metadata().map_err(|e| format!("{shown}: {e}"))?;
+    // Checked before opening: opening a FIFO blocks until a writer comes.
+    let meta = fs::metadata(file).map_err(|e| format!("{shown}: {e}"))?;
     if !meta.is_file() {
+        return Err(format!("{shown} is not a file"));
+    }
+    let opened = open_nonblocking(file).map_err(|e| format!("{shown}: {e}"))?;
+    // It may have been swapped for something else between the two looks.
+    if !opened
+        .metadata()
+        .map_err(|e| format!("{shown}: {e}"))?
+        .is_file()
+    {
         return Err(format!("{shown} is not a file"));
     }
     let mut bytes = Vec::new();
@@ -134,6 +143,19 @@ pub fn read(file: &Path, env: &ResolveEnv) -> Result<CodeWorkspace, String> {
     }
     let text = String::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8 text"))?;
     parse(&text, file, env).map_err(|e| format!("{shown}: {e}"))
+}
+
+/// Open `file` read-only without blocking on a FIFO (`O_NONBLOCK`; for a
+/// regular file it changes nothing).
+fn open_nonblocking(file: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(file)
 }
 
 /// Parse workspace file text; `file` (absolute) anchors relative paths and
@@ -577,6 +599,25 @@ mod tests {
         fs::write(&ok, r#"{"folders":[{"path":"."}]}"#).unwrap();
         let parsed = read(&ok, &env()).unwrap();
         assert_eq!(parsed.folders[0].path, dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("x.code-workspace");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read(&fifo, &env()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO must not block");
+        assert!(result.unwrap_err().contains("is not a file"));
     }
 
     #[test]

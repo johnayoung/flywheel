@@ -48,7 +48,7 @@ pub(super) struct FindQuery {
     root: Option<String>,
 }
 
-/// `{"root","depth","files":[{"path","name","folders","skipped",
+/// `{"root","depth","files":[{"path","name","folders","paths","skipped",
 /// "workspace_id"}|{"path","name","error"}],"truncated"}`: the workspace
 /// files under `root`, each with its folder count and the id of the
 /// workspace already named like it (an import would need `update`).
@@ -98,6 +98,12 @@ pub(super) async fn find_code_workspaces(
                     "path": file,
                     "name": parsed.name,
                     "folders": parsed.folders.len(),
+                    // As the hub would store them, for an update's diff.
+                    "paths": parsed
+                        .folders
+                        .iter()
+                        .map(|f| f.path.canonicalize().unwrap_or_else(|_| f.path.clone()))
+                        .collect::<Vec<_>>(),
                     "skipped": parsed.skipped.len(),
                     "workspace_id": workspaces
                         .iter()

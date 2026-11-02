@@ -1,12 +1,22 @@
-//! The `fw hub <verb>` entry: `serve` and `token`.
+//! The `fw hub <verb>` entry: `serve`, `url`, and `token`.
 
+use crate::auth::{LOGIN_CODE_TTL, Token};
+use crate::client;
 use crate::hub::{Hub, HubOptions};
 use crate::paths::default_state_dir;
-use crate::server::{ServerOptions, login_url, serve};
+use crate::remote::{
+    LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
+    normalize_public_url, process_alive, qr_lines, tailscale_program,
+};
+use crate::server::{ServerOptions, code_login_url, serve};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long the CLI waits for the running hub to answer.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default listen port.
 pub const DEFAULT_PORT: u16 = 7420;
@@ -23,10 +33,35 @@ struct HubCli {
 
 #[derive(Debug, Subcommand)]
 enum HubCommand {
-    /// Run the hub server in the foreground and print the login URL.
+    /// Run the hub server in the foreground and print the login URLs.
     Serve(ServeArgs),
-    /// Print the hub's access token (created on first use).
-    Token(StateDirArg),
+    /// Print one-time login URLs for the running hub (loopback, LAN,
+    /// tailnet, public), optionally as a QR code for a phone. The
+    /// long-lived token is never shown.
+    Url(UrlArgs),
+    /// Print the hub's access token (created on first use), or rotate it.
+    Token(TokenArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct UrlArgs {
+    /// Also draw the most remote-friendly URL as a QR code.
+    #[arg(long)]
+    qr: bool,
+    #[command(flatten)]
+    state: StateDirArg,
+}
+
+#[derive(Debug, clap::Args)]
+struct TokenArgs {
+    /// Replace the token with a fresh one. A running hub switches at once:
+    /// every browser login, one-time code, and open terminal connection of
+    /// the old token stops working. Prints nothing; `fw hub token` shows
+    /// the new one.
+    #[arg(long)]
+    rotate: bool,
+    #[command(flatten)]
+    state: StateDirArg,
 }
 
 #[derive(Debug, clap::Args)]
@@ -50,6 +85,13 @@ struct ServeArgs {
     /// repeatable. Same-origin is always accepted.
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
     allow_origins: Vec<String>,
+    /// A URL browsers reach this hub at through a proxy (e.g.
+    /// https://box.tailnet.ts.net); repeatable. Accepted as an origin,
+    /// listed first by `fw hub url`, and given `Secure` cookies when
+    /// https. `tailscale serve` URLs proxying to this port are detected
+    /// automatically.
+    #[arg(long = "public-url", value_name = "URL")]
+    public_urls: Vec<String>,
     /// Per-session scrollback kept by the server's terminal emulator, in
     /// lines (capped at 1M cells, so wide terminals keep fewer).
     #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
@@ -94,20 +136,102 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
     match cli.command {
-        HubCommand::Token(arg) => token(&arg, out, err),
+        HubCommand::Token(args) => token(&args, out, err),
+        HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err),
     }
 }
 
-fn token(arg: &StateDirArg, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let result = resolve_state_dir(arg).and_then(|dir| {
+fn token(args: &TokenArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let result = resolve_state_dir(&args.state).and_then(|dir| {
         crate::paths::ensure_private_dir(&dir)
             .map_err(|e| format!("state dir {}: {e}", dir.display()))?;
-        crate::auth::Token::load_or_create(&dir).map_err(|e| e.to_string())
+        if args.rotate {
+            rotate(&dir).map(|message| {
+                let _ = writeln!(err, "fw hub: {message}");
+            })
+        } else {
+            let token = Token::load_or_create(&dir).map_err(|e| e.to_string())?;
+            let _ = writeln!(out, "{}", token.expose());
+            Ok(())
+        }
     });
     match result {
-        Ok(token) => {
-            let _ = writeln!(out, "{}", token.expose());
+        Ok(()) => 0,
+        Err(message) => {
+            let _ = writeln!(err, "fw hub: {message}");
+            1
+        }
+    }
+}
+
+/// The running hub for `state_dir`, if its runtime file names a live
+/// process.
+fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, String> {
+    let info = RuntimeInfo::read(state_dir).map_err(|e| {
+        format!(
+            "runtime file {}: {e}",
+            state_dir.join(crate::remote::RUNTIME_FILE).display()
+        )
+    })?;
+    Ok(info.filter(|info| process_alive(info.pid)))
+}
+
+/// Rotate through the running hub (so it switches without a restart), or
+/// in the token file when none runs.
+fn rotate(state_dir: &Path) -> Result<String, String> {
+    if let Some(info) = running_hub(state_dir)? {
+        let token = Token::load(state_dir)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
+        match client::request(
+            info.connect_addr(),
+            "POST",
+            "/api/token/rotate",
+            token.expose(),
+            None,
+            CLIENT_TIMEOUT,
+        ) {
+            Ok(response) if response.status == 204 => {
+                return Ok(
+                    "token rotated; the running hub signed out every browser and closed every terminal connection (log in again via `fw hub url`)"
+                        .to_owned(),
+                );
+            }
+            Ok(response) => {
+                return Err(format!(
+                    "the running hub (pid {}) refused the rotation: {} {}",
+                    info.pid,
+                    response.status,
+                    response.error_message()
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "cannot reach the running hub (pid {}) at {}: {e}",
+                    info.pid,
+                    info.connect_addr()
+                ));
+            }
+        }
+    }
+    Token::rotate(state_dir).map_err(|e| e.to_string())?;
+    Ok("token rotated (no hub is running; the next `fw hub serve` uses it)".to_owned())
+}
+
+fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    match mint_remote_code(&args.state) {
+        Ok((info, code)) => {
+            let tailscale =
+                tailscale_program().and_then(|p| detect_tailscale(&p, info.listen.port()));
+            let targets = login_targets(
+                info.listen,
+                &info.public_urls,
+                tailscale.as_ref(),
+                &local_interfaces(info.listen),
+            );
+            print_login(out, err, &targets, &code, args.qr);
+            print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
             0
         }
         Err(message) => {
@@ -115,6 +239,124 @@ fn token(arg: &StateDirArg, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             1
         }
     }
+}
+
+/// Ask the running hub for a one-time login code.
+fn mint_remote_code(state: &StateDirArg) -> Result<(RuntimeInfo, String), String> {
+    let dir = resolve_state_dir(state)?;
+    let info = running_hub(&dir)?.ok_or_else(|| {
+        format!(
+            "no hub is running for state dir {} (start one with `fw hub serve`)",
+            dir.display()
+        )
+    })?;
+    let token = Token::load(&dir)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
+    let response = client::request(
+        info.connect_addr(),
+        "POST",
+        "/api/login-codes",
+        token.expose(),
+        None,
+        CLIENT_TIMEOUT,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot reach the running hub (pid {}) at {}: {e}",
+            info.pid,
+            info.connect_addr()
+        )
+    })?;
+    if response.status != 200 {
+        return Err(format!(
+            "the running hub refused to mint a login code: {} {}",
+            response.status,
+            response.error_message()
+        ));
+    }
+    let code = serde_json::from_slice::<serde_json::Value>(&response.body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+        .ok_or_else(|| "the running hub sent no login code".to_owned())?;
+    Ok((info, code))
+}
+
+/// The login URLs for `code`, then (with `qr`) the first remote one as a
+/// QR code.
+fn print_login(
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    targets: &[LoginTarget],
+    code: &str,
+    qr: bool,
+) {
+    let minutes = LOGIN_CODE_TTL.as_secs() / 60;
+    let _ = writeln!(
+        out,
+        "log in with a one-time code (single use, valid {minutes} minutes; `fw hub url` mints another):"
+    );
+    let width = targets.iter().map(|t| t.label.len()).max().unwrap_or(0);
+    for target in targets {
+        let _ = writeln!(
+            out,
+            "  {:width$}  {}",
+            target.label,
+            code_login_url(&target.base, code)
+        );
+    }
+    if !qr {
+        return;
+    }
+    let Some(remote) = targets.iter().find(|t| t.remote) else {
+        let _ = writeln!(
+            err,
+            "fw hub: no QR code: the hub listens on loopback only, which a phone cannot reach (use `tailscale serve`, --public-url, or `fw hub serve --bind`)"
+        );
+        return;
+    };
+    let url = code_login_url(&remote.base, code);
+    match qr_lines(&url) {
+        Ok(lines) => {
+            let _ = writeln!(
+                out,
+                "
+scan to log in ({}):",
+                remote.label
+            );
+            for line in lines {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(err, "fw hub: {e}");
+        }
+    }
+}
+
+/// Point at `tailscale serve` when the tailnet is up but nothing serves the
+/// hub over HTTPS on it.
+fn print_tailscale_hint(
+    err: &mut dyn Write,
+    tailscale: Option<&Tailscale>,
+    targets: &[LoginTarget],
+    port: u16,
+) {
+    let Some(ts) = tailscale else {
+        return;
+    };
+    if !ts.serve_urls.is_empty() || targets.iter().any(|t| t.base.starts_with("https://")) {
+        return;
+    }
+    let at = ts
+        .dns_name
+        .as_deref()
+        .map(|name| format!(" at https://{name}"))
+        .unwrap_or_default();
+    let _ = writeln!(
+        err,
+        "fw hub: tailscale is up: `tailscale serve --bg http://127.0.0.1:{port}` serves this hub over HTTPS on your tailnet{at} (recommended for phones)"
+    );
 }
 
 /// The host a browser should use to reach `addr`.
@@ -128,6 +370,18 @@ fn browse_host(addr: SocketAddr) -> String {
         IpAddr::V4(v4) => format!("{v4}:{}", addr.port()),
         IpAddr::V6(v6) => format!("[{v6}]:{}", addr.port()),
     }
+}
+
+/// This machine's interface addresses; where they cannot be listed, the
+/// default-route address.
+fn local_interfaces(listen: SocketAddr) -> Vec<(String, IpAddr)> {
+    let found = interface_addresses();
+    if !found.is_empty() || !listen.ip().is_unspecified() {
+        return found;
+    }
+    route_address(listen.ip())
+        .map(|ip| vec![("default route".to_owned(), ip)])
+        .unwrap_or_default()
 }
 
 /// This machine's address on its default route, for a URL another device
@@ -156,6 +410,18 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             return 1;
+        }
+    };
+    let public_urls = match args
+        .public_urls
+        .iter()
+        .map(|u| normalize_public_url(u))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(urls) => urls,
+        Err(message) => {
+            let _ = writeln!(err, "fw hub: --public-url {message}");
+            return 2;
         }
     };
     let mut options = HubOptions::new(state_dir);
@@ -195,26 +461,49 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
              plus `tailscale serve`."
         );
     }
+    let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, local.port()));
     let base = format!("http://{}", browse_host(local));
     let _ = writeln!(out, "flywheel hub listening on {base}");
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
-    let _ = writeln!(out, "open: {}", login_url(&base, hub.token()));
-    if local.ip().is_unspecified()
-        && let Some(ip) = route_address(local.ip())
-    {
-        let remote = format!("http://{}", browse_host(SocketAddr::new(ip, local.port())));
-        let _ = writeln!(
-            out,
-            "from another device: {}",
-            login_url(&remote, hub.token())
-        );
+    let targets = login_targets(
+        local,
+        &public_urls,
+        tailscale.as_ref(),
+        &local_interfaces(local),
+    );
+    match hub.mint_login_code() {
+        Ok(code) => {
+            let qr = targets.iter().any(|t| t.remote);
+            print_login(out, err, &targets, &code, qr);
+        }
+        Err(e) => {
+            let _ = writeln!(err, "fw hub: cannot mint a login code: {e}");
+        }
     }
+    print_tailscale_hint(err, tailscale.as_ref(), &targets, local.port());
     let _ = out.flush();
 
-    let server_options = ServerOptions {
-        allowed_origins: args.allow_origins,
+    let runtime_info = RuntimeInfo {
+        pid: std::process::id(),
+        listen: local,
+        public_urls: public_urls.clone(),
     };
+    if let Err(e) = runtime_info.write(hub.state_dir()) {
+        let _ = writeln!(
+            err,
+            "fw hub: cannot write the runtime file (`fw hub url` and `fw hub token --rotate` \
+             will not find this hub): {e}"
+        );
+    }
+    let mut allowed_origins = args.allow_origins;
+    allowed_origins.extend(public_urls);
+    if let Some(ts) = &tailscale {
+        allowed_origins.extend(ts.serve_urls.iter().cloned());
+    }
+    let server_options = ServerOptions { allowed_origins };
+    let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve(listener, hub, server_options, shutdown_signal()));
+    RuntimeInfo::remove_if_owned(&state_dir, runtime_info.pid);
     match result {
         Ok(()) => {
             let _ = writeln!(out, "flywheel hub stopped");

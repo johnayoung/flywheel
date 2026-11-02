@@ -18,21 +18,30 @@
 //!   "signal":S|null}` once the process ends; `{"type":"reset"}` when the
 //!   client fell too far behind -- clear the terminal, a fresh snapshot of
 //!   the screen alone (no scrollback, so a slow link catches up) follows.
-//! * client -> server, **text** JSON: `{"type":"input","data":"..."}` and
-//!   `{"type":"resize","cols":N,"rows":N}`; **binary** frames are raw input.
+//! * client -> server, **text** JSON: `{"type":"input","data":"..."}`,
+//!   `{"type":"resize","cols":N,"rows":N}`, and `{"type":"theme",
+//!   "foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}`
+//!   (the viewer's colours, which the server's colour-query answers use from
+//!   then on; send on attach, theme change, and focus); **binary** frames
+//!   are raw input.
+//! * Rotating the token closes every socket with code 4001.
 
 use crate::auth::{
-    self, bearer_value, cookie_name, cookie_value, login_cookie, logout_cookie, origin_allowed,
+    FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
+    logout_cookie, origin_allowed,
 };
 use crate::hub::{CreateSession, Hub, HubError};
 use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
 use crate::state::{StateError, WorkspaceInput, validate_repo};
-use crate::vt::{DEFAULT_RECENT_LINES, SNAPSHOT_HISTORY_BYTES, TextSource};
+use crate::vt::{DEFAULT_RECENT_LINES, SNAPSHOT_HISTORY_BYTES, TextSource, ViewerColors};
 use crate::web;
 use axum::body::Bytes;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Form, FromRequest, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{
+    ConnectInfo, Form, FromRequest, FromRequestParts, Path, Query, Request, State,
+};
+use axum::http::request::Parts;
+use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -42,8 +51,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 
@@ -60,6 +70,9 @@ const SNAPSHOT_FRAME: usize = 256 * 1024;
 const LAGGED_SNAPSHOT_HISTORY: usize = 0;
 /// Largest `lines` the screen endpoint accepts.
 const MAX_SCREEN_LINES: usize = 100_000;
+/// WebSocket close code sent when the token rotates (the client must log
+/// in again).
+pub const WS_CLOSE_ROTATED: u16 = 4001;
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -68,7 +81,8 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 pub struct ServerOptions {
     /// Extra browser origins allowed on WebSocket and state-changing
     /// requests (e.g. a reverse proxy's public `https://host`), on top of
-    /// same-origin.
+    /// same-origin. Requests arriving under an `https` one get `Secure`
+    /// cookies.
     pub allowed_origins: Vec<String>,
 }
 
@@ -77,6 +91,7 @@ struct AppState {
     hub: Arc<Hub>,
     options: Arc<ServerOptions>,
     shutdown: watch::Receiver<bool>,
+    failures: Arc<Mutex<FailureLimiter>>,
 }
 
 /// Build the router. Flipping `shutdown` to `true` closes every open
@@ -86,6 +101,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         hub,
         options: Arc::new(options),
         shutdown,
+        failures: Arc::new(Mutex::new(FailureLimiter::default())),
     };
     let protected = Router::new()
         .route(
@@ -111,6 +127,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
         .route("/api/sessions/{id}/ws", get(session_ws))
+        .route("/api/login-codes", post(mint_login_code))
+        .route("/api/token/rotate", post(rotate_token))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -134,6 +152,7 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let (tx, rx) = watch::channel(false);
     let app = router(Arc::clone(&hub), options, rx);
+    let app = app.into_make_service_with_connect_info::<Peer>();
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal.await;
@@ -150,44 +169,176 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn is_authenticated(headers: &HeaderMap, hub: &Hub) -> bool {
-    let token = hub.token();
+/// A connection's two ends, recorded per connection by [`serve`].
+#[derive(Debug, Clone, Copy)]
+pub struct Peer {
+    pub remote: SocketAddr,
+    pub local: Option<SocketAddr>,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>> for Peer {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        Self {
+            remote: *stream.remote_addr(),
+            local: stream.io().local_addr().ok(),
+        }
+    }
+}
+
+/// Who sent a request: the client address the failure limiter keys on,
+/// whether the TCP peer is this machine (then a reverse proxy such as
+/// `tailscale serve` may stand in front: from a loopback peer its
+/// `X-Forwarded-For` / `-Host` / `-Proto` are believed), and whether the
+/// request comes straight from this machine (no proxy in between).
+#[derive(Debug, Clone, Copy)]
+struct Client {
+    ip: IpAddr,
+    local_peer: bool,
+    /// A process on this machine talking to the hub directly (the CLI, a
+    /// local browser): exempt from the failure lockout, which guards
+    /// against the network.
+    same_machine: bool,
+}
+
+impl Client {
+    fn of(extensions: &Extensions, headers: &HeaderMap) -> Self {
+        // `router` used without connect info (an in-process caller) is
+        // this machine.
+        let (peer, local) = match extensions.get::<ConnectInfo<Peer>>() {
+            Some(ConnectInfo(p)) => (p.remote.ip(), p.local.map(|l| l.ip())),
+            None => (IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+        };
+        let local_peer = peer.is_loopback();
+        // The proxy appends the address it saw: the last entry is the one
+        // a client cannot forge.
+        let forwarded_for = local_peer
+            .then(|| header_str(headers, header::HeaderName::from_static("x-forwarded-for")))
+            .flatten();
+        let forwarded = forwarded_for
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        // From this machine: loopback, or our own address as the source
+        // (a connection to a LAN bind from this host).
+        let from_here = local_peer || local == Some(peer);
+        Self {
+            ip: forwarded.unwrap_or(peer),
+            local_peer,
+            same_machine: from_here && forwarded_for.is_none(),
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Client {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self::of(&parts.extensions, &parts.headers))
+    }
+}
+
+/// The outcome of checking a request's credentials.
+enum Auth {
+    Granted,
+    /// No credential presented.
+    Anonymous,
+    /// A wrong credential (counted against the client).
+    Denied,
+    /// The client failed too often; nothing it presents is checked.
+    Limited(Duration),
+}
+
+fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
+    let token = app.hub.token();
     let name = cookie_name(token.expose());
-    let by_cookie = headers
+    let presented: Vec<&str> = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .filter_map(|v| cookie_value(v, &name))
-        .any(|v| token.matches(v));
-    by_cookie
-        || header_str(headers, header::AUTHORIZATION)
-            .and_then(bearer_value)
-            .is_some_and(|v| token.matches(v))
+        .chain(header_str(headers, header::AUTHORIZATION).and_then(bearer_value))
+        .collect();
+    if presented.is_empty() {
+        return Auth::Anonymous;
+    }
+    if client.same_machine {
+        return if presented.iter().any(|v| token.matches(v)) {
+            Auth::Granted
+        } else {
+            Auth::Denied
+        };
+    }
+    let mut failures = app.failures.lock().unwrap_or_else(PoisonError::into_inner);
+    let now = Instant::now();
+    if let Some(wait) = failures.locked(client.ip, now) {
+        return Auth::Limited(wait);
+    }
+    if presented.iter().any(|v| token.matches(v)) {
+        Auth::Granted
+    } else {
+        failures.record_failure(client.ip, now);
+        Auth::Denied
+    }
 }
 
-fn origin_ok(headers: &HeaderMap, options: &ServerOptions) -> bool {
+fn origin_ok(headers: &HeaderMap, client: Client, options: &ServerOptions) -> bool {
+    let forwarded_host = client
+        .local_peer
+        .then(|| header_str(headers, header::HeaderName::from_static("x-forwarded-host")))
+        .flatten();
+    let hosts: Vec<&str> = header_str(headers, header::HOST)
+        .into_iter()
+        .chain(forwarded_host)
+        .collect();
     origin_allowed(
         header_str(headers, header::ORIGIN),
-        header_str(headers, header::HOST),
+        &hosts,
         &options.allowed_origins,
     )
 }
 
-async fn require_auth(State(app): State<AppState>, request: Request, next: Next) -> Response {
-    if is_authenticated(request.headers(), &app.hub) {
-        next.run(request).await
-    } else {
-        error_response(StatusCode::UNAUTHORIZED, "authentication required")
+fn too_many_attempts(wait: Duration) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many failed login attempts from this address; try again later",
+    );
+    insert_retry_after(&mut response, wait);
+    response
+}
+
+fn insert_retry_after(response: &mut Response, wait: Duration) {
+    let seconds = wait.as_secs().max(1).to_string();
+    if let Ok(value) = HeaderValue::from_str(&seconds) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+}
+
+async fn require_auth(
+    State(app): State<AppState>,
+    client: Client,
+    request: Request,
+    next: Next,
+) -> Response {
+    match authenticate(&app, request.headers(), client) {
+        Auth::Granted => next.run(request).await,
+        Auth::Limited(wait) => too_many_attempts(wait),
+        Auth::Anonymous | Auth::Denied => {
+            error_response(StatusCode::UNAUTHORIZED, "authentication required")
+        }
     }
 }
 
 /// Cross-origin browser requests may not change state.
-async fn origin_guard(State(app): State<AppState>, request: Request, next: Next) -> Response {
+async fn origin_guard(
+    State(app): State<AppState>,
+    client: Client,
+    request: Request,
+    next: Next,
+) -> Response {
     let safe = matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     );
-    if !safe && !origin_ok(request.headers(), &app.options) {
+    if !safe && !origin_ok(request.headers(), client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin request refused");
     }
     next.run(request).await
@@ -217,58 +368,124 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-fn forwarded_https(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
+/// Whether the browser reached the hub over HTTPS (through a TLS proxy):
+/// an `X-Forwarded-Proto: https` from a local proxy, or a `Host` that is
+/// one of the configured `https://` origins.
+fn browser_https(headers: &HeaderMap, client: Client, options: &ServerOptions) -> bool {
+    let proto = client
+        .local_peer
+        .then(|| {
+            header_str(
+                headers,
+                header::HeaderName::from_static("x-forwarded-proto"),
+            )
+        })
+        .flatten()
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
+    proto
+        || header_str(headers, header::HOST).is_some_and(|host| {
+            options.allowed_origins.iter().any(|origin| {
+                origin
+                    .trim_end_matches('/')
+                    .strip_prefix("https://")
+                    .is_some_and(|authority| {
+                        let authority = authority.to_ascii_lowercase();
+                        let host = host.trim().to_ascii_lowercase();
+                        host == authority || host.strip_suffix(":443") == Some(authority.as_str())
+                    })
+            })
+        })
 }
 
 // --- pages ------------------------------------------------------------------
 
-async fn index(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    if is_authenticated(&headers, &app.hub) {
-        no_store(Html(web::INDEX_HTML).into_response())
-    } else {
-        no_store(Html(web::login_page(None)).into_response())
+async fn index(State(app): State<AppState>, client: Client, headers: HeaderMap) -> Response {
+    match authenticate(&app, &headers, client) {
+        Auth::Granted => no_store(Html(web::INDEX_HTML).into_response()),
+        Auth::Limited(wait) => login_refused(wait),
+        Auth::Anonymous | Auth::Denied => no_store(Html(web::login_page(None)).into_response()),
     }
 }
 
+/// `/login` parameters: the token, or a one-time code (the form's single
+/// field takes either).
 #[derive(Deserialize)]
-struct TokenParam {
+struct LoginParam {
     token: Option<String>,
+    code: Option<String>,
+}
+
+impl LoginParam {
+    fn presented(&self) -> Option<&str> {
+        self.code
+            .as_deref()
+            .or(self.token.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
 }
 
 async fn login_query(
     State(app): State<AppState>,
+    client: Client,
     headers: HeaderMap,
-    Query(param): Query<TokenParam>,
+    Query(param): Query<LoginParam>,
 ) -> Response {
-    login(&app, &headers, param.token.as_deref())
+    login(&app, &headers, client, param.presented())
 }
 
 async fn login_form(
     State(app): State<AppState>,
+    client: Client,
     headers: HeaderMap,
-    Form(param): Form<TokenParam>,
+    Form(param): Form<LoginParam>,
 ) -> Response {
-    login(&app, &headers, param.token.as_deref())
+    login(&app, &headers, client, param.presented())
 }
 
-/// Trade the token for the login cookie. Success answers with a page that
-/// navigates to `/` from this origin (a same-site navigation, so the
-/// `SameSite=Strict` cookie is sent even when the login link was opened
-/// from another app) and drops the token from the address bar.
-fn login(app: &AppState, headers: &HeaderMap, presented: Option<&str>) -> Response {
-    let Some(presented) = presented.map(str::trim).filter(|t| !t.is_empty()) else {
+fn login_refused(wait: Duration) -> Response {
+    let minutes = wait.as_secs().div_ceil(60).max(1);
+    let message = format!(
+        "Too many failed attempts from this address. Try again in {minutes} minute{}.",
+        if minutes == 1 { "" } else { "s" }
+    );
+    let mut response = Html(web::login_page(Some(&message))).into_response();
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    insert_retry_after(&mut response, wait);
+    no_store(response)
+}
+
+/// Trade the token or a one-time code for the login cookie. Success
+/// answers with a page that navigates to `/` from this origin (a same-site
+/// navigation, so the `SameSite=Strict` cookie is sent even when the login
+/// link was opened from another app) and drops the credential from the
+/// address bar.
+fn login(app: &AppState, headers: &HeaderMap, client: Client, presented: Option<&str>) -> Response {
+    let Some(presented) = presented else {
         return no_store(Html(web::login_page(None)).into_response());
     };
-    if !app.hub.token().matches(presented) {
-        let mut response = Html(web::login_page(Some("That token is not valid."))).into_response();
-        *response.status_mut() = StatusCode::UNAUTHORIZED;
-        return no_store(response);
+    let token = app.hub.token();
+    {
+        let mut failures = app.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if !client.same_machine
+            && let Some(wait) = failures.locked(client.ip, now)
+        {
+            return login_refused(wait);
+        }
+        if !token.matches(presented) && !app.hub.redeem_login_code(presented) {
+            if !client.same_machine {
+                failures.record_failure(client.ip, now);
+            }
+            let mut response = Html(web::login_page(Some(
+                "That token or code is not valid (codes work once, for 5 minutes).",
+            )))
+            .into_response();
+            *response.status_mut() = StatusCode::UNAUTHORIZED;
+            return no_store(response);
+        }
     }
-    let cookie = login_cookie(app.hub.token(), forwarded_https(headers));
+    let cookie = login_cookie(&token, browser_https(headers, client, &app.options));
     let mut response = Html(web::LOGGED_IN_HTML).into_response();
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -278,7 +495,7 @@ fn login(app: &AppState, headers: &HeaderMap, presented: Option<&str>) -> Respon
 
 async fn logout(State(app): State<AppState>) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if let Ok(value) = HeaderValue::from_str(&logout_cookie(app.hub.token())) {
+    if let Ok(value) = HeaderValue::from_str(&logout_cookie(&app.hub.token())) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
@@ -288,11 +505,18 @@ async fn logout(State(app): State<AppState>) -> Response {
 /// login page also uses are public.
 async fn asset(
     State(app): State<AppState>,
+    client: Client,
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    if !web::is_public_asset(&path) && !is_authenticated(&headers, &app.hub) {
-        return error_response(StatusCode::UNAUTHORIZED, "authentication required");
+    if !web::is_public_asset(&path) {
+        match authenticate(&app, &headers, client) {
+            Auth::Granted => {}
+            Auth::Limited(wait) => return too_many_attempts(wait),
+            Auth::Anonymous | Auth::Denied => {
+                return error_response(StatusCode::UNAUTHORIZED, "authentication required");
+            }
+        }
     }
     match web::asset(&path) {
         Some((bytes, content_type)) => (
@@ -592,15 +816,35 @@ async fn session_screen(
     Ok(Json(body).into_response())
 }
 
+// --- credentials ------------------------------------------------------------
+
+/// Mint a one-time login code: `{"code","expires_in"}` (seconds). Open
+/// `/login?code=<code>` once within that time to get the login cookie.
+async fn mint_login_code(State(app): State<AppState>) -> ApiResult<Response> {
+    let code = app.hub.mint_login_code()?;
+    Ok(no_store(
+        Json(json!({ "code": code, "expires_in": LOGIN_CODE_TTL.as_secs() })).into_response(),
+    ))
+}
+
+/// Rotate the token: every cookie, code, and socket of the old one stops
+/// working at once.
+async fn rotate_token(State(app): State<AppState>) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.rotate_token()).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 // --- websocket --------------------------------------------------------------
 
 async fn session_ws(
     State(app): State<AppState>,
     Path(id): Path<String>,
+    client: Client,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !origin_ok(&headers, &app.options) {
+    if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
     }
     let Some(session) = app.hub.live_session(&id) else {
@@ -610,15 +854,27 @@ async fn session_ws(
         );
     };
     let shutdown = app.shutdown.clone();
+    let rotations = app.hub.subscribe_rotations();
     ws.max_message_size(WS_MAX_MESSAGE)
-        .on_upgrade(move |socket| pump(socket, session, shutdown))
+        .on_upgrade(move |socket| pump(socket, session, shutdown, rotations))
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
+    Input {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Theme {
+        foreground: String,
+        background: String,
+        cursor: String,
+        ansi: Vec<String>,
+    },
 }
 
 fn exit_message(info: &ExitInfo) -> Message {
@@ -701,6 +957,7 @@ async fn pump(
     mut socket: WebSocket,
     session: Arc<PtySession>,
     mut shutdown: watch::Receiver<bool>,
+    mut rotations: watch::Receiver<u64>,
 ) {
     let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
@@ -751,6 +1008,17 @@ async fn pump(
                             Ok(ClientMessage::Resize { cols, rows }) => {
                                 let _ = session.resize(cols, rows);
                             }
+                            Ok(ClientMessage::Theme { foreground, background, cursor, ansi }) => {
+                                match ViewerColors::from_hex(&foreground, &background, &cursor, &ansi) {
+                                    Ok(colors) => session.set_viewer_colors(colors),
+                                    Err(e) => {
+                                        let error = json!({ "type": "error", "message": format!("bad theme: {e}") });
+                                        if socket.send(Message::Text(error.to_string().into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 let error = json!({ "type": "error", "message": format!("bad message: {e}") });
                                 if socket.send(Message::Text(error.to_string().into())).await.is_err() {
@@ -781,6 +1049,17 @@ async fn pump(
                     break;
                 }
             }
+            changed = rotations.changed() => {
+                if changed.is_ok() {
+                    let close = CloseFrame {
+                        code: WS_CLOSE_ROTATED,
+                        reason: "token rotated: log in again".into(),
+                    };
+                    let _ = socket.send(Message::Close(Some(close))).await;
+                    break;
+                }
+                // The hub is gone: shutdown handles it.
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = socket.send(Message::Close(None)).await;
@@ -791,11 +1070,7 @@ async fn pump(
     }
 }
 
-/// The login URL printed by `fw hub serve`.
-pub fn login_url(base: &str, token: &auth::Token) -> String {
-    format!(
-        "{}/login?token={}",
-        base.trim_end_matches('/'),
-        token.expose()
-    )
+/// The login URL for a one-time `code` under `base`.
+pub fn code_login_url(base: &str, code: &str) -> String {
+    format!("{}/login?code={code}", base.trim_end_matches('/'))
 }

@@ -13,9 +13,11 @@
 pub mod agent;
 pub mod auth;
 pub mod cli;
+pub mod client;
 pub mod hub;
 pub mod paths;
 pub mod pty;
+pub mod remote;
 pub mod server;
 pub mod state;
 pub mod vt;

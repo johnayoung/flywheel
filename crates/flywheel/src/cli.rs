@@ -164,7 +164,7 @@ Verbs:
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
   docs [TOPIC]     print a curated operator doc (bare: list the topics)
-  hub serve        run the web workspace of agent terminals (hub token: print the token)
+  hub serve        run the web workspace of agent terminals (hub url: login links + QR)
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists

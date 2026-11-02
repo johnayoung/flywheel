@@ -279,7 +279,25 @@
       term.options.theme = TERM_THEMES[resolvedTheme()];
       term.options.minimumContrastRatio = contrastFloor();
     }
+    sendTheme();
   }
+  // The server answers programs' colour queries (OSC 4/10/11/12) for every
+  // viewer, so it is told this one's palette on attach, theme change, and
+  // focus: the last-focused viewer's colours win.
+  const ANSI_KEYS = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta",
+    "brightCyan", "brightWhite"];
+  function sendTheme() {
+    const colors = TERM_THEMES[resolvedTheme()];
+    send(JSON.stringify({
+      type: "theme",
+      foreground: colors.foreground,
+      background: colors.background,
+      cursor: colors.cursor,
+      ansi: ANSI_KEYS.map((key) => colors[key]),
+    }));
+  }
+  window.addEventListener("focus", () => sendTheme());
   // Agent TUIs (Claude Code) paint with 256-colour indexes tuned for dark
   // backgrounds -- pale blue, gold -- that vanish on the light theme's
   // paper. xterm lifts any cell below this ratio against its background.
@@ -495,6 +513,7 @@
       state.retry = 0;
       state.dropped = 0;
       setLink("attached");
+      sendTheme();
       hideBanner();
       term.focus();
       refresh(false).catch(() => {});
@@ -543,6 +562,11 @@
       if (state.socket !== socket) return;
       state.socket = null;
       endReplay();
+      // 4001: the hub's token was rotated; this login no longer counts.
+      if (event.code === 4001) {
+        window.location.replace("/");
+        return;
+      }
       if (state.exited || state.attached !== id) return;
       scheduleReconnect(id, event.code);
     };

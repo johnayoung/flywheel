@@ -2,7 +2,7 @@
 //! sessions the server owns.
 
 use crate::agent::{AgentPrograms, SessionKind, which};
-use crate::auth::{Token, TokenError};
+use crate::auth::{LoginCodes, Token, TokenError};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SpawnError, SpawnSpec};
 use crate::state::{
@@ -14,7 +14,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// SIGHUP-to-SIGKILL grace when killing a session.
@@ -122,7 +122,11 @@ pub struct KindAvailability {
 /// The hub.
 pub struct Hub {
     options: HubOptions,
-    token: Token,
+    token: RwLock<Token>,
+    /// One-time login codes (cleared when the token rotates).
+    login_codes: Mutex<LoginCodes>,
+    /// Bumped on every token rotation; open WebSockets close on a change.
+    rotations: tokio::sync::watch::Sender<u64>,
     store: Mutex<HubStore>,
     live: Mutex<HashMap<String, Arc<PtySession>>>,
 }
@@ -146,14 +150,54 @@ impl Hub {
         let store = HubStore::open(&options.state_dir)?;
         Ok(Arc::new(Self {
             options,
-            token,
+            token: RwLock::new(token),
+            login_codes: Mutex::new(LoginCodes::default()),
+            rotations: tokio::sync::watch::Sender::new(0),
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
         }))
     }
 
-    pub fn token(&self) -> &Token {
-        &self.token
+    /// The current token.
+    pub fn token(&self) -> Token {
+        self.token
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the token (and its file) with a fresh one. Every login
+    /// cookie (named and valued after the old token), outstanding login
+    /// code, and open WebSocket stops working; bearer clients need the new
+    /// token.
+    pub fn rotate_token(&self) -> Result<(), HubError> {
+        let mut token = self.token.write().unwrap_or_else(PoisonError::into_inner);
+        *token = Token::rotate(&self.options.state_dir)?;
+        self.login_codes().clear();
+        drop(token);
+        self.rotations.send_modify(|n| *n += 1);
+        Ok(())
+    }
+
+    /// Notified on every token rotation.
+    pub fn subscribe_rotations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rotations.subscribe()
+    }
+
+    /// Mint a one-time login code (valid [`crate::auth::LOGIN_CODE_TTL`]).
+    pub fn mint_login_code(&self) -> Result<String, HubError> {
+        Ok(self.login_codes().mint(Instant::now())?)
+    }
+
+    /// Spend a one-time login code; true when it was live.
+    pub fn redeem_login_code(&self, presented: &str) -> bool {
+        self.login_codes().redeem(presented, Instant::now())
+    }
+
+    fn login_codes(&self) -> MutexGuard<'_, LoginCodes> {
+        self.login_codes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn state_dir(&self) -> &std::path::Path {

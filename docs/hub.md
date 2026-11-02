@@ -7,28 +7,39 @@
 ## Verbs
 
 ```bash
-fw hub serve [--bind ADDR] [--port N] [--allow-origin ORIGIN]... [--scrollback-lines N] [--state-dir DIR]
-fw hub token [--state-dir DIR]     # print the access token (created on first use)
+fw hub serve [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--scrollback-lines N] [--state-dir DIR]
+fw hub url [--qr] [--state-dir DIR]           # one-time login URLs for the running hub (+ QR for a phone)
+fw hub token [--rotate] [--state-dir DIR]     # print the access token (created on first use) / rotate it
 ```
 
-`serve` runs in the foreground and prints the login URL (`http://127.0.0.1:7420/login?token=...`; on `--bind 0.0.0.0` also a `from another device:` URL on the default-route address). Ctrl-C / SIGTERM records every running session stopped, then hangs them up (SIGHUP, SIGKILL after a grace).
+`serve` runs in the foreground and prints one-time login URLs (below); when any is reachable from another device (non-loopback bind, `--public-url`, or a detected `tailscale serve`) it also draws a QR code of the first. Ctrl-C / SIGTERM records every running session stopped, then hangs them up (SIGHUP, SIGKILL after a grace). While it runs, `<state-dir>/server.json` (0600) records its pid, address, and public URLs for `url` / `token --rotate`.
+
+`url` asks the running hub for a fresh one-time code and lists it under every URL that reaches the hub, most remote-friendly first: `public` (`--public-url`), `tailnet https (tailscale serve)`, `tailnet (MagicDNS)` / `tailnet` (100.x), `lan (<iface>)` (non-loopback binds; container bridges skipped), `this machine`. `--qr` draws the first remote one (black-on-white half blocks, any terminal theme). The long-lived token is never printed by `serve` or `url`.
+
+`token --rotate` replaces the token. A running hub switches at once (no restart): every browser cookie, outstanding code, and open terminal socket (closed with code 4001; the UI returns to sign-in) of the old token stops working; bearer scripts need `fw hub token` again. With no hub running it just rewrites the file.
 
 | Flag | Default | |
 |---|---|---|
 | `--bind` | `127.0.0.1` | non-loopback prints a warning |
 | `--port` | `7420` | `0` picks a free port |
-| `--allow-origin` | none | extra browser origin (e.g. `https://box.tailnet.ts.net`); same-origin always allowed |
+| `--public-url` | none | origin browsers reach the hub at through a proxy (`https://box.tailnet.ts.net`); accepted as an origin, listed first by `url`, `Secure` cookies when https. Origin only (no path) |
+| `--allow-origin` | none | extra browser origin accepted without being listed; same-origin always allowed |
 | `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer |
 | `--state-dir` | `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub` | |
 
 ## Remote access (phone, other machines)
 
+Recommended -- Tailscale (HTTPS on the tailnet, which phones need for the clipboard API):
+
 ```bash
-fw hub serve                       # loopback only
-tailscale serve --bg 7420          # https://<machine>.<tailnet>.ts.net -> 127.0.0.1:7420
+fw hub serve                                     # loopback only
+tailscale serve --bg http://127.0.0.1:7420       # https://<machine>.<tailnet>.ts.net -> the hub
+fw hub url --qr                                  # scan with the phone
 ```
 
-Open `https://<machine>.<tailnet>.ts.net/login?token=$(fw hub token)` on the phone. If the proxy rewrites `Host`, add `--allow-origin https://<machine>.<tailnet>.ts.net`.
+- `serve` and `url` run `tailscale status --json` / `tailscale serve status --json` (3 s timeout; `tailscale` on `PATH` or the macOS app): a `serve` whose `/` proxies to the hub's port is listed and, when found at startup, accepted as an origin. Tailnet up but nothing served: they print the `tailscale serve` command.
+- Behind any reverse proxy on this machine, `X-Forwarded-For` (last entry), `X-Forwarded-Host` (counts as same-origin), and `X-Forwarded-Proto` are believed only from loopback peers. A proxy elsewhere: pass `--public-url`.
+- LAN: `fw hub serve --bind 0.0.0.0` (warns; plain HTTP, so the clipboard API is off on phones), then `fw hub url --qr`.
 
 ## Model
 
@@ -39,15 +50,17 @@ Open `https://<machine>.<tailnet>.ts.net/login?token=$(fw hub token)` on the pho
 - Terminal size is shared: the last client to resize sets it for everyone.
 - Input beyond 4 MiB queued for a terminal that is not reading is dropped (the client gets an `error` message).
 - The server runs a terminal emulator per session (`alacritty_terminal`). Attaching sends a **snapshot** -- escape sequences that rebuild scrollback, screen, alternate screen (with the shell screen under it), cursor, saved cursor, SGR pen, scroll region, charsets, DEC modes (cursor keys, keypad, bracketed paste, mouse, focus), cursor style, title, palette -- then live bytes, with no gap or overlap. The snapshot carries the newest scrollback up to 2 MiB (whole lines); a client that falls behind gets the screen alone. Not replayed: custom tab stops, blink/overline; `?47`/`?1047` alt screens and the kitty keyboard protocol are not emulated.
-- The server answers terminal queries (DA, DSR/cursor position, DECRQM, OSC 4/10/11/12 colours) once per session, attached or not; clients must not answer them. Colour answers use the web UI's dark theme, even for a client on the light theme.
+- The server answers terminal queries (DA, DSR/cursor position, DECRQM, OSC 4/10/11/12 colours) once per session, attached or not; clients must not answer them. Colour answers use the viewer's theme: the web UI reports its palette per session on attach, theme change, and window focus (last report wins; the dark theme before any).
 - Output cannot grow server memory without bound: OSC strings are cut at 64 KiB, titles at 4 KiB (title stack 10 deep), hyperlinks over 2 KiB dropped, at most 8 combining marks per cell.
 - Sessions get `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`.
 
 ## Auth
 
-- Token: 256 random bits, hex, `<state-dir>/token` (0600). Delete the file and restart to rotate.
-- Browsers: `/login?token=...` (or the form at `/`) sets an `HttpOnly; SameSite=Strict` cookie named `fw_hub_<digest of the token>` (hubs on one host do not clobber each other's login) (`Secure` behind an `X-Forwarded-Proto: https` proxy).
-- Scripts: `Authorization: Bearer <token>`.
+- Token: 256 random bits, hex, `<state-dir>/token` (0600). Rotate with `fw hub token --rotate`.
+- One-time codes: 20 Crockford base32 characters (100 bits), single use, 5 minutes, at most 64 outstanding, digests only in memory, dropped on rotation. Minted by `serve`, `url`, or `POST /api/login-codes`. Case, `-`/spaces and `i l o` look-alikes are forgiven when typed.
+- Browsers: `/login?code=...` or `/login?token=...` (or the form at `/`, whose one field takes either) sets an `HttpOnly; SameSite=Strict` cookie named `fw_hub_<digest of the token>` (hubs on one host do not clobber each other's login) (`Secure` behind an `X-Forwarded-Proto: https` local proxy or under an https `--public-url` / tailscale serve host).
+- Scripts: `Authorization: Bearer <token>` (codes are not bearer credentials).
+- Failure limit: 10 wrong credentials (token, code, cookie, or bearer) per client address in a sliding 10 minutes, then everything that client presents -- even a valid credential -- gets 429 + `Retry-After` until the oldest failure ages out. IPv6 clients are keyed by /64. Direct connections from this machine (loopback or the host's own address, no `X-Forwarded-For`: the CLI, a local browser) are exempt, so a remote attacker cannot lock out `fw hub url`.
 - Cross-origin `Origin` headers are refused on WebSocket upgrades and on every non-GET request.
 
 ## API
@@ -65,9 +78,11 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
 | GET | `/sessions/{id}/ws` | WebSocket attach |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
+| POST | `/login-codes` | `{"code","expires_in":300}`: a one-time code for `/login?code=` |
+| POST | `/token/rotate` | 204: rotate the token (see `fw hub token --rotate`) |
 | GET | `/repos/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
 
-WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
+WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001.
 
 Screen text: `source=visible` (default) is the screen's rows (`lines` is refused); `recent` the last `lines` (1..100000, default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
 

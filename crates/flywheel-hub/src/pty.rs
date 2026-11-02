@@ -26,7 +26,7 @@
 //! some escaped process (one that `setsid`ed away but kept the terminal open)
 //! still holds the PTY, so a removed session's fds and threads are freed.
 
-use crate::vt::{Emulator, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource};
+use crate::vt::{Emulator, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource, ViewerColors};
 use axum::body::Bytes;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -429,6 +429,12 @@ impl PtySession {
     /// Scrollback lines retained by the active screen.
     pub fn scrollback_lines(&self) -> usize {
         self.lock().screen.history_lines()
+    }
+
+    /// Answer colour queries with a viewer's theme from now on (see
+    /// [`ViewerColors`]).
+    pub fn set_viewer_colors(&self, colors: ViewerColors) {
+        self.lock().screen.set_viewer_colors(colors);
     }
 
     /// The terminal's rendered plain text.

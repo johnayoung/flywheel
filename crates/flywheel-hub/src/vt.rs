@@ -162,42 +162,120 @@ fn truncated(mut s: String, max: usize) -> String {
     s
 }
 
-/// The colour a fresh client shows for palette / dynamic-colour `index`
-/// when the program has not set one: the web app's dark terminal theme
-/// (`TERM_THEMES.dark` in `web/app.js`; keep the two in sync) and xterm.js
-/// 6's 256-colour cube and greys.
-fn default_color(index: usize) -> Rgb {
-    const ANSI: [u32; 16] = [
-        0x22241f, 0xef5a4c, 0xa3c76d, 0xe3b341, 0x6fa3d6, 0xc98bd1, 0x62c2b5, 0xd9d3c3, 0x5d5a51,
-        0xff7a66, 0xbfe08a, 0xf4cd68, 0x93bff0, 0xe0a9e6, 0x86ddd0, 0xf6f1e4,
-    ];
-    const FOREGROUND: u32 = 0xe6e0cf;
-    const BACKGROUND: u32 = 0x0c0d0c;
-    const CURSOR: u32 = 0xff5a1f;
-    let hex = |v: u32| Rgb {
+/// The colours a viewer's terminal shows wherever the program has set none:
+/// the 16 ANSI colours plus the default foreground, background, and cursor.
+/// Terminal colour queries (OSC 4/10/11/12) are answered from these, so a
+/// program that adapts to the background (light or dark) matches what the
+/// viewer actually sees. The web UI reports its theme on attach and on
+/// every theme change or focus; the last report wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerColors {
+    pub ansi: [Rgb; 16],
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+}
+
+const fn rgb(v: u32) -> Rgb {
+    Rgb {
         r: (v >> 16) as u8,
         g: (v >> 8) as u8,
         b: v as u8,
-    };
-    match index {
-        0..16 => hex(ANSI[index]),
-        16..232 => {
-            let level = |n: usize| [0u8, 95, 135, 175, 215, 255][n % 6];
-            let i = index - 16;
-            Rgb {
-                r: level(i / 36),
-                g: level(i / 6),
-                b: level(i),
-            }
-        }
-        232..256 => {
-            let v = u8::try_from(8 + (index - 232) * 10).unwrap_or(u8::MAX);
-            Rgb { r: v, g: v, b: v }
-        }
-        _ if index == NamedColor::Background as usize => hex(BACKGROUND),
-        _ if index == NamedColor::Cursor as usize => hex(CURSOR),
-        _ => hex(FOREGROUND),
     }
+}
+
+impl ViewerColors {
+    /// The web app's dark terminal theme (`TERM_THEMES.dark` in
+    /// `web/app.js`): what a session answers before any viewer reported.
+    pub const DARK: Self = Self {
+        ansi: [
+            rgb(0x22241f),
+            rgb(0xef5a4c),
+            rgb(0xa3c76d),
+            rgb(0xe3b341),
+            rgb(0x6fa3d6),
+            rgb(0xc98bd1),
+            rgb(0x62c2b5),
+            rgb(0xd9d3c3),
+            rgb(0x5d5a51),
+            rgb(0xff7a66),
+            rgb(0xbfe08a),
+            rgb(0xf4cd68),
+            rgb(0x93bff0),
+            rgb(0xe0a9e6),
+            rgb(0x86ddd0),
+            rgb(0xf6f1e4),
+        ],
+        foreground: rgb(0xe6e0cf),
+        background: rgb(0x0c0d0c),
+        cursor: rgb(0xff5a1f),
+    };
+
+    /// Parse a viewer's report: `#rrggbb` colours (16 ANSI ones).
+    pub fn from_hex(
+        foreground: &str,
+        background: &str,
+        cursor: &str,
+        ansi: &[String],
+    ) -> Result<Self, String> {
+        let parse = |what: &str, text: &str| {
+            parse_hex_color(text).ok_or_else(|| format!("{what}: {text:?} is not #rrggbb"))
+        };
+        if ansi.len() != 16 {
+            return Err(format!("ansi: expected 16 colours, got {}", ansi.len()));
+        }
+        let mut colors = [Rgb::default(); 16];
+        for (i, text) in ansi.iter().enumerate() {
+            colors[i] = parse(&format!("ansi[{i}]"), text)?;
+        }
+        Ok(Self {
+            ansi: colors,
+            foreground: parse("foreground", foreground)?,
+            background: parse("background", background)?,
+            cursor: parse("cursor", cursor)?,
+        })
+    }
+
+    /// The colour for palette / dynamic-colour `index` when the program has
+    /// not set one: these colours, then xterm.js 6's 256-colour cube and
+    /// greys (which no theme changes).
+    fn color(&self, index: usize) -> Rgb {
+        match index {
+            0..16 => self.ansi[index],
+            16..232 => {
+                let level = |n: usize| [0u8, 95, 135, 175, 215, 255][n % 6];
+                let i = index - 16;
+                Rgb {
+                    r: level(i / 36),
+                    g: level(i / 6),
+                    b: level(i),
+                }
+            }
+            232..256 => {
+                let v = u8::try_from(8 + (index - 232) * 10).unwrap_or(u8::MAX);
+                Rgb { r: v, g: v, b: v }
+            }
+            _ if index == NamedColor::Background as usize => self.background,
+            _ if index == NamedColor::Cursor as usize => self.cursor,
+            _ => self.foreground,
+        }
+    }
+}
+
+impl Default for ViewerColors {
+    fn default() -> Self {
+        Self::DARK
+    }
+}
+
+/// `#rrggbb` (case-insensitive) as a colour.
+fn parse_hex_color(text: &str) -> Option<Rgb> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    Some(rgb(v))
 }
 
 /// The parser's view of the terminal: `Term` with what output can make it
@@ -209,14 +287,16 @@ fn default_color(index: usize) -> Rgb {
 /// * combining characters beyond [`MAX_ZEROWIDTH`] on one cell are dropped
 ///   (`Term` keeps every one);
 /// * over-long hyperlinks are dropped;
-/// * OSC 4/10/11/12 queries are answered from the palette (`Term` would ask
-///   a renderer for colours it does not know).
+/// * OSC 4/10/11/12 queries are answered from the palette, falling back to
+///   the viewer's [`ViewerColors`] (`Term` would ask a renderer for colours
+///   it does not know).
 ///
 /// Everything else is forwarded unchanged.
 struct Guarded<'a> {
     term: &'a mut Term<Listener>,
     titles: &'a mut Vec<Option<String>>,
     listener: &'a Listener,
+    colors: &'a ViewerColors,
 }
 
 macro_rules! forward {
@@ -288,7 +368,7 @@ impl Handler for Guarded<'_> {
         if index >= alacritty_terminal::term::color::COUNT {
             return;
         }
-        let rgb = self.term.colors()[index].unwrap_or_else(|| default_color(index));
+        let rgb = self.term.colors()[index].unwrap_or_else(|| self.colors.color(index));
         self.listener.reply(&format!(
             "\x1b]{prefix};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}{terminator}",
             rgb.r, rgb.g, rgb.b
@@ -552,6 +632,8 @@ pub struct Emulator {
     listener: Listener,
     /// The title stack (see [`Guarded`]).
     titles: Vec<Option<String>>,
+    /// What colour queries answer where the program set no colour.
+    colors: ViewerColors,
     osc: OscScan,
     config: Config,
     scrollback_lines: usize,
@@ -594,10 +676,17 @@ impl Emulator {
             tracked: Tracked::new(size.rows),
             listener,
             titles: Vec::new(),
+            colors: ViewerColors::default(),
             osc: OscScan::default(),
             config,
             scrollback_lines,
         }
+    }
+
+    /// Set the colours that colour queries answer where the program set
+    /// none (the attached viewer's theme).
+    pub fn set_viewer_colors(&mut self, colors: ViewerColors) {
+        self.colors = colors;
     }
 
     /// Feed PTY output. Replies to any terminal queries in it are queued
@@ -629,6 +718,7 @@ impl Emulator {
                 term: &mut self.term,
                 titles: &mut self.titles,
                 listener: &self.listener,
+                colors: &self.colors,
             });
         }
     }
@@ -640,6 +730,7 @@ impl Emulator {
                 term: &mut self.term,
                 titles: &mut self.titles,
                 listener: &self.listener,
+                colors: &self.colors,
             },
             bytes,
         );
@@ -667,6 +758,7 @@ impl Emulator {
                 term: &mut self.term,
                 titles: &mut self.titles,
                 listener: &self.listener,
+                colors: &self.colors,
             });
         }
     }
@@ -1635,9 +1727,10 @@ mod tests {
             String::from_utf8(e.take_replies()).unwrap(),
             "\x1b]11;rgb:1212/3434/5656\x07"
         );
-        assert_eq!(default_color(232), Rgb { r: 8, g: 8, b: 8 });
+        let dark = ViewerColors::DARK;
+        assert_eq!(dark.color(232), Rgb { r: 8, g: 8, b: 8 });
         assert_eq!(
-            default_color(231),
+            dark.color(231),
             Rgb {
                 r: 255,
                 g: 255,
@@ -1647,6 +1740,35 @@ mod tests {
         // Snapshots carry no queries, so replaying one asks nothing.
         let mut client = replayed(&mut e);
         assert!(client.take_replies().is_empty());
+    }
+
+    #[test]
+    fn colour_queries_follow_the_viewer_theme() {
+        let mut e = fed(b"");
+        let ansi: Vec<String> = (0..16).map(|i| format!("#0000{i:02x}")).collect();
+        let light = ViewerColors::from_hex("#23241F", "#f2eee4", "#e2470c", &ansi).unwrap();
+        e.set_viewer_colors(light);
+        e.process(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b]4;3;?\x07\x1b]4;16;?\x07");
+        assert_eq!(
+            String::from_utf8(e.take_replies()).unwrap(),
+            "\x1b]10;rgb:2323/2424/1f1f\x07\x1b]11;rgb:f2f2/eeee/e4e4\x07\
+             \x1b]12;rgb:e2e2/4747/0c0c\x07\x1b]4;3;rgb:0000/0000/0303\x07\
+             \x1b]4;16;rgb:0000/0000/0000\x07"
+        );
+        // A colour the program set still wins over the viewer's.
+        e.process(b"\x1b]11;rgb:12/34/56\x07\x1b]11;?\x07");
+        assert_eq!(
+            String::from_utf8(e.take_replies()).unwrap(),
+            "\x1b]11;rgb:1212/3434/5656\x07"
+        );
+        for bad in [
+            ViewerColors::from_hex("#fff", "#000000", "#000000", &ansi),
+            ViewerColors::from_hex("#ffffff", "000000", "#000000", &ansi),
+            ViewerColors::from_hex("#ffffff", "#000000", "#00000g", &ansi),
+            ViewerColors::from_hex("#ffffff", "#000000", "#000000", &ansi[..15]),
+        ] {
+            assert!(bad.is_err());
+        }
     }
 
     #[test]

@@ -149,8 +149,8 @@ pub fn login_page(error: Option<&str>) -> String {
 <form method="post" action="/login">
   <span class="kicker">flywheel hub</span>
   <h1>Sign in</h1>
-  <p>Paste the token from <code>fw hub token</code>, or open the login URL <code>fw hub serve</code> printed.</p>
-  <input name="token" type="password" autocomplete="current-password" placeholder="token" aria-label="Token" autofocus required>
+  <p>Open a link from <code>fw hub url</code> (on a phone, scan <code>fw hub url --qr</code>), or paste its one-time code or the token from <code>fw hub token</code>.</p>
+  <input name="token" type="password" autocomplete="current-password" autocapitalize="off" spellcheck="false" placeholder="code or token" aria-label="Code or token" autofocus required>
   <button type="submit">Sign in</button>
   {error}
 </form>

@@ -2,9 +2,11 @@
 //! end: real git repos in temp dirs, a real server on 127.0.0.1:0, real
 //! PTYs.
 
+mod support;
+
 use flywheel_hub::hub::RestoreOutcome;
 use flywheel_hub::remote::RuntimeInfo;
-use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
+use flywheel_hub::{HubOptions, ServerOptions, serve};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -43,10 +45,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 /// A stand-in agent CLI that just reads its input.
 fn fake_agent(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("claude");
-    std::fs::write(&path, "#!/bin/sh\nexec cat\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_script(&path, "#!/bin/sh\nexec cat\n");
     path
 }
 
@@ -67,12 +67,13 @@ impl TestHub {
     }
 
     async fn reopen(dir: tempfile::TempDir) -> (Self, Vec<RestoreOutcome>) {
+        flywheel_hub::install_crypto_provider();
         let mut options = HubOptions::new(dir.path().join("state"));
         options.default_shell = vec!["/bin/sh".into()];
         options.agents.claude = fake_agent(dir.path()).to_string_lossy().into_owned();
         options.claude_config_dir = Some(dir.path().join("claude-config"));
         options.codex_home = Some(dir.path().join("codex-home"));
-        let hub = Hub::open(options).unwrap();
+        let hub = support::open_hub(options);
         let restored = hub.restore_sessions();
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

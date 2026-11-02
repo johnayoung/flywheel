@@ -1,8 +1,10 @@
 //! End-to-end: a real hub server on 127.0.0.1:0, real HTTP, real
 //! WebSockets, real PTYs running `/bin/sh`.
 
+mod support;
+
 use flywheel_hub::vt::{Emulator, TextSource};
-use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
+use flywheel_hub::{HubOptions, ServerOptions, serve};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
@@ -55,7 +57,7 @@ impl TestHub {
         let mut options = HubOptions::new(state_dir.clone());
         options.default_shell = vec!["/bin/sh".into()];
         configure(&mut options);
-        let hub = Hub::open(options).unwrap();
+        let hub = support::open_hub(options);
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -876,10 +878,8 @@ async fn api_errors_are_json_and_edge_inputs_are_handled() {
 
 /// Write an executable script standing in for an agent CLI.
 fn fake_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    support::write_script(&path, &format!("#!/bin/sh\n{body}\n"));
     path
 }
 
@@ -1819,7 +1819,7 @@ async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
     // What `fw hub serve` does on start.
     let mut options = HubOptions::new(state_dir.clone());
     options.default_shell = vec!["/bin/sh".into()];
-    let reopened = Hub::open(options).unwrap();
+    let reopened = support::open_hub(options);
     let outcomes = reopened.restore_sessions();
     assert_eq!(outcomes.len(), 2, "the exited session is not restored");
     assert_eq!(outcomes[0].id, sid);
@@ -1864,7 +1864,7 @@ async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
     std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
     let mut options = HubOptions::new(state_dir.clone());
     options.default_shell = vec!["/bin/sh".into()];
-    let after_crash = Hub::open(options).unwrap();
+    let after_crash = support::open_hub(options);
     assert!(after_crash.restore_sessions().is_empty());
     let views = after_crash.sessions(None);
     assert!(!views[0].record.state.is_restorable());

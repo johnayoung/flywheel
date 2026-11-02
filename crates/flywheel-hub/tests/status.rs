@@ -8,6 +8,8 @@
 //! the `-c notify=[...]` program (Codex) -- here by sending the report
 //! those `fw hub report` invocations send.
 
+mod support;
+
 use flywheel_hub::report::{self, Report, ReportError};
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
 use futures_util::{SinkExt, StreamExt};
@@ -60,7 +62,7 @@ impl TestHub {
         options.agents.codex = codex.to_string_lossy().into_owned();
         options.report_command = Some(vec![REPORT_PROGRAM.into(), "hub".into()]);
         options.claude_config_dir = Some(dir.path().join("claude-config"));
-        let hub = Hub::open(options).unwrap();
+        let hub = support::open_hub(options);
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -163,19 +165,16 @@ impl TestHub {
 }
 
 fn fake_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
     let dump = dir.join(name);
-    std::fs::write(
+    support::write_script(
         &path,
-        format!(
+        &format!(
             "#!/bin/sh\nenv > '{d}.env.tmp' && mv '{d}.env.tmp' '{d}.env'\n\
              printf '%s\\n' \"$@\" > '{d}.args.tmp' && mv '{d}.args.tmp' '{d}.args'\n{body}\n",
             d = dump.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     path
 }
 

@@ -36,6 +36,11 @@ pub mod vscode;
 pub mod vt;
 pub mod web;
 
+/// The integration tests' helpers (stand-in scripts), for unit tests too.
+#[cfg(test)]
+#[path = "../tests/support/script.rs"]
+mod test_support;
+
 pub use hub::{CreateSession, Hub, HubError, HubEvent, HubOptions, RestoreOutcome, SessionView};
 pub use server::{ServerOptions, router, serve};
 

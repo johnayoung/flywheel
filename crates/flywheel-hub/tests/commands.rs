@@ -5,12 +5,14 @@
 //! commands`; pastes go into a real terminal that records the exact bytes
 //! it received.
 
+mod support;
+
 use flywheel_hub::agent::claude_project_dir_name;
 use flywheel_hub::hub::RestoreOutcome;
 use flywheel_hub::remote::RuntimeInfo;
 use flywheel_hub::report::{self, Report};
 use flywheel_hub::restore::RestoreHow;
-use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
+use flywheel_hub::{HubOptions, ServerOptions, serve};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -60,7 +62,7 @@ impl TestHub {
         options.claude_config_dir = Some(dir.path().join("claude-config"));
         options.codex_home = Some(dir.path().join("codex-home"));
         options.agent_resume = agent_resume;
-        let hub = Hub::open(options).unwrap();
+        let hub = support::open_hub(options);
         let restored = hub.restore_sessions();
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -155,18 +157,15 @@ impl TestHub {
 
 /// A stand-in agent CLI: dumps its environment, then echoes its input.
 fn fake_agent(dir: &Path, name: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
     let env = dir.join(format!("{name}.env"));
-    std::fs::write(
+    support::write_script(
         &path,
-        format!(
+        &format!(
             "#!/bin/sh\nenv > '{e}.tmp' && mv '{e}.tmp' '{e}'\nexec cat\n",
             e = env.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     path
 }
 

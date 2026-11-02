@@ -551,20 +551,30 @@ mod tests {
         info.write(dir.path()).unwrap();
         assert_eq!(running_hub(dir.path()).unwrap(), None);
         assert!(!dir.path().join(RUNTIME_FILE).exists());
-        let lock = ServeLock::acquire(dir.path()).unwrap().expect("free");
+        let lock = eventually("free", || ServeLock::acquire(dir.path()).unwrap());
         assert!(ServeLock::acquire(dir.path()).unwrap().is_none(), "held");
         info.write(dir.path()).unwrap();
         assert_eq!(running_hub(dir.path()).unwrap(), Some(info.clone()));
         drop(lock);
-        // Released -- once any child forked meanwhile by another test in
-        // this process (PTY spawns) has exec'd and so closed its inherited
-        // copy of the lock's descriptor (it is close-on-exec).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while ServeLock::acquire(dir.path()).unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline, "released");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        eventually("released", || {
+            running_hub(dir.path()).unwrap().is_none().then_some(())
+        });
+    }
+
+    /// `probe` until it yields, within 5s. A lock just released here --
+    /// by a drop, or by `running_hub`'s own probe -- stays held until every
+    /// child forked meanwhile by another test in this process (PTY spawns)
+    /// has exec'd and so closed its inherited copy of the descriptor (it
+    /// is close-on-exec): a flock belongs to the open file, not the fd.
+    fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(running_hub(dir.path()).unwrap(), None);
     }
 
     #[test]
@@ -631,10 +641,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn detects_tailscale_through_its_cli() {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::test_support::write_script;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("tailscale");
-        std::fs::write(
+        write_script(
             &fake,
             r#"#!/bin/sh
 case "$1 $2" in
@@ -643,17 +653,14 @@ case "$1 $2" in
   *) exit 1 ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let ts = detect_tailscale(&fake, 7420).unwrap();
         assert_eq!(ts.dns_name.as_deref(), Some("box.t.ts.net"));
         assert_eq!(ts.serve_urls, vec!["https://box.t.ts.net"]);
         assert!(detect_tailscale(&fake, 1).unwrap().serve_urls.is_empty());
 
         let hang = dir.path().join("hang");
-        std::fs::write(&hang, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&hang, "#!/bin/sh\nexec sleep 30\n");
         let started = Instant::now();
         assert!(detect_tailscale(&hang, 7420).is_none());
         assert!(started.elapsed() < TAILSCALE_TIMEOUT + Duration::from_secs(2));

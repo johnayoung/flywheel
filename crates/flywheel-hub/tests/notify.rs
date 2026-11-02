@@ -2,12 +2,14 @@
 //! scripted Claude Code stand-in reporting over the real report socket,
 //! and a real HTTP server standing in for ntfy that records every POST.
 
+mod support;
+
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use flywheel_hub::notify::{Notifier, NotifyConfig};
 use flywheel_hub::report::{self, Report};
-use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
+use flywheel_hub::{HubOptions, ServerOptions, serve};
 use futures_util::SinkExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -112,7 +114,7 @@ impl TestHub {
         options.agents.claude = claude.to_string_lossy().into_owned();
         options.report_command = Some(vec![REPORT_PROGRAM.into(), "hub".into()]);
         options.claude_config_dir = Some(dir.path().join("claude-config"));
-        let hub = Hub::open(options).unwrap();
+        let hub = support::open_hub(options);
         let notifier = notify.map(|config| {
             let notifier = Notifier::new(config).unwrap();
             notifier.watch(&hub);
@@ -222,17 +224,14 @@ impl TestHub {
 }
 
 fn fake_claude(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("claude");
-    std::fs::write(
+    support::write_script(
         &path,
-        format!(
+        &format!(
             "#!/bin/sh\nenv > '{d}.env.tmp' && mv '{d}.env.tmp' '{d}.env'\nexec cat\n",
             d = path.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     path
 }
 

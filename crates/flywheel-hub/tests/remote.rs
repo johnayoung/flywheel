@@ -3,6 +3,8 @@
 //! behind colour queries, and the `fw hub url` / `fw hub token --rotate`
 //! verbs against a real server on 127.0.0.1:0.
 
+mod support;
+
 use flywheel_hub::auth::{MAX_FAILURES, cookie_name};
 use flywheel_hub::remote::{RuntimeInfo, ServeLock};
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
@@ -43,7 +45,7 @@ impl TestHub {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let mut hub_options = HubOptions::new(state_dir.clone());
         hub_options.default_shell = vec!["/bin/sh".into()];
-        let hub = Hub::open(hub_options).unwrap();
+        let hub = support::open_hub(hub_options);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel::<()>();

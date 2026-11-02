@@ -38,13 +38,15 @@ Open `https://<machine>.<tailnet>.ts.net/login?token=$(fw hub token)` on the pho
 - Killing a session hangs up its whole session (leader's group plus background jobs, even after the leader exited; Linux scans `/proc`, elsewhere only the leader's group). Removing a session, or deleting its workspace, also frees its PTY.
 - Terminal size is shared: the last client to resize sets it for everyone.
 - Input beyond 4 MiB queued for a terminal that is not reading is dropped (the client gets an `error` message).
-- The server runs a terminal emulator per session (`alacritty_terminal`). Attaching sends a **snapshot** -- escape sequences that rebuild scrollback, screen, alternate screen (with the shell screen under it), cursor, saved cursor, SGR pen, scroll region, charsets, DEC modes (cursor keys, keypad, bracketed paste, mouse, focus), cursor style, title, palette -- then live bytes, with no gap or overlap. Not replayed: custom tab stops; `?47`/`?1047` alt screens are not emulated (`?1049` is).
+- The server runs a terminal emulator per session (`alacritty_terminal`). Attaching sends a **snapshot** -- escape sequences that rebuild scrollback, screen, alternate screen (with the shell screen under it), cursor, saved cursor, SGR pen, scroll region, charsets, DEC modes (cursor keys, keypad, bracketed paste, mouse, focus), cursor style, title, palette -- then live bytes, with no gap or overlap. The snapshot carries the newest scrollback up to 2 MiB (whole lines); a client that falls behind gets the screen alone. Not replayed: custom tab stops, blink/overline; `?47`/`?1047` alt screens and the kitty keyboard protocol are not emulated.
+- The server answers terminal queries (DA, DSR/cursor position, DECRQM, OSC 4/10/11/12 colours) once per session, attached or not; clients must not answer them. Colour answers use the web UI's dark theme, even for a client on the light theme.
+- Output cannot grow server memory without bound: OSC strings are cut at 64 KiB, titles at 4 KiB (title stack 10 deep), hyperlinks over 2 KiB dropped, at most 8 combining marks per cell.
 - Sessions get `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`.
 
 ## Auth
 
 - Token: 256 random bits, hex, `<state-dir>/token` (0600). Delete the file and restart to rotate.
-- Browsers: `/login?token=...` (or the form at `/`) sets an `HttpOnly; SameSite=Strict` cookie (`Secure` behind an `X-Forwarded-Proto: https` proxy).
+- Browsers: `/login?token=...` (or the form at `/`) sets an `HttpOnly; SameSite=Strict` cookie named `fw_hub_<digest of the token>` (hubs on one host do not clobber each other's login) (`Secure` behind an `X-Forwarded-Proto: https` proxy).
 - Scripts: `Authorization: Bearer <token>`.
 - Cross-origin `Origin` headers are refused on WebSocket upgrades and on every non-GET request.
 
@@ -65,9 +67,9 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
 | GET | `/repos/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
 
-WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen"}` (size the snapshot was rendered at), then **binary** frames (the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, snapshot follows) / `{"type":"error","message"}`. Clients should reset their terminal before replaying (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
+WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
 
-Screen text: `source=visible` (default) is the screen's rows; `recent` the last `lines` (default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
+Screen text: `source=visible` (default) is the screen's rows (`lines` is refused); `recent` the last `lines` (1..100000, default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
 
 ```json
 {"source":"visible","cols":80,"rows":24,"alt_screen":true,"title":"vim","cursor":{"row":2,"col":2,"visible":true},

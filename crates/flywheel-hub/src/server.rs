@@ -4,26 +4,30 @@
 //! WebSocket protocol (`GET /api/sessions/{id}/ws`):
 //!
 //! * server -> client, **text** JSON `{"type":"snapshot","cols":N,"rows":N,
-//!   "alt_screen":B}` first: the size the snapshot was rendered at.
-//! * server -> client, **binary**: terminal output. The first frames after
-//!   the snapshot message are the snapshot -- escape sequences rebuilding
-//!   the session's terminal (scrollback, screen, alternate screen, cursor,
-//!   modes, title) in a reset client -- then live PTY output, with no gap or
-//!   overlap.
+//!   "alt_screen":B,"bytes":N}` first: the size the snapshot was rendered at
+//!   (size the terminal to it before replaying, then fit and resize) and its
+//!   length.
+//! * server -> client, **binary**: terminal output. The first `bytes` bytes
+//!   after the snapshot message are the snapshot -- escape sequences
+//!   rebuilding the session's terminal (scrollback, screen, alternate
+//!   screen, cursor, modes, title) in a reset client -- then live PTY
+//!   output, with no gap or overlap.
+//! * The server answers terminal queries (device attributes, cursor
+//!   position, mode and colour reports) itself; clients must not.
 //! * server -> client, **text** JSON: `{"type":"exit","code":N|null,
 //!   "signal":S|null}` once the process ends; `{"type":"reset"}` when the
-//!   client fell too far behind -- clear the terminal, a fresh snapshot
-//!   follows.
+//!   client fell too far behind -- clear the terminal, a fresh snapshot of
+//!   the screen alone (no scrollback, so a slow link catches up) follows.
 //! * client -> server, **text** JSON: `{"type":"input","data":"..."}` and
 //!   `{"type":"resize","cols":N,"rows":N}`; **binary** frames are raw input.
 
 use crate::auth::{
-    self, COOKIE_NAME, bearer_value, cookie_value, login_cookie, logout_cookie, origin_allowed,
+    self, bearer_value, cookie_name, cookie_value, login_cookie, logout_cookie, origin_allowed,
 };
 use crate::hub::{CreateSession, Hub, HubError};
 use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
 use crate::state::{StateError, WorkspaceInput, validate_repo};
-use crate::vt::{DEFAULT_RECENT_LINES, TextSource};
+use crate::vt::{DEFAULT_RECENT_LINES, SNAPSHOT_HISTORY_BYTES, TextSource};
 use crate::web;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -50,6 +54,10 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const WS_MAX_MESSAGE: usize = 1024 * 1024;
 /// Snapshot bytes per binary frame.
 const SNAPSHOT_FRAME: usize = 256 * 1024;
+/// Scrollback in the snapshot sent after a client fell behind: none. It
+/// could not keep up with live output, so it gets the smallest snapshot
+/// that is still faithful to the screen.
+const LAGGED_SNAPSHOT_HISTORY: usize = 0;
 /// Largest `lines` the screen endpoint accepts.
 const MAX_SCREEN_LINES: usize = 100_000;
 /// How long [`serve`] waits for sessions to exit on shutdown.
@@ -144,11 +152,12 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
 
 fn is_authenticated(headers: &HeaderMap, hub: &Hub) -> bool {
     let token = hub.token();
+    let name = cookie_name(token.expose());
     let by_cookie = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .filter_map(|v| cookie_value(v, COOKIE_NAME))
+        .filter_map(|v| cookie_value(v, &name))
         .any(|v| token.matches(v));
     by_cookie
         || header_str(headers, header::AUTHORIZATION)
@@ -267,9 +276,9 @@ fn login(app: &AppState, headers: &HeaderMap, presented: Option<&str>) -> Respon
     no_store(response)
 }
 
-async fn logout() -> Response {
+async fn logout(State(app): State<AppState>) -> Response {
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if let Ok(value) = HeaderValue::from_str(&logout_cookie()) {
+    if let Ok(value) = HeaderValue::from_str(&logout_cookie(app.hub.token())) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
@@ -519,7 +528,8 @@ async fn remove_session(
 #[derive(Deserialize)]
 struct ScreenQuery {
     source: Option<String>,
-    lines: Option<usize>,
+    /// Parsed by hand so a bad value gets the API's JSON error.
+    lines: Option<String>,
 }
 
 /// The rendered text of a session's terminal: `source=visible` (default)
@@ -528,16 +538,33 @@ struct ScreenQuery {
 async fn session_screen(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<ScreenQuery>,
+    query: Result<Query<ScreenQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Response> {
-    let lines = query.lines.unwrap_or(DEFAULT_RECENT_LINES);
-    if !(1..=MAX_SCREEN_LINES).contains(&lines) {
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("lines must be between 1 and {MAX_SCREEN_LINES}"),
-        ));
-    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => {
+            return Ok(error_response(rejection.status(), &rejection.body_text()));
+        }
+    };
+    let lines = match query.lines.as_deref() {
+        None => DEFAULT_RECENT_LINES,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=MAX_SCREEN_LINES).contains(&n) => n,
+            _ => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("lines must be an integer between 1 and {MAX_SCREEN_LINES}"),
+                ));
+            }
+        },
+    };
     let source = match query.source.as_deref().unwrap_or("visible") {
+        "visible" if query.lines.is_some() => {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "lines applies to source=recent only (visible is always the whole screen)",
+            ));
+        }
         "visible" => TextSource::Visible,
         "recent" => TextSource::Recent { lines },
         other => {
@@ -603,41 +630,53 @@ fn exit_message(info: &ExitInfo) -> Message {
 }
 
 /// Snapshot a session (and subscribe) off the async workers.
-async fn attach(session: &Arc<PtySession>) -> Option<Attachment> {
+async fn attach(session: &Arc<PtySession>, history_budget: usize) -> Option<Attachment> {
     let session = Arc::clone(session);
-    tokio::task::spawn_blocking(move || session.attach())
+    tokio::task::spawn_blocking(move || session.attach_with(history_budget))
         .await
         .ok()
 }
 
-/// Send an attachment's snapshot (and exit, if already exited).
-async fn send_attachment(socket: &mut WebSocket, attachment: &Attachment) -> bool {
+/// Send an attachment's snapshot (and exit, if already exited), returning
+/// its live receiver. The snapshot is released once sent.
+async fn send_attachment(
+    socket: &mut WebSocket,
+    attachment: Attachment,
+) -> Option<broadcast::Receiver<SessionEvent>> {
+    let Attachment {
+        replay,
+        cols,
+        rows,
+        alt_screen,
+        exit,
+        events,
+    } = attachment;
     let header = json!({
         "type": "snapshot",
-        "cols": attachment.cols,
-        "rows": attachment.rows,
-        "alt_screen": attachment.alt_screen,
+        "cols": cols,
+        "rows": rows,
+        "alt_screen": alt_screen,
+        "bytes": replay.len(),
     });
-    if socket
+    socket
         .send(Message::Text(header.to_string().into()))
         .await
-        .is_err()
-    {
-        return false;
-    }
-    for frame in attachment.replay.chunks(SNAPSHOT_FRAME) {
-        if socket
-            .send(Message::Binary(Bytes::copy_from_slice(frame)))
+        .ok()?;
+    let replay = Bytes::from(replay);
+    let mut start = 0;
+    while start < replay.len() {
+        let end = replay.len().min(start + SNAPSHOT_FRAME);
+        socket
+            .send(Message::Binary(replay.slice(start..end)))
             .await
-            .is_err()
-        {
-            return false;
-        }
+            .ok()?;
+        start = end;
     }
-    if let Some(info) = &attachment.exit {
-        return socket.send(exit_message(info)).await.is_ok();
+    drop(replay);
+    if let Some(info) = &exit {
+        socket.send(exit_message(info)).await.ok()?;
     }
-    true
+    Some(events)
 }
 
 /// Queue client input; tell the client when it was dropped because the
@@ -663,29 +702,37 @@ async fn pump(
     session: Arc<PtySession>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let Some(mut attachment) = attach(&session).await else {
+    let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
     };
-    if !send_attachment(&mut socket, &attachment).await {
+    let Some(mut events) = send_attachment(&mut socket, attachment).await else {
         return;
-    }
+    };
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     loop {
         tokio::select! {
-            event = attachment.events.recv() => {
+            event = events.recv() => {
                 let sent = match event {
                     Ok(SessionEvent::Output(bytes)) => socket.send(Message::Binary(bytes)).await.is_ok(),
                     Ok(SessionEvent::Exit(info)) => socket.send(exit_message(&info)).await.is_ok(),
-                    Err(broadcast::error::RecvError::Lagged(_)) => match attach(&session).await {
-                        Some(fresh) => {
-                            attachment = fresh;
-                            let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
-                            socket.send(reset).await.is_ok()
-                                && send_attachment(&mut socket, &attachment).await
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Unsubscribe first, so the backlog this client
+                        // will never read is not kept alive for it.
+                        drop(events);
+                        let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
+                        if socket.send(reset).await.is_err() {
+                            break;
                         }
-                        None => false,
-                    },
+                        let Some(fresh) = attach(&session, LAGGED_SNAPSHOT_HISTORY).await else {
+                            break;
+                        };
+                        let Some(fresh) = send_attachment(&mut socket, fresh).await else {
+                            break;
+                        };
+                        events = fresh;
+                        true
+                    }
                     Err(broadcast::error::RecvError::Closed) => false,
                 };
                 if !sent {

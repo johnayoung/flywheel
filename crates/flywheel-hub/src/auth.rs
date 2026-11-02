@@ -14,8 +14,8 @@ use subtle::ConstantTimeEq;
 
 /// Token file name inside the state dir.
 pub const TOKEN_FILE: &str = "token";
-/// The login cookie's name.
-pub const COOKIE_NAME: &str = "fw_hub";
+/// The login cookie's name prefix; see [`cookie_name`].
+pub const COOKIE_PREFIX: &str = "fw_hub_";
 /// Login cookie lifetime: 30 days (rotating the token invalidates it sooner).
 pub const COOKIE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 /// Random bytes in a token (256 bits).
@@ -116,6 +116,20 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// The login cookie's name for a hub with `token`: [`COOKIE_PREFIX`] plus a
+/// digest of the token. Browsers do not separate cookies by port, so a
+/// fixed name would let two hubs on one host (or one restarted with a new
+/// token) overwrite each other's login.
+pub fn cookie_name(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(b"flywheel-hub-cookie-name\0")
+        .chain_update(token.as_bytes())
+        .finalize();
+    let suffix: String = digest[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{COOKIE_PREFIX}{suffix}")
+}
+
 /// The login cookie value from a `Cookie` header, if present.
 pub fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header.split(';').find_map(|pair| {
@@ -135,15 +149,19 @@ pub fn bearer_value(authorization: &str) -> Option<&str> {
 /// The `Set-Cookie` value that logs a browser in.
 pub fn login_cookie(token: &Token, secure: bool) -> String {
     format!(
-        "{COOKIE_NAME}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_SECS}{}",
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_SECS}{}",
+        cookie_name(token.expose()),
         token.expose(),
         if secure { "; Secure" } else { "" }
     )
 }
 
 /// The `Set-Cookie` value that logs a browser out.
-pub fn logout_cookie() -> String {
-    format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+pub fn logout_cookie(token: &Token) -> String {
+    format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        cookie_name(token.expose())
+    )
 }
 
 /// Whether a request's `Origin` is acceptable for a state-changing or
@@ -248,13 +266,27 @@ mod tests {
     #[test]
     fn parses_cookie_and_bearer_headers() {
         assert_eq!(
-            cookie_value("a=1; fw_hub=abc; b=2", COOKIE_NAME),
+            cookie_value("a=1; fw_hub_x=abc; b=2", "fw_hub_x"),
             Some("abc")
         );
-        assert_eq!(cookie_value("fw_hubx=abc", COOKIE_NAME), None);
+        assert_eq!(cookie_value("fw_hub_xy=abc", "fw_hub_x"), None);
         assert_eq!(bearer_value("Bearer xyz"), Some("xyz"));
         assert_eq!(bearer_value("bearer  xyz "), Some("xyz"));
         assert_eq!(bearer_value("Basic xyz"), None);
+    }
+
+    #[test]
+    fn cookie_names_differ_per_token() {
+        let (a, b) = (Token::generate().unwrap(), Token::generate().unwrap());
+        let name = cookie_name(a.expose());
+        assert!(name.starts_with(COOKIE_PREFIX) && name.len() == COOKIE_PREFIX.len() + 12);
+        assert_eq!(name, cookie_name(a.expose()));
+        assert_ne!(name, cookie_name(b.expose()));
+        assert!(
+            !name.contains(&a.expose()[..12]),
+            "the name must not reveal the token"
+        );
+        assert!(logout_cookie(&a).starts_with(&format!("{name}=;")));
     }
 
     #[test]
@@ -264,7 +296,7 @@ mod tests {
         assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict"));
         assert!(!c.contains("Secure"));
         assert!(login_cookie(&t, true).ends_with("; Secure"));
-        assert!(logout_cookie().contains("Max-Age=0"));
+        assert!(logout_cookie(&t).contains("Max-Age=0"));
     }
 
     #[test]

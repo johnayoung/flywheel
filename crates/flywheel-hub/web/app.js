@@ -91,6 +91,7 @@
     attached: null, // session id
     socket: null,
     exited: null, // exit info of the attached session's process
+    replaying: false, // a snapshot is being replayed at the session's size
     retry: 0, // reconnect attempts since the last successful attach
     retryTimer: null,
     countdown: null,
@@ -214,6 +215,8 @@
 
   // --- theme -----------------------------------------------------------
 
+  // The server answers colour queries (OSC 4/10/11/12) with the dark
+  // theme (vt.rs default_color; keep the two in sync).
   const TERM_THEMES = {
     dark: {
       background: "#0c0d0c",
@@ -304,6 +307,21 @@
     term.loadAddon(fit);
     term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
     term.open($("#terminal"));
+    // The server's emulator answers terminal queries for every session, so
+    // the browser must not: a second viewer would answer twice.
+    const answered = () => true;
+    for (const id of [{ final: "c" }, { prefix: ">", final: "c" }, { final: "n" },
+      { prefix: "?", final: "n" }, { intermediates: "$", final: "p" },
+      { prefix: "?", intermediates: "$", final: "p" }]) {
+      term.parser.registerCsiHandler(id, answered);
+    }
+    term.parser.registerDcsHandler({ intermediates: "$", final: "q" }, answered);
+    // OSC 4 is "index;spec" pairs, OSC 10-12 a spec list; "?" asks.
+    const onlyQueries = (specs) => specs.length > 0 && specs.every((spec) => spec === "?");
+    term.parser.registerOscHandler(4, (data) => onlyQueries(data.split(";").filter((_, i) => i % 2 === 1)));
+    for (const osc of [10, 11, 12]) {
+      term.parser.registerOscHandler(osc, (data) => onlyQueries(data.split(";")));
+    }
     term.onData((data) => sendInput(JSON.stringify({ type: "input", data })));
     term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
@@ -315,10 +333,11 @@
       updateMeters();
     });
     let pending = 0;
+    // While a snapshot replays the terminal keeps the size it was drawn at.
     const refit = () => {
       cancelAnimationFrame(pending);
       pending = requestAnimationFrame(() => {
-        if ($("#terminal").clientWidth > 0) fit.fit();
+        if (!state.replaying && $("#terminal").clientWidth > 0) fit.fit();
       });
     };
     window.addEventListener("resize", refit);
@@ -381,6 +400,15 @@
       state.socket.close(1000);
       state.socket = null;
     }
+    endReplay();
+  }
+
+  // Stop holding the terminal at a snapshot's size (the replay finished or
+  // its socket went away) and fit it back to this viewport.
+  function endReplay() {
+    if (!state.replaying) return;
+    state.replaying = false;
+    if ($("#terminal").clientWidth > 0) fit.fit();
   }
 
   function detach(message) {
@@ -451,7 +479,7 @@
   }
 
   // Open (or re-open) the attached session's socket. Each connect replays
-  // the scrollback, so the terminal is reset first.
+  // a snapshot of the session's terminal, so the terminal is reset first.
   function connect(id) {
     stopRetry();
     setLink("connecting", state.retry ? `retry ${state.retry}` : "connecting");
@@ -459,22 +487,37 @@
     const socket = new WebSocket(`${scheme}://${window.location.host}/api/sessions/${id}/ws`);
     socket.binaryType = "arraybuffer";
     state.socket = socket;
+    state.replaying = false;
     socket.onopen = () => {
-      // The replay follows; clear only now, so a dead link keeps the last
+      // The snapshot follows; clear only now, so a dead link keeps the last
       // screen visible while it retries.
       term.reset();
       state.retry = 0;
       state.dropped = 0;
       setLink("attached");
       hideBanner();
-      fit.fit();
-      send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
       term.focus();
       refresh(false).catch(() => {});
     };
+    // The snapshot is drawn at the session's size: replay exactly its
+    // bytes at that size, then fit to this viewport and resize the session
+    // (the program redraws).
+    let pending = 0;
+    const replayed = () => {
+      if (state.socket !== socket) return;
+      state.replaying = false;
+      if ($("#terminal").clientWidth > 0) fit.fit();
+      send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
+    };
     socket.onmessage = (event) => {
       if (typeof event.data !== "string") {
-        term.write(new Uint8Array(event.data));
+        const bytes = new Uint8Array(event.data);
+        if (pending > 0) {
+          pending -= bytes.length;
+          term.write(bytes, pending <= 0 ? replayed : undefined);
+        } else {
+          term.write(bytes);
+        }
         return;
       }
       let message;
@@ -483,7 +526,12 @@
       } catch (_) {
         return;
       }
-      if (message.type === "reset") {
+      if (message.type === "snapshot") {
+        state.replaying = true;
+        term.resize(message.cols, message.rows);
+        pending = message.bytes;
+        if (!(pending > 0)) replayed();
+      } else if (message.type === "reset") {
         term.reset();
       } else if (message.type === "exit") {
         onExit(id, message);
@@ -494,6 +542,7 @@
     socket.onclose = (event) => {
       if (state.socket !== socket) return;
       state.socket = null;
+      endReplay();
       if (state.exited || state.attached !== id) return;
       scheduleReconnect(id, event.code);
     };

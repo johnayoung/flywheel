@@ -7,17 +7,28 @@
 //! [`Emulator::snapshot`] -- escape sequences that rebuild that state in a
 //! freshly reset xterm-compatible terminal -- instead of a raw byte replay,
 //! which loses modes set before the ring's horizon, can start inside an
-//! escape sequence, and re-runs terminal queries (making the client answer
-//! them into the PTY a second time).
+//! escape sequence, and re-runs terminal queries.
+//!
+//! The emulator is also the session's only answerer of terminal queries
+//! (device attributes, cursor position, mode and colour reports; see
+//! [`Emulator::take_replies`]): a detached session still gets its replies,
+//! and two viewers do not answer twice. Clients must not answer them.
+//!
+//! Output is untrusted, so everything it can make the emulator retain is
+//! bounded (see [`Guarded`]): OSC strings, titles and the title stack,
+//! hyperlinks, combining marks per cell. The kitty keyboard protocol is not
+//! emulated: the browser terminal (xterm.js 6) does not implement it, so
+//! reporting support would make programs send keys it cannot encode.
 //!
 //! Two pieces of state `alacritty_terminal` keeps private -- the scroll
 //! region and the SI/SO active charset -- are mirrored by a second, tiny
 //! `vte` parser that applies the same rules (see [`Tracked`]).
 //!
 //! Known gaps: custom tab stops are not replayed (rarely changed; apps that
-//! set them re-set them), and `?47`/`?1047` alternate screens are not
-//! emulated (`alacritty_terminal` implements `?1049`, which is what
-//! `xterm-256color` terminfo emits).
+//! set them re-set them); `?47`/`?1047` alternate screens are not emulated
+//! (`alacritty_terminal` implements `?1049`, which is what `xterm-256color`
+//! terminfo emits); blink (SGR 5) and overline (SGR 53) are not stored, so
+//! a snapshot drops them; DECRQSS is not answered.
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Grid};
@@ -25,22 +36,45 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte;
+use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
-    CharsetIndex, Color, CursorShape, NamedColor, Processor, StandardCharset, StdSyncHandler,
+    Attr, CharsetIndex, ClearMode, Color, CursorShape, CursorStyle, Handler, Hyperlink as LinkSpec,
+    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor,
+    PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, StdSyncHandler,
+    TabulationClearMode,
 };
 use serde::Serialize;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
+use unicode_width::UnicodeWidthChar;
 
 /// Default scrollback retained per session, in lines.
 pub const DEFAULT_SCROLLBACK_LINES: usize = 5000;
 /// Upper bound on retained history cells (lines x columns) per session, so a
-/// very wide terminal keeps fewer lines rather than more memory (a cell is
-/// ~24 bytes: about 24 MiB of history at most).
+/// very wide terminal keeps fewer lines rather than more memory. A cell is
+/// 24 bytes, plus a per-cell allocation only for cells carrying combining
+/// marks (at most [`MAX_ZEROWIDTH`]) or a non-default underline colour.
 pub const HISTORY_CELL_BUDGET: usize = 1_000_000;
 /// Default `lines` for [`TextSource::Recent`].
 pub const DEFAULT_RECENT_LINES: usize = 100;
+/// Default byte budget for the scrollback part of a [`Emulator::snapshot`]
+/// (the screen itself is always included): the oldest whole lines beyond it
+/// are left out, so attaching costs a bounded transfer on any link.
+pub const SNAPSHOT_HISTORY_BYTES: usize = 2 * 1024 * 1024;
+/// Combining (zero-width) characters kept per cell; more are dropped (xterm
+/// keeps at most 10).
+pub const MAX_ZEROWIDTH: usize = 8;
+/// Longest OSC string the parsers buffer; the rest of a longer one is not
+/// fed to them (the sequence still ends at its terminator).
+const MAX_OSC_BYTES: usize = 64 * 1024;
+/// Longest title kept, in bytes.
+const MAX_TITLE_BYTES: usize = 4096;
+/// Titles kept by `CSI 22 t` (xterm keeps 10).
+const TITLE_STACK_DEPTH: usize = 10;
+/// Longest hyperlink URI / id kept; longer links are dropped (the text stays).
+const MAX_LINK_URI_BYTES: usize = 2048;
+const MAX_LINK_ID_BYTES: usize = 256;
 
 /// Flags that change how a cell is drawn (everything but layout markers).
 const STYLE_FLAGS: Flags = Flags::INVERSE
@@ -75,21 +109,318 @@ impl Dimensions for Size {
     }
 }
 
-/// Receives the emulator's events. Only the window title is kept: replies
-/// to terminal queries (`PtyWrite`) are the attached clients' job -- they see
-/// the same bytes live -- and clipboard/bell events are theirs too.
+/// Receives the emulator's events: the window title, and replies to
+/// terminal queries (`PtyWrite`), collected for [`Emulator::take_replies`].
+/// Clipboard and bell events are the clients' business (they see the same
+/// bytes live); clipboard reads are never answered.
 #[derive(Clone, Default)]
 struct Listener {
     title: Arc<Mutex<Option<String>>>,
+    replies: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Listener {
+    fn title(&self) -> Option<String> {
+        self.title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn reply(&self, text: &str) {
+        self.replies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(text.as_bytes());
+    }
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        let mut title = self.title.lock().unwrap_or_else(PoisonError::into_inner);
         match event {
-            Event::Title(t) => *title = Some(t),
-            Event::ResetTitle => *title = None,
+            Event::Title(t) => {
+                *self.title.lock().unwrap_or_else(PoisonError::into_inner) = Some(t);
+            }
+            Event::ResetTitle => {
+                *self.title.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            }
+            Event::PtyWrite(text) => self.reply(&text),
             _ => {}
+        }
+    }
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+fn truncated(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+/// The colour a fresh client shows for palette / dynamic-colour `index`
+/// when the program has not set one: the web app's dark terminal theme
+/// (`TERM_THEMES.dark` in `web/app.js`; keep the two in sync) and xterm.js
+/// 6's 256-colour cube and greys.
+fn default_color(index: usize) -> Rgb {
+    const ANSI: [u32; 16] = [
+        0x22241f, 0xef5a4c, 0xa3c76d, 0xe3b341, 0x6fa3d6, 0xc98bd1, 0x62c2b5, 0xd9d3c3, 0x5d5a51,
+        0xff7a66, 0xbfe08a, 0xf4cd68, 0x93bff0, 0xe0a9e6, 0x86ddd0, 0xf6f1e4,
+    ];
+    const FOREGROUND: u32 = 0xe6e0cf;
+    const BACKGROUND: u32 = 0x0c0d0c;
+    const CURSOR: u32 = 0xff5a1f;
+    let hex = |v: u32| Rgb {
+        r: (v >> 16) as u8,
+        g: (v >> 8) as u8,
+        b: v as u8,
+    };
+    match index {
+        0..16 => hex(ANSI[index]),
+        16..232 => {
+            let level = |n: usize| [0u8, 95, 135, 175, 215, 255][n % 6];
+            let i = index - 16;
+            Rgb {
+                r: level(i / 36),
+                g: level(i / 6),
+                b: level(i),
+            }
+        }
+        232..256 => {
+            let v = u8::try_from(8 + (index - 232) * 10).unwrap_or(u8::MAX);
+            Rgb { r: v, g: v, b: v }
+        }
+        _ if index == NamedColor::Background as usize => hex(BACKGROUND),
+        _ if index == NamedColor::Cursor as usize => hex(CURSOR),
+        _ => hex(FOREGROUND),
+    }
+}
+
+/// The parser's view of the terminal: `Term` with what output can make it
+/// retain bounded, and colour queries answered.
+///
+/// * titles are cut to [`MAX_TITLE_BYTES`] and the title stack is kept here,
+///   [`TITLE_STACK_DEPTH`] deep (`Term`'s is 4096 deep, each entry a clone of
+///   the title: output could make it allocate thousands of times its size);
+/// * combining characters beyond [`MAX_ZEROWIDTH`] on one cell are dropped
+///   (`Term` keeps every one);
+/// * over-long hyperlinks are dropped;
+/// * OSC 4/10/11/12 queries are answered from the palette (`Term` would ask
+///   a renderer for colours it does not know).
+///
+/// Everything else is forwarded unchanged.
+struct Guarded<'a> {
+    term: &'a mut Term<Listener>,
+    titles: &'a mut Vec<Option<String>>,
+    listener: &'a Listener,
+}
+
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*);)*) => {
+        $(
+            fn $name(&mut self, $($arg: $ty),*) {
+                <Term<Listener> as Handler>::$name(self.term, $($arg),*)
+            }
+        )*
+    };
+}
+
+impl Handler for Guarded<'_> {
+    fn set_title(&mut self, title: Option<String>) {
+        let title = title.map(|t| truncated(t, MAX_TITLE_BYTES));
+        <Term<Listener> as Handler>::set_title(self.term, title);
+    }
+
+    fn push_title(&mut self) {
+        if self.titles.len() >= TITLE_STACK_DEPTH {
+            self.titles.remove(0);
+        }
+        self.titles.push(self.listener.title());
+    }
+
+    fn pop_title(&mut self) {
+        if let Some(title) = self.titles.pop() {
+            self.set_title(title);
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.titles.clear();
+        <Term<Listener> as Handler>::reset_state(self.term);
+    }
+
+    fn input(&mut self, c: char) {
+        if c.width() == Some(0) {
+            // The cell `Term::input` attaches a zero-width character to.
+            let grid = self.term.grid();
+            let cursor = &grid.cursor;
+            let mut column = cursor.point.column;
+            if !cursor.input_needs_wrap {
+                column.0 = column.0.saturating_sub(1);
+            }
+            let row = &grid[cursor.point.line];
+            if row[column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                column.0 = column.0.saturating_sub(1);
+            }
+            if row[column]
+                .zerowidth()
+                .is_some_and(|z| z.len() >= MAX_ZEROWIDTH)
+            {
+                return;
+            }
+        }
+        <Term<Listener> as Handler>::input(self.term, c);
+    }
+
+    fn set_hyperlink(&mut self, link: Option<LinkSpec>) {
+        let link = link.filter(|l| {
+            l.uri.len() <= MAX_LINK_URI_BYTES
+                && l.id.as_ref().is_none_or(|id| id.len() <= MAX_LINK_ID_BYTES)
+        });
+        <Term<Listener> as Handler>::set_hyperlink(self.term, link);
+    }
+
+    fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
+        if index >= alacritty_terminal::term::color::COUNT {
+            return;
+        }
+        let rgb = self.term.colors()[index].unwrap_or_else(|| default_color(index));
+        self.listener.reply(&format!(
+            "\x1b]{prefix};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}{terminator}",
+            rgb.r, rgb.g, rgb.b
+        ));
+    }
+
+    forward! {
+        set_cursor_style(style: Option<CursorStyle>);
+        set_cursor_shape(shape: CursorShape);
+        goto(line: i32, col: usize);
+        goto_line(line: i32);
+        goto_col(col: usize);
+        insert_blank(count: usize);
+        move_up(count: usize);
+        move_down(count: usize);
+        identify_terminal(intermediate: Option<char>);
+        device_status(arg: usize);
+        move_forward(col: usize);
+        move_backward(col: usize);
+        move_down_and_cr(row: usize);
+        move_up_and_cr(row: usize);
+        put_tab(count: u16);
+        backspace();
+        carriage_return();
+        linefeed();
+        bell();
+        substitute();
+        newline();
+        set_horizontal_tabstop();
+        scroll_up(count: usize);
+        scroll_down(count: usize);
+        insert_blank_lines(count: usize);
+        delete_lines(count: usize);
+        erase_chars(count: usize);
+        delete_chars(count: usize);
+        move_backward_tabs(count: u16);
+        move_forward_tabs(count: u16);
+        save_cursor_position();
+        restore_cursor_position();
+        clear_line(mode: LineClearMode);
+        clear_screen(mode: ClearMode);
+        clear_tabs(mode: TabulationClearMode);
+        set_tabs(interval: u16);
+        reverse_index();
+        terminal_attribute(attr: Attr);
+        set_mode(mode: Mode);
+        unset_mode(mode: Mode);
+        report_mode(mode: Mode);
+        set_private_mode(mode: PrivateMode);
+        unset_private_mode(mode: PrivateMode);
+        report_private_mode(mode: PrivateMode);
+        set_scrolling_region(top: usize, bottom: Option<usize>);
+        set_keypad_application_mode();
+        unset_keypad_application_mode();
+        set_active_charset(index: CharsetIndex);
+        configure_charset(index: CharsetIndex, charset: StandardCharset);
+        set_color(index: usize, color: Rgb);
+        reset_color(index: usize);
+        clipboard_store(clipboard: u8, data: &[u8]);
+        clipboard_load(clipboard: u8, terminator: &str);
+        decaln();
+        text_area_size_pixels();
+        text_area_size_chars();
+        set_mouse_cursor_icon(icon: CursorIcon);
+        report_keyboard_mode();
+        push_keyboard_mode(mode: KeyboardModes);
+        pop_keyboard_modes(to_pop: u16);
+        set_keyboard_mode(mode: KeyboardModes, behavior: KeyboardModesApplyBehavior);
+        set_modify_other_keys(mode: ModifyOtherKeys);
+        report_modify_other_keys();
+        set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
+    }
+}
+
+/// Where the byte stream is relative to an OSC string, so an endless one
+/// can be cut off before the parsers buffer it (`vte` with `std` buffers OSC
+/// strings without limit). Mirrors `vte`'s transitions: ESC enters the
+/// escape state from anywhere, `]` there starts an OSC string, and BEL,
+/// CAN, SUB or ESC ends one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum OscScan {
+    #[default]
+    Other,
+    Escape,
+    Osc(usize),
+    /// Past [`MAX_OSC_BYTES`]: bytes are dropped until the terminator.
+    Discard,
+}
+
+impl OscScan {
+    /// Advance over `byte`; returns whether the parsers should see it.
+    fn keep(&mut self, byte: u8) -> bool {
+        match *self {
+            Self::Other => {
+                if byte == 0x1b {
+                    *self = Self::Escape;
+                }
+                true
+            }
+            Self::Escape => {
+                *self = match byte {
+                    b']' => Self::Osc(0),
+                    // C0 controls (but CAN/SUB) execute without leaving the
+                    // escape state; DEL is ignored there.
+                    0x00..=0x17 | 0x19 | 0x1b..=0x1f | 0x7f => Self::Escape,
+                    _ => Self::Other,
+                };
+                true
+            }
+            Self::Osc(len) => {
+                *self = match byte {
+                    0x07 | 0x18 | 0x1a => Self::Other,
+                    0x1b => Self::Escape,
+                    _ if len >= MAX_OSC_BYTES => {
+                        *self = Self::Discard;
+                        return false;
+                    }
+                    _ => Self::Osc(len + 1),
+                };
+                true
+            }
+            Self::Discard => match byte {
+                0x07 | 0x18 | 0x1a => {
+                    *self = Self::Other;
+                    true
+                }
+                0x1b => {
+                    *self = Self::Escape;
+                    true
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -219,6 +550,9 @@ pub struct Emulator {
     tracker: vte::Parser,
     tracked: Tracked,
     listener: Listener,
+    /// The title stack (see [`Guarded`]).
+    titles: Vec<Option<String>>,
+    osc: OscScan,
     config: Config,
     scrollback_lines: usize,
 }
@@ -248,7 +582,8 @@ impl Emulator {
         };
         let config = Config {
             scrolling_history: history_limit(scrollback_lines, size.cols),
-            kitty_keyboard: true,
+            // Not emulated: see the module docs.
+            kitty_keyboard: false,
             ..Config::default()
         };
         let listener = Listener::default();
@@ -258,15 +593,30 @@ impl Emulator {
             tracker: vte::Parser::new(),
             tracked: Tracked::new(size.rows),
             listener,
+            titles: Vec::new(),
+            osc: OscScan::default(),
             config,
             scrollback_lines,
         }
     }
 
-    /// Feed PTY output.
+    /// Feed PTY output. Replies to any terminal queries in it are queued
+    /// for [`Emulator::take_replies`].
     pub fn process(&mut self, bytes: &[u8]) {
-        self.tracker.advance(&mut self.tracked, bytes);
-        self.parser.advance(&mut self.term, bytes);
+        let mut run = None;
+        for (i, &byte) in bytes.iter().enumerate() {
+            match (self.osc.keep(byte), run) {
+                (true, None) => run = Some(i),
+                (false, Some(start)) => {
+                    self.feed(&bytes[start..i]);
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(start) = run {
+            self.feed(&bytes[start..]);
+        }
         // A synchronized update (`CSI ? 2026 h`) buffers output until its
         // end or a timeout; nothing else drives the timeout here.
         if self
@@ -275,8 +625,37 @@ impl Emulator {
             .sync_timeout()
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.parser.stop_sync(&mut self.term);
+            self.parser.stop_sync(&mut Guarded {
+                term: &mut self.term,
+                titles: &mut self.titles,
+                listener: &self.listener,
+            });
         }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.tracker.advance(&mut self.tracked, bytes);
+        self.parser.advance(
+            &mut Guarded {
+                term: &mut self.term,
+                titles: &mut self.titles,
+                listener: &self.listener,
+            },
+            bytes,
+        );
+    }
+
+    /// Bytes the terminal answers queries with (device attributes, cursor
+    /// position, mode and colour reports), to be written to the program's
+    /// input, in order. Drained by the call.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(
+            &mut *self
+                .listener
+                .replies
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Apply output buffered by an unfinished synchronized update: it has
@@ -284,7 +663,11 @@ impl Emulator {
     fn flush(&mut self) {
         if self.parser.sync_bytes_count() > 0 || self.parser.sync_timeout().sync_timeout().is_some()
         {
-            self.parser.stop_sync(&mut self.term);
+            self.parser.stop_sync(&mut Guarded {
+                term: &mut self.term,
+                titles: &mut self.titles,
+                listener: &self.listener,
+            });
         }
     }
 
@@ -318,11 +701,7 @@ impl Emulator {
 
     /// The window title the program set (OSC 0/2), if any.
     pub fn title(&self) -> Option<String> {
-        self.listener
-            .title
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.listener.title()
     }
 
     /// Whether the alternate screen is up.
@@ -335,7 +714,10 @@ impl Emulator {
     /// scrollback and rows, then (when up) the alternate screen, then the
     /// active screen's cursor, saved cursor, charsets, scroll region, SGR
     /// pen, DEC modes, cursor style, title, and palette changes.
-    pub fn snapshot(&mut self) -> Vec<u8> {
+    ///
+    /// Scrollback is included newest first, in whole logical lines, while
+    /// it fits in `history_budget` bytes; the screen always is.
+    pub fn snapshot(&mut self, history_budget: usize) -> Vec<u8> {
         self.flush();
         let mut w = Writer::default();
         // RIS: a client that did not reset itself starts clean too.
@@ -350,17 +732,18 @@ impl Emulator {
             let alt = self.term.grid().clone();
             self.term.swap_alt();
             let primary = self.term.grid();
-            w.lines(primary, primary.topmost_line());
+            w.rows(primary, primary.topmost_line(), history_budget);
             w.cup(primary.cursor.point);
             w.pen(&primary.cursor.template);
             self.term.swap_alt();
             *self.term.grid_mut() = alt;
             // Save the primary cursor, switch to a cleared alternate screen.
             w.raw(b"\x1b[?1049h\x1b[H");
-            w.lines(self.term.grid(), Line(0));
+            w.plain();
+            w.rows(self.term.grid(), Line(0), 0);
         } else {
             let grid = self.term.grid();
-            w.lines(grid, grid.topmost_line());
+            w.rows(grid, grid.topmost_line(), history_budget);
         }
         self.write_state(&mut w);
         w.out
@@ -444,10 +827,6 @@ impl Emulator {
         if mode.contains(TermMode::LINE_FEED_NEW_LINE) {
             w.raw(b"\x1b[20h");
         }
-        let kitty = kitty_flags(mode);
-        if kitty != 0 {
-            let _ = write!(w.out, "\x1b[={kitty};1u");
-        }
 
         let style = self.term.cursor_style();
         if style != self.config.default_cursor_style {
@@ -521,20 +900,6 @@ impl Emulator {
             lines,
         }
     }
-}
-
-fn kitty_flags(mode: TermMode) -> u8 {
-    [
-        (TermMode::DISAMBIGUATE_ESC_CODES, 1),
-        (TermMode::REPORT_EVENT_TYPES, 2),
-        (TermMode::REPORT_ALTERNATE_KEYS, 4),
-        (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
-        (TermMode::REPORT_ASSOCIATED_TEXT, 16),
-    ]
-    .into_iter()
-    .filter(|(flag, _)| mode.contains(*flag))
-    .map(|(_, bit)| bit)
-    .sum()
 }
 
 /// A title without control characters (it is replayed inside an OSC).
@@ -775,31 +1140,52 @@ impl Writer {
     }
 
     /// Rows `from..=bottom` of `grid`, written from the cursor's current
-    /// position: soft-wrapped rows continue by autowrap (so the client
-    /// keeps them as one logical line), others end in CR LF.
-    fn lines(&mut self, grid: &Grid<Cell>, from: Line) {
-        let cols = grid.columns();
-        let mut previous_wrapped = false;
-        let mut first = true;
-        let mut line = from;
-        while line <= grid.bottommost_line() {
-            let row = &grid[line];
-            let is_wrapped = wrapped(grid, line);
-            let end = if is_wrapped {
-                cols
-            } else {
-                (0..cols)
-                    .rev()
-                    .find(|&c| !is_blank(&row[Column(c)]))
-                    .map_or(0, |c| c + 1)
-            };
-            // A wrapped row's content continues by autowrap.
-            let continues = previous_wrapped && end > 0;
-            if !first && !continues {
-                self.plain();
+    /// position (with the default pen and no link) in logical lines:
+    /// soft-wrapped rows continue by autowrap (so the client keeps them as
+    /// one line), and lines end in CR LF. Lines entirely above the screen
+    /// are included newest first while they fit in `history_budget` bytes.
+    fn rows(&mut self, grid: &Grid<Cell>, from: Line, history_budget: usize) {
+        debug_assert!(self.pen == Pen::default() && self.link.is_none());
+        // Each logical line ends with the default pen and no link (see
+        // `plain`), so lines render independently: bottom up, to stop at
+        // the budget.
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut spent = 0usize;
+        let mut last = grid.bottommost_line();
+        let mut line = last;
+        loop {
+            let starts = line == from || !(wrapped(grid, line - 1) && row_end(grid, line) > 0);
+            if starts {
+                let mut piece = Writer::default();
+                piece.logical_line(grid, line, last);
+                if last < Line(0) {
+                    spent += piece.out.len() + 2;
+                    if spent > history_budget {
+                        break;
+                    }
+                }
+                lines.push(piece.out);
+                if line == from {
+                    break;
+                }
+                last = line - 1;
+            }
+            line -= 1;
+        }
+        for (i, piece) in lines.iter().rev().enumerate() {
+            if i > 0 {
                 self.raw(b"\r\n");
             }
-            for col in 0..end {
+            self.raw(piece);
+        }
+    }
+
+    /// Rows `first..=last` (one logical line), then the default pen.
+    fn logical_line(&mut self, grid: &Grid<Cell>, first: Line, last: Line) {
+        let mut line = first;
+        while line <= last {
+            let row = &grid[line];
+            for col in 0..row_end(grid, line) {
                 let cell = &row[Column(col)];
                 if cell
                     .flags
@@ -809,12 +1195,24 @@ impl Writer {
                 }
                 self.cell(cell);
             }
-            previous_wrapped = is_wrapped;
-            first = false;
             line += 1;
         }
         self.plain();
     }
+}
+
+/// Cells of a row worth writing: all of a soft-wrapped row, else up to the
+/// last non-blank one.
+fn row_end(grid: &Grid<Cell>, line: Line) -> usize {
+    let cols = grid.columns();
+    if wrapped(grid, line) {
+        return cols;
+    }
+    let row = &grid[line];
+    (0..cols)
+        .rev()
+        .find(|&c| !is_blank(&row[Column(c)]))
+        .map_or(0, |c| c + 1)
 }
 
 fn named_index(named: NamedColor) -> Option<u8> {
@@ -876,7 +1274,7 @@ mod tests {
             u16::try_from(rows).unwrap(),
             source.scrollback_lines,
         );
-        client.process(&source.snapshot());
+        client.process(&source.snapshot(SNAPSHOT_HISTORY_BYTES));
         client
     }
 
@@ -1014,8 +1412,12 @@ mod tests {
     fn snapshotting_does_not_perturb_the_session() {
         let mut snapshotted = fed(&full_screen_app());
         let mut control = fed(&full_screen_app());
-        let first = snapshotted.snapshot();
-        assert_eq!(first, snapshotted.snapshot(), "snapshots are stable");
+        let first = snapshotted.snapshot(SNAPSHOT_HISTORY_BYTES);
+        assert_eq!(
+            first,
+            snapshotted.snapshot(SNAPSHOT_HISTORY_BYTES),
+            "snapshots are stable"
+        );
         let tail: &[u8] = b"\x1b8more\x1b[?1049l\x1b[0mafter\r\n";
         for e in [&mut snapshotted, &mut control] {
             e.process(tail);
@@ -1106,9 +1508,175 @@ mod tests {
     #[test]
     fn a_title_cannot_inject_control_sequences() {
         let mut e = fed(b"\x1b]2;evil\x1b[31m\x07");
-        let snapshot = String::from_utf8(e.snapshot()).unwrap();
+        let snapshot = String::from_utf8(e.snapshot(SNAPSHOT_HISTORY_BYTES)).unwrap();
         let osc = snapshot.find("\x1b]2;").unwrap();
         let end = osc + snapshot[osc..].find('\x07').unwrap();
         assert!(!snapshot[osc + 4..end].contains('\x1b'));
+    }
+
+    #[test]
+    fn kitty_keyboard_pushes_are_inert_and_cannot_panic() {
+        // `Term` 0.26 removes from the (empty) title stack once the kitty
+        // stack is 4096 deep: a panic on the reader thread.
+        let mut e = emulator();
+        e.process(&b"\x1b[>1u".repeat(5000));
+        e.process(b"\x1b[?u\x1b[?1049h\x1b[>1u\x1b[=3;1u");
+        assert_eq!(e.take_replies(), b"", "kitty support must not be reported");
+        let snapshot = e.snapshot(SNAPSHOT_HISTORY_BYTES);
+        assert!(!String::from_utf8_lossy(&snapshot).contains("\x1b[="));
+        let mut client = replayed(&mut e);
+        assert_same(&mut e, &mut client);
+    }
+
+    #[test]
+    fn titles_and_the_title_stack_are_bounded() {
+        let mut e = emulator();
+        let huge = "t".repeat(256 * 1024);
+        e.process(format!("\x1b]2;{huge}\x07").as_bytes());
+        e.process(&b"\x1b[22t".repeat(4096));
+        assert_eq!(e.title().map(|t| t.len()), Some(MAX_TITLE_BYTES));
+        assert_eq!(e.titles.len(), TITLE_STACK_DEPTH);
+        let kept: usize = e.titles.iter().flatten().map(String::len).sum();
+        assert!(kept <= TITLE_STACK_DEPTH * MAX_TITLE_BYTES, "{kept}");
+        // The stack still works: push, retitle, pop restores.
+        e.process(b"\x1b]2;one\x07\x1b[22t\x1b]2;two\x07");
+        assert_eq!(e.title().as_deref(), Some("two"));
+        e.process(b"\x1b[23t");
+        assert_eq!(e.title().as_deref(), Some("one"));
+        e.process(b"\x1bc");
+        assert!(e.titles.is_empty());
+    }
+
+    #[test]
+    fn an_endless_osc_string_is_cut_off_and_output_resumes_after_it() {
+        let mut scan = OscScan::default();
+        let osc: Vec<u8> = [&b"\x1b]2;"[..], &vec![b'x'; MAX_OSC_BYTES + 10]].concat();
+        let kept = osc.iter().filter(|&&b| scan.keep(b)).count();
+        assert_eq!(kept, 4 + MAX_OSC_BYTES - 2, "{scan:?}");
+        assert_eq!(scan, OscScan::Discard);
+        assert!(scan.keep(0x07));
+        assert_eq!(scan, OscScan::Other);
+        // Escape-state controls and CSI bytes do not start an OSC.
+        for b in b"\x1b\x05]" {
+            scan.keep(*b);
+        }
+        assert_eq!(scan, OscScan::Osc(0));
+        scan.keep(0x18);
+        for b in b"\x1b[31m]" {
+            scan.keep(*b);
+        }
+        assert_eq!(scan, OscScan::Other);
+
+        let mut e = emulator();
+        e.process(&osc);
+        e.process(&vec![b'y'; 1024 * 1024]);
+        e.process(b"\x1b\\after");
+        assert_eq!(e.title().map(|t| t.len()), Some(MAX_TITLE_BYTES));
+        assert_eq!(e.text(TextSource::Visible).lines[0], "after");
+    }
+
+    #[test]
+    fn combining_marks_per_cell_are_bounded() {
+        let mut e = emulator();
+        let mut bytes = b"a".to_vec();
+        bytes.extend("\u{301}".repeat(200_000).as_bytes());
+        // Wide-char spacer target, and a cursor parked in pending wrap.
+        bytes.extend("\r\n\u{4f60}".as_bytes());
+        bytes.extend("\u{302}".repeat(100).as_bytes());
+        e.process(&bytes);
+        let grid = e.term.grid();
+        let marks = |line: i32, col: usize| {
+            grid[Line(line)][Column(col)]
+                .zerowidth()
+                .map_or(0, <[char]>::len)
+        };
+        assert_eq!(marks(0, 0), MAX_ZEROWIDTH);
+        assert_eq!(marks(1, 0), MAX_ZEROWIDTH);
+        assert!(e.snapshot(SNAPSHOT_HISTORY_BYTES).len() < 1024);
+        let mut client = replayed(&mut e);
+        assert_same(&mut e, &mut client);
+    }
+
+    #[test]
+    fn over_long_hyperlinks_are_dropped() {
+        let long = format!("https://example.com/{}", "a".repeat(MAX_LINK_URI_BYTES));
+        let mut e = fed(format!("\x1b]8;;{long}\x1b\\x\x1b]8;;https://ok\x1b\\y").as_bytes());
+        let row = &e.term.grid()[Line(0)];
+        assert!(row[Column(0)].hyperlink().is_none());
+        assert_eq!(
+            row[Column(1)]
+                .hyperlink()
+                .map(|l| l.uri().to_owned())
+                .as_deref(),
+            Some("https://ok")
+        );
+        let mut client = replayed(&mut e);
+        assert_same(&mut e, &mut client);
+    }
+
+    #[test]
+    fn queries_are_answered_by_the_emulator() {
+        let mut e = fed(b"abc");
+        e.process(b"\x1b[6n\x1b[5n\x1b[c\x1b[?2004$p");
+        assert_eq!(
+            String::from_utf8(e.take_replies()).unwrap(),
+            "\x1b[1;4R\x1b[0n\x1b[?6c\x1b[?2004;2$y"
+        );
+        assert!(e.take_replies().is_empty(), "drained");
+        // Colours: the web theme until the program sets one.
+        e.process(b"\x1b]11;?\x07\x1b]4;1;?\x1b\\\x1b]4;100;?\x07");
+        assert_eq!(
+            String::from_utf8(e.take_replies()).unwrap(),
+            "\x1b]11;rgb:0c0c/0d0d/0c0c\x07\x1b]4;1;rgb:efef/5a5a/4c4c\x1b\\\
+             \x1b]4;100;rgb:8787/8787/0000\x07"
+        );
+        e.process(b"\x1b]11;rgb:12/34/56\x07\x1b]11;?\x07");
+        assert_eq!(
+            String::from_utf8(e.take_replies()).unwrap(),
+            "\x1b]11;rgb:1212/3434/5656\x07"
+        );
+        assert_eq!(default_color(232), Rgb { r: 8, g: 8, b: 8 });
+        assert_eq!(
+            default_color(231),
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
+        // Snapshots carry no queries, so replaying one asks nothing.
+        let mut client = replayed(&mut e);
+        assert!(client.take_replies().is_empty());
+    }
+
+    #[test]
+    fn the_snapshot_keeps_the_newest_history_within_its_budget() {
+        let mut source = Emulator::new(COLS, ROWS, 1000);
+        for i in 0..500 {
+            source.process(format!("\x1b[3{}mline {i}\x1b[0m\r\n", i % 8).as_bytes());
+        }
+        source.process("w".repeat(usize::from(COLS) * 3 + 5).as_bytes());
+        let full = source.snapshot(usize::MAX);
+        let budget = 2000;
+        let small = source.snapshot(budget);
+        let screen_only = source.snapshot(0);
+        assert!(screen_only.len() < small.len() && small.len() < full.len());
+        assert!(small.len() < screen_only.len() + budget);
+        for snapshot in [&small, &screen_only] {
+            let mut client = Emulator::new(COLS, ROWS, 1000);
+            client.process(snapshot);
+            assert!(client.history_lines() < source.history_lines());
+            assert_eq!(
+                client.text(TextSource::Visible),
+                source.text(TextSource::Visible)
+            );
+            // Whole logical lines, newest kept.
+            let recent = client.text(TextSource::Recent { lines: 1000 }).lines;
+            let all = source.text(TextSource::Recent { lines: 1000 }).lines;
+            assert_eq!(recent[..], all[all.len() - recent.len()..]);
+        }
+        let mut client = Emulator::new(COLS, ROWS, 1000);
+        client.process(&full);
+        assert_same(&mut source, &mut client);
     }
 }

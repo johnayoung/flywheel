@@ -81,7 +81,11 @@ impl TestHub {
     }
 
     fn cookie(&self) -> String {
-        format!("fw_hub={}", self.token)
+        format!(
+            "{}={}",
+            flywheel_hub::auth::cookie_name(&self.token),
+            self.token
+        )
     }
 
     fn authed(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -278,7 +282,9 @@ async fn login_trades_the_token_for_a_strict_http_only_cookie() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
     let cookie = ok.headers()[SET_COOKIE].to_str().unwrap().to_owned();
-    assert!(cookie.starts_with(&format!("fw_hub={};", hub.token)));
+    let name = flywheel_hub::auth::cookie_name(&hub.token);
+    assert!(name.starts_with("fw_hub_"), "{name}");
+    assert!(cookie.starts_with(&format!("{name}={};", hub.token)));
     assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
     assert_eq!(ok.headers()["cache-control"], "no-store");
     assert!(ok.text().await.unwrap().contains("url=/"));
@@ -1474,10 +1480,13 @@ async fn screen_text_sources_and_validation() {
     let listed: Value = listed.json().await.unwrap();
     assert!(listed["live"]["scrollback_lines"].as_u64().unwrap() > 0);
 
-    for (query, status) in [
-        ("?source=nope", StatusCode::BAD_REQUEST),
-        ("?source=recent&lines=0", StatusCode::BAD_REQUEST),
-        ("?lines=abc", StatusCode::BAD_REQUEST),
+    for query in [
+        "?source=nope",
+        "?source=recent&lines=0",
+        "?source=recent&lines=abc",
+        "?lines=abc",
+        "?source=visible&lines=5",
+        "?source=recent&lines=999999999",
     ] {
         let response = hub
             .authed(
@@ -1487,7 +1496,9 @@ async fn screen_text_sources_and_validation() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), status, "{query}");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body: Value = response.json().await.expect("a JSON error body");
+        assert!(body["error"].is_string(), "{query}: {body}");
     }
     let missing = hub
         .authed(reqwest::Method::GET, "/api/sessions/nope/screen")
@@ -1502,5 +1513,113 @@ async fn screen_text_sources_and_validation() {
         .await
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    hub.shutdown().await;
+}
+
+/// The next text message (skipping nothing else: binary is an error here).
+async fn next_text(ws: &mut Ws) -> Value {
+    match timeout(Duration::from_secs(30), ws.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).unwrap(),
+        other => panic!("expected a text message, got {other:?}"),
+    }
+}
+
+/// Read exactly `len` bytes of binary frames (the snapshot).
+async fn read_snapshot(ws: &mut Ws, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        match timeout(Duration::from_secs(30), ws.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => out.extend_from_slice(&bytes),
+            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+            other => panic!("expected snapshot bytes, got {other:?}"),
+        }
+    }
+    assert_eq!(out.len(), len, "the snapshot is exactly `bytes` long");
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_falls_behind_gets_the_screen_alone_and_catches_up() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("lag").await;
+    // History first (a large snapshot), then, on cue, a flood far past the
+    // broadcast depth while the client is not reading.
+    let script = "i=0; while [ $i -lt 3000 ]; do echo \"history line $i with some padding\"; \
+                  i=$((i+1)); done; read go; \
+                  yes 'flood flood flood flood flood flood flood flood' | head -c 40000000; \
+                  echo FLOOD-DONE; sleep 60";
+    let session = hub
+        .create_session(
+            ws["id"].as_str().unwrap(),
+            Some(vec!["/bin/sh", "-c", script]),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    hub.wait_screen(&sid, |s| {
+        s["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "history line 2999 with some padding")
+    })
+    .await;
+    let origin = hub.origin();
+    let mut socket = hub.connect(&sid, Some(&origin), true).await.unwrap();
+    let header = next_text(&mut socket).await;
+    assert_eq!(header["type"], "snapshot");
+    let first = usize::try_from(header["bytes"].as_u64().unwrap()).unwrap();
+    assert!(
+        first > 100_000,
+        "the first snapshot carries history: {header}"
+    );
+    read_snapshot(&mut socket, first).await;
+
+    input(&mut socket, "go\r").await;
+    // Stop reading until the flood is over.
+    hub.wait_screen(&sid, |s| {
+        s["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().unwrap().ends_with("FLOOD-DONE"))
+    })
+    .await;
+    let reset_at = loop {
+        match timeout(Duration::from_secs(30), socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "reset" {
+                    break value;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("socket ended before a reset: {other:?}"),
+        }
+    };
+    assert_eq!(reset_at["type"], "reset");
+    let header = next_text(&mut socket).await;
+    assert_eq!(header["type"], "snapshot", "{header}");
+    let bytes = usize::try_from(header["bytes"].as_u64().unwrap()).unwrap();
+    assert!(
+        bytes < 16 * 1024,
+        "a lagged client gets the screen alone: {header}"
+    );
+    let snapshot = read_snapshot(&mut socket, bytes).await;
+    let mut viewer = Viewer {
+        term: Emulator::new(80, 24, 1000),
+        header,
+    };
+    viewer.term.process(&snapshot);
+    assert_eq!(viewer.term.history_lines(), 0);
+    let seen = viewer
+        .converge(&mut socket, &hub, &sid, |s| {
+            s["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().ends_with("FLOOD-DONE"))
+        })
+        .await;
+    assert_eq!(seen["alt_screen"], false);
     hub.shutdown().await;
 }

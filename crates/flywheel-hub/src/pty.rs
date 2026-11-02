@@ -8,7 +8,9 @@
 //!   broadcast. Emulating and broadcasting happen under one lock, and
 //!   [`PtySession::attach`] snapshots + subscribes under that same lock, so an
 //!   attaching client sees the state up to some byte, then every later byte
-//!   exactly once: snapshot, then live.
+//!   exactly once: snapshot, then live. The emulator's replies to terminal
+//!   queries are queued as input (the server is the only answerer, so a
+//!   detached session gets them, and once however many clients watch).
 //! * **writer** -- owns the PTY writer and drains a queue, so a child that
 //!   stops reading its stdin can never block an HTTP handler.
 //! * **waiter** -- reaps the child, lets the reader drain the final output,
@@ -24,7 +26,7 @@
 //! some escaped process (one that `setsid`ed away but kept the terminal open)
 //! still holds the PTY, so a removed session's fds and threads are freed.
 
-use crate::vt::{Emulator, ScreenText, TextSource};
+use crate::vt::{Emulator, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource};
 use axum::body::Bytes;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -298,10 +300,18 @@ impl PtySession {
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = Bytes::copy_from_slice(&buf[..n]);
-                    let mut shared = self.lock();
-                    shared.screen.process(&chunk);
-                    // No receivers is not an error: output is retained.
-                    let _ = self.events.send(SessionEvent::Output(chunk));
+                    let replies = {
+                        let mut shared = self.lock();
+                        shared.screen.process(&chunk);
+                        // No receivers is not an error: output is retained.
+                        let _ = self.events.send(SessionEvent::Output(chunk));
+                        shared.screen.take_replies()
+                    };
+                    if !replies.is_empty() {
+                        // Dropped like any input when the child is not
+                        // reading (or gone).
+                        let _ = self.write(replies);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 // EIO is how Linux reports "slave side closed".
@@ -321,12 +331,19 @@ impl PtySession {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Snapshot the terminal and subscribe to live events atomically.
-    /// Takes milliseconds for a full scrollback; call off async workers.
+    /// Snapshot the terminal (scrollback up to [`SNAPSHOT_HISTORY_BYTES`])
+    /// and subscribe to live events atomically. Takes milliseconds; call
+    /// off async workers.
     pub fn attach(&self) -> Attachment {
+        self.attach_with(SNAPSHOT_HISTORY_BYTES)
+    }
+
+    /// [`PtySession::attach`] with a scrollback byte budget for the
+    /// snapshot (0: the screen only).
+    pub fn attach_with(&self, history_budget: usize) -> Attachment {
         let mut shared = self.lock();
         Attachment {
-            replay: shared.screen.snapshot(),
+            replay: shared.screen.snapshot(history_budget),
             cols: shared.size.cols,
             rows: shared.size.rows,
             alt_screen: shared.screen.alt_screen(),
@@ -689,6 +706,38 @@ mod tests {
         assert!(String::from_utf8_lossy(&late.replay).contains("got:ping"));
         session.kill(Duration::from_secs(2));
         assert!(session.wait_exit(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn terminal_queries_are_answered_once_with_or_without_viewers() {
+        // Raw mode; ask for status and the cursor position; give a second
+        // (duplicate) answer time to arrive, then show what came back.
+        let script = "stty raw -echo min 0 time 5; printf 'xy\\033[5n\\033[6n'; sleep 1; \
+                      r=$(dd bs=256 count=1 2>/dev/null); stty sane; \
+                      printf '\\nreply:'; printf '%s' \"$r\" | od -An -c | tr -s ' '; \
+                      echo end; sleep 30";
+        for viewers in [0, 2] {
+            let session = PtySession::spawn(spec(script), |_| {}).unwrap();
+            let held: Vec<Attachment> = (0..viewers).map(|_| session.attach()).collect();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let text = loop {
+                let text = session
+                    .screen_text(TextSource::Recent { lines: 10 })
+                    .lines
+                    .join("\n");
+                if text.contains("end") || Instant::now() >= deadline {
+                    break text;
+                }
+                thread::sleep(Duration::from_millis(50));
+            };
+            assert!(
+                text.contains("reply: 033 [ 0 n 033 [ 1 ; 3 R\nend"),
+                "{viewers} viewers: {text}"
+            );
+            drop(held);
+            session.kill(Duration::from_secs(2));
+            assert!(session.wait_exit(Duration::from_secs(10)));
+        }
     }
 
     #[test]

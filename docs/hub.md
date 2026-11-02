@@ -7,7 +7,7 @@
 ## Verbs
 
 ```bash
-fw hub serve [--bind ADDR] [--port N] [--allow-origin ORIGIN]... [--scrollback-bytes N] [--state-dir DIR]
+fw hub serve [--bind ADDR] [--port N] [--allow-origin ORIGIN]... [--scrollback-lines N] [--state-dir DIR]
 fw hub token [--state-dir DIR]     # print the access token (created on first use)
 ```
 
@@ -18,7 +18,7 @@ fw hub token [--state-dir DIR]     # print the access token (created on first us
 | `--bind` | `127.0.0.1` | non-loopback prints a warning |
 | `--port` | `7420` | `0` picks a free port |
 | `--allow-origin` | none | extra browser origin (e.g. `https://box.tailnet.ts.net`); same-origin always allowed |
-| `--scrollback-bytes` | `2097152` | per-session output retained for replay |
+| `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer |
 | `--state-dir` | `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub` | |
 
 ## Remote access (phone, other machines)
@@ -38,7 +38,7 @@ Open `https://<machine>.<tailnet>.ts.net/login?token=$(fw hub token)` on the pho
 - Killing a session hangs up its whole session (leader's group plus background jobs, even after the leader exited; Linux scans `/proc`, elsewhere only the leader's group). Removing a session, or deleting its workspace, also frees its PTY.
 - Terminal size is shared: the last client to resize sets it for everyone.
 - Input beyond 4 MiB queued for a terminal that is not reading is dropped (the client gets an `error` message).
-- Replay after the ring fills starts at a line boundary; terminal modes set before that point (alt screen, colours) are not replayed.
+- The server runs a terminal emulator per session (`alacritty_terminal`). Attaching sends a **snapshot** -- escape sequences that rebuild scrollback, screen, alternate screen (with the shell screen under it), cursor, saved cursor, SGR pen, scroll region, charsets, DEC modes (cursor keys, keypad, bracketed paste, mouse, focus), cursor style, title, palette -- then live bytes, with no gap or overlap. Not replayed: custom tab stops; `?47`/`?1047` alt screens are not emulated (`?1049` is).
 - Sessions get `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`.
 
 ## Auth
@@ -60,11 +60,19 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET / PATCH / DELETE | `/sessions/{id}` | PATCH `{"name"}` renames; DELETE kills and forgets |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
 | POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
+| GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
 | GET | `/sessions/{id}/ws` | WebSocket attach |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
 | GET | `/repos/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
 
-WebSocket: server sends **binary** frames of raw output (scrollback replay first, then live) and **text** JSON `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, replay follows) / `{"type":"error","message"}`. Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
+WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen"}` (size the snapshot was rendered at), then **binary** frames (the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, snapshot follows) / `{"type":"error","message"}`. Clients should reset their terminal before replaying (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
+
+Screen text: `source=visible` (default) is the screen's rows; `recent` the last `lines` (default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
+
+```json
+{"source":"visible","cols":80,"rows":24,"alt_screen":true,"title":"vim","cursor":{"row":2,"col":2,"visible":true},
+ "modes":["app_cursor","bracketed_paste","mouse_drag","sgr_mouse"],"lines":["..."]}
+```
 
 ```bash
 T=$(fw hub token)

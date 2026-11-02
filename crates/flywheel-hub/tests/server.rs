@@ -1,6 +1,7 @@
 //! End-to-end: a real hub server on 127.0.0.1:0, real HTTP, real
 //! WebSockets, real PTYs running `/bin/sh`.
 
+use flywheel_hub::vt::{Emulator, TextSource};
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -1173,5 +1174,333 @@ async fn restart_relaunches_an_ended_session_in_place() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    hub.shutdown().await;
+}
+
+// --- terminal state: snapshots on attach, rendered text -----------------------
+
+impl TestHub {
+    async fn screen(&self, sid: &str, query: &str) -> Value {
+        let response = self
+            .authed(
+                reqwest::Method::GET,
+                &format!("/api/sessions/{sid}/screen{query}"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+
+    /// Poll the server's rendered screen until `done` holds.
+    async fn wait_screen(&self, sid: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let screen = self.screen(sid, "?source=visible").await;
+            if done(&screen) {
+                return screen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "screen never settled: {screen:#}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A client-side terminal fed from a WebSocket: starts from the snapshot
+/// header's size, then replays every binary frame.
+struct Viewer {
+    term: Emulator,
+    header: Value,
+}
+
+impl Viewer {
+    /// Attach; the first message must be the snapshot header.
+    async fn attach(hub: &TestHub, sid: &str) -> (Self, Ws) {
+        let origin = hub.origin();
+        let mut ws = hub.connect(sid, Some(&origin), true).await.unwrap();
+        let first = timeout(Duration::from_secs(15), ws.next())
+            .await
+            .expect("a first message")
+            .expect("open socket")
+            .unwrap();
+        let Message::Text(text) = first else {
+            panic!("expected the snapshot header, got {first:?}");
+        };
+        let header: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(header["type"], "snapshot", "{header}");
+        let cols = u16::try_from(header["cols"].as_u64().unwrap()).unwrap();
+        let rows = u16::try_from(header["rows"].as_u64().unwrap()).unwrap();
+        let term = Emulator::new(cols, rows, 1000);
+        (Self { term, header }, ws)
+    }
+
+    fn visible(&mut self) -> Value {
+        let text = self.term.text(TextSource::Visible);
+        json!({ "lines": text.lines, "cursor": text.cursor,
+                "alt_screen": text.alt_screen, "title": text.title, "modes": text.modes })
+    }
+
+    /// Replay frames until this viewer shows exactly what the server's
+    /// emulator shows and `done` holds for it.
+    async fn converge(
+        &mut self,
+        ws: &mut Ws,
+        hub: &TestHub,
+        sid: &str,
+        done: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let server = hub.screen(sid, "?source=visible").await;
+            let mine = self.visible();
+            let same = ["lines", "cursor", "alt_screen", "title", "modes"]
+                .iter()
+                .all(|k| server[k] == mine[k]);
+            if same && done(&mine) {
+                return mine;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "viewer never matched the server\nserver: {server:#}\nviewer: {mine:#}"
+            );
+            match timeout(Duration::from_millis(100), ws.next()).await {
+                Ok(Some(Ok(Message::Binary(bytes)))) => self.term.process(&bytes),
+                Ok(Some(Ok(_))) | Err(_) => {}
+                Ok(other) => panic!("socket ended: {other:?}"),
+            }
+        }
+    }
+}
+
+fn lines_of(screen: &Value) -> Vec<String> {
+    screen["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A full-screen program in plain sh: draws on the alternate screen with
+/// colours, a title, bracketed paste and SGR mouse on, waits for a line of
+/// input, then restores the shell screen.
+const FULL_SCREEN_SCRIPT: &str = r#"
+printf 'before-alt 1\r\nbefore-alt 2\r\n'
+printf '\033[?1049h\033[?2004h\033[?1002h\033[?1006h\033[?1h\033]2;tui-title\007'
+printf '\033[H\033[2J\033[1;44;37m header bar \033[0m'
+printf '\033[5;10H\033[38;5;208mcentered\033[0m'
+printf '\033[24;1H\033[7mstatus: READY\033[0m\033[3;3H'
+read answer
+printf '\033[?2004l\033[?1002l\033[?1006l\033[?1l\033[?1049l'
+printf 'answered %s\r\n' "$answer"
+sleep 30
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reattached_client_sees_the_same_full_screen_program() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("tui").await;
+    let session = hub
+        .create_session(
+            ws["id"].as_str().unwrap(),
+            Some(vec!["/bin/sh", "-c", FULL_SCREEN_SCRIPT]),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let ready = hub
+        .wait_screen(&sid, |s| {
+            s["lines"][23].as_str().is_some_and(|l| l.contains("READY"))
+        })
+        .await;
+    assert_eq!(ready["alt_screen"], true);
+    assert_eq!(ready["title"], "tui-title");
+    assert_eq!(
+        ready["cursor"],
+        json!({ "row": 2, "col": 2, "visible": true })
+    );
+    for mode in ["bracketed_paste", "mouse_drag", "sgr_mouse", "app_cursor"] {
+        assert!(
+            ready["modes"].as_array().unwrap().contains(&json!(mode)),
+            "{ready}"
+        );
+    }
+
+    // Two clients attach after the fact (one, then a reattach): each
+    // rebuilds the alternate screen, cursor, modes, and title exactly.
+    for _ in 0..2 {
+        let (mut viewer, mut socket) = Viewer::attach(&hub, &sid).await;
+        assert_eq!(viewer.header["alt_screen"], true);
+        assert_eq!(viewer.header["cols"], 80);
+        let seen = viewer.converge(&mut socket, &hub, &sid, |_| true).await;
+        assert_eq!(seen["lines"][0], " header bar");
+        assert_eq!(seen["lines"][4], "         centered");
+        drop(socket);
+    }
+
+    // Live output continues the snapshot with no gap: leaving the
+    // alternate screen restores the shell rows the snapshot carried.
+    let (mut viewer, mut socket) = Viewer::attach(&hub, &sid).await;
+    viewer.converge(&mut socket, &hub, &sid, |_| true).await;
+    input(&mut socket, "yes\r").await;
+    let after = viewer
+        .converge(&mut socket, &hub, &sid, |s| {
+            s["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l == "answered yes")
+        })
+        .await;
+    assert_eq!(after["alt_screen"], false);
+    assert_eq!(after["modes"], json!([]));
+    let lines = lines_of(&after);
+    assert_eq!(
+        &lines[..3],
+        ["before-alt 1", "before-alt 2", "answered yes"]
+    );
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reattached_client_sees_the_same_vim_screen() {
+    if std::process::Command::new("vim")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: vim is not installed");
+        return;
+    }
+    let hub = TestHub::start().await;
+    let file = hub.repo.join("notes.txt");
+    let text: String = (1..=40).map(|i| format!("note line {i}\n")).collect();
+    std::fs::write(&file, text).unwrap();
+    let ws = hub.create_workspace("vim").await;
+    let session = hub
+        .create_session(
+            ws["id"].as_str().unwrap(),
+            Some(vec![
+                "vim",
+                "-u",
+                "NONE",
+                "-N",
+                "-i",
+                "NONE",
+                "-n",
+                "+set number",
+                file.to_str().unwrap(),
+            ]),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    hub.wait_screen(&sid, |s| {
+        s["alt_screen"] == true
+            && s["lines"][0]
+                .as_str()
+                .is_some_and(|l| l.contains("note line 1"))
+    })
+    .await;
+
+    let (mut viewer, mut socket) = Viewer::attach(&hub, &sid).await;
+    let seen = viewer.converge(&mut socket, &hub, &sid, |_| true).await;
+    assert!(
+        seen["lines"][0].as_str().unwrap().ends_with("note line 1"),
+        "{seen}"
+    );
+
+    // Drive vim through the reattached client: jump to the end, then quit.
+    input(&mut socket, "G").await;
+    viewer
+        .converge(&mut socket, &hub, &sid, |s| {
+            s["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().ends_with("note line 40"))
+        })
+        .await;
+    input(&mut socket, ":q!\r").await;
+    let exit = read_control(&mut socket, "exit").await;
+    assert_eq!(exit["code"], 0);
+    let last = hub.screen(&sid, "").await;
+    assert_eq!(last["alt_screen"], false);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn screen_text_sources_and_validation() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("text").await;
+    let script = "i=1; while [ $i -le 60 ]; do echo \"row $i\"; i=$((i+1)); done; \
+                  printf '%0100d\\n' 7; sleep 30";
+    let session = hub
+        .create_session(
+            ws["id"].as_str().unwrap(),
+            Some(vec!["/bin/sh", "-c", script]),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let long = format!("{}7", "0".repeat(99));
+    let visible = hub
+        .wait_screen(&sid, |s| {
+            s["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l == "00000000000000000007")
+        })
+        .await;
+    assert_eq!(visible["source"], "visible");
+    assert_eq!(visible["rows"], 24);
+    assert_eq!(visible["lines"].as_array().unwrap().len(), 24);
+
+    // Recent joins the soft-wrapped 100-char line and reaches into history.
+    let recent = hub.screen(&sid, "?source=recent&lines=3").await;
+    assert_eq!(recent["source"], "recent");
+    assert_eq!(lines_of(&recent), ["row 59", "row 60", long.as_str()]);
+    let all = hub.screen(&sid, "?source=recent&lines=1000").await;
+    let all = lines_of(&all);
+    assert_eq!(all.first().map(String::as_str), Some("row 1"));
+    assert_eq!(all.len(), 61);
+    let listed = hub
+        .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap();
+    let listed: Value = listed.json().await.unwrap();
+    assert!(listed["live"]["scrollback_lines"].as_u64().unwrap() > 0);
+
+    for (query, status) in [
+        ("?source=nope", StatusCode::BAD_REQUEST),
+        ("?source=recent&lines=0", StatusCode::BAD_REQUEST),
+        ("?lines=abc", StatusCode::BAD_REQUEST),
+    ] {
+        let response = hub
+            .authed(
+                reqwest::Method::GET,
+                &format!("/api/sessions/{sid}/screen{query}"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{query}");
+    }
+    let missing = hub
+        .authed(reqwest::Method::GET, "/api/sessions/nope/screen")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let anonymous = hub
+        .http
+        .get(hub.url(&format!("/api/sessions/{sid}/screen")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     hub.shutdown().await;
 }

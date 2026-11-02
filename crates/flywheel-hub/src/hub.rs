@@ -5,11 +5,11 @@ use crate::agent::{AgentPrograms, SessionKind, which};
 use crate::auth::{Token, TokenError};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SpawnError, SpawnSpec};
-use crate::scrollback::DEFAULT_SCROLLBACK_BYTES;
 use crate::state::{
     HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput, new_id,
     validate_name,
 };
+use crate::vt::DEFAULT_SCROLLBACK_LINES;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,7 +27,8 @@ pub const DEFAULT_ROWS: u16 = 32;
 #[derive(Debug, Clone)]
 pub struct HubOptions {
     pub state_dir: PathBuf,
-    pub scrollback_bytes: usize,
+    /// Scrollback lines kept per session.
+    pub scrollback_lines: usize,
     /// Command for sessions created without one; defaults to `$SHELL`
     /// (falling back to `/bin/sh`).
     pub default_shell: Vec<String>,
@@ -45,7 +46,7 @@ impl HubOptions {
             .unwrap_or_else(|| "/bin/sh".to_owned());
         Self {
             state_dir,
-            scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             default_shell: vec![shell],
             agents: AgentPrograms::default(),
         }
@@ -105,7 +106,8 @@ pub struct LiveView {
     pub cols: u16,
     pub rows: u16,
     pub clients: usize,
-    pub scrollback_bytes: usize,
+    /// Scrollback lines retained by the active screen.
+    pub scrollback_lines: usize,
 }
 
 /// Whether a session kind can be launched on this host.
@@ -227,7 +229,7 @@ impl Hub {
                 cols,
                 rows,
                 clients: s.subscriber_count(),
-                scrollback_bytes: s.scrollback_len(),
+                scrollback_lines: s.scrollback_lines(),
             }
         });
         SessionView { record, live }
@@ -329,7 +331,7 @@ impl Hub {
                 ],
                 cols: cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
                 rows: rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
-                scrollback_bytes: self.options.scrollback_bytes,
+                scrollback_lines: self.options.scrollback_lines,
             },
             move |exit| {
                 if let Some(hub) = weak.upgrade() {

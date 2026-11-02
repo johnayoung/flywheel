@@ -16,9 +16,9 @@ pub mod cli;
 pub mod hub;
 pub mod paths;
 pub mod pty;
-pub mod scrollback;
 pub mod server;
 pub mod state;
+pub mod vt;
 pub mod web;
 
 pub use hub::{CreateSession, Hub, HubError, HubOptions, SessionView};

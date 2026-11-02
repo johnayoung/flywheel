@@ -1,13 +1,14 @@
-//! One server-owned PTY session: a child process on a pseudo-terminal, its
-//! bounded scrollback, and a broadcast of live output to every attached
-//! client.
+//! One server-owned PTY session: a child process on a pseudo-terminal, a
+//! terminal emulator tracking its screen (bounded scrollback), and a
+//! broadcast of live output to every attached client.
 //!
 //! Threads per session (all blocking, none on the async runtime):
 //!
-//! * **reader** -- drains the PTY master into the scrollback and the
-//!   broadcast. Appending and broadcasting happen under one lock, and
+//! * **reader** -- drains the PTY master into the emulator and the
+//!   broadcast. Emulating and broadcasting happen under one lock, and
 //!   [`PtySession::attach`] snapshots + subscribes under that same lock, so an
-//!   attaching client sees every byte exactly once: replay, then live.
+//!   attaching client sees the state up to some byte, then every later byte
+//!   exactly once: snapshot, then live.
 //! * **writer** -- owns the PTY writer and drains a queue, so a child that
 //!   stops reading its stdin can never block an HTTP handler.
 //! * **waiter** -- reaps the child, lets the reader drain the final output,
@@ -23,7 +24,7 @@
 //! some escaped process (one that `setsid`ed away but kept the terminal open)
 //! still holds the PTY, so a removed session's fds and threads are freed.
 
-use crate::scrollback::Scrollback;
+use crate::vt::{Emulator, ScreenText, TextSource};
 use axum::body::Bytes;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// Live-output broadcast depth (chunks). A subscriber that falls further
-/// behind than this receives a fresh replay instead (see [`Attachment`]).
+/// behind than this receives a fresh snapshot instead (see [`Attachment`]).
 const BROADCAST_DEPTH: usize = 1024;
 /// How long the waiter lets the reader drain output after the child exits.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
@@ -94,7 +95,8 @@ pub struct SpawnSpec {
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
-    pub scrollback_bytes: usize,
+    /// Scrollback lines the emulator keeps (see [`crate::vt`]).
+    pub scrollback_lines: usize,
 }
 
 /// Failure to start a session.
@@ -120,16 +122,22 @@ pub enum WriteOutcome {
     Backlogged,
 }
 
-/// A point-in-time attach: everything retained so far plus a live receiver
-/// positioned exactly after it.
+/// A point-in-time attach: a snapshot of the terminal plus a live receiver
+/// positioned exactly after the output it reflects.
 pub struct Attachment {
+    /// Escape sequences rebuilding the terminal (scrollback, screens,
+    /// cursor, modes) in a freshly reset client.
     pub replay: Vec<u8>,
+    /// The terminal size the snapshot was taken at.
+    pub cols: u16,
+    pub rows: u16,
+    pub alt_screen: bool,
     pub exit: Option<ExitInfo>,
     pub events: broadcast::Receiver<SessionEvent>,
 }
 
 struct Shared {
-    scrollback: Scrollback,
+    screen: Emulator,
     exit: Option<ExitInfo>,
     /// The leader has been reaped (its pid may be recycled from here on).
     reaped: bool,
@@ -229,7 +237,7 @@ impl PtySession {
         });
         let session = Arc::new(Self {
             shared: Mutex::new(Shared {
-                scrollback: Scrollback::new(spec.scrollback_bytes),
+                screen: Emulator::new(size.cols, size.rows, spec.scrollback_lines),
                 exit: None,
                 reaped: false,
                 size,
@@ -291,7 +299,7 @@ impl PtySession {
                 Ok(n) => {
                     let chunk = Bytes::copy_from_slice(&buf[..n]);
                     let mut shared = self.lock();
-                    shared.scrollback.push(&chunk);
+                    shared.screen.process(&chunk);
                     // No receivers is not an error: output is retained.
                     let _ = self.events.send(SessionEvent::Output(chunk));
                 }
@@ -313,11 +321,15 @@ impl PtySession {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Snapshot the scrollback and subscribe to live events atomically.
+    /// Snapshot the terminal and subscribe to live events atomically.
+    /// Takes milliseconds for a full scrollback; call off async workers.
     pub fn attach(&self) -> Attachment {
-        let shared = self.lock();
+        let mut shared = self.lock();
         Attachment {
-            replay: shared.scrollback.snapshot(),
+            replay: shared.screen.snapshot(),
+            cols: shared.size.cols,
+            rows: shared.size.rows,
+            alt_screen: shared.screen.alt_screen(),
             exit: shared.exit.clone(),
             events: self.events.subscribe(),
         }
@@ -367,6 +379,7 @@ impl PtySession {
                 return Ok(());
             }
             shared.size = size;
+            shared.screen.resize(size.cols, size.rows);
         }
         self.master
             .lock()
@@ -396,9 +409,14 @@ impl PtySession {
         self.events.receiver_count()
     }
 
-    /// Bytes currently retained in the scrollback.
-    pub fn scrollback_len(&self) -> usize {
-        self.lock().scrollback.len()
+    /// Scrollback lines retained by the active screen.
+    pub fn scrollback_lines(&self) -> usize {
+        self.lock().screen.history_lines()
+    }
+
+    /// The terminal's rendered plain text.
+    pub fn screen_text(&self, source: TextSource) -> ScreenText {
+        self.lock().screen.text(source)
     }
 
     /// Hang up the session -- the leader's process group and every process
@@ -621,7 +639,7 @@ mod tests {
             env: vec![("FW_HUB_TEST".into(), "marker-value".into())],
             cols: 80,
             rows: 24,
-            scrollback_bytes: 64 * 1024,
+            scrollback_lines: 1000,
         }
     }
 

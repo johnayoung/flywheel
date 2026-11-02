@@ -50,9 +50,10 @@ struct ServeArgs {
     /// repeatable. Same-origin is always accepted.
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
     allow_origins: Vec<String>,
-    /// Per-session scrollback retained for replay, in bytes.
-    #[arg(long, value_name = "BYTES", default_value_t = crate::scrollback::DEFAULT_SCROLLBACK_BYTES)]
-    scrollback_bytes: usize,
+    /// Per-session scrollback kept by the server's terminal emulator, in
+    /// lines (capped at 1M cells, so wide terminals keep fewer).
+    #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
+    scrollback_lines: usize,
     #[command(flatten)]
     state: StateDirArg,
 }
@@ -158,7 +159,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
     let mut options = HubOptions::new(state_dir);
-    options.scrollback_bytes = args.scrollback_bytes;
+    options.scrollback_lines = args.scrollback_lines;
     let hub = match Hub::open(options) {
         Ok(hub) => hub,
         Err(e) => {

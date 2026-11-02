@@ -10,7 +10,7 @@ use crate::remote::{
     normalize_public_url, qr_lines, tailscale_program,
 };
 use crate::server::{ServerOptions, code_login_url, serve};
-use crate::{lifecycle, script};
+use crate::{browser, lifecycle, script};
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Read, Write};
@@ -64,8 +64,15 @@ enum HubCommand {
     /// Hang up a session's processes (the record stays, as exited).
     Kill(script::KillArgs),
     /// Start an ended or stopped session again in place (same id, name,
-    /// command, and repo; a fresh terminal).
+    /// command, and folder; a fresh terminal).
     Relaunch(script::RelaunchArgs),
+    /// Import VS Code multi-root workspace files (*.code-workspace) as
+    /// workspaces: their folders (git repos or plain directories) and
+    /// folder names; missing folders are reported and skipped.
+    Import(script::ImportArgs),
+    /// Open the running hub in a browser on this machine, signed in with
+    /// a fresh one-time code (also printed).
+    Open(browser::OpenArgs),
     /// Print one-time login URLs for the running hub (loopback, LAN,
     /// tailnet, public), optionally as a QR code for a phone. The
     /// long-lived token is never shown.
@@ -183,6 +190,10 @@ pub(crate) struct HubArgs {
     /// conversations (Claude Code `--resume`, `codex resume`).
     #[arg(long)]
     no_agent_resume: bool,
+    /// Where the web UI's "Import VS Code workspace" looks for
+    /// *.code-workspace files (3 levels deep) [default: ~/code].
+    #[arg(long, value_name = "DIR")]
+    import_root: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
@@ -215,6 +226,14 @@ impl HubArgs {
         }
         if self.no_agent_resume {
             argv.push("--no-agent-resume".to_owned());
+        }
+        if let Some(root) = &self.import_root {
+            // Absolute: the detached hub runs from `/`.
+            let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
+            argv.extend([
+                "--import-root".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ]);
         }
         argv.extend([
             "--state-dir".to_owned(),
@@ -289,6 +308,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         HubCommand::Read(args) => script::read(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
+        HubCommand::Import(args) => script::import(&args, out, err),
+        HubCommand::Open(args) => browser::open(&args, out, err),
     }
 }
 
@@ -747,6 +768,11 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     options.scrollback_lines = hub_args.scrollback_lines;
     options.report_command = report_command();
     options.agent_resume = !hub_args.no_agent_resume;
+    if let Some(root) = &hub_args.import_root {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let root = crate::state::expand_home(root, home.as_deref());
+        options.import_root = Some(std::path::absolute(&root).unwrap_or(root));
+    }
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

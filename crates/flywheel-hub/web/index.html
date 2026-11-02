@@ -43,6 +43,7 @@
   <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6"/></symbol>
   <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.2" y="5.2" width="8.3" height="8.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.8 2.5H2.5v8.3" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-import" viewBox="0 0 16 16"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="m5 3.5 4.5 4.5L5 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
 </svg>
 
@@ -135,14 +136,39 @@
       <span class="sheet-kicker" id="workspace-kicker">workspace</span>
       <h2 id="dlg-workspace-title">New workspace</h2>
     </header>
+    <section class="ws-import" id="ws-import">
+      <button type="button" class="import-toggle" id="import-toggle" aria-expanded="false" aria-controls="import-body">
+        <svg><use href="#i-import"/></svg><span>Import VS Code workspace</span><span class="field-hint">.code-workspace</span><svg class="chev"><use href="#i-chev"/></svg>
+      </button>
+      <div class="import-body" id="import-body" hidden>
+        <label class="field">
+          <span class="field-label">Search in <span class="field-hint">3 levels deep, on the hub's machine</span></span>
+          <span class="import-line">
+            <input id="import-root" autocomplete="off" spellcheck="false" placeholder="~/code" aria-label="Search root">
+            <button type="button" class="slab ghost" id="import-scan">Scan</button>
+          </span>
+        </label>
+        <ol class="import-files" id="import-files"></ol>
+        <label class="field">
+          <span class="field-label">Or a file <span class="field-hint">absolute or ~/</span></span>
+          <span class="import-line">
+            <input id="import-path" autocomplete="off" spellcheck="false" placeholder="~/code/workspaces/team.code-workspace" aria-label="Workspace file path">
+            <button type="button" class="slab" id="import-path-go">Import</button>
+          </span>
+        </label>
+        <label class="import-update"><input type="checkbox" id="import-update"> replace the folders of a workspace with the same name</label>
+        <div class="import-report" id="import-report" hidden></div>
+        <p class="form-error" id="import-error" role="alert"></p>
+      </div>
+    </section>
     <label class="field">
       <span class="field-label">Name</span>
       <input name="name" maxlength="100" autocomplete="off" spellcheck="false" placeholder="infrared" required>
     </label>
     <div class="field">
-      <span class="field-label">Repositories <span class="field-hint">git work-tree roots &middot; absolute or ~/</span></span>
+      <span class="field-label">Folders <span class="field-hint">git repos or plain directories &middot; absolute or ~/</span></span>
       <ol id="repo-rows" class="repo-rows"></ol>
-      <button type="button" class="text-btn" id="add-repo"><svg><use href="#i-plus"/></svg>add repo</button>
+      <button type="button" class="text-btn" id="add-repo"><svg><use href="#i-plus"/></svg>add folder</button>
     </div>
     <p class="form-error" id="workspace-error" role="alert"></p>
     <footer class="sheet-foot">
@@ -166,7 +192,7 @@
       <select name="workspace" id="session-workspace"></select>
     </label>
     <fieldset class="field repos-pick" id="repo-picker">
-      <legend class="field-label">In repo</legend>
+      <legend class="field-label">In folder</legend>
     </fieldset>
     <label class="field">
       <span class="field-label">Name <span class="field-hint">optional</span></span>
@@ -236,6 +262,7 @@
 <script src="/assets/vendor/addon-fit/addon-fit.js"></script>
 <script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>
 <script src="/assets/commands.js"></script>
+<script src="/assets/import.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

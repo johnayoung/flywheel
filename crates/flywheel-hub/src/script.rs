@@ -1,6 +1,6 @@
 //! Scripting the running hub from a shell or another agent: `fw hub ls`,
-//! `new`, `send`, `read`, `kill`, all over its HTTP API (bearer token from
-//! the state dir, address from its runtime file).
+//! `new`, `send`, `read`, `kill`, `import`, all over its HTTP API (bearer
+//! token from the state dir, address from its runtime file).
 //!
 //! Sessions and workspaces are addressed by id, unique id prefix, or name.
 
@@ -210,6 +210,34 @@ fn live_cwd(session: &Value) -> &str {
         .unwrap_or_else(|| str_field(session, "cwd"))
 }
 
+/// A workspace's folders for `ls`: paths, plain (non-git) directories
+/// marked. Reads the legacy `repos` list from a hub that predates folders.
+fn folder_list(workspace: &Value) -> Vec<String> {
+    if let Some(folders) = workspace.get("folders").and_then(Value::as_array) {
+        return folders
+            .iter()
+            .map(|f| {
+                let path = str_field(f, "path");
+                if f.get("git").and_then(Value::as_bool) == Some(false) {
+                    format!("{path} (no git)")
+                } else {
+                    path.to_owned()
+                }
+            })
+            .collect();
+    }
+    workspace
+        .get("repos")
+        .and_then(Value::as_array)
+        .map(|r| {
+            r.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn fail(err: &mut dyn Write, message: &str) -> i32 {
     let _ = writeln!(err, "fw hub: {message}");
     1
@@ -274,17 +302,12 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
         if i > 0 {
             let _ = writeln!(out);
         }
-        let repos: Vec<&str> = workspace
-            .get("repos")
-            .and_then(Value::as_array)
-            .map(|r| r.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
         let _ = writeln!(
             out,
             "{}  {}  {}",
             str_field(workspace, "name"),
             short(str_field(workspace, "id")),
-            repos.join(" ")
+            folder_list(workspace).join(" ")
         );
         let listed = of(workspace);
         let rows: Vec<[String; 5]> = listed
@@ -343,14 +366,14 @@ pub(crate) struct NewArgs {
     /// shell (default), claude, or codex.
     #[arg(long, default_value = "shell", value_parser = ["shell", "claude", "codex"])]
     kind: String,
-    /// One of the workspace's repos (default: its first). Relative paths
-    /// are taken from the current directory.
-    #[arg(long, value_name = "PATH")]
+    /// One of the workspace's folders (default: its first). Relative
+    /// paths are taken from the current directory.
+    #[arg(long, visible_alias = "folder", value_name = "PATH")]
     repo: Option<PathBuf>,
     /// Session name (default: program and number).
     #[arg(long)]
     name: Option<String>,
-    /// Create the workspace (named WORKSPACE, with --repo as its repo)
+    /// Create the workspace (named WORKSPACE, with --repo as its folder)
     /// when none matches.
     #[arg(long, requires = "repo")]
     create: bool,
@@ -435,6 +458,117 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         body["command"] = json!(args.command);
     }
     conn.call("POST", "/api/sessions", Some(&body))
+}
+
+// --- import -----------------------------------------------------------------
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ImportArgs {
+    /// VS Code multi-root workspace files (*.code-workspace).
+    #[arg(required = true, value_name = "FILE")]
+    files: Vec<PathBuf>,
+    /// Workspace name (default: the file name without .code-workspace).
+    /// One file only.
+    #[arg(long)]
+    name: Option<String>,
+    /// Replace the folders of the workspace already so named (refused
+    /// when that drops a folder a running session is in).
+    #[arg(long)]
+    update: bool,
+    /// Print each import report as JSON (one document per line).
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    state: StateDirArg,
+}
+
+/// `fw hub import`: every file is tried; exit 1 when any failed.
+pub(crate) fn import(args: &ImportArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    if args.name.is_some() && args.files.len() > 1 {
+        return fail(err, "--name names one workspace: give a single file");
+    }
+    let conn = match connect(&args.state) {
+        Ok(conn) => conn,
+        Err(message) => return fail(err, &message),
+    };
+    let mut failed = false;
+    for file in &args.files {
+        let report = absolute(file).and_then(|path| {
+            let mut body = json!({ "path": path, "update": args.update });
+            if let Some(name) = &args.name {
+                body["name"] = json!(name);
+            }
+            conn.call("POST", "/api/workspaces/import", Some(&body))
+        });
+        match report {
+            Ok(report) if args.json => {
+                let _ = writeln!(out, "{report}");
+            }
+            Ok(report) => print_import(&report, out, err),
+            Err(message) => {
+                failed = true;
+                let _ = writeln!(err, "fw hub: {}: {message}", file.display());
+            }
+        }
+    }
+    i32::from(failed)
+}
+
+/// An import report for humans: what was made, each folder (git or plain),
+/// and every entry skipped with why.
+fn print_import(report: &Value, out: &mut dyn Write, err: &mut dyn Write) {
+    let workspace = &report["workspace"];
+    let verb = if report["created"].as_bool() == Some(true) {
+        "created"
+    } else {
+        "updated"
+    };
+    let _ = writeln!(
+        out,
+        "{verb} workspace {:?} ({}) from {}",
+        str_field(workspace, "name"),
+        short(str_field(workspace, "id")),
+        str_field(report, "file")
+    );
+    let folders = workspace["folders"].as_array().cloned().unwrap_or_default();
+    for folder in &folders {
+        let path = str_field(folder, "path");
+        // A label that only repeats the directory's name adds nothing.
+        let label = match folder.get("name").and_then(Value::as_str) {
+            Some(name) if Some(name) != Path::new(path).file_name().and_then(|n| n.to_str()) => {
+                format!("  ({name})")
+            }
+            _ => String::new(),
+        };
+        let kind = if folder["git"].as_bool() == Some(true) {
+            "git   "
+        } else {
+            "folder"
+        };
+        let _ = writeln!(out, "  {kind}  {path}{label}");
+    }
+    let skipped = report["skipped"].as_array().cloned().unwrap_or_default();
+    for entry in &skipped {
+        let at = match entry.get("path").and_then(Value::as_str) {
+            Some(path) if path != str_field(entry, "entry") => format!(" -> {path}"),
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "  skipped {}{at}: {}",
+            str_field(entry, "entry"),
+            str_field(entry, "reason")
+        );
+    }
+    if !skipped.is_empty() {
+        let _ = writeln!(
+            err,
+            "fw hub: {:?}: {} of {} folders not imported (listed above)",
+            str_field(workspace, "name"),
+            skipped.len(),
+            skipped.len() + folders.len()
+        );
+    }
 }
 
 // --- send / read / kill -----------------------------------------------------
@@ -715,6 +849,45 @@ mod tests {
         assert_eq!(split("ls", false), ("ls".to_owned(), false));
         assert_eq!(split("ls", true), ("ls".to_owned(), true));
         assert_eq!(split("\n", false), (String::new(), true));
+    }
+
+    #[test]
+    fn ls_marks_plain_folders_and_reads_legacy_repos() {
+        let ws = json!({"folders": [
+            {"path": "/code/app", "git": true},
+            {"path": "/notes", "git": false, "name": "Notes"}
+        ]});
+        assert_eq!(folder_list(&ws), ["/code/app", "/notes (no git)"]);
+        assert_eq!(folder_list(&json!({"repos": ["/r"]})), ["/r"]);
+    }
+
+    #[test]
+    fn import_reports_folders_and_skips() {
+        let report = json!({
+            "created": true,
+            "file": "/w/personal.code-workspace",
+            "workspace": {"id": "0123456789ab", "name": "personal", "folders": [
+                {"path": "/code/app", "git": true, "name": "App"},
+                {"path": "/pickem", "git": false}
+            ]},
+            "skipped": [
+                {"entry": "../gone", "path": "/gone", "reason": "does not exist"},
+                {"entry": "vscode-remote://ssh-remote+box/x", "reason": "remote"}
+            ]
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        print_import(&report, &mut out, &mut err);
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "created workspace \"personal\" (01234567) from /w/personal.code-workspace\n\
+             \x20 git     /code/app  (App)\n\
+             \x20 folder  /pickem\n\
+             \x20 skipped ../gone -> /gone: does not exist\n\
+             \x20 skipped vscode-remote://ssh-remote+box/x: remote\n"
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("2 of 4 folders not imported"), "{err}");
     }
 
     #[test]

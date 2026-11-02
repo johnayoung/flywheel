@@ -31,6 +31,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "text/javascript; charset=utf-8",
     ),
     (
+        "import.js",
+        include_bytes!("../web/import.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
         "login.js",
         include_bytes!("../web/login.js"),
         "text/javascript; charset=utf-8",

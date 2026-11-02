@@ -14,10 +14,11 @@ fw hub logs [-f] [-n N]                       # <state-dir>/hub.log (detached hu
 fw hub install-service [SERVE FLAGS] [--name N] [--force] [--print]   # systemd --user unit; never enabled
 fw hub serve [SERVE FLAGS]                    # foreground
 fw hub url [--qr]                             # one-time login URLs for the running hub (+ QR for a phone)
+fw hub open [--session S]                     # open a browser here, signed in (fresh one-time code; URL printed too)
 fw hub token [--rotate]                       # print the access token (created on first use) / rotate it
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent-suggested code blocks
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
-# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume]
+# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--import-root DIR]
 # every verb takes --state-dir DIR
 ```
 
@@ -25,14 +26,19 @@ Scripting the running hub (sessions/workspaces by id, unique id prefix, or name;
 
 ```bash
 fw hub ls [--json]                                         # workspaces > sessions: short id, kind, state (+ agent status), name, live cwd
-fw hub new WS [--kind shell|claude|codex] [--repo PATH] [--name N] [--create] [--json] [-- ARGV...]   # prints the id; a taken --name is refused
+fw hub new WS [--kind shell|claude|codex] [--folder PATH] [--name N] [--create] [--json] [-- ARGV...]   # prints the id; a taken --name is refused (--repo = --folder)
 fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines -> CR, bracketed when the program enabled it
 fw hub read SESSION [--source visible|recent] [--lines N] [--json]
 fw hub kill SESSION [--rm]                                 # hang up (record kept, as exited); --rm also forgets it
 fw hub relaunch SESSION                                    # start an exited/stopped session again in place
+fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code multi-root workspaces -> workspaces
 ```
 
-`new --create` makes workspace `WS` (with `--repo`) when none matches; relative `--repo` is resolved against the caller's directory. `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped, repeatedly, so split markers cannot reassemble), a final newline becomes that Enter (`printf 'make\n' | fw hub send s -` runs it), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
+`import` reads VS Code workspace files (JSONC: comments, trailing commas): each `folders` entry's `path` (relative to the file's directory, absolute, or `~/`) or `file://` `uri` (and, on WSL, `vscode-remote://wsl+<this distro>/...`) becomes a folder, its `name` the folder's label. The workspace is named after the file (`personal.code-workspace` -> `personal`) unless `--name` (one file only). Missing folders and entries naming no local directory (other remotes, Windows paths) are listed as skipped (stderr summarizes); a file with nothing importable fails. An existing workspace of that name is refused unless `--update`, which replaces its folders and labels (refused when that drops a folder a running session is in). Every file is tried; exit 1 if any failed.
+
+`open` mints a one-time code and opens `http://<loopback>:<port>/login?code=...[#session=<id>]` with `$BROWSER` (`:`-separated commands, `%s` = URL) when set, else on WSL `wslview`, else `cmd.exe /c start` (cmd metacharacters `^`-escaped), else `xdg-open` (macOS: `open`). The URL is printed first, so a failed opener (exit 1) still leaves it to click.
+
+`new --create` makes workspace `WS` (with `--folder`) when none matches; relative `--repo` is resolved against the caller's directory. `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped, repeatedly, so split markers cannot reassemble), a final newline becomes that Enter (`printf 'make\n' | fw hub send s -` runs it), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
 
 ## Lifecycle and restore
 
@@ -57,6 +63,7 @@ fw hub relaunch SESSION                                    # start an exited/sto
 | `--trusted-proxy` | none | proxy on another machine whose `X-Forwarded-*` are believed (loopback always is), so its clients are rate-limited per client, not as one address |
 | `--allow-origin` | none | extra browser origin accepted without being listed; same-origin always allowed |
 | `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer |
+| `--import-root` | `~/code` | where the UI's VS Code import looks for `*.code-workspace` (3 levels deep; hidden, `node_modules`/`target`/... and symlinked dirs skipped) |
 | `--state-dir` | `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub` | |
 
 ## Remote access (phone, other machines)
@@ -75,8 +82,8 @@ fw hub url --qr                                  # scan with the phone
 
 ## Model
 
-- **Workspace** = a name (unique) + 1..N git work-tree roots (absolute or `~/...`; a `.git` dir or linked-worktree `.git` file).
-- **Session** = one PTY process in one of its workspace's repos, of a **kind**: `shell` (the hub's `$SHELL`, or an explicit argv), `claude`, or `codex` (the plain CLI, resolved on the hub's `PATH`; a missing CLI is a 400). States: `running`, `exited` (code or signal), `stopped` (the hub stopped while it ran; `clean` when by its own shutdown, plus `last_cwd` / `restore_error`). An exited session keeps its scrollback attachable until removed or the hub restarts.
+- **Workspace** = a name (unique) + 1..32 **folders**: existing directories (absolute or `~/...`), each a git work-tree root (`.git` dir or linked-worktree `.git` file) or a plain directory, with an optional display label. Each folder carries `git` (re-read from disk on load and on every listing); repo-only features (worktrees, branch badges) apply only where it is true. JSON: `folders: [{"path","name"?,"git"}]` plus a legacy `repos` mirror of every path; input takes `folders` (paths or `{"path","name"}`; a path without `name` keeps its label, `""` clears it) or the legacy `repos`.
+- **Session** = one PTY process in one of its workspace's folders, of a **kind**: `shell` (the hub's `$SHELL`, or an explicit argv), `claude`, or `codex` (the plain CLI, resolved on the hub's `PATH`; a missing CLI is a 400). States: `running`, `exited` (code or signal), `stopped` (the hub stopped while it ran; `clean` when by its own shutdown, plus `last_cwd` / `restore_error`). An exited session keeps its scrollback attachable until removed or the hub restarts.
 - Persisted to `<state-dir>/state.json` (0600, atomic writes). Restarts restore sessions (above).
 - Killing a session hangs up its whole session (leader's group plus background jobs, even after the leader exited; Linux scans `/proc`, elsewhere only the leader's group). Removing a session, or deleting its workspace, also frees its PTY.
 - Terminal size is shared: the last client to resize sets it for everyone.
@@ -129,9 +136,11 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/workspaces` | list / create `{"name","repos":[...]}` |
-| GET / PATCH / DELETE | `/workspaces/{id}` | PATCH takes `name` and/or `repos` (409 if it drops a running session's repo); DELETE refuses (409) while sessions run |
-| GET / POST | `/sessions[?workspace_id=]` | list / create `{"workspace_id","repo"?,"name"?,"kind"?,"command"?:[argv],"cols"?,"rows"?}` (`kind` defaults to `shell`; `command` only for shells, default `$SHELL`; default repo the first) |
+| GET / POST | `/workspaces` | list / create `{"name","folders":[...]}` |
+| GET / PATCH / DELETE | `/workspaces/{id}` | PATCH takes `name` and/or `folders` (409 if it drops a running session's folder); DELETE refuses (409) while sessions run |
+| POST | `/workspaces/import` | `{"path","name"?,"update"?}` (a `.code-workspace` on the hub's machine) -> `{"workspace","created","file","skipped":[{"entry","path"?,"reason"}]}`; 201 created, 200 updated, 409 name taken without `update` |
+| GET | `/code-workspaces[?root=]` | `{"root","depth","files":[{"path","name","folders","skipped","workspace_id"}\|{"path","name","error"}],"truncated"}` under `root` (default `--import-root`) |
+| GET / POST | `/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"name"?,"kind"?,"command"?:[argv],"cols"?,"rows"?}` (`repo` = `folder`; `kind` defaults to `shell`; `command` only for shells, default `$SHELL`; default folder the first) |
 | GET / PATCH / DELETE | `/sessions/{id}` | PATCH `{"name"}` renames; DELETE kills and forgets |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
 | POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
@@ -144,7 +153,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
 | POST | `/login-codes` | `{"code","expires_in":300}`: a one-time code for `/login?code=` |
 | POST | `/token/rotate` | 204: rotate the token (see `fw hub token --rotate`) |
-| GET | `/repos/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
+| GET | `/folders/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical,"git"}` or `{"ok":false,"error"}` (the workspace form validates as you type); `/repos/check` is the old name |
 
 WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001 (even one whose upgrade raced the rotation); the UI then shows sign-in with a "token was rotated" notice.
 
@@ -167,7 +176,7 @@ curl -s -H "Authorization: Bearer $T" -H 'content-type: application/json' \
 
 ## Web UI
 
-Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working / done) > sessions, each with its kind glyph and a status dot (live / done / failed / stopped / gone; ended sessions keep their exit code across hub restarts; a running agent shows working / blocked / done / idle instead, blocked with an alert edge). The tab title and favicon badges count blocked and done agents (`(1 blocked, 2 done) ...`; one favicon badge each); on narrow screens the drawer button badges agents in other sessions that need you. A blocked row shows what it asks under its name. Status and list changes are pushed over the events socket; the UI polls only while that socket is down. Dialogs create workspaces (repo paths checked live; paste several lines at once) and sessions (shell | claude | codex, repo picker defaulting to the attached session's repo). The attached session is kept in the URL (`#session=<id>`), so reloads re-attach; a dropped socket keeps the last screen, shows a countdown banner (and how many keystrokes were not sent), and reconnects with backoff (immediately on `online` / tab focus). An ended process, or a session whose terminal did not survive a hub restart, offers Relaunch (in place) and Close. Themes: auto (follows the OS), dark, light; the light theme lifts low-contrast agent TUI colours to 4.5:1.
+Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working / done) > sessions, each with its kind glyph and a status dot (live / done / failed / stopped / gone; ended sessions keep their exit code across hub restarts; a running agent shows working / blocked / done / idle instead, blocked with an alert edge). The tab title and favicon badges count blocked and done agents (`(1 blocked, 2 done) ...`; one favicon badge each); on narrow screens the drawer button badges agents in other sessions that need you. A blocked row shows what it asks under its name. Status and list changes are pushed over the events socket; the UI polls only while that socket is down. Dialogs create workspaces (folder paths checked live, plain folders marked "no git"; paste several lines at once; or **Import VS Code workspace**: the `*.code-workspace` files under a search root you can change, Import / Update per file, or a pasted path, then a report of every folder and every skipped entry) and sessions (shell | claude | codex, folder picker defaulting to the attached session's folder). Plain folders show dashed and italic in the sidebar. The attached session is kept in the URL (`#session=<id>`), so reloads re-attach; a dropped socket keeps the last screen, shows a countdown banner (and how many keystrokes were not sent), and reconnects with backoff (immediately on `online` / tab focus). An ended process, or a session whose terminal did not survive a hub restart, offers Relaunch (in place) and Close. A viewed session removed elsewhere (another browser, `fw hub kill --rm`, its workspace deleted) detaches with "Session removed." and why -- nothing to relaunch. Themes: auto (follows the OS), dark, light; the light theme lifts low-contrast agent TUI colours to 4.5:1.
 
 | Key | |
 |---|---|

@@ -1083,16 +1083,35 @@ async fn repo_check_validates_a_single_path() {
         hub.repo.canonicalize().unwrap().to_str().unwrap()
     );
 
+    assert_eq!(ok["git"], true);
+
+    // A plain directory is a folder too, flagged as not a git repo.
     let plain = hub.repo.parent().unwrap().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     let not_git = check(plain.display().to_string()).await;
-    assert_eq!(not_git["ok"], false);
+    assert_eq!(not_git["ok"], true);
+    assert_eq!(not_git["git"], false);
+    let file = hub.repo.parent().unwrap().join("file");
+    std::fs::write(&file, "").unwrap();
+    let not_dir = check(file.display().to_string()).await;
+    assert_eq!(not_dir["ok"], false);
     assert!(
-        not_git["error"]
+        not_dir["error"]
             .as_str()
             .unwrap()
-            .contains("not a git work-tree root")
+            .contains("not a directory")
     );
+    // The folders spelling of the same check.
+    let folders = hub
+        .authed(reqwest::Method::GET, "/api/folders/check")
+        .query(&[("path", plain.display().to_string())])
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(folders["git"], false);
     assert_eq!(check("relative/path".into()).await["ok"], false);
     assert_eq!(check(String::new()).await["ok"], false);
 
@@ -1929,5 +1948,197 @@ async fn a_missing_directory_is_refused_not_replaced_by_home() {
     assert_eq!(sessions["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(sessions["sessions"][0]["state"], "exited");
     std::fs::rename(&moved, &hub.repo).unwrap();
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workspaces_hold_plain_folders_and_sessions_open_in_them() {
+    let hub = TestHub::start().await;
+    let plain = hub.repo.parent().unwrap().join("finances");
+    std::fs::create_dir_all(&plain).unwrap();
+    let plain = plain.canonicalize().unwrap();
+    let response = hub
+        .authed(reqwest::Method::POST, "/api/workspaces")
+        .json(&json!({ "name": "life", "folders": [
+            { "path": hub.repo, "name": "Code" },
+            plain,
+        ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let ws: Value = response.json().await.unwrap();
+    assert_eq!(ws["folders"][0]["name"], "Code");
+    assert_eq!(ws["folders"][0]["git"], true);
+    assert_eq!(ws["folders"][1]["git"], false);
+    assert!(ws["folders"][1].get("name").is_none());
+    // The legacy mirror lists every folder.
+    assert_eq!(ws["repos"][1], plain.to_str().unwrap());
+    let response = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": ws["id"], "folder": plain, "command": ["/bin/sh"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let session: Value = response.json().await.unwrap();
+    assert_eq!(session["cwd"], plain.to_str().unwrap());
+    // `git init` shows on the next listing.
+    std::fs::create_dir(plain.join(".git")).unwrap();
+    let listed: Value = hub
+        .authed(reqwest::Method::GET, "/api/workspaces")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["workspaces"][0]["folders"][1]["git"], true);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vscode_workspaces_import_list_and_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let code = root.join("code");
+    let repo = code.join("app");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let notes = root.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let files = code.join("workspaces");
+    std::fs::create_dir_all(&files).unwrap();
+    let file = files.join("personal.code-workspace");
+    std::fs::write(
+        &file,
+        r#"{
+        // JSONC, as VS Code writes it
+        "folders": [
+            {"name": "The App", "path": "../app"},
+            {"path": "../../notes"},
+            {"path": "../gone"},
+            {"uri": "vscode-remote://ssh-remote+box/srv"},
+        ],
+        "settings": {},
+    }"#,
+    )
+    .unwrap();
+    std::fs::write(files.join("broken.code-workspace"), "{").unwrap();
+    let hub = TestHub::start_with(dir, root.join("state"), repo.clone(), |options| {
+        options.import_root = Some(code.clone());
+    })
+    .await;
+
+    let import = |body: Value| {
+        let request = hub
+            .authed(reqwest::Method::POST, "/api/workspaces/import")
+            .json(&body);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+    let (status, report) = import(json!({ "path": file })).await;
+    assert_eq!(status, StatusCode::CREATED, "{report}");
+    assert_eq!(report["created"], true);
+    let ws = &report["workspace"];
+    assert_eq!(ws["name"], "personal");
+    let folders = ws["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 2);
+    assert_eq!(folders[0]["path"], repo.to_str().unwrap());
+    assert_eq!(folders[0]["name"], "The App");
+    assert_eq!(folders[0]["git"], true);
+    assert_eq!(folders[1]["path"], notes.to_str().unwrap());
+    assert_eq!(folders[1]["git"], false);
+    let skipped = report["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 2, "{report}");
+    assert_eq!(skipped[0]["entry"], "../gone");
+    assert_eq!(skipped[0]["reason"], "does not exist");
+    assert_eq!(skipped[0]["path"], code.join("gone").to_str().unwrap());
+    assert!(
+        skipped[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ssh-remote+box")
+    );
+
+    // Again: refused without update.
+    let (status, again) = import(json!({ "path": file })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+
+    // The picker lists both files, the importable one with its workspace.
+    let listed: Value = hub
+        .authed(reqwest::Method::GET, "/api/code-workspaces")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["root"], code.to_str().unwrap());
+    let found = listed["files"].as_array().unwrap();
+    assert_eq!(found.len(), 2, "{listed}");
+    assert_eq!(found[0]["name"], "broken");
+    assert!(found[0]["error"].as_str().unwrap().contains("invalid JSON"));
+    assert_eq!(found[1]["path"], file.to_str().unwrap());
+    assert_eq!(found[1]["folders"], 3);
+    assert_eq!(found[1]["skipped"], 1);
+    assert_eq!(found[1]["workspace_id"], ws["id"]);
+    let elsewhere = hub
+        .authed(reqwest::Method::GET, "/api/code-workspaces")
+        .query(&[("root", "relative/dir")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.status(), StatusCode::BAD_REQUEST);
+
+    // Update replaces the folders -- but not out from under a running
+    // session.
+    let session: Value = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": ws["id"], "repo": notes, "command": ["/bin/sh"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    std::fs::write(&file, r#"{"folders": [{"path": "../app"}]}"#).unwrap();
+    let (status, refused) = import(json!({ "path": file, "update": true })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(refused["error"].as_str().unwrap().contains("kill it first"));
+    let killed = hub
+        .authed(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}", session["id"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(killed.status(), StatusCode::NO_CONTENT);
+    let (status, updated) = import(json!({ "path": file, "update": true })).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["created"], false);
+    assert_eq!(updated["workspace"]["id"], ws["id"]);
+    let folders = updated["workspace"]["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert!(
+        folders[0].get("name").is_none(),
+        "label dropped with the file's"
+    );
+
+    // A file with nothing importable, and a relative path, are 400s.
+    std::fs::write(&file, r#"{"folders": [{"path": "../gone"}]}"#).unwrap();
+    let (status, none) = import(json!({ "path": file, "name": "other" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        none["error"]
+            .as_str()
+            .unwrap()
+            .contains("no folder to import")
+    );
+    let (status, _) = import(json!({ "path": "personal.code-workspace" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     hub.shutdown().await;
 }

@@ -335,6 +335,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .ws-repos span { white-space: nowrap; }
 .ws-repos span::before { content: "\2514\2500 "; color: var(--rule-2); }
+/* A plain folder (no git): repo-only features do not apply. */
+.ws-repos span.plain { font-style: italic; opacity: .85; }
+.ws-repos span.plain::before { content: "\2514\2504 "; }
 
 .sessions { list-style: none; margin: 0; padding: 0; }
 
@@ -1049,6 +1052,120 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 }
 
 .repo-row[data-state="bad"] .note { color: var(--alert); }
+
+/* folder kind tags (git / plain dir / skipped) */
+.folder-tag {
+  display: inline-block;
+  margin-left: .45rem;
+  padding: 0 .3rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  font: 500 8.5px/1.5 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  vertical-align: 1px;
+}
+.folder-tag.git { color: var(--brass); border-color: color-mix(in srgb, var(--brass) 45%, transparent); }
+.folder-tag.bad { color: var(--alert); border-color: color-mix(in srgb, var(--alert) 45%, transparent); }
+
+/* --- import VS Code workspace (new-workspace dialog) --- */
+.ws-import {
+  margin: 0 -1.4rem;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-2);
+}
+.ws-import[hidden] { display: none; }
+.import-toggle {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  width: 100%;
+  padding: .7rem 1.4rem;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: 600 11.5px var(--mono);
+  letter-spacing: .04em;
+  text-align: left;
+}
+.import-toggle svg { width: .85rem; height: .85rem; color: var(--signal); }
+.import-toggle .chev { margin-left: auto; color: var(--ink-3); transition: transform .2s var(--ease); }
+.import-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.import-toggle:hover { background: var(--bg-4); }
+.import-toggle:focus-visible { outline: 2px solid var(--signal); outline-offset: -2px; }
+.import-body { display: grid; gap: .8rem; padding: .3rem 1.4rem 1.05rem; }
+.import-body[hidden] { display: none; }
+.import-line { display: flex; gap: .45rem; }
+.import-line input { flex: 1; min-width: 0; font-family: var(--term) !important; font-stretch: normal !important; }
+.import-line .slab { flex: none; }
+.import-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: .35rem;
+  max-height: 15rem;
+  overflow: auto;
+}
+.import-files[hidden] { display: none; }
+.import-file {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: .65rem;
+  padding: .45rem .55rem .45rem .7rem;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--signal);
+  border-radius: 2px;
+  background: var(--bg-3);
+}
+.import-file.broken { border-left-color: var(--alert); opacity: .8; }
+.import-what { display: grid; gap: .1rem; min-width: 0; }
+.import-what b { font-weight: 600; font-size: 12.5px; }
+.import-what small {
+  font-size: 10px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.import-meta { font-size: 10px; color: var(--ink-2); letter-spacing: .03em; }
+.import-meta.bad { color: var(--alert); overflow-wrap: anywhere; }
+.import-what .import-exists { color: var(--brass); font-size: inherit; font-weight: 500; }
+.import-file .slab { padding: .35rem .75rem; font-size: 10px; }
+.import-empty { padding: .5rem 0; font-size: 11px; color: var(--ink-3); }
+.import-update { display: flex; align-items: center; gap: .45rem; font-size: 10.5px; color: var(--ink-2); }
+.import-update input { accent-color: var(--signal); margin: 0; }
+.import-report { display: grid; gap: .55rem; }
+.import-report[hidden] { display: none; }
+.import-headline { margin: 0; font-size: 12px; color: var(--ink-2); }
+.import-headline b { color: var(--ink); font-weight: 600; }
+.import-folders {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: .2rem;
+  max-height: 14rem;
+  overflow: auto;
+}
+.import-folders li {
+  display: grid;
+  grid-template-columns: 2.6rem auto 1fr;
+  align-items: baseline;
+  gap: .5rem;
+  font-size: 11.5px;
+}
+.import-folders li .folder-tag { margin: 0; text-align: center; }
+.import-folders small { font-size: 10px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-folders li.skipped small { color: var(--alert); white-space: normal; }
+.import-folders li.skipped { grid-template-columns: 2.6rem 1fr; }
+.import-folders li.skipped span:nth-child(2) { overflow-wrap: anywhere; }
+.import-folders li.skipped small { grid-column: 2; }
+.import-actions { display: flex; justify-content: space-between; align-items: center; }
 
 .form-error { margin: 0; min-height: 1em; color: var(--alert); font-size: 11px; }
 .form-error:empty { display: none; }

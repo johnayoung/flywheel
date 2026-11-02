@@ -1,6 +1,6 @@
-//! The hub's persisted model: workspaces (a name plus 1..N git repos) and
-//! session records, stored as one JSON document (`state.json`, mode 0600,
-//! written atomically) in the state dir.
+//! The hub's persisted model: workspaces (a name plus 1..N folders, git
+//! repos or plain directories) and session records, stored as one JSON
+//! document (`state.json`, mode 0600, written atomically) in the state dir.
 //!
 //! Processes belong to the running server, not to this file: a session
 //! recorded as `running` when the hub last stopped is loaded back as
@@ -22,16 +22,115 @@ pub const STATE_FILE: &str = "state.json";
 pub const STATE_VERSION: u32 = 1;
 /// Limits on workspace input.
 pub const MAX_NAME_CHARS: usize = 100;
-pub const MAX_REPOS: usize = 32;
+pub const MAX_FOLDERS: usize = 32;
 
-/// A named set of git repositories worked on together.
+/// One directory of a workspace: a git work-tree root or a plain folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Folder {
+    /// Canonical absolute path.
+    pub path: PathBuf,
+    /// Display label (a VS Code workspace folder's `name`); the UI shows
+    /// the directory's name when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether it is a git work-tree root (a `.git` dir, or a `.git` file
+    /// for linked worktrees). Not authoritative on disk: recomputed when
+    /// the state loads and whenever workspaces are listed. Repo-only
+    /// features (worktrees, branch badges) key off it.
+    #[serde(default)]
+    pub git: bool,
+}
+
+impl Folder {
+    /// A folder at canonical `path`, its git flag read from disk.
+    pub fn at(path: PathBuf, name: Option<String>) -> Self {
+        let git = is_git_root(&path);
+        Self { path, name, git }
+    }
+}
+
+/// A named set of folders (git repos or plain directories) worked on
+/// together.
+///
+/// Serialized with `folders` plus a legacy `repos` mirror (every folder's
+/// path, git or not), so readers of the old shape keep working; loads
+/// either (`folders` wins when both are present).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "WorkspaceRepr", into = "WorkspaceRepr")]
 pub struct Workspace {
     pub id: String,
     pub name: String,
-    /// Canonical absolute paths of git work-tree roots, in operator order.
-    pub repos: Vec<PathBuf>,
+    /// In operator order; never empty.
+    pub folders: Vec<Folder>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Workspace {
+    /// Whether `path` (canonical) is one of its folders.
+    pub fn has_folder(&self, path: &Path) -> bool {
+        self.folders.iter().any(|f| f.path == path)
+    }
+
+    /// The folder sessions open in by default.
+    pub fn first_folder(&self) -> &Path {
+        &self.folders[0].path
+    }
+
+    /// Re-read every folder's git flag from disk.
+    pub fn refresh_git(&mut self) {
+        for folder in &mut self.folders {
+            folder.git = is_git_root(&folder.path);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WorkspaceRepr {
+    id: String,
+    name: String,
+    #[serde(default)]
+    folders: Option<Vec<Folder>>,
+    /// Legacy: paths only (state files and API clients from before plain
+    /// folders). Written as a mirror of `folders`.
+    #[serde(default)]
+    repos: Option<Vec<PathBuf>>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<WorkspaceRepr> for Workspace {
+    fn from(repr: WorkspaceRepr) -> Self {
+        let folders = match (repr.folders, repr.repos) {
+            (Some(folders), _) => folders,
+            (None, Some(repos)) => repos
+                .into_iter()
+                .map(|path| Folder {
+                    path,
+                    name: None,
+                    git: false,
+                })
+                .collect(),
+            (None, None) => Vec::new(),
+        };
+        Self {
+            id: repr.id,
+            name: repr.name,
+            folders,
+            created_at: repr.created_at,
+        }
+    }
+}
+
+impl From<Workspace> for WorkspaceRepr {
+    fn from(workspace: Workspace) -> Self {
+        let repos = workspace.folders.iter().map(|f| f.path.clone()).collect();
+        Self {
+            id: workspace.id,
+            name: workspace.name,
+            folders: Some(workspace.folders),
+            repos: Some(repos),
+            created_at: workspace.created_at,
+        }
+    }
 }
 
 /// A session's lifecycle state.
@@ -145,11 +244,49 @@ pub enum StateError {
     Persist { path: PathBuf, message: String },
 }
 
-/// Workspace fields an operator supplies.
+/// A folder as an operator gives it: a path, or `{"path","name"?}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum FolderSpec {
+    Path(PathBuf),
+    Labeled {
+        path: PathBuf,
+        /// Display label. Absent: an updated workspace keeps the label the
+        /// folder already had; empty: no label.
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl FolderSpec {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Path(path) | Self::Labeled { path, .. } => path,
+        }
+    }
+}
+
+/// Workspace fields an operator supplies. `repos` is the legacy spelling
+/// of `folders` (paths only).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WorkspaceInput {
     pub name: Option<String>,
+    pub folders: Option<Vec<FolderSpec>>,
     pub repos: Option<Vec<PathBuf>>,
+}
+
+impl WorkspaceInput {
+    /// The folders given, under either spelling (not both).
+    fn folder_specs(&self) -> Result<Option<Vec<FolderSpec>>, StateError> {
+        match (&self.folders, &self.repos) {
+            (Some(_), Some(_)) => Err(StateError::Invalid(
+                "give folders or repos (its legacy name), not both".into(),
+            )),
+            (Some(folders), None) => Ok(Some(folders.clone())),
+            (None, Some(repos)) => Ok(Some(repos.iter().cloned().map(FolderSpec::Path).collect())),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 /// The persisted hub state.
@@ -182,6 +319,10 @@ impl HubStore {
                 "unsupported version {} (expected {STATE_VERSION})",
                 doc.version
             )));
+        }
+        // A folder may have become (or stopped being) a git repo since.
+        for workspace in &mut doc.workspaces {
+            workspace.refresh_git();
         }
         let now = Utc::now();
         let mut demoted = false;
@@ -238,15 +379,15 @@ impl HubStore {
             .ok_or_else(|| StateError::NotFound(format!("session {id}")))
     }
 
-    /// Create a workspace; `name` and at least one repo are required.
+    /// Create a workspace; `name` and at least one folder are required.
     pub fn create_workspace(&mut self, input: WorkspaceInput) -> Result<Workspace, StateError> {
         let name = validate_name(input.name.as_deref().unwrap_or(""))?;
         self.ensure_unique_name(&name, None)?;
-        let repos = validate_repos(&input.repos.unwrap_or_default())?;
+        let folders = validate_folders(&input.folder_specs()?.unwrap_or_default(), &[])?;
         let workspace = Workspace {
             id: new_id(),
             name,
-            repos,
+            folders,
             created_at: Utc::now(),
         };
         self.doc.workspaces.push(workspace.clone());
@@ -256,7 +397,13 @@ impl HubStore {
         Ok(workspace)
     }
 
-    /// Rename a workspace and/or replace its repos.
+    /// The workspace named exactly `name`.
+    pub fn workspace_named(&self, name: &str) -> Option<&Workspace> {
+        self.doc.workspaces.iter().find(|w| w.name == name)
+    }
+
+    /// Rename a workspace and/or replace its folders (refused when that
+    /// drops a folder a running session is in).
     pub fn update_workspace(
         &mut self,
         id: &str,
@@ -267,15 +414,19 @@ impl HubStore {
         if let Some(name) = &name {
             self.ensure_unique_name(name, Some(id))?;
         }
-        let repos = input.repos.as_deref().map(validate_repos).transpose()?;
-        if let Some(repos) = &repos
-            && let Some(stranded) =
-                self.doc.sessions.iter().find(|s| {
-                    s.workspace_id == id && s.state.is_running() && !repos.contains(&s.cwd)
-                })
+        let folders = input
+            .folder_specs()?
+            .map(|specs| validate_folders(&specs, &self.doc.workspaces[index].folders))
+            .transpose()?;
+        if let Some(folders) = &folders
+            && let Some(stranded) = self.doc.sessions.iter().find(|s| {
+                s.workspace_id == id
+                    && s.state.is_running()
+                    && !folders.iter().any(|f| f.path == s.cwd)
+            })
         {
             return Err(StateError::Conflict(format!(
-                "session {:?} is running in {}, which the new repo list drops; kill it first",
+                "session {:?} is running in {}, which the new folder list drops; kill it first",
                 stranded.name,
                 stranded.cwd.display()
             )));
@@ -285,12 +436,37 @@ impl HubStore {
         if let Some(name) = name {
             workspace.name = name;
         }
-        if let Some(repos) = repos {
-            workspace.repos = repos;
+        if let Some(folders) = folders {
+            workspace.folders = folders;
         }
         let updated = workspace.clone();
         self.save_or_rollback(|doc| doc.workspaces[index] = previous)?;
         Ok(updated)
+    }
+
+    /// Create workspace `name` with `folders`, or -- with `update` --
+    /// replace the folders of the one already so named (refused, like
+    /// [`Self::update_workspace`], when that drops a folder a running
+    /// session is in). Returns it and whether it was created.
+    pub fn import_workspace(
+        &mut self,
+        name: &str,
+        folders: Vec<FolderSpec>,
+        update: bool,
+    ) -> Result<(Workspace, bool), StateError> {
+        let name = validate_name(name)?;
+        let input = |name: Option<String>| WorkspaceInput {
+            name,
+            folders: Some(folders.clone()),
+            repos: None,
+        };
+        match self.workspace_named(&name).map(|w| w.id.clone()) {
+            Some(id) if update => Ok((self.update_workspace(&id, input(None))?, false)),
+            Some(_) => Err(StateError::Conflict(format!(
+                "a workspace named {name:?} already exists; import it with update to replace its folders"
+            ))),
+            None => Ok((self.create_workspace(input(Some(name)))?, true)),
+        }
     }
 
     /// Delete a workspace and its (non-running) session records, returning
@@ -594,57 +770,82 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Check one repo path (`~` expanded): canonical, an existing directory,
-/// and a git work-tree root (a `.git` dir, or a `.git` file for linked
-/// worktrees).
-pub fn validate_repo(raw: &Path) -> Result<PathBuf, StateError> {
+/// Whether `path` is a git work-tree root: a `.git` dir, or the `.git`
+/// file of a linked worktree.
+pub fn is_git_root(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+/// Check one folder path (`~` expanded): absolute, existing, a directory.
+/// Returns it canonical. Git repos and plain directories both qualify.
+pub fn validate_folder(raw: &Path) -> Result<PathBuf, StateError> {
     let path = expand_home(raw, home_dir().as_deref());
     if !path.is_absolute() {
         return Err(StateError::Invalid(format!(
-            "repo path {} must be absolute",
+            "folder path {} must be absolute",
             raw.display()
         )));
     }
     let canonical = path
         .canonicalize()
-        .map_err(|e| StateError::Invalid(format!("repo path {}: {e}", path.display())))?;
+        .map_err(|e| StateError::Invalid(format!("folder path {}: {e}", path.display())))?;
     if !canonical.is_dir() {
         return Err(StateError::Invalid(format!(
-            "repo path {} is not a directory",
-            canonical.display()
-        )));
-    }
-    if !canonical.join(".git").exists() {
-        return Err(StateError::Invalid(format!(
-            "repo path {} is not a git work-tree root (no .git)",
+            "folder path {} is not a directory",
             canonical.display()
         )));
     }
     Ok(canonical)
 }
 
-/// Canonicalize and check repo paths: 1..=MAX_REPOS paths passing
-/// [`validate_repo`], duplicates dropped.
-pub fn validate_repos(raw: &[PathBuf]) -> Result<Vec<PathBuf>, StateError> {
-    if raw.is_empty() {
+/// Validate a folder label: trimmed, bounded, no control characters;
+/// empty means none.
+fn validate_label(raw: &str) -> Result<Option<String>, StateError> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    validate_name(raw)
+        .map(Some)
+        .map_err(|e| StateError::Invalid(format!("folder label: {e}")))
+}
+
+/// Canonicalize and check folder specs: 1..=MAX_FOLDERS paths passing
+/// [`validate_folder`], duplicates dropped (the first keeps its place and
+/// label). A spec without a label keeps the one its path has in
+/// `previous` (the folders being replaced).
+pub fn validate_folders(
+    specs: &[FolderSpec],
+    previous: &[Folder],
+) -> Result<Vec<Folder>, StateError> {
+    if specs.is_empty() {
         return Err(StateError::Invalid(
-            "a workspace needs at least one repo".into(),
+            "a workspace needs at least one folder".into(),
         ));
     }
-    if raw.len() > MAX_REPOS {
+    if specs.len() > MAX_FOLDERS {
         return Err(StateError::Invalid(format!(
-            "a workspace holds at most {MAX_REPOS} repos"
+            "a workspace holds at most {MAX_FOLDERS} folders"
         )));
     }
     let mut seen = HashSet::new();
-    let mut repos = Vec::with_capacity(raw.len());
-    for path in raw {
-        let canonical = validate_repo(path)?;
-        if seen.insert(canonical.clone()) {
-            repos.push(canonical);
+    let mut folders = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let path = validate_folder(spec.path())?;
+        if !seen.insert(path.clone()) {
+            continue;
         }
+        let name = match spec {
+            FolderSpec::Labeled {
+                name: Some(name), ..
+            } => validate_label(name)?,
+            _ => previous
+                .iter()
+                .find(|f| f.path == path)
+                .and_then(|f| f.name.clone()),
+        };
+        folders.push(Folder::at(path, name));
     }
-    Ok(repos)
+    Ok(folders)
 }
 
 #[cfg(test)]
@@ -661,7 +862,12 @@ mod tests {
         WorkspaceInput {
             name: Some(name.into()),
             repos: Some(repos),
+            ..WorkspaceInput::default()
         }
+    }
+
+    fn paths(workspace: &Workspace) -> Vec<PathBuf> {
+        workspace.folders.iter().map(|f| f.path.clone()).collect()
     }
 
     fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
@@ -719,7 +925,7 @@ mod tests {
             .unwrap();
         assert_eq!(ws.name, "proj");
         assert_eq!(
-            ws.repos,
+            paths(&ws),
             vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
         );
         let renamed = store
@@ -727,11 +933,11 @@ mod tests {
                 &ws.id,
                 WorkspaceInput {
                     name: Some("renamed".into()),
-                    repos: None,
+                    ..WorkspaceInput::default()
                 },
             )
             .unwrap();
-        assert_eq!(renamed.repos.len(), 2);
+        assert_eq!(renamed.folders.len(), 2);
 
         let reopened = HubStore::open(dir.path()).unwrap();
         assert_eq!(reopened.workspaces(), std::slice::from_ref(&renamed));
@@ -750,8 +956,8 @@ mod tests {
     fn rejects_bad_workspace_input() {
         let dir = tempfile::tempdir().unwrap();
         let repo = git_repo(dir.path(), "r");
-        let plain = dir.path().join("plain");
-        fs::create_dir(&plain).unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
         let mut store = HubStore::open(dir.path()).unwrap();
         let invalid = |r: Result<Workspace, StateError>| matches!(r, Err(StateError::Invalid(_)));
         assert!(invalid(
@@ -761,10 +967,23 @@ mod tests {
         assert!(invalid(
             store.create_workspace(input("x", vec![PathBuf::from("rel")]))
         ));
-        assert!(invalid(store.create_workspace(input("x", vec![plain]))));
         assert!(invalid(
             store.create_workspace(input("x", vec![dir.path().join("missing")]))
         ));
+        assert!(invalid(store.create_workspace(input("x", vec![file]))));
+        assert!(invalid(store.create_workspace(WorkspaceInput {
+            name: Some("x".into()),
+            folders: Some(vec![FolderSpec::Path(repo.clone())]),
+            repos: Some(vec![repo.clone()]),
+        })));
+        assert!(invalid(store.create_workspace(WorkspaceInput {
+            name: Some("x".into()),
+            folders: Some(vec![FolderSpec::Labeled {
+                path: repo.clone(),
+                name: Some("a\tb".into()),
+            }]),
+            repos: None,
+        })));
         assert!(invalid(
             store.create_workspace(input("a\nb", vec![repo.clone()]))
         ));
@@ -783,7 +1002,9 @@ mod tests {
         let wt = dir.path().join("wt");
         fs::create_dir(&wt).unwrap();
         fs::write(wt.join(".git"), "gitdir: /elsewhere\n").unwrap();
-        assert_eq!(validate_repos(std::slice::from_ref(&wt)).unwrap().len(), 1);
+        assert!(is_git_root(&wt));
+        let folders = validate_folders(&[FolderSpec::Path(wt)], &[]).unwrap();
+        assert!(folders[0].git);
     }
 
     #[test]
@@ -828,19 +1049,153 @@ mod tests {
             .unwrap();
         store.insert_session(running_session(&ws.id, &a)).unwrap();
         let repos = |r: Vec<PathBuf>| WorkspaceInput {
-            name: None,
             repos: Some(r),
+            ..WorkspaceInput::default()
         };
         assert!(matches!(
             store.update_workspace(&ws.id, repos(vec![b.clone()])),
             Err(StateError::Conflict(_))
         ));
-        assert_eq!(store.workspace(&ws.id).unwrap().repos.len(), 2);
+        assert_eq!(store.workspace(&ws.id).unwrap().folders.len(), 2);
         // Dropping a repo no running session uses is fine.
         let updated = store
             .update_workspace(&ws.id, repos(vec![a.clone()]))
             .unwrap();
-        assert_eq!(updated.repos, vec![a]);
+        assert_eq!(paths(&updated), vec![a]);
+    }
+
+    #[test]
+    fn plain_directories_are_folders_flagged_not_git_and_rechecked_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "repo").canonicalize().unwrap();
+        let plain = dir.path().join("notes");
+        fs::create_dir(&plain).unwrap();
+        let plain = plain.canonicalize().unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(WorkspaceInput {
+                name: Some("life".into()),
+                folders: Some(vec![
+                    FolderSpec::Labeled {
+                        path: repo.clone(),
+                        name: Some(" Main ".into()),
+                    },
+                    FolderSpec::Path(plain.clone()),
+                ]),
+                repos: None,
+            })
+            .unwrap();
+        assert_eq!(
+            ws.folders,
+            vec![
+                Folder {
+                    path: repo.clone(),
+                    name: Some("Main".into()),
+                    git: true
+                },
+                Folder {
+                    path: plain.clone(),
+                    name: None,
+                    git: false
+                },
+            ]
+        );
+        // Persisted with a legacy `repos` mirror of every folder.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            raw["workspaces"][0]["repos"],
+            serde_json::json!([repo, plain])
+        );
+        // The flag follows the disk on the next load.
+        fs::create_dir(plain.join(".git")).unwrap();
+        let reopened = HubStore::open(dir.path()).unwrap();
+        assert!(reopened.workspaces()[0].folders.iter().all(|f| f.git));
+        // An update that names a path without a label keeps its label;
+        // an empty label clears it.
+        let mut store = reopened;
+        let kept = store
+            .update_workspace(
+                &ws.id,
+                WorkspaceInput {
+                    folders: Some(vec![FolderSpec::Path(repo.clone())]),
+                    ..WorkspaceInput::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(kept.folders[0].name.as_deref(), Some("Main"));
+        let cleared = store
+            .update_workspace(
+                &ws.id,
+                WorkspaceInput {
+                    folders: Some(vec![FolderSpec::Labeled {
+                        path: repo.clone(),
+                        name: Some(String::new()),
+                    }]),
+                    ..WorkspaceInput::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.folders[0].name, None);
+    }
+
+    #[test]
+    fn a_legacy_repos_state_file_loads_as_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r").canonicalize().unwrap();
+        let legacy = serde_json::json!({
+            "version": 1,
+            "workspaces": [{
+                "id": "w1",
+                "name": "old",
+                "repos": [repo],
+                "created_at": "2026-10-01T00:00:00Z"
+            }],
+            "sessions": []
+        });
+        fs::write(
+            dir.path().join(STATE_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let store = HubStore::open(dir.path()).unwrap();
+        let ws = &store.workspaces()[0];
+        assert_eq!(ws.folders.len(), 1);
+        assert_eq!(ws.folders[0].path, repo);
+        assert!(ws.folders[0].git, "recomputed on load");
+        assert!(ws.has_folder(&repo));
+    }
+
+    #[test]
+    fn import_creates_or_with_update_replaces_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = git_repo(dir.path(), "a").canonicalize().unwrap();
+        let b = git_repo(dir.path(), "b").canonicalize().unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let (ws, created) = store
+            .import_workspace("proj", vec![FolderSpec::Path(a.clone())], false)
+            .unwrap();
+        assert!(created);
+        assert!(matches!(
+            store.import_workspace("proj", vec![FolderSpec::Path(b.clone())], false),
+            Err(StateError::Conflict(_))
+        ));
+        store.insert_session(running_session(&ws.id, &a)).unwrap();
+        // Update may not drop the folder a running session is in.
+        assert!(matches!(
+            store.import_workspace("proj", vec![FolderSpec::Path(b.clone())], true),
+            Err(StateError::Conflict(_))
+        ));
+        let (updated, created) = store
+            .import_workspace(
+                "proj",
+                vec![FolderSpec::Path(a.clone()), FolderSpec::Path(b.clone())],
+                true,
+            )
+            .unwrap();
+        assert!(!created);
+        assert_eq!(updated.id, ws.id);
+        assert_eq!(paths(&updated), vec![a, b]);
     }
 
     #[test]
@@ -1179,18 +1534,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_repo_explains_each_failure() {
+    fn validate_folder_explains_each_failure() {
         let dir = tempfile::tempdir().unwrap();
         let repo = git_repo(dir.path(), "r");
         let file = dir.path().join("file");
         fs::write(&file, "").unwrap();
         let plain = dir.path().join("plain");
         fs::create_dir(&plain).unwrap();
-        assert_eq!(validate_repo(&repo).unwrap(), repo.canonicalize().unwrap());
-        let message = |p: &Path| validate_repo(p).unwrap_err().to_string();
+        assert_eq!(
+            validate_folder(&repo).unwrap(),
+            repo.canonicalize().unwrap()
+        );
+        // Plain directories are folders too.
+        assert_eq!(
+            validate_folder(&plain).unwrap(),
+            plain.canonicalize().unwrap()
+        );
+        assert!(!is_git_root(&plain));
+        let message = |p: &Path| validate_folder(p).unwrap_err().to_string();
         assert!(message(Path::new("rel/x")).contains("must be absolute"));
         assert!(message(&dir.path().join("missing")).contains("missing"));
         assert!(message(&file).contains("not a directory"));
-        assert!(message(&plain).contains("not a git work-tree root"));
     }
 }

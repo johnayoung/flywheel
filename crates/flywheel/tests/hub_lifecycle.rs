@@ -652,3 +652,149 @@ fn install_service_prints_a_unit_running_serve() {
     assert_eq!(second.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&second.stderr).contains("already exists"));
 }
+
+#[test]
+fn import_vscode_workspaces_and_open_a_signed_in_browser() {
+    let env = Env::new();
+    let app = env.repo("code/app");
+    let notes = env.root.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let files = env.root.join("code/workspaces");
+    std::fs::create_dir_all(&files).unwrap();
+    let life = files.join("life.code-workspace");
+    std::fs::write(
+        &life,
+        r#"{
+        "folders": [
+            {"name": "App", "path": "../app"}, // a repo
+            {"path": "../../notes"},           /* a plain folder */
+            {"path": "../missing"},
+        ],
+    }"#,
+    )
+    .unwrap();
+    let team = files.join("team.code-workspace");
+    std::fs::write(&team, r#"{"folders": [{"path": "~/code/app"}]}"#).unwrap();
+    env.ok(&["start", "--port", "0"]);
+
+    let output = env.fw(&["import", life.to_str().unwrap(), team.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("created workspace \"life\"")
+            && stdout.contains("created workspace \"team\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("git     {}  (App)", app.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("folder  {}", notes.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("skipped ../missing -> ") && stdout.contains(": does not exist"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("1 of 3 folders not imported"), "{stderr}");
+
+    // An existing name needs --update, which replaces the folders.
+    let again = env.fw(&["import", life.to_str().unwrap()]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+    let updated = env.ok(&["import", life.to_str().unwrap(), "--update"]);
+    assert!(updated.contains("updated workspace \"life\""), "{updated}");
+    let named = env.ok(&["import", team.to_str().unwrap(), "--name", "team two"]);
+    assert!(named.contains("created workspace \"team two\""), "{named}");
+    let both = env.fw(&[
+        "import",
+        "--name",
+        "x",
+        life.to_str().unwrap(),
+        team.to_str().unwrap(),
+    ]);
+    assert_eq!(both.status.code(), Some(1));
+    let ls = env.ok(&["ls"]);
+    assert!(
+        ls.contains(&format!("{} (no git)", notes.display())),
+        "{ls}"
+    );
+
+    // Sessions open in a plain folder by its path.
+    let session = env
+        .ok(&[
+            "new",
+            "life",
+            "--folder",
+            notes.to_str().unwrap(),
+            "--name",
+            "s",
+        ])
+        .trim()
+        .to_owned();
+
+    // `open` prints the URL and hands it to $BROWSER.
+    let opened = env.root.join("opened");
+    let browser = env.root.join("bin/record-browser");
+    std::fs::create_dir_all(browser.parent().unwrap()).unwrap();
+    std::fs::write(
+        &browser,
+        format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", opened.display()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = env
+        .command(&["open", "--session", "s"])
+        .env("BROWSER", &browser)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let url = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+    assert!(url.contains("/login?code="), "{url}");
+    assert!(url.ends_with(&format!("#session={session}")), "{url}");
+    assert_eq!(std::fs::read_to_string(&opened).unwrap(), url);
+
+    // The code signs a browser in (once).
+    let get = |url: &str| -> String {
+        use std::io::{Read, Write};
+        let rest = url.strip_prefix("http://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        let path = format!("/{}", path.split('#').next().unwrap());
+        let mut stream = std::net::TcpStream::connect(host).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    };
+    let first = get(&url);
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    assert!(
+        first.to_ascii_lowercase().contains("set-cookie: fw_hub_"),
+        "{first}"
+    );
+    assert!(!get(&url).starts_with("HTTP/1.1 200"));
+
+    // An unknown session is refused before anything opens.
+    let _ = std::fs::remove_file(&opened);
+    let output = env
+        .command(&["open", "--session", "nope"])
+        .env("BROWSER", &browser)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!opened.exists());
+}

@@ -45,6 +45,7 @@
 //! * Rotating the token closes it with code 4001 too.
 
 mod commands_api;
+mod import_api;
 
 use crate::auth::{
     FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
@@ -52,7 +53,7 @@ use crate::auth::{
 };
 use crate::hub::{CreateSession, Hub, HubError, HubEvent};
 use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
-use crate::state::{StateError, WorkspaceInput, validate_repo};
+use crate::state::{StateError, WorkspaceInput, is_git_root, validate_folder};
 use crate::vt::{DEFAULT_RECENT_LINES, SNAPSHOT_HISTORY_BYTES, TextSource, ViewerColors};
 use crate::web;
 use axum::body::Bytes;
@@ -146,7 +147,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
                 .delete(remove_session),
         )
         .route("/api/kinds", get(list_kinds))
-        .route("/api/repos/check", get(check_repo))
+        .route("/api/folders/check", get(check_folder))
+        // The pre-folders name of the same check.
+        .route("/api/repos/check", get(check_folder))
+        .route("/api/workspaces/import", post(import_api::import_workspace))
+        .route(
+            "/api/code-workspaces",
+            get(import_api::find_code_workspaces),
+        )
         .route("/api/sessions/{id}/kill", post(kill_session))
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
@@ -799,17 +807,25 @@ struct RepoQuery {
     path: Option<String>,
 }
 
-/// Validate one candidate repo path for the new-workspace form: always 200,
-/// `{"ok":true,"path":canonical}` or `{"ok":false,"error":...}` (a missing
-/// or blank `path` included).
-async fn check_repo(Query(query): Query<RepoQuery>) -> Response {
+/// Validate one candidate folder path for the workspace form: always 200,
+/// `{"ok":true,"path":canonical,"git":bool}` or `{"ok":false,"error":...}`
+/// (a missing or blank `path` included).
+async fn check_folder(Query(query): Query<RepoQuery>) -> Response {
     let Some(path) = query.path.filter(|p| !p.trim().is_empty()) else {
         return Json(json!({ "ok": false, "error": "path is required" })).into_response();
     };
     let raw = std::path::PathBuf::from(path.trim());
-    let result = tokio::task::spawn_blocking(move || validate_repo(&raw)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        validate_folder(&raw).map(|path| {
+            let git = is_git_root(&path);
+            (path, git)
+        })
+    })
+    .await;
     match result {
-        Ok(Ok(path)) => Json(json!({ "ok": true, "path": path })).into_response(),
+        Ok(Ok((path, git))) => {
+            Json(json!({ "ok": true, "path": path, "git": git })).into_response()
+        }
         Ok(Err(e)) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

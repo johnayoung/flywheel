@@ -12,16 +12,17 @@ use crate::remote::ServeLock;
 use crate::report::{self, Report, ReportError, ReportServer};
 use crate::restore::RestoreHow;
 use crate::state::{
-    HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput, new_id,
-    validate_name,
+    FolderSpec, HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput,
+    expand_home, new_id, validate_folder, validate_name,
 };
 use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusView};
 use crate::transcript::CommandBook;
+use crate::vscode;
 use crate::vt::{DEFAULT_SCROLLBACK_LINES, TextSource};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -66,6 +67,10 @@ pub struct HubOptions {
     /// Code's `--resume`, `codex resume`). Off: they come back as fresh
     /// shells (`fw hub serve --no-agent-resume`).
     pub agent_resume: bool,
+    /// Where the UI's "Import VS Code workspace" looks for
+    /// `*.code-workspace` files (to [`vscode::DEFAULT_SEARCH_DEPTH`]) when
+    /// the browser names no root. Defaults to `~/code`.
+    pub import_root: Option<PathBuf>,
 }
 
 impl HubOptions {
@@ -90,6 +95,9 @@ impl HubOptions {
                 std::env::var_os("HOME").as_deref(),
             ),
             agent_resume: true,
+            import_root: std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join("code")),
         }
     }
 }
@@ -118,11 +126,25 @@ pub enum HubError {
     },
 }
 
+/// What [`Hub::import_code_workspace`] did.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportReport {
+    pub workspace: Workspace,
+    /// Created (else an existing workspace's folders were replaced).
+    pub created: bool,
+    /// The workspace file, absolute.
+    pub file: PathBuf,
+    /// Entries not imported, with why.
+    pub skipped: Vec<vscode::Skipped>,
+}
+
 /// A request to open a session.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateSession {
     pub workspace_id: String,
-    /// One of the workspace's repos; defaults to the first.
+    /// One of the workspace's folders; defaults to the first. Also
+    /// accepted as `folder`.
+    #[serde(alias = "folder")]
     pub repo: Option<PathBuf>,
     pub name: Option<String>,
     /// Shell (the default) or an agent CLI.
@@ -387,6 +409,11 @@ impl Hub {
         &self.options.state_dir
     }
 
+    /// The default root the import picker searches.
+    pub fn import_root(&self) -> Option<&Path> {
+        self.options.import_root.as_deref()
+    }
+
     fn store(&self) -> MutexGuard<'_, HubStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -407,12 +434,20 @@ impl Hub {
 
     // --- workspaces ---------------------------------------------------------
 
+    /// Every workspace, each folder's git flag read from disk now (a
+    /// folder may have been `git init`ed or had its `.git` removed).
     pub fn workspaces(&self) -> Vec<Workspace> {
-        self.store().workspaces().to_vec()
+        let mut workspaces = self.store().workspaces().to_vec();
+        for workspace in &mut workspaces {
+            workspace.refresh_git();
+        }
+        workspaces
     }
 
     pub fn workspace(&self, id: &str) -> Result<Workspace, HubError> {
-        Ok(self.store().workspace(id)?.clone())
+        let mut workspace = self.store().workspace(id)?.clone();
+        workspace.refresh_git();
+        Ok(workspace)
     }
 
     pub fn create_workspace(&self, input: WorkspaceInput) -> Result<Workspace, HubError> {
@@ -425,6 +460,82 @@ impl Hub {
         let workspace = self.store().update_workspace(id, input)?;
         self.emit(HubEvent::Sessions);
         Ok(workspace)
+    }
+
+    /// Import a VS Code workspace file (`file`: absolute or `~/...`) as
+    /// workspace `name` (default: the file's name without
+    /// `.code-workspace`). Its existing folders become the workspace's,
+    /// labels kept; missing ones and entries naming no local directory are
+    /// reported, not imported. An existing same-named workspace is refused
+    /// unless `update`, which replaces its folders (refused when that drops
+    /// a running session's folder).
+    pub fn import_code_workspace(
+        &self,
+        file: &Path,
+        name: Option<&str>,
+        update: bool,
+    ) -> Result<ImportReport, HubError> {
+        let env = vscode::ResolveEnv::current();
+        let file = expand_home(file, env.home.as_deref());
+        if !file.is_absolute() {
+            return Err(StateError::Invalid(format!(
+                "workspace file {} must be an absolute path",
+                file.display()
+            ))
+            .into());
+        }
+        let parsed = vscode::read(&file, &env).map_err(StateError::Invalid)?;
+        let mut skipped = parsed.skipped;
+        let mut specs = Vec::new();
+        for folder in parsed.folders {
+            match validate_folder(&folder.path) {
+                Ok(path) => specs.push(FolderSpec::Labeled {
+                    path,
+                    // Explicit, so an update drops a label the file no
+                    // longer has.
+                    name: Some(folder.name.unwrap_or_default()),
+                }),
+                Err(_) if !folder.path.exists() => skipped.push(vscode::Skipped {
+                    index: folder.index,
+                    entry: folder.entry,
+                    path: Some(folder.path),
+                    reason: "does not exist".into(),
+                }),
+                Err(e) => skipped.push(vscode::Skipped {
+                    index: folder.index,
+                    entry: folder.entry,
+                    path: Some(folder.path),
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        skipped.sort_by_key(|s| s.index);
+        if specs.is_empty() {
+            let why = skipped
+                .iter()
+                .map(|s| format!("{}: {}", s.entry, s.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StateError::Invalid(format!(
+                "{} has no folder to import{}",
+                file.display(),
+                if why.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({why})")
+                }
+            ))
+            .into());
+        }
+        let name = name.map(str::to_owned).unwrap_or(parsed.name);
+        let (workspace, created) = self.store().import_workspace(&name, specs, update)?;
+        self.emit(HubEvent::Sessions);
+        Ok(ImportReport {
+            workspace,
+            created,
+            file,
+            skipped,
+        })
     }
 
     /// Delete a workspace (refused while any of its sessions runs) and
@@ -500,21 +611,21 @@ impl Hub {
         self.live().get(id).cloned()
     }
 
-    /// Spawn a session in one of a workspace's repos.
+    /// Spawn a session in one of a workspace's folders.
     pub fn create_session(
         self: &Arc<Self>,
         request: CreateSession,
     ) -> Result<SessionView, HubError> {
         let workspace = self.workspace(&request.workspace_id)?;
         let cwd = match &request.repo {
-            None => workspace.repos[0].clone(),
+            None => workspace.first_folder().to_path_buf(),
             Some(repo) => {
                 let canonical = repo
                     .canonicalize()
-                    .map_err(|e| StateError::Invalid(format!("repo {}: {e}", repo.display())))?;
-                if !workspace.repos.contains(&canonical) {
+                    .map_err(|e| StateError::Invalid(format!("folder {}: {e}", repo.display())))?;
+                if !workspace.has_folder(&canonical) {
                     return Err(StateError::Invalid(format!(
-                        "repo {} is not part of workspace {}",
+                        "folder {} is not part of workspace {}",
                         canonical.display(),
                         workspace.name
                     ))
@@ -932,9 +1043,9 @@ impl Hub {
             .into());
         }
         let workspace = store.workspace(&record.workspace_id)?;
-        if !workspace.repos.contains(&record.cwd) {
+        if !workspace.has_folder(&record.cwd) {
             return Err(StateError::Invalid(format!(
-                "repo {} is no longer part of workspace {}",
+                "folder {} is no longer part of workspace {}",
                 record.cwd.display(),
                 workspace.name
             ))
@@ -1059,9 +1170,9 @@ impl Hub {
         let workspace = store
             .workspace(&record.workspace_id)
             .map_err(|e| e.to_string())?;
-        if !workspace.repos.contains(&record.cwd) {
+        if !workspace.has_folder(&record.cwd) {
             return Err(format!(
-                "repo {} is no longer part of workspace {}",
+                "folder {} is no longer part of workspace {}",
                 record.cwd.display(),
                 workspace.name
             ));

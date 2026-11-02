@@ -95,6 +95,8 @@ pub struct SpawnSpec {
     pub cwd: PathBuf,
     /// Extra environment on top of the hub's own.
     pub env: Vec<(String, String)>,
+    /// Variables of the hub's own environment the child must not inherit.
+    pub env_remove: Vec<String>,
     pub cols: u16,
     pub rows: u16,
     /// Scrollback lines the emulator keeps (see [`crate::vt`]).
@@ -201,6 +203,9 @@ impl PtySession {
         cmd.cwd(&spec.cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for key in &spec.env_remove {
+            cmd.env_remove(key);
+        }
         for (key, value) in &spec.env {
             cmd.env(key, value);
         }
@@ -660,6 +665,7 @@ mod tests {
             argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
             cwd: std::env::temp_dir(),
             env: vec![("FW_HUB_TEST".into(), "marker-value".into())],
+            env_remove: Vec::new(),
             cols: 80,
             rows: 24,
             scrollback_lines: 1000,
@@ -695,6 +701,27 @@ mod tests {
         assert!(String::from_utf8_lossy(&att.replay).contains("out-marker-value"));
         assert!(att.exit.is_some());
         assert_eq!(session.write(b"ignored".to_vec()), WriteOutcome::Closed);
+    }
+
+    #[test]
+    fn removed_variables_are_not_inherited() {
+        // HOME is in every test environment worth the name.
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let (tx, rx) = std_mpsc::channel();
+        let mut spec = spec("echo home=[${HOME-unset}] marker=[$FW_HUB_TEST]");
+        spec.env_remove = vec!["HOME".into()];
+        let session = PtySession::spawn(spec, move |info| {
+            tx.send(info).unwrap();
+        })
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let replay = String::from_utf8_lossy(&session.attach().replay).into_owned();
+        assert!(
+            replay.contains("home=[unset] marker=[marker-value]"),
+            "{replay:?}"
+        );
     }
 
     #[test]

@@ -1,0 +1,568 @@
+//! Agent status: what each agent session is doing, as reported by its
+//! hooks (Claude Code), its turn-complete notifier (Codex), or a screen
+//! heuristic -- and whether each client has seen a finished turn yet.
+//!
+//! States (herdr's model):
+//!
+//! * `working` -- the agent is busy (a prompt was submitted, a tool runs).
+//! * `blocked` -- the agent waits on a person: a permission prompt or a
+//!   question.
+//! * `done` -- the agent finished a turn this client has not looked at.
+//! * `idle` -- finished and seen, or waiting for its first prompt.
+//! * `unknown` -- no signal yet, or the agent ended.
+//!
+//! `done` versus `idle` is per client: a turn that finishes while a client
+//! views the session is idle for that client at once; every other client
+//! sees `done` until it views the session. A session rolls up into its
+//! workspace as the most urgent of its sessions: blocked > working > done >
+//! idle > unknown.
+//!
+//! Agent reports are advisory UI state, never lifecycle state: they cannot
+//! start, stop, or change a session, only how it is drawn.
+
+use crate::auth::Token;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Longest status detail kept (characters).
+pub const MAX_DETAIL_CHARS: usize = 200;
+
+/// What an agent session is doing, as one client sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    Working,
+    Blocked,
+    Done,
+    Idle,
+    Unknown,
+}
+
+impl AgentStatus {
+    /// Urgency, for rollups: blocked > working > done > idle > unknown.
+    pub fn urgency(self) -> u8 {
+        match self {
+            Self::Blocked => 4,
+            Self::Working => 3,
+            Self::Done => 2,
+            Self::Idle => 1,
+            Self::Unknown => 0,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The most urgent of `statuses` (`None` when there are none).
+pub fn rollup(statuses: impl IntoIterator<Item = AgentStatus>) -> Option<AgentStatus> {
+    statuses.into_iter().max_by_key(|s| s.urgency())
+}
+
+/// A status change an agent (or the hub) reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// The agent waits for its first prompt (session start, `/clear`).
+    Ready,
+    /// The agent is busy.
+    Working,
+    /// The agent waits on a person.
+    Blocked,
+    /// The agent has waited for input a while: blocked if it was working
+    /// (a question mid-turn), otherwise nothing new (a finished turn).
+    AwaitingInput,
+    /// The agent finished a turn.
+    Done,
+    /// The agent ended (its session closed or its process exited).
+    Ended,
+    /// Screen heuristic: the agent shows it is busy.
+    Busy,
+    /// Screen heuristic: the busy indicator went quiet.
+    Quiet,
+}
+
+/// The status an entry holds before per-client `seen` is applied, and
+/// whether a heuristic (not a report) set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Raw {
+    status: AgentStatus,
+    heuristic: bool,
+}
+
+/// The transition `signal` causes from `raw`, if any.
+fn transition(raw: Raw, signal: Signal) -> Option<Raw> {
+    let reported = |status| {
+        Some(Raw {
+            status,
+            heuristic: false,
+        })
+    };
+    let next = match signal {
+        Signal::Ready => reported(AgentStatus::Idle),
+        Signal::Working => reported(AgentStatus::Working),
+        Signal::Blocked => reported(AgentStatus::Blocked),
+        Signal::AwaitingInput if raw.status == AgentStatus::Working => {
+            reported(AgentStatus::Blocked)
+        }
+        Signal::AwaitingInput => None,
+        Signal::Done => reported(AgentStatus::Done),
+        Signal::Ended => reported(AgentStatus::Unknown),
+        // A heuristic never overrides a reported working or blocked.
+        Signal::Busy => match raw.status {
+            AgentStatus::Working | AgentStatus::Blocked => None,
+            _ => Some(Raw {
+                status: AgentStatus::Working,
+                heuristic: true,
+            }),
+        },
+        // Quiet only undoes what the heuristic itself claimed: the agent
+        // may be finished or waiting, and nothing says which.
+        Signal::Quiet if raw.heuristic && raw.status == AgentStatus::Working => {
+            reported(AgentStatus::Unknown)
+        }
+        Signal::Quiet => None,
+    };
+    next.filter(|n| *n != raw)
+}
+
+/// One session's status as a client sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StatusView {
+    pub status: AgentStatus,
+    /// Why, when known (e.g. the permission the agent asked for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the status last changed.
+    pub since: DateTime<Utc>,
+}
+
+/// Who sees a status: one client, or "anyone" (the REST API, where a turn
+/// counts as seen once any client looked at it).
+#[derive(Debug, Clone, Copy)]
+pub enum Audience<'a> {
+    Client(&'a str),
+    Anyone,
+}
+
+/// The credentials and generation of one spawn of an agent session.
+#[derive(Debug, Clone)]
+pub struct SpawnKey {
+    /// Secret the session's hooks present (fresh per spawn).
+    pub secret: Token,
+    /// Increases per spawn of the session, so a relaunch ignores late
+    /// signals from the process it replaced.
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+struct Entry {
+    workspace_id: String,
+    raw: Raw,
+    detail: Option<String>,
+    since: DateTime<Utc>,
+    /// Clients that viewed the session since its last `done`.
+    seen_by: HashSet<String>,
+    key: SpawnKey,
+}
+
+impl Entry {
+    fn view(&self, audience: Audience<'_>) -> StatusView {
+        let seen = match audience {
+            Audience::Client(client) => self.seen_by.contains(client),
+            Audience::Anyone => !self.seen_by.is_empty(),
+        };
+        let status = match self.raw.status {
+            AgentStatus::Done if seen => AgentStatus::Idle,
+            other => other,
+        };
+        StatusView {
+            status,
+            detail: self.detail.clone(),
+            since: self.since,
+        }
+    }
+}
+
+/// A connected client and the session it is looking at.
+#[derive(Debug)]
+struct Viewer {
+    client: String,
+    session: Option<String>,
+}
+
+/// Every agent session's status plus which client views what.
+#[derive(Debug, Default)]
+pub struct StatusBoard {
+    entries: HashMap<String, Entry>,
+    viewers: HashMap<u64, Viewer>,
+    next_viewer: u64,
+    next_generation: u64,
+}
+
+/// Every session's status and every workspace's rollup, as one client
+/// sees them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Snapshot {
+    pub sessions: BTreeMap<String, StatusView>,
+    pub workspaces: BTreeMap<String, AgentStatus>,
+}
+
+impl StatusBoard {
+    /// Start tracking a (re)spawned agent session as `unknown`; returns
+    /// the spawn's key. A relaunch replaces the previous spawn's key.
+    pub fn track(&mut self, session_id: &str, workspace_id: &str) -> Result<SpawnKey, String> {
+        let secret = Token::generate().map_err(|e| e.to_string())?;
+        self.next_generation += 1;
+        let key = SpawnKey {
+            secret,
+            generation: self.next_generation,
+        };
+        self.entries.insert(
+            session_id.to_owned(),
+            Entry {
+                workspace_id: workspace_id.to_owned(),
+                raw: Raw {
+                    status: AgentStatus::Unknown,
+                    heuristic: false,
+                },
+                detail: None,
+                since: Utc::now(),
+                seen_by: HashSet::new(),
+                key: key.clone(),
+            },
+        );
+        Ok(key)
+    }
+
+    /// Stop tracking a removed session.
+    pub fn untrack(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+        for viewer in self.viewers.values_mut() {
+            if viewer.session.as_deref() == Some(session_id) {
+                viewer.session = None;
+            }
+        }
+    }
+
+    pub fn is_tracked(&self, session_id: &str) -> bool {
+        self.entries.contains_key(session_id)
+    }
+
+    /// Whether `secret` is the current spawn's secret for the session.
+    pub fn authenticate(&self, session_id: &str, secret: &str) -> Option<u64> {
+        let entry = self.entries.get(session_id)?;
+        entry
+            .key
+            .secret
+            .matches(secret)
+            .then_some(entry.key.generation)
+    }
+
+    /// Apply `signal` from spawn `generation` of a session. Returns whether
+    /// anything changed. Signals from a replaced spawn are ignored.
+    pub fn apply(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        signal: Signal,
+        detail: Option<&str>,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else {
+            return false;
+        };
+        if entry.key.generation != generation {
+            return false;
+        }
+        let Some(next) = transition(entry.raw, signal) else {
+            return false;
+        };
+        entry.raw = next;
+        entry.since = Utc::now();
+        entry.detail = match next.status {
+            AgentStatus::Blocked => detail.map(bounded_detail),
+            _ => None,
+        };
+        if next.status == AgentStatus::Done {
+            // A turn finished: unseen by everyone except whoever is
+            // looking at it right now.
+            entry.seen_by = self
+                .viewers
+                .values()
+                .filter(|v| v.session.as_deref() == Some(session_id))
+                .map(|v| v.client.clone())
+                .collect();
+        }
+        true
+    }
+
+    /// Register a client connection; returns its viewer id.
+    pub fn connect(&mut self, client: &str) -> u64 {
+        self.next_viewer += 1;
+        self.viewers.insert(
+            self.next_viewer,
+            Viewer {
+                client: client.to_owned(),
+                session: None,
+            },
+        );
+        self.next_viewer
+    }
+
+    pub fn disconnect(&mut self, viewer: u64) {
+        self.viewers.remove(&viewer);
+    }
+
+    /// Record what a connection is looking at (`None`: nothing, or the
+    /// page is hidden). Returns whether a finished turn became seen.
+    pub fn view(&mut self, viewer: u64, session_id: Option<&str>) -> bool {
+        let Some(v) = self.viewers.get_mut(&viewer) else {
+            return false;
+        };
+        v.session = session_id
+            .filter(|id| self.entries.contains_key(*id))
+            .map(str::to_owned);
+        let client = v.client.clone();
+        match session_id.and_then(|id| self.entries.get_mut(id)) {
+            Some(entry) if entry.raw.status == AgentStatus::Done => entry.seen_by.insert(client),
+            _ => false,
+        }
+    }
+
+    /// One session's status for `audience`.
+    pub fn status(&self, session_id: &str, audience: Audience<'_>) -> Option<StatusView> {
+        self.entries.get(session_id).map(|e| e.view(audience))
+    }
+
+    /// The workspace a tracked session belongs to.
+    pub fn workspace_of(&self, session_id: &str) -> Option<&str> {
+        self.entries
+            .get(session_id)
+            .map(|e| e.workspace_id.as_str())
+    }
+
+    /// A workspace's rollup for `audience` (`None` without agent sessions).
+    pub fn workspace_status(
+        &self,
+        workspace_id: &str,
+        audience: Audience<'_>,
+    ) -> Option<AgentStatus> {
+        rollup(
+            self.entries
+                .values()
+                .filter(|e| e.workspace_id == workspace_id)
+                .map(|e| e.view(audience).status),
+        )
+    }
+
+    /// Everything, for `audience`.
+    pub fn snapshot(&self, audience: Audience<'_>) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        for (id, entry) in &self.entries {
+            let view = entry.view(audience);
+            let rolled = snapshot
+                .workspaces
+                .entry(entry.workspace_id.clone())
+                .or_insert(view.status);
+            if view.status.urgency() > rolled.urgency() {
+                *rolled = view.status;
+            }
+            snapshot.sessions.insert(id.clone(), view);
+        }
+        snapshot
+    }
+}
+
+/// Trim, flatten whitespace, and bound a detail string.
+fn bounded_detail(raw: &str) -> String {
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_DETAIL_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(MAX_DETAIL_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn board_with(session: &str, workspace: &str) -> (StatusBoard, u64) {
+        let mut board = StatusBoard::default();
+        let key = board.track(session, workspace).unwrap();
+        (board, key.generation)
+    }
+
+    fn status(board: &StatusBoard, session: &str, client: &str) -> AgentStatus {
+        board
+            .status(session, Audience::Client(client))
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn reported_signals_drive_the_claude_cycle() {
+        let (mut board, g) = board_with("s", "w");
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Unknown);
+        assert!(board.apply("s", g, Signal::Ready, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
+        assert!(board.apply("s", g, Signal::Working, None));
+        // A repeat is not a change.
+        assert!(!board.apply("s", g, Signal::Working, None));
+        assert!(board.apply(
+            "s",
+            g,
+            Signal::Blocked,
+            Some("  Claude needs\n your permission ")
+        ));
+        let view = board.status("s", Audience::Anyone).unwrap();
+        assert_eq!(view.status, AgentStatus::Blocked);
+        assert_eq!(view.detail.as_deref(), Some("Claude needs your permission"));
+        assert!(board.apply("s", g, Signal::Working, None));
+        assert_eq!(board.status("s", Audience::Anyone).unwrap().detail, None);
+        assert!(board.apply("s", g, Signal::Done, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
+        assert!(board.apply("s", g, Signal::Ended, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Unknown);
+    }
+
+    #[test]
+    fn awaiting_input_blocks_only_a_working_agent() {
+        let (mut board, g) = board_with("s", "w");
+        board.apply("s", g, Signal::Done, None);
+        assert!(!board.apply("s", g, Signal::AwaitingInput, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
+        board.apply("s", g, Signal::Working, None);
+        assert!(board.apply("s", g, Signal::AwaitingInput, Some("question")));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn heuristics_never_override_reports_and_quiet_only_undoes_busy() {
+        let (mut board, g) = board_with("s", "w");
+        assert!(board.apply("s", g, Signal::Busy, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Working);
+        assert!(board.apply("s", g, Signal::Quiet, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Unknown);
+
+        // Busy then a real report: Quiet no longer applies.
+        board.apply("s", g, Signal::Busy, None);
+        board.apply("s", g, Signal::Done, None);
+        assert!(!board.apply("s", g, Signal::Quiet, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
+        // Busy after done: the next turn started.
+        assert!(board.apply("s", g, Signal::Busy, None));
+        // A reported working stays put through quiet.
+        board.apply("s", g, Signal::Working, None);
+        assert!(!board.apply("s", g, Signal::Quiet, None));
+        board.apply("s", g, Signal::Blocked, None);
+        assert!(!board.apply("s", g, Signal::Busy, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn done_becomes_idle_per_client_on_view() {
+        let (mut board, g) = board_with("s", "w");
+        board.track("other", "w").unwrap();
+        let laptop = board.connect("laptop");
+        let phone = board.connect("phone");
+        board.apply("s", g, Signal::Working, None);
+        board.apply("s", g, Signal::Done, None);
+        assert_eq!(status(&board, "s", "laptop"), AgentStatus::Done);
+        assert_eq!(
+            board.status("s", Audience::Anyone).unwrap().status,
+            AgentStatus::Done
+        );
+        // Viewing something else does not count.
+        assert!(!board.view(laptop, Some("other")));
+        assert!(board.view(laptop, Some("s")));
+        assert_eq!(status(&board, "s", "laptop"), AgentStatus::Idle);
+        assert_eq!(status(&board, "s", "phone"), AgentStatus::Done);
+        assert_eq!(
+            board.status("s", Audience::Anyone).unwrap().status,
+            AgentStatus::Idle
+        );
+        // A turn that finishes while the laptop looks is idle for it at once.
+        board.apply("s", g, Signal::Working, None);
+        board.apply("s", g, Signal::Done, None);
+        assert_eq!(status(&board, "s", "laptop"), AgentStatus::Idle);
+        assert_eq!(status(&board, "s", "phone"), AgentStatus::Done);
+        // Once the laptop looks away, the next finished turn is unseen.
+        board.view(laptop, None);
+        board.apply("s", g, Signal::Working, None);
+        board.apply("s", g, Signal::Done, None);
+        assert_eq!(status(&board, "s", "laptop"), AgentStatus::Done);
+        board.disconnect(phone);
+        board.disconnect(laptop);
+        assert!(!board.view(laptop, Some("s")));
+    }
+
+    #[test]
+    fn rollups_pick_the_most_urgent_session() {
+        let mut board = StatusBoard::default();
+        let a = board.track("a", "w1").unwrap().generation;
+        let b = board.track("b", "w1").unwrap().generation;
+        let c = board.track("c", "w2").unwrap().generation;
+        board.apply("a", a, Signal::Done, None);
+        board.apply("b", b, Signal::Ready, None);
+        board.apply("c", c, Signal::Working, None);
+        let anyone = Audience::Anyone;
+        assert_eq!(
+            board.workspace_status("w1", anyone),
+            Some(AgentStatus::Done)
+        );
+        assert_eq!(
+            board.workspace_status("w2", anyone),
+            Some(AgentStatus::Working)
+        );
+        assert_eq!(board.workspace_status("w3", anyone), None);
+        board.apply("b", b, Signal::Blocked, None);
+        let snap = board.snapshot(anyone);
+        assert_eq!(snap.workspaces["w1"], AgentStatus::Blocked);
+        assert_eq!(snap.workspaces["w2"], AgentStatus::Working);
+        assert_eq!(snap.sessions.len(), 3);
+        assert_eq!(
+            rollup([AgentStatus::Idle, AgentStatus::Unknown, AgentStatus::Done]),
+            Some(AgentStatus::Done)
+        );
+        assert_eq!(rollup([]), None);
+        board.untrack("b");
+        assert_eq!(
+            board.workspace_status("w1", anyone),
+            Some(AgentStatus::Done)
+        );
+    }
+
+    #[test]
+    fn a_relaunch_ignores_the_old_spawn_and_rotates_the_secret() {
+        let mut board = StatusBoard::default();
+        let old = board.track("s", "w").unwrap();
+        assert_eq!(
+            board.authenticate("s", old.secret.expose()),
+            Some(old.generation)
+        );
+        assert_eq!(board.authenticate("s", "nope"), None);
+        assert_eq!(board.authenticate("missing", old.secret.expose()), None);
+        let new = board.track("s", "w").unwrap();
+        assert_ne!(old.secret.expose(), new.secret.expose());
+        assert_eq!(board.authenticate("s", old.secret.expose()), None);
+        assert!(!board.apply("s", old.generation, Signal::Working, None));
+        assert!(board.apply("s", new.generation, Signal::Working, None));
+    }
+
+    #[test]
+    fn details_are_bounded() {
+        let long = "x".repeat(500);
+        let out = bounded_detail(&long);
+        assert_eq!(out.chars().count(), MAX_DETAIL_CHARS);
+        assert!(out.ends_with('\u{2026}'));
+    }
+}

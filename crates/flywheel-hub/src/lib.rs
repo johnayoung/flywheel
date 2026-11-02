@@ -18,10 +18,12 @@ pub mod hub;
 pub mod paths;
 pub mod pty;
 pub mod remote;
+pub mod report;
 pub mod server;
 pub mod state;
+pub mod status;
 pub mod vt;
 pub mod web;
 
-pub use hub::{CreateSession, Hub, HubError, HubOptions, SessionView};
+pub use hub::{CreateSession, Hub, HubError, HubEvent, HubOptions, SessionView};
 pub use server::{ServerOptions, router, serve};

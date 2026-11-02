@@ -122,6 +122,15 @@ impl TestHub {
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 
+    async fn connect_events(&self, cookie: &str) -> Ws {
+        let url = format!("ws://{}/api/events?client=rotation-test", self.addr);
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
     /// Stop the server; the state dir lives as long as the returned guard.
     async fn shutdown(mut self) -> tempfile::TempDir {
         let _ = self.stop.take().unwrap().send(());
@@ -356,6 +365,7 @@ async fn rotating_the_token_signs_everyone_out_without_a_restart() {
     let old_cookie = cookie_pair(&login);
     let sid = hub.shell(&["/bin/sh"]).await;
     let mut ws = hub.connect(&sid, &old_cookie).await;
+    let mut events = hub.connect_events(&old_cookie).await;
     let pending_code = hub.mint().await;
 
     let rotated = hub
@@ -373,18 +383,20 @@ async fn rotating_the_token_signs_everyone_out_without_a_restart() {
         new
     );
 
-    // The open terminal connection is closed with 4001.
-    let close = loop {
-        match timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("closed in time")
-        {
-            Some(Ok(Message::Close(frame))) => break frame,
-            Some(Ok(_)) => {}
-            other => panic!("expected a close frame, got {other:?}"),
-        }
-    };
-    assert_eq!(u16::from(close.unwrap().code), 4001);
+    // The open terminal and events connections are closed with 4001.
+    for socket in [&mut ws, &mut events] {
+        let close = loop {
+            match timeout(Duration::from_secs(10), socket.next())
+                .await
+                .expect("closed in time")
+            {
+                Some(Ok(Message::Close(frame))) => break frame,
+                Some(Ok(_)) => {}
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        };
+        assert_eq!(u16::from(close.unwrap().code), 4001);
+    }
 
     // The old cookie, bearer, and code are dead; the new token works.
     for request in [
@@ -610,9 +622,12 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
     assert_eq!(code, 1);
     assert!(err.contains("no hub is running"), "{err}");
 
-    // `fw hub serve` holds the serve lock and records this; do it for the
-    // test server (this process is its pid).
-    let serve_lock = ServeLock::acquire(&hub.state_dir).unwrap().unwrap();
+    // The hub holds the serve lock; `fw hub serve` records this. Do it for
+    // the test server (this process is its pid).
+    assert!(
+        ServeLock::acquire(&hub.state_dir).unwrap().is_none(),
+        "the open hub holds the serve lock"
+    );
     RuntimeInfo {
         pid: std::process::id(),
         listen: hub.addr,
@@ -682,9 +697,19 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
     // gone) means no hub -- even when the recorded pid is alive again (here
     // this very process) and something listens at the recorded address
     // (here the hub, still up): nothing is sent there, rotation edits the
-    // file, and the stale file is removed.
-    drop(serve_lock);
-    let dead = hub.state_dir.clone();
+    // file, and the stale file is removed. The dead hub's state dir is a
+    // copy of the live one's token with no lock holder.
+    let dead_dir = tempfile::tempdir().unwrap();
+    let dead = dead_dir.path().join("state");
+    flywheel_hub::paths::ensure_private_dir(&dead).unwrap();
+    std::fs::copy(hub.state_dir.join("token"), dead.join("token")).unwrap();
+    RuntimeInfo {
+        pid: std::process::id(),
+        listen: hub.addr,
+        public_urls: Vec::new(),
+    }
+    .write(&dead)
+    .unwrap();
     let (code, _, err) = {
         let state = dead.to_str().unwrap().to_owned();
         tokio::task::spawn_blocking(move || cli(&["url", "--state-dir", &state]))

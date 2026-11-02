@@ -938,10 +938,18 @@ async fn agent_sessions_launch_their_cli_and_report_availability() {
     let mut ws = hub.connect(id, None, true).await.unwrap();
     let repo = hub.repo.canonicalize().unwrap();
     let (output, _) = read_until(&mut ws, &format!("session={id}")).await;
+    // The hub names the conversation; without a report command (library
+    // use) no hooks are injected.
+    let conversation = session["agent_session_id"].as_str().unwrap();
+    assert_eq!(conversation.len(), 36, "{session}");
     assert!(
-        output.contains(&format!("fake-claude in {} args=[]", repo.display())),
+        output.contains(&format!(
+            "fake-claude in {} args=[--session-id {conversation}]",
+            repo.display()
+        )),
         "{output:?}"
     );
+    assert_eq!(session["agent"]["status"], "unknown", "{session}");
     input(&mut ws, "ping-through-agent\r").await;
     read_until(&mut ws, "ping-through-agent").await;
 

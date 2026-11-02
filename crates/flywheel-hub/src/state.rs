@@ -66,6 +66,10 @@ pub struct SessionRecord {
     pub kind: SessionKind,
     pub cwd: PathBuf,
     pub command: Vec<String>,
+    /// The agent's own conversation id (Claude Code's `--session-id`,
+    /// Codex's thread id): the key to its transcript and to resuming it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     #[serde(flatten)]
     pub state: SessionState,
@@ -342,6 +346,29 @@ impl HubStore {
         Ok(self.doc.sessions[index].clone())
     }
 
+    /// Record the conversation id an agent reported (Claude Code moves to
+    /// a new one on `/clear`). Returns whether it changed.
+    pub fn set_agent_session_id(
+        &mut self,
+        id: &str,
+        agent_session_id: &str,
+    ) -> Result<bool, StateError> {
+        let index = self
+            .doc
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("session {id}")))?;
+        if self.doc.sessions[index].agent_session_id.as_deref() == Some(agent_session_id) {
+            return Ok(false);
+        }
+        let previous = self.doc.sessions[index]
+            .agent_session_id
+            .replace(agent_session_id.to_owned());
+        self.save_or_rollback(|doc| doc.sessions[index].agent_session_id = previous)?;
+        Ok(true)
+    }
+
     /// Forget a session record.
     pub fn remove_session(&mut self, id: &str) -> Result<(), StateError> {
         let index = self
@@ -506,9 +533,39 @@ mod tests {
             kind: SessionKind::Shell,
             cwd: cwd.into(),
             command: vec!["/bin/sh".into()],
+            agent_session_id: None,
             created_at: Utc::now(),
             state: SessionState::Running,
         }
+    }
+
+    #[test]
+    fn agent_session_ids_persist_and_are_omitted_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let session = running_session(&ws.id, &repo);
+        store.insert_session(session.clone()).unwrap();
+        let raw = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(!raw.contains("agent_session_id"), "{raw}");
+        assert!(store.set_agent_session_id(&session.id, "conv-1").unwrap());
+        assert!(!store.set_agent_session_id(&session.id, "conv-1").unwrap());
+        let reopened = HubStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .session(&session.id)
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("conv-1")
+        );
+        assert!(matches!(
+            store.set_agent_session_id("missing", "x"),
+            Err(StateError::NotFound(_))
+        ));
     }
 
     #[test]

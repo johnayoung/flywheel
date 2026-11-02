@@ -294,6 +294,24 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .ws-count b { color: var(--signal); font-weight: 600; }
 
+/* Workspace rollup: the most urgent agent status inside, readable even
+   with the workspace collapsed. */
+.ws-status {
+  flex: none;
+  padding: .06rem .32rem;
+  border-radius: 2px;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.ws-status.working { color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
+.ws-status.blocked { color: var(--signal-ink); background: var(--alert); animation: alarm 1.6s ease-in-out infinite; }
+.ws-status.done { color: var(--signal-ink); background: var(--brass); }
+
+@keyframes alarm { 50% { opacity: .6; } }
+
 /* Hidden tools must not take clicks: visibility, not just opacity. */
 .ws-tools { display: inline-flex; opacity: 0; visibility: hidden; transition: opacity .15s, visibility 0s .15s; }
 .workspace:hover .ws-tools, .workspace:focus-within .ws-tools { opacity: 1; visibility: visible; transition: opacity .15s; }
@@ -397,6 +415,20 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .session-state.bad { color: var(--alert); }
 .session-state.live { color: var(--signal); }
+.session-state.brass { color: var(--brass); font-weight: 700; }
+
+/* A blocked agent wants a person: an alert tick on the row's edge. */
+.session.needs-you::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 22%;
+  bottom: 22%;
+  width: 3px;
+  background: var(--alert);
+  animation: alarm 1.6s ease-in-out infinite;
+}
+.session.needs-you.active::before { background: var(--alert); }
 
 .session-actions { display: none; gap: 0; }
 .session:hover .session-actions, .session:focus-within .session-actions { display: inline-flex; }
@@ -438,6 +470,29 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   animation: ping 2.4s var(--ease) infinite;
 }
 .dot.done { background: var(--brass); }
+/* Agent statuses. Working: a signal dot with a sweeping arc. */
+.dot.working { background: var(--signal); }
+.dot.working::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  border-top-color: var(--signal);
+  border-right-color: var(--signal);
+  animation: sweep .9s linear infinite;
+}
+.dot.blocked { background: var(--alert); border-radius: 1px; transform: rotate(45deg) scale(.95); }
+.dot.agent-done { background: var(--brass); box-shadow: 0 0 0 2px var(--bg-2), 0 0 0 3.5px var(--brass); }
+.session:hover .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-3), 0 0 0 3.5px var(--brass); }
+.session.active .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-4), 0 0 0 3.5px var(--brass); }
+.dot.idle { background: transparent; border: 1.5px solid var(--ink-2); }
+
+@keyframes sweep { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .dot.working::after, .ws-status.blocked, .session.needs-you::after, .agent-pill.working::before { animation: none; }
+}
 .dot.bad { background: var(--alert); }
 .dot.stopped, .dot.gone { background: transparent; border: 1.5px solid var(--ink-3); }
 .dot.gone { border-style: dotted; }
@@ -637,6 +692,36 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .kind-tag.claude { color: var(--signal); }
 .kind-tag.codex { color: var(--brass); }
+
+/* The attached agent's status, beside its kind: a solid stamp. */
+.agent-pill {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .14rem .45rem .14rem .4rem;
+  border-radius: 2px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  background: var(--bg-4);
+  color: var(--ink-2);
+}
+.agent-pill::before {
+  content: "";
+  width: .42rem;
+  height: .42rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+.agent-pill.working { color: var(--signal); background: var(--signal-soft); }
+.agent-pill.working::before { animation: blink 1s steps(2, jump-none) infinite; }
+.agent-pill.blocked { color: var(--signal-ink); background: var(--alert); }
+.agent-pill.done { color: var(--signal-ink); background: var(--brass); }
+.agent-pill.idle::before { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+
+@keyframes blink { 50% { opacity: .25; } }
 
 .meters { display: flex; align-items: center; gap: .9rem; min-width: 0; }
 

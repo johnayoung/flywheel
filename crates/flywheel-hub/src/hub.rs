@@ -1,14 +1,19 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
-use crate::agent::{AgentPrograms, SessionKind, which};
+use crate::agent::{
+    self, AgentPrograms, CodexActivity, SessionKind, claude_signal, codex_signal, which,
+};
 use crate::auth::{LoginCodes, Logins, Token, TokenError, unix_now};
 use crate::paths::ensure_private_dir;
-use crate::pty::{ExitInfo, PtySession, SpawnError, SpawnSpec};
+use crate::pty::{ExitInfo, PtySession, SessionEvent, SpawnError, SpawnSpec};
+use crate::remote::ServeLock;
+use crate::report::{self, Report, ReportError, ReportServer};
 use crate::state::{
     HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput, new_id,
     validate_name,
 };
+use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusView};
 use crate::vt::DEFAULT_SCROLLBACK_LINES;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -16,9 +21,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 /// SIGHUP-to-SIGKILL grace when killing a session.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
+/// Hub-wide event broadcast depth; a subscriber further behind resyncs.
+const EVENT_DEPTH: usize = 256;
+/// How often the Codex activity monitor re-checks for quiet.
+const MONITOR_POLL: Duration = Duration::from_millis(100);
 /// Default terminal size for sessions created without one.
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 32;
@@ -35,6 +45,14 @@ pub struct HubOptions {
     /// Programs launched for agent sessions (names searched on `PATH`, or
     /// paths).
     pub agents: AgentPrograms,
+    /// argv prefix that reaches `fw hub` (e.g. `[/path/to/fw, hub]`); agent
+    /// hooks run it with `report ...`. `None` launches agents without
+    /// status hooks (their status stays unknown, bar the Codex heuristic).
+    pub report_command: Option<Vec<String>>,
+    /// Claude Code's config dir (where its transcripts live), for resuming
+    /// a relaunched conversation. Defaults to `$CLAUDE_CONFIG_DIR`, else
+    /// `~/.claude`.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 impl HubOptions {
@@ -49,6 +67,11 @@ impl HubOptions {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             default_shell: vec![shell],
             agents: AgentPrograms::default(),
+            report_command: None,
+            claude_config_dir: agent::claude_config_dir(
+                std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            ),
         }
     }
 }
@@ -62,8 +85,13 @@ pub enum HubError {
     Spawn(#[from] SpawnError),
     #[error(transparent)]
     Token(#[from] TokenError),
+    #[error(transparent)]
+    Report(#[from] ReportError),
     #[error("internal error: {0}")]
     Internal(String),
+    /// Another hub holds the state dir's serve lock.
+    #[error("another hub is already serving state dir {}", .0.display())]
+    InUse(PathBuf),
     #[error("state dir {path}: {source}")]
     StateDir {
         path: PathBuf,
@@ -96,6 +124,19 @@ pub struct SessionView {
     pub record: SessionRecord,
     /// Present while the server holds the session's PTY.
     pub live: Option<LiveView>,
+    /// An agent session's status (a finished turn counts as seen once any
+    /// client viewed it; the events socket gives each client its own).
+    pub agent: Option<StatusView>,
+}
+
+/// A hub-wide change, pushed to every events subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubEvent {
+    /// A session's agent status changed (re-read it per client).
+    Status { session_id: String },
+    /// Sessions or workspaces were created, removed, renamed, or changed
+    /// state: re-list them.
+    Sessions,
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -131,6 +172,14 @@ pub struct Hub {
     rotations: tokio::sync::watch::Sender<u64>,
     store: Mutex<HubStore>,
     live: Mutex<HashMap<String, Arc<PtySession>>>,
+    board: Mutex<StatusBoard>,
+    events: broadcast::Sender<HubEvent>,
+    report: Mutex<Option<ReportServer>>,
+    /// Sessions whose output an activity monitor subscribes to (session ->
+    /// spawn generation), so it is not counted as a client.
+    monitored: Mutex<HashMap<String, u64>>,
+    /// Held until the hub is dropped (see [`ServeLock`]).
+    _serve_lock: ServeLock,
 }
 
 impl std::fmt::Debug for Hub {
@@ -148,10 +197,23 @@ impl Hub {
             path: options.state_dir.clone(),
             source,
         })?;
+        // One hub per state dir, for the hub's whole life: a second would
+        // overwrite the first's runtime file and report socket.
+        let serve_lock = match ServeLock::acquire(&options.state_dir) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return Err(HubError::InUse(options.state_dir.clone())),
+            Err(source) => {
+                return Err(HubError::StateDir {
+                    path: options.state_dir.join(crate::remote::LOCK_FILE),
+                    source,
+                });
+            }
+        };
         let token = Token::load_or_create(&options.state_dir)?;
         let logins = Logins::load(&options.state_dir, unix_now());
         let store = HubStore::open(&options.state_dir)?;
-        Ok(Arc::new(Self {
+        let (events, _) = broadcast::channel(EVENT_DEPTH);
+        let hub = Arc::new(Self {
             options,
             token: RwLock::new(token),
             login_codes: Mutex::new(LoginCodes::default()),
@@ -159,7 +221,37 @@ impl Hub {
             rotations: tokio::sync::watch::Sender::new(0),
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
-        }))
+            board: Mutex::new(StatusBoard::default()),
+            events,
+            report: Mutex::new(None),
+            monitored: Mutex::new(HashMap::new()),
+            _serve_lock: serve_lock,
+        });
+        let weak = Arc::downgrade(&hub);
+        let server = ReportServer::bind(
+            &hub.options.state_dir,
+            Arc::new(move |report: Report| match weak.upgrade() {
+                Some(hub) => hub.handle_report(report),
+                None => Err("the hub is shutting down".into()),
+            }),
+        )?;
+        *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
+        Ok(hub)
+    }
+
+    /// The report socket agent sessions send status to.
+    pub fn report_socket(&self) -> PathBuf {
+        self.options.state_dir.join(report::SOCKET_FILE)
+    }
+
+    /// Hub-wide events (status changes, session list changes).
+    pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, event: HubEvent) {
+        // No subscribers is fine.
+        let _ = self.events.send(event);
     }
 
     /// The current token.
@@ -246,6 +338,16 @@ impl Hub {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn board(&self) -> MutexGuard<'_, StatusBoard> {
+        self.board.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn monitored(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.monitored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     // --- workspaces ---------------------------------------------------------
 
     pub fn workspaces(&self) -> Vec<Workspace> {
@@ -257,11 +359,15 @@ impl Hub {
     }
 
     pub fn create_workspace(&self, input: WorkspaceInput) -> Result<Workspace, HubError> {
-        Ok(self.store().create_workspace(input)?)
+        let workspace = self.store().create_workspace(input)?;
+        self.emit(HubEvent::Sessions);
+        Ok(workspace)
     }
 
     pub fn update_workspace(&self, id: &str, input: WorkspaceInput) -> Result<Workspace, HubError> {
-        Ok(self.store().update_workspace(id, input)?)
+        let workspace = self.store().update_workspace(id, input)?;
+        self.emit(HubEvent::Sessions);
+        Ok(workspace)
     }
 
     /// Delete a workspace (refused while any of its sessions runs) and
@@ -274,9 +380,16 @@ impl Hub {
             removed.iter().filter_map(|sid| live.remove(sid)).collect()
         };
         drop(store);
+        {
+            let mut board = self.board();
+            for sid in &removed {
+                board.untrack(sid);
+            }
+        }
         for session in freed {
             forget(&session);
         }
+        self.emit(HubEvent::Sessions);
         Ok(())
     }
 
@@ -300,17 +413,27 @@ impl Hub {
     }
 
     fn view(&self, record: SessionRecord) -> SessionView {
+        let monitors = usize::from(self.monitored().contains_key(&record.id));
         let live = self.live_session(&record.id).map(|s| {
             let (cols, rows) = s.size();
             LiveView {
                 pid: s.pid().filter(|_| s.exit_info().is_none()),
                 cols,
                 rows,
-                clients: s.subscriber_count(),
+                clients: s.subscriber_count().saturating_sub(monitors),
                 scrollback_lines: s.scrollback_lines(),
             }
         });
-        SessionView { record, live }
+        let agent = record
+            .kind
+            .is_agent()
+            .then(|| self.board().status(&record.id, Audience::Anyone))
+            .flatten();
+        SessionView {
+            record,
+            live,
+            agent,
+        }
     }
 
     /// The PTY (running, or exited with its scrollback) for a session this
@@ -369,6 +492,10 @@ impl Hub {
             kind: request.kind,
             cwd,
             command,
+            // Claude takes its conversation id from the hub, so its
+            // transcript and `--resume` are known from the start.
+            agent_session_id: (request.kind == SessionKind::Claude)
+                .then(|| uuid::Uuid::new_v4().hyphenated().to_string()),
             created_at: Utc::now(),
             state: SessionState::Running,
         };
@@ -377,20 +504,29 @@ impl Hub {
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let session = self.spawn_pty(&record, request.cols, request.rows)?;
+        let session = match self.spawn_pty(&record, request.cols, request.rows) {
+            Ok(session) => session,
+            Err(e) => {
+                self.board().untrack(&id);
+                return Err(e);
+            }
+        };
         if let Err(e) = store.insert_session(record.clone()) {
             drop(store);
+            self.board().untrack(&id);
             session.kill(Duration::ZERO);
             session.release();
             return Err(e.into());
         }
         self.live().insert(id, session);
         drop(store);
+        self.emit(HubEvent::Sessions);
         Ok(self.view(record))
     }
 
     /// Spawn the PTY for `record` (its argv, cwd, and id); its exit is
-    /// recorded against the id.
+    /// recorded against the id. An agent session also gets its launch
+    /// arguments, a fresh report secret, and a fresh `unknown` status.
     fn spawn_pty(
         self: &Arc<Self>,
         record: &SessionRecord,
@@ -399,24 +535,223 @@ impl Hub {
     ) -> Result<Arc<PtySession>, HubError> {
         let weak: Weak<Self> = Arc::downgrade(self);
         let exit_id = record.id.clone();
-        Ok(PtySession::spawn(
+        let mut argv = record.command.clone();
+        let mut env = vec![
+            (report::SESSION_ENV.to_owned(), record.id.clone()),
+            ("FLYWHEEL_HUB_WORKSPACE".into(), record.workspace_id.clone()),
+        ];
+        let mut generation = None;
+        if record.kind.is_agent() {
+            let key = self
+                .board()
+                .track(&record.id, &record.workspace_id)
+                .map_err(HubError::Internal)?;
+            generation = Some(key.generation);
+            let report = self.options.report_command.as_deref();
+            match record.kind {
+                SessionKind::Claude => {
+                    if let Some(conversation) = &record.agent_session_id {
+                        argv.extend(agent::claude_args(
+                            conversation,
+                            self.claude_transcript_exists(record, conversation),
+                            report,
+                        ));
+                    }
+                }
+                SessionKind::Codex => argv.extend(agent::codex_args(report)),
+                SessionKind::Shell => {}
+            }
+            env.push((
+                report::SOCKET_ENV.to_owned(),
+                self.report_socket().to_string_lossy().into_owned(),
+            ));
+            env.push((
+                report::SECRET_ENV.to_owned(),
+                key.secret.expose().to_owned(),
+            ));
+        }
+        let session = PtySession::spawn(
             SpawnSpec {
-                argv: record.command.clone(),
+                argv,
                 cwd: record.cwd.clone(),
-                env: vec![
-                    ("FLYWHEEL_HUB_SESSION".into(), record.id.clone()),
-                    ("FLYWHEEL_HUB_WORKSPACE".into(), record.workspace_id.clone()),
-                ],
+                env,
+                // Another hub's report channel (a hub run inside a hub
+                // session) and an enclosing agent's markers stay out.
+                env_remove: agent::INHERITED_AGENT_ENV
+                    .iter()
+                    .copied()
+                    .chain([report::SOCKET_ENV, report::SECRET_ENV])
+                    .map(str::to_owned)
+                    .collect(),
                 cols: cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
                 rows: rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
                 scrollback_lines: self.options.scrollback_lines,
             },
             move |exit| {
                 if let Some(hub) = weak.upgrade() {
-                    hub.on_session_exit(&exit_id, exit);
+                    hub.on_session_exit(&exit_id, generation, exit);
                 }
             },
-        )?)
+        )?;
+        if let (SessionKind::Codex, Some(generation)) = (record.kind, generation) {
+            self.monitor_codex(&record.id, generation, &session);
+        }
+        Ok(session)
+    }
+
+    /// Whether Claude Code already has a transcript for `conversation` (a
+    /// relaunch then resumes it; reusing `--session-id` would be refused).
+    fn claude_transcript_exists(&self, record: &SessionRecord, conversation: &str) -> bool {
+        self.options
+            .claude_config_dir
+            .as_deref()
+            .and_then(|dir| agent::claude_transcript(dir, &record.cwd, conversation))
+            .is_some()
+    }
+
+    /// Watch a Codex session's output for its busy indicator (Codex has no
+    /// "turn started" hook). Runs until the process exits or the PTY is
+    /// dropped.
+    fn monitor_codex(self: &Arc<Self>, id: &str, generation: u64, session: &Arc<PtySession>) {
+        // Screen-only snapshot: the monitor wants the live stream.
+        let mut events = session.attach_with(0).events;
+        let weak = Arc::downgrade(self);
+        let id = id.to_owned();
+        let thread_id = id.clone();
+        self.monitored().insert(id.clone(), generation);
+        let spawned = std::thread::Builder::new()
+            .name("hub-codex-monitor".into())
+            .spawn(move || {
+                let id = thread_id;
+                let mut activity = CodexActivity::default();
+                loop {
+                    let signal = match events.try_recv() {
+                        Ok(SessionEvent::Output(bytes)) => activity.feed(&bytes, Instant::now()),
+                        Ok(SessionEvent::Exit(_)) | Err(broadcast::error::TryRecvError::Closed) => {
+                            break;
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => None,
+                        Err(broadcast::error::TryRecvError::Empty) => {
+                            std::thread::sleep(MONITOR_POLL);
+                            activity.tick(Instant::now())
+                        }
+                    };
+                    let Some(hub) = weak.upgrade() else {
+                        break;
+                    };
+                    if let Some(signal) = signal {
+                        hub.apply_signal(&id, generation, signal, None);
+                    }
+                }
+                if let Some(hub) = weak.upgrade() {
+                    let mut monitored = hub.monitored();
+                    if monitored.get(&id) == Some(&generation) {
+                        monitored.remove(&id);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.monitored().remove(&id);
+        }
+    }
+
+    /// Apply a status signal; push the change if there was one.
+    fn apply_signal(&self, id: &str, generation: u64, signal: Signal, detail: Option<&str>) {
+        let changed = self.board().apply(id, generation, signal, detail);
+        if changed {
+            self.emit(HubEvent::Status {
+                session_id: id.to_owned(),
+            });
+        }
+    }
+
+    /// Handle one agent report from the report socket: authenticate it
+    /// against the spawn's secret, then apply what it means.
+    pub fn handle_report(&self, report: Report) -> Result<(), String> {
+        let (kind, conversation) = {
+            let store = self.store();
+            let record = store.session(&report.session).map_err(|e| e.to_string())?;
+            (record.kind, record.agent_session_id.clone())
+        };
+        if !kind.is_agent() || report.source != kind.as_str() {
+            return Err(format!(
+                "session {} is a {} session, not {}",
+                report.session,
+                kind.as_str(),
+                report.source
+            ));
+        }
+        let Some(generation) = self.board().authenticate(&report.session, &report.secret) else {
+            return Err(format!(
+                "report secret does not match session {}",
+                report.session
+            ));
+        };
+        let payload = report.payload.clone().unwrap_or(serde_json::Value::Null);
+        let (signal, detail) = match kind {
+            SessionKind::Claude => (
+                claude_signal(&report.event, report.detail.as_deref()),
+                agent::claude_detail(&report.event, &payload),
+            ),
+            SessionKind::Codex if report.event == "notify" => (codex_signal(&payload), None),
+            _ => (None, None),
+        };
+        if let Some(signal) = signal {
+            self.apply_signal(&report.session, generation, signal, detail.as_deref());
+        }
+        if let Some(reported) = agent::reported_conversation(kind, &payload)
+            && conversation.as_deref() != Some(reported.as_str())
+        {
+            let changed = self
+                .store()
+                .set_agent_session_id(&report.session, &reported)
+                .map_err(|e| e.to_string())?;
+            if changed {
+                self.emit(HubEvent::Sessions);
+            }
+        }
+        Ok(())
+    }
+
+    // --- per-client status views ---------------------------------------------
+
+    /// Register an events client (a browser, by its persistent client id).
+    pub fn connect_viewer(&self, client: &str) -> u64 {
+        self.board().connect(client)
+    }
+
+    pub fn disconnect_viewer(&self, viewer: u64) {
+        self.board().disconnect(viewer);
+    }
+
+    /// Record which session a client connection is looking at (`None`:
+    /// none, or the page is hidden). Viewing a finished turn marks it seen.
+    pub fn set_viewing(&self, viewer: u64, session_id: Option<&str>) {
+        let seen = self.board().view(viewer, session_id);
+        if let (true, Some(id)) = (seen, session_id) {
+            self.emit(HubEvent::Status {
+                session_id: id.to_owned(),
+            });
+        }
+    }
+
+    /// Every agent session's status and workspace rollup, for one client.
+    pub fn status_snapshot(&self, client: &str) -> Snapshot {
+        self.board().snapshot(Audience::Client(client))
+    }
+
+    /// One session's status and its workspace's rollup, for one client
+    /// (`None` once it is no longer tracked).
+    pub fn status_for(
+        &self,
+        client: &str,
+        session_id: &str,
+    ) -> Option<(StatusView, String, Option<AgentStatus>)> {
+        let board = self.board();
+        let view = board.status(session_id, Audience::Client(client))?;
+        let workspace = board.workspace_of(session_id)?.to_owned();
+        let rollup = board.workspace_status(&workspace, Audience::Client(client));
+        Some((view, workspace, rollup))
     }
 
     /// Relaunch an ended session in place: same id, name, kind, command,
@@ -466,6 +801,7 @@ impl Hub {
         if let Some(previous) = previous {
             forget(&previous);
         }
+        self.emit(HubEvent::Sessions);
         Ok(self.view(record))
     }
 
@@ -506,6 +842,7 @@ impl Hub {
     /// Rename a session.
     pub fn rename_session(&self, id: &str, name: &str) -> Result<SessionView, HubError> {
         let record = self.store().rename_session(id, name)?;
+        self.emit(HubEvent::Sessions);
         Ok(self.view(record))
     }
 
@@ -526,8 +863,12 @@ impl Hub {
 
     /// Record an exit. The exited PTY stays in the live map -- its
     /// scrollback remains attachable -- until the session is removed.
-    fn on_session_exit(&self, id: &str, exit: ExitInfo) {
+    fn on_session_exit(&self, id: &str, generation: Option<u64>, exit: ExitInfo) {
         let _ = self.store().mark_exited(id, exit);
+        if let Some(generation) = generation {
+            self.apply_signal(id, generation, Signal::Ended, None);
+        }
+        self.emit(HubEvent::Sessions);
     }
 
     /// Hang up a session's processes (SIGHUP, SIGKILL after
@@ -555,9 +896,11 @@ impl Hub {
         store.remove_session(id)?;
         let live = self.live().remove(id);
         drop(store);
+        self.board().untrack(id);
         if let Some(session) = live {
             forget(&session);
         }
+        self.emit(HubEvent::Sessions);
         Ok(())
     }
 
@@ -565,6 +908,14 @@ impl Hub {
     /// up to `timeout` for them to exit, and release their PTYs. (Stopped is
     /// recorded first: the hangup's own exit must not read as a crash.)
     pub fn shutdown(&self, timeout: Duration) {
+        if let Some(mut server) = self
+            .report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            server.stop();
+        }
         let _ = self.store().mark_all_stopped();
         let sessions: Vec<Arc<PtySession>> = self.live().drain().map(|(_, s)| s).collect();
         let grace = timeout / 2;

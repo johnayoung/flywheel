@@ -1,7 +1,8 @@
 // flywheel hub web client: workspaces > sessions in the sidebar, one
 // attached terminal, dialogs, a command palette, and keyboard shortcuts.
-// Plain JS, no build step. Talks to the hub's REST API and per-session
-// WebSocket (protocol: crates/flywheel-hub/src/server.rs).
+// Plain JS, no build step. Talks to the hub's REST API, the per-session
+// terminal WebSocket, and the hub-wide events WebSocket that pushes agent
+// status (protocol: crates/flywheel-hub/src/server.rs).
 "use strict";
 
 (function () {
@@ -106,7 +107,26 @@
     dropped: 0, // keystrokes typed while the link was down
     tick: null, // repaints the reconnect banner
     painted: false, // first sidebar paint done (entry animation plays once)
+    agent: {}, // session id -> {status, detail, since}, as this client sees it
+    rollup: {}, // workspace id -> most urgent agent status
+    events: null, // the hub-wide events socket
+    eventsRetry: 0,
+    eventsTimer: null,
+    poller: null, // REST polling, only while the events socket is down
+    viewing: undefined, // last view sent on the events socket
   };
+
+  // This browser's identity for seen-tracking: a finished agent turn is
+  // "done" until this browser has looked at it, then "idle".
+  const CLIENT_ID = (() => {
+    const kept = store.get("client", null);
+    if (typeof kept === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(kept)) return kept;
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    const id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    store.set("client", id);
+    return id;
+  })();
 
   const sessionById = (id) => state.sessions.find((s) => s.id === id);
   const workspaceById = (id) => state.workspaces.find((w) => w.id === id);
@@ -126,9 +146,29 @@
   // scrollback), in sidebar order: what Alt+1..9 and Alt+Up/Down reach.
   const attachable = () => orderedSessions().filter((s) => s.live);
 
+  // A running agent's status, as pushed for this client.
+  const AGENT_LOOK = {
+    working: { dot: "working", label: "working", tone: "live" },
+    blocked: { dot: "blocked", label: "blocked", tone: "bad" },
+    done: { dot: "agent-done", label: "done", tone: "brass" },
+    idle: { dot: "idle", label: "idle", tone: "" },
+  };
+
+  function agentStatus(session) {
+    if (session.kind === "shell" || session.state !== "running" || !session.live) return null;
+    const pushed = state.agent[session.id];
+    return pushed && AGENT_LOOK[pushed.status] ? pushed : null;
+  }
+
   // The record's own state, kept across hub restarts (a session without a
-  // terminal on this hub still shows how it ended).
+  // terminal on this hub still shows how it ended); a running agent shows
+  // what it is doing instead.
   function status(session) {
+    const agent = agentStatus(session);
+    if (agent) {
+      const look = AGENT_LOOK[agent.status];
+      return { ...look, title: agent.detail ? `${look.label}: ${agent.detail}` : look.label };
+    }
     if (session.state === "running") {
       return session.live
         ? { dot: "live", label: "live", tone: "live" }
@@ -439,6 +479,7 @@
     setLink("idle");
     state.notice = message || "";
     render();
+    sendView();
   }
 
   function attach(id) {
@@ -458,6 +499,7 @@
     term.reset();
     connect(id);
     render();
+    sendView();
   }
 
   // Show a session that has no terminal on this hub (the hub restarted):
@@ -479,6 +521,7 @@
     setLink("exited", "gone");
     showBanner(goneText(session), endedActions(id), true);
     render();
+    sendView();
   }
 
   function endedActions(id) {
@@ -638,6 +681,179 @@
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") wakeUp();
   });
+
+  // --- events: pushed agent status -------------------------------------
+
+  // What this page shows, for seen-tracking: the attached session while
+  // the page is visible, else nothing.
+  function currentView() {
+    const session = sessionById(state.attached);
+    const visible = document.visibilityState === "visible";
+    return visible && session && session.live ? session.id : null;
+  }
+
+  function sendView(force) {
+    const socket = state.events;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const view = currentView();
+    if (!force && view === state.viewing) return;
+    state.viewing = view;
+    socket.send(JSON.stringify({ type: "view", session_id: view }));
+  }
+
+  // A status push repaints the sidebar -- except under an inline rename,
+  // which must not be torn down mid-typing (it repaints when it ends).
+  function renderStatus() {
+    if (state.renaming) renderMain();
+    else render();
+  }
+
+  function startPolling() {
+    if (!state.poller) state.poller = setInterval(() => refresh(false).catch(() => {}), 4000);
+  }
+
+  function stopPolling() {
+    clearInterval(state.poller);
+    state.poller = null;
+  }
+
+  // One socket for the whole hub. While it is up, list changes and status
+  // arrive as pushes; while it is down, the sidebar falls back to polling.
+  function connectEvents() {
+    clearTimeout(state.eventsTimer);
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(
+      `${scheme}://${window.location.host}/api/events?client=${encodeURIComponent(CLIENT_ID)}`,
+    );
+    state.events = socket;
+    socket.onopen = () => {
+      state.eventsRetry = 0;
+      stopPolling();
+      sendView(true);
+      // Anything that changed while the socket was down.
+      refresh(false).catch(() => {});
+    };
+    socket.onmessage = (event) => {
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (_) {
+        return;
+      }
+      if (message.type === "snapshot") {
+        state.agent = message.sessions || {};
+        state.rollup = message.workspaces || {};
+        renderStatus();
+      } else if (message.type === "status") {
+        if (message.status) state.agent[message.session_id] = message.status;
+        else delete state.agent[message.session_id];
+        if (message.workspace_id) {
+          if (message.workspace_status) state.rollup[message.workspace_id] = message.workspace_status;
+          else delete state.rollup[message.workspace_id];
+        }
+        renderStatus();
+      } else if (message.type === "sessions") {
+        refresh(false).catch(() => {});
+      }
+    };
+    socket.onclose = (event) => {
+      if (state.events !== socket) return;
+      state.events = null;
+      state.viewing = undefined;
+      // 4001: the hub's token was rotated (as on the terminal socket).
+      if (event.code === 4001) {
+        window.location.replace("/?signed_out=rotated" + window.location.hash);
+        return;
+      }
+      startPolling();
+      state.eventsRetry += 1;
+      const delay = Math.min(10000, 500 * 2 ** Math.min(state.eventsRetry - 1, 5));
+      state.eventsTimer = setTimeout(connectEvents, delay);
+    };
+  }
+
+  const eventsWake = () => {
+    if (!state.events) connectEvents();
+  };
+  window.addEventListener("online", eventsWake);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") eventsWake();
+    sendView();
+  });
+
+  // Tab title and favicon carry what needs you: blocked and done counts.
+  const favicon = {
+    link: document.querySelector('link[rel="icon"]'),
+    image: null,
+    drawn: "",
+  };
+
+  function attentionCounts() {
+    let blocked = 0;
+    let done = 0;
+    for (const session of state.sessions) {
+      const agent = agentStatus(session);
+      if (agent && agent.status === "blocked") blocked += 1;
+      if (agent && agent.status === "done") done += 1;
+    }
+    return { blocked, done };
+  }
+
+  function titlePrefix({ blocked, done }) {
+    const parts = [];
+    if (blocked) parts.push(`${blocked} blocked`);
+    if (done) parts.push(`${done} done`);
+    return parts.length ? `(${parts.join(", ")}) ` : "";
+  }
+
+  function drawFavicon({ blocked, done }) {
+    const key = `${blocked}/${done}`;
+    if (key === favicon.drawn || !favicon.link) return;
+    if (!blocked && !done) {
+      favicon.drawn = key;
+      favicon.link.type = "image/svg+xml";
+      favicon.link.href = "/assets/icon.svg";
+      return;
+    }
+    if (!favicon.image) {
+      favicon.image = new Image();
+      favicon.image.onload = () => {
+        favicon.drawn = "";
+        drawFavicon(attentionCounts());
+      };
+      favicon.image.src = "/assets/icon.svg";
+      return;
+    }
+    if (!favicon.image.complete) return;
+    const size = 64;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(favicon.image, 0, 0, size, size);
+    // Blocked outranks done: a person is needed.
+    const count = blocked || done;
+    const color = blocked ? "#ff3d5e" : "#d9a93a";
+    const r = 17;
+    const cx = size - r;
+    const cy = r;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+    ctx.fillStyle = "#0c0d0c";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.fillStyle = "#0c0d0c";
+    ctx.font = "bold 26px ui-monospace, Menlo, Consolas, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(count > 9 ? "9+" : String(count), cx, cy + 1);
+    favicon.drawn = key;
+    favicon.link.type = "image/png";
+    favicon.link.href = canvas.toDataURL("image/png");
+  }
 
   // --- session actions -------------------------------------------------
 
@@ -817,7 +1033,7 @@
     return el(
       "li",
       {
-        className: `session${active ? " active" : ""}${session.live ? "" : " gone"}`,
+        className: `session${active ? " active" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}`,
         dataset: { id: session.id },
         tabIndex: 0,
         role: "button",
@@ -847,15 +1063,29 @@
         { className: `glyph ${glyphFor(session.kind)}`, title: session.kind || "shell" },
         icon(glyphFor(session.kind)),
       ),
-      el("span", { className: `dot ${st.dot}`, title: st.label }),
+      el("span", { className: `dot ${st.dot}`, title: st.title || st.label }),
       nameNode,
       el(
         "span",
         { className: "session-meta" },
-        el("span", { className: `session-state ${st.tone}`, textContent: st.label }),
+        el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
         actions,
       ),
     );
+  }
+
+  // The workspace's most urgent agent status (idle and unknown stay quiet).
+  function rollupChip(workspace) {
+    const rolled = state.rollup[workspace.id];
+    if (!["blocked", "working", "done"].includes(rolled)) return null;
+    const count = state.sessions.filter(
+      (s) => s.workspace_id === workspace.id && agentStatus(s)?.status === rolled,
+    ).length;
+    return el("span", {
+      className: `ws-status ${rolled}`,
+      textContent: count > 1 ? `${count} ${rolled}` : rolled,
+      title: `agents here: ${rolled}`,
+    });
   }
 
   function renderWorkspace(workspace, i, numbering) {
@@ -885,6 +1115,7 @@
           { type: "button", className: "ws-head", onclick: toggle, "aria-expanded": String(!collapsed) },
           el("span", { className: "chev" }, icon("chev")),
           el("span", { className: "ws-name", textContent: workspace.name, title: workspace.name }),
+          rollupChip(workspace),
           el(
             "span",
             { className: "ws-count", title: `${live} running of ${sessions.length}` },
@@ -985,7 +1216,17 @@
     $("#meter-cwd").textContent = session ? `\u200e${session.cwd}\u200e` : "";
     $("#meter-cwd").title = session ? session.cwd : "";
     updateMeters();
-    document.title = session ? `${session.name} · flywheel hub` : "flywheel hub";
+    const counts = attentionCounts();
+    document.title = `${titlePrefix(counts)}${session ? `${session.name} · flywheel hub` : "flywheel hub"}`;
+    drawFavicon(counts);
+    const agent = session ? agentStatus(session) : null;
+    const pill = $("#crumb-status");
+    pill.hidden = !agent;
+    if (agent) {
+      pill.textContent = agent.status;
+      pill.className = `agent-pill ${agent.status}`;
+      pill.title = agent.detail || "";
+    }
 
     const actions = $("#empty-actions");
     if (!session) {
@@ -1709,7 +1950,8 @@
       if (sessionById(match[1])) openSession(match[1]);
       else history.replaceState(null, "", window.location.pathname);
     }
-    setInterval(() => refresh(false).catch(() => {}), 4000);
+    startPolling();
+    connectEvents();
   }
 
   boot();

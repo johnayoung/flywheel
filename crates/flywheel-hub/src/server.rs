@@ -25,12 +25,27 @@
 //!   then on; send on attach, theme change, and focus); **binary** frames
 //!   are raw input.
 //! * Rotating the token closes every socket with code 4001.
+//!
+//! Events WebSocket (`GET /api/events?client=<id>`), hub-wide, text JSON:
+//!
+//! * server -> client: `{"type":"snapshot","sessions":{id:status},
+//!   "workspaces":{id:rollup}}` on connect (and after falling behind);
+//!   `{"type":"status","session_id","status":status|null,"workspace_id",
+//!   "workspace_status"}` on each change; `{"type":"sessions"}` when the
+//!   session or workspace list changed (re-list over REST). A `status` is
+//!   `{"status":"working|blocked|done|idle|unknown","detail"?,"since"}`, as
+//!   this client sees it (`done` turns into `idle` once it viewed them).
+//! * client -> server: `{"type":"view","session_id":id|null}` -- what this
+//!   page shows (`null` while hidden). The `client` id (a browser keeps one
+//!   in local storage) scopes seen-tracking; without one, the connection
+//!   gets its own.
+//! * Rotating the token closes it with code 4001 too.
 
 use crate::auth::{
     FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
     logout_cookie, origin_allowed,
 };
-use crate::hub::{CreateSession, Hub, HubError};
+use crate::hub::{CreateSession, Hub, HubError, HubEvent};
 use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
 use crate::state::{StateError, WorkspaceInput, validate_repo};
 use crate::vt::{DEFAULT_RECENT_LINES, SNAPSHOT_HISTORY_BYTES, TextSource, ViewerColors};
@@ -133,6 +148,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
+        .route("/api/events", get(events_ws))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -1146,6 +1162,188 @@ async fn pump(
             }
         }
     }
+}
+
+// --- events -------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    client: Option<String>,
+}
+
+/// A client id: 1..=64 of `[A-Za-z0-9_-]`.
+fn valid_client_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+async fn events_ws(
+    State(app): State<AppState>,
+    Query(query): Query<EventsQuery>,
+    client: Client,
+    headers: HeaderMap,
+    rotations: Option<axum::Extension<RotationWatch>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !origin_ok(&headers, client, &app.options) {
+        return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
+    }
+    let client = match query.client {
+        Some(id) if valid_client_id(&id) => id,
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "client must be 1-64 letters, digits, '-' or '_'",
+            );
+        }
+        None => crate::state::new_id(),
+    };
+    let hub = Arc::clone(&app.hub);
+    let shutdown = app.shutdown.clone();
+    // Taken before the credentials were checked (see `require_auth`).
+    let rotations = match rotations {
+        Some(axum::Extension(RotationWatch(rx))) => rx,
+        None => app.hub.subscribe_rotations(),
+    };
+    ws.max_message_size(64 * 1024)
+        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, rotations))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EventsClientMessage {
+    View { session_id: Option<String> },
+}
+
+/// Unregisters a viewer however the pump ends.
+struct ViewerGuard {
+    hub: Arc<Hub>,
+    viewer: u64,
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.hub.disconnect_viewer(self.viewer);
+    }
+}
+
+fn text(value: serde_json::Value) -> Message {
+    Message::Text(value.to_string().into())
+}
+
+fn snapshot_message(hub: &Hub, client: &str) -> Message {
+    let snapshot = hub.status_snapshot(client);
+    text(json!({
+        "type": "snapshot",
+        "sessions": snapshot.sessions,
+        "workspaces": snapshot.workspaces,
+    }))
+}
+
+fn status_message(hub: &Hub, client: &str, session_id: &str) -> Message {
+    match hub.status_for(client, session_id) {
+        Some((view, workspace_id, rollup)) => text(json!({
+            "type": "status",
+            "session_id": session_id,
+            "status": view,
+            "workspace_id": workspace_id,
+            "workspace_status": rollup,
+        })),
+        None => text(json!({
+            "type": "status",
+            "session_id": session_id,
+            "status": null,
+        })),
+    }
+}
+
+async fn events_pump(
+    mut socket: WebSocket,
+    hub: Arc<Hub>,
+    client: String,
+    mut shutdown: watch::Receiver<bool>,
+    mut rotations: watch::Receiver<u64>,
+) {
+    let mut events = hub.subscribe();
+    let guard = ViewerGuard {
+        viewer: hub.connect_viewer(&client),
+        hub: Arc::clone(&hub),
+    };
+    if socket.send(snapshot_message(&hub, &client)).await.is_err() {
+        return;
+    }
+    let mut ping = tokio::time::interval(WS_PING_INTERVAL);
+    ping.reset();
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                let sent = match event {
+                    Ok(HubEvent::Status { session_id }) => {
+                        socket.send(status_message(&hub, &client, &session_id)).await.is_ok()
+                    }
+                    Ok(HubEvent::Sessions) => {
+                        socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        socket.send(snapshot_message(&hub, &client)).await.is_ok()
+                            && socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
+                    }
+                    Err(broadcast::error::RecvError::Closed) => false,
+                };
+                if !sent {
+                    break;
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Text(body))) => {
+                        match serde_json::from_str::<EventsClientMessage>(body.as_str()) {
+                            Ok(EventsClientMessage::View { session_id }) => {
+                                hub.set_viewing(guard.viewer, session_id.as_deref());
+                            }
+                            Err(e) => {
+                                let error = json!({ "type": "error", "message": format!("bad message: {e}") });
+                                if socket.send(text(error)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) => {
+                        let _ = socket.flush().await;
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
+                }
+            }
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                    break;
+                }
+            }
+            changed = rotations.changed() => {
+                if changed.is_ok() {
+                    let close = CloseFrame {
+                        code: WS_CLOSE_ROTATED,
+                        reason: "token rotated: log in again".into(),
+                    };
+                    let _ = socket.send(Message::Close(Some(close))).await;
+                    break;
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
+        }
+    }
+    drop(guard);
 }
 
 /// The login URL for a one-time `code` under `base`.

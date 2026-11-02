@@ -17,7 +17,9 @@
 //! * server -> client, **text** JSON: `{"type":"exit","code":N|null,
 //!   "signal":S|null}` once the process ends; `{"type":"reset"}` when the
 //!   client fell too far behind -- clear the terminal, a fresh snapshot of
-//!   the screen alone (no scrollback, so a slow link catches up) follows.
+//!   the screen alone (no scrollback, so a slow link catches up) follows;
+//!   `{"type":"size","cols":N,"rows":N}` when a viewer resized the terminal
+//!   (in order with the output: what follows is drawn at that size).
 //! * client -> server, **text** JSON: `{"type":"input","data":"..."}`,
 //!   `{"type":"resize","cols":N,"rows":N}`, and `{"type":"theme",
 //!   "foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}`
@@ -38,10 +40,14 @@
 //!   the last two minutes, not a transcript's backlog). A `status` is
 //!   `{"status":"working|blocked|done|idle|unknown","detail"?,"since"}`, as
 //!   this client sees it (`done` turns into `idle` once it viewed them).
-//! * client -> server: `{"type":"view","session_id":id|null}` -- what this
-//!   page shows (`null` while hidden). The `client` id (a browser keeps one
-//!   in local storage) scopes seen-tracking; without one, the connection
-//!   gets its own.
+//!   `{"type":"layout","workspace_id","rev"}` when a workspace's tabs and
+//!   splits were saved or a removed session's panes closed (re-read
+//!   `GET /api/workspaces/{id}/layout`).
+//! * client -> server: `{"type":"view","session_id":id|null,"visible"?:
+//!   [ids]}` -- what this page shows: the focused pane's session and the
+//!   other panes on screen (all count as viewed; nothing while hidden). The
+//!   `client` id (a browser keeps one in local storage) scopes
+//!   seen-tracking; without one, the connection gets its own.
 //! * Rotating the token closes it with code 4001 too.
 
 mod commands_api;
@@ -148,6 +154,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(get_workspace)
                 .patch(update_workspace)
                 .delete(delete_workspace),
+        )
+        .route(
+            "/api/workspaces/{id}/layout",
+            get(get_layout).put(put_layout),
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
@@ -785,6 +795,49 @@ async fn delete_workspace(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+// --- layouts ----------------------------------------------------------------
+
+async fn get_layout(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
+    let layout = app.hub.layout(&id)?;
+    Ok(Json(json!({ "workspace_id": id, "rev": layout.rev, "tabs": layout.tabs })).into_response())
+}
+
+#[derive(Deserialize)]
+struct LayoutInput {
+    rev: u64,
+    tabs: Vec<crate::layout::Tab>,
+}
+
+/// Save a layout written against `rev`. A stale `rev` is a 409 carrying
+/// the current layout (`{"error","layout"}`), so the client can rebase.
+async fn put_layout(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<LayoutInput>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let workspace = id.clone();
+    let saved = blocking(move || hub.set_layout(&workspace, input.rev, input.tabs)).await;
+    match saved {
+        Ok(layout) => Ok(Json(
+            json!({ "workspace_id": id, "rev": layout.rev, "tabs": layout.tabs }),
+        )
+        .into_response()),
+        Err(ApiError(HubError::State(StateError::Conflict(message)))) => {
+            let current = app.hub.layout(&id)?;
+            Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": message,
+                    "layout": { "workspace_id": id, "rev": current.rev, "tabs": current.tabs },
+                })),
+            )
+                .into_response())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // --- sessions ---------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1087,8 +1140,15 @@ async fn session_ws(
         Some(axum::Extension(RotationWatch(rx))) => rx,
         None => app.hub.subscribe_rotations(),
     };
+    let hub = Arc::clone(&app.hub);
     ws.max_message_size(WS_MAX_MESSAGE)
-        .on_upgrade(move |socket| pump(socket, session, shutdown, rotations))
+        .on_upgrade(move |socket| async move {
+            pump(socket, Arc::clone(&session), shutdown, rotations, &hub).await;
+            // One viewer fewer: panes that follow another's size may now be
+            // the only viewer and fit themselves (re-list for `live.clients`).
+            drop(session);
+            hub.emit(HubEvent::Sessions);
+        })
 }
 
 #[derive(Deserialize)]
@@ -1190,6 +1250,7 @@ async fn pump(
     session: Arc<PtySession>,
     mut shutdown: watch::Receiver<bool>,
     mut rotations: watch::Receiver<u64>,
+    hub: &Hub,
 ) {
     let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
@@ -1197,6 +1258,8 @@ async fn pump(
     let Some(mut events) = send_attachment(&mut socket, attachment).await else {
         return;
     };
+    // One viewer more (`live.clients` in session listings).
+    hub.emit(HubEvent::Sessions);
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     loop {
@@ -1205,6 +1268,10 @@ async fn pump(
                 let sent = match event {
                     Ok(SessionEvent::Output(bytes)) => socket.send(Message::Binary(bytes)).await.is_ok(),
                     Ok(SessionEvent::Exit(info)) => socket.send(exit_message(&info)).await.is_ok(),
+                    Ok(SessionEvent::Resize { cols, rows }) => {
+                        let size = json!({ "type": "size", "cols": cols, "rows": rows });
+                        socket.send(Message::Text(size.to_string().into())).await.is_ok()
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Unsubscribe first, so the backlog this client
                         // will never read is not kept alive for it.
@@ -1354,7 +1421,13 @@ async fn events_ws(
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum EventsClientMessage {
-    View { session_id: Option<String> },
+    /// `session_id`: the focused pane's session; `visible`: the other
+    /// panes on screen (a split layout), which count as viewed too.
+    View {
+        session_id: Option<String>,
+        #[serde(default)]
+        visible: Vec<String>,
+    },
 }
 
 /// Unregisters a viewer however the pump ends.
@@ -1431,6 +1504,9 @@ async fn events_pump(
                         socket.send(commands_api::event_message(&session_id, added)).await.is_ok()
                     }
                     Ok(HubEvent::Unwatched { .. }) => true,
+                    Ok(HubEvent::Layout { workspace_id, rev }) => {
+                        socket.send(text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))).await.is_ok()
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         socket.send(snapshot_message(&hub, &client)).await.is_ok()
                             && socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
@@ -1450,8 +1526,13 @@ async fn events_pump(
                 match message {
                     Some(Ok(Message::Text(body))) => {
                         match serde_json::from_str::<EventsClientMessage>(body.as_str()) {
-                            Ok(EventsClientMessage::View { session_id }) => {
-                                hub.set_viewing(guard.viewer, session_id.as_deref());
+                            Ok(EventsClientMessage::View { session_id, visible }) => {
+                                let ids: Vec<&str> = session_id
+                                    .iter()
+                                    .chain(visible.iter())
+                                    .map(String::as_str)
+                                    .collect();
+                                hub.set_viewing_many(guard.viewer, &ids);
                             }
                             Err(e) => {
                                 let error = json!({ "type": "error", "message": format!("bad message: {e}") });

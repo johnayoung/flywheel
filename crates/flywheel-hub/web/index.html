@@ -54,6 +54,11 @@
   <symbol id="i-import" viewBox="0 0 16 16"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-branch" viewBox="0 0 16 16"><circle cx="4.5" cy="3.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="4.5" cy="12.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M4.5 5.1v5.8M11.5 6.6c0 3-7 2-7 4.3" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="m5 3.5 4.5 4.5L5 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-split-right" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 2.5v11" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-split-down" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M2 8h12" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-zoom" viewBox="0 0 16 16"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-unzoom" viewBox="0 0 16 16"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-dots" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></symbol>
 </svg>
 
 <div id="app">
@@ -100,12 +105,15 @@
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
+        <span id="prefix-pill" class="prefix-pill" hidden title="Pane prefix: press a key (% &quot; arrows z x c n p 1-9 , &amp; ?), Esc to cancel">ctrl b</span>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
     </header>
     <div class="ruler" aria-hidden="true"></div>
+    <nav id="tabs" class="tabs" hidden aria-label="Tabs of this workspace"></nav>
     <section id="stage">
       <div id="terminal"></div>
+      <div id="pane-park" hidden></div>
       <div id="sel-pop" class="sel-pop" hidden role="toolbar" aria-label="Selection"></div>
       <div id="banner" class="banner" hidden role="status">
         <span id="banner-text"></span>
@@ -253,6 +261,15 @@
       <span class="field-label">Name <span class="field-hint">optional</span></span>
       <input name="name" maxlength="100" autocomplete="off" spellcheck="false" id="session-name">
     </label>
+    <label class="field place-pick" id="place-pick" hidden>
+      <span class="field-label">Show in</span>
+      <select id="session-place">
+        <option value="pane">the focused pane</option>
+        <option value="right">a new split, to the right</option>
+        <option value="down">a new split, below</option>
+        <option value="tab">a new tab</option>
+      </select>
+    </label>
     <p class="form-error" id="session-error" role="alert"></p>
     <footer class="sheet-foot">
       <button type="button" class="slab ghost" data-close>Cancel</button>
@@ -327,6 +344,13 @@
       <div><dt><kbd>Alt</kbd><kbd>C</kbd></dt><dd>show / hide suggested commands</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>copy the last suggested shell command</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>`</kbd></dt><dd>flip between an agent and its companion shell (opened on first use)</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>\</kbd> / <kbd>Alt</kbd><kbd>-</kbd></dt><dd>split the focused pane right / down (a new shell; an agent's companion first)</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>&larr;</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&rarr;</kbd></dt><dd>focus the pane that way</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>H</kbd><kbd>J</kbd><kbd>K</kbd><kbd>L</kbd></dt><dd>move the focused pane's divider left / down / up / right</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>Z</kbd> / <kbd>Alt</kbd><kbd>X</kbd></dt><dd>zoom the focused pane (this browser only) / close it (the session keeps running)</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>T</kbd>, <kbd>Alt</kbd><kbd>PgUp</kbd> / <kbd>PgDn</kbd></dt><dd>new tab, previous / next tab</dd></div>
+      <div><dt><kbd>Ctrl</kbd><kbd>B</kbd> then a key</dt><dd>with the pane prefix on (palette): <code>%</code> <code>"</code> split, arrows focus, <kbd>Ctrl</kbd> arrows resize, <code>z</code> zoom, <code>x</code> close pane, <code>c</code> new tab, <code>n</code> <code>p</code> <code>1</code>-<code>9</code> tabs, <code>,</code> rename, <code>&amp;</code> close tab, <code>o</code> next pane; <kbd>Ctrl</kbd><kbd>B</kbd> twice sends ^B</dd></div>
+      <div><dt>drag a session</dt><dd>onto a pane's edge: split that way; its middle: show it there. Right-click a pane's title bar: its menu</dd></div>
       <div><dt><kbd>F2</kbd> / double-click</dt><dd>rename the focused sidebar session (Tab to it)</dd></div>
       <div><dt><kbd>Delete</kbd></dt><dd>close the focused sidebar session</dd></div>
     </dl>
@@ -360,6 +384,8 @@
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>
 <script src="/assets/worktree.js"></script>
+<script src="/assets/layout.js"></script>
+<script src="/assets/panes.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

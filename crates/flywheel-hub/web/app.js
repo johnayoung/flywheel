@@ -1,5 +1,6 @@
-// flywheel hub web client: workspaces > sessions in the sidebar, one
-// attached terminal, dialogs, a command palette, and keyboard shortcuts.
+// flywheel hub web client: workspaces > sessions in the sidebar, each
+// workspace's tabs of split panes (one terminal per pane), dialogs, a
+// command palette, and keyboard shortcuts.
 // Plain JS, no build step. Talks to the hub's REST API, the per-session
 // terminal WebSocket, and the hub-wide events WebSocket that pushes agent
 // status (protocol: crates/flywheel-hub/src/server.rs).
@@ -94,13 +95,16 @@
     workspaces: [],
     sessions: [],
     kinds: null, // last /api/kinds answer
-    attached: null, // session id
-    socket: null,
-    exited: null, // exit info of the attached session's process
-    replaying: false, // a snapshot is being replayed at the session's size
-    retry: 0, // reconnect attempts since the last successful attach
-    retryTimer: null,
-    countdown: null,
+    // attached / exited / replaying: the focused pane's (getters, below).
+    view: null, // id of the workspace whose layout the stage shows
+    layouts: {}, // workspace id -> layout shown (the hub's plus edits being saved)
+    confirmed: {}, // workspace id -> layout as the hub last said
+    layoutQueue: {}, // workspace id -> edits waiting to be saved, in order
+    layoutLoading: new Set(), // workspace ids whose layout is being fetched
+    panes: new Map(), // pane id -> pane (panes.js) of the active tab (desktop)
+    focusId: null, // the focused pane's id (desktop)
+    solo: null, // the phone's one pane
+    stageKey: "", // shape of the tree on the stage
     currentWorkspace: store.get("workspace", null), // last workspace touched
     collapsed: new Set(store.get("collapsed", [])),
     repoChoice: store.get("repo-choice", {}), // workspace id -> repo
@@ -114,9 +118,6 @@
     closing: new Set(), // session ids this browser is removing (no "removed elsewhere" notice)
     refreshSeq: 0, // refreshes started (each response is tagged with its number)
     refreshApplied: 0, // the newest refresh whose response was applied
-    attachedSeq: 0, // refreshSeq when the current session was attached
-    dropped: 0, // keystrokes typed while the link was down
-    tick: null, // repaints the reconnect banner
     painted: false, // first sidebar paint done (entry animation plays once)
     agent: {}, // session id -> {status, detail, since}, as this client sees it
     rollup: {}, // workspace id -> most urgent agent status
@@ -250,11 +251,10 @@
     workspaceById,
     MOD,
     openSession: (id) => openSession(id),
+    flipTo: (id, from) => flipTo(id, from),
     refresh: () => refresh(),
-    termSize: () => ({ cols: term.cols, rows: term.rows }),
-    focusTerminal: () => {
-      if (state.attached && term && !document.querySelector("dialog[open]")) term.focus();
-    },
+    termSize: () => sizeHint(),
+    focusTerminal: () => focusTerminal(),
   });
 
   // The Flywheel panel (flywheel.js): verified-loop state for the
@@ -269,9 +269,7 @@
     onOpen: () => {
       if (commands.isOpen()) commands.toggle();
     },
-    focusTerminal: () => {
-      if (state.attached && term && !document.querySelector("dialog[open]")) term.focus();
-    },
+    focusTerminal: () => focusTerminal(),
   });
 
   // The phone and alerts modules (pwa.js, attention.js, notify.js,
@@ -310,36 +308,25 @@
     }
     if (seq < state.refreshApplied) return;
     state.refreshApplied = seq;
-    const current = seq > state.attachedSeq;
     state.offline = 0;
     $("#offline").hidden = true;
     state.workspaces = ws.workspaces;
     state.sessions = ss.sessions;
     mobile.pruneDrafts(state.sessions.map((s) => s.id));
-    // The attached session was removed (closed in another browser or by
-    // the CLI, or its workspace was deleted): there is nothing to relaunch
-    // or reconnect to, so detach and say what happened.
-    if (state.attached && current && !sessionById(state.attached)) {
-      const gone = state.attachedMeta;
-      const ours = state.closing.has(state.attached);
-      state.snapshot = JSON.stringify([ws, ss]);
-      if (ours) {
-        detach();
-      } else if (gone && !workspaceById(gone.workspaceId)) {
-        detach(`Workspace ${gone.workspaceName} was deleted, and ${gone.name} with it.`, "Session removed.");
-      } else {
-        detach(`${gone ? gone.name : "That session"} was closed elsewhere (another browser or fw hub).`, "Session removed.");
+    // Layouts of workspaces this page has not loaded yet (the first open
+    // of one is then instant).
+    for (const workspace of state.workspaces) {
+      if (!state.confirmed[workspace.id] && !state.layoutLoading.has(workspace.id)) {
+        state.layoutLoading.add(workspace.id);
+        loadLayout(workspace.id).catch(() => {}).finally(() => state.layoutLoading.delete(workspace.id));
       }
-      return;
     }
+    if (settleRemoved(seq, ws, ss)) return;
     rememberAttached();
-    // A lost link whose session is gone will never come back: stop waiting.
-    const attached = sessionById(state.attached);
-    if (state.attached && current && !state.socket && !state.exited && (!attached || !attached.live)) {
-      state.snapshot = JSON.stringify([ws, ss]);
-      if (attached) showGone(attached.id, true);
-      else detach("That session was closed.");
-      return;
+    // Viewer counts changed: a pane that became its session's only viewer
+    // fits itself; one that no longer is follows the other viewer's size.
+    for (const pane of livePanes()) {
+      if (pane.term && pane.size && !pane.replaying && pane.claims() === pane.following) pane.claim();
     }
     const snapshot = JSON.stringify([ws, ss]);
     const busy = $("#sidebar").contains(document.activeElement) &&
@@ -353,6 +340,59 @@
     }
     state.snapshot = snapshot;
     render();
+  }
+
+  // Panes whose session was removed (closed in another browser or by the
+  // CLI, or its workspace was deleted) let go of it -- only on a list
+  // fetched after the pane attached. The hub closed those panes in the
+  // layout; this page follows at once. The focused one says what
+  // happened. Returns true when it re-rendered (or detached).
+  function settleRemoved(seq, ws, ss) {
+    const shown = livePanes().filter((p) => p.sessionId && seq > (p.shownSeq || 0));
+    const gone = shown.filter((p) => !sessionById(p.sessionId));
+    // A lost link whose session has no terminal any more will never come
+    // back: show it gone.
+    for (const pane of shown) {
+      const session = sessionById(pane.sessionId);
+      if (session && !session.live && !pane.socket && !pane.exited) pane.show(session.id, true);
+    }
+    if (!gone.length) return false;
+    state.snapshot = JSON.stringify([ws, ss]);
+    const meta = state.attachedMeta;
+    const focused = focusedPane();
+    const ours = gone.every((p) => state.closing.has(p.sessionId));
+    let message = "";
+    if (!ours && gone.includes(focused)) {
+      message = `${meta ? meta.name : "That session"} was closed elsewhere (another browser or fw hub).`;
+    } else if (!ours) {
+      const names = gone.filter((p) => !state.closing.has(p.sessionId)).map((p) => p.lastName || "A session");
+      message = `${names.join(", ")} ${names.length === 1 ? "was" : "were"} closed elsewhere (another browser or fw hub).`;
+    }
+    if (state.view && !workspaceById(state.view)) {
+      const name = meta ? meta.workspaceName : "This workspace";
+      detach(ours ? undefined : `Workspace ${name} was deleted, and ${meta ? meta.name : "its sessions"} with it.`, "Session removed.");
+      return true;
+    }
+    if (phone()) {
+      detach(message || undefined, "Session removed.");
+      return true;
+    }
+    const known = new Set(state.sessions.map((s) => s.id));
+    for (const id of [state.view]) {
+      if (id && state.layouts[id]) L.prune(state.layouts[id], known);
+      if (id && state.confirmed[id]) L.prune(state.confirmed[id], known);
+    }
+    renderStage();
+    if (!state.attached && message) {
+      // The tab has nothing left: the empty stage says why.
+      state.notice = message;
+      state.noticeTitle = "Session removed.";
+      renderMain();
+    } else if (message) {
+      commands.toast(message, { timeout: 5000 });
+    }
+    if (state.view) loadLayout(state.view).then(() => renderStage()).catch(() => {});
+    return true;
   }
 
   const STALE_LINK = "The session this link points to no longer exists (it was closed, or its workspace deleted).";
@@ -419,9 +459,10 @@
     store.set("theme", theme);
     document.documentElement.dataset.theme = theme;
     $("#theme-label").textContent = theme;
-    if (term) {
-      term.options.theme = TERM_THEMES[resolvedTheme()];
-      term.options.minimumContrastRatio = contrastFloor();
+    for (const pane of livePanes()) {
+      if (!pane.term) continue;
+      pane.term.options.theme = TERM_THEMES[resolvedTheme()];
+      pane.term.options.minimumContrastRatio = contrastFloor();
     }
     sendTheme();
   }
@@ -431,15 +472,19 @@
   const ANSI_KEYS = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
     "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightMagenta",
     "brightCyan", "brightWhite"];
-  function sendTheme() {
+  function themeMessage() {
     const colors = TERM_THEMES[resolvedTheme()];
-    send(JSON.stringify({
+    return JSON.stringify({
       type: "theme",
       foreground: colors.foreground,
       background: colors.background,
       cursor: colors.cursor,
       ansi: ANSI_KEYS.map((key) => colors[key]),
-    }));
+    });
+  }
+  // Every pane on screen (each shows its own session).
+  function sendTheme() {
+    for (const pane of livePanes()) pane.sendTheme();
   }
   window.addEventListener("focus", () => sendTheme());
   // Agent TUIs (Claude Code) paint with 256-colour indexes tuned for dark
@@ -448,101 +493,1199 @@
   const contrastFloor = () => (resolvedTheme() === "light" ? 4.5 : 1);
   prefersLight.addEventListener("change", () => applyTheme(theme));
 
-  // --- terminal --------------------------------------------------------
+  // --- terminals: panes in tabs and splits ----------------------------
+  //
+  // Each workspace has a layout (tabs; each a tree of splits whose leaves
+  // are panes showing one session), stored on the hub and shared by every
+  // browser (layout.js, panes.js). Which tab is active, which pane has
+  // focus, and zoom are this browser's. A phone shows one pane at a time
+  // (the "solo" pane) and never edits layouts.
 
   const TERM_FONT = '"FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
-  let term = null;
-  let fit = null;
+  const L = window.FwHubLayout;
+  const phone = () => window.matchMedia(NARROW).matches;
+  // Wide enough for an agent and its companion shell side by side.
+  const WIDE = "(min-width: 1101px)";
+
+  const focusedPane = () => (phone() ? state.solo : state.panes.get(state.focusId)) || null;
+  const focusedTerm = () => {
+    const pane = focusedPane();
+    return pane && pane.sessionId ? pane.term : null;
+  };
+  const livePanes = () => (phone() ? (state.solo ? [state.solo] : []) : [...state.panes.values()]);
+  // The attached session is the focused pane's.
+  Object.defineProperty(state, "attached", {
+    get: () => {
+      const pane = focusedPane();
+      return pane ? pane.sessionId : null;
+    },
+  });
+  Object.defineProperty(state, "exited", { get: () => (focusedPane() ? focusedPane().exited : null) });
+  Object.defineProperty(state, "replaying", { get: () => !!(focusedPane() && focusedPane().replaying) });
+
   const mobile = window.FwHubMobile({
     $, el, state, store, api, sessionById, agentStatus,
     toast: commands.toast,
     copyText: commands.copyText,
-    term: () => term,
-    fit: () => fit,
-    sendData: (data) => sendInput(JSON.stringify({ type: "input", data })),
-    onKey: () => term && term.scrollToBottom(),
+    term: () => focusedTerm(),
+    pane: () => focusedPane(),
+    panes: () => livePanes(),
+    sendData: (data) => {
+      const pane = focusedPane();
+      if (pane) pane.sendInput(JSON.stringify({ type: "input", data }));
+    },
+    onKey: () => {
+      const term = focusedTerm();
+      if (term) term.scrollToBottom();
+    },
   });
 
-  function createTerminal() {
-    term = new window.Terminal({
-      cursorBlink: true,
-      fontFamily: TERM_FONT,
-      fontSize: mobile.fontSize(),
-      lineHeight: 1.12,
-      scrollback: 10000,
-      allowProposedApi: false,
-      theme: TERM_THEMES[resolvedTheme()],
-      minimumContrastRatio: contrastFloor(),
-    });
-    fit = new window.FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
-    term.open($("#terminal"));
-    // The server's emulator answers terminal queries for every session, so
-    // the browser must not: a second viewer would answer twice.
-    const answered = () => true;
-    for (const id of [{ final: "c" }, { prefix: ">", final: "c" }, { final: "n" },
-      { prefix: "?", final: "n" }, { intermediates: "$", final: "p" },
-      { prefix: "?", intermediates: "$", final: "p" }]) {
-      term.parser.registerCsiHandler(id, answered);
+  // A pane resizes its session's PTY (fits it to its box) only while it
+  // has focus, or while this page is the session's only viewer; else it
+  // follows the size another viewer set (panes.js).
+  function claimsSize(pane) {
+    if (!pane.sessionId) return false;
+    if (pane === focusedPane()) return true;
+    const session = sessionById(pane.sessionId);
+    return !!(session && session.live && (session.live.clients || 0) <= 1);
+  }
+
+  const panes = window.FwHubPanes({
+    el, state, sessionById, TERM_FONT, status, goneText, exitHow,
+    fontSize: () => mobile.fontSize(),
+    termTheme: () => ({ theme: TERM_THEMES[resolvedTheme()], minimumContrastRatio: contrastFloor() }),
+    transformInput: (data) => mobile.transformInput(data),
+    fitTerminal: (pane) => mobile.fitTerminal(pane),
+    attachTerminal: (pane) => mobile.attachTerminal(pane.term),
+    themeMessage: () => themeMessage(),
+    claims: (pane) => claimsSize(pane),
+    onResize: (pane) => {
+      if (pane === focusedPane()) updateMeters();
+      renderPaneHead(pane);
+    },
+    onLink: (pane) => {
+      if (pane === focusedPane()) setLink(pane.link.kind, pane.link.text);
+    },
+    onFocusIn: (pane) => {
+      if (!phone() && pane.id !== state.focusId) focusPane(pane.id, { fromTerminal: true });
+    },
+    onAttached: (pane) => {
+      if (pane === focusedPane()) focusTerminal();
+      refresh(false).catch(() => {});
+    },
+    onExit: (pane) => {
+      if (sessionById(pane.sessionId)) refresh().catch(showError);
+      if (pane === focusedPane()) renderMain();
+    },
+    onSessionGone: () => refresh().catch(() => {}),
+    relaunch: (id) => relaunch(id),
+    closeSession: (id) => closeSession(id),
+    refresh: () => refresh(),
+  });
+
+  // --- per-browser view of each workspace's layout ---------------------
+
+  // workspace id -> {tab, focus: {tab id: pane id}, zoom: {tab id: pane id}}
+  const views = (() => {
+    const kept = store.get("layout-view", {});
+    return kept && typeof kept === "object" ? kept : {};
+  })();
+  function viewOf(workspaceId) {
+    if (!views[workspaceId] || typeof views[workspaceId] !== "object") views[workspaceId] = {};
+    const view = views[workspaceId];
+    if (!view.focus || typeof view.focus !== "object") view.focus = {};
+    if (!view.zoom || typeof view.zoom !== "object") view.zoom = {};
+    return view;
+  }
+  const saveViews = () => store.set("layout-view", views);
+
+  const layoutOf = (workspaceId) => state.layouts[workspaceId] || null;
+  const viewLayout = () => layoutOf(state.view);
+
+  function activeTab(workspaceId = state.view) {
+    const layout = layoutOf(workspaceId);
+    if (!layout || !layout.tabs.length) return null;
+    const view = viewOf(workspaceId);
+    return layout.tabs.find((t) => t.id === view.tab) || layout.tabs[0];
+  }
+
+  // The leaf (data, not pane object) that has focus in the active tab.
+  function focusedLeaf() {
+    const tab = activeTab();
+    if (!tab) return null;
+    const leaves = L.panes(tab.root);
+    return leaves.find((p) => p.id === viewOf(state.view).focus[tab.id]) || leaves[0];
+  }
+
+  const zoomedIn = (tab) => {
+    if (!tab) return null;
+    const id = viewOf(state.view).zoom[tab.id];
+    return id && L.findPane(tab.root, id) ? id : null;
+  };
+
+  // --- layouts: loading and saving -------------------------------------
+
+  async function loadLayout(workspaceId) {
+    const layout = await api("GET", `/api/workspaces/${workspaceId}/layout`);
+    const queue = state.layoutQueue[workspaceId];
+    // A write in flight settles it (its answer, or a 409 carrying it).
+    if (queue && queue.length) return layoutOf(workspaceId);
+    state.confirmed[workspaceId] = layout;
+    state.layouts[workspaceId] = L.clone(layout);
+    return layout;
+  }
+
+  async function ensureLayout(workspaceId) {
+    if (layoutOf(workspaceId)) return layoutOf(workspaceId);
+    try {
+      return await loadLayout(workspaceId);
+    } catch (error) {
+      if (!layoutOf(workspaceId)) state.layouts[workspaceId] = { rev: 0, tabs: [] };
+      state.confirmed[workspaceId] = state.confirmed[workspaceId] || { rev: 0, tabs: [] };
+      throw error;
     }
-    term.parser.registerDcsHandler({ intermediates: "$", final: "q" }, answered);
-    // OSC 4 is "index;spec" pairs, OSC 10-12 a spec list; "?" asks.
-    const onlyQueries = (specs) => specs.length > 0 && specs.every((spec) => spec === "?");
-    term.parser.registerOscHandler(4, (data) => onlyQueries(data.split(";").filter((_, i) => i % 2 === 1)));
-    for (const osc of [10, 11, 12]) {
-      term.parser.registerOscHandler(osc, (data) => onlyQueries(data.split(";")));
+  }
+
+  // Change a workspace's layout: `edit(layout)` edits a copy in place (or
+  // returns false: nothing to do). It shows at once, then is saved; when
+  // another browser saved first (409), it is replayed onto theirs. Edits
+  // are saved one at a time, in order.
+  function editLayout(workspaceId, edit) {
+    const shown = L.clone(layoutOf(workspaceId) || { rev: 0, tabs: [] });
+    if (edit(shown) === false) return Promise.resolve(false);
+    state.layouts[workspaceId] = shown;
+    renderStage();
+    const queue = state.layoutQueue[workspaceId] || (state.layoutQueue[workspaceId] = []);
+    return new Promise((resolve) => {
+      queue.push({ edit, resolve });
+      if (queue.length === 1) drainLayout(workspaceId);
+    });
+  }
+
+  async function drainLayout(workspaceId) {
+    const queue = state.layoutQueue[workspaceId];
+    while (queue.length) {
+      const { edit, resolve } = queue[0];
+      let ok = false;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const base = L.clone(state.confirmed[workspaceId] || { rev: 0, tabs: [] });
+        if (edit(base) === false) {
+          ok = true;
+          break;
+        }
+        // Never send a pane for a session this page has not heard of yet.
+        L.prune(base, new Set(state.sessions.filter((s) => s.workspace_id === workspaceId).map((s) => s.id)));
+        try {
+          state.confirmed[workspaceId] = await putLayout(workspaceId, base);
+          ok = true;
+          break;
+        } catch (error) {
+          if (error.layout) {
+            state.confirmed[workspaceId] = error.layout;
+            continue;
+          }
+          commands.toast(`Layout not saved: ${error.message}`, { tone: "bad", timeout: 6000 });
+          break;
+        }
+      }
+      if (!ok) {
+        // Gave up: show what the hub has.
+        try {
+          state.confirmed[workspaceId] = await api("GET", `/api/workspaces/${workspaceId}/layout`);
+        } catch (_) {
+          // Unreachable: keep the last confirmed one.
+        }
+      }
+      queue.shift();
+      resolve(ok);
     }
-    // Sticky Ctrl/Alt from the phone's key bar apply to what is typed.
-    term.onData((data) => sendInput(JSON.stringify({ type: "input", data: mobile.transformInput(data) })));
-    term.onBinary((data) => {
-      const bytes = new Uint8Array(data.length);
-      for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
-      sendInput(bytes);
+    // Settled: show the hub's layout plus nothing pending.
+    if (state.confirmed[workspaceId]) {
+      state.layouts[workspaceId] = L.clone(state.confirmed[workspaceId]);
+      if (workspaceId === state.view) renderStage();
+    }
+  }
+
+  async function putLayout(workspaceId, layout) {
+    const response = await fetch(`/api/workspaces/${workspaceId}/layout`, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rev: layout.rev, tabs: layout.tabs }),
     });
-    term.onResize(({ cols, rows }) => {
-      send(JSON.stringify({ type: "resize", cols, rows }));
-      updateMeters();
+    if (response.status === 401) {
+      window.location.replace("/" + window.location.hash);
+      throw new Error("signed out");
+    }
+    const data = await response.json().catch(() => null);
+    if (response.ok) return data;
+    const error = new Error((data && data.error) || response.statusText);
+    if (response.status === 409 && data && data.layout) error.layout = data.layout;
+    throw error;
+  }
+
+  // Another browser saved a layout (events socket).
+  function onLayoutEvent(message) {
+    const id = message.workspace_id;
+    const confirmed = state.confirmed[id];
+    if (confirmed && confirmed.rev >= message.rev) return;
+    if (state.layoutQueue[id] && state.layoutQueue[id].length) return;
+    if (!confirmed && id !== state.view) return;
+    loadLayout(id).then(() => {
+      if (id === state.view) renderStage();
+    }).catch(() => {});
+  }
+
+  // --- placing sessions ------------------------------------------------
+
+  // Show a session: in the pane already showing it (its tab comes to the
+  // front), else -- `place` -- in the focused pane (`{pane}`: that one), a
+  // new split beside it (`{split: "right"|"left"|"down"|"up"}`), or a new
+  // tab (`{newTab: true}`). Phones show it alone, the layout untouched.
+  async function openSession(id, place = {}) {
+    const session = sessionById(id);
+    if (!session) return;
+    state.notice = "";
+    state.noticeTitle = "";
+    delete state.wsErrors[session.workspace_id];
+    rememberWorkspace(session.workspace_id);
+    document.body.classList.remove("side-open");
+    const workspaceId = session.workspace_id;
+    try {
+      await ensureLayout(workspaceId);
+    } catch (_) {
+      // Unreachable hub: the layout loads with the next refresh.
+    }
+    if (!sessionById(id)) return;
+    state.view = workspaceId;
+    if (phone()) {
+      showSolo(id);
+      return;
+    }
+    const layout = layoutOf(workspaceId);
+    const tab = activeTab();
+    const where = [tab, ...layout.tabs.filter((t) => t !== tab)].filter(Boolean)
+      .map((t) => ({ tab: t, leaf: L.paneShowing(t.root, id) }))
+      .find((hit) => hit.leaf);
+    if (where && !place.split && !place.newTab && !place.pane) {
+      selectTab(where.tab.id, where.leaf.id);
+      return;
+    }
+    const view = viewOf(workspaceId);
+    if (place.newTab) {
+      const fresh = L.tab(L.nextTabName(layout), id);
+      if (layout.tabs.length >= L.MAX_TABS) {
+        commands.toast(`At most ${L.MAX_TABS} tabs per workspace.`, { timeout: 3000 });
+        return;
+      }
+      view.tab = fresh.id;
+      view.focus[fresh.id] = fresh.root.id;
+      saveViews();
+      await editLayout(workspaceId, (draft) => {
+        draft.tabs.push(L.clone(fresh));
+      });
+      return;
+    }
+    if (!tab) {
+      const fresh = L.tab("main", id);
+      view.tab = fresh.id;
+      view.focus[fresh.id] = fresh.root.id;
+      saveViews();
+      await editLayout(workspaceId, (draft) => {
+        if (draft.tabs.length) {
+          // Another browser laid it out meanwhile: show it in its first tab.
+          const first = L.panes(draft.tabs[0].root)[0];
+          if (!L.sessionsOf(draft.tabs[0].root).includes(id)) first.session = id;
+          return;
+        }
+        draft.tabs.push(L.clone(fresh));
+      });
+      return;
+    }
+    const target = place.pane ? L.findPane(tab.root, place.pane) : focusedLeaf();
+    if (!target) return;
+    if (place.split) {
+      if (L.panes(tab.root).length >= L.MAX_PANES && !(where && where.tab === tab)) {
+        commands.toast(`At most ${L.MAX_PANES} panes per tab.`, { timeout: 3000 });
+        return;
+      }
+      const freshId = L.newId("p");
+      view.focus[tab.id] = freshId;
+      delete view.zoom[tab.id];
+      saveViews();
+      await editLayout(workspaceId, (draft) => {
+        const t = draft.tabs.find((x) => x.id === tab.id);
+        if (!t || !L.findPane(t.root, target.id)) return false;
+        // Shown elsewhere in this tab: it moves.
+        const old = L.paneShowing(t.root, id);
+        if (old && old.id === target.id) return false;
+        if (old) t.root = L.close(t.root, old.id) || t.root;
+        const done = L.split(t.root, target.id, place.split, id, place.ratio || 0.5);
+        if (!done) return false;
+        done.pane.id = freshId;
+        t.root = done.root;
+      });
+      return;
+    }
+    view.focus[tab.id] = target.id;
+    saveViews();
+    await editLayout(workspaceId, (draft) => {
+      const t = draft.tabs.find((x) => x.id === tab.id);
+      const leaf = t && L.findPane(t.root, target.id);
+      if (!leaf || leaf.session === id) return false;
+      // Already in this tab in another pane: swap the two.
+      const other = L.paneShowing(t.root, id);
+      if (other) other.session = leaf.session;
+      leaf.session = id;
+      if (other && !other.session) t.root = L.close(t.root, other.id) || t.root;
     });
-    let pending = 0;
-    // While a snapshot replays the terminal keeps the size it was drawn at.
-    const refit = () => {
-      cancelAnimationFrame(pending);
-      pending = requestAnimationFrame(() => {
-        if (!state.replaying && $("#terminal").clientWidth > 0) mobile.fitTerminal();
+  }
+
+  // Bring tab `tabId` of the viewed workspace to the front (this browser
+  // only), focusing `paneId` when given.
+  function selectTab(tabId, paneId) {
+    const view = viewOf(state.view);
+    const switching = (activeTab() || {}).id !== tabId;
+    view.tab = tabId;
+    if (paneId) view.focus[tabId] = paneId;
+    saveViews();
+    if (switching || !state.panes.size) renderStage();
+    const leaf = focusedLeaf();
+    if (leaf) focusPane(leaf.id);
+  }
+
+  // --- the stage -------------------------------------------------------
+
+  // Build the stage for the viewed workspace: the active tab's tree on a
+  // desktop (panes of other tabs are closed: no sockets, no rendering),
+  // or the solo pane on a phone.
+  function renderStage() {
+    const host = $("#terminal");
+    if (phone()) {
+      for (const [id, pane] of state.panes) {
+        pane.dispose();
+        state.panes.delete(id);
+      }
+      state.stageKey = "";
+      if (state.solo && state.solo.el.parentNode !== host) host.replaceChildren(state.solo.el);
+      if (!state.solo) host.replaceChildren();
+      renderTabs();
+      renderMain();
+      sendView();
+      return;
+    }
+    if (state.solo) {
+      state.solo.dispose();
+      state.solo = null;
+    }
+    const tab = activeTab();
+    const leaves = tab ? L.panes(tab.root) : [];
+    for (const [id, pane] of state.panes) {
+      if (!leaves.some((leaf) => leaf.id === id && leaf.session)) {
+        pane.dispose();
+        state.panes.delete(id);
+      }
+    }
+    const leaf = focusedLeaf();
+    state.focusId = leaf ? leaf.id : null;
+    for (const node of leaves) {
+      if (!node.session || !sessionById(node.session)) continue;
+      let pane = state.panes.get(node.id);
+      if (!pane) {
+        pane = panes.create(node.id);
+        wirePane(pane);
+        state.panes.set(node.id, pane);
+      }
+      if (pane.sessionId !== node.session) {
+        pane.show(node.session);
+        pane.shownSeq = state.refreshSeq;
+      }
+    }
+    const zoom = zoomedIn(tab);
+    const tree = !tab ? null : zoom ? { type: "pane", id: zoom } : tab.root;
+    // Rebuild only when the shape changed (a moved xterm loses focus);
+    // a ratio alone is restyled in place.
+    const key = JSON.stringify([tab && tab.id, shape(tree)]);
+    const hadFocus = host.contains(document.activeElement);
+    if (key !== state.stageKey) {
+      state.stageKey = key;
+      const park = $("#pane-park");
+      for (const pane of state.panes.values()) park.append(pane.el);
+      host.replaceChildren(...(tree ? [buildNode(tree, "")] : []));
+    } else if (tree) {
+      restyle(tree, "");
+    }
+    host.classList.toggle("multi", !!tree && tree.type === "split");
+    for (const pane of state.panes.values()) {
+      pane.el.classList.toggle("focused", pane.id === state.focusId);
+      renderPaneHead(pane);
+    }
+    if (hadFocus && !document.querySelector("dialog[open]") && !paletteOpen()) focusTerminal();
+    renderTabs();
+    history.replaceState(null, "", state.attached ? `#session=${state.attached}` : window.location.pathname);
+    rememberAttached();
+    render();
+    sendView();
+  }
+
+  const shape = (node) => (!node ? null : node.type === "pane"
+    ? (node.session === null ? `${node.id}:empty` : node.id)
+    : [node.dir, shape(node.a), shape(node.b)]);
+
+  function buildNode(node, path) {
+    if (node.type === "pane") {
+      const pane = state.panes.get(node.id);
+      if (pane) return pane.el;
+      return emptyPane(node.id);
+    }
+    const a = buildNode(node.a, path + "a");
+    const b = buildNode(node.b, path + "b");
+    const first = el("div", { className: "split-side" }, a);
+    const second = el("div", { className: "split-side" }, b);
+    const divider = el("div", {
+      className: "divider",
+      role: "separator",
+      tabIndex: 0,
+      "aria-orientation": node.dir === "right" ? "vertical" : "horizontal",
+      "aria-valuemin": 5,
+      "aria-valuemax": 95,
+      "aria-label": "Resize panes (arrow keys)",
+      title: "Drag to resize (arrow keys when focused; double-click: even)",
+      dataset: { path },
+    });
+    bindDivider(divider, path, node.dir);
+    const box = el("div", { className: `split ${node.dir}`, dataset: { path } }, first, divider, second);
+    styleSplit(box, node);
+    return box;
+  }
+
+  function styleSplit(box, node) {
+    const [first, divider, second] = box.children;
+    first.style.flex = `${node.ratio} 1 0`;
+    second.style.flex = `${1 - node.ratio} 1 0`;
+    divider.setAttribute("aria-valuenow", String(Math.round(node.ratio * 100)));
+  }
+
+  function restyle(node, path) {
+    if (node.type !== "split") return;
+    const box = $(`#terminal .split[data-path="${path}"]`);
+    if (box) styleSplit(box, node);
+    restyle(node.a, path + "a");
+    restyle(node.b, path + "b");
+  }
+
+  // A pane with no session (its session was closed, or a new tab): the
+  // empty stage stands in for it when it is the tab's only pane.
+  function emptyPane(id) {
+    return el("section", { className: "pane empty-pane", dataset: { pane: id } });
+  }
+
+  // Dividers: drag (pointer) or arrow keys; saved when the drag ends.
+  function bindDivider(divider, path, dir) {
+    const ratioAt = (event) => {
+      const box = divider.parentElement.getBoundingClientRect();
+      const r = dir === "right" ? (event.clientX - box.left) / box.width : (event.clientY - box.top) / box.height;
+      return L.clampRatio(r);
+    };
+    // Restyled only: the layout changes (and is saved) on commit.
+    const preview = (ratio) => styleSplit(divider.parentElement, { ratio });
+    const commit = (ratio) => {
+      const tab = activeTab();
+      if (!tab) return;
+      editLayout(state.view, (draft) => {
+        const t = draft.tabs.find((x) => x.id === tab.id);
+        const node = t && L.splitAt(t.root, path);
+        if (!node || node.ratio === ratio) return false;
+        node.ratio = ratio;
       });
     };
-    window.addEventListener("resize", refit);
-    new ResizeObserver(refit).observe($("#terminal"));
-    mobile.fitTerminal();
-    mobile.attachTerminal();
+    divider.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      divider.setPointerCapture(event.pointerId);
+      divider.classList.add("dragging");
+      document.body.classList.add(dir === "right" ? "resizing-x" : "resizing-y");
+      let last = null;
+      const move = (e) => {
+        last = ratioAt(e);
+        preview(last);
+      };
+      const up = () => {
+        divider.removeEventListener("pointermove", move);
+        divider.classList.remove("dragging");
+        document.body.classList.remove("resizing-x", "resizing-y");
+        if (last !== null) commit(last);
+      };
+      divider.addEventListener("pointermove", move);
+      divider.addEventListener("pointerup", up, { once: true });
+      divider.addEventListener("pointercancel", up, { once: true });
+    });
+    divider.addEventListener("dblclick", () => {
+      preview(0.5);
+      commit(0.5);
+    });
+    divider.addEventListener("keydown", (event) => {
+      const tab = activeTab();
+      const node = tab && L.splitAt(tab.root, path);
+      if (!node) return;
+      const back = dir === "right" ? "ArrowLeft" : "ArrowUp";
+      const forth = dir === "right" ? "ArrowRight" : "ArrowDown";
+      const step = event.shiftKey ? 0.1 : 0.02;
+      let next = null;
+      const current = divider.pending ?? node.ratio;
+      if (event.key === back) next = current - step;
+      else if (event.key === forth) next = current + step;
+      else if (event.key === "Home") next = L.MIN_RATIO;
+      else if (event.key === "End") next = 1 - L.MIN_RATIO;
+      else if (event.key === "Escape" || event.key === "Enter") {
+        event.preventDefault();
+        focusTerminal();
+        return;
+      }
+      if (next === null) return;
+      event.preventDefault();
+      event.stopPropagation();
+      next = L.clampRatio(next);
+      divider.pending = next;
+      preview(next);
+      clearTimeout(divider.saveTimer);
+      divider.saveTimer = setTimeout(() => {
+        divider.pending = undefined;
+        commit(next);
+      }, 400);
+    });
   }
 
-  function send(message) {
-    const socket = state.socket;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(message);
-      return true;
+  // Pointer, menus, and drops on a pane.
+  function wirePane(pane) {
+    pane.el.addEventListener("pointerdown", () => {
+      if (pane.id !== state.focusId && !phone()) focusPane(pane.id, { fromTerminal: true });
+    }, true);
+    pane.head.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      paneMenu(pane, event.clientX, event.clientY);
+    });
+    pane.head.addEventListener("dblclick", (event) => {
+      if (!event.target.closest("button")) toggleZoom(pane.id);
+    });
+    bindDrop(pane.el, () => pane.id);
+  }
+
+  function renderPaneHead(pane) {
+    const session = sessionById(pane.sessionId);
+    if (session) pane.lastName = session.name;
+    if (!session || phone()) {
+      pane.head.replaceChildren();
+      return;
     }
-    return false;
+    const st = status(session);
+    const tab = activeTab();
+    const zoomed = tab && zoomedIn(tab) === pane.id;
+    const size = pane.term ? `${pane.term.cols}×${pane.term.rows}` : "";
+    pane.head.replaceChildren(...[
+      el("span", { className: `glyph ${glyphFor(session.kind)}` }, icon(glyphFor(session.kind))),
+      el("span", { className: `dot ${st.dot}`, title: st.title || st.label }),
+      el("span", { className: "pane-name", textContent: session.name, title: session.cwd }),
+      el("span", { className: `pane-state ${st.tone}`, textContent: st.label }),
+      pane.following
+        ? el("span", {
+          className: "pane-follow",
+          textContent: `${size} · another viewer's size`,
+          title: "This pane follows the size another viewer set; focus it to fit the terminal to this pane.",
+        })
+        : null,
+      el(
+        "span",
+        { className: "pane-tools" },
+        iconButton("split-right", `Split right: new shell (${MOD} \\)`, () => splitWithShell(pane, "right")),
+        iconButton("split-down", `Split down: new shell (${MOD} -)`, () => splitWithShell(pane, "down")),
+        iconButton(zoomed ? "unzoom" : "zoom", zoomed ? `Unzoom (${MOD} Z)` : `Zoom (${MOD} Z)`, () => toggleZoom(pane.id)),
+        iconButton("dots", "Pane menu", (event) => {
+          const box = event.currentTarget.getBoundingClientRect();
+          paneMenu(pane, box.left, box.bottom + 2);
+        }),
+        iconButton("x", `Close pane: the session keeps running (${MOD} X)`, () => closePane(pane.id)),
+      ),
+    ].filter(Boolean));
   }
 
-  // Keystrokes cannot be queued safely (a reconnect replays a screen they
-  // were not typed against), so they are dropped -- and the banner says so.
-  function sendInput(message) {
-    if (send(message) || !state.attached || state.exited) return;
-    state.dropped += 1;
-    if (state.retryTimer) retryTick();
+  // The phone's one pane.
+  function showSolo(id) {
+    if (!state.solo) {
+      state.solo = panes.create("solo");
+      state.solo.el.classList.add("solo", "focused");
+    }
+    const host = $("#terminal");
+    if (state.solo.el.parentNode !== host) host.replaceChildren(state.solo.el);
+    state.solo.show(id);
+    state.solo.shownSeq = state.refreshSeq;
+    rememberAttached();
+    history.replaceState(null, "", `#session=${id}`);
+    renderTabs();
+    render();
+    sendView();
   }
 
-  // --- connection ------------------------------------------------------
+  // Focus a pane of the active tab (this browser only). It claims the
+  // PTY size; the one that had focus may go back to following.
+  function focusPane(paneId, { fromTerminal } = {}) {
+    const tab = activeTab();
+    if (!tab || !L.findPane(tab.root, paneId)) return;
+    const before = focusedPane();
+    viewOf(state.view).focus[tab.id] = paneId;
+    saveViews();
+    state.focusId = paneId;
+    const zoom = zoomedIn(tab);
+    if (zoom && zoom !== paneId) {
+      delete viewOf(state.view).zoom[tab.id];
+      renderStage();
+    }
+    for (const pane of state.panes.values()) pane.el.classList.toggle("focused", pane.id === paneId);
+    const pane = state.panes.get(paneId);
+    if (pane) {
+      if (!fromTerminal) focusTerminal();
+      pane.claim();
+      setLink(pane.link.kind, pane.link.text);
+    } else {
+      setLink("idle");
+    }
+    if (before && before !== pane) before.refit();
+    history.replaceState(null, "", state.attached ? `#session=${state.attached}` : window.location.pathname);
+    rememberAttached();
+    render();
+    sendView();
+  }
 
+  // Focus the pane next to the focused one, by where they are on screen.
+  function focusToward(direction) {
+    const current = focusedPane();
+    if (!current || phone()) return;
+    const from = current.el.getBoundingClientRect();
+    const cx = from.left + from.width / 2;
+    const cy = from.top + from.height / 2;
+    let best = null;
+    for (const pane of state.panes.values()) {
+      if (pane === current || !pane.el.isConnected) continue;
+      const r = pane.el.getBoundingClientRect();
+      const ok = direction === "left" ? r.right <= from.left + 2
+        : direction === "right" ? r.left >= from.right - 2
+          : direction === "up" ? r.bottom <= from.top + 2
+            : r.top >= from.bottom - 2;
+      if (!ok) continue;
+      const dx = r.left + r.width / 2 - cx;
+      const dy = r.top + r.height / 2 - cy;
+      // Prefer panes in line with this one.
+      const along = direction === "left" || direction === "right" ? Math.abs(dx) : Math.abs(dy);
+      const across = direction === "left" || direction === "right" ? Math.abs(dy) : Math.abs(dx);
+      const score = along + across * 2;
+      if (!best || score < best.score) best = { pane, score };
+    }
+    if (best) focusPane(best.pane.id);
+  }
+
+  function cyclePane(delta) {
+    const tab = activeTab();
+    if (!tab || phone()) return;
+    const leaves = L.panes(tab.root).filter((p) => state.panes.has(p.id));
+    if (leaves.length < 2) return;
+    const at = leaves.findIndex((p) => p.id === state.focusId);
+    focusPane(leaves[(at + delta + leaves.length) % leaves.length].id);
+  }
+
+  function toggleZoom(paneId = state.focusId) {
+    const tab = activeTab();
+    if (!tab || !paneId || phone()) return;
+    const view = viewOf(state.view);
+    if (view.zoom[tab.id] === paneId) delete view.zoom[tab.id];
+    else if (L.panes(tab.root).length > 1) view.zoom[tab.id] = paneId;
+    else return;
+    view.focus[tab.id] = paneId;
+    saveViews();
+    renderStage();
+    const pane = state.panes.get(paneId);
+    if (pane) requestAnimationFrame(() => pane.claim());
+  }
+
+  // Resize the focused pane from the keyboard: move its nearest divider.
+  function nudgePane(direction) {
+    const tab = activeTab();
+    const paneId = state.focusId;
+    if (!tab || !paneId || phone()) return;
+    const axis = direction === "left" || direction === "right" ? "right" : "down";
+    const step = direction === "left" || direction === "up" ? -0.05 : 0.05;
+    editLayout(state.view, (draft) => {
+      const t = draft.tabs.find((x) => x.id === tab.id);
+      if (!t || !L.resizePane(t.root, paneId, axis, step)) return false;
+    });
+  }
+
+  // Take a pane out of the tab; its session keeps running. The last pane
+  // of a tab closes the tab (an only tab is left empty).
+  function closePane(paneId = state.focusId) {
+    const tab = activeTab();
+    if (!tab || !paneId || phone()) return;
+    const view = viewOf(state.view);
+    const leaves = L.panes(tab.root);
+    const at = leaves.findIndex((p) => p.id === paneId);
+    if (at < 0) return;
+    if (view.focus[tab.id] === paneId) {
+      const next = leaves[at + 1] || leaves[at - 1];
+      if (next) view.focus[tab.id] = next.id;
+    }
+    if (view.zoom[tab.id] === paneId) delete view.zoom[tab.id];
+    saveViews();
+    const layout = viewLayout();
+    if (leaves.length === 1 && layout.tabs.length > 1) {
+      closeTab(tab.id);
+      return;
+    }
+    editLayout(state.view, (draft) => {
+      const t = draft.tabs.find((x) => x.id === tab.id);
+      if (!t || !L.findPane(t.root, paneId)) return false;
+      t.root = L.close(t.root, paneId) || { type: "pane", id: paneId, session: null };
+    });
+  }
+
+  // A new shell beside a pane: an agent's companion (in its directory,
+  // worktree included) unless that is on screen already, else a shell in
+  // the session's folder.
+  async function splitWithShell(pane, side) {
+    const session = sessionById(pane && pane.sessionId);
+    if (!session) return;
+    const tab = activeTab();
+    if (tab && L.panes(tab.root).length >= L.MAX_PANES) {
+      commands.toast(`At most ${L.MAX_PANES} panes per tab.`, { timeout: 3000 });
+      return;
+    }
+    focusPane(pane.id);
+    const agent = session.kind === "claude" || session.kind === "codex";
+    const companion = agent ? state.sessions.find((s) => s.companion_of === session.id) : null;
+    const companionShown = companion && tab && L.paneShowing(tab.root, companion.id);
+    try {
+      let created;
+      if (agent && !companionShown) {
+        created = await api("POST", `/api/sessions/${session.id}/companion`, sizeHint());
+      } else {
+        const workspace = workspaceById(session.workspace_id);
+        const folder = session.worktree ? session.worktree.repo : session.cwd;
+        const body = { workspace_id: session.workspace_id, kind: "shell", ...sizeHint() };
+        if (workspace && workspace.folders.some((f) => f.path === folder && !f.missing)) body.folder = folder;
+        created = await api("POST", "/api/sessions", body);
+      }
+      await refresh();
+      await openSession(created.id || created.session.id, { split: side, pane: pane.id });
+    } catch (error) {
+      commands.toast(error.message, { tone: "bad", timeout: 6000 });
+    }
+  }
+
+  // Alt+` between an agent and its companion shell: side by side on a
+  // wide screen (palette "Companion shell" turns that off), else in place.
+  const companionBeside = () => store.get("companion", "split") !== "swap";
+  function flipTo(id, from) {
+    const tab = activeTab();
+    if (phone() || !companionBeside() || !window.matchMedia(WIDE).matches || !tab) {
+      openSession(id);
+      return;
+    }
+    const shown = L.paneShowing(tab.root, id);
+    if (shown) {
+      focusPane(shown.id);
+      return;
+    }
+    const at = L.paneShowing(tab.root, from);
+    const target = sessionById(id);
+    // The agent goes back to the left of its shell.
+    const side = target && target.companion_of ? "right" : "left";
+    openSession(id, at ? { split: side, pane: at.id } : { split: side });
+  }
+
+  // The focused terminal's size: a reasonable first size for a new one.
+  function sizeHint() {
+    const term = focusedTerm();
+    return term ? { cols: term.cols, rows: term.rows } : {};
+  }
+
+  // --- tabs ------------------------------------------------------------
+
+  function newTab() {
+    const layout = viewLayout();
+    if (!state.view || !layout || phone()) return;
+    if (layout.tabs.length >= L.MAX_TABS) {
+      commands.toast(`At most ${L.MAX_TABS} tabs per workspace.`, { timeout: 3000 });
+      return;
+    }
+    const fresh = L.tab(L.nextTabName(layout), null);
+    const view = viewOf(state.view);
+    view.tab = fresh.id;
+    view.focus[fresh.id] = fresh.root.id;
+    saveViews();
+    editLayout(state.view, (draft) => {
+      if (draft.tabs.length >= L.MAX_TABS) return false;
+      draft.tabs.push(L.clone(fresh));
+    });
+  }
+
+  function closeTab(tabId) {
+    const layout = viewLayout();
+    if (!layout) return;
+    const at = layout.tabs.findIndex((t) => t.id === tabId);
+    if (at < 0) return;
+    const view = viewOf(state.view);
+    if ((view.tab || layout.tabs[0].id) === tabId) {
+      const next = layout.tabs[at + 1] || layout.tabs[at - 1];
+      view.tab = next ? next.id : undefined;
+    }
+    delete view.focus[tabId];
+    delete view.zoom[tabId];
+    saveViews();
+    editLayout(state.view, (draft) => {
+      const i = draft.tabs.findIndex((t) => t.id === tabId);
+      if (i < 0) return false;
+      draft.tabs.splice(i, 1);
+    });
+  }
+
+  function cycleTab(delta) {
+    const layout = viewLayout();
+    const tab = activeTab();
+    if (!layout || !tab || layout.tabs.length < 2) return;
+    const at = layout.tabs.indexOf(tab);
+    selectTab(layout.tabs[(at + delta + layout.tabs.length) % layout.tabs.length].id);
+  }
+
+  function renameTab(tabId, name) {
+    const clean = name.trim().slice(0, L.MAX_TAB_NAME);
+    const layout = viewLayout();
+    if (!clean || !layout) return;
+    if (layout.tabs.some((t) => t.id !== tabId && t.name.toLowerCase() === clean.toLowerCase())) {
+      commands.toast(`A tab is already named ${clean}.`, { timeout: 3000 });
+      return;
+    }
+    editLayout(state.view, (draft) => {
+      const t = draft.tabs.find((x) => x.id === tabId);
+      if (!t || t.name === clean) return false;
+      t.name = clean;
+    });
+  }
+
+  // Move the focused pane's session to a tab of its own.
+  function paneToTab(pane) {
+    const tab = activeTab();
+    const layout = viewLayout();
+    if (!pane || !pane.sessionId || !tab || !layout) return;
+    if (layout.tabs.length >= L.MAX_TABS) {
+      commands.toast(`At most ${L.MAX_TABS} tabs per workspace.`, { timeout: 3000 });
+      return;
+    }
+    const sid = pane.sessionId;
+    const session = sessionById(sid);
+    const fresh = L.tab(L.nextTabName(layout, session ? session.name.slice(0, 24) : "tab"), sid);
+    const view = viewOf(state.view);
+    view.tab = fresh.id;
+    view.focus[fresh.id] = fresh.root.id;
+    saveViews();
+    editLayout(state.view, (draft) => {
+      const t = draft.tabs.find((x) => x.id === tab.id);
+      if (t && L.panes(t.root).length > 1) t.root = L.close(t.root, pane.id) || t.root;
+      draft.tabs.push(L.clone(fresh));
+    });
+  }
+
+  let tabRenaming = null;
+  function renderTabs() {
+    const bar = $("#tabs");
+    const layout = viewLayout();
+    if (phone()) {
+      renderSwitcher(bar, layout);
+      return;
+    }
+    if (!state.view || !layout || !layout.tabs.length) {
+      bar.hidden = true;
+      bar.replaceChildren();
+      return;
+    }
+    const active = activeTab();
+    const workspace = workspaceById(state.view);
+    const tabs = layout.tabs.map((t, i) => {
+      if (tabRenaming === t.id) {
+        const input = el("input", {
+          className: "tab-rename",
+          value: t.name,
+          maxLength: L.MAX_TAB_NAME,
+          "aria-label": "Tab name",
+          onkeydown: (e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              tabRenaming = null;
+              renameTab(t.id, e.target.value);
+              renderTabs();
+              focusTerminal();
+            } else if (e.key === "Escape") {
+              tabRenaming = null;
+              renderTabs();
+              focusTerminal();
+            }
+          },
+          onblur: (e) => {
+            if (tabRenaming !== t.id) return;
+            tabRenaming = null;
+            renameTab(t.id, e.target.value);
+            renderTabs();
+          },
+        });
+        requestAnimationFrame(() => {
+          input.focus();
+          input.select();
+        });
+        return el("span", { className: "tab renaming" }, input);
+      }
+      const count = L.sessionsOf(t.root).length;
+      const urgent = L.sessionsOf(t.root).map(sessionById).filter(Boolean)
+        .map((s) => agentStatus(s)?.status).find((s) => s === "blocked") ||
+        L.sessionsOf(t.root).map(sessionById).filter(Boolean).map((s) => agentStatus(s)?.status).find((s) => s === "done");
+      return el(
+        "span",
+        {
+          className: `tab${t === active ? " active" : ""}`,
+          role: "tab",
+          "aria-selected": String(t === active),
+          dataset: { tab: t.id },
+        },
+        el("button", {
+          type: "button",
+          className: "tab-pick",
+          title: `${t.name}: ${count} pane${count === 1 ? "" : "s"}${i < 9 ? ` (Ctrl B ${i + 1} with the prefix on)` : ""}; double-click to rename`,
+          onclick: () => {
+            selectTab(t.id);
+            focusTerminal();
+          },
+          ondblclick: () => {
+            tabRenaming = t.id;
+            renderTabs();
+          },
+          oncontextmenu: (e) => {
+            e.preventDefault();
+            tabMenu(t, e.clientX, e.clientY);
+          },
+          onauxclick: (e) => {
+            if (e.button === 1) closeTab(t.id);
+          },
+        },
+        urgent ? el("span", { className: `tab-dot ${urgent}`, title: `an agent here is ${urgent}` }) : null,
+        t.name,
+        count > 1 ? el("b", { className: "tab-count", textContent: count }) : null),
+        layout.tabs.length > 1 ? iconButton("x", `Close tab ${t.name} (its sessions keep running)`, () => closeTab(t.id)) : null,
+      );
+    });
+    bar.hidden = false;
+    bar.replaceChildren(...[
+      el("span", { className: "tabs-ws", textContent: workspace ? workspace.name : "" }),
+      el("div", { className: "tab-list", role: "tablist", "aria-label": "Tabs" }, tabs),
+      layout.tabs.length < L.MAX_TABS ? iconButton("plus", `New tab (${MOD} T)`, newTab) : null,
+      zoomedIn(active) ? el("button", { type: "button", className: "zoom-pill", onclick: () => toggleZoom(zoomedIn(active)), title: `Unzoom (${MOD} Z)` }, "zoomed") : null,
+    ].filter(Boolean));
+  }
+
+  // Phones: tabs and panes of the viewed workspace as one row of chips.
+  function renderSwitcher(bar, layout) {
+    const chips = [];
+    if (layout && state.solo && state.solo.sessionId) {
+      const multiTab = layout.tabs.length > 1;
+      for (const t of layout.tabs) {
+        for (const leaf of L.panes(t.root)) {
+          const session = sessionById(leaf.session);
+          if (!session) continue;
+          const st = status(session);
+          const on = leaf.session === state.solo.sessionId;
+          chips.push(el(
+            "button",
+            {
+              type: "button",
+              className: `pane-chip${on ? " active" : ""}`,
+              "aria-pressed": String(on),
+              onclick: () => {
+                const view = viewOf(state.view);
+                view.tab = t.id;
+                view.focus[t.id] = leaf.id;
+                saveViews();
+                showSolo(leaf.session);
+              },
+            },
+            el("span", { className: `dot ${st.dot}` }),
+            multiTab ? el("small", { textContent: `${t.name}` }) : null,
+            session.name,
+          ));
+        }
+      }
+    }
+    bar.hidden = chips.length < 2;
+    bar.replaceChildren(...(chips.length < 2 ? [] : [el("div", { className: "pane-switch", role: "toolbar", "aria-label": "Panes" }, chips)]));
+  }
+
+  // --- menus -----------------------------------------------------------
+
+  function closeMenu() {
+    const menu = $("#ctx-menu");
+    if (menu) menu.remove();
+  }
+
+  function showMenu(x, y, items) {
+    closeMenu();
+    const menu = el("div", { id: "ctx-menu", className: "ctx-menu", role: "menu" }, items.map((item) => item.group
+      ? el("div", { className: "ctx-group", role: "presentation", textContent: item.group })
+      : el("button", {
+        type: "button",
+        role: "menuitem",
+        className: item.danger ? "danger" : "",
+        disabled: !!item.disabled,
+        onclick: () => {
+          closeMenu();
+          item.run();
+        },
+      }, el("span", { textContent: item.label }), item.hint ? el("kbd", { textContent: item.hint }) : null)));
+    document.body.append(menu);
+    const box = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(4, Math.min(window.innerWidth - box.width - 4, x))}px`;
+    menu.style.top = `${Math.max(4, Math.min(window.innerHeight - box.height - 4, y))}px`;
+    const first = menu.querySelector("button:not([disabled])");
+    if (first) first.focus();
+    menu.addEventListener("keydown", (event) => {
+      const buttons = [...menu.querySelectorAll("button:not([disabled])")];
+      const at = buttons.indexOf(document.activeElement);
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeMenu();
+        focusTerminal();
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const next = buttons[(at + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length];
+        if (next) next.focus();
+      }
+      event.stopPropagation();
+    });
+  }
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest("#ctx-menu")) closeMenu();
+  }, true);
+  window.addEventListener("blur", closeMenu);
+
+  function paneMenu(pane, x, y) {
+    const session = sessionById(pane.sessionId);
+    const tab = activeTab();
+    if (!session || !tab) return;
+    focusPane(pane.id);
+    const shown = new Set(L.sessionsOf(tab.root));
+    const others = state.sessions.filter((s) => s.workspace_id === session.workspace_id && !shown.has(s.id));
+    const zoomed = zoomedIn(tab) === pane.id;
+    const items = [
+      { label: "Split right: new shell", hint: `${MOD} \\`, run: () => splitWithShell(pane, "right") },
+      { label: "Split down: new shell", hint: `${MOD} -`, run: () => splitWithShell(pane, "down") },
+      { label: zoomed ? "Unzoom" : "Zoom", hint: `${MOD} Z`, run: () => toggleZoom(pane.id), disabled: L.panes(tab.root).length < 2 },
+      { label: "Move to a new tab", run: () => paneToTab(pane), disabled: L.panes(tab.root).length < 2 },
+      { label: "Close pane (keeps running)", hint: `${MOD} X`, run: () => closePane(pane.id) },
+      { label: `Close session ${session.name}`, hint: `${MOD} W`, danger: true, run: () => closeSession(session.id) },
+    ];
+    if (others.length) {
+      items.push({ group: "show beside" });
+      for (const other of others.slice(0, 8)) {
+        items.push({ label: `${other.name} (right)`, run: () => openSession(other.id, { split: "right", pane: pane.id }) });
+      }
+      items.push({ group: "show here instead" });
+      for (const other of others.slice(0, 8)) {
+        items.push({ label: other.name, run: () => openSession(other.id, { pane: pane.id }) });
+      }
+    }
+    showMenu(x, y, items);
+  }
+
+  function tabMenu(t, x, y) {
+    const layout = viewLayout();
+    showMenu(x, y, [
+      { label: "Rename", run: () => {
+        tabRenaming = t.id;
+        renderTabs();
+      } },
+      { label: "New tab", hint: `${MOD} T`, run: newTab, disabled: layout.tabs.length >= L.MAX_TABS },
+      { label: "Close tab (sessions keep running)", danger: true, run: () => closeTab(t.id), disabled: layout.tabs.length < 2 },
+    ]);
+  }
+
+  // --- drag a session from the sidebar onto a pane ---------------------
+
+  const DRAG_TYPE = "application/x-fw-hub-session";
+  let dragged = null; // session id being dragged (dataTransfer is unreadable on dragover)
+
+  // Which part of a pane the pointer is over: an edge (split that way)
+  // or the middle (show it here).
+  function dropZone(box, event) {
+    const x = (event.clientX - box.left) / box.width;
+    const y = (event.clientY - box.top) / box.height;
+    const edges = [["left", x], ["right", 1 - x], ["up", y], ["down", 1 - y]];
+    edges.sort((a, b) => a[1] - b[1]);
+    return edges[0][1] < 0.28 ? edges[0][0] : "center";
+  }
+
+  function bindDrop(node, paneIdOf) {
+    const marker = () => {
+      let mark = node.querySelector(":scope > .drop-mark");
+      if (!mark) {
+        mark = el("div", { className: "drop-mark" });
+        node.append(mark);
+      }
+      return mark;
+    };
+    const clear = () => {
+      const mark = node.querySelector(":scope > .drop-mark");
+      if (mark) mark.remove();
+    };
+    node.addEventListener("dragover", (event) => {
+      if (!dragged || phone()) return;
+      const session = sessionById(dragged);
+      if (!session || session.workspace_id !== state.view) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+      const zone = paneIdOf() && node.classList.contains("pane") && !node.classList.contains("empty-pane")
+        ? dropZone(node.getBoundingClientRect(), event)
+        : "center";
+      marker().dataset.zone = zone;
+    });
+    node.addEventListener("dragleave", (event) => {
+      if (!node.contains(event.relatedTarget)) clear();
+    });
+    node.addEventListener("drop", (event) => {
+      const mark = node.querySelector(":scope > .drop-mark");
+      const zone = mark ? mark.dataset.zone : "center";
+      clear();
+      const id = dragged || event.dataTransfer.getData(DRAG_TYPE);
+      dragged = null;
+      if (!id || !sessionById(id)) return;
+      event.preventDefault();
+      const paneId = paneIdOf();
+      if (zone === "center") openSession(id, paneId ? { pane: paneId } : {});
+      else openSession(id, { split: zone, pane: paneId });
+    });
+  }
+  bindDrop($("#empty"), () => {
+    const leaf = focusedLeaf();
+    return leaf ? leaf.id : null;
+  });
+  // A session from another workspace cannot join this layout.
+  document.addEventListener("dragend", () => {
+    dragged = null;
+    document.querySelectorAll(".drop-mark").forEach((m) => m.remove());
+  });
+
+  // --- sockets ---------------------------------------------------------
+
+  // The header's link pill follows the focused pane.
   function setLink(kind, text) {
     const pill = $("#link");
     pill.dataset.link = kind;
     pill.textContent = text || kind;
   }
 
+  // Hub-wide messages (an error not about one pane).
   function showBanner(text, actions, calm) {
     $("#banner").hidden = false;
     $("#banner").classList.toggle("calm", !!calm);
@@ -550,51 +1693,22 @@
     $("#banner-actions").replaceChildren(...(actions || []).filter(Boolean));
   }
 
-  function hideBanner() {
-    $("#banner").hidden = true;
-  }
-
-  const retryTick = () => {
-    if (state.tick) state.tick();
-  };
-
-  function stopRetry() {
-    clearTimeout(state.retryTimer);
-    clearInterval(state.countdown);
-    state.retryTimer = null;
-    state.countdown = null;
-    state.tick = null;
-  }
-
-  function closeSocket() {
-    stopRetry();
-    if (state.socket) {
-      state.socket.onclose = null;
-      state.socket.close(1000);
-      state.socket = null;
-    }
-    endReplay();
-  }
-
-  // Stop holding the terminal at a snapshot's size (the replay finished or
-  // its socket went away) and fit it back to this viewport.
-  function endReplay() {
-    if (!state.replaying) return;
-    state.replaying = false;
-    if ($("#terminal").clientWidth > 0) mobile.fitTerminal();
-  }
-
+  // Leave the workspace: every pane closes (the layout stays on the hub).
   function detach(message, title) {
-    closeSocket();
-    state.attached = null;
+    for (const pane of livePanes()) pane.dispose();
+    state.panes.clear();
+    state.solo = null;
+    state.focusId = null;
+    state.view = null;
+    state.stageKey = "";
+    $("#terminal").replaceChildren();
     state.attachedMeta = null;
-    state.exited = null;
-    term.reset();
     history.replaceState(null, "", window.location.pathname);
-    hideBanner();
+    $("#banner").hidden = true;
     setLink("idle");
     state.notice = message || "";
     state.noticeTitle = (message && title) || "";
+    renderTabs();
     render();
     sendView();
   }
@@ -611,210 +1725,23 @@
     };
   }
 
-  function attach(id) {
-    const session = sessionById(id);
-    if (!session || !session.live) return;
-    closeSocket();
-    state.attached = id;
-    state.attachedSeq = state.refreshSeq;
-    state.exited = null;
-    state.retry = 0;
-    state.dropped = 0;
-    state.notice = "";
-    state.noticeTitle = "";
-    rememberAttached();
-    delete state.wsErrors[session.workspace_id];
-    rememberWorkspace(session.workspace_id);
-    history.replaceState(null, "", `#session=${id}`);
-    hideBanner();
-    document.body.classList.remove("side-open");
-    term.reset();
-    connect(id);
-    render();
-    sendView();
-  }
-
-  // Show a session that has no terminal on this hub (the hub restarted):
-  // the last screen stays when `keepScreen` (it was attached when the
-  // link died), with Relaunch and Close.
-  function showGone(id, keepScreen) {
-    const session = sessionById(id);
-    if (!session) return;
-    closeSocket();
-    state.attached = id;
-    state.attachedSeq = state.refreshSeq;
-    state.exited = { gone: true };
-    state.notice = "";
-    state.noticeTitle = "";
-    rememberAttached();
-    delete state.wsErrors[session.workspace_id];
-    rememberWorkspace(session.workspace_id);
-    history.replaceState(null, "", `#session=${id}`);
-    document.body.classList.remove("side-open");
-    if (!keepScreen) term.reset();
-    term.write(`\r\n\x1b[2m[no terminal on this hub: ${status(session).label}]\x1b[0m\r\n`);
-    setLink("exited", "gone");
-    showBanner(goneText(session), endedActions(id), true);
-    render();
-    sendView();
-  }
-
-  function endedActions(id) {
-    return [
-      el("button", { type: "button", className: "slab", onclick: () => relaunch(id) }, "Relaunch"),
-      el("button", { type: "button", className: "slab ghost", onclick: () => closeSession(id) }, "Close"),
-    ];
-  }
-
-  // Attach a session with a terminal; show an ended one's state.
-  function openSession(id) {
-    const session = sessionById(id);
-    if (!session) return;
-    if (session.live) attach(id);
-    else showGone(id, false);
-  }
-
-  // Open (or re-open) the attached session's socket. Each connect replays
-  // a snapshot of the session's terminal, so the terminal is reset first.
-  function connect(id) {
-    stopRetry();
-    setLink("connecting", state.retry ? `retry ${state.retry}` : "connecting");
-    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${scheme}://${window.location.host}/api/sessions/${id}/ws`);
-    socket.binaryType = "arraybuffer";
-    state.socket = socket;
-    state.replaying = false;
-    socket.onopen = () => {
-      // The snapshot follows; clear only now, so a dead link keeps the last
-      // screen visible while it retries.
-      term.reset();
-      state.retry = 0;
-      state.dropped = 0;
-      setLink("attached");
-      sendTheme();
-      hideBanner();
-      term.focus();
-      refresh(false).catch(() => {});
-    };
-    // The snapshot is drawn at the session's size: replay exactly its
-    // bytes at that size, then fit to this viewport and resize the session
-    // (the program redraws).
-    let pending = 0;
-    const replayed = () => {
-      if (state.socket !== socket) return;
-      state.replaying = false;
-      if ($("#terminal").clientWidth > 0) mobile.fitTerminal();
-      send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
-    };
-    socket.onmessage = (event) => {
-      if (typeof event.data !== "string") {
-        const bytes = new Uint8Array(event.data);
-        if (pending > 0) {
-          pending -= bytes.length;
-          term.write(bytes, pending <= 0 ? replayed : undefined);
-        } else {
-          term.write(bytes);
-        }
-        return;
-      }
-      let message;
-      try {
-        message = JSON.parse(event.data);
-      } catch (_) {
-        return;
-      }
-      if (message.type === "snapshot") {
-        state.replaying = true;
-        term.resize(message.cols, message.rows);
-        pending = message.bytes;
-        if (!(pending > 0)) replayed();
-      } else if (message.type === "reset") {
-        term.reset();
-      } else if (message.type === "exit") {
-        onExit(id, message);
-      } else if (message.type === "error") {
-        showBanner(message.message, [], true);
-      }
-    };
-    socket.onclose = (event) => {
-      if (state.socket !== socket) return;
-      state.socket = null;
-      endReplay();
-      // 4001: the hub's token was rotated; this login no longer counts.
-      if (event.code === 4001) {
-        window.location.replace("/?signed_out=rotated" + window.location.hash);
-        return;
-      }
-      if (state.exited || state.attached !== id) return;
-      scheduleReconnect(id, event.code);
-    };
-  }
-
-  function onExit(id, message) {
-    const how = exitHow(message);
-    state.exited = message;
-    term.write(`\r\n\x1b[2m[process ended: ${how}]\x1b[0m\r\n`);
-    setLink("exited", "ended");
-    const session = sessionById(id);
-    showBanner(
-      `Process ended (${how}). Scrollback stays until the session is closed or relaunched.`,
-      endedActions(id),
-      !message.signal && message.code === 0,
-    );
-    if (session) refresh().catch(showError);
-  }
-
-  function scheduleReconnect(id, code) {
-    state.retry += 1;
-    const delay = Math.min(10000, 500 * 2 ** Math.min(state.retry - 1, 5));
-    const due = Date.now() + delay;
-    setLink("lost", "link lost");
-    const now = el("button", { type: "button", className: "slab", onclick: () => reconnectNow(id) }, "Reconnect now");
-    const tick = () => {
-      const seconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
-      const why = state.offline
-        ? "The hub is unreachable."
-        : `Link lost (code ${code}); the session keeps running on the hub.`;
-      const dropped = state.dropped
-        ? ` ${state.dropped} keystroke${state.dropped === 1 ? "" : "s"} not sent.`
-        : "";
-      $("#banner-text").textContent = `${why} Reconnecting in ${seconds}s.${dropped}`;
-    };
-    state.tick = tick;
-    showBanner("", [now]);
-    tick();
-    state.countdown = setInterval(tick, 250);
-    state.retryTimer = setTimeout(() => reconnectNow(id), delay);
-  }
-
-  async function reconnectNow(id) {
-    stopRetry();
-    if (state.attached !== id || state.socket) return;
-    try {
-      await refresh();
-    } catch (_) {
-      // Hub unreachable: try the socket anyway; its failure reschedules.
-    }
-    // The refresh may have settled it already (session gone or closed).
-    if (state.attached !== id || state.exited || state.socket) return;
-    const session = sessionById(id);
-    if (state.offline === 0 && !session) {
-      detach("That session was closed.", "Session removed.");
-      return;
-    }
-    if (state.offline === 0 && !session.live) {
-      showGone(id, true);
-      return;
-    }
-    connect(id);
-  }
-
   const wakeUp = () => {
-    if (state.attached && !state.socket && !state.exited) reconnectNow(state.attached);
+    for (const pane of livePanes()) pane.wake();
   };
   window.addEventListener("online", wakeUp);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") wakeUp();
+  });
+
+  // Crossing the phone breakpoint swaps the solo pane and the layout.
+  window.matchMedia(NARROW).addEventListener("change", () => {
+    const shown = state.attached;
+    if (phone()) {
+      renderStage();
+      if (shown) showSolo(shown);
+    } else {
+      renderStage();
+    }
   });
 
   // --- events: pushed agent status -------------------------------------
@@ -851,18 +1778,26 @@
   // someone is at the page (above), else nothing (a window left visible
   // behind an editor is not being looked at, so a turn that finishes
   // there stays "done").
+  // Every pane on screen counts (a split shows several sessions at once;
+  // panes behind a zoom or in other tabs do not).
   function currentView() {
+    if (!present()) return { session_id: null, visible: [] };
     const session = sessionById(state.attached);
-    return present() && session && session.live ? session.id : null;
+    const focused = session && session.live ? session.id : null;
+    const visible = livePanes()
+      .filter((p) => p.sessionId && p.sessionId !== focused && p.el.isConnected && sessionById(p.sessionId)?.live)
+      .map((p) => p.sessionId);
+    return { session_id: focused, visible };
   }
 
   function sendView(force) {
     const socket = state.events;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
     const view = currentView();
-    if (!force && view === state.viewing) return;
-    state.viewing = view;
-    socket.send(JSON.stringify({ type: "view", session_id: view }));
+    const key = JSON.stringify(view);
+    if (!force && key === state.viewing) return;
+    state.viewing = key;
+    socket.send(JSON.stringify({ type: "view", ...view }));
   }
 
   // A status push repaints the sidebar -- except under an inline rename,
@@ -928,6 +1863,8 @@
         commands.onEvent(message);
       } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
         flywheel.onEvent(message);
+      } else if (message.type === "layout") {
+        onLayoutEvent(message);
       }
     };
     socket.onclose = (event) => {
@@ -1044,27 +1981,35 @@
     store.set("workspace", id);
   }
 
-  async function createSession(body) {
-    const created = await api("POST", "/api/sessions", {
-      ...body,
-      cols: term.cols,
-      rows: term.rows,
-    });
+  // `place`: where it shows (see openSession); the focused pane by default.
+  async function createSession(body, place) {
+    const created = await api("POST", "/api/sessions", { ...body, ...sizeHint() });
     await refresh();
-    attach(created.id);
+    await openSession(created.id, place || {});
     return created;
   }
 
   // Relaunch in place: same record (name, place in the sidebar), a fresh
-  // process and scrollback.
+  // process and scrollback; every pane showing it re-attaches.
   async function relaunch(id) {
     if (!sessionById(id)) return;
+    const showing = livePanes().filter((p) => p.sessionId === id);
     try {
-      await api("POST", `/api/sessions/${id}/restart`, { cols: term.cols, rows: term.rows });
+      await api("POST", `/api/sessions/${id}/restart`, sizeHint());
       await refresh();
-      attach(id);
+      if (!showing.length) {
+        await openSession(id);
+        return;
+      }
+      for (const pane of showing) {
+        pane.show(id);
+        pane.shownSeq = state.refreshSeq;
+      }
+      render();
     } catch (error) {
-      showBanner(`Relaunch failed: ${error.message}`, endedActions(id), false);
+      const pane = showing[0];
+      if (pane) pane.showBanner(`Relaunch failed: ${error.message}`, pane.endedActions(id), false);
+      else showBanner(`Relaunch failed: ${error.message}`, [], false);
     }
   }
 
@@ -1114,7 +2059,7 @@
       } finally {
         closing.forEach((c) => setTimeout(() => state.closing.delete(c), 3000));
       }
-      if (state.attached === id || closing.includes(state.attached)) detach();
+      // The hub closed the panes that showed them; refresh follows.
       await refresh();
     } catch (error) {
       flagError(id, error);
@@ -1142,7 +2087,8 @@
   }
 
   function focusTerminal() {
-    if (state.attached && !document.querySelector("dialog[open]") && !paletteOpen()) term.focus();
+    const term = focusedTerm();
+    if (term && !document.querySelector("dialog[open]") && !paletteOpen() && !$("#ctx-menu")) term.focus();
   }
 
   function startRename(id) {
@@ -1189,10 +2135,11 @@
     try {
       for (const session of running) {
         await api("DELETE", `/api/sessions/${session.id}`);
-        if (state.attached === session.id) detach();
       }
       await api("DELETE", `/api/workspaces/${workspace.id}`);
-      if (sessions.some((s) => s.id === state.attached)) detach();
+      if (state.view === workspace.id) detach();
+      delete state.layouts[workspace.id];
+      delete state.confirmed[workspace.id];
       delete state.wsErrors[workspace.id];
       await refresh();
     } catch (error) {
@@ -1208,6 +2155,8 @@
   function renderSession(session, index) {
     const st = status(session);
     const active = state.attached === session.id;
+    // In another pane on screen.
+    const shown = !active && livePanes().some((p) => p.sessionId === session.id && p.el.isConnected);
     const nameNode = state.renaming === session.id
       ? el("input", {
         className: "rename",
@@ -1241,12 +2190,20 @@
     return el(
       "li",
       {
-        className: `session${active ? " active" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of ? " companion" : ""}`,
+        className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of ? " companion" : ""}`,
         dataset: { id: session.id },
         tabIndex: 0,
         role: "button",
         "aria-current": active ? "true" : undefined,
         title: session.live ? undefined : goneText(session),
+        // Drag onto a pane: its edge splits that way, its middle shows it there.
+        draggable: !window.matchMedia(NARROW).matches,
+        ondragstart: (e) => {
+          dragged = session.id;
+          e.dataTransfer.setData(DRAG_TYPE, session.id);
+          e.dataTransfer.setData("text/plain", session.name);
+          e.dataTransfer.effectAllowed = "copyMove";
+        },
         onclick: () => openSession(session.id),
         ondblclick: (e) => {
           if (!e.target.closest("button")) startRename(session.id);
@@ -1418,6 +2375,8 @@
     wheel.style.setProperty("--spin-state", running ? "running" : "paused");
 
     attention.render();
+    if (!tabRenaming) renderTabs();
+    for (const pane of livePanes()) renderPaneHead(pane);
     renderMain();
   }
 
@@ -1518,6 +2477,7 @@
 
   function updateMeters() {
     const session = sessionById(state.attached);
+    const term = focusedTerm();
     $("#meter-size").textContent = session && term ? `${term.cols}×${term.rows}` : "";
     const viewers = session && session.live ? session.live.clients : 0;
     $("#meter-viewers").textContent = viewers > 1 ? `${viewers} viewers` : "";
@@ -1550,9 +2510,7 @@
       // A click on the backdrop lands on the dialog element itself.
       if (event.target === dialog) dialog.close("cancel");
     });
-    dialog.addEventListener("close", () => {
-      if (state.attached && !document.querySelector("dialog[open]")) term.focus();
-    });
+    dialog.addEventListener("close", () => focusTerminal());
   });
 
   // --- dialogs: workspace ----------------------------------------------
@@ -1920,7 +2878,8 @@
     $("#session-name").placeholder = worktrees.taskName() || `${kind} ${count + 1}`;
   }
 
-  async function openSessionDialog(workspaceId) {
+  // `place`: preset "Show in" ("pane", "right", "down", "tab").
+  async function openSessionDialog(workspaceId, place) {
     if (!state.workspaces.length) {
       openWorkspaceDialog();
       return;
@@ -1937,6 +2896,8 @@
     );
     renderKinds(state.kinds || [{ kind: "shell", available: true, program: null }], store.get("kind", "shell"));
     renderRepoPicker();
+    $("#session-place").value = place || "pane";
+    placePickChanged();
     $("#dlg-session").showModal();
     const first = sessionForm.querySelector('input[name="kind"]:checked');
     if (first) first.focus();
@@ -1950,7 +2911,17 @@
     }
   }
 
-  $("#session-workspace").addEventListener("change", renderRepoPicker);
+  // "Show in" means something only for the workspace on the stage, on a
+  // screen with splits; another workspace's session opens in its layout.
+  function placePickChanged() {
+    const usable = !phone() && !!state.view && $("#session-workspace").value === state.view &&
+      !!activeTab() && !!focusedPane();
+    $("#place-pick").hidden = !usable;
+  }
+  $("#session-workspace").addEventListener("change", () => {
+    renderRepoPicker();
+    placePickChanged();
+  });
   $("#repo-picker").addEventListener("change", pickedFolderChanged);
   $("#repo-picker").addEventListener("input", (event) => {
     if (event.target.matches(".repo-filter")) pickedFolderChanged();
@@ -1987,8 +2958,10 @@
         store.set("repo-choice", state.repoChoice);
       }
       store.set("kind", kind);
+      const pick = $("#place-pick").hidden ? "pane" : $("#session-place").value;
+      const place = pick === "tab" ? { newTab: true } : pick === "right" || pick === "down" ? { split: pick } : {};
       $("#dlg-session").close("ok");
-      await createSession(body);
+      await createSession(body, place);
     } catch (error) {
       if (!$("#dlg-session").open) $("#dlg-session").showModal();
       $("#session-error").textContent = error.message;
@@ -2038,8 +3011,44 @@
         cmd(`Relaunch ${attached.name}`, "same session, fresh process", () => relaunch(attached.id), "redo");
       }
       cmd(`Close ${attached.name}`, `${MOD} W`, () => closeSession(attached.id), "x");
-      cmd("Detach", "leave the session running", () => detach(), "chev");
+      cmd("Detach", "close every pane here; the sessions keep running", () => detach(), "chev");
     }
+    if (state.view && !phone()) {
+      const tab = activeTab();
+      const pane = focusedPane();
+      if (pane && pane.sessionId) {
+        cmd("Split right: new shell", `${MOD} \\`, () => splitWithShell(pane, "right"), "split-right");
+        cmd("Split down: new shell", `${MOD} -`, () => splitWithShell(pane, "down"), "split-down");
+        if (tab && L.panes(tab.root).length > 1) {
+          cmd(zoomedIn(tab) ? "Unzoom pane" : "Zoom pane", `${MOD} Z`, () => toggleZoom(), "zoom");
+          cmd("Move pane to a new tab", "", () => paneToTab(pane), "chev");
+        }
+        cmd("Close pane", `${MOD} X · the session keeps running`, () => closePane(), "x");
+      }
+      cmd("New tab", `${MOD} T`, () => newTab(), "plus");
+      const layout = viewLayout();
+      if (layout) {
+        layout.tabs.forEach((t, i) => {
+          if (t !== tab) cmd(`Tab: ${t.name}`, `${L.panes(t.root).length} panes${prefix.on && i < 9 ? ` · Ctrl B ${i + 1}` : ""}`, () => selectTab(t.id), "chev");
+        });
+        if (tab) {
+          cmd(`Rename tab ${tab.name}`, prefix.on ? "Ctrl B ," : "double-click the tab", () => {
+            tabRenaming = tab.id;
+            renderTabs();
+          }, "pen");
+        }
+      }
+    }
+    cmd(`Pane prefix Ctrl B: turn ${prefix.on ? "off" : "on"}`, prefix.on ? "now on (Ctrl B twice sends ^B)" : "tmux-style: Ctrl B then % \" arrows z x c n p", () => {
+      prefix.on = !prefix.on;
+      store.set("prefix", prefix.on);
+      armPrefix(false);
+      commands.toast(prefix.on ? "Pane prefix on: Ctrl B, then a key (Ctrl B twice sends ^B)." : "Pane prefix off: Ctrl B goes to the terminal.", { timeout: 3500 });
+    }, "gear");
+    const beside = companionBeside();
+    cmd(`Companion shell: ${beside ? "in place" : "beside the agent"}`, `${MOD} \` ${beside ? "now opens it beside (wide screens)" : "now flips in place"}`, () => {
+      store.set("companion", beside ? "swap" : "split");
+    }, "gear");
     commands.paletteItems(cmd);
     flywheel.paletteItems(cmd);
     mobile.paletteItems(cmd);
@@ -2165,7 +3174,7 @@
 
   function closePalette() {
     $("#palette").hidden = true;
-    if (state.attached && !document.querySelector("dialog[open]")) term.focus();
+    focusTerminal();
   }
 
   function runPalette(i) {
@@ -2207,7 +3216,7 @@
     if (!live.length) return;
     const at = live.findIndex((s) => s.id === state.attached);
     const next = at < 0 ? (delta > 0 ? 0 : live.length - 1) : (at + delta + live.length) % live.length;
-    attach(live[next].id);
+    openSession(live[next].id);
   }
 
   // The hub chord: Alt (no Ctrl/Meta) elsewhere, Ctrl+Option on macOS.
@@ -2220,6 +3229,77 @@
   // opposed to a layout character or a dead key.
   const typesItself = (event, ch) => event.key.length === 1 && event.key.toUpperCase() === ch;
 
+  const ARROWS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+  const VIM = { KeyH: "left", KeyJ: "down", KeyK: "up", KeyL: "right" };
+
+  // The tmux-style prefix (off unless turned on: palette "Pane prefix"):
+  // Ctrl+B, then one key. Ctrl+B twice sends a literal ^B.
+  const prefix = { on: store.get("prefix", false) === true, armed: false, timer: 0 };
+  function armPrefix(armed) {
+    prefix.armed = armed;
+    clearTimeout(prefix.timer);
+    if (armed) prefix.timer = setTimeout(() => armPrefix(false), 2500);
+    $("#prefix-pill").hidden = !armed;
+  }
+
+  // Returns true when the key was the prefix's (and is consumed).
+  function prefixKey(event) {
+    if (!prefix.on || phone()) return false;
+    const ctrlB = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.code === "KeyB";
+    if (!prefix.armed) {
+      if (!ctrlB) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      armPrefix(true);
+      return true;
+    }
+    if (["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(event.key)) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    armPrefix(false);
+    const key = event.key;
+    const pane = focusedPane();
+    if (ctrlB) {
+      if (pane) pane.send(JSON.stringify({ type: "input", data: "\x02" }));
+    } else if (key === "%") {
+      splitWithShell(pane, "right");
+    } else if (key === '"') {
+      splitWithShell(pane, "down");
+    } else if (ARROWS[event.code] && event.ctrlKey) {
+      nudgePane(ARROWS[event.code]);
+    } else if (ARROWS[event.code]) {
+      focusToward(ARROWS[event.code]);
+    } else if (key === "z") {
+      toggleZoom();
+    } else if (key === "x") {
+      closePane();
+    } else if (key === "c") {
+      newTab();
+    } else if (key === "n") {
+      cycleTab(1);
+    } else if (key === "p") {
+      cycleTab(-1);
+    } else if (key === "o") {
+      cyclePane(1);
+    } else if (/^[1-9]$/.test(key)) {
+      const layout = viewLayout();
+      const t = layout && layout.tabs[Number(key) - 1];
+      if (t) selectTab(t.id);
+    } else if (key === ",") {
+      const t = activeTab();
+      if (t) {
+        tabRenaming = t.id;
+        renderTabs();
+      }
+    } else if (key === "&") {
+      const t = activeTab();
+      if (t) closeTab(t.id);
+    } else if (key === "?") {
+      $("#dlg-keys").showModal();
+    }
+    return true;
+  }
+
   // Capture phase: runs before xterm sees the key, so hub shortcuts never
   // reach the shell (Ctrl+K twice sends a literal ^K).
   window.addEventListener(
@@ -2231,13 +3311,14 @@
         event.stopPropagation();
         if (paletteOpen()) {
           closePalette();
-          if (state.attached) send(JSON.stringify({ type: "input", data: "\x0b" }));
+          if (focusedPane()) focusedPane().send(JSON.stringify({ type: "input", data: "\x0b" }));
         } else if (!document.querySelector("dialog[open]")) {
           openPalette();
         }
         return;
       }
-      if (paletteOpen() || document.querySelector("dialog[open]")) return;
+      if (paletteOpen() || document.querySelector("dialog[open]") || $("#ctx-menu")) return;
+      if (prefixKey(event)) return;
       if (!hubChord(event)) return;
       let handled = true;
       const digit = /^Digit([1-9])$/.exec(event.code);
@@ -2248,7 +3329,7 @@
         handled = false;
       } else if (digit) {
         const target = attachable()[Number(digit[1]) - 1];
-        if (target) attach(target.id);
+        if (target) openSession(target.id);
         else handled = false;
       } else if (event.code === "KeyN") {
         if (event.shiftKey) openWorkspaceDialog();
@@ -2268,6 +3349,22 @@
         commands.flipCompanion();
       } else if (event.code === "KeyF" && !event.shiftKey) {
         flywheel.togglePill();
+      } else if (event.code === "Backslash" && !event.shiftKey && (IS_MAC || event.key === "\\")) {
+        splitWithShell(focusedPane(), "right");
+      } else if (event.code === "Minus" && !event.shiftKey && (IS_MAC || event.key === "-")) {
+        splitWithShell(focusedPane(), "down");
+      } else if (event.shiftKey && ARROWS[event.code]) {
+        focusToward(ARROWS[event.code]);
+      } else if (event.shiftKey && VIM[event.code]) {
+        nudgePane(VIM[event.code]);
+      } else if (event.code === "KeyZ" && !event.shiftKey) {
+        toggleZoom();
+      } else if (event.code === "KeyX" && !event.shiftKey && state.focusId && !phone()) {
+        closePane();
+      } else if (event.code === "KeyT" && !event.shiftKey && state.view && !phone()) {
+        newTab();
+      } else if (event.code === "PageDown" || event.code === "PageUp") {
+        cycleTab(event.code === "PageDown" ? 1 : -1);
       } else {
         handled = false;
       }
@@ -2315,7 +3412,6 @@
       ])
       : Promise.resolve();
     await Promise.race([fonts, new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
-    createTerminal();
     applyTheme(theme);
     loadKinds();
     // Static chord labels follow the platform's hub modifier.

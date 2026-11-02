@@ -212,12 +212,16 @@ impl Entry {
     }
 }
 
-/// A connected client and the session it is looking at.
+/// A connected client and the sessions it is looking at (a split layout
+/// shows several at once).
 #[derive(Debug)]
 struct Viewer {
     client: String,
-    session: Option<String>,
+    sessions: Vec<String>,
 }
+
+/// Most sessions one connection counts as viewing at once.
+pub const MAX_VIEWED: usize = 32;
 
 /// Every agent session's status plus which client views what.
 #[derive(Debug, Default)]
@@ -282,9 +286,7 @@ impl StatusBoard {
     pub fn untrack(&mut self, session_id: &str) {
         self.entries.remove(session_id);
         for viewer in self.viewers.values_mut() {
-            if viewer.session.as_deref() == Some(session_id) {
-                viewer.session = None;
-            }
+            viewer.sessions.retain(|s| s != session_id);
         }
     }
 
@@ -333,7 +335,7 @@ impl StatusBoard {
             entry.seen_by = self
                 .viewers
                 .values()
-                .filter(|v| v.session.as_deref() == Some(session_id))
+                .filter(|v| v.sessions.iter().any(|s| s == session_id))
                 .map(|v| v.client.clone())
                 .collect();
         }
@@ -347,45 +349,73 @@ impl StatusBoard {
             self.next_viewer,
             Viewer {
                 client: client.to_owned(),
-                session: None,
+                sessions: Vec::new(),
             },
         );
         self.next_viewer
     }
 
-    /// Drop a client connection. Returns the session it was viewing when
-    /// nobody else views that session any more.
-    pub fn disconnect(&mut self, viewer: u64) -> Option<String> {
-        let left = self.viewers.remove(&viewer)?.session?;
-        (!self.is_watched(&left)).then_some(left)
+    /// Drop a client connection. Returns the sessions it was viewing that
+    /// nobody else views any more.
+    pub fn disconnect(&mut self, viewer: u64) -> Vec<String> {
+        let Some(left) = self.viewers.remove(&viewer) else {
+            return Vec::new();
+        };
+        left.sessions
+            .into_iter()
+            .filter(|s| !self.is_watched(s))
+            .collect()
     }
 
-    /// The session a connection is looking at.
-    pub fn viewing(&self, viewer: u64) -> Option<&str> {
-        self.viewers.get(&viewer)?.session.as_deref()
+    /// The sessions a connection is looking at.
+    pub fn viewing(&self, viewer: u64) -> &[String] {
+        self.viewers
+            .get(&viewer)
+            .map(|v| v.sessions.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Whether any connection is looking at `session_id`.
     pub fn is_watched(&self, session_id: &str) -> bool {
         self.viewers
             .values()
-            .any(|v| v.session.as_deref() == Some(session_id))
+            .any(|v| v.sessions.iter().any(|s| s == session_id))
     }
 
     /// Record what a connection is looking at (`None`: nothing, or the
     /// page is hidden). Returns whether a finished turn became seen.
     pub fn view(&mut self, viewer: u64, session_id: Option<&str>) -> bool {
+        !self.view_many(viewer, session_id.as_slice()).is_empty()
+    }
+
+    /// Record every session a connection shows (the panes on its screen;
+    /// empty: nothing, or the page is hidden). Untracked ids are ignored,
+    /// duplicates collapse, and at most [`MAX_VIEWED`] count. Returns the
+    /// sessions whose finished turn became seen.
+    pub fn view_many(&mut self, viewer: u64, session_ids: &[&str]) -> Vec<String> {
         let Some(v) = self.viewers.get_mut(&viewer) else {
-            return false;
+            return Vec::new();
         };
-        v.session = session_id
-            .filter(|id| self.entries.contains_key(*id))
-            .map(str::to_owned);
-        let client = v.client.clone();
-        match session_id.and_then(|id| self.entries.get_mut(id)) {
-            Some(entry) if entry.raw.status == AgentStatus::Done => entry.seen_by.insert(client),
-            _ => false,
+        let mut sessions: Vec<String> = Vec::new();
+        for id in session_ids {
+            if sessions.len() >= MAX_VIEWED {
+                break;
+            }
+            if self.entries.contains_key(*id) && !sessions.iter().any(|s| s == id) {
+                sessions.push((*id).to_owned());
+            }
         }
+        v.sessions = sessions.clone();
+        let client = v.client.clone();
+        sessions
+            .into_iter()
+            .filter(|id| match self.entries.get_mut(id) {
+                Some(entry) if entry.raw.status == AgentStatus::Done => {
+                    entry.seen_by.insert(client.clone())
+                }
+                _ => false,
+            })
+            .collect()
     }
 
     /// Spawn `generation`'s status before seen tracking, and how many
@@ -698,5 +728,32 @@ mod tests {
         board.view(viewer, None);
         let away = board.alert("s1").unwrap();
         assert!(!away.watched && away.seen, "{away:?}");
+    }
+
+    #[test]
+    fn every_pane_on_screen_counts_as_viewed() {
+        let mut board = StatusBoard::default();
+        let g1 = board.track("a", "w").unwrap().generation;
+        let g2 = board.track("b", "w").unwrap().generation;
+        for (id, g) in [("a", g1), ("b", g2)] {
+            board.apply(id, g, Signal::Working, None);
+            board.apply(id, g, Signal::Done, None);
+        }
+        let laptop = board.connect("laptop");
+        // Focused pane plus a visible one; unknown ids and repeats drop.
+        let mut seen = board.view_many(laptop, &["a", "b", "nope", "a"]);
+        seen.sort();
+        assert_eq!(seen, ["a", "b"]);
+        assert_eq!(board.viewing(laptop), ["a", "b"]);
+        assert!(board.is_watched("a") && board.is_watched("b"));
+        assert_eq!(status(&board, "b", "laptop"), AgentStatus::Idle);
+        // A turn finishing in either pane is seen at once.
+        board.apply("b", g2, Signal::Working, None);
+        board.apply("b", g2, Signal::Done, None);
+        assert_eq!(status(&board, "b", "laptop"), AgentStatus::Idle);
+        board.untrack("b");
+        assert_eq!(board.viewing(laptop), ["a"]);
+        assert_eq!(board.disconnect(laptop), ["a"]);
+        assert!(!board.is_watched("a"));
     }
 }

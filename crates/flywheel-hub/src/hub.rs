@@ -284,6 +284,9 @@ pub enum HubEvent {
     /// Sessions or workspaces were created, removed, renamed, or changed
     /// state: re-list them.
     Sessions,
+    /// A workspace's tabs and splits were saved (or a removed session's
+    /// panes closed): `rev` is the new revision.
+    Layout { workspace_id: String, rev: u64 },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -1332,6 +1335,8 @@ impl Hub {
                                 signal = codex.feed(&bytes, Instant::now());
                             }
                         }
+                        // A resize redraws: look again.
+                        Ok(SessionEvent::Resize { .. }) => dirty = true,
                         Ok(SessionEvent::Exit(_)) | Err(broadcast::error::TryRecvError::Closed) => {
                             break;
                         }
@@ -1461,7 +1466,7 @@ impl Hub {
 
     pub fn disconnect_viewer(&self, viewer: u64) {
         let left = self.board().disconnect(viewer);
-        if let Some(session_id) = left {
+        for session_id in left {
             self.emit(HubEvent::Unwatched { session_id });
         }
     }
@@ -1469,21 +1474,27 @@ impl Hub {
     /// Record which session a client connection is looking at (`None`:
     /// none, or the page is hidden). Viewing a finished turn marks it seen.
     pub fn set_viewing(&self, viewer: u64, session_id: Option<&str>) {
+        self.set_viewing_many(viewer, session_id.as_slice());
+    }
+
+    /// Record every session a client connection shows (each pane of a
+    /// split layout; empty: none, or the page is hidden).
+    pub fn set_viewing_many(&self, viewer: u64, session_ids: &[&str]) {
         let (seen, left) = {
             let mut board = self.board();
-            let before = board.viewing(viewer).map(str::to_owned);
-            let seen = board.view(viewer, session_id);
-            let left = before
-                .filter(|b| board.viewing(viewer) != Some(b.as_str()) && !board.is_watched(b));
+            let before = board.viewing(viewer).to_vec();
+            let seen = board.view_many(viewer, session_ids);
+            let left: Vec<String> = before
+                .into_iter()
+                .filter(|b| !board.is_watched(b))
+                .collect();
             (seen, left)
         };
-        if let Some(session_id) = left {
+        for session_id in left {
             self.emit(HubEvent::Unwatched { session_id });
         }
-        if let (true, Some(id)) = (seen, session_id) {
-            self.emit(HubEvent::Status {
-                session_id: id.to_owned(),
-            });
+        for session_id in seen {
+            self.emit(HubEvent::Status { session_id });
         }
     }
 
@@ -1826,7 +1837,7 @@ impl Hub {
     /// Kill (if running) and forget a session.
     pub fn remove_session(&self, id: &str) -> Result<(), HubError> {
         let mut store = self.store();
-        store.remove_session(id)?;
+        let relaid = store.remove_session(id)?;
         let live = self.live().remove(id);
         drop(store);
         self.board().untrack(id);
@@ -1834,7 +1845,33 @@ impl Hub {
             forget(&session);
         }
         self.emit(HubEvent::Sessions);
+        if let Some((workspace_id, rev)) = relaid {
+            self.emit(HubEvent::Layout { workspace_id, rev });
+        }
         Ok(())
+    }
+
+    // --- layouts --------------------------------------------------------------
+
+    /// A workspace's tabs and splits (`rev` 0, no tabs: never saved).
+    pub fn layout(&self, workspace_id: &str) -> Result<crate::layout::Layout, HubError> {
+        Ok(self.store().layout(workspace_id)?)
+    }
+
+    /// Save a workspace's layout written against revision `rev` (see
+    /// [`HubStore::set_layout`]); every events client hears of it.
+    pub fn set_layout(
+        &self,
+        workspace_id: &str,
+        rev: u64,
+        tabs: Vec<crate::layout::Tab>,
+    ) -> Result<crate::layout::Layout, HubError> {
+        let layout = self.store().set_layout(workspace_id, rev, tabs)?;
+        self.emit(HubEvent::Layout {
+            workspace_id: workspace_id.to_owned(),
+            rev: layout.rev,
+        });
+        Ok(layout)
     }
 
     /// Record every running session as stopped (with the directory its

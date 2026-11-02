@@ -21,6 +21,7 @@ pub mod daemon;
 pub mod flywheel;
 pub mod git;
 pub mod hub;
+pub mod layout;
 pub mod lifecycle;
 pub mod notify;
 pub mod paths;

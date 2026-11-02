@@ -311,7 +311,7 @@ window.FwHubCommands = function (ctx) {
     const attached = attachedSession();
     if (!attached) return;
     if (attached.companion_of) {
-      if (sessionById(attached.companion_of)) ctx.openSession(attached.companion_of);
+      if (sessionById(attached.companion_of)) ctx.flipTo(attached.companion_of, attached.id);
       else toast(`${attached.name}'s agent session is gone.`, { timeout: 2500 });
       return;
     }
@@ -321,13 +321,13 @@ window.FwHubCommands = function (ctx) {
     }
     const running = companionOf(attached);
     if (running) {
-      ctx.openSession(running.id);
+      ctx.flipTo(running.id, attached.id);
       return;
     }
     try {
       const shell = await api("POST", `/api/sessions/${attached.id}/companion`, ctx.termSize());
       await ctx.refresh();
-      ctx.openSession(shell.id);
+      ctx.flipTo(shell.id, attached.id);
     } catch (error) {
       toast(error.message, { tone: "bad", timeout: 6000 });
     }

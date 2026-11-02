@@ -10,17 +10,22 @@
 use crate::agent::SessionKind;
 use crate::auth::write_private;
 use crate::git::WorktreeRef;
+use crate::layout::{Layout, Tab};
 use crate::pty::ExitInfo;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// State file name inside the state dir.
 pub const STATE_FILE: &str = "state.json";
-/// On-disk schema version.
-pub const STATE_VERSION: u32 = 1;
+/// On-disk schema version: 2 added per-workspace `layouts`. Version 1
+/// files (no layouts) load and are written back as 2; a newer hub's file
+/// is refused rather than rewritten without what it does not know.
+pub const STATE_VERSION: u32 = 2;
+/// The oldest schema version still loaded.
+pub const STATE_VERSION_MIN: u32 = 1;
 /// Limits on workspace input.
 pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_FOLDERS: usize = 32;
@@ -262,6 +267,9 @@ struct StateDoc {
     workspaces: Vec<Workspace>,
     #[serde(default)]
     sessions: Vec<SessionRecord>,
+    /// Workspace id -> its tabs and splits (absent: never laid out).
+    #[serde(default)]
+    layouts: BTreeMap<String, Layout>,
 }
 
 /// Store and validation failures.
@@ -347,11 +355,50 @@ impl HubStore {
             },
             Err(e) => return Err(persist_err(e.to_string())),
         };
-        if doc.version != STATE_VERSION {
+        if !(STATE_VERSION_MIN..=STATE_VERSION).contains(&doc.version) {
             return Err(persist_err(format!(
-                "unsupported version {} (expected {STATE_VERSION})",
+                "unsupported version {} (expected {STATE_VERSION_MIN}..={STATE_VERSION})",
                 doc.version
             )));
+        }
+        let migrated = doc.version != STATE_VERSION;
+        doc.version = STATE_VERSION;
+        // A layout must never name a session or workspace that is gone (a
+        // hand-edited file, or one written by a hub that crashed between
+        // the two changes).
+        let mut pruned = false;
+        {
+            let StateDoc {
+                workspaces,
+                sessions,
+                layouts,
+                ..
+            } = &mut doc;
+            let before = layouts.len();
+            layouts.retain(|id, _| workspaces.iter().any(|w| &w.id == id));
+            pruned |= layouts.len() != before;
+            for (workspace_id, layout) in layouts.iter_mut() {
+                let mut stale: Vec<String> = Vec::new();
+                for tab in &layout.tabs {
+                    for (_, session) in tab.root.panes() {
+                        if let Some(session) = session
+                            && !sessions
+                                .iter()
+                                .any(|s| s.id == session && &s.workspace_id == workspace_id)
+                        {
+                            stale.push(session.to_owned());
+                        }
+                    }
+                }
+                let mut changed = false;
+                for session in stale {
+                    changed |= layout.prune_session(&session);
+                }
+                if changed {
+                    layout.rev += 1;
+                    pruned = true;
+                }
+            }
         }
         // A folder may have become (or stopped being) a git repo, or
         // disappeared, since.
@@ -372,7 +419,7 @@ impl HubStore {
             }
         }
         let store = Self { path, doc };
-        if demoted {
+        if demoted || migrated || pruned {
             store.save()?;
         }
         Ok(store)
@@ -531,6 +578,7 @@ impl HubStore {
             .map(|s| s.id.clone())
             .collect();
         self.doc.sessions.retain(|s| s.workspace_id != id);
+        self.doc.layouts.remove(id);
         self.save_or_rollback(|doc| *doc = previous)?;
         Ok(removed)
     }
@@ -733,8 +781,9 @@ impl HubStore {
         Ok(true)
     }
 
-    /// Forget a session record.
-    pub fn remove_session(&mut self, id: &str) -> Result<(), StateError> {
+    /// Forget a session record, closing the panes that showed it. Returns
+    /// the workspace whose layout that changed, with its new revision.
+    pub fn remove_session(&mut self, id: &str) -> Result<Option<(String, u64)>, StateError> {
         let index = self
             .doc
             .sessions
@@ -742,7 +791,80 @@ impl HubStore {
             .position(|s| s.id == id)
             .ok_or_else(|| StateError::NotFound(format!("session {id}")))?;
         let removed = self.doc.sessions.remove(index);
-        self.save_or_rollback(|doc| doc.sessions.insert(index, removed))
+        let workspace_id = removed.workspace_id.clone();
+        let previous_layout = self.doc.layouts.get(&workspace_id).cloned();
+        let relaid = self
+            .doc
+            .layouts
+            .get_mut(&workspace_id)
+            .filter(|layout| layout.shows(id))
+            .map(|layout| {
+                layout.prune_session(id);
+                layout.rev += 1;
+                (workspace_id.clone(), layout.rev)
+            });
+        self.save_or_rollback(|doc| {
+            doc.sessions.insert(index, removed);
+            if let Some(layout) = previous_layout {
+                doc.layouts.insert(workspace_id, layout);
+            }
+        })?;
+        Ok(relaid)
+    }
+
+    /// A workspace's layout (`rev` 0, no tabs: never saved).
+    pub fn layout(&self, workspace_id: &str) -> Result<Layout, StateError> {
+        self.workspace(workspace_id)?;
+        Ok(self
+            .doc
+            .layouts
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Replace a workspace's layout, written against revision `rev` (the
+    /// one the client last read): a stale `rev` is a conflict. Panes may
+    /// show only the workspace's own sessions. Returns the saved layout
+    /// (its `rev` one higher).
+    pub fn set_layout(
+        &mut self,
+        workspace_id: &str,
+        rev: u64,
+        mut tabs: Vec<Tab>,
+    ) -> Result<Layout, StateError> {
+        let current = self.layout(workspace_id)?;
+        if current.rev != rev {
+            return Err(StateError::Conflict(format!(
+                "the layout changed meanwhile (revision {}, not {rev}); reload it",
+                current.rev
+            )));
+        }
+        let sessions: HashSet<&str> = self
+            .doc
+            .sessions
+            .iter()
+            .filter(|s| s.workspace_id == workspace_id)
+            .map(|s| s.id.as_str())
+            .collect();
+        crate::layout::validate(&mut tabs, &sessions).map_err(StateError::Invalid)?;
+        let layout = Layout {
+            rev: current.rev + 1,
+            tabs,
+        };
+        let previous = self
+            .doc
+            .layouts
+            .insert(workspace_id.to_owned(), layout.clone());
+        self.save_or_rollback(|doc| match previous {
+            Some(previous) => {
+                doc.layouts.insert(workspace_id.to_owned(), previous);
+            }
+            None => {
+                doc.layouts.remove(workspace_id);
+            }
+        })?;
+        Ok(layout)
     }
 
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {
@@ -1647,5 +1769,145 @@ mod tests {
         assert!(message(Path::new("rel/x")).contains("must be absolute"));
         assert!(message(&dir.path().join("missing")).contains("missing"));
         assert!(message(&file).contains("not a directory"));
+    }
+
+    fn pane(id: &str, session: Option<&str>) -> crate::layout::Node {
+        crate::layout::Node::Pane {
+            id: id.into(),
+            session: session.map(Into::into),
+        }
+    }
+
+    fn two_pane_tab(id: &str, name: &str, a: &str, b: &str) -> Tab {
+        Tab {
+            id: id.into(),
+            name: name.into(),
+            root: crate::layout::Node::Split {
+                dir: crate::layout::SplitDir::Right,
+                ratio: 0.6,
+                a: Box::new(pane(&format!("{id}a"), Some(a))),
+                b: Box::new(pane(&format!("{id}b"), Some(b))),
+            },
+        }
+    }
+
+    #[test]
+    fn layouts_persist_per_workspace_with_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let other = store
+            .create_workspace(input("o", vec![repo.clone()]))
+            .unwrap();
+        let s1 = running_session(&ws.id, &repo);
+        let s2 = running_session(&ws.id, &repo);
+        let foreign = running_session(&other.id, &repo);
+        for s in [&s1, &s2, &foreign] {
+            store.insert_session(s.clone()).unwrap();
+        }
+        assert_eq!(store.layout(&ws.id).unwrap(), Layout::default());
+        assert!(matches!(store.layout("nope"), Err(StateError::NotFound(_))));
+
+        let saved = store
+            .set_layout(
+                &ws.id,
+                0,
+                vec![two_pane_tab("t1", "agents", &s1.id, &s2.id)],
+            )
+            .unwrap();
+        assert_eq!(saved.rev, 1);
+        // Written against an old revision: refused, nothing changes.
+        assert!(matches!(
+            store.set_layout(&ws.id, 0, Vec::new()),
+            Err(StateError::Conflict(_))
+        ));
+        // Another workspace's session is not this layout's to show.
+        assert!(matches!(
+            store.set_layout(
+                &ws.id,
+                1,
+                vec![two_pane_tab("t1", "a", &s1.id, &foreign.id)]
+            ),
+            Err(StateError::Invalid(_))
+        ));
+        assert_eq!(store.layout(&ws.id).unwrap(), saved);
+        drop(store);
+
+        // Survives a restart (running sessions load as stopped; layouts
+        // keep naming them, so a restore re-attaches in place).
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert_eq!(store.layout(&ws.id).unwrap(), saved);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["version"], STATE_VERSION);
+        assert_eq!(raw["layouts"][&ws.id]["rev"], 1);
+
+        // Removing a session closes its pane and bumps the revision.
+        assert_eq!(
+            store.remove_session(&s2.id).unwrap(),
+            Some((ws.id.clone(), 2))
+        );
+        let layout = store.layout(&ws.id).unwrap();
+        assert_eq!(layout.tabs[0].root, pane("t1a", Some(&s1.id)));
+        // A session no pane shows leaves the layout alone.
+        assert_eq!(store.remove_session(&foreign.id).unwrap(), None);
+        // Deleting the workspace drops its layout.
+        store
+            .mark_exited(
+                &s1.id,
+                ExitInfo {
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+            .unwrap();
+        store.delete_workspace(&ws.id).unwrap();
+        drop(store);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert!(raw["layouts"].get(&ws.id).is_none(), "{raw}");
+    }
+
+    #[test]
+    fn version_1_files_migrate_and_stale_layout_entries_are_pruned_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r").canonicalize().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"workspaces":[{{"id":"w1","name":"w","repos":[{repo:?}],
+                "created_at":"2026-01-01T00:00:00Z"}}],"sessions":[]}}"#
+            ),
+        )
+        .unwrap();
+        let store = HubStore::open(dir.path()).unwrap();
+        assert_eq!(store.layout("w1").unwrap(), Layout::default());
+        drop(store);
+        let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["version"], STATE_VERSION,
+            "rewritten as the current version"
+        );
+
+        // A layout naming a gone session or workspace (hand edit, crash).
+        raw["layouts"] = serde_json::json!({
+            "w1": {"rev": 4, "tabs": [{"id": "t1", "name": "a", "root":
+                {"type": "split", "dir": "down", "ratio": 0.5,
+                 "a": {"type": "pane", "id": "p1", "session": "gone"},
+                 "b": {"type": "pane", "id": "p2", "session": null}}}]},
+            "w-gone": {"rev": 1, "tabs": []}
+        });
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let store = HubStore::open(dir.path()).unwrap();
+        let layout = store.layout("w1").unwrap();
+        assert_eq!(layout.rev, 5);
+        assert_eq!(layout.tabs[0].root, pane("p2", None));
+        drop(store);
+        let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(raw["layouts"].get("w-gone").is_none(), "{raw}");
     }
 }

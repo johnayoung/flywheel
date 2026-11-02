@@ -22,8 +22,8 @@
 
 window.FwHubMobile = function (ctx) {
   const { $, el, state, store, api, toast, copyText, sessionById, agentStatus } = ctx;
+  // The focused pane's terminal (a phone shows one pane).
   const term = () => ctx.term();
-  const fit = () => ctx.fit();
 
   const coarse = window.matchMedia("(pointer: coarse)");
   const FONT_MIN = 8;
@@ -272,32 +272,34 @@ window.FwHubMobile = function (ctx) {
 
   // --- font size -------------------------------------------------------
 
+  // Every pane's text (the size is per device, not per pane).
   function setFont(size, keep = true) {
     const next = Math.max(FONT_MIN, Math.min(FONT_MAX, Math.round(size)));
-    const t = term();
-    if (!t) return;
-    if (t.options.fontSize !== next) {
+    for (const pane of ctx.panes()) {
+      const t = pane.term;
+      if (!t || t.options.fontSize === next) continue;
       t.options.fontSize = next;
-      if ($("#terminal").clientWidth > 0 && !state.replaying) fitTerminal();
+      pane.refit();
     }
     if (keep) store.set("font-size", next);
   }
 
   // --- fitting ---------------------------------------------------------
 
-  // Fit the terminal to its box, but never below MIN_ROWS: the PTY's size
-  // is every viewer's, and a phone with its keyboard up (or Compose open)
-  // would otherwise squeeze the agent's real terminal to a row or two. A
-  // floored terminal is bottom-aligned (where prompts are) and clipped.
-  function fitTerminal() {
-    const t = term();
-    const f = fit();
+  // Fit a pane's terminal to its box, but never below MIN_ROWS: the PTY's
+  // size is every viewer's, and a phone with its keyboard up (or Compose
+  // open) would otherwise squeeze the agent's real terminal to a row or
+  // two. A floored terminal is bottom-aligned (where prompts are) and
+  // clipped. `pane`: {term, fit, host} (panes.js); the focused one if none.
+  function fitTerminal(pane = ctx.pane()) {
+    const t = pane && pane.term;
+    const f = pane && pane.fit;
     if (!t || !f) return;
     const dims = f.proposeDimensions();
     if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return;
     const cols = Math.max(2, dims.cols);
     const rows = Math.max(MIN_ROWS, dims.rows);
-    $("#terminal").classList.toggle("floored", rows > dims.rows);
+    pane.host.classList.toggle("floored", rows > dims.rows);
     if (t.cols !== cols || t.rows !== rows) t.resize(cols, rows);
   }
 
@@ -922,15 +924,17 @@ window.FwHubMobile = function (ctx) {
     cmd("Text: smaller", `${fontSize()}px`, () => setFont(fontSize() - 1), "chev");
   }
 
-  // Called once the terminal exists.
-  function attachTerminal() {
-    const t = term();
+  // Called for each pane's terminal once it exists: quick answers follow
+  // the focused one's screen.
+  function attachTerminal(t) {
     t.onWriteParsed(() => {
+      if (t !== term()) return;
       if (!$("#quick").hidden || isBlocked(sessionById(state.attached))) scheduleQuick();
     });
-    bindTouch();
   }
 
+  // Touch gestures on the stage act on the focused pane's terminal.
+  bindTouch();
   buildKeybar();
   bindCompose();
   bindSelectionPop();

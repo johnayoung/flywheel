@@ -85,6 +85,9 @@ pub enum SessionEvent {
     Output(Bytes),
     /// The child exited; no further output follows.
     Exit(ExitInfo),
+    /// A viewer resized the terminal (in order with the output: what
+    /// follows is drawn at this size).
+    Resize { cols: u16, rows: u16 },
 }
 
 /// What to spawn.
@@ -404,8 +407,17 @@ impl PtySession {
             if shared.exit.is_some() {
                 return Ok(());
             }
+            let changed = shared.size.cols != size.cols || shared.size.rows != size.rows;
             shared.size = size;
             shared.screen.resize(size.cols, size.rows);
+            if changed {
+                // Under the lock, like output, so every viewer hears of it
+                // between the same two chunks.
+                let _ = self.events.send(SessionEvent::Resize {
+                    cols: size.cols,
+                    rows: size.rows,
+                });
+            }
         }
         self.master
             .lock()
@@ -728,6 +740,7 @@ mod tests {
             match att.events.try_recv() {
                 Ok(SessionEvent::Output(bytes)) => seen.push_str(&String::from_utf8_lossy(&bytes)),
                 Ok(SessionEvent::Exit(_)) => break,
+                Ok(SessionEvent::Resize { .. }) => {}
                 Err(_) => thread::sleep(Duration::from_millis(10)),
             }
         }

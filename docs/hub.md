@@ -18,7 +18,7 @@ fw hub open [--session S]                     # open a browser here, signed in (
 fw hub token [--rotate]                       # print the access token (created on first use) / rotate it
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent-suggested code blocks
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
-# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
+# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
 # every verb takes --state-dir DIR
 ```
 
@@ -178,6 +178,16 @@ Built for driving Claude Code and Codex from a phone (tested at 390x844 and 430x
 - **Alerts** (sidebar chip, per device): a system notification when an agent becomes blocked or done while the page is hidden, unfocused, or idle 5 min; each spell once, one per session and status per 15 s (a later spell waits for the window); clicking it opens that session. Needs https or localhost; on iOS only from the Home Screen app.
 - **Install**: `/manifest.webmanifest` (standalone, flywheel icons) + `/sw.js`. The service worker never touches `/api`, sockets, or sign-in; it serves the cached signed-in page and `/assets/` only when the hub is unreachable (the page then says so and reconnects), is replaced with each hub build, and is emptied on sign-out. The Home Screen app has its own cookies on iOS: sign in once more there (`fw hub url --qr`).
 
+## Flywheel panel
+
+Workspace folders that are flywheel-adopted repos (a `flywheel.toml` or a `.flywheel/` dir) get a Flywheel panel: the verified loop beside the terminals. Read-only; `--no-flywheel` turns it off.
+
+- **What it shows**: active phases (`tasks/active/<phase>/`) and their tasks as `pending | running | verified | failed | parked | awaiting | blocked` (from `fw status --json`: `verified` = a DONE lifecycle, `parked` = DONE but its landing parked); in-flight runs (the console's live rows); the 12 newest runs with their latest attempt's grader receipts; worker liveness (a live lease in `task_claims` -- an idle worker holds none) and autopilot liveness (`.flywheel/logs/autopilot/activity.json`); claims; and alerts (failed, stranded, stopped, awaiting a gate, blocked), which also join the sidebar's **Needs you** list.
+- **Where**: an adopted folder's sidebar chip gets a `verified/total` badge (red with alerts, pulsing while runs or daemons are live); click it, the `flywheel` header pill (attached session in an adopted folder; `Alt F`), a Needs-you row, or the palette.
+- **Actions**: **Start worker here** opens a hub shell session `fw worker` running `<this fw> worker` in the folder (a real terminal; when it exits the shell stays; a restart restores it as a plain shell). **Output** on a task / run opens its `fw show` summary and its redacted agent transcript (`<store dir>/logs/runs/<run>.jsonl`, newest 1500 entries, followed live while the run is in flight).
+- **Cost**: one watcher thread per adopted folder; every 2s it stats the policy, store (+ `-wal`), task tree, and activity record, and re-reads only on a change or every 15s (leases lapse with time). Each folder's own `flywheel.toml` is read (paths anchored at the folder, never the hub's cwd); stores are opened once and kept. A missing SQLite store is never created (tasks list as pending). Tracker sources (`github*`) are not listed (a network call per read): runs, claims, and alerts still show. Opening a store runs its idempotent schema bootstrap, as every `fw` read verb does.
+- **Seam**: `flywheel-hub` defines `flywheel::FlywheelProvider` and plain data; the `flywheel` crate implements it (`hub_flywheel.rs`) over its console/status code and injects it into `fw hub serve`, so the hub never depends on the loop's crates.
+
 ## API
 
 All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`rows` of 0 mean the default (120x32).
@@ -207,12 +217,16 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET | `/folders/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical,"git"}` or `{"ok":false,"error"}` (the workspace form validates as you type); `/repos/check` is the old name |
 | GET | `/notify` | `{"push":null}` or `{"push":{"host","events","debounce_secs","settle_secs","detail"}}` |
 | POST | `/notify/test` | 204 sent; 409 push off; 502 `{"error"}` the webhook refused or was unreachable |
+| GET | `/flywheel` | `{"enabled","folders":[summary]}`; summary `{"folder","generated_at","phases","counts":{state:n},"alerts":[{"kind","subject","detail","run_id"}],"live_runs","worker_live","autopilot_live","problem"}` |
+| GET | `/flywheel/panel?folder=` | the whole panel (`phases`, `live`, `runs`, `worker`, `autopilot`, `claims`, `alerts`, `source`, `store`, `problem`); 404 unless an adopted workspace folder |
+| GET | `/flywheel/run?folder=&run=&since=N` | `{"run_id","task_id","status","active","summary","from","entries":[{"ts","kind","header","body","error"}],"next"}`; poll with `since=next`. 400 bad run id, 404 unknown run |
+| POST | `/flywheel/worker` | `{"folder","workspace_id"?,"cols"?,"rows"?}` -> 201 the new `fw worker` session |
 
 WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001 (even one whose upgrade raced the rotation); the UI then shows sign-in with a "token was rotated" notice.
 
 Session views carry `agent` (`{"status","detail"?,"since"}`, agent kinds only), `agent_session_id`, `worktree`, `companion_of`, and `git` (`{"branch","dirty","untracked","ahead","behind","against"?}` from the badge cache; absent until read or outside git).
 
-Events WebSocket (`client`: 1-64 of `[A-Za-z0-9_-]`, else 400; omitted, the connection gets its own): server sends `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` on connect and after falling behind, `{"type":"status","session_id","status"|null,"workspace_id","workspace_status"}` per change (as this client sees it), and `{"type":"sessions"}` when sessions or workspaces changed (re-list), and `{"type":"commands","session_id","fresh","commands":[...]}` when an agent suggested code blocks (newest first; `fresh`: written in the last 2 minutes, not a re-read backlog). Client sends `{"type":"view","session_id":id|null}` (what it shows; `null` while hidden). Token rotation closes it with 4001 too.
+Events WebSocket (`client`: 1-64 of `[A-Za-z0-9_-]`, else 400; omitted, the connection gets its own): server sends `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` on connect and after falling behind, `{"type":"status","session_id","status"|null,"workspace_id","workspace_status"}` per change (as this client sees it), and `{"type":"sessions"}` when sessions or workspaces changed (re-list), and `{"type":"commands","session_id","fresh","commands":[...]}` when an agent suggested code blocks (newest first; `fresh`: written in the last 2 minutes, not a re-read backlog), `{"type":"flywheel","folder","summary"|null}` when an adopted folder's panel changed (`null`: no longer watched), and `{"type":"flywheel_reset"}` after missing some (re-list `/api/flywheel`). Client sends `{"type":"view","session_id":id|null}` (what it shows; `null` while hidden). Token rotation closes it with 4001 too.
 
 Screen text: `source=visible` (default) is the screen's rows (`lines` is refused); `recent` the last `lines` (1..100000, default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
 
@@ -240,6 +254,7 @@ Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working /
 | `Alt W`; `Delete` on a focused sidebar row | close session (confirms while it runs) |
 | `Alt C` / `Alt Shift C` | Commands drawer / copy the last suggested shell command |
 | ``Alt ` `` | flip between an agent and its companion shell (opened on first use) |
+| `Alt F` | Flywheel panel of the attached session's folder |
 
 The **Commands drawer** (`suggested` in the header, `Alt C`, or the palette; it overlays the terminal so opening it never resizes the PTY for other viewers) lists the attached agent's code blocks newest first (from a shell session: the workspace's agent that suggested last, or the one picked), unwrapped in monospace, each with Copy (the clipboard API on https/localhost, a selected-textarea fallback on plain-http LAN and iOS Safari), Send (paste into the chosen running shell of the workspace, no Enter) and Send + Run. "send to" defaults to the agent's companion shell, else the attached shell, else a shell in the agent's directory; with none, it is "new shell (companion)" and the buttons read Open shell & send / Open shell & run (start the companion, wait for its prompt, paste). A line under the pickers says where Send goes. Keys in the drawer: arrows / `j` `k` pick, `Enter` or `c` copy, `1`-`9` copy the nth, `s` Send, `Shift S` Send + Run, `Esc` close. Lines wider than the card fade at the edge with a `wide: scroll` hint. A new shell command from an agent in the workspace in view raises a toast with Copy.
 

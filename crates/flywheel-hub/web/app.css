@@ -2112,3 +2112,295 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 @media (max-width: 480px) {
   .flip-pill span { font-size: 10px; margin-left: .3rem; }
 }
+
+/* --- flywheel panel ------------------------------------------------------- */
+/* Verified work beside the terminals (flywheel.js). One more ink: a
+   verified green, tuned per theme like the rest. */
+
+:root, :root[data-theme="dark"] { --fw-ok: #8cc265; --fw-ok-ink: #0b1406; }
+:root[data-theme="light"] { --fw-ok: #3d7a22; --fw-ok-ink: #f6fbf1; }
+@media (prefers-color-scheme: light) {
+  :root[data-theme="auto"] { --fw-ok: #3d7a22; --fw-ok-ink: #f6fbf1; }
+}
+
+/* A sidebar folder chip of an adopted repo: opens its panel. */
+.ws-repos .fw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: 0 .3rem 0 0;
+  border: 0;
+  border-radius: 2px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+.ws-repos .fw-chip:hover span, .ws-repos .fw-chip.open span { color: var(--ink); }
+.ws-repos .fw-chip.open { background: var(--bg-4); }
+.fw-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  padding: 0 .3rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  color: var(--ink-2);
+  font-weight: 600;
+  font-size: 9px;
+  letter-spacing: .04em;
+  font-variant-numeric: tabular-nums;
+}
+.fw-chip.alert .fw-badge { border-color: var(--alert); color: var(--alert); }
+.fw-chip.live .fw-badge { border-color: var(--signal); color: var(--ink); }
+.fw-dot {
+  display: inline-block;
+  width: .42rem;
+  height: .42rem;
+  border-radius: 50%;
+  background: var(--ink-3);
+  flex: none;
+}
+.fw-dot.live { background: var(--signal); box-shadow: 0 0 0 2px var(--signal-soft); animation: fw-pulse 1.8s ease-in-out infinite; }
+.fw-dot.alert { background: var(--alert); }
+@keyframes fw-pulse { 50% { box-shadow: 0 0 0 4px transparent; } }
+
+.fw-pill[data-tone="alert"] { border-color: var(--alert); }
+.fw-pill b { background: var(--alert); color: #fff; }
+
+/* The drawer: the commands drawer's frame, wider, verified green edge. */
+.fw-drawer { width: min(46rem, 100%); border-left-color: var(--fw-ok); z-index: 4; }
+.fw-drawer .cmd-head { border-bottom: 1px solid var(--rule-2); padding-bottom: .7rem; }
+.fw-drawer .sheet-kicker { color: var(--fw-ok); }
+.fw-read { margin-left: .5rem; color: var(--ink-3); letter-spacing: .12em; }
+.fw-path {
+  display: block;
+  margin-top: .25rem;
+  max-width: 34rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+.fw-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 1rem 1.2rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+.fw-empty { margin: .6rem 0; color: var(--ink-3); line-height: 1.6; }
+.fw-problem {
+  margin: .7rem 0 0;
+  padding: .5rem .7rem;
+  border-left: 3px solid var(--brass);
+  background: var(--bg-3);
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+.fw-daemons {
+  display: grid;
+  gap: .35rem;
+  margin: 0 -1rem;
+  padding: .7rem 1rem .75rem;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-3);
+}
+.fw-daemon {
+  display: grid;
+  grid-template-columns: auto 5.5rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .55rem;
+  min-height: 1.9rem;
+}
+.fw-daemon b {
+  font-size: 10px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+.fw-daemon.live b { color: var(--ink); }
+.fw-daemon-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.fw-daemon-actions { display: inline-flex; align-items: center; gap: .7rem; }
+.fw-start { padding: .35rem .65rem; }
+.fw-where { display: flex; flex-wrap: wrap; gap: .2rem 1.2rem; color: var(--ink-3); font-size: 10px; padding-left: 1rem; }
+
+.fw-sec { margin-top: 1.05rem; }
+.fw-sec h3 {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+  margin: 0 0 .45rem;
+  font: 700 1.05rem/1 var(--display);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.fw-n { font: 500 10px/1 var(--mono); letter-spacing: .08em; color: var(--ink-3); text-transform: none; }
+
+.fw-list { list-style: none; margin: 0; padding: 0; }
+.fw-list > li { border-top: 1px solid var(--rule); }
+.fw-list > li:first-child { border-top: 0; }
+
+.fw-phase { margin-bottom: .9rem; border: 1px solid var(--rule-2); background: var(--bg); }
+.fw-phase-head { display: flex; justify-content: space-between; align-items: baseline; gap: .6rem; padding: .4rem .6rem .3rem; }
+.fw-phase-head b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.fw-phase-head small { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.fw-bar { display: flex; gap: 2px; height: 4px; margin: 0 .6rem .35rem; background: var(--rule); }
+.fw-seg { display: block; height: 100%; min-width: 4px; }
+
+/* One color per lifecycle light, shared by the bar and the pills. */
+.fw-seg.verified, .fw-light.verified { background: var(--fw-ok); color: var(--fw-ok-ink); }
+.fw-seg.running, .fw-light.running { background: var(--signal); color: var(--signal-ink); }
+.fw-seg.failed, .fw-light.failed { background: var(--alert); color: #fff; }
+.fw-seg.parked, .fw-light.parked { background: var(--brass); color: var(--signal-ink); }
+.fw-seg.awaiting, .fw-light.awaiting { background: var(--brass); color: var(--signal-ink); }
+.fw-seg.blocked, .fw-light.blocked { background: var(--ink-2); color: var(--bg); }
+.fw-seg.pending { background: var(--rule-2); }
+.fw-light.pending { background: none; color: var(--ink-3); box-shadow: inset 0 0 0 1px var(--rule-2); }
+
+.fw-task, .fw-alert {
+  display: grid;
+  grid-template-columns: 5.6rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .6rem;
+  padding: .38rem .6rem;
+}
+.fw-light, .fw-kind, .fw-status {
+  justify-self: start;
+  padding: .1rem .38rem;
+  border-radius: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.fw-task-text { display: grid; min-width: 0; gap: .05rem; }
+.fw-task-text b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-weight: 600; }
+.fw-task-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: 10.5px; }
+.fw-task.failed .fw-task-text small, .fw-task.parked .fw-task-text small { color: var(--ink-2); }
+.fw-task-meta { display: inline-flex; align-items: center; gap: .6rem; color: var(--ink-3); }
+.fw-task-meta small { font-size: 10px; }
+.fw-out { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+
+.fw-alert { border-left: 3px solid var(--alert); background: var(--bg); }
+.fw-alert.awaiting, .fw-alert.stopped, .fw-alert.blocked { border-left-color: var(--brass); }
+.fw-kind { background: var(--alert); color: #fff; }
+.fw-kind.awaiting, .fw-kind.stopped, .fw-kind.blocked { background: var(--brass); color: var(--signal-ink); }
+.fw-list > li.fw-alert { border-top: 1px solid var(--rule); margin-bottom: 2px; }
+
+.fw-run { padding: .45rem .1rem .5rem; }
+.fw-run-line { display: grid; grid-template-columns: 6.6rem minmax(0, 1fr) auto auto; align-items: center; gap: .6rem; }
+.fw-run-line b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.fw-run-when { color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.fw-run.stale .fw-run-when { color: var(--alert); }
+.fw-status { box-shadow: inset 0 0 0 1px var(--rule-2); color: var(--ink-2); }
+.fw-status.done { background: var(--fw-ok); color: var(--fw-ok-ink); box-shadow: none; }
+.fw-status.running, .fw-status.validating { background: var(--signal); color: var(--signal-ink); box-shadow: none; }
+.fw-status.failed, .fw-status.failed_validation, .fw-status.internal_error { background: var(--alert); color: #fff; box-shadow: none; }
+.fw-status.awaiting_approval, .fw-status.interrupted { background: var(--brass); color: var(--signal-ink); box-shadow: none; }
+.fw-run-sub { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .35rem .8rem; margin: .3rem 0 0 7.2rem; }
+.fw-run.live > small, .fw-run-error { display: block; margin: .25rem 0 0 7.2rem; color: var(--ink-3); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fw-run-error { color: var(--alert); }
+.fw-run-cost { color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.fw-graders { display: flex; flex-wrap: wrap; gap: .25rem; min-width: 0; }
+.fw-grader {
+  padding: 0 .35rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  font-size: 10px;
+  line-height: 1.55;
+  white-space: nowrap;
+}
+.fw-grader::before { margin-right: .3em; font-weight: 700; }
+.fw-grader.pass { border-color: color-mix(in srgb, var(--fw-ok) 55%, var(--rule-2)); color: var(--ink-2); }
+.fw-grader.pass::before { content: "\2713"; color: var(--fw-ok); }
+.fw-grader.fail { border-color: var(--alert); color: var(--alert); }
+.fw-grader.fail::before { content: "\2717"; }
+.fw-nograders { color: var(--ink-3); font-size: 10px; }
+
+.fw-claim { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: .6rem; padding: .3rem .1rem; color: var(--ink-3); }
+.fw-claim b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font-weight: 500; }
+.fw-claim.live b, .fw-claim.live span { color: var(--ink); }
+.fw-claim small { font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* Needs you: flywheel rows beside the agents. */
+.attn-row.fw { border-left-color: var(--alert); }
+.attn-row.fw.awaiting, .attn-row.fw.stopped, .attn-row.fw.blocked { border-left-color: var(--brass); }
+.attn-row .glyph.fw svg { width: .85rem; height: .85rem; color: var(--fw-ok); }
+.attn-status.fw { background: var(--alert); }
+.attn-status.fw.awaiting, .attn-status.fw.stopped, .attn-status.fw.blocked { background: var(--brass); }
+
+/* The run output viewer. */
+.fw-run-sheet {
+  width: min(64rem, calc(100vw - 2rem));
+  height: calc(100dvh - 4rem);
+  display: none;
+  overflow: hidden;
+}
+.fw-run-sheet[open] { display: flex; flex-direction: column; }
+.run-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0; }
+.run-head h2 { overflow-wrap: anywhere; }
+.run-tabs {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .55rem 1.4rem;
+  border-bottom: 1px solid var(--rule);
+}
+.run-tabs [role="tab"] {
+  padding: .3rem .7rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: none;
+  color: var(--ink-2);
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.run-tabs [role="tab"][aria-selected="true"] { border-color: var(--fw-ok); color: var(--ink); background: var(--bg-4); }
+.run-tabs .cmd-check { margin-left: auto; }
+.run-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: .7rem 1.4rem 1.4rem;
+  background: var(--bg);
+  font: 400 12px/1.5 var(--term);
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+.run-summary { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font: inherit; }
+.run-entry { display: grid; grid-template-columns: 4.6rem minmax(0, 1fr); column-gap: .7rem; padding: .18rem 0; }
+.run-ts { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.run-header { font-weight: 700; color: var(--ink-2); overflow-wrap: anywhere; }
+.run-text, .run-fold { grid-column: 2; margin: .1rem 0 .2rem; }
+.run-text { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: var(--ink); }
+.run-fold summary { cursor: pointer; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.run-entry.agent_text .run-header { color: var(--fw-ok); }
+.run-entry.tool_call .run-header { color: var(--signal); }
+.run-entry.tool_result .run-header { color: var(--ink-3); font-weight: 500; }
+.run-entry.tool_result .run-text { color: var(--ink-2); }
+.run-entry.user_text .run-header, .run-entry.operator_say .run-header { color: var(--brass); }
+.run-entry.system, .run-entry.result, .run-entry.lifecycle { color: var(--ink-3); }
+.run-entry.system .run-text, .run-entry.result .run-text, .run-entry.lifecycle .run-text { color: var(--ink-3); }
+.run-entry.gate .run-header, .run-entry.error .run-header, .run-entry.error .run-text { color: var(--alert); }
+
+@media (max-width: 760px) {
+  .fw-daemon { grid-template-columns: auto 5rem minmax(0, 1fr); }
+  .fw-daemon-actions { grid-column: 1 / -1; justify-content: flex-end; }
+  .fw-task, .fw-alert { grid-template-columns: 5rem minmax(0, 1fr) auto; }
+  .fw-run-line { grid-template-columns: 5.6rem minmax(0, 1fr) auto; }
+  .fw-run-line .fw-run-when { display: none; }
+  .fw-run-sub, .fw-run.live > small, .fw-run-error { margin-left: 0; }
+  .fw-run-sheet { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+  .run-entry { grid-template-columns: 1fr; }
+  .run-text, .run-fold { grid-column: 1; }
+  .run-ts { display: none; }
+}

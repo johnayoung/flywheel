@@ -257,11 +257,29 @@
     },
   });
 
+  // The Flywheel panel (flywheel.js): verified-loop state for the
+  // flywheel-adopted folders.
+  const flywheel = window.FwHubFlywheel({
+    $, el, icon, api, state, workspaceById, sessionById, folderLabel,
+    openSession: (id) => openSession(id),
+    toast: commands.toast,
+    confirmDialog: (options) => confirmDialog(options),
+    refresh: () => refresh(),
+    rerender: () => render(),
+    onOpen: () => {
+      if (commands.isOpen()) commands.toggle();
+    },
+    focusTerminal: () => {
+      if (state.attached && term && !document.querySelector("dialog[open]")) term.focus();
+    },
+  });
+
   // The phone and alerts modules (pwa.js, attention.js, notify.js,
   // mobile.js).
   const pwa = window.FwHubPwa();
   const attention = window.FwHubAttention({
     $, el, icon, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
+    flywheel,
   });
   const notify = window.FwHubNotify({
     $, state, store, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
@@ -882,6 +900,7 @@
       sendView(true);
       // Anything that changed while the socket was down.
       refresh(false).catch(() => {});
+      flywheel.reload();
     };
     socket.onmessage = (event) => {
       let message;
@@ -907,6 +926,8 @@
         refresh(false).catch(() => {});
       } else if (message.type === "commands") {
         commands.onEvent(message);
+      } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
+        flywheel.onEvent(message);
       }
     };
     socket.onclose = (event) => {
@@ -1332,13 +1353,13 @@
           "div",
           { className: "ws-repos" },
           workspace.folders.map((f) =>
-            el("span", {
+            flywheel.folderChip(f, el("span", {
               className: f.missing ? "missing" : f.git ? "git" : "plain",
               textContent: folderLabel(f),
               title: f.missing
                 ? `${f.path} (missing: moved or deleted?)`
                 : f.git ? `${f.path} (git repo)` : `${f.path} (plain folder, no git)`,
-            })),
+            }), workspace.id)),
         ),
         error
           ? el("p", {
@@ -1468,6 +1489,7 @@
 
     commands.render();
     commands.prefetch();
+    flywheel.render();
     mobile.render();
 
     const actions = $("#empty-actions");
@@ -2019,6 +2041,7 @@
       cmd("Detach", "leave the session running", () => detach(), "chev");
     }
     commands.paletteItems(cmd);
+    flywheel.paletteItems(cmd);
     mobile.paletteItems(cmd);
     notify.paletteItems(cmd);
     for (const workspace of state.workspaces) {
@@ -2243,6 +2266,8 @@
         else commands.toggle();
       } else if (event.code === "Backquote" && !event.shiftKey && state.attached) {
         commands.flipCompanion();
+      } else if (event.code === "KeyF" && !event.shiftKey) {
+        flywheel.togglePill();
       } else {
         handled = false;
       }
@@ -2272,6 +2297,7 @@
     "toggle-sidebar": () => document.body.classList.toggle("side-open"),
     "toggle-commands": () => commands.toggle(),
     "flip-companion": () => commands.flipCompanion(),
+    "toggle-flywheel": () => flywheel.togglePill(),
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");

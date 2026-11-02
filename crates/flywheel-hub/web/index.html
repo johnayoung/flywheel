@@ -99,6 +99,7 @@
         <span id="meter-viewers" class="meter"></span>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
+        <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
     </header>
@@ -126,6 +127,17 @@
         <p class="cmd-hint" id="cmd-hint" aria-live="polite"></p>
         <ul id="cmd-list" class="cmd-list"></ul>
         <footer class="cmd-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</footer>
+      </aside>
+      <aside id="flywheel" class="commands fw-drawer" hidden tabindex="-1" aria-label="Flywheel panel">
+        <header class="cmd-head">
+          <div class="cmd-title">
+            <span class="sheet-kicker">flywheel <span id="fw-read" class="fw-read"></span></span>
+            <h2 id="fw-title"></h2>
+            <span id="fw-path" class="fw-path"></span>
+          </div>
+          <button type="button" class="icon" id="fw-close" title="Close (Esc)" aria-label="Close the Flywheel panel"><svg><use href="#i-x"/></svg></button>
+        </header>
+        <div id="fw-body" class="fw-body"></div>
       </aside>
       <div id="empty" class="empty">
         <section id="empty-attention" class="attention empty-attention" hidden aria-label="Agents that need you"></section>
@@ -281,6 +293,23 @@
   </form>
 </dialog>
 
+<dialog id="dlg-run" class="sheet fw-run-sheet" aria-labelledby="run-title">
+  <header class="sheet-head run-head">
+    <div>
+      <span class="sheet-kicker">run output</span>
+      <h2 id="run-title"></h2>
+      <span id="run-meta" class="fw-path"></span>
+    </div>
+    <button type="button" class="icon" data-close title="Close (Esc)" aria-label="Close run output"><svg><use href="#i-x"/></svg></button>
+  </header>
+  <div class="run-tabs" role="tablist" aria-label="Run output">
+    <button type="button" role="tab" id="run-tab-transcript" aria-selected="true" aria-controls="run-body">Transcript</button>
+    <button type="button" role="tab" id="run-tab-summary" aria-selected="false" aria-controls="run-body">Summary</button>
+    <label class="cmd-check" id="run-follow-wrap" hidden><input type="checkbox" id="run-follow" checked> follow</label>
+  </div>
+  <div id="run-body" class="run-body" role="tabpanel" tabindex="0"></div>
+</dialog>
+
 <dialog id="dlg-keys" class="sheet narrow" aria-labelledby="keys-title">
   <form method="dialog">
     <header class="sheet-head">
@@ -326,6 +355,7 @@
 <script src="/assets/commands.js"></script>
 <script src="/assets/import.js"></script>
 <script src="/assets/pwa.js"></script>
+<script src="/assets/flywheel.js"></script>
 <script src="/assets/attention.js"></script>
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>

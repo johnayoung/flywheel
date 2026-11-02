@@ -3,6 +3,7 @@
 
 use crate::auth::{LOGIN_CODE_TTL, Token};
 use crate::client;
+use crate::flywheel::{FlywheelMonitor, MonitorTiming};
 use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
 use crate::notify::{Notifier, NotifyConfig};
 use crate::paths::default_state_dir;
@@ -191,6 +192,10 @@ pub(crate) struct HubArgs {
     /// conversations (Claude Code `--resume`, `codex resume`).
     #[arg(long)]
     no_agent_resume: bool,
+    /// Turn off the Flywheel panel (verified-loop status for the
+    /// flywheel-adopted folders of your workspaces).
+    #[arg(long)]
+    no_flywheel: bool,
     /// Where the web UI's "Import VS Code workspace" looks for
     /// *.code-workspace files (3 levels deep) [default: ~/code].
     #[arg(long, value_name = "DIR")]
@@ -241,6 +246,9 @@ impl HubArgs {
         if self.no_agent_resume {
             argv.push("--no-agent-resume".to_owned());
         }
+        if self.no_flywheel {
+            argv.push("--no-flywheel".to_owned());
+        }
         if let Some(root) = &self.import_root {
             // Absolute: the detached hub runs from `/`.
             let root = std::path::absolute(root).unwrap_or_else(|_| root.clone());
@@ -290,8 +298,33 @@ pub fn main(args: &[String]) -> i32 {
     code
 }
 
+/// What the embedding binary plugs into `fw hub serve`.
+#[derive(Clone, Default)]
+pub struct HubExtensions {
+    /// Reads flywheel state for the Flywheel panel (`None`: no panel).
+    pub flywheel: Option<Arc<dyn crate::flywheel::FlywheelProvider>>,
+}
+
+impl std::fmt::Debug for HubExtensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubExtensions")
+            .field("flywheel", &self.flywheel.is_some())
+            .finish()
+    }
+}
+
 /// [`main`] against injected streams.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    run_with(args, out, err, &HubExtensions::default())
+}
+
+/// [`run`] with the embedding binary's [`HubExtensions`].
+pub fn run_with(
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    extensions: &HubExtensions,
+) -> i32 {
     if args.first().map(String::as_str) == Some("report") {
         return report_main(&args[1..], &mut std::io::stdin().lock(), &EnvReport, err);
     }
@@ -313,7 +346,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match cli.command {
         HubCommand::Token(args) => token(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
-        HubCommand::Serve(args) => serve_cmd(args, out, err),
+        HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.
         HubCommand::Report(_) => 0,
@@ -736,7 +769,12 @@ fn route_address(unspecified: IpAddr) -> Option<IpAddr> {
     (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
-fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn serve_cmd(
+    args: ServeArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    extensions: &HubExtensions,
+) -> i32 {
     // Detached (`fw hub start`): everything this process writes to stdout
     // and stderr goes to the rotating log from here on. Declared first so
     // it is dropped last, after the final message.
@@ -974,10 +1012,24 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if let Some(ts) = &tailscale {
         allowed_origins.extend(ts.serve_urls.iter().cloned());
     }
+    let flywheel = match (&extensions.flywheel, hub_args.no_flywheel) {
+        (Some(provider), false) => {
+            let monitor = FlywheelMonitor::new(Arc::clone(provider), MonitorTiming::default());
+            match monitor.watch(&hub) {
+                Ok(()) => Some(monitor),
+                Err(e) => {
+                    let _ = writeln!(err, "fw hub: Flywheel panel off: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let server_options = ServerOptions {
         allowed_origins,
         trusted_proxies: hub_args.trusted_proxies,
         notifier,
+        flywheel,
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve(

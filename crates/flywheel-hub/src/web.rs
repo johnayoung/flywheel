@@ -64,6 +64,7 @@ const JS: &str = "text/javascript; charset=utf-8";
 const ASSETS: &[(&str, &[u8], &str)] = &[
     ("app.js", include_bytes!("../web/app.js"), JS),
     ("attention.js", include_bytes!("../web/attention.js"), JS),
+    ("flywheel.js", include_bytes!("../web/flywheel.js"), JS),
     ("mobile.js", include_bytes!("../web/mobile.js"), JS),
     ("notify.js", include_bytes!("../web/notify.js"), JS),
     ("pwa.js", include_bytes!("../web/pwa.js"), JS),

@@ -1,0 +1,689 @@
+// flywheel hub: the Flywheel panel. For every workspace folder that is a
+// flywheel-adopted repo: its active phases and tasks with lifecycle
+// status, in-flight and recent runs with grader receipts, worker and
+// autopilot liveness, claims, and the stop / strand alerts -- read-only,
+// beside the terminals. Actions: start `fw worker` in a hub shell session
+// there, and open a run's output (its `fw show` summary and redacted
+// agent transcript). app.js creates it with its helpers; protocol:
+// GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
+// /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
+// {"type":"flywheel_reset"} pushes.
+"use strict";
+
+window.FwHubFlywheel = function (ctx) {
+  const { $, el, icon, api, state, workspaceById, folderLabel, openSession, toast, confirmDialog } = ctx;
+
+  const RUN_POLL_MS = 2000;
+  const ui = {
+    enabled: false,
+    summaries: new Map(), // folder path -> summary
+    folder: null, // folder whose panel is open
+    workspaceId: null, // workspace it was opened from
+    panel: null,
+    loading: false,
+    error: "",
+    seq: 0,
+    run: null, // the run viewer's state
+  };
+
+  const LIGHTS = ["failed", "parked", "awaiting", "blocked", "running", "pending", "verified"];
+  const KIND_LABEL = {
+    failed: "failed",
+    stranded: "stranded",
+    stopped: "stopped",
+    awaiting: "awaiting you",
+    blocked: "blocked",
+  };
+
+  // --- time --------------------------------------------------------------
+
+  function ago(iso) {
+    const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (!Number.isFinite(seconds)) return "";
+    return span(seconds);
+  }
+  function span(seconds) {
+    if (seconds < 60) return `${Math.floor(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
+  }
+  function clock(iso) {
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour12: false });
+  }
+  const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+  const dollars = (n) => `$${(n || 0).toFixed(2)}`;
+
+  // --- data --------------------------------------------------------------
+
+  async function reload() {
+    try {
+      const data = await api("GET", "/api/flywheel");
+      ui.enabled = !!data.enabled;
+      ui.summaries = new Map((data.folders || []).map((s) => [s.folder, s]));
+    } catch (_) {
+      return;
+    }
+    changed();
+    if (ui.folder) loadPanel();
+  }
+
+  function onEvent(message) {
+    if (message.type === "flywheel_reset") {
+      reload();
+      return;
+    }
+    ui.enabled = true;
+    if (message.summary) ui.summaries.set(message.folder, message.summary);
+    else ui.summaries.delete(message.folder);
+    changed();
+    if (ui.folder === message.folder) {
+      if (message.summary) loadPanel();
+      else renderDrawer();
+    }
+  }
+
+  function changed() {
+    ctx.rerender();
+    renderPill();
+  }
+
+  async function loadPanel() {
+    const folder = ui.folder;
+    if (!folder) return;
+    const seq = ++ui.seq;
+    ui.loading = !ui.panel || ui.panel.folder !== folder;
+    if (ui.loading) renderDrawer();
+    try {
+      const panel = await api("GET", `/api/flywheel/panel?folder=${encodeURIComponent(folder)}`);
+      if (seq !== ui.seq || ui.folder !== folder) return;
+      ui.panel = panel;
+      ui.error = "";
+    } catch (error) {
+      if (seq !== ui.seq || ui.folder !== folder) return;
+      ui.error = error.message;
+    }
+    ui.loading = false;
+    renderDrawer();
+  }
+
+  const summary = (folder) => ui.summaries.get(folder) || null;
+
+  // The worst thing about a folder, for its badge.
+  function tone(s) {
+    if (!s) return "";
+    if (s.alerts.length) return "alert";
+    if (s.live_runs || s.worker_live || s.autopilot_live) return "live";
+    return "idle";
+  }
+
+  function total(s) {
+    return Object.values(s.counts).reduce((a, b) => a + b, 0);
+  }
+
+  // The adopted folder a session runs in (its own folder, or above it).
+  function folderOf(session) {
+    if (!session) return null;
+    const cwd = session.cwd || "";
+    let best = null;
+    for (const folder of ui.summaries.keys()) {
+      if ((cwd === folder || cwd.startsWith(`${folder}/`)) && (!best || folder.length > best.length)) best = folder;
+    }
+    return best;
+  }
+
+  // Hub sessions running a worker in `folder` (started from this panel).
+  function workerSessions(folder) {
+    return state.sessions.filter((s) =>
+      s.cwd === folder && s.live && s.live.pid && s.state === "running" &&
+      Array.isArray(s.command) && s.command[3] === "fw-worker");
+  }
+
+  function workspaceFor(folder) {
+    const preferred = ui.workspaceId && workspaceById(ui.workspaceId);
+    if (preferred && preferred.folders.some((f) => f.path === folder)) return preferred;
+    return state.workspaces.find((w) => w.folders.some((f) => f.path === folder)) || null;
+  }
+
+  function labelFor(folder) {
+    for (const w of state.workspaces) {
+      const f = w.folders.find((x) => x.path === folder);
+      if (f) return folderLabel(f);
+    }
+    return folder.split("/").filter(Boolean).pop() || folder;
+  }
+
+  // --- sidebar: folder chips --------------------------------------------
+
+  // `node` is the plain folder chip; an adopted folder's becomes a button
+  // that opens its panel, with a verified / total count and a tone dot.
+  function folderChip(folder, node, workspaceId) {
+    const s = summary(folder.path);
+    if (!s) return node;
+    const count = total(s);
+    const verified = s.counts.verified || 0;
+    const t = tone(s);
+    const why = s.alerts.length
+      ? `${s.alerts.length} need${s.alerts.length === 1 ? "s" : ""} you`
+      : s.live_runs ? `${s.live_runs} running` : s.worker_live ? "worker live" : "idle";
+    return el(
+      "button",
+      {
+        type: "button",
+        className: `fw-chip ${t}${ui.folder === folder.path ? " open" : ""}`,
+        title: `${node.title}\nflywheel: ${verified}/${count} verified, ${why}. Open the Flywheel panel.`,
+        "aria-label": `${folderLabel(folder)}: Flywheel panel (${verified} of ${count} verified, ${why})`,
+        onclick: (event) => {
+          event.stopPropagation();
+          open(folder.path, workspaceId);
+        },
+      },
+      node,
+      el(
+        "b",
+        { className: "fw-badge" },
+        el("i", { className: `fw-dot ${t}`, "aria-hidden": "true" }),
+        count ? `${verified}/${count}` : "fw",
+      ),
+    );
+  }
+
+  // --- attention list ------------------------------------------------------
+
+  // Every adopted folder's alerts, for "Needs you".
+  function attention() {
+    const out = [];
+    for (const [folder, s] of ui.summaries) {
+      for (const alert of s.alerts) out.push({ folder, label: labelFor(folder), alert });
+    }
+    const rank = { failed: 0, stranded: 1, awaiting: 2, blocked: 3, stopped: 4 };
+    out.sort((a, b) => (rank[a.alert.kind] ?? 9) - (rank[b.alert.kind] ?? 9) || a.label.localeCompare(b.label));
+    return out;
+  }
+
+  // --- header pill -----------------------------------------------------------
+
+  function renderPill() {
+    const pill = $("#fw-toggle");
+    if (!pill) return;
+    const session = ctx.sessionById(state.attached);
+    const folder = folderOf(session);
+    pill.hidden = !folder;
+    if (!folder) return;
+    const s = summary(folder);
+    pill.setAttribute("aria-pressed", String(ui.folder === folder));
+    pill.dataset.tone = tone(s);
+    const badge = $("#fw-count");
+    badge.hidden = !s.alerts.length;
+    badge.textContent = String(s.alerts.length);
+    pill.title = `Flywheel panel for ${labelFor(folder)} (Alt F)`;
+  }
+
+  function togglePill() {
+    const folder = folderOf(ctx.sessionById(state.attached));
+    if (!folder) return;
+    if (ui.folder === folder) close();
+    else open(folder, ctx.sessionById(state.attached).workspace_id);
+  }
+
+  // --- the drawer -------------------------------------------------------------
+
+  function open(folder, workspaceId) {
+    if (ui.folder !== folder) ui.panel = null;
+    ui.folder = folder;
+    ui.workspaceId = workspaceId || null;
+    ui.error = "";
+    ctx.onOpen();
+    renderDrawer();
+    $("#flywheel").focus({ preventScroll: true });
+    loadPanel();
+    changed();
+  }
+
+  function close() {
+    if (!ui.folder) return;
+    ui.folder = null;
+    ui.panel = null;
+    renderDrawer();
+    changed();
+    ctx.focusTerminal();
+  }
+
+  $("#fw-close").addEventListener("click", close);
+  $("#flywheel").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.querySelector("dialog[open]")) {
+      event.stopPropagation();
+      close();
+    }
+  });
+
+  function section(title, count, ...body) {
+    return el(
+      "section",
+      { className: "fw-sec" },
+      el("h3", {}, title, count !== undefined && count !== null ? el("span", { className: "fw-n", textContent: String(count) }) : null),
+      ...body,
+    );
+  }
+
+  function outputButton(run_id, task) {
+    if (!run_id) return null;
+    return el("button", {
+      type: "button",
+      className: "text-btn fw-out",
+      textContent: "output",
+      title: `Open run ${run_id}'s output`,
+      onclick: (event) => {
+        event.stopPropagation();
+        openRun(ui.folder, run_id, task);
+      },
+    });
+  }
+
+  function daemonRow(name, daemon, extra) {
+    return el(
+      "div",
+      { className: `fw-daemon${daemon.live ? " live" : ""}` },
+      el("i", { className: `fw-dot ${daemon.live ? "live" : "idle"}`, "aria-hidden": "true" }),
+      el("b", { textContent: name }),
+      el("span", { className: "fw-daemon-detail", textContent: daemon.detail }),
+      extra || null,
+    );
+  }
+
+  async function startWorker() {
+    const folder = ui.folder;
+    const panel = ui.panel;
+    const workspace = workspaceFor(folder);
+    if (!folder || !workspace) return;
+    if (panel && panel.worker.live) {
+      const ok = await confirmDialog({
+        kicker: "flywheel",
+        title: "Start another worker?",
+        body: `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
+        ok: "Start worker",
+      });
+      if (!ok) return;
+    }
+    try {
+      const view = await api("POST", "/api/flywheel/worker", { folder, workspace_id: workspace.id });
+      await ctx.refresh();
+      // The worker's terminal is the thing to watch now.
+      close();
+      openSession(view.id);
+      toast(el("span", {}, "Started ", el("b", { textContent: "fw worker" }), ` in ${labelFor(folder)}`), { timeout: 3500 });
+    } catch (error) {
+      toast(`Could not start a worker: ${error.message}`, { tone: "bad" });
+    }
+  }
+
+  function phaseBar(tasks) {
+    const counts = {};
+    for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
+    return el(
+      "div",
+      { className: "fw-bar", role: "img", "aria-label": LIGHTS.filter((l) => counts[l]).map((l) => `${counts[l]} ${l}`).join(", ") },
+      LIGHTS.filter((l) => counts[l]).map((l) => el("i", { className: `fw-seg ${l}`, style: `flex-grow:${counts[l]}`, title: `${counts[l]} ${l}` })),
+    );
+  }
+
+  function taskRow(task) {
+    const note = task.stranded
+      ? `stranded: ${task.stranded.kind}${task.stranded.detail ? ` -- ${task.stranded.detail}` : ""}`
+      : task.stopped
+        ? `stopped: ${task.stopped.kind}${task.stopped.detail ? ` -- ${task.stopped.detail}` : ""}`
+        : task.awaiting
+          ? `awaiting: ${task.awaiting}`
+          : task.blocked_on
+            ? `blocked on ${task.blocked_on}`
+            : task.error || (task.prerequisites.length && task.state === "pending" ? `after ${task.prerequisites.join(", ")}` : "");
+    return el(
+      "li",
+      { className: `fw-task ${task.state}` },
+      el("span", { className: `fw-light ${task.state}`, textContent: task.state }),
+      el(
+        "span",
+        { className: "fw-task-text" },
+        el("b", { textContent: task.id, title: task.id }),
+        note ? el("small", { textContent: note, title: note }) : null,
+      ),
+      el(
+        "span",
+        { className: "fw-task-meta" },
+        task.worker_id ? el("small", { textContent: task.worker_id, title: "worker" }) : null,
+        outputButton(task.run_id, task.id),
+      ),
+    );
+  }
+
+  function graderChips(graders) {
+    if (!graders.length) return el("span", { className: "fw-nograders", textContent: "no receipts" });
+    return el(
+      "span",
+      { className: "fw-graders" },
+      graders.map((g) => el("span", {
+        className: `fw-grader ${g.passed ? "pass" : "fail"}`,
+        textContent: g.name,
+        title: `${g.kind} grader ${g.name}: ${g.passed ? "pass" : "FAIL"} (${g.duration_ms} ms)`,
+      })),
+    );
+  }
+
+  function runRow(run) {
+    return el(
+      "li",
+      { className: `fw-run ${run.status}` },
+      el(
+        "div",
+        { className: "fw-run-line" },
+        el("span", { className: `fw-status ${run.status}`, textContent: run.status.replace("_", " ") }),
+        el("b", { textContent: run.task_id, title: run.run_id }),
+        el("span", { className: "fw-run-when", textContent: run.updated_at ? `${ago(run.updated_at)} ago` : "" }),
+        outputButton(run.run_id, run.task_id),
+      ),
+      el(
+        "div",
+        { className: "fw-run-sub" },
+        graderChips(run.graders),
+        el("small", {
+          className: "fw-run-cost",
+          textContent: `${run.attempts} attempt${run.attempts === 1 ? "" : "s"} · ${tokens(run.tokens)} tok · ${dollars(run.cost_usd)}`,
+        }),
+      ),
+      run.error ? el("small", { className: "fw-run-error", textContent: run.error, title: run.error }) : null,
+    );
+  }
+
+  function liveRow(run) {
+    const idle = run.idle_seconds;
+    return el(
+      "li",
+      { className: `fw-run live${idle > 90 ? " stale" : ""}` },
+      el(
+        "div",
+        { className: "fw-run-line" },
+        el("span", { className: `fw-status ${run.status}`, textContent: run.status.replace("_", " ") }),
+        el("b", { textContent: run.task_id, title: run.run_id }),
+        el("span", {
+          className: "fw-run-when",
+          textContent: idle !== null && idle !== undefined ? `idle ${span(idle)}${idle > 90 ? " STALE" : ""}` : "",
+        }),
+        outputButton(run.run_id, run.task_id),
+      ),
+      el("small", {
+        className: "fw-run-cost",
+        textContent: [
+          run.attempt ? `attempt ${run.attempt}` : null,
+          run.iteration ? `iter ${run.iteration}` : null,
+          `${tokens(run.tokens)} tok`,
+          dollars(run.cost_usd),
+          run.worker_id,
+          run.awaiting ? `awaiting: ${run.awaiting}` : run.last_detail,
+        ].filter(Boolean).join(" · "),
+      }),
+    );
+  }
+
+  function alertRow(alert) {
+    return el(
+      "li",
+      { className: `fw-alert ${alert.kind}` },
+      el("span", { className: `fw-kind ${alert.kind}`, textContent: KIND_LABEL[alert.kind] || alert.kind }),
+      el(
+        "span",
+        { className: "fw-task-text" },
+        el("b", { textContent: alert.subject }),
+        el("small", { textContent: alert.detail, title: alert.detail }),
+      ),
+      outputButton(alert.run_id, alert.subject),
+    );
+  }
+
+  function claimRow(claim) {
+    const lease = Date.parse(claim.lease_expires_at) - Date.now();
+    return el(
+      "li",
+      { className: `fw-claim${claim.live ? " live" : ""}` },
+      el("b", { textContent: claim.task_id }),
+      el("span", { textContent: claim.worker_id }),
+      el("small", {
+        textContent: claim.live ? `lease ${span(lease / 1000)} left` : `lapsed ${ago(claim.lease_expires_at)} ago`,
+      }),
+    );
+  }
+
+  function renderDrawer() {
+    const drawer = $("#flywheel");
+    drawer.hidden = !ui.folder;
+    if (!ui.folder) return;
+    const folder = ui.folder;
+    const panel = ui.panel && ui.panel.folder === folder ? ui.panel : null;
+    $("#fw-title").textContent = labelFor(folder);
+    // The LRMs keep the path's slashes in place under the start-ellipsis
+    // (direction: rtl) styling, as the header's cwd meter does.
+    $("#fw-path").textContent = `\u200e${folder}\u200e`;
+    $("#fw-path").title = folder;
+    const workers = workerSessions(folder);
+    const body = $("#fw-body");
+    if (!panel) {
+      body.replaceChildren(el("p", { className: "fw-empty", textContent: ui.error || "Reading the loop's state..." }));
+      $("#fw-read").textContent = "";
+      return;
+    }
+    $("#fw-read").textContent = `read ${ago(panel.generated_at)} ago`;
+    $("#fw-read").title = `${panel.source} · ${panel.store}`;
+    const start = el(
+      "button",
+      { type: "button", className: "slab fw-start", onclick: startWorker, title: "Run fw worker in a new shell session in this folder" },
+      icon("plus"),
+      panel.worker.live ? "Start another worker" : "Start worker here",
+    );
+    const goto = workers.length
+      ? el("button", {
+        type: "button",
+        className: "text-btn",
+        textContent: workers.length === 1 ? "open worker session" : `${workers.length} worker sessions`,
+        onclick: () => openSession(workers[0].id),
+      })
+      : null;
+    const tasks = panel.phases.flatMap((p) => p.tasks);
+    const verified = tasks.filter((t) => t.state === "verified").length;
+    const children = [
+      el(
+        "div",
+        { className: "fw-daemons" },
+        daemonRow("worker", panel.worker, el("span", { className: "fw-daemon-actions" }, goto, start)),
+        daemonRow("autopilot", panel.autopilot),
+        el("div", { className: "fw-where" }, el("span", { textContent: panel.source }), el("span", { textContent: panel.store })),
+      ),
+    ];
+    if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
+    if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));
+    if (panel.alerts.length) {
+      children.push(section("Needs you", panel.alerts.length, el("ul", { className: "fw-list" }, panel.alerts.map(alertRow))));
+    }
+    if (panel.live.length) {
+      children.push(section("In flight", panel.live.length, el("ul", { className: "fw-list" }, panel.live.map(liveRow))));
+    }
+    if (panel.tasks_note) children.push(section("Tasks", null, el("p", { className: "fw-empty", textContent: panel.tasks_note })));
+    else if (!panel.phases.length) {
+      children.push(section("Active phases", 0, el("p", { className: "fw-empty", textContent: "No active tasks: every phase is archived (or none was planned yet)." })));
+    } else {
+      children.push(section(
+        "Active phases",
+        `${verified}/${tasks.length} verified`,
+        ...panel.phases.map((phase) => el(
+          "div",
+          { className: "fw-phase" },
+          el(
+            "div",
+            { className: "fw-phase-head" },
+            el("b", { textContent: phase.name }),
+            el("small", { textContent: `${phase.tasks.filter((t) => t.state === "verified").length}/${phase.tasks.length}` }),
+          ),
+          phaseBar(phase.tasks),
+          el("ul", { className: "fw-list" }, phase.tasks.map(taskRow)),
+        )),
+      ));
+    }
+    children.push(section(
+      "Recent runs",
+      panel.runs.length,
+      panel.runs.length
+        ? el("ul", { className: "fw-list" }, panel.runs.map(runRow))
+        : el("p", { className: "fw-empty", textContent: "No runs recorded yet." }),
+    ));
+    if (panel.claims.length) {
+      children.push(section("Claims", panel.claims.length, el("ul", { className: "fw-list fw-claims" }, panel.claims.map(claimRow))));
+    }
+    const scroll = body.scrollTop;
+    body.replaceChildren(...children);
+    body.scrollTop = scroll;
+  }
+
+  // "read Ns ago" and lease countdowns move while the drawer shows.
+  setInterval(() => {
+    if (ui.folder && ui.panel && document.visibilityState === "visible") {
+      $("#fw-read").textContent = `read ${ago(ui.panel.generated_at)} ago`;
+    }
+  }, 5000);
+
+  // --- run output viewer -------------------------------------------------------
+
+  const runDialog = $("#dlg-run");
+
+  function openRun(folder, runId, task) {
+    if (ui.run) clearTimeout(ui.run.timer);
+    ui.run = { folder, runId, task, next: 0, from: 0, entries: [], summary: "", status: null, active: false, tab: "transcript", timer: null, error: "", seq: 0 };
+    $("#run-title").textContent = task || runId;
+    $("#run-meta").textContent = runId;
+    $("#run-body").replaceChildren(el("p", { className: "fw-empty", textContent: "Reading the run..." }));
+    selectTab("transcript");
+    if (!runDialog.open) runDialog.showModal();
+    pollRun();
+  }
+
+  async function pollRun() {
+    const run = ui.run;
+    if (!run || !runDialog.open) return;
+    const seq = ++run.seq;
+    try {
+      const out = await api(
+        "GET",
+        `/api/flywheel/run?folder=${encodeURIComponent(run.folder)}&run=${encodeURIComponent(run.runId)}&since=${run.next}`,
+      );
+      if (ui.run !== run || seq !== run.seq) return;
+      if (out.from > run.next || run.next === 0) {
+        // The first read (or a gap past the retained window): start over.
+        run.entries = out.entries;
+        run.from = out.from;
+      } else {
+        run.entries.push(...out.entries);
+      }
+      run.next = out.next;
+      run.summary = out.summary;
+      run.status = out.status;
+      run.active = out.active;
+      run.error = "";
+      renderRun(out.entries.length > 0);
+    } catch (error) {
+      if (ui.run !== run) return;
+      run.error = error.message;
+      renderRun(false);
+    }
+    if (ui.run === run && run.active && runDialog.open) run.timer = setTimeout(pollRun, RUN_POLL_MS);
+  }
+
+  function selectTab(tab) {
+    if (ui.run) ui.run.tab = tab;
+    for (const name of ["transcript", "summary"]) {
+      const button = $(`#run-tab-${name}`);
+      button.setAttribute("aria-selected", String(name === tab));
+    }
+    renderRun(true);
+    if (tab === "summary") $("#run-body").scrollTop = 0;
+  }
+  $("#run-tab-transcript").addEventListener("click", () => selectTab("transcript"));
+  $("#run-tab-summary").addEventListener("click", () => selectTab("summary"));
+  runDialog.addEventListener("close", () => {
+    if (ui.run) clearTimeout(ui.run.timer);
+    ui.run = null;
+  });
+
+  function entryNode(entry) {
+    const body = entry.body || "";
+    const lines = body.split("\n");
+    const long = entry.kind === "tool_result" && lines.length > 4;
+    const text = long
+      ? el(
+        "details",
+        { className: "run-fold" },
+        el("summary", { textContent: `${lines[0].slice(0, 160)}  (+${lines.length - 1} lines)` }),
+        el("pre", { className: "run-text", textContent: body }),
+      )
+      : body ? el("pre", { className: "run-text", textContent: body }) : null;
+    return el(
+      "div",
+      { className: `run-entry ${entry.kind}${entry.error ? " error" : ""}` },
+      el("span", { className: "run-ts", textContent: clock(entry.ts) }),
+      el("span", { className: "run-header", textContent: entry.header }),
+      text,
+    );
+  }
+
+  function renderRun(scrollToEnd) {
+    const run = ui.run;
+    if (!run) return;
+    const body = $("#run-body");
+    $("#run-meta").textContent = [run.runId, run.status, run.active ? "live" : null].filter(Boolean).join(" · ");
+    $("#run-follow-wrap").hidden = !run.active;
+    if (run.tab === "summary") {
+      body.replaceChildren(
+        run.error ? el("p", { className: "fw-problem", textContent: run.error }) : null,
+        el("pre", { className: "run-summary", textContent: run.summary || "" }),
+      );
+      return;
+    }
+    const nearEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+    const nodes = [];
+    if (run.error) nodes.push(el("p", { className: "fw-problem", textContent: run.error }));
+    if (run.from > 0) nodes.push(el("p", { className: "fw-empty", textContent: `${run.from} earlier entries not shown (the newest are).` }));
+    if (!run.entries.length && !run.error) {
+      nodes.push(el("p", { className: "fw-empty", textContent: run.active ? "No transcript yet: waiting for the agent." : "This run left no transcript in the logs (see the summary)." }));
+    }
+    nodes.push(...run.entries.map(entryNode));
+    body.replaceChildren(...nodes);
+    if (scrollToEnd && ($("#run-follow").checked || nearEnd)) {
+      body.scrollTop = body.scrollHeight;
+    }
+  }
+
+  // --- palette ----------------------------------------------------------------
+
+  function paletteItems(cmd) {
+    for (const folder of ui.summaries.keys()) {
+      const s = summary(folder);
+      const n = s.alerts.length;
+      cmd(`Flywheel: ${labelFor(folder)}`, n ? `${n} need${n === 1 ? "s" : ""} you` : `${s.counts.verified || 0}/${total(s)} verified`, () => open(folder), "wheel");
+    }
+  }
+
+  return {
+    reload,
+    onEvent,
+    folderChip,
+    attention,
+    open,
+    close,
+    togglePill,
+    renderPill,
+    render: () => {
+      renderPill();
+      if (ui.folder) renderDrawer();
+    },
+    paletteItems,
+    isOpen: () => !!ui.folder,
+    openRun,
+  };
+};

@@ -45,6 +45,7 @@
 //! * Rotating the token closes it with code 4001 too.
 
 mod commands_api;
+mod flywheel_api;
 mod import_api;
 mod notify_api;
 mod pwa;
@@ -115,6 +116,9 @@ pub struct ServerOptions {
     /// Push notifications (`--notify-url` / `notify.toml`), for the
     /// notify API (`GET /api/notify`, `POST /api/notify/test`).
     pub notifier: Option<Arc<crate::notify::Notifier>>,
+    /// The Flywheel panel's monitor (`/api/flywheel*` and the events
+    /// socket's `flywheel` messages); `None` turns the panel off.
+    pub flywheel: Option<Arc<crate::flywheel::FlywheelMonitor>>,
 }
 
 #[derive(Clone)]
@@ -185,6 +189,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/events", get(events_ws))
         .route("/api/notify", get(notify_api::status))
         .route("/api/notify/test", post(notify_api::test))
+        .route("/api/flywheel", get(flywheel_api::list))
+        .route("/api/flywheel/panel", get(flywheel_api::panel))
+        .route("/api/flywheel/run", get(flywheel_api::run_output))
+        .route("/api/flywheel/worker", post(flywheel_api::start_worker))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -1333,13 +1341,14 @@ async fn events_ws(
     };
     let hub = Arc::clone(&app.hub);
     let shutdown = app.shutdown.clone();
+    let flywheel = app.options.flywheel.as_ref().map(|m| m.subscribe());
     // Taken before the credentials were checked (see `require_auth`).
     let rotations = match rotations {
         Some(axum::Extension(RotationWatch(rx))) => rx,
         None => app.hub.subscribe_rotations(),
     };
     ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, rotations))
+        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, rotations, flywheel))
 }
 
 #[derive(Deserialize)]
@@ -1396,6 +1405,7 @@ async fn events_pump(
     client: String,
     mut shutdown: watch::Receiver<bool>,
     mut rotations: watch::Receiver<u64>,
+    mut flywheel: Option<broadcast::Receiver<crate::flywheel::FlywheelEvent>>,
 ) {
     let mut events = hub.subscribe();
     let guard = ViewerGuard {
@@ -1428,6 +1438,11 @@ async fn events_pump(
                     Err(broadcast::error::RecvError::Closed) => false,
                 };
                 if !sent {
+                    break;
+                }
+            }
+            event = flywheel_api::next_event(&mut flywheel) => {
+                if socket.send(flywheel_api::event_message(event)).await.is_err() {
                     break;
                 }
             }

@@ -1,11 +1,13 @@
 // flywheel hub: the attention list. Every agent that needs you, across all
 // workspaces, at the top of the sidebar (the phone's session switcher):
 // blocked ones first (longest waiting first), then finished turns this
-// browser has not looked at (newest first). Tap one to open it.
+// browser has not looked at (newest first), then flywheel tasks that
+// failed, stranded, stopped, or wait on a gate (flywheel.js). Tap one to
+// open it (a flywheel row opens its folder's Flywheel panel).
 "use strict";
 
 window.FwHubAttention = function (ctx) {
-  const { $, el, icon, state, workspaceById, agentStatus, openSession } = ctx;
+  const { $, el, icon, state, workspaceById, agentStatus, openSession, flywheel } = ctx;
 
   function age(since) {
     const seconds = Math.max(0, (Date.now() - Date.parse(since)) / 1000);
@@ -83,19 +85,54 @@ window.FwHubAttention = function (ctx) {
     );
   }
 
+  // A flywheel task that needs you: opens its folder's panel.
+  function flywheelRow({ folder, label, alert }) {
+    return el(
+      "li",
+      {},
+      el(
+        "button",
+        {
+          type: "button",
+          className: `attn-row fw ${alert.kind}`,
+          onclick: () => flywheel.open(folder),
+          title: `${alert.subject} in ${folder}: ${alert.detail}`,
+        },
+        el("span", { className: "glyph fw" }, icon("wheel")),
+        el(
+          "span",
+          { className: "attn-text" },
+          el(
+            "span",
+            { className: "attn-line" },
+            el("b", { className: "attn-name", textContent: alert.subject }),
+            el("span", { className: "attn-ws", textContent: label }),
+          ),
+          el("span", { className: "attn-detail", textContent: alert.detail }),
+        ),
+        el(
+          "span",
+          { className: "attn-meta" },
+          el("span", { className: `attn-status fw ${alert.kind}`, textContent: alert.kind }),
+        ),
+      ),
+    );
+  }
+
   // The sidebar's list, and the phone's start screen (no session open:
   // the drawer is closed, so the list is the screen; app.css shows it on
   // narrow screens only).
   function render() {
     const list = entries();
+    const loop = flywheel ? flywheel.attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      root.hidden = list.length === 0;
-      root.replaceChildren(...(list.length ? content(list) : []));
+      root.hidden = list.length === 0 && loop.length === 0;
+      root.replaceChildren(...(list.length || loop.length ? content(list, loop) : []));
     }
   }
 
-  function content(list) {
+  function content(list, loop) {
     const blocked = list.filter((e) => e.agent.status === "blocked").length;
     return [
       el(
@@ -104,12 +141,16 @@ window.FwHubAttention = function (ctx) {
         el("span", { className: "attn-title", textContent: "Needs you" }),
         el("span", {
           className: "attn-count",
-          textContent: [blocked ? `${blocked} blocked` : "", list.length - blocked ? `${list.length - blocked} done` : ""]
+          textContent: [
+            blocked ? `${blocked} blocked` : "",
+            list.length - blocked ? `${list.length - blocked} done` : "",
+            loop.length ? `${loop.length} flywheel` : "",
+          ]
             .filter(Boolean)
             .join(" / "),
         }),
       ),
-      el("ul", { className: "attn-list" }, list.map(row)),
+      el("ul", { className: "attn-list" }, list.map(row), loop.map(flywheelRow)),
     ];
   }
 

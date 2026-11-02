@@ -352,7 +352,14 @@ pub fn route(
         return docs::run_with(rest, out, err);
     }
     if verb == HUB_VERB {
-        return flywheel_hub::cli::run(rest, out, err);
+        // The hub's Flywheel panel reads each adopted folder through this
+        // crate's store and snapshot code (the hub sits below it).
+        let extensions = flywheel_hub::cli::HubExtensions {
+            flywheel: Some(std::sync::Arc::new(
+                crate::hub_flywheel::HubFlywheel::for_current_exe(),
+            )),
+        };
+        return flywheel_hub::cli::run_with(rest, out, err, &extensions);
     }
     if verb == exec::EXEC_VERB {
         // One agent call: no flywheel.toml load, no store, no worktree.

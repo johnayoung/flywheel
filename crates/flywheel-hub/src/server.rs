@@ -1417,6 +1417,7 @@ async fn events_pump(
                     Ok(HubEvent::Commands { session_id, added }) => {
                         socket.send(commands_api::event_message(&session_id, added)).await.is_ok()
                     }
+                    Ok(HubEvent::Unwatched { .. }) => true,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         socket.send(snapshot_message(&hub, &client)).await.is_ok()
                             && socket.send(text(json!({ "type": "sessions" }))).await.is_ok()

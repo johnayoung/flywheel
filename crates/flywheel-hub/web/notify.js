@@ -10,14 +10,17 @@
 "use strict";
 
 window.FwHubNotify = function (ctx) {
-  const { $, state, store, sessionById, workspaceById, pwa, api, toast, openSession } = ctx;
+  const { $, state, store, sessionById, workspaceById, pwa, api, toast, openSession, present } = ctx;
 
   const supported = "Notification" in window;
   const IS_IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  // One notification per session and status at most this often.
+  // One notification per session and status at most this often; a new
+  // spell inside the window is held until it ends, then shown if it still
+  // stands (back-to-back permission prompts each reach you).
   const DEBOUNCE_MS = 15000;
   const recent = new Map(); // "id:status" -> ms
+  const held = new Map(); // id -> timer
   let push = undefined; // the hub's webhook push: null (off) or {host, events}
 
   const permission = () => (supported ? Notification.permission : "unsupported");
@@ -73,20 +76,35 @@ window.FwHubNotify = function (ctx) {
     toast("Alerts on: this device hears about blocked and finished agents while the hub is in the background.");
   }
 
-  // Someone is looking at the page right now.
-  const looking = () => document.visibilityState === "visible" && document.hasFocus();
+  // Someone is at the page right now (visible, focused, not idle).
+  const looking = () => (present ? present() : document.visibilityState === "visible" && document.hasFocus());
 
   // A pushed status change (`before`/`after`: {status, detail, since}).
   function onStatus(sessionId, before, after) {
-    if (!after || !isOn() || looking()) return;
+    clearTimeout(held.get(sessionId));
+    held.delete(sessionId);
+    if (!after || !isOn()) return;
     const status = after.status;
     if (status !== "blocked" && status !== "done") return;
-    if (before && before.status === status) return;
-    const key = `${sessionId}:${status}`;
-    const now = Date.now();
-    if (recent.get(key) > now - DEBOUNCE_MS) return;
-    recent.set(key, now);
-    show(sessionId, after).catch(() => {});
+    // The same spell again (a detail or rollup update): already handled.
+    if (before && before.status === status && before.since === after.since) return;
+    consider(sessionId, after);
+  }
+
+  function consider(sessionId, agent) {
+    if (looking()) return;
+    const key = `${sessionId}:${agent.status}`;
+    const wait = (recent.get(key) || 0) + DEBOUNCE_MS - Date.now();
+    if (wait > 0) {
+      held.set(sessionId, setTimeout(() => {
+        held.delete(sessionId);
+        const now = state.agent[sessionId];
+        if (now && now.status === agent.status && now.since === agent.since && isOn()) consider(sessionId, now);
+      }, wait));
+      return;
+    }
+    recent.set(key, Date.now());
+    show(sessionId, agent).catch(() => {});
   }
 
   async function show(sessionId, agent) {

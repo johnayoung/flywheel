@@ -353,8 +353,23 @@ impl StatusBoard {
         self.next_viewer
     }
 
-    pub fn disconnect(&mut self, viewer: u64) {
-        self.viewers.remove(&viewer);
+    /// Drop a client connection. Returns the session it was viewing when
+    /// nobody else views that session any more.
+    pub fn disconnect(&mut self, viewer: u64) -> Option<String> {
+        let left = self.viewers.remove(&viewer)?.session?;
+        (!self.is_watched(&left)).then_some(left)
+    }
+
+    /// The session a connection is looking at.
+    pub fn viewing(&self, viewer: u64) -> Option<&str> {
+        self.viewers.get(&viewer)?.session.as_deref()
+    }
+
+    /// Whether any connection is looking at `session_id`.
+    pub fn is_watched(&self, session_id: &str) -> bool {
+        self.viewers
+            .values()
+            .any(|v| v.session.as_deref() == Some(session_id))
     }
 
     /// Record what a connection is looking at (`None`: nothing, or the
@@ -389,10 +404,7 @@ impl StatusBoard {
             status: entry.raw.status,
             detail: entry.detail.clone(),
             spell: entry.changes,
-            watched: self
-                .viewers
-                .values()
-                .any(|v| v.session.as_deref() == Some(session_id)),
+            watched: self.is_watched(session_id),
             seen: entry.raw.status == AgentStatus::Done && !entry.seen_by.is_empty(),
         })
     }

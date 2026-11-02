@@ -95,12 +95,13 @@ fw hub start --notify-url https://ntfy.sh/<long-random-topic>    # subscribe to 
 url = "https://ntfy.example.com/hub"
 token = "tk_..."               # optional, sent as Authorization: Bearer (or user:pass@ in the URL: Basic)
 events = ["blocked", "done"]   # default both
-debounce_secs = 30             # one push per session and status per window
+debounce_secs = 30             # one push per session and status per window (a new spell inside it waits for its end)
 settle_secs = 3                # how long a status must hold before it pushes (max 60)
+detail = false                 # names only: leave out what a blocked agent asks (default true)
 ```
 
 - Says: title `<session> is blocked|done`, body `<workspace> / <session> (<kind>) waits on you: <status detail>` / `... finished its turn.`, `Priority: high` for blocked, `Tags: flywheel,<status>`, `Click: <public URL>/#session=<id>` when the hub has a `--public-url` or `tailscale serve` URL. Never terminal content, prompts, paths, or tokens; logs name only the webhook's host.
-- When: the status must hold 3 s (an approval within that never pushes), nobody may be viewing the session, a finished turn must still be unseen; then debounced per session and status. One HTTP/1.1 POST, 10 s timeout, no redirects followed, rustls with the system's roots; failures go to the hub log.
+- When: the status must hold 3 s (an approval within that never pushes), nobody may be viewing the session (a page counts as viewing while visible, focused, and used in the last 5 min; when the last viewer looks away or leaves, an unanswered spell pushes then), a finished turn must still be unseen. Each spell pushes at most once; a new spell within `debounce_secs` of the last push of that status is held until the window ends and pushes if it still stands. One HTTP/1.1 POST, 10 s timeout, no redirects followed, rustls with the system's roots; failures go to the hub log.
 - `GET /api/notify` says whether it is on (host only), `POST /api/notify/test` sends a test (palette: "Send a test push").
 
 ## Model
@@ -158,12 +159,13 @@ Agents draw suggested commands with margins and wrapping, so copying them off th
 Built for driving Claude Code and Codex from a phone (tested at 390x844 and 430x932 under iPhone 14 emulation):
 
 - **Viewport**: the app is pinned to the visual viewport, so the on-screen keyboard shrinks the terminal instead of covering it (no page scroll or zoom on focus: fields are 16 px on touch screens); safe-area insets respected.
-- **Needs you**: blocked and done agents of every workspace head the sidebar (the phone's switcher: drawer button, badge counts them); blocked first, longest-waiting first. Tap to open.
-- **Key bar** (touch screens; palette "Key bar: on/off/auto"): `esc` `tab` `shift-tab` (Claude's permission-mode cycle), sticky `ctrl` / `alt` (tap: next key, twice: locked; applied to what the keyboard types), arrows (repeat when held; honour app cursor mode), `enter`, `^C`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd` (show/hide the keyboard), `compose`.
-- **Quick answers**: while the attached agent is blocked, the options of the prompt on screen become buttons: numbered lists (Claude's permission dialogs: sends the digit; an option ending `(y)` sends that key) or a `(y/n)` line (sends the letter + Enter); `esc` cancels. The status detail heads it.
-- **Compose**: a multi-line text area (autocorrect, dictation) sent as one bracketed paste + Enter (`POST /paste` with `run`); `Paste` sends without Enter; history per device (arrows, or Up at the start); draft kept per session; `Ctrl Enter` sends.
+- **Row floor**: the PTY size is shared, so a page never sizes it below 16 rows; a shorter terminal box (keyboard up, Compose open) shows the bottom rows. With the keyboard up the quick answers shrink to one row and Compose hides the rest.
+- **Needs you**: blocked and done agents of every workspace head the sidebar (the phone's switcher: drawer button, badge counts them) and are the phone's start screen; blocked first, longest-waiting first. Tap to open. Below 760 px the sidebar is a drawer; tablets get a narrower one.
+- **Key bar** (touch screens; palette "Key bar: on/off/auto"), two rows. First, always in view: `esc` `tab` `shift-tab` (Claude's permission-mode cycle), sticky `ctrl` (tap: next key, twice: locked; applied to what the keyboard types), arrows (repeat when held; honour app cursor mode), `enter`, `^c`. Second, scrolls: sticky `alt`, `/ | ~ -`, `pgup` `pgdn`, text size; then `kbd` (show/hide the keyboard), `compose`.
+- **Quick answers**: while the attached agent is blocked, the options of the prompt on the live screen (never the scrollback in view) become buttons: numbered lists (Claude's permission dialogs: sends the digit; an option ending `(y)` sends that key) or a `(y/n)` line (sends the letter + Enter); `esc` cancels. The status detail heads it.
+- **Compose**: a multi-line text area (autocorrect, dictation) sent as one bracketed paste + Enter (`POST /paste` with `run`); `Paste` sends without Enter; history per device (arrows, or Up at the start); draft kept per session (switching sessions closes the panel; drafts of removed sessions are dropped); `Ctrl Enter` sends. Sign-out deletes history and drafts from the device.
 - **Touch**: swipe scrolls the scrollback with momentum (in full-screen programs: wheel reports, else arrow keys); long-press selects a word, drag extends, then Copy / Copy screen; pinch or `A-` `A+` sets the text size (per device).
-- **Alerts** (sidebar chip, per device): a system notification when an agent becomes blocked or done while the page is hidden or unfocused; clicking it opens that session. Needs https or localhost; on iOS only from the Home Screen app.
+- **Alerts** (sidebar chip, per device): a system notification when an agent becomes blocked or done while the page is hidden, unfocused, or idle 5 min; each spell once, one per session and status per 15 s (a later spell waits for the window); clicking it opens that session. Needs https or localhost; on iOS only from the Home Screen app.
 - **Install**: `/manifest.webmanifest` (standalone, flywheel icons) + `/sw.js`. The service worker never touches `/api`, sockets, or sign-in; it serves the cached signed-in page and `/assets/` only when the hub is unreachable (the page then says so and reconnects), is replaced with each hub build, and is emptied on sign-out. The Home Screen app has its own cookies on iOS: sign in once more there (`fw hub url --qr`).
 
 ## API
@@ -190,7 +192,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | POST | `/login-codes` | `{"code","expires_in":300}`: a one-time code for `/login?code=` |
 | POST | `/token/rotate` | 204: rotate the token (see `fw hub token --rotate`) |
 | GET | `/folders/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical,"git"}` or `{"ok":false,"error"}` (the workspace form validates as you type); `/repos/check` is the old name |
-| GET | `/notify` | `{"push":null}` or `{"push":{"host","events","debounce_secs","settle_secs"}}` |
+| GET | `/notify` | `{"push":null}` or `{"push":{"host","events","debounce_secs","settle_secs","detail"}}` |
 | POST | `/notify/test` | 204 sent; 409 push off; 502 `{"error"}` the webhook refused or was unreachable |
 
 WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001 (even one whose upgrade raced the rotation); the UI then shows sign-in with a "token was rotated" notice.

@@ -18,6 +18,7 @@ pub(super) async fn status(State(app): State<AppState>) -> Response {
             "events": config.events(),
             "debounce_secs": config.debounce.as_secs(),
             "settle_secs": config.settle.as_secs(),
+            "detail": config.detail,
         })
     });
     Json(json!({ "push": push })).into_response()

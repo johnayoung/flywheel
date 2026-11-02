@@ -67,6 +67,9 @@
   const KIND_GLYPH = { shell: "shell", claude: "claude", codex: "codex" };
   const glyphFor = (kind) => KIND_GLYPH[kind] || "shell";
 
+  // Below this the sidebar is a drawer (keep in step with app.css).
+  const NARROW = "(max-width: 760px)";
+
   const store = {
     get(key, fallback) {
       try {
@@ -261,6 +264,7 @@
   const notify = window.FwHubNotify({
     $, state, store, sessionById, workspaceById, pwa, api, toast: commands.toast,
     openSession: (id) => openSession(id),
+    present: () => present(),
   });
 
   // `force` re-renders even when nothing changed. The periodic refresh
@@ -288,6 +292,7 @@
     $("#offline").hidden = true;
     state.workspaces = ws.workspaces;
     state.sessions = ss.sessions;
+    mobile.pruneDrafts(state.sessions.map((s) => s.id));
     // The attached session was removed (closed in another browser or by
     // the CLI, or its workspace was deleted): there is nothing to relaunch
     // or reconnect to, so detach and say what happened.
@@ -481,12 +486,12 @@
     const refit = () => {
       cancelAnimationFrame(pending);
       pending = requestAnimationFrame(() => {
-        if (!state.replaying && $("#terminal").clientWidth > 0) fit.fit();
+        if (!state.replaying && $("#terminal").clientWidth > 0) mobile.fitTerminal();
       });
     };
     window.addEventListener("resize", refit);
     new ResizeObserver(refit).observe($("#terminal"));
-    fit.fit();
+    mobile.fitTerminal();
     mobile.attachTerminal();
   }
 
@@ -553,7 +558,7 @@
   function endReplay() {
     if (!state.replaying) return;
     state.replaying = false;
-    if ($("#terminal").clientWidth > 0) fit.fit();
+    if ($("#terminal").clientWidth > 0) mobile.fitTerminal();
   }
 
   function detach(message, title) {
@@ -675,7 +680,7 @@
     const replayed = () => {
       if (state.socket !== socket) return;
       state.replaying = false;
-      if ($("#terminal").clientWidth > 0) fit.fit();
+      if ($("#terminal").clientWidth > 0) mobile.fitTerminal();
       send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
     };
     socket.onmessage = (event) => {
@@ -791,14 +796,41 @@
 
   // --- events: pushed agent status -------------------------------------
 
+  // Someone is at this page: it is visible and focused, and was touched,
+  // typed into, or pointed at in the last IDLE_MS. A tab left focused on a
+  // desk monitor while its user is away must not count as watching (it
+  // would hold off every push about the session it shows).
+  const IDLE_MS = 5 * 60 * 1000;
+  let lastInput = Date.now();
+  let idleTimer = 0;
+  const idle = () => Date.now() - lastInput >= IDLE_MS;
+  function present() {
+    return document.visibilityState === "visible" && document.hasFocus() && !idle();
+  }
+  function armIdle() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => sendView(), IDLE_MS + 100);
+  }
+  function noteInput(event) {
+    // Pointer moves are many: one a second is plenty.
+    if (event.type === "pointermove" && Date.now() - lastInput < 1000) return;
+    const wasIdle = idle();
+    lastInput = Date.now();
+    armIdle();
+    if (wasIdle) sendView();
+  }
+  for (const type of ["keydown", "pointerdown", "pointermove", "wheel", "touchstart"]) {
+    window.addEventListener(type, noteInput, { capture: true, passive: true });
+  }
+  armIdle();
+
   // What this page shows, for seen-tracking: the attached session while
-  // the page is visible and focused, else nothing (a window left visible
+  // someone is at the page (above), else nothing (a window left visible
   // behind an editor is not being looked at, so a turn that finishes
   // there stays "done").
   function currentView() {
     const session = sessionById(state.attached);
-    const looking = document.visibilityState === "visible" && document.hasFocus();
-    return looking && session && session.live ? session.id : null;
+    return present() && session && session.live ? session.id : null;
   }
 
   function sendView(force) {
@@ -1073,7 +1105,7 @@
     const session = sessionById(id);
     if (!session) return;
     state.collapsed.delete(session.workspace_id);
-    if (window.matchMedia("(max-width: 820px)").matches) document.body.classList.add("side-open");
+    if (window.matchMedia(NARROW).matches) document.body.classList.add("side-open");
     state.renaming = id;
     render();
     const input = $(`.session[data-id="${id}"] .rename`);
@@ -1349,6 +1381,9 @@
     $("#empty").hidden = !!session;
     $("#crumb-workspace").textContent = workspace ? workspace.name : "";
     $("#crumb-session").textContent = session ? session.name : "No session";
+    // Without a session the header's session controls mean nothing.
+    $("#cmd-toggle").hidden = !session;
+    $("#link").hidden = !session;
     const kind = $("#crumb-kind");
     kind.hidden = !session;
     if (session) {
@@ -1397,7 +1432,9 @@
       $("#empty-title").textContent = state.noticeTitle ||
         (hasWorkspace ? "Nothing on the wheel." : "Set up a workspace.");
       $("#empty-body").textContent = state.notice || (hasWorkspace
-        ? "Pick a session from the left, or launch a shell, Claude Code, or Codex in one of your folders."
+        ? (window.matchMedia(NARROW).matches
+          ? "Open the menu for every session, or launch a shell, Claude Code, or Codex in one of your folders."
+          : "Pick a session from the left, or launch a shell, Claude Code, or Codex in one of your folders.")
         : "Group the folders you work on together (or import a VS Code workspace), then launch shells and agents inside them. Every terminal lives on the hub: close the tab, come back from your phone, it is still there.");
       actions.replaceChildren(
         ...[hasWorkspace
@@ -2156,6 +2193,7 @@
 
   async function logout() {
     pwa.forget();
+    mobile.forget();
     await fetch("/logout", { method: "POST", credentials: "same-origin" });
     window.location.replace("/");
   }

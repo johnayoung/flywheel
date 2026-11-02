@@ -11,9 +11,11 @@
 //!
 //! When: a status spell must last [`NotifyConfig::settle`] (a prompt
 //! answered at once never pushes), nobody may be viewing the session (a
-//! person looking at it needs no push), a finished turn must still be
-//! unseen, and one session pushes one status at most once per
-//! [`NotifyConfig::debounce`].
+//! person looking at it needs no push; once the last viewer looks away a
+//! still-unanswered spell pushes), a finished turn must still be unseen,
+//! and each spell pushes at most once. One session pushes one status at
+//! most once per [`NotifyConfig::debounce`]: a new spell inside the
+//! window is held until it ends, then pushes if it still stands.
 //!
 //! Configured by `fw hub serve --notify-url URL` and/or
 //! `<state-dir>/notify.toml`:
@@ -23,6 +25,7 @@
 //! token = "tk_..."             # optional: Authorization: Bearer
 //! events = ["blocked", "done"] # default both
 //! debounce_secs = 30
+//! detail = false               # names only: leave out what a blocked agent asks
 //! ```
 
 use crate::agent::SessionKind;
@@ -58,6 +61,8 @@ pub struct NotifyConfig {
     pub done: bool,
     pub debounce: Duration,
     pub settle: Duration,
+    /// Include the status detail (what a blocked agent asks) in pushes.
+    pub detail: bool,
     /// Origin a push's click opens (`<origin>/#session=<id>`): the hub's
     /// public URL, when it has one a phone can reach.
     pub click_base: Option<String>,
@@ -73,6 +78,7 @@ impl std::fmt::Debug for NotifyConfig {
             .field("done", &self.done)
             .field("debounce", &self.debounce)
             .field("settle", &self.settle)
+            .field("detail", &self.detail)
             .field("click_base", &self.click_base)
             .finish()
     }
@@ -86,6 +92,7 @@ struct FileConfig {
     events: Option<Vec<String>>,
     debounce_secs: Option<u64>,
     settle_secs: Option<u64>,
+    detail: Option<bool>,
 }
 
 impl NotifyConfig {
@@ -98,6 +105,7 @@ impl NotifyConfig {
             done: true,
             debounce: DEFAULT_DEBOUNCE,
             settle: DEFAULT_SETTLE,
+            detail: true,
             click_base: None,
         })
     }
@@ -163,6 +171,9 @@ impl NotifyConfig {
         }
         if let Some(secs) = parsed.settle_secs {
             config.settle = Duration::from_secs(secs.min(60));
+        }
+        if let Some(detail) = parsed.detail {
+            config.detail = detail;
         }
         Ok(Some(config))
     }
@@ -262,7 +273,8 @@ pub struct Push {
 }
 
 /// The push for `subject` (`None` unless it is blocked or done).
-pub fn compose(subject: &Subject, click_base: Option<&str>) -> Option<Push> {
+/// `detail`: say what a blocked agent asks (else names only).
+pub fn compose(subject: &Subject, click_base: Option<&str>, detail: bool) -> Option<Push> {
     let session = clean(&subject.session);
     let workspace = clean(&subject.workspace);
     let place = if workspace.is_empty() {
@@ -273,7 +285,13 @@ pub fn compose(subject: &Subject, click_base: Option<&str>) -> Option<Push> {
     let (title, message, priority) = match subject.alert.status {
         AgentStatus::Blocked => (
             format!("{session} is blocked"),
-            match subject.alert.detail.as_deref().map(clean) {
+            match subject
+                .alert
+                .detail
+                .as_deref()
+                .filter(|_| detail)
+                .map(clean)
+            {
                 Some(detail) if !detail.is_empty() => {
                     format!("{place} waits on you: {detail}")
                 }
@@ -338,8 +356,26 @@ pub struct Notifier {
     config: NotifyConfig,
     /// TLS for an https URL.
     tls: Option<Arc<rustls::ClientConfig>>,
+    /// Which spells pushed, which wait to, and when each status last
+    /// pushed.
+    state: Mutex<PushState>,
+}
+
+#[derive(Debug, Default)]
+struct PushState {
     /// Last push per (session, status).
-    sent: Mutex<HashMap<(String, AgentStatus), Instant>>,
+    sent: HashMap<(String, AgentStatus), Instant>,
+    /// The spell each session last pushed.
+    pushed: HashMap<String, u64>,
+    /// The spell a settle task is waiting on, per session.
+    pending: HashMap<String, u64>,
+}
+
+/// What a settle task does next.
+enum Next {
+    Stop,
+    Wait(Duration),
+    Send,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -358,7 +394,7 @@ impl Notifier {
                 _ => None,
             },
             config,
-            sent: Mutex::new(HashMap::new()),
+            state: Mutex::new(PushState::default()),
         }))
     }
 
@@ -446,18 +482,82 @@ impl Notifier {
         .await
     }
 
-    /// Whether a push for `(session, status)` is allowed now (and if so,
-    /// record it as sent).
-    fn debounced(&self, session: &str, status: AgentStatus) -> bool {
-        let now = Instant::now();
-        let mut sent = self.sent.lock().unwrap_or_else(PoisonError::into_inner);
-        sent.retain(|_, at| now.duration_since(*at) < self.config.debounce);
-        let key = (session.to_owned(), status);
-        if sent.contains_key(&key) {
-            return true;
+    fn state(&self) -> std::sync::MutexGuard<'_, PushState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Start waiting on `subject`'s spell unless it already pushed or a
+    /// task already waits on it. Returns whether a task should start.
+    fn schedule(&self, subject: &Subject) -> bool {
+        if !self.config.enabled_for(subject.alert.status) || subject.alert.watched {
+            return false;
         }
-        sent.insert(key, now);
-        false
+        let spell = subject.alert.spell;
+        let mut state = self.state();
+        if state.pushed.get(&subject.session_id) == Some(&spell)
+            || state.pending.get(&subject.session_id) == Some(&spell)
+        {
+            return false;
+        }
+        state.pending.insert(subject.session_id.clone(), spell);
+        true
+    }
+
+    /// Decide, for the settle task waiting on `spell` of `session_id`,
+    /// with `now` the session's current facts. Reads and decides under
+    /// one lock, so a viewer leaving between the two cannot be missed:
+    /// either this sees the viewer gone, or its `pending` mark is gone
+    /// by the time the leave event is handled.
+    fn decide(
+        &self,
+        session_id: &str,
+        spell: u64,
+        read: impl FnOnce() -> Option<Subject>,
+        at: Instant,
+    ) -> (Next, Option<Subject>) {
+        let mut state = self.state();
+        let now = read();
+        let next = self.decide_locked(&mut state, session_id, spell, now.as_ref(), at);
+        (next, now)
+    }
+
+    fn decide_locked(
+        &self,
+        state: &mut PushState,
+        session_id: &str,
+        spell: u64,
+        now: Option<&Subject>,
+        at: Instant,
+    ) -> Next {
+        let stop = |state: &mut PushState| {
+            if state.pending.get(session_id) == Some(&spell) {
+                state.pending.remove(session_id);
+            }
+            Next::Stop
+        };
+        let Some(now) = now else {
+            state.pushed.remove(session_id);
+            return stop(state);
+        };
+        if now.alert.spell != spell
+            || !self.config.wants(&now.alert)
+            || state.pending.get(session_id) != Some(&spell)
+            || state.pushed.get(session_id) == Some(&spell)
+        {
+            return stop(state);
+        }
+        let debounce = self.config.debounce;
+        state
+            .sent
+            .retain(|_, sent| at.duration_since(*sent) < debounce);
+        let key = (session_id.to_owned(), now.alert.status);
+        if let Some(sent) = state.sent.get(&key) {
+            return Next::Wait(debounce.saturating_sub(at.duration_since(*sent)));
+        }
+        state.sent.insert(key, at);
+        state.pushed.insert(session_id.to_owned(), spell);
+        state.pending.remove(session_id);
+        Next::Send
     }
 
     /// Follow `hub`'s status changes and push (on the current tokio
@@ -467,11 +567,11 @@ impl Notifier {
         let weak = Arc::downgrade(hub);
         let notifier = Arc::clone(self);
         tokio::spawn(async move {
-            // The spell each session last scheduled a push for.
-            let mut scheduled: HashMap<String, u64> = HashMap::new();
             loop {
                 let session_id = match events.recv().await {
-                    Ok(HubEvent::Status { session_id }) => session_id,
+                    Ok(HubEvent::Status { session_id } | HubEvent::Unwatched { session_id }) => {
+                        session_id
+                    }
                     Ok(_) | Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
                 };
@@ -479,35 +579,47 @@ impl Notifier {
                 let subject = hub.alert_subject(&session_id);
                 drop(hub);
                 let Some(subject) = subject else {
-                    scheduled.remove(&session_id);
+                    let mut state = notifier.state();
+                    state.pushed.remove(&session_id);
+                    state.pending.remove(&session_id);
                     continue;
                 };
-                let spell = subject.alert.spell;
-                if !notifier.config.enabled_for(subject.alert.status)
-                    || scheduled.get(&session_id) == Some(&spell)
-                {
+                if !notifier.schedule(&subject) {
                     continue;
                 }
-                scheduled.insert(session_id.clone(), spell);
+                let spell = subject.alert.spell;
                 let notifier = Arc::clone(&notifier);
                 let weak = weak.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(notifier.config.settle).await;
-                    let Some(hub) = weak.upgrade() else { return };
-                    let now = hub.alert_subject(&session_id);
-                    drop(hub);
-                    let Some(now) = now else { return };
-                    if now.alert.spell != spell
-                        || !notifier.config.wants(&now.alert)
-                        || notifier.debounced(&session_id, now.alert.status)
-                    {
-                        return;
-                    }
-                    let Some(push) = compose(&now, notifier.config.click_base.as_deref()) else {
-                        return;
-                    };
-                    if let Err(e) = notifier.send(&push).await {
-                        eprintln!("fw hub: push notification failed: {e}");
+                    loop {
+                        let Some(hub) = weak.upgrade() else { return };
+                        let (next, now) = notifier.decide(
+                            &session_id,
+                            spell,
+                            || hub.alert_subject(&session_id),
+                            Instant::now(),
+                        );
+                        drop(hub);
+                        match next {
+                            Next::Stop => return,
+                            Next::Wait(wait) => tokio::time::sleep(wait).await,
+                            Next::Send => {
+                                let Some(push) = now.as_ref().and_then(|now| {
+                                    compose(
+                                        now,
+                                        notifier.config.click_base.as_deref(),
+                                        notifier.config.detail,
+                                    )
+                                }) else {
+                                    return;
+                                };
+                                if let Err(e) = notifier.send(&push).await {
+                                    eprintln!("fw hub: push notification failed: {e}");
+                                }
+                                return;
+                            }
+                        }
                     }
                 });
             }
@@ -564,11 +676,11 @@ fn basic_auth(url: &url::Url) -> Option<String> {
     if url.username().is_empty() && url.password().is_none() {
         return None;
     }
+    // Userinfo is percent-encoded only: '+', '&', and '=' are literal.
     let decode = |s: &str| {
-        url::form_urlencoded::parse(format!("x={}", s.replace('+', "%2B")).as_bytes())
-            .next()
-            .map(|(_, v)| v.into_owned())
-            .unwrap_or_default()
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
     };
     let pair = format!(
         "{}:{}",
@@ -639,6 +751,11 @@ mod tests {
         assert!(both.blocked && !both.done);
         assert_eq!(both.debounce, Duration::from_secs(5));
         assert_eq!(both.settle, Duration::from_secs(1));
+        assert!(both.detail, "detail is on by default");
+        let quiet = NotifyConfig::from_parts(Some("url = \"https://a/b\"\ndetail = false\n"), None)
+            .unwrap()
+            .unwrap();
+        assert!(!quiet.detail);
         let only_file = NotifyConfig::from_parts(Some(file), None).unwrap().unwrap();
         assert_eq!(only_file.host(), "127.0.0.1:8080");
     }
@@ -704,6 +821,7 @@ mod tests {
         let blocked = compose(
             &subject(AgentStatus::Blocked, Some("permission to use Bash")),
             Some("https://box.tail.ts.net/"),
+            true,
         )
         .unwrap();
         assert_eq!(blocked.title, "claude 1 is blocked");
@@ -717,21 +835,29 @@ mod tests {
             blocked.click.as_deref(),
             Some("https://box.tail.ts.net/#session=abc123")
         );
-        let done = compose(&subject(AgentStatus::Done, None), None).unwrap();
+        let done = compose(&subject(AgentStatus::Done, None), None, true).unwrap();
         assert_eq!(done.title, "claude 1 is done");
         assert_eq!(
             done.message,
             "infrared / claude 1 (claude) finished its turn."
         );
         assert_eq!(done.click, None);
-        assert!(compose(&subject(AgentStatus::Working, None), None).is_none());
-        assert!(compose(&subject(AgentStatus::Idle, None), None).is_none());
+        assert!(compose(&subject(AgentStatus::Working, None), None, true).is_none());
+        assert!(compose(&subject(AgentStatus::Idle, None), None, true).is_none());
         // Control characters cannot forge lines or headers.
         let mut evil = subject(AgentStatus::Blocked, Some("a\r\nTitle: x\x1b[2J"));
         evil.session = "s\nx".into();
-        let push = compose(&evil, None).unwrap();
+        let push = compose(&evil, None, true).unwrap();
         assert!(!push.title.contains('\n') && !push.message.contains('\r'));
         assert!(!push.message.contains('\x1b'));
+        // `detail = false`: names only.
+        let quiet = compose(
+            &subject(AgentStatus::Blocked, Some("Deploy with key sk-live-1?")),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(quiet.message, "infrared / claude 1 (claude) waits on you.");
     }
 
     #[test]
@@ -756,13 +882,77 @@ mod tests {
         assert_eq!(header_text("caf\u{e9}"), "=?UTF-8?B?Y2Fmw6k=?=");
     }
 
+    fn decide(notifier: &Notifier, subject: &Subject, at: Instant) -> Next {
+        let mut state = notifier.state();
+        notifier.decide_locked(
+            &mut state,
+            &subject.session_id,
+            subject.alert.spell,
+            Some(subject),
+            at,
+        )
+    }
+
     #[test]
-    fn debounce_is_per_session_and_status() {
+    fn each_spell_pushes_once_and_a_debounced_one_waits_for_the_window() {
+        let mut config = NotifyConfig::new("http://127.0.0.1:9/t").unwrap();
+        config.debounce = Duration::from_secs(30);
+        let notifier = Notifier::new(config).unwrap();
+        let t0 = Instant::now();
+        let mut blocked = subject(AgentStatus::Blocked, None);
+        assert!(notifier.schedule(&blocked));
+        assert!(!notifier.schedule(&blocked), "one task per spell");
+        assert!(matches!(decide(&notifier, &blocked, t0), Next::Send));
+        assert!(
+            !notifier.schedule(&blocked),
+            "a pushed spell never pushes again"
+        );
+
+        // Answered, then blocked again 8s later: a new spell, held until
+        // the window ends, then sent.
+        blocked.alert.spell = 3;
+        assert!(notifier.schedule(&blocked));
+        let at = t0 + Duration::from_secs(8);
+        match decide(&notifier, &blocked, at) {
+            Next::Wait(wait) => assert_eq!(wait, Duration::from_secs(22)),
+            _ => panic!("expected a wait"),
+        }
+        assert!(matches!(
+            decide(&notifier, &blocked, t0 + Duration::from_secs(30)),
+            Next::Send
+        ));
+
+        // Another session or status is not held.
+        let mut other = subject(AgentStatus::Blocked, None);
+        other.session_id = "other".into();
+        assert!(notifier.schedule(&other));
+        assert!(matches!(decide(&notifier, &other, at), Next::Send));
+        let mut done = subject(AgentStatus::Done, None);
+        done.alert.spell = 4;
+        assert!(notifier.schedule(&done));
+        assert!(matches!(decide(&notifier, &done, at), Next::Send));
+    }
+
+    #[test]
+    fn a_watched_spell_gives_up_and_can_be_scheduled_again_once_unwatched() {
         let notifier = Notifier::new(NotifyConfig::new("http://127.0.0.1:9/t").unwrap()).unwrap();
-        assert!(!notifier.debounced("a", AgentStatus::Blocked));
-        assert!(notifier.debounced("a", AgentStatus::Blocked));
-        assert!(!notifier.debounced("a", AgentStatus::Done));
-        assert!(!notifier.debounced("b", AgentStatus::Blocked));
+        let mut blocked = subject(AgentStatus::Blocked, None);
+        assert!(notifier.schedule(&blocked));
+        blocked.alert.watched = true;
+        assert!(matches!(
+            decide(&notifier, &blocked, Instant::now()),
+            Next::Stop
+        ));
+        assert!(!notifier.schedule(&blocked), "still watched");
+        blocked.alert.watched = false;
+        assert!(
+            notifier.schedule(&blocked),
+            "the viewer left: same spell again"
+        );
+        assert!(matches!(
+            decide(&notifier, &blocked, Instant::now()),
+            Next::Send
+        ));
     }
 
     #[test]
@@ -779,6 +969,12 @@ mod tests {
         assert_eq!(
             basic_auth(&url::Url::parse("https://ntfy.sh/t").unwrap()),
             None
+        );
+        // '&', '=' and '+' are literal in userinfo.
+        let url = url::Url::parse("https://me:a&b=c%2Bd+e@ntfy.example.com/t").unwrap();
+        assert_eq!(
+            basic_auth(&url).as_deref(),
+            Some(format!("Basic {}", crate::commands_cli::base64(b"me:a&b=c+d+e")).as_str())
         );
     }
 }

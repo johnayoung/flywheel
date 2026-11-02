@@ -125,6 +125,7 @@
         <footer class="cmd-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</footer>
       </aside>
       <div id="empty" class="empty">
+        <section id="empty-attention" class="attention empty-attention" hidden aria-label="Agents that need you"></section>
         <svg class="empty-wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
         <h1 id="empty-title">Nothing on the wheel.</h1>
         <p id="empty-body">Pick a session, or start one.</p>
@@ -145,7 +146,7 @@
           <button type="button" class="kb-key tool" id="compose-prev" title="Previous prompt" aria-label="Previous prompt">&uarr;</button>
           <button type="button" class="kb-key tool" id="compose-next" title="Next prompt" aria-label="Next prompt">&darr;</button>
           <span id="compose-pos" class="compose-pos"></span>
-          <button type="button" class="kb-key tool" id="compose-close" title="Close (Esc)">close</button>
+          <button type="button" class="slab ghost" id="compose-close" title="Close (Esc)">Close</button>
           <button type="button" class="slab ghost" id="compose-paste" title="Paste without Enter">Paste</button>
           <button type="button" class="slab" id="compose-send" title="Paste, then Enter (Ctrl Enter)">Send</button>
         </div>

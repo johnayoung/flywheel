@@ -179,6 +179,9 @@ pub enum HubEvent {
     },
     /// A session's agent status changed (re-read it per client).
     Status { session_id: String },
+    /// The last client looking at a session looked away (or left): a
+    /// status nobody was told about may now deserve a push.
+    Unwatched { session_id: String },
     /// Sessions or workspaces were created, removed, renamed, or changed
     /// state: re-list them.
     Sessions,
@@ -1007,13 +1010,26 @@ impl Hub {
     }
 
     pub fn disconnect_viewer(&self, viewer: u64) {
-        self.board().disconnect(viewer);
+        let left = self.board().disconnect(viewer);
+        if let Some(session_id) = left {
+            self.emit(HubEvent::Unwatched { session_id });
+        }
     }
 
     /// Record which session a client connection is looking at (`None`:
     /// none, or the page is hidden). Viewing a finished turn marks it seen.
     pub fn set_viewing(&self, viewer: u64, session_id: Option<&str>) {
-        let seen = self.board().view(viewer, session_id);
+        let (seen, left) = {
+            let mut board = self.board();
+            let before = board.viewing(viewer).map(str::to_owned);
+            let seen = board.view(viewer, session_id);
+            let left = before
+                .filter(|b| board.viewing(viewer) != Some(b.as_str()) && !board.is_watched(b));
+            (seen, left)
+        };
+        if let Some(session_id) = left {
+            self.emit(HubEvent::Unwatched { session_id });
+        }
         if let (true, Some(id)) = (seen, session_id) {
             self.emit(HubEvent::Status {
                 session_id: id.to_owned(),

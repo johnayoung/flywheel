@@ -74,16 +74,21 @@ window.FwHubAttention = function (ctx) {
     );
   }
 
+  // The sidebar's list, and the phone's start screen (no session open:
+  // the drawer is closed, so the list is the screen; app.css shows it on
+  // narrow screens only).
   function render() {
-    const root = $("#attention");
     const list = entries();
-    root.hidden = list.length === 0;
-    if (!list.length) {
-      root.replaceChildren();
-      return;
+    for (const root of [$("#attention"), $("#empty-attention")]) {
+      if (!root) continue;
+      root.hidden = list.length === 0;
+      root.replaceChildren(...(list.length ? content(list) : []));
     }
+  }
+
+  function content(list) {
     const blocked = list.filter((e) => e.agent.status === "blocked").length;
-    root.replaceChildren(
+    return [
       el(
         "header",
         { className: "attn-head" },
@@ -96,7 +101,7 @@ window.FwHubAttention = function (ctx) {
         }),
       ),
       el("ul", { className: "attn-list" }, list.map(row)),
-    );
+    ];
   }
 
   // Ages tick while the list shows.

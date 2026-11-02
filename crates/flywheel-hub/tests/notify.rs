@@ -312,7 +312,8 @@ async fn blocked_and_done_push_once_with_names_and_detail_only() {
     assert_eq!(done.headers["priority"], "default");
     assert_eq!(done.body, "infrared / fixer (claude) finished its turn.");
 
-    // Debounced: the same statuses again within the window send nothing.
+    // Debounced: the same statuses again within the window send nothing
+    // (they would be held until the window ends).
     fire(&env, "UserPromptSubmit", None, json!({}));
     fire(
         &env,
@@ -420,6 +421,128 @@ async fn a_watched_session_or_a_spell_shorter_than_settle_does_not_push() {
         pushed.body.ends_with("permission to use Write"),
         "{pushed:?}"
     );
+    hub.shutdown().await;
+}
+
+/// An events socket for client `client` looking at `session` (or nothing).
+async fn viewer(
+    hub: &TestHub,
+    client: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut request = format!("ws://{}/api/events?client={client}", hub.addr)
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("cookie", hub.cookie.parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
+
+async fn look_at<S>(events: &mut S, session: Option<&str>)
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Debug,
+{
+    events
+        .send(Message::Text(
+            json!({ "type": "view", "session_id": session })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spell_blocked_while_watched_pushes_once_the_last_viewer_leaves() {
+    let webhook = Webhook::start(200).await;
+    let hub = TestHub::start(Some(config(
+        &webhook,
+        "settle_secs = 1\ndebounce_secs = 0\nevents = [\"blocked\"]\n",
+    )))
+    .await;
+    let (sid, env) = hub.claude().await;
+
+    // Two tabs watch it block, and stay past the settle time: no push.
+    let mut laptop = viewer(&hub, "laptop").await;
+    let mut desk = viewer(&hub, "desk").await;
+    look_at(&mut laptop, Some(&sid)).await;
+    look_at(&mut desk, Some(&sid)).await;
+    fire(&env, "UserPromptSubmit", None, json!({}));
+    fire(
+        &env,
+        "PermissionRequest",
+        None,
+        json!({ "tool_name": "Bash" }),
+    );
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(webhook.all().is_empty(), "{:?}", webhook.all());
+
+    // One looks away: the other still watches.
+    look_at(&mut laptop, None).await;
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(webhook.all().is_empty(), "{:?}", webhook.all());
+
+    // The last one goes (its socket drops): the still-blocked spell
+    // pushes, once.
+    drop(desk);
+    let pushed = webhook.nth(1).await;
+    assert_eq!(pushed.headers["title"], "fixer is blocked");
+    look_at(&mut laptop, Some(&sid)).await;
+    look_at(&mut laptop, None).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(webhook.all().len(), 1, "{:?}", webhook.all());
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_block_inside_the_debounce_window_pushes_when_it_ends() {
+    let webhook = Webhook::start(200).await;
+    let hub = TestHub::start(Some(config(
+        &webhook,
+        "settle_secs = 0\ndebounce_secs = 3\nevents = [\"blocked\"]\n",
+    )))
+    .await;
+    let (_sid, env) = hub.claude().await;
+    let started = Instant::now();
+    fire(&env, "UserPromptSubmit", None, json!({}));
+    fire(
+        &env,
+        "PermissionRequest",
+        None,
+        json!({ "tool_name": "Bash" }),
+    );
+    let first = webhook.nth(1).await;
+    assert!(first.body.ends_with("permission to use Bash"), "{first:?}");
+    // Approved, then the next prompt: held, not dropped.
+    fire(&env, "PostToolUse", None, json!({}));
+    fire(
+        &env,
+        "PermissionRequest",
+        None,
+        json!({ "tool_name": "Write" }),
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(webhook.all().len(), 1, "{:?}", webhook.all());
+    let second = webhook.nth(2).await;
+    assert!(
+        second.body.ends_with("permission to use Write"),
+        "{second:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(2900));
+    // A held spell answered before the window ends never pushes.
+    fire(&env, "PostToolUse", None, json!({}));
+    fire(
+        &env,
+        "PermissionRequest",
+        None,
+        json!({ "tool_name": "Edit" }),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fire(&env, "PostToolUse", None, json!({}));
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(webhook.all().len(), 2, "{:?}", webhook.all());
     hub.shutdown().await;
 }
 

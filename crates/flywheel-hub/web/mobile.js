@@ -15,6 +15,9 @@
 // * Touch on the terminal: swipe scrolls (with momentum; in full-screen
 //   programs it scrolls them), long-press selects (drag to extend) with a
 //   Copy button, pinch sets the font size (kept per device).
+// * A row floor: the PTY is shared by every viewer and sized by the last
+//   one to resize, so a short phone viewport (keyboard up) never shrinks it
+//   below MIN_ROWS; the terminal is then bottom-aligned and clipped.
 "use strict";
 
 window.FwHubMobile = function (ctx) {
@@ -26,6 +29,9 @@ window.FwHubMobile = function (ctx) {
   const FONT_MIN = 8;
   const FONT_MAX = 24;
   const HISTORY_MAX = 50;
+  // Fewest rows this page sizes the shared PTY to (Claude's permission
+  // dialogs need about this many to draw).
+  const MIN_ROWS = 16;
 
   // --- preferences -----------------------------------------------------
 
@@ -122,19 +128,23 @@ window.FwHubMobile = function (ctx) {
 
   // --- key bar ---------------------------------------------------------
 
-  // [label, title, sequence or action, repeats when held]
-  const KEYS = [
+  // The first row holds what driving an agent takes most (menus: arrows
+  // and Enter; Esc, ^C, Shift+Tab) and always fits a phone's width; the
+  // second scrolls sideways.
+  const PRIMARY = [
     { label: "esc", title: "Escape", seq: () => "\x1b" },
     { label: "tab", title: "Tab", seq: () => (mods.alt ? "\x1b\t" : "\t") },
     { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => "\x1b[Z" },
     { label: "ctrl", title: "Ctrl (sticky: tap for the next key, twice to lock)", mod: "ctrl" },
-    { label: "alt", title: "Alt (sticky: tap for the next key, twice to lock)", mod: "alt" },
     { label: "←", title: "Left", seq: () => arrow("D"), repeat: true },
     { label: "↑", title: "Up", seq: () => arrow("A"), repeat: true },
     { label: "↓", title: "Down", seq: () => arrow("B"), repeat: true },
     { label: "→", title: "Right", seq: () => arrow("C"), repeat: true },
     { label: "↵", title: "Enter", seq: () => (mods.alt ? "\x1b\r" : "\r"), wide: true },
-    { label: "^C", title: "Ctrl+C (interrupt)", seq: () => "\x03", danger: true },
+    { label: "^c", title: "Ctrl+C (interrupt)", seq: () => "\x03", danger: true },
+  ];
+  const SECONDARY = [
+    { label: "alt", title: "Alt (sticky: tap for the next key, twice to lock)", mod: "alt" },
     { label: "/", title: "Slash", seq: () => "/" },
     { label: "|", title: "Pipe", seq: () => "|" },
     { label: "~", title: "Tilde", seq: () => "~" },
@@ -231,12 +241,17 @@ window.FwHubMobile = function (ctx) {
 
   function buildKeybar() {
     const bar = $("#keybar");
-    const keys = el(
+    const primary = el(
       "div",
-      { className: "kb-keys", role: "toolbar", "aria-label": "Terminal keys" },
-      KEYS.map(keyButton),
-      toolButton("A−", "Smaller text", () => setFont(fontSize() - 1)),
-      toolButton("A+", "Larger text", () => setFont(fontSize() + 1)),
+      { className: "kb-row kb-primary", role: "toolbar", "aria-label": "Terminal keys" },
+      PRIMARY.map(keyButton),
+    );
+    const more = el(
+      "div",
+      { className: "kb-keys", role: "toolbar", "aria-label": "More keys" },
+      SECONDARY.map(keyButton),
+      toolButton("a−", "Smaller text", () => setFont(fontSize() - 1)),
+      toolButton("a+", "Larger text", () => setFont(fontSize() + 1)),
     );
     const tools = el(
       "div",
@@ -244,7 +259,7 @@ window.FwHubMobile = function (ctx) {
       toolButton("kbd", "Show / hide the keyboard", toggleKeyboard, "kbd-toggle"),
       toolButton("compose", "Write a prompt (Compose)", () => openCompose(), "compose-btn"),
     );
-    bar.replaceChildren(keys, tools);
+    bar.replaceChildren(primary, el("div", { className: "kb-row kb-second" }, more, tools));
     renderMods();
   }
 
@@ -263,9 +278,27 @@ window.FwHubMobile = function (ctx) {
     if (!t) return;
     if (t.options.fontSize !== next) {
       t.options.fontSize = next;
-      if ($("#terminal").clientWidth > 0 && !state.replaying) fit().fit();
+      if ($("#terminal").clientWidth > 0 && !state.replaying) fitTerminal();
     }
     if (keep) store.set("font-size", next);
+  }
+
+  // --- fitting ---------------------------------------------------------
+
+  // Fit the terminal to its box, but never below MIN_ROWS: the PTY's size
+  // is every viewer's, and a phone with its keyboard up (or Compose open)
+  // would otherwise squeeze the agent's real terminal to a row or two. A
+  // floored terminal is bottom-aligned (where prompts are) and clipped.
+  function fitTerminal() {
+    const t = term();
+    const f = fit();
+    if (!t || !f) return;
+    const dims = f.proposeDimensions();
+    if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return;
+    const cols = Math.max(2, dims.cols);
+    const rows = Math.max(MIN_ROWS, dims.rows);
+    $("#terminal").classList.toggle("floored", rows > dims.rows);
+    if (t.cols !== cols || t.rows !== rows) t.resize(cols, rows);
   }
 
   // --- quick answers ---------------------------------------------------
@@ -277,15 +310,19 @@ window.FwHubMobile = function (ctx) {
   const HOTKEY = /\s*\(([a-z])\)\s*$/i;
   const HINT = /\s*\((?:esc|shift\+tab|tab|enter|ctrl\+[a-z])\)\s*$/i;
 
-  // The visible screen as logical lines: a line the terminal soft-wrapped
-  // is joined back onto the one it continues.
-  function screenLines() {
+  // The screen as logical lines: a line the terminal soft-wrapped is
+  // joined back onto the one it continues. `live` (quick answers): the
+  // program's current screen, wherever the user has scrolled back to --
+  // an old numbered list in the scrollback is not the prompt; else the
+  // rows on view (Copy screen).
+  function screenLines(live) {
     const t = term();
     if (!t) return [];
     const buffer = t.buffer.active;
+    const top = live ? buffer.baseY : buffer.viewportY;
     const lines = [];
     for (let y = 0; y < t.rows; y++) {
-      const line = buffer.getLine(buffer.viewportY + y);
+      const line = buffer.getLine(top + y);
       const text = line ? line.translateToString(true) : "";
       if (line && line.isWrapped && lines.length) lines[lines.length - 1] += text;
       else lines.push(text);
@@ -368,7 +405,7 @@ window.FwHubMobile = function (ctx) {
       }
       return;
     }
-    const prompt = parsePrompt(screenLines());
+    const prompt = parsePrompt(screenLines(true));
     const options = prompt ? prompt.options : [];
     const question = agent.detail || (prompt && prompt.question) || "waiting on you";
     const key = JSON.stringify([state.attached, question, options]);
@@ -423,6 +460,8 @@ window.FwHubMobile = function (ctx) {
   };
   let historyAt = -1; // index into history while browsing, -1 = draft
   let draft = "";
+  // The session the text area's text is for (its draft key).
+  let composeFor = null;
 
   function openCompose() {
     if (!state.attached) return;
@@ -431,8 +470,12 @@ window.FwHubMobile = function (ctx) {
     updateBar();
     document.body.classList.add("composing");
     const area = $("#compose-text");
-    const saved = store.get(`draft.${state.attached}`, "");
-    if (!area.value && typeof saved === "string") area.value = saved;
+    if (composeFor !== state.attached) {
+      composeFor = state.attached;
+      const saved = store.get(`draft.${composeFor}`, "");
+      area.value = typeof saved === "string" ? saved : "";
+      $("#compose-pos").textContent = "";
+    }
     historyAt = -1;
     autosize();
     area.focus();
@@ -446,6 +489,44 @@ window.FwHubMobile = function (ctx) {
     document.body.classList.remove("composing");
     $("#compose-text").blur();
     if (refocus && term()) term().focus();
+  }
+
+  // Another session is attached: the text stays that session's draft (it
+  // is kept as typed), and the panel closes rather than send it here.
+  function switchCompose() {
+    if (composeFor === null || composeFor === state.attached) return;
+    closeCompose(false);
+    composeFor = null;
+    $("#compose-text").value = "";
+    $("#compose-pos").textContent = "";
+    historyAt = -1;
+  }
+
+  // Drafts of sessions that no longer exist (`ids`: every session).
+  function pruneDrafts(ids) {
+    const keep = new Set(ids);
+    try {
+      for (let i = window.localStorage.length - 1; i >= 0; i--) {
+        const key = window.localStorage.key(i);
+        if (key && key.startsWith("fw-hub.draft.") && !keep.has(key.slice("fw-hub.draft.".length))) {
+          window.localStorage.removeItem(key);
+        }
+      }
+    } catch (_) {
+      // Storage unavailable: nothing was kept either.
+    }
+  }
+
+  // Sign-out: what was typed into Compose leaves this device.
+  function forget() {
+    pruneDrafts([]);
+    try {
+      window.localStorage.removeItem("fw-hub.compose-history");
+    } catch (_) {
+      // As above.
+    }
+    composeFor = null;
+    $("#compose-text").value = "";
   }
 
   function autosize() {
@@ -469,8 +550,8 @@ window.FwHubMobile = function (ctx) {
   async function sendCompose(run) {
     const area = $("#compose-text");
     const text = area.value.replace(/\s+$/, "");
-    const id = state.attached;
-    if (!id || !text.trim()) {
+    const id = composeFor;
+    if (!id || id !== state.attached || !text.trim()) {
       area.focus();
       return;
     }
@@ -498,7 +579,7 @@ window.FwHubMobile = function (ctx) {
     const area = $("#compose-text");
     area.addEventListener("input", () => {
       autosize();
-      if (state.attached) store.set(`draft.${state.attached}`, area.value);
+      if (composeFor) store.set(`draft.${composeFor}`, area.value);
     });
     area.addEventListener("keydown", (event) => {
       if (event.isComposing) return;
@@ -787,7 +868,7 @@ window.FwHubMobile = function (ctx) {
         onclick: () => {
           hideSelectionPop();
           term().clearSelection();
-          copy(screenLines().join("\n").replace(/\s+$/, ""));
+          copy(screenLines(false).join("\n").replace(/\s+$/, ""));
         },
       }),
       el("button", {
@@ -818,6 +899,7 @@ window.FwHubMobile = function (ctx) {
     const show = running && keybarWanted();
     document.body.classList.toggle("keybar-on", show);
     $("#keybar").hidden = !show;
+    switchCompose();
     if (!running) closeCompose(false);
     renderQuick();
     updateBar();
@@ -854,5 +936,8 @@ window.FwHubMobile = function (ctx) {
   bindSelectionPop();
   coarse.addEventListener("change", () => render());
 
-  return { fontSize, transformInput, attachTerminal, render, paletteItems, openCompose, parsePrompt };
+  return {
+    fontSize, fitTerminal, transformInput, attachTerminal, render, paletteItems, openCompose, parsePrompt,
+    pruneDrafts, forget,
+  };
 };

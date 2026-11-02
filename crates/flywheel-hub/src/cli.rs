@@ -200,8 +200,16 @@ pub(crate) struct HubArgs {
     /// a turn nobody has seen; overrides `url` in <state-dir>/notify.toml.
     #[arg(long, value_name = "URL")]
     notify_url: Option<String>,
+    /// Prefix of the branches session worktrees are cut on
+    /// (`<prefix><task>`, e.g. `agent/`) [default: none].
+    #[arg(long, value_name = "PREFIX", value_parser = parse_branch_prefix)]
+    worktree_branch_prefix: Option<String>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
+}
+
+fn parse_branch_prefix(raw: &str) -> Result<String, String> {
+    crate::git::validate_prefix(raw)
 }
 
 impl HubArgs {
@@ -243,6 +251,9 @@ impl HubArgs {
         }
         if let Some(url) = &self.notify_url {
             argv.extend(["--notify-url".to_owned(), url.clone()]);
+        }
+        if let Some(prefix) = &self.worktree_branch_prefix {
+            argv.extend(["--worktree-branch-prefix".to_owned(), prefix.clone()]);
         }
         argv.extend([
             "--state-dir".to_owned(),
@@ -785,6 +796,9 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     options.scrollback_lines = hub_args.scrollback_lines;
     options.report_command = report_command();
     options.agent_resume = !hub_args.no_agent_resume;
+    if let Some(prefix) = &hub_args.worktree_branch_prefix {
+        options.worktree_branch_prefix = prefix.clone();
+    }
     if let Some(root) = &hub_args.import_root {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let root = crate::state::expand_home(root, home.as_deref());

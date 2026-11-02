@@ -151,6 +151,8 @@ mod tests {
             created_at: Utc::now(),
             state: SessionState::stopped(Utc::now(), true),
             fallback_command: None,
+            worktree: None,
+            companion_of: None,
         }
     }
 

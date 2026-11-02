@@ -18,6 +18,7 @@ pub mod client;
 pub mod commands;
 pub mod commands_cli;
 pub mod daemon;
+pub mod git;
 pub mod hub;
 pub mod lifecycle;
 pub mod notify;

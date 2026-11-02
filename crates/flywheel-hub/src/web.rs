@@ -89,6 +89,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("commands.js", include_bytes!("../web/commands.js"), JS),
     ("import.js", include_bytes!("../web/import.js"), JS),
+    ("worktree.js", include_bytes!("../web/worktree.js"), JS),
     ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",

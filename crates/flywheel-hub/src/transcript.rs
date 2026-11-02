@@ -857,6 +857,20 @@ pub struct PasteOutcome {
     pub bytes: usize,
 }
 
+/// Refuse a paste that is empty (whitespace only) or over
+/// [`MAX_PASTE_BYTES`].
+pub(crate) fn check_paste(text: &str) -> Result<(), HubError> {
+    if text.trim().is_empty() {
+        return Err(StateError::Invalid("nothing to paste".into()).into());
+    }
+    if text.len() > MAX_PASTE_BYTES {
+        return Err(
+            StateError::Invalid(format!("paste is larger than {MAX_PASTE_BYTES} bytes")).into(),
+        );
+    }
+    Ok(())
+}
+
 impl Hub {
     /// Read `record`'s transcript for new commands and push them to events
     /// subscribers.
@@ -884,15 +898,7 @@ impl Hub {
     /// each line, so it is refused unless `run`.
     pub fn paste(&self, id: &str, text: &str, run: bool) -> Result<PasteOutcome, HubError> {
         let record = self.session(id)?.record;
-        if text.trim().is_empty() {
-            return Err(StateError::Invalid("nothing to paste".into()).into());
-        }
-        if text.len() > MAX_PASTE_BYTES {
-            return Err(StateError::Invalid(format!(
-                "paste is larger than {MAX_PASTE_BYTES} bytes"
-            ))
-            .into());
-        }
+        check_paste(text)?;
         let session = self
             .live_session(id)
             .filter(|s| s.exit_info().is_none())
@@ -918,6 +924,9 @@ impl Hub {
             std::thread::sleep(ENTER_DELAY);
             outcome = session.write(b"\r".to_vec());
             len += 1;
+        }
+        if run && outcome == WriteOutcome::Queued {
+            self.nudge_badge_soon(&record);
         }
         match outcome {
             WriteOutcome::Queued => Ok(PasteOutcome {
@@ -958,6 +967,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             state: SessionState::Running,
             fallback_command: None,
+            worktree: None,
+            companion_of: None,
         }
     }
 

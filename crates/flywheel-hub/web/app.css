@@ -1991,3 +1991,94 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   #link { display: none; }
   #stage { margin: .25rem .2rem .2rem; }
 }
+/* --- worktrees and companion shells ------------------------------------- */
+
+/* The branch line under a session row (git folders and worktrees). */
+.session-git {
+  grid-column: 3 / -1;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  min-width: 0;
+  margin-top: -.3rem;
+  font-size: 10px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.session-git svg { flex: none; width: .75rem; height: .75rem; }
+.session-git .branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-git.worktree .branch { color: var(--ink-2); }
+.session-git .wt-tag {
+  padding: 0 .25rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  font-size: 8.5px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.session-git .ahead { color: var(--signal); }
+.session-git .behind { color: var(--ink-2); }
+.session-git .dirty, .session-git .untracked { color: var(--brass); }
+.session.active .session-git { color: var(--ink-2); }
+
+/* A companion shell hangs under its agent. */
+.session.companion { padding-left: 2.9rem; min-height: 1.8rem; }
+.session.companion::after {
+  content: "";
+  position: absolute;
+  left: 2.15rem;
+  top: 0;
+  height: 50%;
+  width: .45rem;
+  border-left: 1px solid var(--rule-2);
+  border-bottom: 1px solid var(--rule-2);
+  pointer-events: none;
+}
+.session.companion.needs-you::after { border: 0; }
+.session.companion .num { left: 1.5rem; }
+
+/* New-session form: the worktree option. */
+.wt-pick { gap: .35rem; }
+.wt-toggle { display: flex; align-items: center; gap: .45rem; font-size: 11.5px; color: var(--ink); cursor: pointer; }
+.wt-pick .wt-toggle input { width: auto; flex: none; accent-color: var(--signal); margin: 0; }
+.wt-toggle .field-hint { font-size: 10px; }
+.wt-pick.unavailable .wt-toggle { cursor: not-allowed; color: var(--ink-3); }
+.wt-fields { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem .7rem; }
+.wt-fields[hidden] { display: none; }
+.wt-field { display: grid; gap: .3rem; }
+.wt-field input {
+  width: 100%;
+  padding: .45rem .55rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px var(--term);
+}
+.wt-field input:focus { outline: none; border-color: var(--signal); }
+.wt-note { margin: 0; font-size: 10.5px; color: var(--ink-3); overflow-wrap: anywhere; font-family: var(--term); }
+.wt-note:empty { display: none; }
+.wt-note.ok { color: var(--ink-2); }
+.wt-note.bad { color: var(--alert); }
+@media (max-width: 520px) { .wt-fields { grid-template-columns: 1fr; } }
+
+/* Close dialog of a worktree session. */
+.cwt-state { margin: .2rem 0 .1rem; font-size: 11px; line-height: 1.55; color: var(--ink-2); }
+.cwt-state.ok { color: var(--ink-2); }
+.cwt-state.bad { color: var(--alert); }
+#dlg-close-wt code { font-family: var(--term); font-size: 11px; color: var(--ink); overflow-wrap: anywhere; }
+#dlg-close-wt .slab:disabled { opacity: .45; cursor: not-allowed; }
+
+/* Commands drawer: where Send goes. */
+.cmd-controls:has(+ .cmd-hint:not(:empty)) { border-bottom: 0; padding-bottom: .35rem; }
+.cmd-hint {
+  margin: 0;
+  padding: 0 1rem .65rem;
+  border-bottom: 1px solid var(--rule-2);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+.cmd-hint:empty { display: none; }
+.cmd-actions .slab.opens { border-style: dashed; }
+#dlg-close-wt .sheet-foot { flex-wrap: wrap; }

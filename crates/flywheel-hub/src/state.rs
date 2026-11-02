@@ -9,6 +9,7 @@
 
 use crate::agent::SessionKind;
 use crate::auth::write_private;
+use crate::git::WorktreeRef;
 use crate::pty::ExitInfo;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -225,9 +226,23 @@ pub struct SessionRecord {
     /// session is; relaunching it runs `command` again and clears this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_command: Option<Vec<String>>,
+    /// The sibling worktree the session runs in (`cwd` is its directory),
+    /// cut from one of the workspace's git folders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeRef>,
+    /// A shell opened as an agent session's companion (same directory):
+    /// the agent's id. Suggested commands go there by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_of: Option<String>,
 }
 
 impl SessionRecord {
+    /// The workspace folder the session belongs to: its worktree's repo,
+    /// else its own directory.
+    pub fn folder(&self) -> &Path {
+        self.worktree.as_ref().map_or(&self.cwd, |w| &w.repo)
+    }
+
     /// Whether the session runs its agent CLI: an agent kind not restored
     /// as a fallback shell (which has no hooks, status, or transcript of
     /// its own).
@@ -441,13 +456,13 @@ impl HubStore {
             && let Some(stranded) = self.doc.sessions.iter().find(|s| {
                 s.workspace_id == id
                     && s.state.is_running()
-                    && !folders.iter().any(|f| f.path == s.cwd)
+                    && !folders.iter().any(|f| f.path == s.folder())
             })
         {
             return Err(StateError::Conflict(format!(
                 "session {:?} is running in {}, which the new folder list drops; kill it first",
                 stranded.name,
-                stranded.cwd.display()
+                stranded.folder().display()
             )));
         }
         let previous = self.doc.workspaces[index].clone();
@@ -520,12 +535,27 @@ impl HubStore {
         Ok(removed)
     }
 
-    /// Record a newly spawned session.
+    /// Record a newly spawned session: last, or -- a companion shell --
+    /// right after its agent's other companions and the agent itself, so
+    /// every listing keeps the pair together.
     pub fn insert_session(&mut self, record: SessionRecord) -> Result<(), StateError> {
         self.workspace(&record.workspace_id)?;
-        self.doc.sessions.push(record);
+        let at = record
+            .companion_of
+            .as_deref()
+            .and_then(|agent| {
+                let sessions = &self.doc.sessions;
+                let start = sessions.iter().position(|s| s.id == agent)?;
+                let after = sessions[start + 1..]
+                    .iter()
+                    .take_while(|s| s.companion_of.as_deref() == Some(agent))
+                    .count();
+                Some(start + 1 + after)
+            })
+            .unwrap_or(self.doc.sessions.len());
+        self.doc.sessions.insert(at, record);
         self.save_or_rollback(|doc| {
-            doc.sessions.pop();
+            doc.sessions.remove(at);
         })
     }
 
@@ -907,6 +937,8 @@ mod tests {
             created_at: Utc::now(),
             state: SessionState::Running,
             fallback_command: None,
+            worktree: None,
+            companion_of: None,
         }
     }
 

@@ -310,6 +310,45 @@ fn print_json(out: &mut dyn Write, value: &Value) {
 
 // --- ls ---------------------------------------------------------------------
 
+/// A session's git badge for `ls`: ` [branch +ahead -behind ~changed
+/// ?untracked]` (zero counts left out; a worktree session's branch before
+/// its first read), else empty.
+fn git_label(session: &Value) -> String {
+    let count = |git: &Value, field: &str| git.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let mut parts: Vec<String> = Vec::new();
+    match session.get("git").filter(|g| g.is_object()) {
+        Some(git) => {
+            parts.push(
+                git.get("branch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(detached)")
+                    .to_owned(),
+            );
+            for (field, mark) in [
+                ("ahead", "+"),
+                ("behind", "-"),
+                ("dirty", "~"),
+                ("untracked", "?"),
+            ] {
+                let n = count(git, field);
+                if n > 0 {
+                    parts.push(format!("{mark}{n}"));
+                }
+            }
+        }
+        None => match session.get("worktree") {
+            Some(worktree) if worktree.is_object() => {
+                parts.push(str_field(worktree, "branch").to_owned());
+            }
+            _ => return String::new(),
+        },
+    }
+    if session.get("worktree").is_some_and(Value::is_object) {
+        parts.push("worktree".to_owned());
+    }
+    format!(" [{}]", parts.join(" "))
+}
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct LsArgs {
     /// Print JSON: {"workspaces":[{...,"sessions":[...]}]}.
@@ -371,7 +410,7 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     kind_label(s),
                     state_label(s),
                     str_field(s, "name").to_owned(),
-                    live_cwd(s).to_owned(),
+                    format!("{}{}", live_cwd(s), git_label(s)),
                 ]
             })
             .collect();
@@ -431,6 +470,16 @@ pub(crate) struct NewArgs {
     /// when none matches.
     #[arg(long, requires = "repo")]
     create: bool,
+    /// Run it in a new sibling worktree of its (git) folder:
+    /// `<repo-parent>/<repo>.worktrees/TASK` on branch TASK (after the
+    /// hub's --worktree-branch-prefix). Names the session TASK unless
+    /// --name.
+    #[arg(long, value_name = "TASK")]
+    worktree: Option<String>,
+    /// Branch or commit the worktree's branch is cut from (default: the
+    /// repo's current branch).
+    #[arg(long, requires = "worktree", value_name = "REF")]
+    base: Option<String>,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -518,7 +567,20 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     if !args.command.is_empty() {
         body["command"] = json!(args.command);
     }
-    conn.call("POST", "/api/sessions", Some(&body))
+    if let Some(task) = &args.worktree {
+        body["worktree"] = json!({ "task": task, "base": args.base });
+    }
+    let view = conn.call("POST", "/api/sessions", Some(&body))?;
+    if let Some(worktree) = view.get("worktree") {
+        let _ = writeln!(
+            err,
+            "fw hub: worktree {} on branch {} (from {})",
+            str_field(worktree, "path"),
+            str_field(worktree, "branch"),
+            str_field(worktree, "base")
+        );
+    }
+    Ok(view)
 }
 
 /// The folder of `workspace` that `query` names: a path (relative to this
@@ -821,6 +883,15 @@ pub(crate) struct KillArgs {
     /// Also forget the session (its record and scrollback).
     #[arg(long)]
     rm: bool,
+    /// With --rm: also remove the session's worktree (and its companion
+    /// shells). Refused when it has uncommitted changes or commits its
+    /// base lacks, unless --force; the branch is deleted only when merged.
+    #[arg(long, requires = "rm")]
+    remove_worktree: bool,
+    /// With --remove-worktree: remove it even so (uncommitted work is
+    /// lost; an unmerged branch is kept).
+    #[arg(long, requires = "remove_worktree")]
+    force: bool,
     #[command(flatten)]
     state: StateDirArg,
 }
@@ -828,6 +899,37 @@ pub(crate) struct KillArgs {
 pub(crate) fn kill(args: &KillArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let result = connect(&args.state).and_then(|conn| {
         let (id, session) = find_session(&conn, &args.target.session)?;
+        if args.remove_worktree {
+            let outcome = conn.call(
+                "DELETE",
+                &format!(
+                    "/api/sessions/{id}?remove_worktree=true&force={}",
+                    args.force
+                ),
+                None,
+            )?;
+            let worktree = outcome.get("worktree").cloned().unwrap_or(Value::Null);
+            let companions = outcome
+                .get("removed")
+                .and_then(Value::as_array)
+                .map_or(0, |r| r.len().saturating_sub(1));
+            let branch = str_field(&worktree, "branch");
+            return Ok(format!(
+                "removed session {:?} ({id}){}, worktree {}; branch {branch} {}",
+                str_field(&session, "name"),
+                match companions {
+                    0 => String::new(),
+                    1 => " and its companion shell".to_owned(),
+                    n => format!(" and {n} companion shells"),
+                },
+                str_field(&worktree, "path"),
+                if worktree.get("branch_deleted").and_then(Value::as_bool) == Some(true) {
+                    "deleted (merged)"
+                } else {
+                    "kept (it has commits its base lacks)"
+                }
+            ));
+        }
         if args.rm {
             conn.call("DELETE", &format!("/api/sessions/{id}"), None)?;
             return Ok(format!(

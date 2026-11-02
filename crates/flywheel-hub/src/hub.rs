@@ -6,6 +6,7 @@ use crate::agent::{
     which,
 };
 use crate::auth::{LoginCodes, Logins, Token, TokenError, unix_now};
+use crate::git::{self, BadgeKey, BadgeSource, GitStatus, GitWatch, WorktreeRef};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SessionEvent, SpawnError, SpawnSpec};
 use crate::remote::ServeLock;
@@ -71,6 +72,9 @@ pub struct HubOptions {
     /// `*.code-workspace` files (to [`vscode::DEFAULT_SEARCH_DEPTH`]) when
     /// the browser names no root. Defaults to `~/code`.
     pub import_root: Option<PathBuf>,
+    /// Prefix of the branches new session worktrees are cut on
+    /// (`<prefix><task>`; `fw hub serve --worktree-branch-prefix`).
+    pub worktree_branch_prefix: String,
 }
 
 impl HubOptions {
@@ -98,6 +102,7 @@ impl HubOptions {
             import_root: std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
                 .map(|h| PathBuf::from(h).join("code")),
+            worktree_branch_prefix: String::new(),
         }
     }
 }
@@ -155,6 +160,97 @@ pub struct CreateSession {
     pub command: Option<Vec<String>>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    /// Run it in a new sibling worktree of its (git) folder.
+    pub worktree: Option<NewWorktree>,
+}
+
+/// A new worktree for a session: `<repo-parent>/<repo>.worktrees/<task>`
+/// on branch `<prefix><task>`, cut from `base` (default: the repo's
+/// current branch).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NewWorktree {
+    pub task: String,
+    pub base: Option<String>,
+}
+
+/// How long a new companion shell gets to draw its prompt before a paste
+/// goes in anyway.
+pub const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Output this long quiet (after some) reads as a drawn prompt.
+const READY_QUIET: Duration = Duration::from_millis(500);
+const READY_POLL: Duration = Duration::from_millis(25);
+/// When a run paste's effect on the git badge is looked at (and again at
+/// three times this, for slower commands).
+const BADGE_AFTER_RUN: Duration = Duration::from_millis(1500);
+
+/// How a shell was judged ready for a paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    /// It was running already.
+    Running,
+    /// Its line editor enabled bracketed paste (a prompt is up).
+    Bracketed,
+    /// It drew output, then went quiet.
+    Quiet,
+    /// Neither within [`READY_TIMEOUT`]; pasted anyway (typed ahead).
+    Timeout,
+}
+
+/// What [`Hub::send_to_companion`] did.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompanionPaste {
+    pub session: SessionView,
+    /// The companion shell was started (or relaunched) for this paste.
+    pub created: bool,
+    pub ready: Readiness,
+    pub paste: crate::transcript::PasteOutcome,
+}
+
+/// What removing a session should also do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct RemoveOptions {
+    /// Also remove its worktree (and its companion shells, which run
+    /// there); refused when that loses work unless `force`.
+    #[serde(default)]
+    pub remove_worktree: bool,
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What [`Hub::remove_session_with`] did.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoveOutcome {
+    /// Sessions forgotten (the session, then its companions).
+    pub removed: Vec<String>,
+    pub worktree: Option<git::Removed>,
+}
+
+/// A worktree session's worktree, and what removing it would lose.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeInfo {
+    pub worktree: WorktreeRef,
+    #[serde(flatten)]
+    pub check: git::RemovalCheck,
+    /// Why removal is refused without force (`None`: safe).
+    pub refusal: Option<String>,
+    /// Companion shells removed along with it.
+    pub companions: Vec<String>,
+    /// Other running sessions in it (removal is refused while any runs).
+    pub blocking: Vec<String>,
+}
+
+/// [`Hub::worktree_plan`]'s answer for the new-session form.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreePlanView {
+    /// Where worktrees of this folder go.
+    pub dir: Option<PathBuf>,
+    /// The base used when none is given.
+    pub default_base: Option<String>,
+    pub branches: Vec<String>,
+    /// The resolved worktree, when `task` was given and is usable.
+    pub plan: Option<git::WorktreePlan>,
+    pub error: Option<String>,
 }
 
 /// A session record joined with its live state.
@@ -167,6 +263,9 @@ pub struct SessionView {
     /// An agent session's status (a finished turn counts as seen once any
     /// client viewed it; the events socket gives each client its own).
     pub agent: Option<StatusView>,
+    /// Branch, changes, and ahead/behind of its directory (git folders
+    /// and worktrees), from the badge cache: refreshed in the background.
+    pub git: Option<GitStatus>,
 }
 
 /// A hub-wide change, pushed to every events subscriber.
@@ -246,6 +345,10 @@ pub struct Hub {
     monitored: Mutex<HashMap<String, u64>>,
     /// Suggested commands read from agent transcripts.
     commands: CommandBook,
+    /// Session git badges.
+    git: GitWatch,
+    /// Serializes companion shell creation (one per agent).
+    companion_lock: Mutex<()>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -298,6 +401,8 @@ impl Hub {
             events,
             report: Mutex::new(None),
             monitored: Mutex::new(HashMap::new()),
+            git: GitWatch::default(),
+            companion_lock: Mutex::new(()),
             _serve_lock: serve_lock,
         });
         let weak = Arc::downgrade(&hub);
@@ -310,6 +415,7 @@ impl Hub {
         )?;
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
         crate::transcript::spawn_watcher(&hub);
+        git::spawn_watcher(&hub);
         Ok(hub)
     }
 
@@ -613,10 +719,12 @@ impl Hub {
             .runs_agent()
             .then(|| self.board().status(&record.id, Audience::Anyone))
             .flatten();
+        let git = self.git.get(&badge_key(&record));
         SessionView {
             record,
             live,
             agent,
+            git,
         }
     }
 
@@ -658,6 +766,13 @@ impl Hub {
             ))
             .into());
         }
+        if request.worktree.is_some() && !crate::state::is_git_root(&cwd) {
+            return Err(StateError::Invalid(format!(
+                "folder {} is not a git repository; worktrees need one",
+                cwd.display()
+            ))
+            .into());
+        }
         let command = match (request.kind, request.command) {
             (SessionKind::Shell, Some(argv)) if argv.is_empty() || argv[0].trim().is_empty() => {
                 return Err(StateError::Invalid("command must not be empty".into()).into());
@@ -673,17 +788,38 @@ impl Hub {
             }
             (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
-        let id = new_id();
-        let name = match request.name.as_deref() {
-            Some(raw) => validate_name(raw)?,
-            None => self.default_session_name(&workspace.id, &command),
+        let name = request.name.as_deref().map(validate_name).transpose()?;
+        // Everything else checked: only now cut the worktree (git work).
+        let worktree = match &request.worktree {
+            Some(new) => {
+                let plan = git::plan(
+                    &cwd,
+                    &new.task,
+                    &self.options.worktree_branch_prefix,
+                    new.base.as_deref(),
+                )
+                .map_err(StateError::Invalid)?;
+                Some(git::create(&cwd, &plan).map_err(HubError::Internal)?)
+            }
+            None => None,
+        };
+        let name = match (name, &worktree) {
+            (Some(name), _) => name,
+            (None, Some(_)) => self.unique_session_name(
+                &request
+                    .worktree
+                    .as_ref()
+                    .map(|w| w.task.trim().to_owned())
+                    .unwrap_or_default(),
+            ),
+            (None, None) => self.default_session_name(&workspace.id, &command),
         };
         let record = SessionRecord {
-            id: id.clone(),
+            id: new_id(),
             workspace_id: workspace.id.clone(),
             name,
             kind: request.kind,
-            cwd,
+            cwd: worktree.as_ref().map_or(cwd, |w| w.path.clone()),
             command,
             // Claude takes its conversation id from the hub, so its
             // transcript and `--resume` are known from the start.
@@ -692,13 +828,32 @@ impl Hub {
             created_at: Utc::now(),
             state: SessionState::Running,
             fallback_command: None,
+            worktree: worktree.clone(),
+            companion_of: None,
         };
+        let launched = self.launch(record, request.cols, request.rows);
+        if launched.is_err()
+            && let Some(worktree) = &worktree
+        {
+            // Nothing runs in it and nothing was done there: undo the cut.
+            let _ = git::remove(worktree, true);
+        }
+        launched
+    }
 
+    /// Spawn and record a new session.
+    fn launch(
+        self: &Arc<Self>,
+        record: SessionRecord,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<SessionView, HubError> {
+        let id = record.id.clone();
         // Insert the live entry and the record under the store lock so the
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let session = match self.spawn_pty(&record, request.cols, request.rows, false) {
+        let session = match self.spawn_pty(&record, cols, rows, false) {
             Ok(session) => session,
             Err(e) => {
                 self.board().untrack(&id);
@@ -714,8 +869,292 @@ impl Hub {
         }
         self.live().insert(id, session);
         drop(store);
+        self.git.nudge(badge_key(&record));
         self.emit(HubEvent::Sessions);
         Ok(self.view(record))
+    }
+
+    /// Re-read `record`'s git badge shortly (a command just ran there).
+    pub(crate) fn nudge_badge_soon(&self, record: &SessionRecord) {
+        let key = badge_key(record);
+        let Some(wake) = self.git.sender() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("hub-git-nudge".into())
+            .spawn(move || {
+                for delay in [BADGE_AFTER_RUN, BADGE_AFTER_RUN * 3] {
+                    std::thread::sleep(delay);
+                    if wake.send(Some(key.clone())).is_err() {
+                        break;
+                    }
+                }
+            });
+    }
+
+    /// An agent session's companion shell (same directory, worktree
+    /// included), started on demand: the running one, else its ended one
+    /// relaunched in place, else a new shell placed right after the
+    /// agent. Returns it and whether it was (re)started now.
+    pub fn companion(
+        self: &Arc<Self>,
+        agent_id: &str,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<(SessionView, bool), HubError> {
+        let _one = self
+            .companion_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (agent, companions) = {
+            let store = self.store();
+            let agent = store.session(agent_id)?.clone();
+            let companions: Vec<SessionRecord> = store
+                .sessions()
+                .iter()
+                .filter(|s| s.companion_of.as_deref() == Some(agent.id.as_str()))
+                .cloned()
+                .collect();
+            (agent, companions)
+        };
+        if !agent.kind.is_agent() {
+            return Err(StateError::Invalid(format!(
+                "session {:?} is a {} session; only agent sessions have companion shells",
+                agent.name,
+                agent.kind.as_str()
+            ))
+            .into());
+        }
+        let alive = |s: &SessionRecord| {
+            s.state.is_running()
+                && self
+                    .live_session(&s.id)
+                    .is_some_and(|l| l.exit_info().is_none())
+        };
+        if let Some(running) = companions.iter().find(|s| alive(s)) {
+            return Ok((self.view(running.clone()), false));
+        }
+        if let Some(ended) = companions.iter().find(|s| !s.state.is_running()) {
+            return Ok((self.restart_session(&ended.id, cols, rows)?, true));
+        }
+        let workspace = self.workspace(&agent.workspace_id)?;
+        if !workspace.has_folder(agent.folder()) {
+            return Err(StateError::Invalid(format!(
+                "folder {} is no longer part of workspace {}",
+                agent.folder().display(),
+                workspace.name
+            ))
+            .into());
+        }
+        if !agent.cwd.is_dir() {
+            return Err(StateError::Invalid(format!(
+                "{}'s directory {} no longer exists",
+                agent.name,
+                agent.cwd.display()
+            ))
+            .into());
+        }
+        let record = SessionRecord {
+            id: new_id(),
+            workspace_id: agent.workspace_id.clone(),
+            name: self.unique_session_name(&format!("{} shell", agent.name)),
+            kind: SessionKind::Shell,
+            cwd: agent.cwd.clone(),
+            command: self.options.default_shell.clone(),
+            agent_session_id: None,
+            created_at: Utc::now(),
+            state: SessionState::Running,
+            fallback_command: None,
+            worktree: agent.worktree.clone(),
+            companion_of: Some(agent.id.clone()),
+        };
+        Ok((self.launch(record, cols, rows)?, true))
+    }
+
+    /// Paste `text` into an agent session's companion shell, starting it
+    /// first when none runs and waiting (at most [`READY_TIMEOUT`]) for its
+    /// prompt; Enter only with `run` (as [`Hub::paste`]).
+    pub fn send_to_companion(
+        self: &Arc<Self>,
+        agent_id: &str,
+        text: &str,
+        run: bool,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<CompanionPaste, HubError> {
+        // Refuse a bad paste before starting anything for it.
+        crate::transcript::check_paste(text)?;
+        let (view, created) = self.companion(agent_id, cols, rows)?;
+        let id = view.record.id.clone();
+        let ready = if created {
+            let session = self.live_session(&id).ok_or_else(|| {
+                StateError::Conflict(format!("{:?} did not start", view.record.name))
+            })?;
+            wait_ready(&session, READY_TIMEOUT)?
+        } else {
+            Readiness::Running
+        };
+        let paste = self.paste(&id, text, run)?;
+        Ok(CompanionPaste {
+            session: self.session(&id)?,
+            created,
+            ready,
+            paste,
+        })
+    }
+
+    /// A worktree session's worktree and what removing it would lose
+    /// (runs git now).
+    pub fn worktree_info(&self, id: &str) -> Result<WorktreeInfo, HubError> {
+        let (record, companions, blocking) = self.worktree_neighbours(id)?;
+        let worktree = record.worktree.clone().ok_or_else(|| {
+            StateError::Invalid(format!(
+                "session {:?} does not run in a worktree",
+                record.name
+            ))
+        })?;
+        let check = git::removal_check(&worktree).map_err(HubError::Internal)?;
+        Ok(WorktreeInfo {
+            refusal: check.refusal(),
+            worktree,
+            check,
+            companions: companions.into_iter().map(|s| s.name).collect(),
+            blocking: blocking.into_iter().map(|s| s.name).collect(),
+        })
+    }
+
+    /// `id`'s record, its companions, and the other running sessions in
+    /// its worktree.
+    #[allow(clippy::type_complexity)]
+    fn worktree_neighbours(
+        &self,
+        id: &str,
+    ) -> Result<(SessionRecord, Vec<SessionRecord>, Vec<SessionRecord>), HubError> {
+        let store = self.store();
+        let record = store.session(id)?.clone();
+        let companions: Vec<SessionRecord> = store
+            .sessions()
+            .iter()
+            .filter(|s| s.companion_of.as_deref() == Some(id))
+            .cloned()
+            .collect();
+        let blocking = match &record.worktree {
+            Some(worktree) => store
+                .sessions()
+                .iter()
+                .filter(|s| {
+                    s.id != id
+                        && s.companion_of.as_deref() != Some(id)
+                        && s.state.is_running()
+                        && s.cwd.starts_with(&worktree.path)
+                })
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((record, companions, blocking))
+    }
+
+    /// Remove a session; with `remove_worktree`, also its companion shells
+    /// and its worktree (refused, nothing touched, when another session
+    /// runs there, or -- unless `force` -- when it holds uncommitted work
+    /// or commits its base lacks). The branch goes too when it has nothing
+    /// its base lacks.
+    pub fn remove_session_with(
+        &self,
+        id: &str,
+        options: RemoveOptions,
+    ) -> Result<RemoveOutcome, HubError> {
+        if !options.remove_worktree {
+            self.remove_session(id)?;
+            return Ok(RemoveOutcome {
+                removed: vec![id.to_owned()],
+                worktree: None,
+            });
+        }
+        let info = self.worktree_info(id)?;
+        if let Some(other) = info.blocking.first() {
+            return Err(StateError::Conflict(format!(
+                "session {other:?} also runs in worktree {}; close it first",
+                info.worktree.path.display()
+            ))
+            .into());
+        }
+        if !options.force
+            && let Some(why) = &info.refusal
+        {
+            return Err(StateError::Conflict(why.clone()).into());
+        }
+        // Nothing may run in a directory being deleted: the companions and
+        // the session go first, each waited for.
+        let (_, companions, _) = self.worktree_neighbours(id)?;
+        let mut removed: Vec<String> = companions.into_iter().map(|s| s.id).collect();
+        removed.push(id.to_owned());
+        for sid in &removed {
+            if let Some(session) = self.live_session(sid)
+                && session.exit_info().is_none()
+            {
+                session.kill(KILL_GRACE);
+                session.wait_exit(KILL_GRACE + Duration::from_secs(1));
+            }
+        }
+        for sid in &removed {
+            match self.remove_session(sid) {
+                Ok(()) | Err(HubError::State(StateError::NotFound(_))) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let worktree = git::remove(&info.worktree, options.force).map_err(|e| {
+            StateError::Conflict(format!(
+                "the session is closed, but its worktree was kept: {e}"
+            ))
+        })?;
+        removed.rotate_right(1);
+        Ok(RemoveOutcome {
+            removed,
+            worktree: Some(worktree),
+        })
+    }
+
+    /// For the new-session form: where `folder`'s worktrees go, its
+    /// branches and default base, and -- with `task` -- the worktree that
+    /// would be cut (or why not). Runs git.
+    pub fn worktree_plan(
+        &self,
+        folder: &Path,
+        task: Option<&str>,
+        base: Option<&str>,
+    ) -> WorktreePlanView {
+        let mut view = WorktreePlanView {
+            dir: None,
+            default_base: None,
+            branches: Vec::new(),
+            plan: None,
+            error: None,
+        };
+        if !crate::state::is_git_root(folder) {
+            view.error = Some(format!(
+                "{} is not a git repository; worktrees need one",
+                folder.display()
+            ));
+            return view;
+        }
+        match git::worktrees_dir(folder) {
+            Ok(dir) => view.dir = Some(dir),
+            Err(e) => {
+                view.error = Some(e);
+                return view;
+            }
+        }
+        view.branches = git::branches(folder);
+        view.default_base = git::status(folder, None).ok().and_then(|s| s.branch);
+        if let Some(task) = task.filter(|t| !t.trim().is_empty()) {
+            match git::plan(folder, task, &self.options.worktree_branch_prefix, base) {
+                Ok(plan) => view.plan = Some(plan),
+                Err(e) => view.error = Some(e),
+            }
+        }
+        view
     }
 
     /// Spawn the PTY for `record` (its argv, cwd, and id); its exit is
@@ -946,6 +1385,11 @@ impl Hub {
     fn apply_signal(&self, id: &str, generation: u64, signal: Signal, detail: Option<&str>) {
         let changed = self.board().apply(id, generation, signal, detail);
         if changed {
+            // A turn started or ended: its files may have changed.
+            let key = self.store().session(id).ok().map(badge_key);
+            if let Some(key) = key {
+                self.git.nudge(key);
+            }
             self.emit(HubEvent::Status {
                 session_id: id.to_owned(),
             });
@@ -1099,10 +1543,10 @@ impl Hub {
             .into());
         }
         let workspace = store.workspace(&record.workspace_id)?;
-        if !workspace.has_folder(&record.cwd) {
+        if !workspace.has_folder(record.folder()) {
             return Err(StateError::Invalid(format!(
                 "folder {} is no longer part of workspace {}",
-                record.cwd.display(),
+                record.folder().display(),
                 workspace.name
             ))
             .into());
@@ -1133,6 +1577,7 @@ impl Hub {
         if let Some(previous) = previous {
             forget(&previous);
         }
+        self.git.nudge(badge_key(&record));
         self.emit(HubEvent::Sessions);
         Ok(self.view(record))
     }
@@ -1226,10 +1671,10 @@ impl Hub {
         let workspace = store
             .workspace(&record.workspace_id)
             .map_err(|e| e.to_string())?;
-        if !workspace.has_folder(&record.cwd) {
+        if !workspace.has_folder(record.folder()) {
             return Err(format!(
                 "folder {} is no longer part of workspace {}",
-                record.cwd.display(),
+                record.folder().display(),
                 workspace.name
             ));
         }
@@ -1293,6 +1738,23 @@ impl Hub {
         let record = self.store().rename_session(id, name)?;
         self.emit(HubEvent::Sessions);
         Ok(self.view(record))
+    }
+
+    /// `base` when no session has that name, else `base 2`, `base 3`, ...
+    fn unique_session_name(&self, base: &str) -> String {
+        let store = self.store();
+        let taken = |name: &str| store.sessions().iter().any(|s| s.name == name);
+        let base: String = base
+            .chars()
+            .take(crate::state::MAX_NAME_CHARS - 4)
+            .collect();
+        if !taken(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|name| !taken(name))
+            .unwrap_or(base)
     }
 
     fn default_session_name(&self, workspace_id: &str, command: &[String]) -> String {
@@ -1372,6 +1834,7 @@ impl Hub {
             server.stop();
         }
         self.commands.stop();
+        self.git.stop();
         let last_cwds: HashMap<String, PathBuf> = self
             .live()
             .iter()
@@ -1392,6 +1855,68 @@ impl Hub {
         for session in &sessions {
             session.release();
         }
+    }
+}
+
+impl BadgeSource for Hub {
+    fn git_watch(&self) -> &GitWatch {
+        &self.git
+    }
+
+    fn badge_keys(&self) -> Vec<(BadgeKey, bool)> {
+        let store = self.store();
+        let live = self.live();
+        store
+            .sessions()
+            .iter()
+            .map(|s| {
+                let running = live.get(&s.id).is_some_and(|l| l.exit_info().is_none());
+                (badge_key(s), running)
+            })
+            .collect()
+    }
+
+    fn badges_changed(&self) {
+        self.emit(HubEvent::Sessions);
+    }
+}
+
+/// What a session's git badge is read for.
+fn badge_key(record: &SessionRecord) -> BadgeKey {
+    BadgeKey {
+        dir: record.cwd.clone(),
+        base: record.worktree.as_ref().map(|w| w.base.clone()),
+    }
+}
+
+/// Wait until a just-started shell is ready for a paste: bracketed paste
+/// enabled (a line editor's prompt is up), or output drawn and then quiet
+/// for [`READY_QUIET`]; after `timeout`, go ahead anyway (the terminal
+/// buffers typed-ahead input). An exit while waiting is a conflict.
+fn wait_ready(session: &PtySession, timeout: Duration) -> Result<Readiness, HubError> {
+    let deadline = Instant::now() + timeout;
+    let mut seen = session.output_bytes();
+    let mut since = Instant::now();
+    loop {
+        if session.exit_info().is_some() {
+            return Err(
+                StateError::Conflict("the shell exited before its prompt came up".into()).into(),
+            );
+        }
+        if session.bracketed_paste() {
+            return Ok(Readiness::Bracketed);
+        }
+        let now = session.output_bytes();
+        if now != seen {
+            seen = now;
+            since = Instant::now();
+        } else if now > 0 && since.elapsed() >= READY_QUIET {
+            return Ok(Readiness::Quiet);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Readiness::Timeout);
+        }
+        std::thread::sleep(READY_POLL);
     }
 }
 

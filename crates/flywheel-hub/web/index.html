@@ -52,6 +52,7 @@
   <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.2" y="5.2" width="8.3" height="8.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.8 2.5H2.5v8.3" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-import" viewBox="0 0 16 16"><path d="M8 2v8M4.5 6.8 8 10.3l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2.5 11v2.5h11V11" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 16 16"><circle cx="4.5" cy="3.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="4.5" cy="12.5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="5" r="1.6" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M4.5 5.1v5.8M11.5 6.6c0 3-7 2-7 4.3" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="m5 3.5 4.5 4.5L5 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
 </svg>
 
@@ -121,6 +122,7 @@
           <label class="cmd-field"><span>send to</span><select id="cmd-target"></select></label>
           <label class="cmd-check"><input type="checkbox" id="cmd-all"> all blocks</label>
         </div>
+        <p class="cmd-hint" id="cmd-hint" aria-live="polite"></p>
         <ul id="cmd-list" class="cmd-list"></ul>
         <footer class="cmd-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</footer>
       </aside>
@@ -223,6 +225,17 @@
     <fieldset class="field repos-pick" id="repo-picker">
       <legend class="field-label">In folder</legend>
     </fieldset>
+    <div class="field wt-pick unavailable" id="wt-pick">
+      <label class="wt-toggle"><input type="checkbox" id="wt-on" disabled> in a new sibling worktree <span class="field-hint">git folders only</span></label>
+      <div class="wt-fields" id="wt-fields" hidden>
+        <label class="wt-field"><span class="field-label">Task <span class="field-hint">directory + branch name</span></span>
+          <input id="wt-task" maxlength="64" autocomplete="off" spellcheck="false" placeholder="fix-login"></label>
+        <label class="wt-field"><span class="field-label">From <span class="field-hint">base branch or commit</span></span>
+          <input id="wt-base" list="wt-bases" autocomplete="off" spellcheck="false" placeholder="HEAD"></label>
+        <datalist id="wt-bases"></datalist>
+      </div>
+      <p class="wt-note" id="wt-note" aria-live="polite"></p>
+    </div>
     <label class="field">
       <span class="field-label">Name <span class="field-hint">optional</span></span>
       <input name="name" maxlength="100" autocomplete="off" spellcheck="false" id="session-name">
@@ -249,6 +262,23 @@
   </form>
 </dialog>
 
+<dialog id="dlg-close-wt" class="sheet narrow" aria-labelledby="cwt-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker">close worktree session</span>
+      <h2 id="cwt-title"></h2>
+    </header>
+    <p class="sheet-body" id="cwt-where"></p>
+    <p class="cwt-state" id="cwt-state" role="status"></p>
+    <label class="import-update" id="cwt-force-row" hidden><input type="checkbox" id="cwt-force"> force: lose the uncommitted work (an unmerged branch is kept)</label>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab ghost" value="cancel">Cancel</button>
+      <button type="submit" class="slab ghost" value="keep" id="cwt-keep">Close, keep worktree</button>
+      <button type="submit" class="slab danger" value="remove" id="cwt-remove" disabled>Remove worktree</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-keys" class="sheet narrow" aria-labelledby="keys-title">
   <form method="dialog">
     <header class="sheet-head">
@@ -265,6 +295,7 @@
       <div><dt><kbd>Alt</kbd><kbd>W</kbd></dt><dd>close the attached session</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>C</kbd></dt><dd>show / hide suggested commands</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>copy the last suggested shell command</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>`</kbd></dt><dd>flip between an agent and its companion shell (opened on first use)</dd></div>
       <div><dt><kbd>F2</kbd> / double-click</dt><dd>rename the focused sidebar session (Tab to it)</dd></div>
       <div><dt><kbd>Delete</kbd></dt><dd>close the focused sidebar session</dd></div>
     </dl>
@@ -296,6 +327,7 @@
 <script src="/assets/attention.js"></script>
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>
+<script src="/assets/worktree.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

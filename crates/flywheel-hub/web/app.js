@@ -250,6 +250,8 @@
     workspaceById,
     MOD,
     openSession: (id) => openSession(id),
+    refresh: () => refresh(),
+    termSize: () => ({ cols: term.cols, rows: term.rows }),
     focusTerminal: () => {
       if (state.attached && term && !document.querySelector("dialog[open]")) term.focus();
     },
@@ -266,6 +268,9 @@
     openSession: (id) => openSession(id),
     present: () => present(),
   });
+  // Sibling worktrees (worktree.js): the new-session fields, row badges,
+  // and the keep / remove close dialog.
+  const worktrees = window.FwHubWorktree({ $, el, icon, api });
 
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
@@ -1054,7 +1059,12 @@
   async function closeSession(id) {
     const session = sessionById(id);
     if (!session) return;
-    if (session.state === "running" && session.live) {
+    let query = "";
+    if (session.worktree) {
+      const how = await worktrees.confirmClose(session);
+      if (!how) return;
+      if (how.remove) query = `?remove_worktree=true${how.force ? "&force=true" : ""}`;
+    } else if (session.state === "running" && session.live) {
       const ok = await confirmDialog({
         kicker: "close session",
         title: `Close ${session.name}?`,
@@ -1069,8 +1079,15 @@
     }
     state.closing.add(id);
     try {
-      await api("DELETE", `/api/sessions/${id}`);
-      if (state.attached === id) detach();
+      // Removing a worktree also closes its companion shells.
+      const companions = query ? state.sessions.filter((s) => s.companion_of === id).map((s) => s.id) : [];
+      companions.forEach((c) => state.closing.add(c));
+      try {
+        await api("DELETE", `/api/sessions/${id}${query}`);
+      } finally {
+        companions.forEach((c) => setTimeout(() => state.closing.delete(c), 3000));
+      }
+      if (state.attached === id || companions.includes(state.attached)) detach();
       await refresh();
     } catch (error) {
       flagError(id, error);
@@ -1197,7 +1214,7 @@
     return el(
       "li",
       {
-        className: `session${active ? " active" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}`,
+        className: `session${active ? " active" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of ? " companion" : ""}`,
         dataset: { id: session.id },
         tabIndex: 0,
         role: "button",
@@ -1239,6 +1256,8 @@
       st.dot === "blocked" && st.detail
         ? el("span", { className: "session-detail", textContent: st.detail })
         : null,
+      // A companion sits under its agent: the agent's line says it all.
+      session.companion_of && sessionById(session.companion_of) ? null : worktrees.badge(session),
     );
   }
 
@@ -1774,7 +1793,7 @@
     const attached = sessionById(state.attached);
     const paths = workspace.folders.map((f) => f.path);
     const chosen = [
-      attached && attached.workspace_id === workspace.id ? attached.cwd : null,
+      attached && attached.workspace_id === workspace.id ? (attached.worktree ? attached.worktree.repo : attached.cwd) : null,
       state.repoChoice[workspace.id],
     ].find((path) => path && paths.includes(path)) || paths[0];
     // Missing folders cannot be opened; they stay listed, disabled.
@@ -1835,6 +1854,15 @@
       : null;
     list.classList.toggle("long", !!filter);
     picker.replaceChildren(legend, ...(filter ? [filter] : []), list);
+    pickedFolderChanged();
+  }
+
+  // The worktree fields follow the picked folder (git ones only).
+  function pickedFolderChanged() {
+    const workspace = workspaceById($("#session-workspace").value);
+    const checked = sessionForm.querySelector('input[name="repo"]:checked');
+    const folder = workspace && checked ? workspace.folders.find((f) => f.path === checked.value) : null;
+    worktrees.setFolder(folder || null);
     updateSessionPlaceholder();
   }
 
@@ -1842,7 +1870,7 @@
     const kind = selectedKind();
     const workspaceId = $("#session-workspace").value;
     const count = state.sessions.filter((s) => s.workspace_id === workspaceId).length;
-    $("#session-name").placeholder = `${kind} ${count + 1}`;
+    $("#session-name").placeholder = worktrees.taskName() || `${kind} ${count + 1}`;
   }
 
   async function openSessionDialog(workspaceId) {
@@ -1855,6 +1883,7 @@
       workspaceById(state.currentWorkspace) ||
       state.workspaces[0];
     sessionForm.reset();
+    worktrees.reset();
     $("#session-error").textContent = "";
     $("#session-workspace").replaceChildren(
       ...state.workspaces.map((w) => el("option", { value: w.id, textContent: w.name, selected: w.id === target.id })),
@@ -1875,6 +1904,11 @@
   }
 
   $("#session-workspace").addEventListener("change", renderRepoPicker);
+  $("#repo-picker").addEventListener("change", pickedFolderChanged);
+  $("#repo-picker").addEventListener("input", (event) => {
+    if (event.target.matches(".repo-filter")) pickedFolderChanged();
+  });
+  $("#wt-pick").addEventListener("input", updateSessionPlaceholder);
   // Enter launches from anywhere in the form (radios do not submit on
   // their own).
   sessionForm.addEventListener("keydown", (event) => {
@@ -1896,6 +1930,8 @@
     try {
       const body = { workspace_id: workspaceId, kind };
       if (repoInput) body.repo = repoInput.value;
+      const worktree = worktrees.request();
+      if (worktree) body.worktree = worktree;
       if (name) body.name = name;
       if (repoInput) {
         state.repoChoice[workspaceId] = repoInput.value;
@@ -2178,6 +2214,8 @@
       } else if (event.code === "KeyC") {
         if (event.shiftKey) commands.copyLast();
         else commands.toggle();
+      } else if (event.code === "Backquote" && !event.shiftKey && state.attached) {
+        commands.flipCompanion();
       } else {
         handled = false;
       }

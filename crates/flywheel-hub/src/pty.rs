@@ -145,6 +145,8 @@ struct Shared {
     exit: Option<ExitInfo>,
     /// The leader has been reaped (its pid may be recycled from here on).
     reaped: bool,
+    /// Output bytes read from the child so far.
+    output_bytes: u64,
     size: PtySize,
 }
 
@@ -247,6 +249,7 @@ impl PtySession {
                 screen: Emulator::new(size.cols, size.rows, spec.scrollback_lines),
                 exit: None,
                 reaped: false,
+                output_bytes: 0,
                 size,
             }),
             exited: Condvar::new(),
@@ -308,6 +311,7 @@ impl PtySession {
                     let replies = {
                         let mut shared = self.lock();
                         shared.screen.process(&chunk);
+                        shared.output_bytes += chunk.len() as u64;
                         // No receivers is not an error: output is retained.
                         let _ = self.events.send(SessionEvent::Output(chunk));
                         shared.screen.take_replies()
@@ -440,6 +444,12 @@ impl PtySession {
     /// [`ViewerColors`]).
     pub fn set_viewer_colors(&self, colors: ViewerColors) {
         self.lock().screen.set_viewer_colors(colors);
+    }
+
+    /// Output bytes the child has written so far (a cheap "is it still
+    /// drawing" probe).
+    pub fn output_bytes(&self) -> u64 {
+        self.lock().output_bytes
     }
 
     /// Whether the program in the terminal enabled bracketed paste.

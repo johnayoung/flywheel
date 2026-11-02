@@ -48,6 +48,7 @@ mod commands_api;
 mod import_api;
 mod notify_api;
 mod pwa;
+mod worktree_api;
 
 use crate::auth::{
     FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
@@ -149,7 +150,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             "/api/sessions/{id}",
             get(get_session)
                 .patch(update_session)
-                .delete(remove_session),
+                .delete(worktree_api::remove_session),
         )
         .route("/api/kinds", get(list_kinds))
         .route("/api/folders/check", get(check_folder))
@@ -169,6 +170,15 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(commands_api::list_commands),
         )
         .route("/api/sessions/{id}/paste", post(commands_api::paste))
+        .route(
+            "/api/sessions/{id}/companion",
+            post(worktree_api::companion),
+        )
+        .route(
+            "/api/sessions/{id}/worktree",
+            get(worktree_api::worktree_info),
+        )
+        .route("/api/worktrees/plan", get(worktree_api::plan))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
@@ -878,15 +888,6 @@ async fn restart_session(
     Ok(Json(view).into_response())
 }
 
-async fn remove_session(
-    State(app): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Response> {
-    let hub = Arc::clone(&app.hub);
-    blocking(move || hub.remove_session(&id)).await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
 #[derive(Deserialize)]
 struct ScreenQuery {
     source: Option<String>,
@@ -989,7 +990,7 @@ async fn session_input(
     Path(id): Path<String>,
     ApiJson(request): ApiJson<InputRequest>,
 ) -> ApiResult<Response> {
-    app.hub.session(&id)?;
+    let view = app.hub.session(&id)?;
     let Some(session) = app.hub.live_session(&id) else {
         return Ok(error_response(
             StatusCode::CONFLICT,
@@ -1028,6 +1029,8 @@ async fn session_input(
             return Ok(refused);
         }
         sent += 1;
+        // A command may have run: its git badge is looked at shortly.
+        app.hub.nudge_badge_soon(&view.record);
     }
     Ok(Json(json!({ "bytes": sent, "bracketed": bracketed })).into_response())
 }

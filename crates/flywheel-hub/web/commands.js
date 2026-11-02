@@ -1,15 +1,20 @@
 // flywheel hub: the Commands drawer. Code blocks an agent suggested, read
 // by the hub from the agent's transcript (exact text, no terminal margins
 // or wrapping), with Copy, Send (paste into a shell session, never Enter)
-// and Send + Run. app.js creates it with its helpers; protocol:
-// GET /api/sessions/{id}/commands, POST /api/sessions/{id}/paste, and the
-// events socket's {"type":"commands"} pushes.
+// and Send + Run. With no shell running where the agent works, "Open shell
+// & send" starts the agent's companion shell (same directory) and pastes
+// once its prompt is up. app.js creates it with its helpers; protocol:
+// GET /api/sessions/{id}/commands, POST /api/sessions/{id}/paste,
+// POST /api/sessions/{id}/companion, and the events socket's
+// {"type":"commands"} pushes.
 "use strict";
 
 window.FwHubCommands = function (ctx) {
   const { $, el, icon, api, state, sessionById, workspaceById, focusTerminal } = ctx;
 
   const MAX_CACHED = 500;
+  // The "send to" pick that opens the agent's companion shell.
+  const NEW_COMPANION = "companion:new";
   const cache = {}; // session id -> commands, newest first
   const ui = {
     open: false,
@@ -31,13 +36,22 @@ window.FwHubCommands = function (ctx) {
   const basename = (path) => String(path || "").split("/").filter(Boolean).pop() || String(path || "");
 
   // A session as the pickers name it: its name, plus the folder it runs in
-  // when its workspace has more than one.
+  // when its workspace has more than one, and its worktree's branch.
   function sessionLabel(s) {
     const workspace = workspaceById(s.workspace_id);
-    if (!workspace || !workspace.folders || workspace.folders.length < 2) return s.name;
-    const folder = workspace.folders.find((f) => f.path === s.cwd);
-    return `${s.name} \u00b7 ${folder ? folder.name || basename(folder.path) : basename(s.cwd)}`;
+    const branch = s.worktree ? ` \u00b7 wt ${s.worktree.branch}` : "";
+    if (!workspace || !workspace.folders || workspace.folders.length < 2) return `${s.name}${branch}`;
+    const home = s.worktree ? s.worktree.repo : s.cwd;
+    const folder = workspace.folders.find((f) => f.path === home);
+    return `${s.name} \u00b7 ${folder ? folder.name || basename(folder.path) : basename(home)}${branch}`;
   }
+
+  // An agent's running companion shell.
+  const companionOf = (agent) =>
+    agent ? state.sessions.find((s) => s.companion_of === agent.id && isRunning(s)) || null : null;
+
+  // Where a session works, for hints: its worktree branch or its folder.
+  const placeOf = (s) => (s.worktree ? `worktree ${s.worktree.branch}` : basename(s.cwd));
 
   // Drop what refers to sessions that no longer exist (closed here or
   // elsewhere, or their workspace deleted): picks, cache, keyboard focus.
@@ -47,7 +61,7 @@ window.FwHubCommands = function (ctx) {
       ui.source = null;
       ui.selected = null;
     }
-    if (ui.target && !live.has(ui.target)) ui.target = null;
+    if (ui.target && ui.target !== NEW_COMPANION && !live.has(ui.target)) ui.target = null;
     for (const id of Object.keys(cache)) {
       if (!live.has(id) && ui.loading !== id) delete cache[id];
     }
@@ -194,18 +208,42 @@ window.FwHubCommands = function (ctx) {
     return state.sessions.filter((s) => runsShell(s) && isRunning(s) && s.workspace_id === workspace);
   }
 
-  // The user's pick; else the attached shell; else a shell in the
-  // source's folder (where its commands were meant to run); else any.
+  // Whether Send can open the source agent's companion shell.
+  const canOpenCompanion = (source) => isAgent(source) && !companionOf(source);
+
+  // Where Send goes: {session} (a running shell) or {open: agent} (start
+  // the agent's companion shell first), or null. The user's pick; else the
+  // agent's companion; else the attached shell; else a shell in the
+  // agent's directory (where its commands were meant to run); else a new
+  // companion there; else any shell of the workspace.
   function currentTarget(source) {
     const pool = targets(source);
     const attached = attachedSession();
-    return (
+    if (ui.target === NEW_COMPANION && canOpenCompanion(source)) return { open: source };
+    const session =
       pool.find((s) => s.id === ui.target) ||
+      companionOf(source) ||
       (attached && pool.find((s) => s.id === attached.id)) ||
-      (source && pool.find((s) => s.cwd === source.cwd)) ||
-      pool[0] ||
-      null
-    );
+      (source && pool.find((s) => s.cwd === source.cwd));
+    if (session) return { session };
+    if (canOpenCompanion(source)) return { open: source };
+    return pool[0] ? { session: pool[0] } : null;
+  }
+
+  // The line under the pickers saying where Send goes.
+  function targetHint(source, target) {
+    if (!target) {
+      return source
+        ? `No shell is running in this workspace to send to; copy the command instead.`
+        : "";
+    }
+    if (target.open) {
+      return `No shell runs in ${placeOf(target.open)} yet. Open shell starts ${target.open.name}'s companion shell there, waits for its prompt, then pastes (Run also presses Enter). ${ctx.MOD} \` flips between them.`;
+    }
+    const where = target.session.cwd ? ` in ${placeOf(target.session)}` : "";
+    const own = source && target.session.companion_of === source.id ? ` (${source.name}'s companion)` : "";
+    const elsewhere = source && target.session.cwd !== source.cwd ? `, not where ${source.name} works (${placeOf(source)})` : "";
+    return `Send pastes into ${target.session.name}${own}${where}${elsewhere} without pressing Enter; Send + Run also presses it.`;
   }
 
   function shown(source) {
@@ -216,11 +254,16 @@ window.FwHubCommands = function (ctx) {
   // --- actions -----------------------------------------------------------
 
   async function sendTo(command, run, source) {
-    const target = currentTarget(source);
-    if (!target) {
+    const picked = currentTarget(source);
+    if (!picked) {
       toast("No running shell in this workspace to send to.", { tone: "bad" });
       return;
     }
+    if (picked.open) {
+      await openAndSend(command, run, picked.open);
+      return;
+    }
+    const target = picked.session;
     try {
       await api("POST", `/api/sessions/${target.id}/paste`, { text: command.command, run });
       const open = target.id !== state.attached
@@ -231,6 +274,60 @@ window.FwHubCommands = function (ctx) {
         timeout: 3000,
       });
       if (target.id === state.attached) focusTerminal();
+    } catch (error) {
+      toast(error.message, { tone: "bad", timeout: 6000 });
+    }
+  }
+
+  // Start (or reuse) `agent`'s companion shell and paste into it once its
+  // prompt is up.
+  async function openAndSend(command, run, agent) {
+    const busy = toast(`Opening a shell in ${placeOf(agent)}…`, { timeout: 0 });
+    try {
+      const sent = await api("POST", `/api/sessions/${agent.id}/companion`, {
+        text: command.command,
+        run,
+        ...ctx.termSize(),
+      });
+      busy.remove();
+      if (ui.target === NEW_COMPANION) ui.target = null;
+      await ctx.refresh();
+      const shell = sent.session;
+      const late = sent.ready === "timeout" ? " Its prompt was slow to appear; check it." : "";
+      toast(`${sent.created ? "Opened" : "Used"} ${shell.name} and ${run ? "ran it" : "pasted it (not run: press Enter there)"}.${late}`, {
+        actions: [el("button", { type: "button", className: "text-btn", textContent: "open", onclick: () => ctx.openSession(shell.id) })],
+        timeout: 4000,
+        tone: late ? "bad" : "",
+      });
+    } catch (error) {
+      busy.remove();
+      toast(error.message, { tone: "bad", timeout: 6000 });
+    }
+  }
+
+  // Alt+`: from an agent to its companion shell (started on first use),
+  // and back.
+  async function flipCompanion() {
+    const attached = attachedSession();
+    if (!attached) return;
+    if (attached.companion_of) {
+      if (sessionById(attached.companion_of)) ctx.openSession(attached.companion_of);
+      else toast(`${attached.name}'s agent session is gone.`, { timeout: 2500 });
+      return;
+    }
+    if (!isAgent(attached)) {
+      toast(`${ctx.MOD} \` flips between an agent session and its companion shell; ${attached.name} is a shell.`, { timeout: 3000 });
+      return;
+    }
+    const running = companionOf(attached);
+    if (running) {
+      ctx.openSession(running.id);
+      return;
+    }
+    try {
+      const shell = await api("POST", `/api/sessions/${attached.id}/companion`, ctx.termSize());
+      await ctx.refresh();
+      ctx.openSession(shell.id);
     } catch (error) {
       toast(error.message, { tone: "bad", timeout: 6000 });
     }
@@ -262,6 +359,30 @@ window.FwHubCommands = function (ctx) {
     if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
     if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
     return at.toLocaleDateString();
+  }
+
+  function sendButtons(command, source, target) {
+    const opens = !!(target && target.open);
+    const name = target && target.session ? target.session.name : "";
+    const label = opens ? ["Open shell & send", "Open shell & run"] : ["Send", "Send + Run"];
+    const title = !target
+      ? "No running shell in this workspace, and no agent to open one for"
+      : opens
+        ? [`Open ${target.open.name}'s companion shell in ${placeOf(target.open)} and paste, without Enter`, "Open the companion shell, paste, and press Enter"]
+        : [`Paste into ${name} without pressing Enter`, `Paste into ${name} and press Enter`];
+    return [false, true].map((run, i) =>
+      el(
+        "button",
+        {
+          type: "button",
+          className: `slab ghost${opens ? " opens" : ""}`,
+          disabled: !target,
+          title: Array.isArray(title) ? title[i] : title,
+          onclick: () => sendTo(command, run, source),
+        },
+        i === 0 ? icon("send") : null,
+        label[i],
+      ));
   }
 
   function renderItem(command, source, target) {
@@ -297,29 +418,7 @@ window.FwHubCommands = function (ctx) {
           icon("copy"),
           "Copy",
         ),
-        el(
-          "button",
-          {
-            type: "button",
-            className: "slab ghost",
-            disabled: !target,
-            title: target ? `Paste into ${target.name} without pressing Enter` : "No running shell in this workspace",
-            onclick: () => sendTo(command, false, source),
-          },
-          icon("send"),
-          "Send",
-        ),
-        el(
-          "button",
-          {
-            type: "button",
-            className: "slab ghost",
-            disabled: !target,
-            title: target ? `Paste into ${target.name} and press Enter` : "No running shell in this workspace",
-            onclick: () => sendTo(command, true, source),
-          },
-          "Send + Run",
-        ),
+        ...sendButtons(command, source, target),
       ),
     );
   }
@@ -345,12 +444,22 @@ window.FwHubCommands = function (ctx) {
     const target = currentTarget(source);
     const targetPool = targets(source);
     const targetPick = $("#cmd-target");
-    targetPick.replaceChildren(
-      ...(targetPool.length
-        ? targetPool.map((s) => el("option", { value: s.id, textContent: sessionLabel(s), selected: target && s.id === target.id }))
-        : [el("option", { value: "", textContent: "no running shell" })]),
-    );
-    targetPick.disabled = targetPool.length < 2;
+    const options = targetPool.map((s) =>
+      el("option", {
+        value: s.id,
+        textContent: s.companion_of && source && s.companion_of === source.id ? `${sessionLabel(s)} (companion)` : sessionLabel(s),
+        selected: !!(target && target.session && s.id === target.session.id),
+      }));
+    if (canOpenCompanion(source)) {
+      options.push(el("option", {
+        value: NEW_COMPANION,
+        textContent: `new shell in ${placeOf(source)} (companion)`,
+        selected: !!(target && target.open),
+      }));
+    }
+    targetPick.replaceChildren(...(options.length ? options : [el("option", { value: "", textContent: "no running shell" })]));
+    targetPick.disabled = options.length < 2;
+    $("#cmd-hint").textContent = targetHint(source, target);
     $("#cmd-all").checked = ui.all;
 
     const list = $("#cmd-list");
@@ -588,6 +697,13 @@ window.FwHubCommands = function (ctx) {
     if (source) {
       cmd(`Copy last command from ${source.name}`, `${ctx.MOD} Shift C`, copyLast, "copy");
     }
+    const attached = attachedSession();
+    if (attached && attached.companion_of && sessionById(attached.companion_of)) {
+      cmd(`Back to agent ${sessionById(attached.companion_of).name}`, `${ctx.MOD} \``, flipCompanion, "claude");
+    } else if (isAgent(attached)) {
+      const running = companionOf(attached);
+      cmd(running ? `Companion shell of ${attached.name}` : `Open a companion shell for ${attached.name}`, `${ctx.MOD} \``, flipCompanion, "shell");
+    }
   }
 
   // The drawer follows the attached session.
@@ -602,5 +718,5 @@ window.FwHubCommands = function (ctx) {
     if (source && !cache[source.id] && ui.loading !== source.id) load(source.id);
   }
 
-  return { onEvent, toggle, copyLast, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
+  return { onEvent, toggle, copyLast, flipCompanion, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
 };

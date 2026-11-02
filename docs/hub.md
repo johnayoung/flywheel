@@ -59,9 +59,10 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | GET / POST | `/sessions[?workspace_id=]` | list / create `{"workspace_id","repo"?,"name"?,"kind"?,"command"?:[argv],"cols"?,"rows"?}` (`kind` defaults to `shell`; `command` only for shells, default `$SHELL`; default repo the first) |
 | GET / PATCH / DELETE | `/sessions/{id}` | PATCH `{"name"}` renames; DELETE kills and forgets |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
+| POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
 | GET | `/sessions/{id}/ws` | WebSocket attach |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
-| GET | `/repos/check?path=` | always 200: `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
+| GET | `/repos/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical}` or `{"ok":false,"error"}` (the new-workspace form validates as you type) |
 
 WebSocket: server sends **binary** frames of raw output (scrollback replay first, then live) and **text** JSON `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, replay follows) / `{"type":"error","message"}`. Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, or binary raw input.
 
@@ -73,14 +74,14 @@ curl -s -H "Authorization: Bearer $T" -H 'content-type: application/json' \
 
 ## Web UI
 
-Sidebar: workspaces (collapsible) > sessions, each with its kind glyph and a status dot (live / done / failed / stopped / gone). Dialogs create workspaces (repo paths checked live; paste several lines at once) and sessions (shell | claude | codex, repo picker). The attached session is kept in the URL (`#session=<id>`), so reloads re-attach; a dropped socket keeps the last screen, shows a countdown banner, and reconnects with backoff (immediately on `online` / tab focus). An ended process offers Relaunch and Close. Themes: auto (follows the OS), dark, light.
+Sidebar: workspaces (collapsible) > sessions, each with its kind glyph and a status dot (live / done / failed / stopped / gone; ended sessions keep their exit code across hub restarts). Dialogs create workspaces (repo paths checked live; paste several lines at once) and sessions (shell | claude | codex, repo picker defaulting to the attached session's repo). The attached session is kept in the URL (`#session=<id>`), so reloads re-attach; a dropped socket keeps the last screen, shows a countdown banner (and how many keystrokes were not sent), and reconnects with backoff (immediately on `online` / tab focus). An ended process, or a session whose terminal did not survive a hub restart, offers Relaunch (in place) and Close. Themes: auto (follows the OS), dark, light; the light theme lifts low-contrast agent TUI colours to 4.5:1.
 
 | Key | |
 |---|---|
 | `Ctrl K` | command palette (fuzzy: sessions, actions, themes); again inside it sends a literal `^K` |
 | `Alt N` / `Alt Shift N` | new session / new workspace |
-| `Alt 1`..`9`, `Alt Up/Down` | jump to the nth / previous / next session |
-| `Alt R`, `F2`, double-click | rename session |
-| `Alt W`, `Delete` | close session (confirms while it runs) |
+| `Alt 1`..`9`, `Alt Up/Down` | jump to the nth / previous / next session with a terminal (numbers skip gone ones) |
+| `Alt R`; `F2` or double-click on a sidebar row | rename session |
+| `Alt W`; `Delete` on a focused sidebar row | close session (confirms while it runs) |
 
-Hub shortcuts are captured before the terminal sees them. Served from the binary (no build step): xterm.js 6.0.0 + fit + web-links and the UI fonts (Big Shoulders Display, Martian Mono, JetBrains Mono; SIL OFL), vendored under `crates/flywheel-hub/web/vendor/` with their licenses. Only the fonts and icon are served without the token (the login page uses them).
+Hub shortcuts are captured before the terminal sees them. On macOS the chord is `Ctrl Option` instead of `Alt`, so Option keeps typing layout characters (`| [ ] { }`, dead keys); elsewhere an `Alt` key the layout turns into a character also goes to the terminal. Served from the binary (no build step): xterm.js 6.0.0 + fit + web-links and the UI fonts (Big Shoulders Display, Martian Mono, JetBrains Mono; SIL OFL), vendored under `crates/flywheel-hub/web/vendor/` with their licenses. Only the fonts and icon are served without the token (the login page uses them).

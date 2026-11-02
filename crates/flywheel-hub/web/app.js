@@ -51,6 +51,14 @@
     );
   }
 
+  // macOS types characters with Option ([ ] | { } on many layouts, dead
+  // keys on US), so plain Option chords belong to the terminal there; the
+  // hub's chords use Ctrl+Option instead.
+  const IS_MAC = /mac|iphone|ipad/i.test(
+    (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "",
+  );
+  const MOD = IS_MAC ? "Ctrl Opt" : "Alt";
+
   const basename = (path) => path.replace(/\/+$/, "").split("/").pop() || path;
   const pad2 = (n) => String(n).padStart(2, "0");
   const KIND_GLYPH = { shell: "shell", claude: "claude", codex: "codex" };
@@ -94,6 +102,8 @@
     snapshot: "",
     offline: 0, // consecutive failed refreshes
     notice: "", // why the last session detached, shown on the empty stage
+    dropped: 0, // keystrokes typed while the link was down
+    tick: null, // repaints the reconnect banner
     painted: false, // first sidebar paint done (entry animation plays once)
   };
 
@@ -111,9 +121,18 @@
     return out;
   }
 
+  // Sessions with a terminal on the hub (running, or ended with their
+  // scrollback), in sidebar order: what Alt+1..9 and Alt+Up/Down reach.
+  const attachable = () => orderedSessions().filter((s) => s.live);
+
+  // The record's own state, kept across hub restarts (a session without a
+  // terminal on this hub still shows how it ended).
   function status(session) {
-    if (!session.live) return { dot: "gone", label: "gone", tone: "" };
-    if (session.state === "running") return { dot: "live", label: "live", tone: "live" };
+    if (session.state === "running") {
+      return session.live
+        ? { dot: "live", label: "live", tone: "live" }
+        : { dot: "gone", label: "gone", tone: "" };
+    }
     if (session.state === "exited") {
       if (session.signal) return { dot: "bad", label: session.signal, tone: "bad" };
       return session.code === 0
@@ -121,6 +140,19 @@
         : { dot: "bad", label: `exit ${session.code}`, tone: "bad" };
     }
     return { dot: "stopped", label: "stopped", tone: "" };
+  }
+
+  const exitHow = (info) => (info.signal ? `killed by ${info.signal}` : `exit code ${info.code}`);
+
+  // Why a session has no terminal on this hub.
+  function goneText(session) {
+    if (session.state === "stopped") {
+      return `${session.name} was running when the hub stopped; its terminal did not survive the restart.`;
+    }
+    if (session.state === "exited") {
+      return `${session.name} ended (${exitHow(session)}) before the hub restarted; its terminal is gone.`;
+    }
+    return `${session.name} has no terminal on this hub.`;
   }
 
   // --- API -------------------------------------------------------------
@@ -168,7 +200,8 @@
     const attached = sessionById(state.attached);
     if (state.attached && !state.socket && !state.exited && (!attached || !attached.live)) {
       state.snapshot = JSON.stringify([ws, ss]);
-      detach("That session's terminal is gone (closed, or the hub restarted).");
+      if (attached) showGone(attached.id, true);
+      else detach("That session was closed.");
       return;
     }
     const snapshot = JSON.stringify([ws, ss]);
@@ -239,8 +272,15 @@
     store.set("theme", theme);
     document.documentElement.dataset.theme = theme;
     $("#theme-label").textContent = theme;
-    if (term) term.options.theme = TERM_THEMES[resolvedTheme()];
+    if (term) {
+      term.options.theme = TERM_THEMES[resolvedTheme()];
+      term.options.minimumContrastRatio = contrastFloor();
+    }
   }
+  // Agent TUIs (Claude Code) paint with 256-colour indexes tuned for dark
+  // backgrounds -- pale blue, gold -- that vanish on the light theme's
+  // paper. xterm lifts any cell below this ratio against its background.
+  const contrastFloor = () => (resolvedTheme() === "light" ? 4.5 : 1);
   prefersLight.addEventListener("change", () => applyTheme(theme));
 
   // --- terminal --------------------------------------------------------
@@ -258,16 +298,17 @@
       scrollback: 10000,
       allowProposedApi: false,
       theme: TERM_THEMES[resolvedTheme()],
+      minimumContrastRatio: contrastFloor(),
     });
     fit = new window.FitAddon.FitAddon();
     term.loadAddon(fit);
     term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
     term.open($("#terminal"));
-    term.onData((data) => send(JSON.stringify({ type: "input", data })));
+    term.onData((data) => sendInput(JSON.stringify({ type: "input", data })));
     term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
       for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
-      send(bytes);
+      sendInput(bytes);
     });
     term.onResize(({ cols, rows }) => {
       send(JSON.stringify({ type: "resize", cols, rows }));
@@ -287,7 +328,19 @@
 
   function send(message) {
     const socket = state.socket;
-    if (socket && socket.readyState === WebSocket.OPEN) socket.send(message);
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(message);
+      return true;
+    }
+    return false;
+  }
+
+  // Keystrokes cannot be queued safely (a reconnect replays a screen they
+  // were not typed against), so they are dropped -- and the banner says so.
+  function sendInput(message) {
+    if (send(message) || !state.attached || state.exited) return;
+    state.dropped += 1;
+    if (state.retryTimer) retryTick();
   }
 
   // --- connection ------------------------------------------------------
@@ -309,11 +362,16 @@
     $("#banner").hidden = true;
   }
 
+  const retryTick = () => {
+    if (state.tick) state.tick();
+  };
+
   function stopRetry() {
     clearTimeout(state.retryTimer);
     clearInterval(state.countdown);
     state.retryTimer = null;
     state.countdown = null;
+    state.tick = null;
   }
 
   function closeSocket() {
@@ -344,6 +402,7 @@
     state.attached = id;
     state.exited = null;
     state.retry = 0;
+    state.dropped = 0;
     state.notice = "";
     delete state.wsErrors[session.workspace_id];
     rememberWorkspace(session.workspace_id);
@@ -353,6 +412,42 @@
     term.reset();
     connect(id);
     render();
+  }
+
+  // Show a session that has no terminal on this hub (the hub restarted):
+  // the last screen stays when `keepScreen` (it was attached when the
+  // link died), with Relaunch and Close.
+  function showGone(id, keepScreen) {
+    const session = sessionById(id);
+    if (!session) return;
+    closeSocket();
+    state.attached = id;
+    state.exited = { gone: true };
+    state.notice = "";
+    delete state.wsErrors[session.workspace_id];
+    rememberWorkspace(session.workspace_id);
+    history.replaceState(null, "", `#session=${id}`);
+    document.body.classList.remove("side-open");
+    if (!keepScreen) term.reset();
+    term.write(`\r\n\x1b[2m[no terminal on this hub: ${status(session).label}]\x1b[0m\r\n`);
+    setLink("exited", "gone");
+    showBanner(goneText(session), endedActions(id), true);
+    render();
+  }
+
+  function endedActions(id) {
+    return [
+      el("button", { type: "button", className: "slab", onclick: () => relaunch(id) }, "Relaunch"),
+      el("button", { type: "button", className: "slab ghost", onclick: () => closeSession(id) }, "Close"),
+    ];
+  }
+
+  // Attach a session with a terminal; show an ended one's state.
+  function openSession(id) {
+    const session = sessionById(id);
+    if (!session) return;
+    if (session.live) attach(id);
+    else showGone(id, false);
   }
 
   // Open (or re-open) the attached session's socket. Each connect replays
@@ -369,6 +464,7 @@
       // screen visible while it retries.
       term.reset();
       state.retry = 0;
+      state.dropped = 0;
       setLink("attached");
       hideBanner();
       fit.fit();
@@ -404,17 +500,14 @@
   }
 
   function onExit(id, message) {
-    const how = message.signal ? `killed by ${message.signal}` : `exit code ${message.code}`;
+    const how = exitHow(message);
     state.exited = message;
     term.write(`\r\n\x1b[2m[process ended: ${how}]\x1b[0m\r\n`);
     setLink("exited", "ended");
     const session = sessionById(id);
     showBanner(
-      `Process ended (${how}). Scrollback stays until the session is closed.`,
-      [
-        el("button", { type: "button", className: "slab", onclick: () => relaunch(id) }, "Relaunch"),
-        el("button", { type: "button", className: "slab ghost", onclick: () => closeSession(id) }, "Close"),
-      ],
+      `Process ended (${how}). Scrollback stays until the session is closed or relaunched.`,
+      endedActions(id),
       !message.signal && message.code === 0,
     );
     if (session) refresh().catch(showError);
@@ -431,8 +524,12 @@
       const why = state.offline
         ? "The hub is unreachable."
         : `Link lost (code ${code}); the session keeps running on the hub.`;
-      $("#banner-text").textContent = `${why} Reconnecting in ${seconds}s.`;
+      const dropped = state.dropped
+        ? ` ${state.dropped} keystroke${state.dropped === 1 ? "" : "s"} not sent.`
+        : "";
+      $("#banner-text").textContent = `${why} Reconnecting in ${seconds}s.${dropped}`;
     };
+    state.tick = tick;
     showBanner("", [now]);
     tick();
     state.countdown = setInterval(tick, 250);
@@ -447,10 +544,15 @@
     } catch (_) {
       // Hub unreachable: try the socket anyway; its failure reschedules.
     }
-    if (state.attached !== id) return;
+    // The refresh may have settled it already (session gone or closed).
+    if (state.attached !== id || state.exited || state.socket) return;
     const session = sessionById(id);
-    if (state.offline === 0 && (!session || !session.live)) {
-      detach("That session's terminal is gone (closed, or the hub restarted).");
+    if (state.offline === 0 && !session) {
+      detach("That session was closed.");
+      return;
+    }
+    if (state.offline === 0 && !session.live) {
+      showGone(id, true);
       return;
     }
     connect(id);
@@ -482,20 +584,16 @@
     return created;
   }
 
+  // Relaunch in place: same record (name, place in the sidebar), a fresh
+  // process and scrollback.
   async function relaunch(id) {
-    const session = sessionById(id);
-    if (!session) return;
-    const body = {
-      workspace_id: session.workspace_id,
-      repo: session.cwd,
-      kind: session.kind || "shell",
-      name: session.name,
-    };
-    if (body.kind === "shell") body.command = session.command;
+    if (!sessionById(id)) return;
     try {
-      await createSession(body);
+      await api("POST", `/api/sessions/${id}/restart`, { cols: term.cols, rows: term.rows });
+      await refresh();
+      attach(id);
     } catch (error) {
-      showBanner(`Relaunch failed: ${error.message}`, [], false);
+      showBanner(`Relaunch failed: ${error.message}`, endedActions(id), false);
     }
   }
 
@@ -533,20 +631,26 @@
     }
   }
 
-  async function renameSession(id, name) {
+  // `refocus`: the user finished with Enter/Esc (not by clicking away), so
+  // the keyboard goes back to the terminal.
+  async function renameSession(id, name, refocus) {
     state.renaming = null;
     const session = sessionById(id);
-    if (!session || !name.trim() || name.trim() === session.name) {
-      render();
-      return;
-    }
     try {
-      await api("PATCH", `/api/sessions/${id}`, { name });
-      await refresh();
+      if (session && name.trim() && name.trim() !== session.name) {
+        await api("PATCH", `/api/sessions/${id}`, { name });
+        await refresh();
+      } else {
+        render();
+      }
     } catch (error) {
       flagError(id, error);
-      render();
     }
+    if (refocus) focusTerminal();
+  }
+
+  function focusTerminal() {
+    if (state.attached && !document.querySelector("dialog[open]") && !paletteOpen()) term.focus();
   }
 
   function startRename(id) {
@@ -570,17 +674,29 @@
   }
 
   async function deleteWorkspace(workspace) {
-    const count = state.sessions.filter((s) => s.workspace_id === workspace.id).length;
+    const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
+    const running = sessions.filter((s) => s.state === "running");
+    const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
     const ok = await confirmDialog({
       kicker: "delete workspace",
       title: `Delete ${workspace.name}?`,
-      body: count
-        ? `Its ${count} session record${count === 1 ? "" : "s"} go with it. Running sessions must be closed first. The repos on disk are not touched.`
-        : "The repos on disk are not touched.",
-      ok: "Delete",
+      body: [
+        running.length
+          ? `${plural(running.length, "session")} still ${running.length === 1 ? "runs" : "run"} here: deleting kills ${running.length === 1 ? "it" : "them"}, and every attached browser loses ${running.length === 1 ? "it" : "them"}.`
+          : "",
+        sessions.length
+          ? `Its ${plural(sessions.length, "session record")} ${sessions.length === 1 ? "goes" : "go"} with it.`
+          : "",
+        "The repos on disk are not touched.",
+      ].filter(Boolean).join(" "),
+      ok: running.length ? `Kill ${running.length} and delete` : "Delete",
     });
     if (!ok) return;
     try {
+      for (const session of running) {
+        await api("DELETE", `/api/sessions/${session.id}`);
+        if (state.attached === session.id) detach();
+      }
       await api("DELETE", `/api/workspaces/${workspace.id}`);
       delete state.wsErrors[workspace.id];
       await refresh();
@@ -604,10 +720,11 @@
         onclick: (e) => e.stopPropagation(),
         onkeydown: (e) => {
           e.stopPropagation();
-          if (e.key === "Enter") renameSession(session.id, e.target.value);
+          if (e.key === "Enter") renameSession(session.id, e.target.value, true);
           if (e.key === "Escape") {
             state.renaming = null;
             render();
+            focusTerminal();
           }
         },
         onblur: (e) => {
@@ -621,7 +738,7 @@
       iconButton("pen", "Rename (F2)", () => startRename(session.id)),
       session.state === "running" && session.live
         ? iconButton("stop", "Stop: hang up, keep the scrollback", () => stopSession(session.id))
-        : null,
+        : iconButton("redo", "Relaunch in place", () => relaunch(session.id)),
       iconButton("x", "Close session", () => closeSession(session.id), true),
     );
     return el(
@@ -632,15 +749,8 @@
         tabIndex: 0,
         role: "button",
         "aria-current": active ? "true" : undefined,
-        title: session.live ? undefined : "Ended before the hub restarted; its terminal is gone",
-        onclick: () => {
-          if (session.live) attach(session.id);
-          else {
-            state.wsErrors[session.workspace_id] =
-              `"${session.name}" ended before the hub restarted; its terminal is gone. Close it to clear it.`;
-            render();
-          }
-        },
+        title: session.live ? undefined : goneText(session),
+        onclick: () => openSession(session.id),
         ondblclick: (e) => {
           if (!e.target.closest("button")) startRename(session.id);
         },
@@ -663,8 +773,8 @@
         "span",
         { className: `glyph ${glyphFor(session.kind)}`, title: session.kind || "shell" },
         icon(glyphFor(session.kind)),
-        el("span", { className: `dot ${st.dot}` }),
       ),
+      el("span", { className: `dot ${st.dot}`, title: st.label }),
       nameNode,
       el(
         "span",
@@ -755,8 +865,7 @@
   }
 
   function render() {
-    const ordered = orderedSessions();
-    const numbering = new Map(ordered.map((s, i) => [s.id, i]));
+    const numbering = new Map(attachable().map((s, i) => [s.id, i]));
     const root = $("#workspaces");
     if (state.workspaces.length === 0) {
       root.replaceChildren(
@@ -900,7 +1009,10 @@
       clearTimeout(timer);
       row.dataset.state = input.value.trim() ? "checking" : "empty";
       setVerdict(row, true);
+      // Drop the previous check too: its answer is for the old text.
       row.result = null;
+      row.pending = null;
+      row.seq = ++checkSeq;
       note.textContent = "";
       timer = setTimeout(row.check, 280);
     });
@@ -944,10 +1056,11 @@
     const seq = ++checkSeq;
     row.seq = seq;
     row.dataset.state = "checking";
+    row.pendingRaw = raw;
     row.pending = api("GET", `/api/repos/check?path=${encodeURIComponent(raw)}`)
       .then((result) => {
         if (row.seq !== seq) return row.pending;
-        row.result = result;
+        row.result = { ...result, raw };
         row.dataset.state = result.ok ? "ok" : "bad";
         setVerdict(row, result.ok);
         row.note.textContent = result.ok
@@ -958,13 +1071,23 @@
       })
       .catch((error) => {
         if (row.seq !== seq) return row.pending;
-        row.result = { ok: false, error: error.message };
+        row.result = { ok: false, error: error.message, raw };
         row.dataset.state = "bad";
         setVerdict(row, false);
         row.note.textContent = error.message;
         return row.result;
       });
     return row.pending;
+  }
+
+  // The check answer for exactly what the row says now: the settled
+  // result, the in-flight check, or a fresh one -- never an answer for
+  // text the user has since changed.
+  function currentCheck(row) {
+    const raw = row.input.value.trim();
+    if (row.result && row.result.raw === raw) return row.result;
+    if (row.pending && row.pendingRaw === raw) return row.pending;
+    return row.check();
   }
 
   function setVerdict(row, ok) {
@@ -1003,6 +1126,10 @@
   }
 
   $("#add-repo").addEventListener("click", () => addRepoRow("").input.focus());
+  // A stale error (name taken, bad path) clears as soon as the form changes.
+  wsForm.addEventListener("input", () => {
+    $("#workspace-error").textContent = "";
+  });
 
   wsForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1023,7 +1150,7 @@
     const submit = $("#workspace-submit");
     submit.disabled = true;
     try {
-      const results = await Promise.all(rows.map((row) => row.result || row.pending || row.check()));
+      const results = await Promise.all(rows.map(currentCheck));
       const bad = rows.find((row, i) => !results[i] || !results[i].ok);
       if (bad) {
         error.textContent = "Fix the highlighted repository paths.";
@@ -1096,9 +1223,12 @@
       picker.replaceChildren(legend);
       return;
     }
-    const chosen = workspace.repos.includes(state.repoChoice[workspace.id])
-      ? state.repoChoice[workspace.id]
-      : workspace.repos[0];
+    // The repo of the session you are in, then the last one picked here.
+    const attached = sessionById(state.attached);
+    const chosen = [
+      attached && attached.workspace_id === workspace.id ? attached.cwd : null,
+      state.repoChoice[workspace.id],
+    ].find((repo) => repo && workspace.repos.includes(repo)) || workspace.repos[0];
     picker.replaceChildren(
       legend,
       ...workspace.repos.map((repo) =>
@@ -1198,27 +1328,32 @@
   function paletteCommands() {
     const attached = sessionById(state.attached);
     const items = [];
-    for (const [i, session] of orderedSessions().entries()) {
-      if (!session.live) continue;
+    const numbering = new Map(attachable().map((s, i) => [s.id, i]));
+    for (const session of orderedSessions()) {
       const workspace = workspaceById(session.workspace_id);
+      const n = numbering.get(session.id);
       items.push({
         group: "Sessions",
         glyph: glyphFor(session.kind),
         label: session.name,
-        hint: `${workspace ? workspace.name : ""} · ${status(session).label}${i < 9 ? ` · Alt ${i + 1}` : ""}`,
-        run: () => attach(session.id),
+        hint: `${workspace ? workspace.name : ""} · ${status(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
+        run: () => openSession(session.id),
       });
     }
     const cmd = (label, hint, run, glyph = "chev") => items.push({ group: "Commands", glyph, label, hint, run });
-    cmd("New session", "Alt N", () => openSessionDialog(), "plus");
+    cmd("New session", `${MOD} N`, () => openSessionDialog(), "plus");
     for (const workspace of state.workspaces) {
       cmd(`New session in ${workspace.name}`, "", () => openSessionDialog(workspace.id), "plus");
     }
-    cmd("New workspace", "Alt Shift N", () => openWorkspaceDialog(), "plus");
+    cmd("New workspace", `${MOD} Shift N`, () => openWorkspaceDialog(), "plus");
     if (attached) {
-      cmd(`Rename ${attached.name}`, "Alt R", () => startRename(attached.id), "pen");
-      if (attached.state === "running") cmd(`Stop ${attached.name}`, "keep scrollback", () => stopSession(attached.id), "stop");
-      cmd(`Close ${attached.name}`, "Alt W", () => closeSession(attached.id), "x");
+      cmd(`Rename ${attached.name}`, `${MOD} R`, () => startRename(attached.id), "pen");
+      if (attached.state === "running" && attached.live) {
+        cmd(`Stop ${attached.name}`, "keep scrollback", () => stopSession(attached.id), "stop");
+      } else {
+        cmd(`Relaunch ${attached.name}`, "same session, fresh process", () => relaunch(attached.id), "redo");
+      }
+      cmd(`Close ${attached.name}`, `${MOD} W`, () => closeSession(attached.id), "x");
       cmd("Detach", "leave the session running", () => detach(), "chev");
     }
     for (const workspace of state.workspaces) {
@@ -1380,12 +1515,22 @@
   // --- keyboard --------------------------------------------------------
 
   function jumpBy(delta) {
-    const live = orderedSessions().filter((s) => s.live);
+    const live = attachable();
     if (!live.length) return;
     const at = live.findIndex((s) => s.id === state.attached);
     const next = at < 0 ? (delta > 0 ? 0 : live.length - 1) : (at + delta + live.length) % live.length;
     attach(live[next].id);
   }
+
+  // The hub chord: Alt (no Ctrl/Meta) elsewhere, Ctrl+Option on macOS.
+  function hubChord(event) {
+    if (event.metaKey) return false;
+    return IS_MAC ? event.ctrlKey && event.altKey : event.altKey && !event.ctrlKey;
+  }
+
+  // Whether the key reports its plain character (Alt+7 -> "7"), as
+  // opposed to a layout character or a dead key.
+  const typesItself = (event, ch) => event.key.length === 1 && event.key.toUpperCase() === ch;
 
   // Capture phase: runs before xterm sees the key, so hub shortcuts never
   // reach the shell (Ctrl+K twice sends a literal ^K).
@@ -1405,12 +1550,18 @@
         return;
       }
       if (paletteOpen() || document.querySelector("dialog[open]")) return;
-      if (!event.altKey || mod) return;
+      if (!hubChord(event)) return;
       let handled = true;
       const digit = /^Digit([1-9])$/.exec(event.code);
-      if (digit) {
-        const target = orderedSessions()[Number(digit[1]) - 1];
-        if (target && target.live) attach(target.id);
+      const letter = /^Key([A-Z])$/.exec(event.code);
+      if ((digit || letter) && !IS_MAC && !typesItself(event, (digit || letter)[1])) {
+        // The layout made Alt+key into a character of its own: the
+        // terminal's, not a hub shortcut.
+        handled = false;
+      } else if (digit) {
+        const target = attachable()[Number(digit[1]) - 1];
+        if (target) attach(target.id);
+        else handled = false;
       } else if (event.code === "KeyN") {
         if (event.shiftKey) openWorkspaceDialog();
         else openSessionDialog();
@@ -1467,6 +1618,13 @@
     createTerminal();
     applyTheme(theme);
     loadKinds();
+    // Static chord labels follow the platform's hub modifier.
+    document.querySelectorAll("kbd").forEach((k) => {
+      if (k.textContent === "Alt") k.textContent = MOD;
+    });
+    document.querySelectorAll("[title]").forEach((node) => {
+      node.title = node.title.replace(/\bAlt\b/g, MOD);
+    });
     try {
       await refresh();
     } catch (error) {
@@ -1475,8 +1633,7 @@
     // Re-attach the session named in the URL (survives reloads).
     const match = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
     if (match) {
-      const session = sessionById(match[1]);
-      if (session && session.live) attach(session.id);
+      if (sessionById(match[1])) openSession(match[1]);
       else history.replaceState(null, "", window.location.pathname);
     }
     setInterval(() => refresh(false).catch(() => {}), 4000);

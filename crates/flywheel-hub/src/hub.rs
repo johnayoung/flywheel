@@ -287,8 +287,8 @@ impl Hub {
             workspace_id: workspace.id.clone(),
             name,
             kind: request.kind,
-            cwd: cwd.clone(),
-            command: command.clone(),
+            cwd,
+            command,
             created_at: Utc::now(),
             state: SessionState::Running,
         };
@@ -297,26 +297,7 @@ impl Hub {
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let weak: Weak<Self> = Arc::downgrade(self);
-        let exit_id = id.clone();
-        let session = PtySession::spawn(
-            SpawnSpec {
-                argv: command,
-                cwd,
-                env: vec![
-                    ("FLYWHEEL_HUB_SESSION".into(), id.clone()),
-                    ("FLYWHEEL_HUB_WORKSPACE".into(), workspace.id.clone()),
-                ],
-                cols: request.cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
-                rows: request.rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
-                scrollback_bytes: self.options.scrollback_bytes,
-            },
-            move |exit| {
-                if let Some(hub) = weak.upgrade() {
-                    hub.on_session_exit(&exit_id, exit);
-                }
-            },
-        )?;
+        let session = self.spawn_pty(&record, request.cols, request.rows)?;
         if let Err(e) = store.insert_session(record.clone()) {
             drop(store);
             session.kill(Duration::ZERO);
@@ -325,6 +306,86 @@ impl Hub {
         }
         self.live().insert(id, session);
         drop(store);
+        Ok(self.view(record))
+    }
+
+    /// Spawn the PTY for `record` (its argv, cwd, and id); its exit is
+    /// recorded against the id.
+    fn spawn_pty(
+        self: &Arc<Self>,
+        record: &SessionRecord,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<Arc<PtySession>, HubError> {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let exit_id = record.id.clone();
+        Ok(PtySession::spawn(
+            SpawnSpec {
+                argv: record.command.clone(),
+                cwd: record.cwd.clone(),
+                env: vec![
+                    ("FLYWHEEL_HUB_SESSION".into(), record.id.clone()),
+                    ("FLYWHEEL_HUB_WORKSPACE".into(), record.workspace_id.clone()),
+                ],
+                cols: cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
+                rows: rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
+                scrollback_bytes: self.options.scrollback_bytes,
+            },
+            move |exit| {
+                if let Some(hub) = weak.upgrade() {
+                    hub.on_session_exit(&exit_id, exit);
+                }
+            },
+        )?)
+    }
+
+    /// Relaunch an ended session in place: same id, name, kind, command,
+    /// and repo, a fresh PTY and scrollback. Works for a session that
+    /// exited on this server and for one left stopped by a hub restart.
+    /// Refused (409) while it still runs.
+    ///
+    /// The record's state gates this: it leaves `running` only once the
+    /// old PTY's exit callback has run (or the hub restarted), so no late
+    /// exit of the old process can land on the relaunched one.
+    pub fn restart_session(
+        self: &Arc<Self>,
+        id: &str,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    ) -> Result<SessionView, HubError> {
+        let mut store = self.store();
+        let record = store.session(id)?.clone();
+        if record.state.is_running() {
+            return Err(StateError::Conflict(format!(
+                "session {:?} is still running",
+                record.name
+            ))
+            .into());
+        }
+        let workspace = store.workspace(&record.workspace_id)?;
+        if !workspace.repos.contains(&record.cwd) {
+            return Err(StateError::Invalid(format!(
+                "repo {} is no longer part of workspace {}",
+                record.cwd.display(),
+                workspace.name
+            ))
+            .into());
+        }
+        let session = self.spawn_pty(&record, cols, rows)?;
+        let record = match store.mark_running(id) {
+            Ok(record) => record,
+            Err(e) => {
+                drop(store);
+                session.kill(Duration::ZERO);
+                session.release();
+                return Err(e.into());
+            }
+        };
+        let previous = self.live().insert(record.id.clone(), session);
+        drop(store);
+        if let Some(previous) = previous {
+            forget(&previous);
+        }
         Ok(self.view(record))
     }
 

@@ -282,7 +282,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   white-space: nowrap;
   font: 700 1.2rem/1.1 var(--display);
   letter-spacing: .03em;
-  text-transform: uppercase;
 }
 
 .workspace.current .ws-name { color: var(--signal); }
@@ -295,8 +294,17 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .ws-count b { color: var(--signal); font-weight: 600; }
 
-.ws-tools { display: inline-flex; opacity: 0; transition: opacity .15s; }
-.workspace:hover .ws-tools, .workspace:focus-within .ws-tools { opacity: 1; }
+/* Hidden tools must not take clicks: visibility, not just opacity. */
+.ws-tools { display: inline-flex; opacity: 0; visibility: hidden; transition: opacity .15s, visibility 0s .15s; }
+.workspace:hover .ws-tools, .workspace:focus-within .ws-tools { opacity: 1; visibility: visible; transition: opacity .15s; }
+
+/* Touch screens have no hover: tools stay out, and the attached row's
+   actions replace its state label. */
+@media (hover: none) {
+  .ws-tools { opacity: 1; visibility: visible; }
+  .session.active .session-actions { display: inline-flex; }
+  .session.active .session-state { display: none; }
+}
 
 .ws-repos {
   display: flex;
@@ -315,7 +323,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .session {
   position: relative;
   display: grid;
-  grid-template-columns: 1.1rem 1fr auto;
+  grid-template-columns: 1.1rem .5rem minmax(0, 1fr) auto;
   align-items: center;
   gap: .55rem;
   min-height: 2.05rem;
@@ -363,10 +371,10 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .glyph.claude { color: var(--signal); }
 .glyph.codex { color: var(--brass); }
 
-.glyph .dot {
-  position: absolute;
-  right: -.18rem;
-  bottom: -.12rem;
+.session > .dot {
+  position: relative;
+  flex: none;
+  margin-left: -.3rem;
 }
 
 .session-name {
@@ -424,7 +432,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .dot.live::after {
   content: "";
   position: absolute;
-  inset: -3px;
+  inset: -2px;
   border-radius: 50%;
   border: 1px solid var(--signal);
   animation: ping 2.4s var(--ease) infinite;
@@ -436,7 +444,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 @keyframes ping {
   0% { transform: scale(.6); opacity: .9; }
-  80%, 100% { transform: scale(1.9); opacity: 0; }
+  80%, 100% { transform: scale(1.7); opacity: 0; }
 }
 
 .ws-error {
@@ -599,9 +607,8 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 }
 
 .crumb-ws {
-  font: 600 1rem/1 var(--display);
-  letter-spacing: .08em;
-  text-transform: uppercase;
+  font: 600 1.05rem/1 var(--display);
+  letter-spacing: .05em;
   color: var(--ink-3);
   white-space: nowrap;
 }
@@ -615,7 +622,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   white-space: nowrap;
   font: 800 1.85rem/1 var(--display);
   letter-spacing: .01em;
-  text-transform: uppercase;
 }
 
 .kind-tag {
@@ -694,6 +700,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   flex: 1;
   min-height: 0;
   display: flex;
+  flex-direction: column;
   margin: .5rem 1.2rem 1.2rem;
 }
 
@@ -708,11 +715,12 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 #terminal .xterm-viewport { background-color: var(--bg) !important; }
 #terminal .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--rule-2) transparent; }
 
+/* In flow under the terminal, which refits above it: the last lines of
+   output stay visible. */
 .banner {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  position: relative;
+  flex: none;
+  margin-top: .45rem;
   display: flex;
   align-items: center;
   gap: 1rem;
@@ -842,7 +850,6 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .sheet-head h2 {
   margin: .15rem 0 0;
   font: 800 2rem/1 var(--display);
-  text-transform: uppercase;
   letter-spacing: .01em;
 }
 
@@ -1087,10 +1094,15 @@ button:disabled { cursor: not-allowed; opacity: .45; }
     inset: 0 auto 0 0;
     width: min(var(--side), 86vw);
     transform: translateX(-102%);
-    transition: transform .25s var(--ease);
-    box-shadow: var(--shadow);
+    visibility: hidden;
+    transition: transform .25s var(--ease), visibility 0s .25s;
   }
-  body.side-open #sidebar { transform: none; }
+  body.side-open #sidebar {
+    transform: none;
+    visibility: visible;
+    box-shadow: var(--shadow);
+    transition: transform .25s var(--ease);
+  }
   body.side-open .scrim { display: block; position: fixed; inset: 0; z-index: 2; background: rgba(8, 8, 6, .5); }
   .menu-toggle { display: inline-grid; }
   #term-header { padding: .5rem .7rem; gap: .5rem; }

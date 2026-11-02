@@ -89,6 +89,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/kinds", get(list_kinds))
         .route("/api/repos/check", get(check_repo))
         .route("/api/sessions/{id}/kill", post(kill_session))
+        .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
@@ -450,13 +451,17 @@ async fn list_kinds(State(app): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 struct RepoQuery {
-    path: String,
+    path: Option<String>,
 }
 
 /// Validate one candidate repo path for the new-workspace form: always 200,
-/// `{"ok":true,"path":canonical}` or `{"ok":false,"error":...}`.
+/// `{"ok":true,"path":canonical}` or `{"ok":false,"error":...}` (a missing
+/// or blank `path` included).
 async fn check_repo(Query(query): Query<RepoQuery>) -> Response {
-    let raw = std::path::PathBuf::from(query.path.trim());
+    let Some(path) = query.path.filter(|p| !p.trim().is_empty()) else {
+        return Json(json!({ "ok": false, "error": "path is required" })).into_response();
+    };
+    let raw = std::path::PathBuf::from(path.trim());
     let result = tokio::task::spawn_blocking(move || validate_repo(&raw)).await;
     match result {
         Ok(Ok(path)) => Json(json!({ "ok": true, "path": path })).into_response(),
@@ -472,6 +477,22 @@ async fn kill_session(State(app): State<AppState>, Path(id): Path<String>) -> Ap
     let hub = Arc::clone(&app.hub);
     blocking(move || hub.kill_session(&id)).await?;
     Ok(StatusCode::ACCEPTED.into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct RestartRequest {
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+async fn restart_session(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<RestartRequest>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.restart_session(&id, request.cols, request.rows)).await?;
+    Ok(Json(view).into_response())
 }
 
 async fn remove_session(

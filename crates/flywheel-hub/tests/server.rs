@@ -1036,6 +1036,17 @@ async fn repo_check_validates_a_single_path() {
     assert_eq!(check("relative/path".into()).await["ok"], false);
     assert_eq!(check(String::new()).await["ok"], false);
 
+    // No `path` at all still answers 200 JSON, not a plain-text rejection.
+    let missing = hub
+        .authed(reqwest::Method::GET, "/api/repos/check")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::OK);
+    let missing: Value = missing.json().await.unwrap();
+    assert_eq!(missing["ok"], false);
+    assert_eq!(missing["error"], "path is required");
+
     let anonymous = hub
         .http
         .get(hub.url("/api/repos/check?path=/"))
@@ -1043,5 +1054,124 @@ async fn repo_check_validates_a_single_path() {
         .await
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    hub.shutdown().await;
+}
+
+async fn wait_state(hub: &TestHub, sid: &str, want: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let view: Value = hub
+            .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if view["state"] == want {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "never reached {want}: {view}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_relaunches_an_ended_session_in_place() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("relaunch").await;
+    let workspace_id = ws["id"].as_str().unwrap().to_owned();
+    let session = hub
+        .create_session(
+            &workspace_id,
+            Some(vec![
+                "/bin/sh",
+                "-c",
+                "echo ready; read x; echo got-$x; exit 3",
+            ]),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let restart = |sid: String| {
+        hub.authed(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/restart"),
+        )
+        .json(&json!({ "cols": 90, "rows": 20 }))
+        .send()
+    };
+
+    // Still running: refused.
+    assert_eq!(
+        restart(sid.clone()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    let mut client = hub.connect(&sid, None, true).await.unwrap();
+    read_until(&mut client, "ready").await;
+    input(&mut client, "one\n").await;
+    read_until(&mut client, "got-one").await;
+    assert_eq!(read_control(&mut client, "exit").await["code"], 3);
+    wait_state(&hub, &sid, "exited").await;
+
+    let relaunched = restart(sid.clone()).await.unwrap();
+    assert_eq!(relaunched.status(), StatusCode::OK);
+    let view: Value = relaunched.json().await.unwrap();
+    assert_eq!(view["id"], sid.as_str());
+    assert_eq!(view["name"], session["name"]);
+    assert_eq!(view["state"], "running");
+    assert_eq!(view["live"]["cols"], 90);
+    // One record, not a look-alike second one.
+    let list: Value = hub
+        .authed(reqwest::Method::GET, "/api/sessions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+
+    // The relaunched process answers on the same session id, with fresh
+    // scrollback (the first run's output is not replayed).
+    let mut client = hub.connect(&sid, None, true).await.unwrap();
+    let (replay, _) = read_until(&mut client, "ready").await;
+    assert!(!replay.contains("got-one"), "{replay:?}");
+    input(&mut client, "two\n").await;
+    read_until(&mut client, "got-two").await;
+    assert_eq!(read_control(&mut client, "exit").await["code"], 3);
+    wait_state(&hub, &sid, "exited").await;
+
+    // A session left stopped by a hub restart relaunches too.
+    let (dir, state_dir, repo) = hub.shutdown().await;
+    let hub = TestHub::start_in(dir, state_dir, repo).await;
+    let long = hub
+        .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "sleep 300"]))
+        .await;
+    let long_id = long["id"].as_str().unwrap().to_owned();
+    let (dir, state_dir, repo) = hub.shutdown().await;
+    let hub = TestHub::start_in(dir, state_dir, repo).await;
+    let stopped = wait_state(&hub, &long_id, "stopped").await;
+    assert!(stopped["live"].is_null());
+    let relaunched = hub
+        .authed(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{long_id}/restart"),
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relaunched.status(), StatusCode::OK);
+    let view: Value = relaunched.json().await.unwrap();
+    assert_eq!(view["state"], "running");
+    assert!(view["live"]["pid"].is_u64(), "{view}");
+
+    let missing = hub
+        .authed(reqwest::Method::POST, "/api/sessions/nope/restart")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     hub.shutdown().await;
 }

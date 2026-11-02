@@ -240,14 +240,18 @@ impl HubStore {
     /// the removed session ids. Refused while any of its sessions is running.
     pub fn delete_workspace(&mut self, id: &str) -> Result<Vec<String>, StateError> {
         let index = self.workspace_index(id)?;
-        if self
+        let running = self
             .doc
             .sessions
             .iter()
-            .any(|s| s.workspace_id == id && s.state.is_running())
-        {
+            .filter(|s| s.workspace_id == id && s.state.is_running())
+            .count();
+        if running > 0 {
             return Err(StateError::Conflict(format!(
-                "workspace {id} has running sessions; kill them first"
+                "workspace {:?} has {running} running session{}; stop {} first",
+                self.doc.workspaces[index].name,
+                if running == 1 { "" } else { "s" },
+                if running == 1 { "it" } else { "them" },
             )));
         }
         let previous = self.doc.clone();
@@ -290,6 +294,27 @@ impl HubStore {
             at: Utc::now(),
         };
         self.save()
+    }
+
+    /// Record a relaunched session running again (same id, name, and
+    /// place in its workspace). Refused while it still runs.
+    pub fn mark_running(&mut self, id: &str) -> Result<SessionRecord, StateError> {
+        let index = self
+            .doc
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("session {id}")))?;
+        if self.doc.sessions[index].state.is_running() {
+            return Err(StateError::Conflict(format!(
+                "session {:?} is still running",
+                self.doc.sessions[index].name
+            )));
+        }
+        let previous =
+            std::mem::replace(&mut self.doc.sessions[index].state, SessionState::Running);
+        self.save_or_rollback(|doc| doc.sessions[index].state = previous)?;
+        Ok(self.doc.sessions[index].clone())
     }
 
     /// Mark every running session stopped (hub shutdown).
@@ -574,10 +599,16 @@ mod tests {
             .unwrap();
         let session = running_session(&ws.id, &repo);
         store.insert_session(session.clone()).unwrap();
-        assert!(matches!(
-            store.delete_workspace(&ws.id),
-            Err(StateError::Conflict(_))
-        ));
+        match store.delete_workspace(&ws.id) {
+            // Named for the operator, not by its id.
+            Err(StateError::Conflict(message)) => {
+                assert_eq!(
+                    message,
+                    "workspace \"w\" has 1 running session; stop it first"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
 
         let reopened = HubStore::open(dir.path()).unwrap();
         assert!(matches!(
@@ -642,6 +673,39 @@ mod tests {
                 .unwrap()
                 .state,
             SessionState::Stopped { .. }
+        ));
+    }
+
+    #[test]
+    fn mark_running_relaunches_an_ended_record_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let session = running_session(&ws.id, &repo);
+        store.insert_session(session.clone()).unwrap();
+        assert!(matches!(
+            store.mark_running(&session.id),
+            Err(StateError::Conflict(_))
+        ));
+        store
+            .mark_exited(
+                &session.id,
+                ExitInfo {
+                    code: Some(1),
+                    signal: None,
+                },
+            )
+            .unwrap();
+        let record = store.mark_running(&session.id).unwrap();
+        assert_eq!(record.state, SessionState::Running);
+        assert_eq!(record.name, session.name);
+        assert_eq!(store.sessions().len(), 1);
+        assert!(matches!(
+            store.mark_running("missing"),
+            Err(StateError::NotFound(_))
         ));
     }
 

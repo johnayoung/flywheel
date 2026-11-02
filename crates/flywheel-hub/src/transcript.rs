@@ -11,6 +11,11 @@
 //! is replaced or truncated is read again from the start, without
 //! duplicating blocks already seen. Codex sessions with no rollout to be
 //! found fall back to the `notify` payload's `last-assistant-message`.
+//!
+//! Each session's commands and its tail position are saved under the state
+//! dir (`commands/<session>.json`), so a restarted hub keeps every block,
+//! including those of conversations before a `/clear`, under the same
+//! `seq`, and resumes reading where it stopped.
 
 use crate::agent::{SessionKind, claude_transcript, is_conversation_id};
 use crate::commands::{Command, CommandSource, MAX_BLOCK_BYTES, copyable, fenced_blocks, is_shell};
@@ -18,7 +23,7 @@ use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::WriteOutcome;
 use crate::state::{SessionRecord, StateError};
 use crate::vt::TextSource;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -27,6 +32,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+/// The state dir's subdirectory holding each session's saved commands.
+pub const COMMANDS_DIR: &str = "commands";
 /// Commands kept per session (oldest dropped first).
 pub const MAX_COMMANDS: usize = 500;
 /// Block keys remembered per session against re-reading a replaced file.
@@ -50,7 +57,8 @@ pub const FRESH_WITHIN: Duration = Duration::from_secs(120);
 pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
 
 /// Which agent's file format a tail reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Format {
     Claude,
     Codex,
@@ -65,6 +73,9 @@ struct Tail {
     conversation: Option<String>,
     /// Bytes consumed from the file.
     offset: u64,
+    /// Where the incomplete last line starts (`offset` minus `pending`,
+    /// or inside a skipped line): the position to resume from.
+    line_start: u64,
     /// (device, inode) when last read: a different file at the path
     /// (rotation) is read from the start.
     identity: Option<(u64, u64)>,
@@ -90,54 +101,85 @@ impl Tail {
             format,
             conversation,
             offset: 0,
+            line_start: 0,
             identity: None,
             pending: Vec::new(),
             skipping: false,
         }
     }
 
-    /// Read what was appended since the last call; return the replies in
-    /// the complete lines. A missing file reads as nothing.
-    fn read(&mut self) -> Vec<Reply> {
+    /// A tail resumed from a saved position (the start of a line).
+    fn resume(saved: SavedTail) -> Self {
+        Self {
+            path: saved.path,
+            format: saved.format,
+            conversation: saved.conversation,
+            offset: saved.offset,
+            line_start: saved.offset,
+            identity: saved.identity,
+            pending: Vec::new(),
+            skipping: false,
+        }
+    }
+
+    fn saved(&self) -> SavedTail {
+        SavedTail {
+            path: self.path.clone(),
+            format: self.format,
+            conversation: self.conversation.clone(),
+            offset: self.line_start,
+            identity: self.identity,
+        }
+    }
+
+    /// Read what was appended since the last call, handing `each` the
+    /// replies in the complete lines as they are read (so a long backlog
+    /// is never held whole). A missing file reads as nothing.
+    fn read(&mut self, each: &mut dyn FnMut(Reply)) {
         let Ok(mut file) = File::open(&self.path) else {
-            return Vec::new();
+            return;
         };
         let Ok(meta) = file.metadata() else {
-            return Vec::new();
+            return;
         };
         let identity = file_identity(&meta);
         if self.identity.is_some_and(|known| known != identity) || meta.len() < self.offset {
             // Replaced or truncated: start over.
             self.offset = 0;
+            self.line_start = 0;
             self.pending.clear();
             self.skipping = false;
         }
         self.identity = Some(identity);
         if meta.len() == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return Vec::new();
+            return;
         }
-        let mut replies = Vec::new();
         let mut chunk = vec![0u8; READ_CHUNK];
         loop {
             let n = match file.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            let base = self.offset;
             self.offset += n as u64;
             let mut rest = &chunk[..n];
+            let mut at_in_chunk = 0usize;
             while let Some(at) = rest.iter().position(|&b| b == b'\n') {
                 let (head, tail) = rest.split_at(at);
                 rest = &tail[1..];
+                at_in_chunk += at + 1;
+                let start = self.line_start;
+                self.line_start = base + at_in_chunk as u64;
                 if self.skipping {
                     self.skipping = false;
                     continue;
                 }
                 if self.pending.is_empty() {
-                    self.line(head, &mut replies);
+                    self.line(head, start, each);
                 } else {
                     self.pending.extend_from_slice(head);
                     let line = std::mem::take(&mut self.pending);
-                    self.line(&line, &mut replies);
+                    self.line(&line, start, each);
                 }
             }
             if !self.skipping {
@@ -149,10 +191,10 @@ impl Tail {
                 }
             }
         }
-        replies
     }
 
-    fn line(&self, line: &[u8], replies: &mut Vec<Reply>) {
+    /// One complete line, starting at byte `start` of the file.
+    fn line(&self, line: &[u8], start: u64, each: &mut dyn FnMut(Reply)) {
         // Cheap pre-filter: only lines with a fence are parsed (big tool
         // results without one are skipped unparsed).
         if !contains(line, b"```") && !contains(line, b"~~~") {
@@ -165,7 +207,16 @@ impl Tail {
             Format::Claude => claude_reply(&value),
             Format::Codex => codex_reply(&value),
         };
-        replies.extend(reply);
+        if let Some(mut reply) = reply {
+            // Codex rollouts carry no message id, and several items can
+            // share a millisecond timestamp: the line's place in the file
+            // tells replies apart (and is the same when a replaced file is
+            // read again).
+            if reply.message_id.is_empty() {
+                reply.message_id = format!("@{start}");
+            }
+            each(reply);
+        }
     }
 }
 
@@ -241,13 +292,11 @@ pub fn codex_reply(value: &serde_json::Value) -> Option<Reply> {
     }
     // One reply's parts are one text.
     let texts = vec![texts.concat()];
-    let timestamp = str_field(value, "timestamp");
-    let message_id = str_field(item, "id")
-        .or_else(|| timestamp.clone())
-        .unwrap_or_default();
     Some(Reply {
-        message_id,
-        timestamp,
+        // Rollouts do not write the item id (codex-rs skips serializing
+        // it); empty means "use the line's offset" (see `Tail::line`).
+        message_id: str_field(item, "id").unwrap_or_default(),
+        timestamp: str_field(value, "timestamp"),
         texts,
     })
 }
@@ -311,6 +360,26 @@ pub fn codex_rollout(codex_home: &Path, thread: &str) -> Option<PathBuf> {
     None
 }
 
+/// A session's commands as saved under the state dir.
+#[derive(Debug, Serialize, Deserialize)]
+struct Saved {
+    next_seq: u64,
+    tail: Option<SavedTail>,
+    /// Oldest first.
+    commands: Vec<Command>,
+}
+
+/// Where a tail stopped.
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedTail {
+    path: PathBuf,
+    format: Format,
+    conversation: Option<String>,
+    /// The start of the first line not yet read.
+    offset: u64,
+    identity: Option<(u64, u64)>,
+}
+
 /// One session's commands and the tail feeding them.
 #[derive(Debug, Default)]
 struct SessionCommands {
@@ -326,9 +395,66 @@ struct SessionCommands {
     missed: Option<(Option<String>, Instant)>,
     /// Codex `notify` replies (turn id, text) not yet read.
     notified: VecDeque<(String, String)>,
+    /// Where the log is saved (`None`: kept in memory only).
+    file: Option<PathBuf>,
+    /// Why the last save failed.
+    save_error: Option<String>,
 }
 
 impl SessionCommands {
+    /// The log saved at `file`, or an empty one when there is none (or it
+    /// cannot be read: it is rewritten at the next save).
+    fn load(file: Option<PathBuf>) -> Self {
+        let mut log = Self {
+            file,
+            ..Self::default()
+        };
+        let Some(saved) = log
+            .file
+            .as_deref()
+            .and_then(|f| std::fs::read(f).ok())
+            .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+        else {
+            return log;
+        };
+        let skip = saved.commands.len().saturating_sub(MAX_COMMANDS);
+        for command in saved.commands.into_iter().skip(skip) {
+            log.remember(key_of(
+                command.conversation.as_deref(),
+                &command.message_id,
+                command.block_index,
+            ));
+            log.next_seq = log.next_seq.max(command.seq + 1);
+            log.entries.push_back(command);
+        }
+        log.next_seq = log.next_seq.max(saved.next_seq);
+        log.tail = saved.tail.map(Tail::resume);
+        log
+    }
+
+    /// Write the log to its file (atomically, owner-only).
+    fn save(&mut self) {
+        let Some(file) = self.file.as_deref() else {
+            return;
+        };
+        let saved = Saved {
+            next_seq: self.next_seq,
+            tail: self.tail.as_ref().map(Tail::saved),
+            commands: self.entries.iter().cloned().collect(),
+        };
+        let result = serde_json::to_vec(&saved)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                if let Some(dir) = file.parent() {
+                    crate::paths::ensure_private_dir(dir)?;
+                }
+                crate::auth::write_private(file, &bytes)
+            });
+        self.save_error = result
+            .err()
+            .map(|e| format!("cannot save commands to {}: {e}", file.display()));
+    }
+
     /// Add a reply's blocks; returns the new commands. `closed_only` keeps
     /// unclosed fences out (a text that may have been cut short).
     fn add(
@@ -347,11 +473,7 @@ impl SessionCommands {
                 if (closed_only && !block.closed) || block.text.len() > MAX_BLOCK_BYTES {
                     continue;
                 }
-                let key = (
-                    conversation.unwrap_or_default().to_owned(),
-                    reply.message_id.clone(),
-                    block_index,
-                );
+                let key = key_of(conversation, &reply.message_id, block_index);
                 if self.keys.contains(&key) {
                     continue;
                 }
@@ -392,6 +514,9 @@ impl SessionCommands {
     }
 
     fn remember(&mut self, key: (String, String, usize)) {
+        if self.keys.contains(&key) {
+            return;
+        }
         if self.key_order.len() == MAX_KEYS
             && let Some(old) = self.key_order.pop_front()
         {
@@ -400,6 +525,39 @@ impl SessionCommands {
         self.keys.insert(key.clone());
         self.key_order.push_back(key);
     }
+
+    /// Read what `tail` has new into the log, adding to `added` (at most
+    /// [`MAX_COMMANDS`], the newest); returns the tail.
+    fn drain(&mut self, mut tail: Tail, added: &mut Vec<Command>) -> Tail {
+        let source = source_of(tail.format);
+        let conversation = tail.conversation.clone();
+        tail.read(&mut |reply| {
+            let more = self.add(&reply, conversation.as_deref(), source, false);
+            push_bounded(added, more);
+        });
+        tail
+    }
+}
+
+/// A block's identity: conversation, reply, position in the reply.
+fn key_of(
+    conversation: Option<&str>,
+    message_id: &str,
+    block_index: usize,
+) -> (String, String, usize) {
+    (
+        conversation.unwrap_or_default().to_owned(),
+        message_id.to_owned(),
+        block_index,
+    )
+}
+
+/// Keep at most [`MAX_COMMANDS`] of `added`, the newest.
+fn push_bounded(added: &mut Vec<Command>, more: Vec<Command>) {
+    added.extend(more);
+    if added.len() > MAX_COMMANDS {
+        added.drain(..added.len() - MAX_COMMANDS);
+    }
 }
 
 /// Every session's suggested commands.
@@ -407,6 +565,10 @@ impl SessionCommands {
 pub struct CommandBook {
     claude_config_dir: Option<PathBuf>,
     codex_home: Option<PathBuf>,
+    /// Where each session's log is saved (`<dir>/<session id>.json`).
+    dir: Option<PathBuf>,
+    /// Logs of sessions deleted while no hub ran have been removed.
+    swept: std::sync::atomic::AtomicBool,
     sessions: Mutex<HashMap<String, Arc<Mutex<SessionCommands>>>>,
     wake: Mutex<Option<mpsc::Sender<()>>>,
 }
@@ -429,21 +591,51 @@ pub struct CommandList {
     /// The file being followed, when one was found.
     pub transcript: Option<PathBuf>,
     pub commands: Vec<Command>,
+    /// Why the commands could not be saved (they are kept in memory, and
+    /// lost at a restart).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_error: Option<String>,
 }
 
 impl CommandBook {
-    pub fn new(claude_config_dir: Option<PathBuf>, codex_home: Option<PathBuf>) -> Self {
+    /// A book saving each session's log under `dir` (`None`: memory only).
+    pub fn new(
+        claude_config_dir: Option<PathBuf>,
+        codex_home: Option<PathBuf>,
+        dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             claude_config_dir,
             codex_home,
+            dir,
+            swept: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             wake: Mutex::new(None),
         }
     }
 
+    /// Where session `id`'s log is saved (ids are the hub's own hex, but
+    /// anything else is never turned into a path).
+    fn file_of(&self, id: &str) -> Option<PathBuf> {
+        let safe = !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        self.dir
+            .as_deref()
+            .filter(|_| safe)
+            .map(|d| d.join(format!("{id}.json")))
+    }
+
     fn entry(&self, id: &str) -> Arc<Mutex<SessionCommands>> {
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(sessions.entry(id.to_owned()).or_default())
+        if let Some(entry) = sessions.get(id) {
+            return Arc::clone(entry);
+        }
+        let entry = Arc::new(Mutex::new(SessionCommands::load(self.file_of(id))));
+        sessions.insert(id.to_owned(), Arc::clone(&entry));
+        entry
     }
 
     /// Note what an agent report says about its transcript (Claude hooks
@@ -536,6 +728,7 @@ impl CommandBook {
         let mut log = entry.lock().unwrap_or_else(PoisonError::into_inner);
         let conversation = record.agent_session_id.clone();
         let mut added = Vec::new();
+        let mut switched = false;
         let following = log
             .tail
             .as_ref()
@@ -550,30 +743,19 @@ impl CommandBook {
                     Some((path, format)) => {
                         // Finish the old file first: its last reply may
                         // have landed after the previous look.
-                        if let Some(mut old) = log.tail.take() {
-                            let source = source_of(old.format);
-                            let old_conversation = old.conversation.clone();
-                            for reply in old.read() {
-                                added.extend(log.add(
-                                    &reply,
-                                    old_conversation.as_deref(),
-                                    source,
-                                    false,
-                                ));
-                            }
+                        if let Some(old) = log.tail.take() {
+                            log.drain(old, &mut added);
                         }
                         log.tail = Some(Tail::new(path, format, conversation.clone()));
                         log.missed = None;
+                        switched = true;
                     }
                     None => log.missed = Some((conversation.clone(), Instant::now())),
                 }
             }
         }
-        if let Some(mut tail) = log.tail.take() {
-            let source = source_of(tail.format);
-            for reply in tail.read() {
-                added.extend(log.add(&reply, tail.conversation.as_deref(), source, false));
-            }
+        if let Some(tail) = log.tail.take() {
+            let tail = log.drain(tail, &mut added);
             log.tail = Some(tail);
         }
         // Codex replies with no rollout to read: from the notify payload
@@ -588,8 +770,12 @@ impl CommandBook {
                     ),
                     texts: vec![text],
                 };
-                added.extend(log.add(&reply, conversation.as_deref(), CommandSource::Notify, true));
+                let more = log.add(&reply, conversation.as_deref(), CommandSource::Notify, true);
+                push_bounded(&mut added, more);
             }
+        }
+        if switched || !added.is_empty() {
+            log.save();
         }
         added
     }
@@ -602,6 +788,7 @@ impl CommandBook {
             session_id: record.id.clone(),
             conversation: record.agent_session_id.clone(),
             transcript: log.tail.as_ref().map(|t| t.path.clone()),
+            save_error: log.save_error.clone(),
             commands: log
                 .entries
                 .iter()
@@ -613,12 +800,41 @@ impl CommandBook {
         }
     }
 
-    /// Drop the logs of sessions not in `keep`.
+    /// Drop (and delete the saved files of) the logs of sessions not in
+    /// `keep`, which must be every session the hub has. The first call
+    /// also removes files left by sessions deleted while no hub ran.
     pub fn retain(&self, keep: &HashSet<String>) {
+        let mut gone = Vec::new();
         self.sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, _| keep.contains(id));
+            .retain(|id, _| {
+                let kept = keep.contains(id);
+                if !kept {
+                    gone.push(id.clone());
+                }
+                kept
+            });
+        for id in gone {
+            if let Some(file) = self.file_of(&id) {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        if let Some(dir) = self.dir.as_deref()
+            && !self.swept.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+                let stale = path.extension().is_some_and(|e| e == "json")
+                    && path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|id| !keep.contains(id));
+                if stale {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     /// Stop the watcher (it exits at its next wake).
@@ -774,7 +990,7 @@ impl Hub {
         let multiline = text.trim_end_matches(['\n', '\r']).contains(['\n', '\r']);
         if multiline && !bracketed && !run {
             return Err(StateError::Conflict(format!(
-                "{:?} has not enabled bracketed paste, so pasting several lines would run each one; use Send + Run, or copy it",
+                "{:?} has not enabled bracketed paste, so pasting several lines would run each one as it arrives; copy it instead and paste it where it is safe",
                 record.name
             ))
             .into());
@@ -855,7 +1071,7 @@ mod tests {
             .join(crate::agent::claude_project_dir_name(&cwd));
         std::fs::create_dir_all(&project).unwrap();
         let path = project.join(format!("{conversation}.jsonl"));
-        let book = CommandBook::new(Some(config), None);
+        let book = CommandBook::new(Some(config), None, None);
         let record = record(SessionKind::Claude, &cwd, conversation);
         (dir, book, record, path)
     }
@@ -1021,7 +1237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("codex");
         let thread = "01a07c85-9201-7123-8801-041350ceed6a";
-        let book = CommandBook::new(None, Some(home.clone()));
+        let book = CommandBook::new(None, Some(home.clone()), None);
         let record = record(SessionKind::Codex, dir.path(), thread);
         // No rollout: the notify reply, closed fences only.
         book.note_report(
@@ -1049,11 +1265,13 @@ mod tests {
         std::fs::create_dir_all(&older).unwrap();
         std::fs::write(older.join("rollout-2026-01-01T00-00-00-other.jsonl"), "").unwrap();
         let rollout = day.join(format!("rollout-2026-11-02T10-00-00-{thread}.jsonl"));
-        let item = |id: &str, text: &str| {
+        // As codex-rs writes them: no item id, and items recorded in one
+        // batch share a millisecond timestamp.
+        let item = |text: &str| {
             json!({
                 "timestamp": "2026-11-02T10:00:01.000Z",
                 "type": "response_item",
-                "payload": {"type": "message", "id": id, "role": "assistant",
+                "payload": {"type": "message", "role": "assistant",
                     "content": [{"type": "output_text", "text": text}]},
             })
             .to_string()
@@ -1064,10 +1282,23 @@ mod tests {
             &json!({"type": "session_meta", "payload": {"id": thread}}).to_string(),
         );
         append(&rollout, "\n");
-        append(&rollout, &item("m1", "Run:\n```bash\nmake test\n```"));
-        append(&rollout, &item("m2", "```zsh\nls -la\n```"));
-        // Old-style bare items and user messages.
-        append(&rollout, &(json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "```sh\nno\n```"}]}).to_string() + "\n"));
+        append(&rollout, &item("Run:\n```bash\nmake test\n```"));
+        append(&rollout, &item("```zsh\nls -la\n```"));
+        // Old-style bare items (no timestamp either) and user messages.
+        let bare = |role: &str, kind: &str, text: &str| {
+            json!({"type": "message", "role": role, "content": [{"type": kind, "text": text}]})
+                .to_string()
+                + "\n"
+        };
+        append(&rollout, &bare("user", "input_text", "```sh\nno\n```"));
+        append(
+            &rollout,
+            &bare("assistant", "output_text", "```sh\nuptime\n```"),
+        );
+        append(
+            &rollout,
+            &bare("assistant", "output_text", "```sh\nhostname\n```"),
+        );
         assert_eq!(
             codex_rollout(&home, thread).as_deref(),
             Some(rollout.as_path())
@@ -1076,12 +1307,95 @@ mod tests {
         let added = book.refresh(&record);
         assert_eq!(
             added.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
-            ["ls -la"]
+            ["ls -la", "uptime", "hostname"]
         );
         assert_eq!(added[0].source, CommandSource::Rollout);
+        // Read again from the start (a replaced file): nothing repeats.
+        let copy = rollout.with_extension("tmp");
+        std::fs::copy(&rollout, &copy).unwrap();
+        std::fs::rename(&copy, &rollout).unwrap();
+        assert!(book.refresh(&record).is_empty());
         assert_eq!(
             added[0].timestamp.as_deref(),
             Some("2026-11-02T10:00:01.000Z")
+        );
+    }
+
+    #[test]
+    fn commands_survive_a_restart_with_their_seq_across_a_clear() {
+        let (dir, _, mut record, path) = claude_setup("c1");
+        let config = dir.path().join("claude");
+        let store = dir.path().join("state").join(COMMANDS_DIR);
+        let book = CommandBook::new(Some(config.clone()), None, Some(store.clone()));
+        append(&path, &claude_line("u1", "```sh\ncat <<'EOF'\nx\nEOF\n```"));
+        assert_eq!(book.refresh(&record).len(), 1);
+        // `/clear`: the next conversation's file.
+        let new_path = path.with_file_name("c2.jsonl");
+        append(&new_path, &claude_line("v1", "```sh\nprintf x\n```"));
+        record.agent_session_id = Some("c2".into());
+        assert_eq!(book.refresh(&record).len(), 1);
+        let before = book
+            .list(
+                &record,
+                CommandFilter {
+                    all: true,
+                    limit: 50,
+                },
+            )
+            .commands;
+        drop(book);
+
+        // A new hub on the same state dir: same blocks, same seq, and the
+        // tail resumes (nothing is read twice; new lines still arrive).
+        let book = CommandBook::new(Some(config.clone()), None, Some(store.clone()));
+        let after = book
+            .list(
+                &record,
+                CommandFilter {
+                    all: true,
+                    limit: 50,
+                },
+            )
+            .commands;
+        assert_eq!(after, before);
+        assert_eq!(
+            after
+                .iter()
+                .map(|c| (c.seq, c.conversation.as_deref()))
+                .collect::<Vec<_>>(),
+            [(1, Some("c2")), (0, Some("c1"))]
+        );
+        assert!(book.refresh(&record).is_empty());
+        append(&new_path, &claude_line("v2", "```sh\nid\n```"));
+        let added = book.refresh(&record);
+        assert_eq!((added[0].seq, added[0].text.as_str()), (2, "id"));
+
+        // A deleted session's file goes; so do strays from a hub that
+        // was not running when theirs were deleted.
+        std::fs::write(store.join("gone.json"), "{}").unwrap();
+        book.retain(&HashSet::from(["s1".to_owned()]));
+        assert!(store.join("s1.json").is_file());
+        assert!(!store.join("gone.json").exists());
+        book.retain(&HashSet::new());
+        assert!(!store.join("s1.json").exists());
+    }
+
+    #[test]
+    fn a_long_backlog_reports_only_the_newest_commands() {
+        let (_dir, book, record, path) = claude_setup("c1");
+        let mut backlog = String::new();
+        for i in 0..(MAX_COMMANDS * 2) {
+            backlog.push_str(&claude_line(
+                &format!("m{i}"),
+                &format!("```sh\necho {i}\n```"),
+            ));
+        }
+        append(&path, &backlog);
+        let added = book.refresh(&record);
+        assert_eq!(added.len(), MAX_COMMANDS);
+        assert_eq!(
+            added.last().unwrap().text,
+            format!("echo {}", MAX_COMMANDS * 2 - 1)
         );
     }
 

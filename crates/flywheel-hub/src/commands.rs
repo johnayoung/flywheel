@@ -6,7 +6,7 @@
 //! the agent's transcript instead (see [`crate::transcript`]); this module
 //! is the pure part: Markdown fences in, blocks out.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Largest block kept; a bigger one is not a command anyone pastes.
 pub const MAX_BLOCK_BYTES: usize = 256 * 1024;
@@ -139,56 +139,125 @@ const CONSOLE_LANGS: &[&str] = &["console", "shell-session", "shellsession", "sh
 
 /// First words that mark an untagged block as a command.
 const COMMAND_WORDS: &[&str] = &[
+    "./gradlew",
+    "[",
     "alias",
     "apt",
     "apt-get",
-    "aws",
+    "asdf",
     "awk",
+    "aws",
+    "az",
+    "base64",
+    "basename",
+    "bash",
+    "bat",
     "brew",
     "bun",
+    "bundle",
     "bunx",
     "cargo",
     "cat",
     "cd",
+    "chgrp",
     "chmod",
     "chown",
+    "clang",
     "claude",
+    "cmake",
     "codex",
+    "composer",
+    "conda",
     "cp",
+    "createdb",
+    "crontab",
     "curl",
+    "cut",
     "deno",
+    "df",
+    "diff",
+    "dig",
+    "dirname",
     "dnf",
     "docker",
     "docker-compose",
+    "doctl",
+    "dotnet",
+    "dropdb",
     "du",
     "echo",
     "env",
+    "eslint",
+    "eval",
+    "exec",
     "export",
+    "fd",
+    "ffmpeg",
     "find",
+    "fish",
+    "flyctl",
     "flywheel",
     "for",
     "fw",
+    "gawk",
+    "gcc",
     "gcloud",
+    "gem",
     "gh",
     "git",
     "go",
+    "gradle",
     "grep",
+    "gunzip",
+    "gzip",
     "head",
     "helm",
+    "heroku",
+    "java",
+    "javac",
     "journalctl",
     "jq",
     "kill",
+    "killall",
     "kubectl",
+    "launchctl",
+    "less",
     "ln",
     "ls",
+    "lsof",
     "make",
+    "md5sum",
+    "meson",
+    "minikube",
+    "mise",
     "mkdir",
+    "mktemp",
+    "mongosh",
+    "mount",
     "mv",
+    "mvn",
+    "mypy",
+    "mysql",
+    "nano",
+    "nc",
+    "netstat",
+    "ninja",
+    "nix",
     "node",
+    "nohup",
     "npm",
     "npx",
+    "nvm",
+    "ollama",
+    "openssl",
     "pacman",
+    "pbcopy",
+    "pbpaste",
+    "perl",
+    "pg_dump",
     "pgrep",
+    "php",
+    "ping",
     "pip",
     "pip3",
     "pipx",
@@ -196,38 +265,78 @@ const COMMAND_WORDS: &[&str] = &[
     "pnpm",
     "podman",
     "poetry",
+    "prettier",
     "printf",
     "ps",
     "psql",
+    "pwd",
+    "pyenv",
+    "pytest",
     "python",
     "python3",
+    "rails",
+    "rake",
+    "readlink",
+    "realpath",
+    "redis-cli",
     "rg",
     "rm",
     "rsync",
+    "ruby",
+    "ruff",
+    "rustc",
     "rustup",
     "scp",
     "sed",
     "set",
+    "sh",
+    "sha256sum",
+    "sleep",
+    "sort",
     "source",
     "sqlite3",
     "ssh",
+    "stat",
     "sudo",
+    "supabase",
+    "swift",
     "systemctl",
+    "tac",
     "tail",
     "tailscale",
     "tar",
     "tee",
     "terraform",
+    "test",
     "tmux",
     "touch",
+    "tox",
+    "tr",
+    "tree",
+    "tsc",
+    "uname",
+    "uniq",
     "unset",
+    "unzip",
     "uv",
     "uvx",
+    "vercel",
+    "vim",
+    "wc",
     "wget",
     "which",
     "while",
+    "whoami",
+    "wl-copy",
+    "wrangler",
     "xargs",
+    "xclip",
+    "xcodebuild",
+    "xz",
     "yarn",
+    "yq",
+    "zip",
+    "zsh",
 ];
 
 /// Whether a block of language `lang` is a shell command block: a shell
@@ -279,36 +388,70 @@ fn is_assignment(word: &str) -> bool {
 }
 
 /// The text to copy or paste for a block: `text` itself, except a
-/// console-style block (a console language, or an untagged block) whose
-/// every non-blank line carries a `$ ` prompt gets the prompts stripped. A
-/// console block with any line lacking one (output, a continuation) is
-/// left exactly as written: which lines are commands is then a guess.
+/// console-style block (a console language, or an untagged block whose
+/// first line carries a `$ ` prompt) gets just its commands: the prompted
+/// lines without the `$ `, their continuations (after a trailing `\\`, or
+/// behind a `> ` secondary prompt, which is stripped too), and blank lines
+/// between commands. Every other line is the commands' output and is left
+/// out, so Send + Run never feeds output to the shell. A console block with
+/// no prompt at all is left exactly as written.
 pub fn copyable(lang: Option<&str>, text: &str) -> String {
-    let console = match lang {
-        Some(lang) => CONSOLE_LANGS.contains(&lang),
-        None => true,
-    };
     let prompted = |l: &str| l == "$" || l.starts_with("$ ");
     let lines: Vec<&str> = text.split('\n').collect();
-    let nonblank = || lines.iter().filter(|l| !l.trim().is_empty());
-    if !console || nonblank().next().is_none() || !nonblank().all(|l| prompted(l)) {
+    let console = match lang {
+        Some(lang) => CONSOLE_LANGS.contains(&lang),
+        None => lines
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| prompted(l)),
+    };
+    if !console || !lines.iter().any(|l| prompted(l)) {
         return text.to_owned();
     }
-    lines
-        .iter()
-        .map(|l| {
-            if *l == "$" {
-                ""
-            } else {
-                l.strip_prefix("$ ").unwrap_or(l)
+    // Each line: Some(command text) or None (output); blank lines decided
+    // after, by their neighbours.
+    let mut kept: Vec<Option<&str>> = Vec::with_capacity(lines.len());
+    // The previous line was a command (`Some`), and whether it ended in `\`.
+    let mut previous: Option<bool> = None;
+    for line in &lines {
+        let command = if *line == "$" {
+            Some("")
+        } else if let Some(rest) = line.strip_prefix("$ ") {
+            Some(rest)
+        } else if previous == Some(true) {
+            // After a trailing `\`: the same command, maybe behind `> `.
+            Some(line.strip_prefix("> ").unwrap_or(line))
+        } else if previous.is_some() && (line.starts_with("> ") || *line == ">") {
+            // A secondary prompt right after a command: its continuation
+            // (a heredoc body, an open quote).
+            Some(line.strip_prefix("> ").unwrap_or(""))
+        } else {
+            None
+        };
+        previous = command.map(|c| c.ends_with('\\'));
+        kept.push(command);
+    }
+    let blank = |i: usize| lines[i].trim().is_empty() && kept[i].is_none();
+    let mut out: Vec<&str> = Vec::new();
+    for (i, line) in kept.iter().enumerate() {
+        match line {
+            Some(command) => out.push(command),
+            None if blank(i) => {
+                let before = (0..i).rev().find(|&j| !blank(j));
+                let after = (i + 1..lines.len()).find(|&j| !blank(j));
+                let command = |j: Option<usize>| j.is_some_and(|j| kept[j].is_some());
+                if command(before) && command(after) {
+                    out.push("");
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            None => {}
+        }
+    }
+    out.join("\n")
 }
 
 /// Where a command was read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandSource {
     /// A Claude Code transcript (`projects/*/<id>.jsonl`).
@@ -321,7 +464,7 @@ pub enum CommandSource {
 }
 
 /// A code block an agent suggested in one session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Command {
     /// Per-session sequence number, increasing in arrival order.
     pub seq: u64,
@@ -451,19 +594,51 @@ mod tests {
     }
 
     #[test]
-    fn strips_prompts_only_when_every_line_has_one() {
+    fn console_blocks_copy_only_their_commands() {
         assert_eq!(
             copyable(Some("console"), "$ cd x\n$ make\n$"),
             "cd x\nmake\n"
         );
         assert_eq!(copyable(None, "$ ls\n\n$ pwd"), "ls\n\npwd");
-        // Output lines: left exactly as written.
-        let session = "$ ls\nfile.txt";
-        assert_eq!(copyable(Some("console"), session), session);
-        // Not a console language: `$ ` is the user's literal text.
-        assert_eq!(copyable(Some("bash"), "$ ls"), "$ ls");
+        // Output lines are left out (the reviewers' live block).
+        assert_eq!(
+            copyable(Some("console"), "$ echo \"hello\"\nhello\n$ pwd"),
+            "echo \"hello\"\npwd"
+        );
+        assert_eq!(
+            copyable(None, "$ ls\nfile.txt\n\nother.txt\n\n$ pwd\n/tmp"),
+            "ls\npwd"
+        );
+        // Continuations: after a trailing backslash, and `> ` prompts.
+        assert_eq!(
+            copyable(
+                Some("console"),
+                "$ cargo build \\\n    --release\nCompiling\n$ cat <<EOF > f\n> a b\n> EOF\n$ wc -l f\n1 f"
+            ),
+            "cargo build \\\n    --release\ncat <<EOF > f\na b\nEOF\nwc -l f"
+        );
+        // No prompt at all, or not a console language: exactly as written.
+        assert_eq!(copyable(Some("console"), "ls\nfile"), "ls\nfile");
+        assert_eq!(copyable(Some("bash"), "$ ls\nx"), "$ ls\nx");
+        assert_eq!(copyable(None, "ls\n$ pwd"), "ls\n$ pwd");
         // `$HOME` is not a prompt.
         assert_eq!(copyable(None, "$HOME/bin/x"), "$HOME/bin/x");
         assert_eq!(copyable(Some("console"), ""), "");
+    }
+
+    #[test]
+    fn common_first_words_classify_untagged_blocks() {
+        for text in [
+            "bash -c 'echo hi'",
+            "sh install.sh",
+            "zsh -l",
+            "sort -u a | wc -l",
+            "diff a b",
+            "[ -f x ] && echo y",
+            "test -d x",
+            "openssl rand -hex 32",
+        ] {
+            assert!(is_shell(None, text), "{text:?}");
+        }
     }
 }

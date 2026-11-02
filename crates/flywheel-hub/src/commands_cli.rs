@@ -28,8 +28,9 @@ pub struct CommandsArgs {
     #[arg(long)]
     json: bool,
     /// Copy the newest block to the clipboard of the terminal you are in
-    /// (OSC 52; works over SSH; tmux needs `set -g set-clipboard on`).
-    /// Prints nothing.
+    /// (OSC 52; works over SSH; tmux needs `set -g set-clipboard on`; GNU
+    /// screen gets it passed through). Prints only a confirmation, on
+    /// stderr.
     #[arg(long, conflicts_with = "json")]
     copy: bool,
     /// How many blocks to list, newest first.
@@ -43,8 +44,11 @@ pub struct CommandsArgs {
 
 /// Run `fw hub commands`.
 pub fn run(args: &CommandsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    match fetch(args) {
-        Ok((name, commands)) => match render(args, &name, &commands, out, err) {
+    // Block text is agent-written: on a terminal its control characters
+    // are shown, not obeyed (piped output stays byte-exact).
+    let escape = std::io::stdout().is_terminal();
+    match fetch(args, err) {
+        Ok((name, commands)) => match render(args, &name, &commands, escape, out, err) {
             Ok(code) => code,
             Err(message) => {
                 let _ = writeln!(err, "fw hub: {message}");
@@ -70,6 +74,56 @@ fn get(addr: std::net::SocketAddr, token: &Token, path: &str) -> Result<serde_js
         ));
     }
     serde_json::from_slice(&response.body).map_err(|e| format!("bad answer from the hub: {e}"))
+}
+
+/// The agent session to read for `wanted`: the session itself, or, for a
+/// shell session, the one agent session of its workspace (as the web UI's
+/// drawer does). Returns (id, name, note to print).
+pub fn resolve_agent(
+    sessions: &[serde_json::Value],
+    wanted: &str,
+) -> Result<(String, String, Option<String>), String> {
+    let (id, name) = resolve_session(sessions, wanted)?;
+    let field = |s: &serde_json::Value, k: &str| {
+        s.get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let Some(session) = sessions.iter().find(|s| field(s, "id") == id) else {
+        return Ok((id, name, None));
+    };
+    if matches!(field(session, "kind").as_str(), "claude" | "codex") {
+        return Ok((id, name, None));
+    }
+    let workspace = field(session, "workspace_id");
+    let agents: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            field(s, "workspace_id") == workspace
+                && matches!(field(s, "kind").as_str(), "claude" | "codex")
+        })
+        .collect();
+    match agents.as_slice() {
+        [] => Err(format!(
+            "{name:?} is a {} session, not an agent (Claude Code or Codex) session, and its workspace has none",
+            field(session, "kind")
+        )),
+        [agent] => {
+            let agent_name = field(agent, "name");
+            let note = format!(
+                "{name:?} is a shell session; showing its workspace's agent session {agent_name:?}"
+            );
+            Ok((field(agent, "id"), agent_name, Some(note)))
+        }
+        many => Err(format!(
+            "{name:?} is a shell session; name one of its workspace's agent sessions: {}",
+            many.iter()
+                .map(|s| format!("{:?}", field(s, "name")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// The session matching `wanted` by id, unique id prefix, or exact name.
@@ -126,7 +180,10 @@ fn state_dir(arg: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 /// The session's name and its commands, newest first.
-fn fetch(args: &CommandsArgs) -> Result<(String, Vec<serde_json::Value>), String> {
+fn fetch(
+    args: &CommandsArgs,
+    err: &mut dyn Write,
+) -> Result<(String, Vec<serde_json::Value>), String> {
     let dir = state_dir(args.state_dir.as_deref())?;
     let info = crate::remote::running_hub(&dir)
         .map_err(|e| format!("runtime file in {}: {e}", dir.display()))?
@@ -146,7 +203,10 @@ fn fetch(args: &CommandsArgs) -> Result<(String, Vec<serde_json::Value>), String
         .and_then(|s| s.as_array())
         .cloned()
         .unwrap_or_default();
-    let (id, name) = resolve_session(&sessions, &args.session)?;
+    let (id, name, note) = resolve_agent(&sessions, &args.session)?;
+    if let Some(note) = note {
+        let _ = writeln!(err, "fw hub: {note}");
+    }
     let limit = if args.last || args.copy {
         1
     } else {
@@ -166,6 +226,7 @@ fn render(
     args: &CommandsArgs,
     name: &str,
     commands: &[serde_json::Value],
+    escape: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
@@ -188,24 +249,28 @@ fn render(
             0
         });
     }
-    let text_of = |c: &serde_json::Value| {
+    let raw_of = |c: &serde_json::Value| {
         c.get("command")
             .and_then(|t| t.as_str())
             .unwrap_or_default()
             .to_owned()
+    };
+    let text_of = |c: &serde_json::Value| {
+        let raw = raw_of(c);
+        if escape { visible_controls(&raw) } else { raw }
     };
     if commands.is_empty() {
         writeln!(err, "fw hub: {name:?} has suggested no {what} yet").map_err(io)?;
         return Ok(if args.last || args.copy { 1 } else { 0 });
     }
     if args.copy {
-        let text = text_of(&commands[0]);
+        let text = raw_of(&commands[0]);
         copy_osc52(&text)?;
         let mut note = format!(
             "fw hub: copied {} bytes to the clipboard (OSC 52)",
             text.len()
         );
-        if osc52(&text).len() > OSC52_COMFORT_BYTES {
+        if osc52(&text, false).len() > OSC52_COMFORT_BYTES {
             note.push_str("; it is large, and some terminals drop OSC 52 copies this big");
         }
         writeln!(err, "{note}").map_err(io)?;
@@ -239,15 +304,57 @@ fn render(
     Ok(0)
 }
 
-/// The OSC 52 sequence that sets the clipboard to `text`.
-pub fn osc52(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64(text.as_bytes()))
+/// `text` with C0 and C1 control characters (other than newline and tab)
+/// shown as `^X` / `\u{..}`, so an escape sequence in a block is printed,
+/// not run by the terminal.
+pub fn visible_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\x7f' => out.push_str("^?"),
+            c if (c as u32) < 0x20 => {
+                out.push('^');
+                out.push(char::from(b'@' + c as u8));
+            }
+            c if ('\u{80}'..='\u{9f}').contains(&c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The OSC 52 sequence that sets the clipboard to `text`. Inside GNU
+/// screen (`screen`), it is passed through in DCS chunks, since screen
+/// does not forward OSC 52 itself. (tmux forwards plain OSC 52 with
+/// `set-clipboard on`.)
+pub fn osc52(text: &str, screen: bool) -> String {
+    let encoded = base64(text.as_bytes());
+    if !screen {
+        return format!("\x1b]52;c;{encoded}\x07");
+    }
+    // screen limits one DCS string; split the payload.
+    let mut out = String::from("\x1bP\x1b]52;c;");
+    for chunk in encoded.as_bytes().chunks(76) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push_str("\x1b\\\x1bP");
+    }
+    out.push_str("\x07\x1b\\");
+    out
+}
+
+/// Whether we run inside GNU screen (and not a tmux inside it).
+fn in_screen() -> bool {
+    std::env::var_os("TMUX").is_none_or(|v| v.is_empty())
+        && std::env::var_os("STY").is_some_and(|v| !v.is_empty())
 }
 
 /// Write the OSC 52 copy to the controlling terminal (stdout when that is
 /// one, else `/dev/tty`), so `--copy` works even with stdout redirected.
 fn copy_osc52(text: &str) -> Result<(), String> {
-    let sequence = osc52(text);
+    let sequence = osc52(text, in_screen());
     let stdout = std::io::stdout();
     if stdout.is_terminal() {
         let mut lock = stdout.lock();
@@ -305,7 +412,58 @@ mod tests {
         ] {
             assert_eq!(base64(raw.as_bytes()), encoded);
         }
-        assert_eq!(osc52("ls\n"), "\x1b]52;c;bHMK\x07");
+        assert_eq!(osc52("ls\n", false), "\x1b]52;c;bHMK\x07");
+        assert_eq!(
+            osc52("ls\n", true),
+            "\x1bP\x1b]52;c;bHMK\x1b\\\x1bP\x07\x1b\\"
+        );
+        // Long payloads: every DCS piece stays small.
+        let long = osc52(&"x".repeat(300), true);
+        assert!(long.split("\x1bP").all(|piece| piece.len() < 100));
+    }
+
+    #[test]
+    fn terminal_output_shows_control_characters_instead_of_obeying_them() {
+        let hostile = "\x1b]52;c;Y3VybCBldmlsfHNo\x07ls\tx\ny\u{9b}2J\x7f";
+        assert_eq!(
+            visible_controls(hostile),
+            "^[]52;c;Y3VybCBldmlsfHNo^Gls\tx\ny\\u{9b}2J^?"
+        );
+        let args = <CommandsArgs as clap::Args>::augment_args(clap::Command::new("t"))
+            .try_get_matches_from(["t", "s1", "--last"])
+            .and_then(|m| <CommandsArgs as clap::FromArgMatches>::from_arg_matches(&m))
+            .unwrap();
+        let commands = [json!({"command": hostile})];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        render(&args, "s1", &commands, true, &mut out, &mut err).unwrap();
+        assert!(!out.contains(&0x1b), "no raw ESC reaches the terminal");
+        // Piped: exact.
+        let mut out = Vec::new();
+        render(&args, "s1", &commands, false, &mut out, &mut err).unwrap();
+        assert_eq!(out, format!("{hostile}\n").into_bytes());
+    }
+
+    #[test]
+    fn a_shell_session_resolves_to_its_workspaces_agent() {
+        let sessions = vec![
+            json!({"id": "a1a1a1a1", "name": "sh", "kind": "shell", "workspace_id": "w1"}),
+            json!({"id": "b2b2b2b2", "name": "cl", "kind": "claude", "workspace_id": "w1"}),
+            json!({"id": "c3c3c3c3", "name": "lone", "kind": "shell", "workspace_id": "w2"}),
+            json!({"id": "d4d4d4d4", "name": "two", "kind": "shell", "workspace_id": "w3"}),
+            json!({"id": "e5e5e5e5", "name": "x1", "kind": "codex", "workspace_id": "w3"}),
+            json!({"id": "f6f6f6f6", "name": "x2", "kind": "claude", "workspace_id": "w3"}),
+        ];
+        let (id, name, note) = resolve_agent(&sessions, "sh").unwrap();
+        assert_eq!((id.as_str(), name.as_str()), ("b2b2b2b2", "cl"));
+        assert!(note.unwrap().contains("shell session"));
+        assert_eq!(resolve_agent(&sessions, "cl").unwrap().2, None);
+        assert!(
+            resolve_agent(&sessions, "lone")
+                .unwrap_err()
+                .contains("has none")
+        );
+        let err = resolve_agent(&sessions, "two").unwrap_err();
+        assert!(err.contains("\"x1\"") && err.contains("\"x2\""), "{err}");
     }
 
     #[test]

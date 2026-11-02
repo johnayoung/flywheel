@@ -63,7 +63,7 @@
     </div>
     <footer class="side-foot">
       <button type="button" class="chip" data-action="palette" title="Command palette">
-        <kbd>Ctrl K</kbd><span>commands</span>
+        <kbd>Ctrl K</kbd><span>palette</span>
       </button>
       <button type="button" class="chip" id="theme-toggle" data-action="cycle-theme" title="Theme">
         <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label">auto</span>
@@ -85,7 +85,7 @@
         <span id="meter-cwd" class="meter cwd"></span>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
-        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>cmds<b id="cmd-count" hidden></b></button>
+        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
     </header>
@@ -96,7 +96,7 @@
         <span id="banner-text"></span>
         <span class="banner-actions" id="banner-actions"></span>
       </div>
-      <aside id="commands" class="commands" hidden aria-label="Suggested commands">
+      <aside id="commands" class="commands" hidden tabindex="-1" aria-label="Suggested commands">
         <header class="cmd-head">
           <div class="cmd-title">
             <span class="sheet-kicker">suggested</span>
@@ -110,6 +110,7 @@
           <label class="cmd-check"><input type="checkbox" id="cmd-all"> all blocks</label>
         </div>
         <ul id="cmd-list" class="cmd-list"></ul>
+        <footer class="cmd-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</footer>
       </aside>
       <div id="empty" class="empty">
         <svg class="empty-wheel" aria-hidden="true"><use href="#i-wheel"/></svg>

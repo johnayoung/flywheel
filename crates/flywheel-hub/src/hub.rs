@@ -260,6 +260,7 @@ impl Hub {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
                 options.codex_home.clone(),
+                Some(options.state_dir.join(crate::transcript::COMMANDS_DIR)),
             ),
             options,
             token: RwLock::new(token),

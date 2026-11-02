@@ -19,6 +19,8 @@ window.FwHubCommands = function (ctx) {
     loading: null, // session id being fetched
     error: "",
     unseen: 0, // shell commands that arrived while the drawer was closed
+    selected: null, // seq of the card the keyboard acts on
+    focusPending: false, // opened: focus the selected card once it renders
   };
 
   const isAgent = (s) => s && (s.kind === "claude" || s.kind === "codex");
@@ -238,7 +240,11 @@ window.FwHubCommands = function (ctx) {
     const lines = command.text.split("\n").length;
     return el(
       "li",
-      { className: `cmd${command.shell ? " shell" : ""}`, dataset: { seq: String(command.seq) } },
+      {
+        className: `cmd${command.shell ? " shell" : ""}${command.seq === ui.selected ? " selected" : ""}`,
+        dataset: { seq: String(command.seq) },
+        tabIndex: command.seq === ui.selected ? 0 : -1,
+      },
       el(
         "div",
         { className: "cmd-meta" },
@@ -246,11 +252,13 @@ window.FwHubCommands = function (ctx) {
         el("span", { className: "cmd-when", textContent: when(command.timestamp), title: command.timestamp || "" }),
         el("span", { className: "cmd-lines", textContent: `${lines} line${lines === 1 ? "" : "s"}` }),
         command.command !== command.text
-          ? el("span", { className: "cmd-note", textContent: "prompts stripped", title: "Copy and Send leave out the $ prompts" })
+          ? command.command.split("\n").length < lines
+            ? el("span", { className: "cmd-note", textContent: "commands only", title: "Copy and Send take the commands without $ prompts, and leave the output lines out" })
+            : el("span", { className: "cmd-note", textContent: "prompts stripped", title: "Copy and Send leave out the $ prompts" })
           : null,
         el("span", { className: "cmd-seq", textContent: `#${command.seq}` }),
       ),
-      el("pre", { className: "cmd-code", tabIndex: 0 }, el("code", { textContent: command.text })),
+      el("pre", { className: "cmd-code", tabIndex: -1 }, el("code", { textContent: command.text })),
       el(
         "div",
         { className: "cmd-actions" },
@@ -318,6 +326,12 @@ window.FwHubCommands = function (ctx) {
 
     const list = $("#cmd-list");
     const items = shown(source);
+    if (!items.some((c) => c.seq === ui.selected)) ui.selected = items.length ? items[0].seq : null;
+    // Re-rendering replaces the cards: note where focus was, to put it
+    // back (a lost focus lands on <body>, where no key reaches the drawer).
+    const active = document.activeElement;
+    const focusedCard = list.contains(active) ? active.closest(".cmd") : null;
+    const focusedAction = focusedCard && active.matches("button") ? [...focusedCard.querySelectorAll("button")].indexOf(active) : -1;
     let empty = null;
     if (!source) {
       empty = "Commands appear here when a Claude Code or Codex session in this workspace suggests a code block.";
@@ -335,20 +349,87 @@ window.FwHubCommands = function (ctx) {
         ? [el("li", { className: "cmd-empty", textContent: empty })]
         : items.map((c) => renderItem(c, source, target))),
     );
+    markOverflow();
+    if (focusedCard || (ui.focusPending && drawer.contains(document.activeElement))) {
+      const card = selectedCard();
+      const button = card && focusedAction >= 0 ? card.querySelectorAll("button")[focusedAction] : null;
+      const into = button || card;
+      if (into) {
+        into.focus({ preventScroll: true });
+        ui.focusPending = false;
+      } else if (!drawer.contains(document.activeElement)) {
+        drawer.focus({ preventScroll: true });
+      }
+    }
+  }
+
+  // Code wider than its card scrolls sideways; mark those so the edge
+  // fades and a hint shows (a cut-off pipeline must not look complete).
+  function markOverflow() {
+    for (const pre of document.querySelectorAll("#cmd-list .cmd-code")) {
+      const update = () => {
+        const more = pre.scrollWidth - pre.clientWidth - pre.scrollLeft > 2;
+        pre.parentElement.classList.toggle("overflows", more);
+      };
+      update();
+      if (!pre.dataset.watched) {
+        pre.dataset.watched = "1";
+        pre.addEventListener("scroll", update, { passive: true });
+      }
+    }
+  }
+
+  function selectedCard() {
+    return ui.selected === null ? null : $(`#cmd-list .cmd[data-seq="${ui.selected}"]`);
+  }
+
+  function selectedCommand() {
+    const source = currentSource();
+    return shown(source).find((c) => c.seq === ui.selected) || null;
+  }
+
+  // Make card `seq` the keyboard's (roving tabindex); `focus` moves focus.
+  function select(seq, focus = true) {
+    ui.selected = seq;
+    for (const card of document.querySelectorAll("#cmd-list .cmd")) {
+      const on = card.dataset.seq === String(seq);
+      card.classList.toggle("selected", on);
+      card.tabIndex = on ? 0 : -1;
+    }
+    const card = selectedCard();
+    if (card && focus) {
+      card.focus({ preventScroll: true });
+      card.scrollIntoView({ block: "nearest" });
+    }
+  }
+
+  function moveSelection(by) {
+    const items = shown(currentSource());
+    if (!items.length) return;
+    const at = items.findIndex((c) => c.seq === ui.selected);
+    const next = Math.max(0, Math.min(items.length - 1, (at < 0 ? 0 : at) + by));
+    select(items[next].seq);
   }
 
   function setOpen(open) {
+    const wasOpen = ui.open;
     ui.open = open;
     if (open) {
       ui.unseen = 0;
+      // Keys go to the drawer at once (not the terminal behind it), and
+      // to the selected card once the list has loaded.
+      ui.focusPending = true;
+      if (!wasOpen) ui.selected = null;
+      renderDrawer();
+      const drawer = $("#commands");
+      const card = selectedCard();
+      (card || drawer).focus({ preventScroll: true });
+      if (card) ui.focusPending = false;
       const source = currentSource();
       if (source) load(source.id);
-    }
-    renderDrawer();
-    if (open) {
-      const first = $("#cmd-list .cmd-copy");
-      if (first) first.focus({ preventScroll: true });
     } else {
+      ui.focusPending = false;
+      renderDrawer();
       focusTerminal();
     }
   }
@@ -369,11 +450,56 @@ window.FwHubCommands = function (ctx) {
     renderDrawer();
   });
   $("#cmd-close").addEventListener("click", () => setOpen(false));
+  // Tabbing or clicking into a card makes it the keyboard's.
+  $("#cmd-list").addEventListener("focusin", (event) => {
+    const card = event.target.closest(".cmd[data-seq]");
+    if (card && card.dataset.seq !== String(ui.selected)) select(Number(card.dataset.seq), false);
+  });
+  // Keys inside the drawer: Esc closes; arrows / j k / Home End pick a
+  // card; Enter or c copies it; 1-9 copy the nth; s sends it, Shift S
+  // sends and runs. Form fields and buttons keep their own keys.
   $("#commands").addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const done = () => {
       event.preventDefault();
       event.stopPropagation();
+    };
+    if (event.key === "Escape") {
+      done();
       setOpen(false);
+      return;
+    }
+    const field = event.target.closest("select, input, textarea");
+    if (field) return;
+    const onButton = !!event.target.closest("button");
+    const command = selectedCommand();
+    const source = currentSource();
+    if (event.key === "ArrowDown" || event.key === "j") {
+      done();
+      moveSelection(1);
+    } else if (event.key === "ArrowUp" || event.key === "k") {
+      done();
+      moveSelection(-1);
+    } else if (event.key === "Home") {
+      done();
+      moveSelection(-Infinity);
+    } else if (event.key === "End") {
+      done();
+      moveSelection(Infinity);
+    } else if ((event.key === "Enter" && !onButton) || event.key === "c") {
+      if (!command) return;
+      done();
+      copyCommand(command);
+    } else if (/^[1-9]$/.test(event.key)) {
+      const nth = shown(source)[Number(event.key) - 1];
+      if (!nth) return;
+      done();
+      select(nth.seq);
+      copyCommand(nth);
+    } else if (event.key === "s" || event.key === "S") {
+      if (!command) return;
+      done();
+      sendTo(command, event.key === "S", source);
     }
   });
 
@@ -429,7 +555,7 @@ window.FwHubCommands = function (ctx) {
 
   function paletteItems(cmd) {
     const source = currentSource();
-    cmd(ui.open ? "Hide commands" : "Show commands", `${ctx.MOD} C`, toggle, "copy");
+    cmd(ui.open ? "Hide suggested commands" : "Show suggested commands", `${ctx.MOD} C`, toggle, "copy");
     if (source) {
       cmd(`Copy last command from ${source.name}`, `${ctx.MOD} Shift C`, copyLast, "copy");
     }

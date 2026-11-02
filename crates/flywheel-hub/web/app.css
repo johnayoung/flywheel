@@ -1348,6 +1348,37 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 .cmd-empty { padding: 1.4rem .2rem; color: var(--ink-3); line-height: 1.6; }
 
+.commands:focus { outline: none; }
+.cmd:focus { outline: none; }
+.cmd.selected { border-color: var(--signal); box-shadow: inset 3px 0 0 var(--signal); }
+.cmd:focus-visible, .cmd.selected:focus { box-shadow: inset 3px 0 0 var(--signal), 0 0 0 1px var(--signal); }
+
+/* A line wider than the card: fade the right edge and say so. */
+.cmd { position: relative; }
+.cmd-code { position: relative; }
+.cmd.overflows .cmd-code {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+  scrollbar-width: auto;
+}
+.cmd.overflows .cmd-meta::after {
+  content: "wide: scroll \2192";
+  color: var(--brass);
+  order: 9;
+}
+.cmd.overflows .cmd-seq { order: 10; }
+
+.cmd-keys {
+  padding: .45rem 1rem;
+  border-top: 1px solid var(--rule-2);
+  color: var(--ink-3);
+  font-size: 10px;
+  letter-spacing: .04em;
+  line-height: 1.9;
+}
+.cmd-keys kbd { margin: 0 .15rem; }
+@media (hover: none) { .cmd-keys { display: none; } }
+
 /* --- toasts ----------------------------------------------------------------- */
 
 .toasts {

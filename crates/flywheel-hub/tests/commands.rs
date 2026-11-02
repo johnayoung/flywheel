@@ -525,8 +525,9 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(
-        body["error"].as_str().unwrap().contains("bracketed paste"),
-        "{body}"
+        body["error"].as_str().unwrap().contains("bracketed paste")
+            && !body["error"].as_str().unwrap().contains("Send + Run"),
+        "the refusal must not suggest running the lines one by one: {body}"
     );
     hub.post(
         &format!("/api/sessions/{pid}/paste"),

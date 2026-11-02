@@ -145,8 +145,12 @@ impl fmt::Display for MemberExit {
 /// The child is its own session leader (`setsid`), so a group signal
 /// reaches the member and every descendant still in its group; its agents
 /// and graders lead groups of their own, swept by the member's own signal
-/// handler. `log_path` is the redirected stdout/stderr sink (`None` when
-/// output is inherited), kept for forensics after the member dies.
+/// handler. A member that dies without running that handler (SIGKILL, the
+/// OOM killer, the stop window's escalation) leaves those groups behind,
+/// still in its session: [`PoolMember::poll`] kills whatever is left there
+/// before reaping it. `log_path` is the redirected stdout/stderr sink
+/// (`None` when output is inherited), kept for forensics after the member
+/// dies.
 pub struct PoolMember {
     pub slot: usize,
     pub worker_id: String,
@@ -154,6 +158,9 @@ pub struct PoolMember {
     pub log_path: Option<PathBuf>,
     child: Child,
     exit: Option<ExitStatus>,
+    /// Processes left in the member's session after it died, killed by
+    /// [`PoolMember::poll`] (logged by the supervisor).
+    orphans_killed: usize,
     /// The write end of this member's lifeline pipe, held only here; dropped
     /// (closing it) when the member leaves the pool or the supervisor dies.
     #[cfg(unix)]
@@ -174,9 +181,21 @@ impl fmt::Debug for PoolMember {
 
 impl PoolMember {
     /// The member's exit status if it has exited (reaping it), else `None`.
+    ///
+    /// Before reaping, everything still in the dead member's session is
+    /// killed: its agent / grader groups (and their children) when it died
+    /// without its own sweep running. The member is still an unreaped
+    /// zombie at that point, so its pid -- the session id -- cannot have
+    /// been reused, and only its own descendants can match.
     fn poll(&mut self) -> Option<ExitStatus> {
         if let Some(status) = self.exit {
             return Some(status);
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(pid) = libc::pid_t::try_from(self.pid)
+            && exited_unreaped(pid)
+        {
+            self.orphans_killed += kill_session(pid);
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
@@ -322,10 +341,16 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// the whole invocation; it only records the signal number. SIGHUP is a
 /// terminal or PTY closing on the supervisor's foreground job: left at its
 /// default it would kill the supervisor alone and orphan every member.
+///
+/// An inherited SIG_IGN for SIGHUP (`nohup fw worker ...`, or a parent that
+/// detached it deliberately) is left in place: the operator asked for the
+/// worker to outlive its terminal, and the members inherit the same
+/// disposition.
 #[cfg(unix)]
 fn arm_stop_signals() {
     STOP_SIGNAL.store(0, Ordering::SeqCst);
-    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    let hangup = (!hangup_ignored()).then_some(libc::SIGHUP);
+    for sig in [libc::SIGTERM, libc::SIGINT].into_iter().chain(hangup) {
         // SAFETY: installing a handler that only stores into an atomic; the
         // handler is async-signal-safe and the signal numbers are valid.
         unsafe {
@@ -334,6 +359,19 @@ fn arm_stop_signals() {
                 on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
             );
         }
+    }
+}
+
+/// Whether SIGHUP is currently ignored (SIG_IGN), i.e. inherited that way
+/// from `nohup` or a detaching parent. Read without changing it.
+#[cfg(unix)]
+pub(crate) fn hangup_ignored() -> bool {
+    // SAFETY: sigaction with a null new action only reads the current
+    // disposition into the zeroed, correctly sized buffer.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current) == 0
+            && current.sa_sigaction == libc::SIG_IGN
     }
 }
 
@@ -380,6 +418,76 @@ const KILL_SIGNAL: libc::c_int = libc::SIGKILL;
 const TERM_SIGNAL: i32 = 15;
 #[cfg(not(unix))]
 const KILL_SIGNAL: i32 = 9;
+
+// --- Dead members' sessions ------------------------------------------------------------------
+
+/// Whether child `pid` has exited and awaits reaping (left unreaped).
+#[cfg(target_os = "linux")]
+fn exited_unreaped(pid: libc::pid_t) -> bool {
+    // SAFETY: waitid writes into the zeroed siginfo buffer; WNOWAIT leaves
+    // the child reapable, WNOHANG keeps the call from blocking.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc == 0 && info.si_pid() == pid
+    }
+}
+
+/// The pids (other than `sid` itself) whose session is `sid`.
+#[cfg(target_os = "linux")]
+fn session_members(sid: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid != sid)
+        .filter(|pid| {
+            // `pid (comm) state ppid pgrp session ...`; comm may hold spaces
+            // or parens, so split after the last ')'.
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let (_, rest) = stat.rsplit_once(')')?;
+                    rest.split_whitespace().nth(3)?.parse::<libc::pid_t>().ok()
+                })
+                == Some(sid)
+        })
+        .collect()
+}
+
+/// SIGKILL everything left in session `sid` (a dead member's), repeating
+/// until a pass finds nothing so a process forked mid-sweep is caught too.
+/// Returns how many processes were killed. The member that owned them is
+/// gone, so there is nobody left to finalize for and no grace to give.
+#[cfg(target_os = "linux")]
+fn kill_session(sid: libc::pid_t) -> usize {
+    let mut killed = BTreeSet::new();
+    for _ in 0..16 {
+        let left: Vec<libc::pid_t> = session_members(sid)
+            .into_iter()
+            .filter(|pid| !killed.contains(pid))
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        for pid in left {
+            // SAFETY: kill(2) on a pid in the dead member's session; its
+            // zombie pins the session id, so the pid is one of its own.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            killed.insert(pid);
+        }
+    }
+    killed.len()
+}
 
 // --- The supervisor lifeline ---------------------------------------------------------------------
 
@@ -668,7 +776,14 @@ impl WorkerPool {
             let exit = MemberExit::of(status);
             let worker_id = member.worker_id.clone();
             let log_path = member.log_path.clone();
+            let orphans = member.orphans_killed;
             self.members.remove(&slot);
+            if orphans > 0 {
+                (self.log)(&format!(
+                    "pool member {worker_id} died leaving {orphans} process(es) in its session; \
+                     killed them"
+                ));
+            }
             if exit.is_clean() && self.once {
                 // Clean drain: this slot is done, do not respawn (else the
                 // pool would never terminate in --once mode).
@@ -761,6 +876,12 @@ impl WorkerPool {
         }
         for member in self.members.values_mut() {
             member.poll();
+            if member.orphans_killed > 0 {
+                (self.log)(&format!(
+                    "pool member {} died leaving {} process(es) in its session; killed them",
+                    member.worker_id, member.orphans_killed
+                ));
+            }
         }
         self.members.clear();
     }
@@ -838,6 +959,7 @@ impl WorkerPool {
                 log_path,
                 child,
                 exit: None,
+                orphans_killed: 0,
                 // This process's copy of the read end closes here; the
                 // member holds its own.
                 #[cfg(unix)]
@@ -1184,6 +1306,45 @@ mod tests {
         // What the kernel does when the supervisor dies: its write end closes.
         drop(pool.members.get_mut(&0).unwrap()._lifeline.take());
         assert_eq!(wait_for_file(&marker), "eof\n");
+        pool.stop(Some(0.5));
+    }
+
+    /// A member SIGKILLed (the pid alone: no handler, no group signal) with
+    /// a child still running must not leave that child behind: reaping the
+    /// member kills what is left in its session, whatever group it is in.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reaping_a_killed_member_kills_what_is_left_in_its_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("job");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pidfile.display());
+        let spawn: SpawnMember = Arc::new(move |_id: &str| sh(&script));
+        let (log, lines) = capture();
+        let mut pool =
+            WorkerPool::new(PoolOptions::new(1, spawn, log, false).with_prefix("orphan")).unwrap();
+        pool.start().unwrap();
+        let job = wait_for_file(&pidfile).trim().parse::<u32>().unwrap();
+        let member = pool.member_pid(0).unwrap();
+        // SAFETY: kill(2) on this test's own child.
+        unsafe {
+            libc::kill(member as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(pool.wait_member(0, Duration::from_secs(5)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(job) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(job), "the dead member's job {job} survived it");
+        pool.supervise_tick().unwrap();
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("orphan-0 died leaving 1 process(es)")),
+            "{:?}",
+            lines.lock().unwrap()
+        );
         pool.stop(Some(0.5));
     }
 

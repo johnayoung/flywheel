@@ -48,6 +48,13 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
+/// The session id of `pid` (`None` once it is gone).
+fn session_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(3)?.parse().ok()
+}
+
 /// Gone, or a zombie awaiting its reaper.
 fn process_gone(pid: i32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -174,6 +181,12 @@ impl Fixture {
     /// process group -- the shape of a shell's foreground job on a PTY, so
     /// `kill(-pid, SIGHUP)` is exactly what the PTY closing delivers.
     fn spawn_worker(&mut self, concurrency: u32) -> Child {
+        self.spawn_worker_with(concurrency, false)
+    }
+
+    /// [`Fixture::spawn_worker`], optionally with SIGHUP ignored the way
+    /// `nohup` leaves it (SIG_IGN survives exec).
+    fn spawn_worker_with(&mut self, concurrency: u32, nohup: bool) -> Child {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.root.join("bin")];
         paths.extend(std::env::split_paths(&path));
@@ -192,8 +205,11 @@ impl Fixture {
             .stderr(log);
         // SAFETY: setsid(2) is async-signal-safe and touches no memory.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nohup && libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -417,4 +433,99 @@ fn sighup_to_a_single_worker_releases_its_claim_and_agent() {
         "{}",
         fx.worker_log()
     );
+}
+
+/// `nohup fw worker --concurrency 2`: SIGHUP was ignored when the worker
+/// started, so a terminal closing (SIGHUP to the supervisor's group, and to
+/// each member directly) must not stop anything. SIGTERM still drains it.
+#[test]
+fn nohup_pool_ignores_sighup_and_still_drains_on_sigterm() {
+    let mut fx = Fixture::new();
+    let mut worker = fx.spawn_worker_with(2, true);
+    let members = fx.wait_in_flight(&worker, 2, 2);
+    signal(-(worker.id() as i32), libc::SIGHUP);
+    for member in &members {
+        signal(*member, libc::SIGHUP);
+    }
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        worker.try_wait().unwrap().is_none(),
+        "the nohup'd pool supervisor stopped on SIGHUP\n{}",
+        fx.worker_log()
+    );
+    let stopped: Vec<i32> = members
+        .iter()
+        .chain(&fx.agents())
+        .copied()
+        .filter(|pid| process_gone(*pid))
+        .collect();
+    assert_eq!(stopped, Vec::<i32>::new(), "{}", fx.worker_log());
+    assert_eq!(fx.claims().len(), 2, "{}", fx.worker_log());
+    signal(worker.id() as i32, libc::SIGTERM);
+    assert!(wait_exit(&mut worker, SHUTDOWN_DEADLINE).is_some());
+    fx.assert_clean_shutdown(&members);
+}
+
+/// `nohup fw worker` (a single worker): SIGHUP to its group is ignored;
+/// SIGTERM is still an orderly stop.
+#[test]
+fn nohup_single_worker_ignores_sighup_and_still_stops_on_sigterm() {
+    let mut fx = Fixture::new();
+    let mut worker = fx.spawn_worker_with(1, true);
+    let members = fx.wait_in_flight(&worker, 1, 0);
+    signal(-(worker.id() as i32), libc::SIGHUP);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        worker.try_wait().unwrap().is_none(),
+        "the nohup'd worker stopped on SIGHUP\n{}",
+        fx.worker_log()
+    );
+    assert!(fx.agents().iter().all(|pid| !process_gone(*pid)));
+    assert_eq!(fx.claims().len(), 1, "{}", fx.worker_log());
+    signal(worker.id() as i32, libc::SIGTERM);
+    assert!(wait_exit(&mut worker, SHUTDOWN_DEADLINE).is_some());
+    fx.assert_clean_shutdown(&members);
+}
+
+/// A pool member SIGKILLed mid-run (operator, OOM killer, the stop
+/// window's escalation) runs no handler, so its agent group -- and the
+/// agent's own children -- would run on as orphans in the task worktree.
+/// The supervisor must kill them when it reaps the member, before anything
+/// can re-claim the task; the pool still shuts down clean afterwards.
+#[test]
+fn sigkilled_pool_member_leaves_no_orphaned_agent() {
+    let mut fx = Fixture::new();
+    let mut worker = fx.spawn_worker(2);
+    let members = fx.wait_in_flight(&worker, 2, 2);
+    let victim = members[0];
+    let orphans: Vec<i32> = fx
+        .agents()
+        .into_iter()
+        .chain(fx.grandchildren())
+        .filter(|pid| session_of(*pid) == Some(victim))
+        .collect();
+    assert_eq!(orphans.len(), 2, "agent + grandchild in {victim}'s session");
+    signal(victim, libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !orphans.iter().all(|pid| process_gone(*pid)) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let survivors: Vec<i32> = orphans
+        .iter()
+        .copied()
+        .filter(|pid| !process_gone(*pid))
+        .collect();
+    assert_eq!(
+        survivors,
+        Vec::<i32>::new(),
+        "the SIGKILLed member's agent group outlived it\n{}",
+        fx.worker_log()
+    );
+    assert!(worker.try_wait().unwrap().is_none(), "{}", fx.worker_log());
+    signal(worker.id() as i32, libc::SIGTERM);
+    assert!(wait_exit(&mut worker, SHUTDOWN_DEADLINE).is_some());
+    // The respawned member may have started its own agents meanwhile.
+    let mut every_member = members.clone();
+    every_member.extend(children_of(worker.id() as i32));
+    fx.assert_clean_shutdown(&every_member);
 }

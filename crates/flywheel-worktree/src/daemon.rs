@@ -1329,7 +1329,8 @@ pub fn interruptible_sleep(seconds: f64, should_stop: &dyn Fn() -> bool) {
 /// group), and logs the request. SIGHUP is what a closing terminal or PTY
 /// sends its foreground job, so it is an orderly stop too, never the
 /// default instant death that would strand the claim and orphan the
-/// agents. Spawned on `runtime`; a no-op off unix.
+/// agents -- unless SIGHUP was inherited ignored (`nohup`), which is left
+/// alone. Spawned on `runtime`; a no-op off unix.
 pub fn arm_signals(runtime: &Runtime, stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
     runtime.spawn(watch_signals(stop, shutdown, log));
 }
@@ -1362,14 +1363,28 @@ async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
     let Some(mut int) = install("SIGINT", SignalKind::interrupt()) else {
         return;
     };
-    let Some(mut hup) = install("SIGHUP", SignalKind::hangup()) else {
-        return;
+    // An inherited SIG_IGN (`nohup`, or a pool supervisor started that way)
+    // stays: installing a handler would turn a terminal closing into the
+    // very shutdown the operator opted out of.
+    let mut hup = if crate::pool::hangup_ignored() {
+        None
+    } else {
+        let Some(stream) = install("SIGHUP", SignalKind::hangup()) else {
+            return;
+        };
+        Some(stream)
     };
     loop {
+        let hangup = async {
+            match hup.as_mut() {
+                Some(stream) => stream.recv().await,
+                None => std::future::pending().await,
+            }
+        };
         let signum = tokio::select! {
             _ = term.recv() => SignalKind::terminate().as_raw_value(),
             _ = int.recv() => SignalKind::interrupt().as_raw_value(),
-            _ = hup.recv() => SignalKind::hangup().as_raw_value(),
+            _ = hangup => SignalKind::hangup().as_raw_value(),
         };
         begin_shutdown(&stop, &shutdown, &log, &format!("signal {signum}"));
     }

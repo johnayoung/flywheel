@@ -801,6 +801,11 @@ impl Emulator {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Whether the program enabled bracketed paste (`CSI ? 2004 h`).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Escape sequences that rebuild this terminal in a freshly reset
     /// xterm-compatible one of the same size: the primary screen's
     /// scrollback and rows, then (when up) the alternate screen, then the

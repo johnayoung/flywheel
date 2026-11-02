@@ -442,6 +442,11 @@ impl PtySession {
         self.lock().screen.set_viewer_colors(colors);
     }
 
+    /// Whether the program in the terminal enabled bracketed paste.
+    pub fn bracketed_paste(&self) -> bool {
+        self.lock().screen.bracketed_paste()
+    }
+
     /// The terminal's rendered plain text.
     pub fn screen_text(&self, source: TextSource) -> ScreenText {
         self.lock().screen.text(source)

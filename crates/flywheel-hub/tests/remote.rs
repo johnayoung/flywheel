@@ -632,6 +632,8 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         pid: std::process::id(),
         listen: hub.addr,
         public_urls: vec!["https://box.tail1234.ts.net".into()],
+        started_at: None,
+        log_file: None,
     }
     .write(&hub.state_dir)
     .unwrap();
@@ -707,6 +709,8 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         pid: std::process::id(),
         listen: hub.addr,
         public_urls: Vec::new(),
+        started_at: None,
+        log_file: None,
     }
     .write(&dead)
     .unwrap();
@@ -723,6 +727,8 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         pid: std::process::id(),
         listen: hub.addr,
         public_urls: Vec::new(),
+        started_at: None,
+        log_file: None,
     }
     .write(&dead)
     .unwrap();

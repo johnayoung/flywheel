@@ -4,14 +4,15 @@
 //!
 //! Processes belong to the running server, not to this file: a session
 //! recorded as `running` when the hub last stopped is loaded back as
-//! `stopped`.
+//! `stopped` (not `clean`: the hub died without recording it, so it is not
+//! restored).
 
 use crate::agent::SessionKind;
 use crate::auth::write_private;
 use crate::pty::ExitInfo;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,12 +47,40 @@ pub enum SessionState {
     /// The hub stopped while the session was running.
     Stopped {
         at: DateTime<Utc>,
+        /// Recorded by the hub's own (graceful) shutdown, rather than
+        /// inferred on load after the hub died: the next start restores it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clean: bool,
+        /// Why the last attempt to restore it failed (e.g. its working
+        /// directory is gone). Retried on every start until it succeeds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_error: Option<String>,
+        /// The process's working directory when the hub stopped it (where
+        /// the shell had `cd`'d to), where a restore starts it again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_cwd: Option<PathBuf>,
     },
 }
 
 impl SessionState {
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
+    }
+
+    /// Stopped by a clean hub shutdown (so restored on start).
+    pub fn is_restorable(&self) -> bool {
+        matches!(self, Self::Stopped { clean: true, .. })
+    }
+
+    /// A state stopped at `at` by the hub's own shutdown (`clean`) or found
+    /// running after the hub died.
+    pub fn stopped(at: DateTime<Utc>, clean: bool) -> Self {
+        Self::Stopped {
+            at,
+            clean,
+            restore_error: None,
+            last_cwd: None,
+        }
     }
 }
 
@@ -139,7 +168,7 @@ impl HubStore {
         let mut demoted = false;
         for session in &mut doc.sessions {
             if session.state.is_running() {
-                session.state = SessionState::Stopped { at: now };
+                session.state = SessionState::stopped(now, false);
                 demoted = true;
             }
         }
@@ -321,15 +350,74 @@ impl HubStore {
         Ok(self.doc.sessions[index].clone())
     }
 
-    /// Mark every running session stopped (hub shutdown).
-    pub fn mark_all_stopped(&mut self) -> Result<(), StateError> {
+    /// Mark every running session stopped by a clean shutdown (restored
+    /// on the next start), with the working directory each was in, where
+    /// known (`last_cwds`, by session id).
+    pub fn mark_all_stopped(
+        &mut self,
+        last_cwds: &HashMap<String, PathBuf>,
+    ) -> Result<(), StateError> {
         let now = Utc::now();
         for session in &mut self.doc.sessions {
             if session.state.is_running() {
-                session.state = SessionState::Stopped { at: now };
+                session.state = SessionState::Stopped {
+                    at: now,
+                    clean: true,
+                    restore_error: None,
+                    last_cwd: last_cwds.get(&session.id).cloned(),
+                };
             }
         }
         self.save()
+    }
+
+    /// Record a session restored after a clean shutdown: running again
+    /// (same id, name, and place) as `kind` running `command` -- which a
+    /// restore may change (an agent coming back as a shell).
+    pub fn mark_restored(
+        &mut self,
+        id: &str,
+        kind: SessionKind,
+        command: Vec<String>,
+    ) -> Result<SessionRecord, StateError> {
+        let index = self.session_index(id)?;
+        if !self.doc.sessions[index].state.is_restorable() {
+            return Err(StateError::Conflict(format!(
+                "session {:?} was not stopped by a clean shutdown",
+                self.doc.sessions[index].name
+            )));
+        }
+        let previous = self.doc.sessions[index].clone();
+        let session = &mut self.doc.sessions[index];
+        session.kind = kind;
+        session.command = command;
+        session.state = SessionState::Running;
+        self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
+        Ok(self.doc.sessions[index].clone())
+    }
+
+    /// Record why restoring a cleanly stopped session failed; it stays
+    /// stopped (and restorable, so a later start retries).
+    pub fn set_restore_error(&mut self, id: &str, message: &str) -> Result<(), StateError> {
+        let index = self.session_index(id)?;
+        let SessionState::Stopped { restore_error, .. } = &mut self.doc.sessions[index].state
+        else {
+            return Err(StateError::Conflict(format!("session {id} is not stopped")));
+        };
+        let previous = restore_error.replace(message.to_owned());
+        self.save_or_rollback(|doc| {
+            if let SessionState::Stopped { restore_error, .. } = &mut doc.sessions[index].state {
+                *restore_error = previous;
+            }
+        })
+    }
+
+    fn session_index(&self, id: &str) -> Result<usize, StateError> {
+        self.doc
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("session {id}")))
     }
 
     /// Rename a session.
@@ -713,7 +801,7 @@ mod tests {
             .unwrap();
         let session = running_session(&ws.id, &repo);
         store.insert_session(session.clone()).unwrap();
-        store.mark_all_stopped().unwrap();
+        store.mark_all_stopped(&HashMap::new()).unwrap();
         store
             .mark_exited(
                 &session.id,
@@ -730,6 +818,61 @@ mod tests {
                 .unwrap()
                 .state,
             SessionState::Stopped { .. }
+        ));
+    }
+
+    #[test]
+    fn only_a_clean_shutdown_makes_sessions_restorable() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let crashed = running_session(&ws.id, &repo);
+        store.insert_session(crashed.clone()).unwrap();
+        drop(store);
+        // Found running on load: the hub died without recording it.
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert!(!store.session(&crashed.id).unwrap().state.is_restorable());
+        let raw = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+        assert!(!raw.contains("clean"), "{raw}");
+        assert!(matches!(
+            store.mark_restored(&crashed.id, SessionKind::Shell, vec!["/bin/sh".into()]),
+            Err(StateError::Conflict(_))
+        ));
+
+        let clean = running_session(&ws.id, &repo);
+        store.insert_session(clean.clone()).unwrap();
+        let cwds = HashMap::from([(clean.id.clone(), PathBuf::from("/somewhere/deeper"))]);
+        store.mark_all_stopped(&cwds).unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert!(store.session(&clean.id).unwrap().state.is_restorable());
+        assert!(matches!(
+            &store.session(&clean.id).unwrap().state,
+            SessionState::Stopped { last_cwd: Some(cwd), .. } if cwd == Path::new("/somewhere/deeper")
+        ));
+        store.set_restore_error(&clean.id, "cwd gone").unwrap();
+        let reopened = HubStore::open(dir.path()).unwrap();
+        match &reopened.session(&clean.id).unwrap().state {
+            SessionState::Stopped {
+                clean: true,
+                restore_error: Some(message),
+                ..
+            } => assert_eq!(message, "cwd gone"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let mut store = reopened;
+        let restored = store
+            .mark_restored(&clean.id, SessionKind::Shell, vec!["/bin/bash".into()])
+            .unwrap();
+        assert!(restored.state.is_running());
+        assert_eq!(restored.command, vec!["/bin/bash".to_owned()]);
+        // Same place in the session order.
+        assert_eq!(store.sessions()[1].id, clean.id);
+        assert!(matches!(
+            store.set_restore_error(&clean.id, "x"),
+            Err(StateError::Conflict(_))
         ));
     }
 

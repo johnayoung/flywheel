@@ -10,6 +10,7 @@ use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SessionEvent, SpawnError, SpawnSpec};
 use crate::remote::ServeLock;
 use crate::report::{self, Report, ReportError, ReportServer};
+use crate::restore::RestoreHow;
 use crate::state::{
     HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput, new_id,
     validate_name,
@@ -152,6 +153,17 @@ pub struct LiveView {
     pub clients: usize,
     /// Scrollback lines retained by the active screen.
     pub scrollback_lines: usize,
+}
+
+/// What [`Hub::restore_sessions`] did with one session.
+#[derive(Debug, Clone)]
+pub struct RestoreOutcome {
+    pub id: String,
+    pub name: String,
+    /// Where it started (its recorded directory when it failed).
+    pub cwd: PathBuf,
+    /// How it came back, or why it could not.
+    pub result: Result<RestoreHow, String>,
 }
 
 /// Whether a session kind can be launched on this host.
@@ -872,6 +884,93 @@ impl Hub {
         Ok(self.view(record))
     }
 
+    /// Restore every session a clean shutdown stopped (see
+    /// [`crate::restore`]), oldest first: each keeps its id, name, and
+    /// place, with a fresh PTY in its saved working directory. One that
+    /// cannot come back (its directory is gone, its repo left the
+    /// workspace, the spawn failed) stays stopped with the reason recorded
+    /// as `restore_error`, and is retried on the next start.
+    pub fn restore_sessions(self: &Arc<Self>) -> Vec<RestoreOutcome> {
+        let candidates: Vec<SessionRecord> = self
+            .store()
+            .sessions()
+            .iter()
+            .filter(|s| s.state.is_restorable())
+            .cloned()
+            .collect();
+        candidates
+            .into_iter()
+            .map(|record| {
+                let (cwd, result) = match self.restore_one(&record) {
+                    Ok((how, cwd)) => (cwd, Ok(how)),
+                    Err(message) => {
+                        let _ = self.store().set_restore_error(&record.id, &message);
+                        (record.cwd, Err(message))
+                    }
+                };
+                RestoreOutcome {
+                    id: record.id,
+                    name: record.name,
+                    cwd,
+                    result,
+                }
+            })
+            .collect()
+    }
+
+    /// Restore one session: how, and the directory it started in.
+    fn restore_one(
+        self: &Arc<Self>,
+        record: &SessionRecord,
+    ) -> Result<(RestoreHow, PathBuf), String> {
+        if !record.cwd.is_dir() {
+            return Err(format!(
+                "its working directory {} no longer exists",
+                record.cwd.display()
+            ));
+        }
+        // Where its shell had `cd`'d to, while that still exists; else the
+        // session's repo.
+        let cwd = match &record.state {
+            SessionState::Stopped {
+                last_cwd: Some(last),
+                ..
+            } if last.is_dir() => last.clone(),
+            _ => record.cwd.clone(),
+        };
+        let plan = crate::restore::plan(record, &self.options.default_shell);
+        let mut store = self.store();
+        let workspace = store
+            .workspace(&record.workspace_id)
+            .map_err(|e| e.to_string())?;
+        if !workspace.repos.contains(&record.cwd) {
+            return Err(format!(
+                "repo {} is no longer part of workspace {}",
+                record.cwd.display(),
+                workspace.name
+            ));
+        }
+        let mut relaunched = record.clone();
+        relaunched.kind = plan.kind;
+        relaunched.command = plan.command.clone();
+        relaunched.cwd = cwd.clone();
+        let session = self
+            .spawn_pty(&relaunched, None, None)
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = store.mark_restored(&record.id, plan.kind, plan.command) {
+            drop(store);
+            session.kill(Duration::ZERO);
+            session.release();
+            return Err(e.to_string());
+        }
+        let previous = self.live().insert(record.id.clone(), session);
+        drop(store);
+        if let Some(previous) = previous {
+            forget(&previous);
+        }
+        Ok((plan.how, cwd))
+    }
+
     /// Resolve an agent kind's CLI, or explain that it is not installed.
     fn agent_program(&self, kind: SessionKind) -> Result<PathBuf, HubError> {
         let program = self.options.agents.program(kind).unwrap_or_default();
@@ -971,8 +1070,9 @@ impl Hub {
         Ok(())
     }
 
-    /// Record every running session as stopped, then hang them all up, wait
-    /// up to `timeout` for them to exit, and release their PTYs. (Stopped is
+    /// Record every running session as stopped (with the directory its
+    /// process is in, for restore), then hang them all up, wait up to
+    /// `timeout` for them to exit, and release their PTYs. (Stopped is
     /// recorded first: the hangup's own exit must not read as a crash.)
     pub fn shutdown(&self, timeout: Duration) {
         if let Some(mut server) = self
@@ -983,7 +1083,13 @@ impl Hub {
         {
             server.stop();
         }
-        let _ = self.store().mark_all_stopped();
+        let last_cwds: HashMap<String, PathBuf> = self
+            .live()
+            .iter()
+            .filter(|(_, s)| s.exit_info().is_none())
+            .filter_map(|(id, s)| Some((id.clone(), process_cwd(s.pid()?)?)))
+            .collect();
+        let _ = self.store().mark_all_stopped(&last_cwds);
         let sessions: Vec<Arc<PtySession>> = self.live().drain().map(|(_, s)| s).collect();
         let grace = timeout / 2;
         for session in &sessions {
@@ -997,6 +1103,19 @@ impl Hub {
         for session in &sessions {
             session.release();
         }
+    }
+}
+
+/// The working directory of process `pid`, where the platform exposes it.
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
     }
 }
 

@@ -7,11 +7,37 @@
 ## Verbs
 
 ```bash
-fw hub serve [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--state-dir DIR]
-fw hub url [--qr] [--state-dir DIR]           # one-time login URLs for the running hub (+ QR for a phone)
-fw hub token [--rotate] [--state-dir DIR]     # print the access token (created on first use) / rotate it
+fw hub start [SERVE FLAGS] [--timeout SECS]   # detached; returns once serving, prints login URLs
+fw hub stop [--timeout SECS] [--force]        # graceful: sessions recorded for restore
+fw hub status [--json]                        # pid, uptime, url, counts; exit 0 running, 3 not, 1 unreachable
+fw hub logs [-f] [-n N]                       # <state-dir>/hub.log (detached hubs only)
+fw hub install-service [SERVE FLAGS] [--name N] [--force] [--print]   # systemd --user unit; never enabled
+fw hub serve [SERVE FLAGS]                    # foreground
+fw hub url [--qr]                             # one-time login URLs for the running hub (+ QR for a phone)
+fw hub token [--rotate]                       # print the access token (created on first use) / rotate it
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
+# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore]
+# every verb takes --state-dir DIR
 ```
+
+Scripting the running hub (sessions/workspaces by id, unique id prefix, or name; exact name beats prefix; ambiguity is an error):
+
+```bash
+fw hub ls [--json]                                         # workspaces > sessions: short id, kind, state, name, cwd
+fw hub new WS [--kind shell|claude|codex] [--repo PATH] [--name N] [--create] [--json] [-- ARGV...]   # prints the id
+fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines -> CR, bracketed when the program enabled it
+fw hub read SESSION [--source visible|recent] [--lines N] [--json]
+fw hub kill SESSION [--rm]                                 # hang up (record kept, as exited); --rm also forgets it
+```
+
+`new --create` makes workspace `WS` (with `--repo`) when none matches; relative `--repo` is resolved against the caller's directory. `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
+
+## Lifecycle and restore
+
+- `start` re-execs `fw hub serve` in a new session (`setsid`, cwd `/`, stdin `/dev/null`), stdout/stderr into `<state-dir>/hub.log` (0600; rotated at 10 MiB, 3 kept as `hub.log.1..3`). Ready = it wrote `server.json` with its pid (after binding and restoring). Failing to start prints the log tail; not ready within `--timeout` (30 s) it is SIGTERMed. Already running: prints it, exits 0. One-time codes and the token never go to the log.
+- `stop` sends SIGTERM and waits for the serve lock to free; no hub running exits 0. `--force` SIGKILLs after `--timeout` (sessions then not recorded for restore).
+- **Restore** (on every start unless `--no-restore`): sessions recorded `stopped` by a clean shutdown come back with the same id, name, and order, a fresh PTY in the directory their process was in at shutdown (Linux `/proc`; else, or when gone, the session's repo). Interactive shells (`sh`, `bash`, `zsh`, `fish`, ... with at most `-l`/`-i`) relaunch as recorded; anything else -- a shell running a command, `claude`, `codex` -- comes back as a fresh hub shell (never re-runs the command; agents' native resume plugs into `restore::plan`). A session whose repo dir is gone stays `stopped` with `restore_error` (retried each start; UI shows "not restored"). Sessions found `running` after a crash, and `exited` ones, are not restored.
+- `install-service` writes `$XDG_CONFIG_HOME/systemd/user/<name>.service` (`~/.config/...`): `ExecStart=<this binary> hub serve ...` (absolute state dir), current `PATH`/`SHELL`, `Restart=on-failure`, `KillMode=mixed` (SIGTERM reaches the hub first, so sessions are recorded for restore). Prints the `systemctl --user enable --now` / `loginctl enable-linger` steps; enables nothing.
 
 `serve` runs in the foreground and prints one-time login URLs (below); when any is reachable from another device (non-loopback bind, `--public-url`, or a detected `tailscale serve`) it also draws a QR code of the first (only when stdout is a terminal; logs get a pointer to `url --qr`). One hub per state dir: the hub holds an exclusive lock on `<state-dir>/serve.lock` for its whole life (guarding `server.json` and `report.sock`), and `serve` refuses to start while another holds it. Ctrl-C / SIGTERM records every running session stopped, then hangs them up (SIGHUP, SIGKILL after a grace). While it runs, `<state-dir>/server.json` (0600) records its pid, address, and public URLs for `url` / `token --rotate`; one left behind by a crashed hub (lock not held) is ignored and removed, so the CLI never sends the token to whatever now listens there.
 
@@ -48,8 +74,8 @@ fw hub url --qr                                  # scan with the phone
 ## Model
 
 - **Workspace** = a name (unique) + 1..N git work-tree roots (absolute or `~/...`; a `.git` dir or linked-worktree `.git` file).
-- **Session** = one PTY process in one of its workspace's repos, of a **kind**: `shell` (the hub's `$SHELL`, or an explicit argv), `claude`, or `codex` (the plain CLI, resolved on the hub's `PATH`; a missing CLI is a 400). States: `running`, `exited` (code or signal), `stopped` (the hub stopped while it ran). An exited session keeps its scrollback attachable until removed or the hub restarts.
-- Persisted to `<state-dir>/state.json` (0600, atomic writes). Processes are not restored across restarts yet.
+- **Session** = one PTY process in one of its workspace's repos, of a **kind**: `shell` (the hub's `$SHELL`, or an explicit argv), `claude`, or `codex` (the plain CLI, resolved on the hub's `PATH`; a missing CLI is a 400). States: `running`, `exited` (code or signal), `stopped` (the hub stopped while it ran; `clean` when by its own shutdown, plus `last_cwd` / `restore_error`). An exited session keeps its scrollback attachable until removed or the hub restarts.
+- Persisted to `<state-dir>/state.json` (0600, atomic writes). Restarts restore sessions (above).
 - Killing a session hangs up its whole session (leader's group plus background jobs, even after the leader exited; Linux scans `/proc`, elsewhere only the leader's group). Removing a session, or deleting its workspace, also frees its PTY.
 - Terminal size is shared: the last client to resize sets it for everyone.
 - Input beyond 4 MiB queued for a terminal that is not reading is dropped (the client gets an `error` message).
@@ -98,6 +124,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
 | POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
 | GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
+| POST | `/sessions/{id}/input` | `{"data","paste"?,"enter"?}` -> `{"bytes","bracketed"}`: type into it (`paste`: as `fw hub send`). 409 when it has no running terminal or is not reading |
 | GET | `/sessions/{id}/ws` | WebSocket attach |
 | GET | `/events[?client=ID]` | hub-wide events WebSocket (below) |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |

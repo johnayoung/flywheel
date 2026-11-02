@@ -3,13 +3,15 @@
 
 use crate::auth::{LOGIN_CODE_TTL, Token};
 use crate::client;
-use crate::hub::{Hub, HubError, HubOptions};
+use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
 use crate::paths::default_state_dir;
 use crate::remote::{
     LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
     normalize_public_url, qr_lines, tailscale_program,
 };
 use crate::server::{ServerOptions, code_login_url, serve};
+use crate::{lifecycle, script};
+use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -37,6 +39,30 @@ struct HubCli {
 enum HubCommand {
     /// Run the hub server in the foreground and print the login URLs.
     Serve(ServeArgs),
+    /// Start the hub detached (output to the state dir's rotating
+    /// hub.log); returns once it is serving and prints the login URLs.
+    Start(lifecycle::StartArgs),
+    /// Stop the running hub gracefully; its running sessions are recorded
+    /// stopped and come back on the next start.
+    Stop(lifecycle::StopArgs),
+    /// Is the hub running: pid, uptime, URL, workspace and session counts.
+    /// Exit code 0 running, 3 not running, 1 running but unreachable.
+    Status(lifecycle::StatusArgs),
+    /// Print the detached hub's log (hub.log), optionally following it.
+    Logs(lifecycle::LogsArgs),
+    /// Write a systemd --user unit that runs the hub (printed; not
+    /// enabled).
+    InstallService(lifecycle::InstallServiceArgs),
+    /// List workspaces and their sessions with state.
+    Ls(script::LsArgs),
+    /// Open a session in a workspace; prints its id.
+    New(script::NewArgs),
+    /// Type text into a session (pasted, bracketed-paste aware).
+    Send(script::SendArgs),
+    /// Print a session's screen text.
+    Read(script::ReadArgs),
+    /// Hang up a session's processes (the record stays, as exited).
+    Kill(script::KillArgs),
     /// Print one-time login URLs for the running hub (loopback, LAN,
     /// tailnet, public), optionally as a QR code for a phone. The
     /// long-lived token is never shown.
@@ -88,16 +114,27 @@ struct ReportArgs {
     payload: Option<String>,
 }
 
-#[derive(Debug, clap::Args)]
-struct StateDirArg {
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct StateDirArg {
     /// State directory [default: $XDG_STATE_HOME/flywheel/hub or
     /// ~/.local/state/flywheel/hub].
     #[arg(long, value_name = "DIR")]
-    state_dir: Option<PathBuf>,
+    pub(crate) state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
 struct ServeArgs {
+    #[command(flatten)]
+    hub: HubArgs,
+    /// Run detached: send stdout and stderr to this rotating log file and
+    /// print no login codes into it (`fw hub start` passes it).
+    #[arg(long, value_name = "PATH", hide = true)]
+    log_file: Option<PathBuf>,
+}
+
+/// How the hub serves: shared by `serve`, `start`, and `install-service`.
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct HubArgs {
     /// Address to listen on. Anything but loopback exposes shells to the
     /// network: prefer `tailscale serve` for remote access.
     #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
@@ -126,11 +163,58 @@ struct ServeArgs {
     /// lines (capped at 1M cells, so wide terminals keep fewer).
     #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
     scrollback_lines: usize,
+    /// Do not restore the sessions the last clean shutdown stopped (they
+    /// stay stopped; relaunch them from the UI).
+    #[arg(long)]
+    no_restore: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    pub(crate) state: StateDirArg,
 }
 
-fn resolve_state_dir(arg: &StateDirArg) -> Result<PathBuf, String> {
+impl HubArgs {
+    /// These options as `serve` arguments, with `state_dir` (absolute)
+    /// in place of the one given.
+    pub(crate) fn to_argv(&self, state_dir: &Path) -> Vec<String> {
+        let mut argv = vec![
+            "--bind".to_owned(),
+            self.bind.to_string(),
+            "--port".to_owned(),
+            self.port.to_string(),
+        ];
+        for origin in &self.allow_origins {
+            argv.extend(["--allow-origin".to_owned(), origin.clone()]);
+        }
+        for url in &self.public_urls {
+            argv.extend(["--public-url".to_owned(), url.clone()]);
+        }
+        for proxy in &self.trusted_proxies {
+            argv.extend(["--trusted-proxy".to_owned(), proxy.to_string()]);
+        }
+        argv.extend([
+            "--scrollback-lines".to_owned(),
+            self.scrollback_lines.to_string(),
+        ]);
+        if self.no_restore {
+            argv.push("--no-restore".to_owned());
+        }
+        argv.extend([
+            "--state-dir".to_owned(),
+            state_dir.to_string_lossy().into_owned(),
+        ]);
+        argv
+    }
+
+    /// The `--public-url`s as origins (an error names the bad one).
+    pub(crate) fn public_url_origins(&self) -> Result<Vec<String>, String> {
+        self.public_urls
+            .iter()
+            .map(|u| normalize_public_url(u))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|message| format!("--public-url {message}"))
+    }
+}
+
+pub(crate) fn resolve_state_dir(arg: &StateDirArg) -> Result<PathBuf, String> {
     match &arg.state_dir {
         Some(dir) => Ok(dir.clone()),
         None => default_state_dir()
@@ -174,6 +258,16 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         HubCommand::Serve(args) => serve_cmd(args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.
         HubCommand::Report(_) => 0,
+        HubCommand::Start(args) => lifecycle::start(&args, out, err),
+        HubCommand::Stop(args) => lifecycle::stop(&args, out, err),
+        HubCommand::Status(args) => lifecycle::status(&args, out, err),
+        HubCommand::Logs(args) => lifecycle::logs(&args, out, err),
+        HubCommand::InstallService(args) => lifecycle::install_service(&args, out, err),
+        HubCommand::Ls(args) => script::ls(&args, out, err),
+        HubCommand::New(args) => script::new(&args, out, err),
+        HubCommand::Send(args) => script::send(&args, out, err),
+        HubCommand::Read(args) => script::read(&args, out, err),
+        HubCommand::Kill(args) => script::kill(&args, out, err),
     }
 }
 
@@ -296,7 +390,7 @@ fn token(args: &TokenArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 /// The hub serving `state_dir`, if one holds its serve lock.
-fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, String> {
+pub(crate) fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, String> {
     crate::remote::running_hub(state_dir).map_err(|e| {
         format!(
             "runtime file {}: {e}",
@@ -348,19 +442,11 @@ fn rotate(state_dir: &Path) -> Result<String, String> {
 }
 
 fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    match mint_remote_code(&args.state) {
+    let minted = resolve_state_dir(&args.state).and_then(|dir| mint_remote_code(&dir));
+    match minted {
         Ok((info, code)) => {
-            let tailscale =
-                tailscale_program().and_then(|p| detect_tailscale(&p, info.listen.port()));
-            let targets = login_targets(
-                info.listen,
-                &info.public_urls,
-                tailscale.as_ref(),
-                &local_interfaces(info.listen),
-            );
             let qr = if args.qr { Qr::Draw } else { Qr::No };
-            print_login(out, err, &targets, &code, qr);
-            print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
+            show_login(&info, &code, qr, out, err);
             0
         }
         Err(message) => {
@@ -370,9 +456,45 @@ fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-/// Ask the running hub for a one-time login code.
-fn mint_remote_code(state: &StateDirArg) -> Result<(RuntimeInfo, String), String> {
-    let dir = resolve_state_dir(state)?;
+/// Print the login URLs for `code` on the hub `info` describes (`qr`:
+/// [`Qr::Auto`] draws one only when it can be scanned from elsewhere and
+/// stdout is a terminal).
+pub(crate) fn show_login(
+    info: &RuntimeInfo,
+    code: &str,
+    qr: Qr,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) {
+    let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, info.listen.port()));
+    let targets = login_targets(
+        info.listen,
+        &info.public_urls,
+        tailscale.as_ref(),
+        &local_interfaces(info.listen),
+    );
+    let qr = match qr {
+        Qr::Auto => auto_qr(&targets),
+        qr => qr,
+    };
+    print_login(out, err, &targets, code, qr);
+    print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
+}
+
+/// Draw a QR code when a remote device could use it and stdout can show it.
+fn auto_qr(targets: &[LoginTarget]) -> Qr {
+    if !targets.iter().any(|t| t.remote) {
+        Qr::No
+    } else if std::io::stdout().is_terminal() {
+        Qr::Draw
+    } else {
+        Qr::NotATerminal
+    }
+}
+
+/// Ask the hub serving `dir` for a one-time login code.
+pub(crate) fn mint_remote_code(dir: &Path) -> Result<(RuntimeInfo, String), String> {
+    let dir = dir.to_path_buf();
     let info = running_hub(&dir)?.ok_or_else(|| {
         format!(
             "no hub is running for state dir {} (start one with `fw hub serve`)",
@@ -413,9 +535,11 @@ fn mint_remote_code(state: &StateDirArg) -> Result<(RuntimeInfo, String), String
 
 /// Whether [`print_login`] draws the QR code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Qr {
+pub(crate) enum Qr {
     No,
     Draw,
+    /// [`Qr::Draw`] when a remote URL exists and stdout is a terminal.
+    Auto,
     /// Wanted, but the output is not a terminal (a log or journal): say
     /// how to get one instead of writing colour escapes into it.
     NotATerminal,
@@ -506,7 +630,7 @@ fn print_tailscale_hint(
 }
 
 /// The host a browser should use to reach `addr`.
-fn browse_host(addr: SocketAddr) -> String {
+pub(crate) fn browse_host(addr: SocketAddr) -> String {
     let ip = if addr.ip().is_unspecified() {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     } else {
@@ -551,22 +675,46 @@ fn route_address(unspecified: IpAddr) -> Option<IpAddr> {
 }
 
 fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let state_dir = match resolve_state_dir(&args.state) {
+    // Detached (`fw hub start`): everything this process writes to stdout
+    // and stderr goes to the rotating log from here on. Declared first so
+    // it is dropped last, after the final message.
+    #[cfg(unix)]
+    let _log = match &args.log_file {
+        Some(path) => match crate::daemon::LogRedirect::install(path) {
+            Ok(redirect) => Some(redirect),
+            Err(e) => {
+                let _ = writeln!(err, "fw hub: cannot log to {}: {e}", path.display());
+                return 1;
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(unix))]
+    if args.log_file.is_some() {
+        let _ = writeln!(err, "fw hub: running detached is supported on unix only");
+        return 1;
+    }
+    let detached = args.log_file.is_some();
+    if detached {
+        let _ = writeln!(
+            out,
+            "=== flywheel hub (pid {}) starting at {} ===",
+            std::process::id(),
+            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+        );
+    }
+    let hub_args = args.hub;
+    let state_dir = match resolve_state_dir(&hub_args.state) {
         Ok(dir) => dir,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             return 1;
         }
     };
-    let public_urls = match args
-        .public_urls
-        .iter()
-        .map(|u| normalize_public_url(u))
-        .collect::<Result<Vec<_>, _>>()
-    {
+    let public_urls = match hub_args.public_url_origins() {
         Ok(urls) => urls,
         Err(message) => {
-            let _ = writeln!(err, "fw hub: --public-url {message}");
+            let _ = writeln!(err, "fw hub: {message}");
             return 2;
         }
     };
@@ -575,7 +723,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         return 1;
     }
     let mut options = HubOptions::new(state_dir);
-    options.scrollback_lines = args.scrollback_lines;
+    options.scrollback_lines = hub_args.scrollback_lines;
     options.report_command = report_command();
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
@@ -612,7 +760,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 1;
         }
     };
-    let bind = SocketAddr::new(args.bind, args.port);
+    let bind = SocketAddr::new(hub_args.bind, hub_args.port);
     let listener = match runtime.block_on(tokio::net::TcpListener::bind(bind)) {
         Ok(listener) => listener,
         Err(e) => {
@@ -621,7 +769,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
     let local = listener.local_addr().unwrap_or(bind);
-    if !args.bind.is_loopback() {
+    if !hub_args.bind.is_loopback() {
         let _ = writeln!(
             err,
             "fw hub: WARNING: listening on {local}, reachable beyond this machine. \
@@ -640,50 +788,58 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = writeln!(out, "flywheel hub listening on {base}");
     }
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
-    let targets = login_targets(
-        local,
-        &public_urls,
-        tailscale.as_ref(),
-        &local_interfaces(local),
-    );
-    match hub.mint_login_code() {
-        Ok(code) => {
-            let qr = if !targets.iter().any(|t| t.remote) {
-                Qr::No
-            } else if std::io::stdout().is_terminal() {
-                Qr::Draw
-            } else {
-                Qr::NotATerminal
-            };
-            print_login(out, err, &targets, &code, qr);
-        }
-        Err(e) => {
-            let _ = writeln!(err, "fw hub: cannot mint a login code: {e}");
-        }
+    if hub_args.no_restore {
+        let _ = writeln!(out, "session restore off (--no-restore)");
+    } else {
+        report_restore(&hub.restore_sessions(), out, err);
     }
-    print_tailscale_hint(err, tailscale.as_ref(), &targets, local.port());
+    if detached {
+        // One-time codes stay out of log files: `fw hub start` printed one
+        // to the operator's terminal.
+        let _ = writeln!(
+            out,
+            "log in with a one-time URL from `fw hub url` (or `fw hub url --qr` for a phone)"
+        );
+    } else {
+        let targets = login_targets(
+            local,
+            &public_urls,
+            tailscale.as_ref(),
+            &local_interfaces(local),
+        );
+        match hub.mint_login_code() {
+            Ok(code) => print_login(out, err, &targets, &code, auto_qr(&targets)),
+            Err(e) => {
+                let _ = writeln!(err, "fw hub: cannot mint a login code: {e}");
+            }
+        }
+        print_tailscale_hint(err, tailscale.as_ref(), &targets, local.port());
+    }
     let _ = out.flush();
 
+    // Written last: `fw hub start` treats it as the hub being ready.
     let runtime_info = RuntimeInfo {
         pid: std::process::id(),
         listen: local,
         public_urls: public_urls.clone(),
+        started_at: Some(Utc::now()),
+        log_file: args.log_file.clone(),
     };
     if let Err(e) = runtime_info.write(hub.state_dir()) {
         let _ = writeln!(
             err,
-            "fw hub: cannot write the runtime file (`fw hub url` and `fw hub token --rotate` \
-             will not find this hub): {e}"
+            "fw hub: cannot write the runtime file (`fw hub url`, `status`, `stop`, and the \
+             scripting verbs will not find this hub): {e}"
         );
     }
-    let mut allowed_origins = args.allow_origins;
+    let mut allowed_origins = hub_args.allow_origins;
     allowed_origins.extend(public_urls);
     if let Some(ts) = &tailscale {
         allowed_origins.extend(ts.serve_urls.iter().cloned());
     }
     let server_options = ServerOptions {
         allowed_origins,
-        trusted_proxies: args.trusted_proxies,
+        trusted_proxies: hub_args.trusted_proxies,
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve(
@@ -697,12 +853,40 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     drop(hub);
     match result {
         Ok(()) => {
-            let _ = writeln!(out, "flywheel hub stopped");
+            let _ = writeln!(
+                out,
+                "flywheel hub stopped at {}",
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+            );
             0
         }
         Err(e) => {
             let _ = writeln!(err, "fw hub: server error: {e}");
             1
+        }
+    }
+}
+
+/// Say what restoring the last clean shutdown's sessions did.
+fn report_restore(outcomes: &[RestoreOutcome], out: &mut dyn Write, err: &mut dyn Write) {
+    for outcome in outcomes {
+        match &outcome.result {
+            Ok(how) => {
+                let _ = writeln!(
+                    out,
+                    "restored session {:?} in {} ({})",
+                    outcome.name,
+                    outcome.cwd.display(),
+                    how.as_str()
+                );
+            }
+            Err(message) => {
+                let _ = writeln!(
+                    err,
+                    "fw hub: cannot restore session {:?} ({}): {message}; it stays stopped",
+                    outcome.name, outcome.id
+                );
+            }
         }
     }
 }
@@ -905,6 +1089,8 @@ mod tests {
             pid: 4242,
             listen: "127.0.0.1:47533".parse().unwrap(),
             public_urls: Vec::new(),
+            started_at: None,
+            log_file: None,
         }
         .write(&state)
         .unwrap();

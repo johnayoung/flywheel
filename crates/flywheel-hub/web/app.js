@@ -184,6 +184,7 @@
         ? { dot: "done", label: "done", tone: "" }
         : { dot: "bad", label: `exit ${session.code}`, tone: "bad" };
     }
+    if (session.restore_error) return { dot: "bad", label: "not restored", tone: "bad" };
     return { dot: "stopped", label: "stopped", tone: "" };
   }
 
@@ -191,6 +192,9 @@
 
   // Why a session has no terminal on this hub.
   function goneText(session) {
+    if (session.state === "stopped" && session.restore_error) {
+      return `${session.name} was running when the hub stopped, but could not be restored: ${session.restore_error}.`;
+    }
     if (session.state === "stopped") {
       return `${session.name} was running when the hub stopped; its terminal did not survive the restart.`;
     }

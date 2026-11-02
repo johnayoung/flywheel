@@ -145,6 +145,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/kill", post(kill_session))
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
+        .route("/api/sessions/{id}/input", post(session_input))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
@@ -905,6 +906,106 @@ async fn session_screen(
     Ok(Json(body).into_response())
 }
 
+#[derive(Deserialize)]
+struct InputRequest {
+    #[serde(default)]
+    data: String,
+    /// Send `data` the way a terminal pastes it: newlines as `CR`, wrapped
+    /// in bracketed-paste markers when the program enabled them.
+    #[serde(default)]
+    paste: bool,
+    /// Press Enter afterwards (a separate `CR`, [`ENTER_DELAY`] later).
+    #[serde(default)]
+    enter: bool,
+}
+
+/// Pause between sent text and the Enter that follows it, so a program
+/// reads the Enter as a keypress rather than as part of the text (TUIs
+/// treat one fast burst of input as a paste).
+pub const ENTER_DELAY: Duration = Duration::from_millis(50);
+const BRACKETED_PASTE_START: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
+/// The bytes a terminal sends when `text` is pasted: line breaks become
+/// `CR` (what Enter sends); with `bracketed` the text is wrapped in paste
+/// markers, minus any markers inside it (which would end the paste early
+/// and let the rest run as typed input).
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    if !bracketed {
+        return text.into_bytes();
+    }
+    let inner = text
+        .replace(BRACKETED_PASTE_START, "")
+        .replace(BRACKETED_PASTE_END, "");
+    format!("{BRACKETED_PASTE_START}{inner}{BRACKETED_PASTE_END}").into_bytes()
+}
+
+fn input_refused(outcome: WriteOutcome) -> Option<Response> {
+    match outcome {
+        WriteOutcome::Queued => None,
+        WriteOutcome::Closed => Some(error_response(
+            StatusCode::CONFLICT,
+            "the session has exited",
+        )),
+        WriteOutcome::Backlogged => Some(error_response(
+            StatusCode::CONFLICT,
+            "input dropped: the terminal is not reading its input",
+        )),
+    }
+}
+
+/// Type into a session (for scripts and `fw hub send`): `data` as is, or
+/// pasted (`paste`), then optionally Enter. Answers
+/// `{"bytes","bracketed"}`.
+async fn session_input(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<InputRequest>,
+) -> ApiResult<Response> {
+    app.hub.session(&id)?;
+    let Some(session) = app.hub.live_session(&id) else {
+        return Ok(error_response(
+            StatusCode::CONFLICT,
+            &format!("session {id} has no terminal on this server"),
+        ));
+    };
+    if session.exit_info().is_some() {
+        return Ok(error_response(
+            StatusCode::CONFLICT,
+            "the session has exited",
+        ));
+    }
+    if request.data.is_empty() && !request.enter {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "nothing to send: give data and/or enter",
+        ));
+    }
+    let bracketed = request.paste && session.bracketed_paste();
+    let bytes = if request.paste {
+        paste_bytes(&request.data, bracketed)
+    } else {
+        request.data.into_bytes()
+    };
+    let mut sent = bytes.len();
+    if !bytes.is_empty()
+        && let Some(refused) = input_refused(session.write(bytes))
+    {
+        return Ok(refused);
+    }
+    if request.enter {
+        if sent > 0 {
+            tokio::time::sleep(ENTER_DELAY).await;
+        }
+        if let Some(refused) = input_refused(session.write(b"\r".to_vec())) {
+            return Ok(refused);
+        }
+        sent += 1;
+    }
+    Ok(Json(json!({ "bytes": sent, "bracketed": bracketed })).into_response())
+}
+
 // --- credentials ------------------------------------------------------------
 
 /// Mint a one-time login code: `{"code","expires_in"}` (seconds). Open
@@ -1366,6 +1467,16 @@ mod tests {
             headers.insert("x-forwarded-for", xff.parse().unwrap());
         }
         Client::of(&extensions, &headers, options)
+    }
+
+    #[test]
+    fn pasted_text_uses_cr_and_cannot_escape_bracketed_paste() {
+        assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
+        assert_eq!(
+            paste_bytes("x\n\x1b[201~rm -rf /\n", true),
+            b"\x1b[200~x\rrm -rf /\r\x1b[201~"
+        );
+        assert_eq!(paste_bytes("", true), b"\x1b[200~\x1b[201~");
     }
 
     #[test]

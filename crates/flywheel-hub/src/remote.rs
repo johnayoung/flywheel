@@ -30,6 +30,12 @@ pub struct RuntimeInfo {
     /// Configured public URLs (`--public-url`), normalized origins.
     #[serde(default)]
     pub public_urls: Vec<String>,
+    /// When it started serving (`fw hub status` uptime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Where its output goes when it runs detached (`fw hub start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<PathBuf>,
 }
 
 impl RuntimeInfo {
@@ -510,6 +516,8 @@ mod tests {
             pid: 42,
             listen: "0.0.0.0:7420".parse().unwrap(),
             public_urls: vec!["https://box.ts.net".into()],
+            started_at: None,
+            log_file: None,
         };
         info.write(dir.path()).unwrap();
         assert_eq!(RuntimeInfo::read(dir.path()).unwrap(), Some(info.clone()));
@@ -535,6 +543,8 @@ mod tests {
             pid: std::process::id(),
             listen: "127.0.0.1:7420".parse().unwrap(),
             public_urls: Vec::new(),
+            started_at: None,
+            log_file: None,
         };
         // A runtime file nobody holds the lock for is stale: ignored and
         // removed (a crashed hub, even if its pid was reused).

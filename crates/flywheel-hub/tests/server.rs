@@ -1676,3 +1676,174 @@ async fn a_client_that_falls_behind_gets_the_screen_alone_and_catches_up() {
     assert_eq!(seen["alt_screen"], false);
     hub.shutdown().await;
 }
+
+async fn send_input(hub: &TestHub, sid: &str, body: Value) -> (StatusCode, Value) {
+    let response = hub
+        .authed(reqwest::Method::POST, &format!("/api/sessions/{sid}/input"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_is_pasted_bracketed_only_when_the_program_asked() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("input").await;
+    let workspace_id = ws["id"].as_str().unwrap().to_owned();
+    // `cat -v` shows exactly what arrives (ESC as `^[`); echo off so only
+    // cat's copy is on screen.
+    let bracketed = hub
+        .create_session(
+            &workspace_id,
+            Some(vec![
+                "/bin/sh",
+                "-c",
+                "stty -echo; printf '\\033[?2004h'; echo ready; exec cat -v",
+            ]),
+        )
+        .await;
+    let sid = bracketed["id"].as_str().unwrap().to_owned();
+    hub.wait_screen(&sid, |s| lines_of(s).iter().any(|l| l == "ready"))
+        .await;
+    let (status, body) = send_input(
+        &hub,
+        &sid,
+        json!({"data": "one\ntwo\u{1b}[201~three", "paste": true, "enter": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["bracketed"], true);
+    let screen = hub
+        .wait_screen(&sid, |s| lines_of(s).iter().any(|l| l.contains("201~")))
+        .await;
+    let lines = lines_of(&screen);
+    // One paste: the embedded end marker was dropped, newlines became CR
+    // (the tty turns them into line ends), Enter followed separately.
+    assert!(lines.contains(&"^[[200~one".to_owned()), "{lines:?}");
+    assert!(lines.contains(&"twothree^[[201~".to_owned()), "{lines:?}");
+    // Raw input is passed through untouched.
+    let (status, body) =
+        send_input(&hub, &sid, json!({"data": "\u{1b}[Araw\n", "paste": false})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["bracketed"], false);
+    hub.wait_screen(&sid, |s| lines_of(s).iter().any(|l| l == "^[[Araw"))
+        .await;
+
+    // A program that did not enable bracketed paste gets plain lines.
+    let plain = hub
+        .create_session(
+            &workspace_id,
+            Some(vec!["/bin/sh", "-c", "stty -echo; echo ready; exec cat -v"]),
+        )
+        .await;
+    let plain_id = plain["id"].as_str().unwrap().to_owned();
+    hub.wait_screen(&plain_id, |s| lines_of(s).iter().any(|l| l == "ready"))
+        .await;
+    let (_, body) = send_input(&hub, &plain_id, json!({"data": "a\nb\n", "paste": true})).await;
+    assert_eq!(body["bracketed"], false);
+    let screen = hub
+        .wait_screen(&plain_id, |s| lines_of(s).iter().any(|l| l == "b"))
+        .await;
+    assert!(lines_of(&screen).contains(&"a".to_owned()));
+
+    // Refusals.
+    let (status, _) = send_input(&hub, &sid, json!({"data": ""})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send_input(&hub, "missing", json!({"data": "x"})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let ended = hub
+        .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "exit 0"]))
+        .await;
+    let ended_id = ended["id"].as_str().unwrap().to_owned();
+    wait_state(&hub, &ended_id, "exited").await;
+    let (status, body) = send_input(&hub, &ended_id, json!({"data": "x"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("restore").await;
+    let workspace_id = ws["id"].as_str().unwrap().to_owned();
+    let deeper = hub.repo.join("sub");
+    std::fs::create_dir_all(&deeper).unwrap();
+    let deeper = deeper.canonicalize().unwrap();
+    let shell = hub.create_session(&workspace_id, None).await;
+    let sid = shell["id"].as_str().unwrap().to_owned();
+    let command = hub
+        .create_session(
+            &workspace_id,
+            Some(vec!["/bin/sh", "-c", "echo ran; sleep 300"]),
+        )
+        .await;
+    let cid = command["id"].as_str().unwrap().to_owned();
+    let exited = hub
+        .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "exit 3"]))
+        .await;
+    let eid = exited["id"].as_str().unwrap().to_owned();
+    wait_state(&hub, &eid, "exited").await;
+    send_input(&hub, &sid, json!({"data": "cd sub", "enter": true})).await;
+    send_input(&hub, &sid, json!({"data": "pwd", "enter": true})).await;
+    let marker = deeper.display().to_string();
+    hub.wait_screen(&sid, |s| lines_of(s).contains(&marker))
+        .await;
+
+    let (dir, state_dir, repo) = hub.shutdown().await;
+    let raw = std::fs::read_to_string(state_dir.join("state.json")).unwrap();
+    assert!(raw.contains("\"clean\": true"), "{raw}");
+
+    // What `fw hub serve` does on start.
+    let mut options = HubOptions::new(state_dir.clone());
+    options.default_shell = vec!["/bin/sh".into()];
+    let reopened = Hub::open(options).unwrap();
+    let outcomes = reopened.restore_sessions();
+    assert_eq!(outcomes.len(), 2, "the exited session is not restored");
+    assert_eq!(outcomes[0].id, sid);
+    assert_eq!(outcomes[0].cwd, deeper, "where its shell had cd'd to");
+    assert_eq!(outcomes[1].id, cid);
+    assert_eq!(
+        outcomes[1].result.as_ref().unwrap(),
+        &flywheel_hub::restore::RestoreHow::Shell
+    );
+    let views = reopened.sessions(None);
+    let order: Vec<&str> = views.iter().map(|v| v.record.id.as_str()).collect();
+    assert_eq!(order, [sid.as_str(), cid.as_str(), eid.as_str()]);
+    assert!(views[0].record.state.is_running() && views[0].live.is_some());
+    assert_eq!(views[1].record.command, vec!["/bin/sh".to_owned()]);
+    assert!(!views[2].record.state.is_running());
+    // A second restore finds nothing left to do.
+    assert!(reopened.restore_sessions().is_empty());
+    reopened.shutdown(Duration::from_secs(4));
+    drop(reopened);
+
+    // A hub that died leaves its sessions recorded `running`: loaded back
+    // as stopped, but not restored.
+    let path = state_dir.join("state.json");
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for session in doc["sessions"].as_array_mut().unwrap() {
+        if session["state"] == "stopped" {
+            let session = session.as_object_mut().unwrap();
+            session.insert("state".into(), json!("running"));
+            session.remove("at");
+            session.remove("clean");
+            session.remove("last_cwd");
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut options = HubOptions::new(state_dir.clone());
+    options.default_shell = vec!["/bin/sh".into()];
+    let after_crash = Hub::open(options).unwrap();
+    assert!(after_crash.restore_sessions().is_empty());
+    let views = after_crash.sessions(None);
+    assert!(!views[0].record.state.is_restorable());
+    assert!(matches!(
+        views[0].record.state,
+        flywheel_hub::state::SessionState::Stopped { clean: false, .. }
+    ));
+    drop(after_crash);
+    drop((dir, repo));
+}

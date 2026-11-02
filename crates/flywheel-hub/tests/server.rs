@@ -503,6 +503,14 @@ async fn shell_session_over_websocket_replays_then_streams_live() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Nothing is left to kill: a no-op is a conflict, not 202.
+    let again = hub
+        .authed(reqwest::Method::POST, &format!("/api/sessions/{sid}/kill"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+
     // An exited session still replays its scrollback and the exit.
     let mut late = hub.connect(&sid, Some(&origin), true).await.unwrap();
     let (replay, _) = read_until(&mut late, "bin-5").await;
@@ -619,10 +627,8 @@ async fn shutdown_hangs_up_sessions_and_state_survives_restart() {
         .unwrap();
     let record = &list["sessions"][0];
     assert_eq!(record["id"], sid.as_str());
-    assert!(
-        record["state"] == "stopped" || record["state"] == "exited",
-        "{record}"
-    );
+    // Recorded as stopped by the hub, not as killed by its own hangup.
+    assert_eq!(record["state"], "stopped", "{record}");
     assert!(record["live"].is_null());
     let workspaces: Value = restarted
         .authed(reqwest::Method::GET, "/api/workspaces")
@@ -650,4 +656,142 @@ fn state_path(state_dir: &Path, name: &str) -> PathBuf {
 fn process_alive(pid: i32) -> bool {
     // SAFETY: kill(2) with signal 0 only probes for existence.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_close_completes_the_closing_handshake() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("close").await;
+    let session = hub
+        .create_session(
+            ws["id"].as_str().unwrap(),
+            Some(vec!["/bin/sh", "-c", "echo up; sleep 30"]),
+        )
+        .await;
+    let mut client = hub
+        .connect(session["id"].as_str().unwrap(), None, true)
+        .await
+        .unwrap();
+    read_until(&mut client, "up").await;
+    client.close(None).await.unwrap();
+    // The server answers with its own Close frame, then ends the stream.
+    let mut saw_close = false;
+    while let Some(frame) = timeout(Duration::from_secs(10), client.next())
+        .await
+        .expect("server answered the close")
+    {
+        match frame {
+            Ok(Message::Close(_)) => saw_close = true,
+            Ok(_) => {}
+            Err(e) => panic!("unclean close: {e}"),
+        }
+    }
+    assert!(saw_close, "server never replied with a Close frame");
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_workspace_frees_its_exited_sessions() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("ended").await;
+    let workspace_id = ws["id"].as_str().unwrap().to_owned();
+    let session = hub
+        .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "echo bye"]))
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let view: Value = hub
+            .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if view["state"] == "exited" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never exited: {view}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The exited terminal is still attachable before the delete...
+    drop(hub.connect(&sid, None, true).await.unwrap());
+    let deleted = hub
+        .authed(
+            reqwest::Method::DELETE,
+            &format!("/api/workspaces/{workspace_id}"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    // ...and gone with it afterwards, not pinned in the live map.
+    assert_eq!(hub.connect(&sid, None, true).await.unwrap_err(), 404);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_errors_are_json_and_edge_inputs_are_handled() {
+    let hub = TestHub::start().await;
+    let other = hub.repo.parent().unwrap().join("repo2");
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let created: Value = hub
+        .authed(reqwest::Method::POST, "/api/workspaces")
+        .json(&json!({ "name": "two", "repos": [hub.repo, other] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let workspace_id = created["id"].as_str().unwrap().to_owned();
+
+    // Body rejections answer in the same {"error": ...} JSON as the rest.
+    for (body, status) in [
+        ("garbage", StatusCode::BAD_REQUEST),
+        (
+            r#"{"workspace_id":"x","cols":100000}"#,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = hub
+            .authed(reqwest::Method::POST, "/api/sessions")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let error: Value = response.json().await.expect("JSON error body");
+        assert!(error["error"].as_str().is_some_and(|e| !e.is_empty()));
+    }
+
+    // A zero size means "default", not a 1x1 terminal.
+    let zero: Value = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": workspace_id, "cols": 0, "rows": 0,
+                       "command": ["/bin/sh", "-c", "sleep 30"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(zero["live"]["cols"], 120);
+    assert_eq!(zero["live"]["rows"], 32);
+
+    // The running session's repo cannot be dropped from the workspace.
+    let patch = |repos: Value| {
+        let request = hub
+            .authed(
+                reqwest::Method::PATCH,
+                &format!("/api/workspaces/{workspace_id}"),
+            )
+            .json(&json!({ "repos": repos }));
+        async move { request.send().await.unwrap().status() }
+    };
+    assert_eq!(patch(json!([other])).await, StatusCode::CONFLICT);
+    assert_eq!(patch(json!([hub.repo])).await, StatusCode::OK);
+    hub.shutdown().await;
 }

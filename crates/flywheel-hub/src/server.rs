@@ -16,17 +16,19 @@ use crate::auth::{
     self, COOKIE_NAME, bearer_value, cookie_value, login_cookie, logout_cookie, origin_allowed,
 };
 use crate::hub::{CreateSession, Hub, HubError};
-use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent};
+use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
 use crate::state::{StateError, WorkspaceInput};
 use crate::web;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Form, Path, Query, Request, State};
+use axum::extract::{Form, FromRequest, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::SinkExt;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::future::Future;
 use std::sync::Arc;
@@ -306,6 +308,25 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+/// `Json` whose rejections (bad syntax, wrong shape, missing content type)
+/// answer in the API's `{"error": ...}` form like every other error.
+struct ApiJson<T>(T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Response> {
+        match Json::<T>::from_request(request, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(error_response(rejection.status(), &rejection.body_text())),
+        }
+    }
+}
+
 /// Run a blocking hub call (state-file writes, PTY spawns) off the async
 /// workers.
 async fn blocking<T: Send + 'static>(
@@ -331,7 +352,7 @@ async fn get_workspace(State(app): State<AppState>, Path(id): Path<String>) -> A
 
 async fn create_workspace(
     State(app): State<AppState>,
-    Json(input): Json<WorkspaceInput>,
+    ApiJson(input): ApiJson<WorkspaceInput>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
     let workspace = blocking(move || hub.create_workspace(input)).await?;
@@ -341,7 +362,7 @@ async fn create_workspace(
 async fn update_workspace(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    Json(input): Json<WorkspaceInput>,
+    ApiJson(input): ApiJson<WorkspaceInput>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
     let workspace = blocking(move || hub.update_workspace(&id, input)).await?;
@@ -377,7 +398,7 @@ async fn get_session(State(app): State<AppState>, Path(id): Path<String>) -> Api
 
 async fn create_session(
     State(app): State<AppState>,
-    Json(request): Json<CreateSession>,
+    ApiJson(request): ApiJson<CreateSession>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
     let view = blocking(move || hub.create_session(request)).await?;
@@ -385,7 +406,8 @@ async fn create_session(
 }
 
 async fn kill_session(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
-    app.hub.kill_session(&id)?;
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.kill_session(&id)).await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -451,6 +473,24 @@ async fn send_attachment(socket: &mut WebSocket, attachment: &Attachment) -> boo
     true
 }
 
+/// Queue client input; tell the client when it was dropped because the
+/// terminal is not reading. Returns false when the socket is gone.
+async fn forward_input(socket: &mut WebSocket, session: &PtySession, bytes: Vec<u8>) -> bool {
+    match session.write(bytes) {
+        WriteOutcome::Queued | WriteOutcome::Closed => true,
+        WriteOutcome::Backlogged => {
+            let error = json!({
+                "type": "error",
+                "message": "input dropped: the terminal is not reading its input",
+            });
+            socket
+                .send(Message::Text(error.to_string().into()))
+                .await
+                .is_ok()
+        }
+    }
+}
+
 async fn pump(
     mut socket: WebSocket,
     session: Arc<PtySession>,
@@ -485,7 +525,9 @@ async fn pump(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
                             Ok(ClientMessage::Input { data }) => {
-                                session.write(data.into_bytes());
+                                if !forward_input(&mut socket, &session, data.into_bytes()).await {
+                                    break;
+                                }
                             }
                             Ok(ClientMessage::Resize { cols, rows }) => {
                                 let _ = session.resize(cols, rows);
@@ -499,10 +541,20 @@ async fn pump(
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        session.write(bytes.to_vec());
+                        if !forward_input(&mut socket, &session, bytes.to_vec()).await {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    Some(Ok(Message::Close(_))) => {
+                        // Complete the closing handshake: tungstenite queued
+                        // the reply Close on receipt but only writes it on a
+                        // flush (a send would be refused after closing), so
+                        // the client sees a clean close instead of 1006.
+                        let _ = socket.flush().await;
+                        break;
+                    }
+                    Some(Err(_)) | None => break,
                 }
             }
             _ = ping.tick() => {

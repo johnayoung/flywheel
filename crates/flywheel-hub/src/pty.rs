@@ -14,8 +14,14 @@
 //!   then records the exit status and broadcasts [`SessionEvent::Exit`].
 //!
 //! The child is a session leader (portable-pty `setsid`s it), so its process
-//! group id is its pid: [`PtySession::kill`] signals the whole group (SIGHUP,
-//! then SIGKILL after a grace period).
+//! group id and session id are its pid. [`PtySession::kill`] signals the
+//! leader's group and every other process still in its session -- background
+//! jobs a shell put in their own groups, and processes that outlived the
+//! leader -- with SIGHUP, then SIGKILL after a grace period.
+//!
+//! [`PtySession::release`] stops the reader and writer threads even while
+//! some escaped process (one that `setsid`ed away but kept the terminal open)
+//! still holds the PTY, so a removed session's fds and threads are freed.
 
 use crate::scrollback::Scrollback;
 use axum::body::Bytes;
@@ -23,10 +29,11 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// Live-output broadcast depth (chunks). A subscriber that falls further
@@ -36,6 +43,13 @@ const BROADCAST_DEPTH: usize = 1024;
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
 /// Terminal size bounds accepted from clients.
 pub const MAX_DIMENSION: u16 = 1000;
+/// Input bytes queued for a child that is not reading its stdin before
+/// further input is refused.
+pub const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+/// How often the reader and writer threads re-check [`PtySession::release`].
+const RELEASE_POLL: Duration = Duration::from_millis(200);
+/// Largest single write to the PTY after it reports writable.
+const WRITE_SLICE: usize = 512;
 
 /// How a session's child process ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +108,18 @@ pub enum SpawnError {
     Spawn { program: String, reason: String },
 }
 
+/// What happened to input handed to [`PtySession::write`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// Queued for the child's stdin.
+    Queued,
+    /// The session has exited (or was released); the input was discarded.
+    Closed,
+    /// The child has [`INPUT_QUEUE_LIMIT`] bytes of unread input queued;
+    /// this input was discarded.
+    Backlogged,
+}
+
 /// A point-in-time attach: everything retained so far plus a live receiver
 /// positioned exactly after it.
 pub struct Attachment {
@@ -105,7 +131,15 @@ pub struct Attachment {
 struct Shared {
     scrollback: Scrollback,
     exit: Option<ExitInfo>,
+    /// The leader has been reaped (its pid may be recycled from here on).
+    reaped: bool,
     size: PtySize,
+}
+
+/// State shared with the writer thread.
+struct InputQueue {
+    queued: AtomicUsize,
+    released: AtomicBool,
 }
 
 /// A running (or exited) PTY session.
@@ -114,6 +148,7 @@ pub struct PtySession {
     exited: Condvar,
     events: broadcast::Sender<SessionEvent>,
     input: std_mpsc::Sender<Vec<u8>>,
+    queue: Arc<InputQueue>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     pid: Option<u32>,
 }
@@ -182,17 +217,27 @@ impl PtySession {
             .take_writer()
             .map_err(|e| spawn_err(e.to_string()))?;
         let pid = child.process_id();
+        let fd = pair
+            .master
+            .as_raw_fd()
+            .ok_or_else(|| spawn_err("the pty master has no file descriptor".into()))?;
         let (events, _) = broadcast::channel(BROADCAST_DEPTH);
         let (input, input_rx) = std_mpsc::channel::<Vec<u8>>();
+        let queue = Arc::new(InputQueue {
+            queued: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
+        });
         let session = Arc::new(Self {
             shared: Mutex::new(Shared {
                 scrollback: Scrollback::new(spec.scrollback_bytes),
                 exit: None,
+                reaped: false,
                 size,
             }),
             exited: Condvar::new(),
             events,
             input,
+            queue: Arc::clone(&queue),
             master: Mutex::new(pair.master),
             pid,
         });
@@ -202,14 +247,14 @@ impl PtySession {
         thread::Builder::new()
             .name("hub-pty-reader".into())
             .spawn(move || {
-                reader_session.read_loop(reader);
+                reader_session.read_loop(fd, reader);
                 let _ = drained_tx.send(());
             })
             .map_err(|e| spawn_err(e.to_string()))?;
 
         thread::Builder::new()
             .name("hub-pty-writer".into())
-            .spawn(move || write_loop(writer, input_rx))
+            .spawn(move || write_loop(fd, writer, &input_rx, &queue))
             .map_err(|e| spawn_err(e.to_string()))?;
 
         let waiter_session = Arc::clone(&session);
@@ -223,6 +268,7 @@ impl PtySession {
                         signal: None,
                     },
                 };
+                waiter_session.lock().reaped = true;
                 // Let the reader flush the child's final output first so
                 // the exit event is ordered after it.
                 let _ = drained_rx.recv_timeout(DRAIN_AFTER_EXIT);
@@ -234,9 +280,12 @@ impl PtySession {
         Ok(session)
     }
 
-    fn read_loop(&self, mut reader: Box<dyn Read + Send>) {
+    /// Drain the master until EOF or [`PtySession::release`]. `fd` is the
+    /// master (kept open by `self`); `reader` is a dup of it, so readiness on
+    /// one is readiness on the other.
+    fn read_loop(&self, fd: libc::c_int, mut reader: Box<dyn Read + Send>) {
         let mut buf = vec![0u8; 64 * 1024];
-        loop {
+        while wait_ready(fd, libc::POLLIN, &self.queue.released) {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -274,16 +323,38 @@ impl PtySession {
         }
     }
 
-    /// Queue `bytes` for the child's stdin. Returns false once the session
-    /// has exited (input is discarded).
-    pub fn write(&self, bytes: Vec<u8>) -> bool {
+    /// Queue `bytes` for the child's stdin, refusing (and discarding) input
+    /// once the session has exited or while [`INPUT_QUEUE_LIMIT`] bytes the
+    /// child has not read are already queued.
+    pub fn write(&self, bytes: Vec<u8>) -> WriteOutcome {
         if bytes.is_empty() {
-            return true;
+            return WriteOutcome::Queued;
         }
-        if self.lock().exit.is_some() {
-            return false;
+        if self.lock().exit.is_some() || self.queue.released.load(Ordering::Acquire) {
+            return WriteOutcome::Closed;
         }
-        self.input.send(bytes).is_ok()
+        let len = bytes.len();
+        let reserved =
+            self.queue
+                .queued
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    // A single message larger than the limit is still accepted
+                    // into an empty queue (a big paste), never on top of one.
+                    (queued == 0 || queued + len <= INPUT_QUEUE_LIMIT).then_some(queued + len)
+                });
+        if reserved.is_err() {
+            return WriteOutcome::Backlogged;
+        }
+        if self.input.send(bytes).is_err() {
+            self.queue.queued.fetch_sub(len, Ordering::AcqRel);
+            return WriteOutcome::Closed;
+        }
+        WriteOutcome::Queued
+    }
+
+    /// Input bytes queued but not yet written to the PTY.
+    pub fn queued_input(&self) -> usize {
+        self.queue.queued.load(Ordering::Acquire)
     }
 
     /// Resize the terminal (clamped to `1..=MAX_DIMENSION`). The kernel
@@ -330,44 +401,100 @@ impl PtySession {
         self.lock().scrollback.len()
     }
 
-    /// Hang up the session's process group, escalating to SIGKILL if it is
-    /// still alive after `grace`. Returns immediately; the escalation runs on
-    /// a background thread.
+    /// Hang up the session -- the leader's process group and every process
+    /// still in its session, whether or not the leader has exited --
+    /// escalating to SIGKILL for anything still alive after `grace`. Returns
+    /// immediately; the escalation runs on a background thread.
     pub fn kill(self: &Arc<Self>, grace: Duration) {
-        if !self.signal_group(libc::SIGHUP) {
+        if !self.signal_session(libc::SIGHUP) {
             return;
         }
         let session = Arc::clone(self);
         let _ = thread::Builder::new()
             .name("hub-pty-kill".into())
             .spawn(move || {
-                if !session.wait_exit(grace) {
-                    session.signal_group(libc::SIGKILL);
+                if !session.wait_quiet(grace) {
+                    session.signal_session(libc::SIGKILL);
                 }
             });
     }
 
-    /// Signal the process group if the child has not been reaped yet (the
-    /// pid cannot have been recycled while unreaped). Returns whether a
-    /// signal was sent.
-    fn signal_group(&self, signal: libc::c_int) -> bool {
-        let shared = self.lock();
-        if shared.exit.is_some() {
-            return false;
-        }
+    /// Stop the reader and writer threads and refuse further input. The
+    /// threads notice within [`RELEASE_POLL`]; once they and every other
+    /// holder drop their `Arc`, the PTY master is closed. Use after
+    /// [`PtySession::kill`] when the session is being forgotten.
+    pub fn release(&self) {
+        self.queue.released.store(true, Ordering::Release);
+    }
+
+    /// Whether [`PtySession::release`] has been called.
+    pub fn is_released(&self) -> bool {
+        self.queue.released.load(Ordering::Acquire)
+    }
+
+    /// Every process still in this session, other than an already-reaped
+    /// leader. Empty off Linux (only the leader's group is reachable there).
+    pub fn session_processes(&self) -> Vec<u32> {
+        let Some(sid) = self.pid else {
+            return Vec::new();
+        };
+        let reaped = self.lock().reaped;
+        session_members(sid)
+            .into_iter()
+            .filter(|&p| !(reaped && p == sid))
+            .collect()
+    }
+
+    /// Send `signal` to the leader's process group (while the leader is
+    /// unreaped, so its pid cannot have been recycled) and to every other
+    /// process in its session. Returns whether anything was signalled.
+    fn signal_session(&self, signal: libc::c_int) -> bool {
         let Some(pid) = self.pid.and_then(|p| libc::pid_t::try_from(p).ok()) else {
             return false;
         };
-        // SAFETY: kill(2) has no memory-safety preconditions. A negative pid
-        // addresses the process group the session leader created.
-        let rc = unsafe { libc::kill(-pid, signal) };
-        if rc != 0 {
-            // The group may already be gone; fall back to the leader alone.
-            // SAFETY: as above.
-            unsafe { libc::kill(pid, signal) };
+        let mut sent = false;
+        {
+            let shared = self.lock();
+            if !shared.reaped {
+                // SAFETY: kill(2) has no memory-safety preconditions. A
+                // negative pid addresses the group the session leader made.
+                let rc = unsafe { libc::kill(-pid, signal) };
+                if rc != 0 {
+                    // The group may already be gone; fall back to the leader.
+                    // SAFETY: as above.
+                    unsafe { libc::kill(pid, signal) };
+                }
+                sent = true;
+            }
         }
-        drop(shared);
-        true
+        for member in self.session_processes() {
+            let Ok(member) = libc::pid_t::try_from(member) else {
+                continue;
+            };
+            // SAFETY: as above; `member` was in this session when listed.
+            if unsafe { libc::kill(member, signal) } == 0 {
+                sent = true;
+            }
+        }
+        sent
+    }
+
+    /// Wait up to `timeout` for the leader to exit and the rest of the
+    /// session to go away; returns whether both happened.
+    fn wait_quiet(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        if !self.wait_exit(timeout) {
+            return false;
+        }
+        loop {
+            if self.session_processes().is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Block until the child has exited or `timeout` elapses; returns whether
@@ -382,16 +509,104 @@ impl PtySession {
     }
 }
 
-fn write_loop(mut writer: Box<dyn Write + Send>, input: std_mpsc::Receiver<Vec<u8>>) {
-    while let Ok(bytes) = input.recv() {
-        if writer
-            .write_all(&bytes)
-            .and_then(|()| writer.flush())
-            .is_err()
-        {
-            break;
+/// Block until `fd` reports `events` (or an error/hangup, which the next
+/// read or write surfaces), checking `released` every [`RELEASE_POLL`].
+/// Returns false once released.
+fn wait_ready(fd: libc::c_int, events: libc::c_short, released: &AtomicBool) -> bool {
+    let timeout = libc::c_int::try_from(RELEASE_POLL.as_millis()).unwrap_or(200);
+    loop {
+        if released.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid pollfd for the duration of the call and
+        // nfds is 1. `fd` stays open: the session owning it outlives us.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout) };
+        if rc > 0 {
+            return true;
+        }
+        if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            // poll itself failed: let the read/write report the error.
+            return true;
         }
     }
+}
+
+/// Drain the input queue into the PTY. Writes go out in small slices, each
+/// after the PTY reports writable, so a child that stops reading parks this
+/// thread in `poll` (where it can see `release`) rather than in `write`.
+fn write_loop(
+    fd: libc::c_int,
+    mut writer: Box<dyn Write + Send>,
+    input: &std_mpsc::Receiver<Vec<u8>>,
+    queue: &InputQueue,
+) {
+    loop {
+        if queue.released.load(Ordering::Acquire) {
+            return;
+        }
+        let bytes = match input.recv_timeout(RELEASE_POLL) {
+            Ok(bytes) => bytes,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let len = bytes.len();
+        let mut ok = true;
+        for slice in bytes.chunks(WRITE_SLICE) {
+            if !wait_ready(fd, libc::POLLOUT, &queue.released)
+                || writer
+                    .write_all(slice)
+                    .and_then(|()| writer.flush())
+                    .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        queue.queued.fetch_sub(len, Ordering::AcqRel);
+        if !ok {
+            return;
+        }
+    }
+}
+
+/// Live (non-zombie) pids whose session id is `sid` (Linux: from
+/// `/proc/<pid>/stat`).
+#[cfg(target_os = "linux")]
+fn session_members(sid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat_session(&stat))
+                .is_some_and(|(state, session)| session == sid && state != 'Z' && state != 'X')
+        })
+        .collect()
+}
+
+/// The state and session id fields of a `/proc/<pid>/stat` line. The
+/// command name (field 2) is parenthesised and may contain spaces or parens,
+/// so fields are counted from the last `)`: state, ppid, pgrp, session.
+#[cfg(target_os = "linux")]
+fn stat_session(stat: &str) -> Option<(char, u32)> {
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let session = fields.nth(2)?.parse().ok()?;
+    Some((state, session))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn session_members(_sid: u32) -> Vec<u32> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -438,7 +653,7 @@ mod tests {
         let att = session.attach();
         assert!(String::from_utf8_lossy(&att.replay).contains("out-marker-value"));
         assert!(att.exit.is_some());
-        assert!(!session.write(b"ignored".to_vec()));
+        assert_eq!(session.write(b"ignored".to_vec()), WriteOutcome::Closed);
     }
 
     #[test]
@@ -448,7 +663,7 @@ mod tests {
         let mut first = session.attach();
         let mut second = session.attach();
         assert_eq!(session.subscriber_count(), 2);
-        assert!(session.write(b"ping\r".to_vec()));
+        assert_eq!(session.write(b"ping\r".to_vec()), WriteOutcome::Queued);
         assert!(read_until(&mut first, "got:ping", Duration::from_secs(10)).contains("got:ping"));
         assert!(read_until(&mut second, "got:ping", Duration::from_secs(10)).contains("got:ping"));
         // A late attach replays what both live subscribers saw.
@@ -502,5 +717,114 @@ mod tests {
             PtySession::spawn(missing, |_| {}),
             Err(SpawnError::Spawn { .. })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        done()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn marked_pid(text: &str, marker: &str) -> u32 {
+        let start = text.find(marker).expect("marker") + marker.len();
+        text[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("pid")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pid_alive(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat_session(&stat))
+            .is_some_and(|(state, _)| state != 'Z' && state != 'X')
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_after_the_leader_exits_reaches_its_background_jobs_and_frees_the_session() {
+        // Job control puts the background job in its own process group, so
+        // only a session-wide kill reaches it once the leader is gone.
+        let session =
+            PtySession::spawn(spec("set -m; sleep 300 & echo bg=$!; exit 0"), |_| {}).unwrap();
+        let mut att = session.attach();
+        let seen = read_until(&mut att, "bg=", Duration::from_secs(10));
+        assert!(session.wait_exit(Duration::from_secs(10)));
+        let seen = seen + &read_until(&mut att, "\n", Duration::from_secs(2));
+        let bg = marked_pid(&seen, "bg=");
+        assert!(pid_alive(bg), "background job should outlive the shell");
+        assert_eq!(session.session_processes(), vec![bg]);
+        drop(att);
+        session.kill(Duration::from_millis(300));
+        assert!(
+            wait_for(Duration::from_secs(10), || !pid_alive(bg)),
+            "kill must reach the background job"
+        );
+        // With the slave closed the reader hits EOF; every thread lets go.
+        assert!(
+            wait_for(Duration::from_secs(10), || Arc::strong_count(&session) == 1),
+            "threads still hold the session"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn release_frees_a_session_whose_terminal_an_escaped_process_holds() {
+        let session = PtySession::spawn(
+            spec("setsid sh -c 'echo esc=$$; exec sleep 300' & sleep 1; exit 0"),
+            |_| {},
+        )
+        .unwrap();
+        let mut att = session.attach();
+        let seen = read_until(&mut att, "esc=", Duration::from_secs(10));
+        let seen = seen + &read_until(&mut att, "\n", Duration::from_secs(2));
+        let escaped = marked_pid(&seen, "esc=");
+        drop(att);
+        assert!(session.wait_exit(Duration::from_secs(10)));
+        // The escaped process left the session: kill cannot reach it, and
+        // it keeps the slave open, so the reader would block forever.
+        session.kill(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(500));
+        assert!(Arc::strong_count(&session) > 1);
+        session.release();
+        assert_eq!(session.write(b"x".to_vec()), WriteOutcome::Closed);
+        let freed = wait_for(Duration::from_secs(5), || Arc::strong_count(&session) == 1);
+        // SAFETY: test cleanup of the process this test started.
+        unsafe { libc::kill(libc::pid_t::try_from(escaped).unwrap(), libc::SIGKILL) };
+        assert!(freed, "release must stop the reader and writer threads");
+    }
+
+    #[test]
+    fn input_queue_is_bounded_while_the_child_is_not_reading() {
+        let session = PtySession::spawn(spec("echo ready; sleep 300"), |_| {}).unwrap();
+        let mut att = session.attach();
+        assert!(read_until(&mut att, "ready", Duration::from_secs(10)).contains("ready"));
+        let chunk = vec![b'a'; 1024 * 1024];
+        let mut outcomes = Vec::new();
+        for _ in 0..16 {
+            outcomes.push(session.write(chunk.clone()));
+        }
+        assert!(outcomes.contains(&WriteOutcome::Backlogged), "{outcomes:?}");
+        assert!(session.queued_input() <= INPUT_QUEUE_LIMIT + chunk.len());
+        session.kill(Duration::from_millis(200));
+        assert!(session.wait_exit(Duration::from_secs(10)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stat_session_reads_past_a_parenthesised_command_name() {
+        let stat = "4242 (we(ird) name) S 1 4240 4241 34816 4240 4194560";
+        assert_eq!(stat_session(stat), Some(('S', 4241)));
+        assert_eq!(stat_session("garbage"), None);
     }
 }

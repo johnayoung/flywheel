@@ -207,6 +207,18 @@ impl HubStore {
             self.ensure_unique_name(name, Some(id))?;
         }
         let repos = input.repos.as_deref().map(validate_repos).transpose()?;
+        if let Some(repos) = &repos
+            && let Some(stranded) =
+                self.doc.sessions.iter().find(|s| {
+                    s.workspace_id == id && s.state.is_running() && !repos.contains(&s.cwd)
+                })
+        {
+            return Err(StateError::Conflict(format!(
+                "session {:?} is running in {}, which the new repo list drops; kill it first",
+                stranded.name,
+                stranded.cwd.display()
+            )));
+        }
         let previous = self.doc.workspaces[index].clone();
         let workspace = &mut self.doc.workspaces[index];
         if let Some(name) = name {
@@ -220,9 +232,9 @@ impl HubStore {
         Ok(updated)
     }
 
-    /// Delete a workspace and its (non-running) session records. Refused
-    /// while any of its sessions is running.
-    pub fn delete_workspace(&mut self, id: &str) -> Result<(), StateError> {
+    /// Delete a workspace and its (non-running) session records, returning
+    /// the removed session ids. Refused while any of its sessions is running.
+    pub fn delete_workspace(&mut self, id: &str) -> Result<Vec<String>, StateError> {
         let index = self.workspace_index(id)?;
         if self
             .doc
@@ -236,8 +248,16 @@ impl HubStore {
         }
         let previous = self.doc.clone();
         self.doc.workspaces.remove(index);
+        let removed = self
+            .doc
+            .sessions
+            .iter()
+            .filter(|s| s.workspace_id == id)
+            .map(|s| s.id.clone())
+            .collect();
         self.doc.sessions.retain(|s| s.workspace_id != id);
-        self.save_or_rollback(|doc| *doc = previous)
+        self.save_or_rollback(|doc| *doc = previous)?;
+        Ok(removed)
     }
 
     /// Record a newly spawned session.
@@ -249,10 +269,16 @@ impl HubStore {
         })
     }
 
-    /// Record a session's exit.
+    /// Record a running session's exit. A session already recorded stopped
+    /// (the hub hung it up on shutdown) keeps that state.
     pub fn mark_exited(&mut self, id: &str, exit: ExitInfo) -> Result<(), StateError> {
-        let Some(session) = self.doc.sessions.iter_mut().find(|s| s.id == id) else {
-            // Removed while it was shutting down: nothing to record.
+        let Some(session) = self
+            .doc
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id && s.state.is_running())
+        else {
+            // Removed, or stopped by shutdown: nothing to record.
             return Ok(());
         };
         session.state = SessionState::Exited {
@@ -517,6 +543,62 @@ mod tests {
         let mut store = reopened;
         store.delete_workspace(&ws.id).unwrap();
         assert!(store.sessions().is_empty());
+    }
+
+    #[test]
+    fn repo_changes_may_not_strand_a_running_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = git_repo(dir.path(), "a").canonicalize().unwrap();
+        let b = git_repo(dir.path(), "b").canonicalize().unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![a.clone(), b.clone()]))
+            .unwrap();
+        store.insert_session(running_session(&ws.id, &a)).unwrap();
+        let repos = |r: Vec<PathBuf>| WorkspaceInput {
+            name: None,
+            repos: Some(r),
+        };
+        assert!(matches!(
+            store.update_workspace(&ws.id, repos(vec![b.clone()])),
+            Err(StateError::Conflict(_))
+        ));
+        assert_eq!(store.workspace(&ws.id).unwrap().repos.len(), 2);
+        // Dropping a repo no running session uses is fine.
+        let updated = store
+            .update_workspace(&ws.id, repos(vec![a.clone()]))
+            .unwrap();
+        assert_eq!(updated.repos, vec![a]);
+    }
+
+    #[test]
+    fn a_session_stopped_by_shutdown_stays_stopped_when_its_exit_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let session = running_session(&ws.id, &repo);
+        store.insert_session(session.clone()).unwrap();
+        store.mark_all_stopped().unwrap();
+        store
+            .mark_exited(
+                &session.id,
+                ExitInfo {
+                    code: None,
+                    signal: Some("Hangup".into()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            HubStore::open(dir.path())
+                .unwrap()
+                .session(&session.id)
+                .unwrap()
+                .state,
+            SessionState::Stopped { .. }
+        ));
     }
 
     #[test]

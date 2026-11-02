@@ -166,8 +166,20 @@ impl Hub {
         Ok(self.store().update_workspace(id, input)?)
     }
 
+    /// Delete a workspace (refused while any of its sessions runs) and
+    /// forget its sessions, freeing the PTYs of the exited ones.
     pub fn delete_workspace(&self, id: &str) -> Result<(), HubError> {
-        Ok(self.store().delete_workspace(id)?)
+        let mut store = self.store();
+        let removed = store.delete_workspace(id)?;
+        let freed: Vec<Arc<PtySession>> = {
+            let mut live = self.live();
+            removed.iter().filter_map(|sid| live.remove(sid)).collect()
+        };
+        drop(store);
+        for session in freed {
+            forget(&session);
+        }
+        Ok(())
     }
 
     // --- sessions -----------------------------------------------------------
@@ -268,8 +280,8 @@ impl Hub {
                     ("FLYWHEEL_HUB_SESSION".into(), id.clone()),
                     ("FLYWHEEL_HUB_WORKSPACE".into(), workspace.id.clone()),
                 ],
-                cols: request.cols.unwrap_or(DEFAULT_COLS),
-                rows: request.rows.unwrap_or(DEFAULT_ROWS),
+                cols: request.cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
+                rows: request.rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
                 scrollback_bytes: self.options.scrollback_bytes,
             },
             move |exit| {
@@ -281,6 +293,7 @@ impl Hub {
         if let Err(e) = store.insert_session(record.clone()) {
             drop(store);
             session.kill(Duration::ZERO);
+            session.release();
             return Err(e.into());
         }
         self.live().insert(id, session);
@@ -309,13 +322,22 @@ impl Hub {
         let _ = self.store().mark_exited(id, exit);
     }
 
-    /// Hang up a running session (SIGHUP, SIGKILL after [`KILL_GRACE`]).
-    /// The record stays (as exited) until [`Hub::remove_session`].
+    /// Hang up a session's processes (SIGHUP, SIGKILL after
+    /// [`KILL_GRACE`]): the leader if it runs, plus anything it left behind
+    /// in its session. The record stays (as exited) until
+    /// [`Hub::remove_session`]. A conflict when there is nothing to kill.
     pub fn kill_session(&self, id: &str) -> Result<(), HubError> {
         self.store().session(id)?;
-        if let Some(session) = self.live_session(id) {
-            session.kill(KILL_GRACE);
+        let Some(session) = self.live_session(id) else {
+            return Err(StateError::Conflict(format!(
+                "session {id} has no process on this server"
+            ))
+            .into());
+        };
+        if session.exit_info().is_some() && session.session_processes().is_empty() {
+            return Err(StateError::Conflict(format!("session {id} has already exited")).into());
         }
+        session.kill(KILL_GRACE);
         Ok(())
     }
 
@@ -326,15 +348,17 @@ impl Hub {
         let live = self.live().remove(id);
         drop(store);
         if let Some(session) = live {
-            session.kill(KILL_GRACE);
+            forget(&session);
         }
         Ok(())
     }
 
-    /// Kill every live session, wait up to `timeout` for them to exit, and
-    /// record anything still running as stopped.
+    /// Record every running session as stopped, then hang them all up, wait
+    /// up to `timeout` for them to exit, and release their PTYs. (Stopped is
+    /// recorded first: the hangup's own exit must not read as a crash.)
     pub fn shutdown(&self, timeout: Duration) {
-        let sessions: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
+        let _ = self.store().mark_all_stopped();
+        let sessions: Vec<Arc<PtySession>> = self.live().drain().map(|(_, s)| s).collect();
         let grace = timeout / 2;
         for session in &sessions {
             session.kill(grace);
@@ -344,6 +368,14 @@ impl Hub {
             let remaining = deadline.saturating_duration_since(Instant::now());
             session.wait_exit(remaining);
         }
-        let _ = self.store().mark_all_stopped();
+        for session in &sessions {
+            session.release();
+        }
     }
+}
+
+/// Hang up a session being forgotten and free its PTY threads.
+fn forget(session: &Arc<PtySession>) {
+    session.kill(KILL_GRACE);
+    session.release();
 }

@@ -77,7 +77,8 @@ pub fn main(args: &[String]) -> i32 {
 
 /// [`main`] against injected streams.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let argv = std::iter::once("hub".to_owned()).chain(args.iter().cloned());
+    // argv[0] becomes clap's bin name, so usage reads `fw hub ...`.
+    let argv = std::iter::once("fw hub".to_owned()).chain(args.iter().cloned());
     let cli = match HubCli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(e) => {
@@ -126,6 +127,26 @@ fn browse_host(addr: SocketAddr) -> String {
         IpAddr::V4(v4) => format!("{v4}:{}", addr.port()),
         IpAddr::V6(v6) => format!("[{v6}]:{}", addr.port()),
     }
+}
+
+/// This machine's address on its default route, for a URL another device
+/// can open when listening on an unspecified address. A UDP `connect` only
+/// selects a route; nothing is sent.
+fn route_address(unspecified: IpAddr) -> Option<IpAddr> {
+    let (bind, probe): (SocketAddr, SocketAddr) = match unspecified {
+        IpAddr::V4(_) => (
+            (Ipv4Addr::UNSPECIFIED, 0).into(),
+            (Ipv4Addr::new(192, 0, 2, 1), 9).into(),
+        ),
+        IpAddr::V6(_) => (
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+            (std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9).into(),
+        ),
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
 fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -177,6 +198,16 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let _ = writeln!(out, "flywheel hub listening on {base}");
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
     let _ = writeln!(out, "open: {}", login_url(&base, hub.token()));
+    if local.ip().is_unspecified()
+        && let Some(ip) = route_address(local.ip())
+    {
+        let remote = format!("http://{}", browse_host(SocketAddr::new(ip, local.port())));
+        let _ = writeln!(
+            out,
+            "from another device: {}",
+            login_url(&remote, hub.token())
+        );
+    }
     let _ = out.flush();
 
     let server_options = ServerOptions {
@@ -254,9 +285,19 @@ mod tests {
         assert_eq!(code, 2, "{err}");
         let (code, out, _) = run_args(&["--help"]);
         assert_eq!(code, 0);
+        assert!(out.contains("Usage: fw hub"), "{out}");
         assert!(out.contains("serve") && out.contains("token"));
         let (code, _, _) = run_args(&["serve", "--port", "notaport"]);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn route_address_is_never_loopback_or_unspecified() {
+        // Offline boxes may have no route; when there is one it is usable
+        // from another device.
+        if let Some(ip) = route_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) {
+            assert!(!ip.is_loopback() && !ip.is_unspecified() && ip.is_ipv4());
+        }
     }
 
     #[test]

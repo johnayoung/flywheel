@@ -19,6 +19,12 @@
     sessions: [],
     attached: null, // session id
     socket: null,
+    exited: false, // the attached session's process has ended
+    retry: 0, // reconnect attempts since the last successful attach
+    retryTimer: null,
+    repoChoice: {}, // workspace id -> repo picked for "+ shell"
+    wsErrors: {}, // workspace id -> last action error
+    snapshot: "", // last rendered data, to skip no-op re-renders
   };
 
   // --- API -------------------------------------------------------------
@@ -40,13 +46,21 @@
     return data;
   }
 
-  async function refresh() {
+  // `force` re-renders even when nothing changed. The periodic refresh
+  // passes false and also holds off while a sidebar control has focus, so
+  // an open dropdown or a half-made choice is never torn down under the user.
+  async function refresh(force = true) {
     const [ws, ss] = await Promise.all([
       api("GET", "/api/workspaces"),
       api("GET", "/api/sessions"),
     ]);
     state.workspaces = ws.workspaces;
     state.sessions = ss.sessions;
+    const snapshot = JSON.stringify([ws, ss]);
+    const busy = $("#sidebar").contains(document.activeElement) &&
+      document.activeElement.matches("select, input, textarea");
+    if (!force && (snapshot === state.snapshot || busy)) return;
+    state.snapshot = snapshot;
     render();
   }
 
@@ -82,23 +96,51 @@
   window.addEventListener("resize", refit);
   new ResizeObserver(refit).observe($("#terminal"));
 
-  function attach(id) {
+  function closeSocket() {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = null;
     if (state.socket) {
       state.socket.onclose = null;
-      state.socket.close();
+      state.socket.close(1000);
       state.socket = null;
     }
-    state.attached = id;
+  }
+
+  function detach(message) {
+    closeSocket();
+    state.attached = null;
     term.reset();
+    history.replaceState(null, "", window.location.pathname);
+    $("#empty").hidden = false;
+    $("#term-title").textContent = "No session attached";
+    $("#term-status").textContent = message || "";
+    render();
+  }
+
+  function attach(id) {
+    closeSocket();
+    state.attached = id;
+    state.exited = false;
+    state.retry = 0;
+    history.replaceState(null, "", `#session=${id}`);
     $("#empty").hidden = true;
     const session = state.sessions.find((s) => s.id === id);
     $("#term-title").textContent = session ? `${session.name}  ${session.cwd}` : id;
-    $("#term-status").textContent = "connecting";
+    connect(id);
+    render();
+  }
+
+  // Open (or re-open) the attached session's socket. Each connect replays
+  // the scrollback, so the terminal is reset first.
+  function connect(id) {
+    term.reset();
+    $("#term-status").textContent = state.retry ? `reconnecting (${state.retry})` : "connecting";
     const scheme = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${scheme}://${window.location.host}/api/sessions/${id}/ws`);
     socket.binaryType = "arraybuffer";
     state.socket = socket;
     socket.onopen = () => {
+      state.retry = 0;
       $("#term-status").textContent = "attached";
       fit.fit();
       send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
@@ -116,18 +158,38 @@
         const how = message.signal ? `signal ${message.signal}` : `code ${message.code}`;
         term.write(`\r\n\x1b[2m[process exited with ${how}]\x1b[0m\r\n`);
         $("#term-status").textContent = `exited (${how})`;
+        state.exited = true;
         refresh().catch(showError);
       } else if (message.type === "error") {
         $("#term-status").textContent = message.message;
       }
     };
-    socket.onclose = () => {
-      if (state.socket === socket) {
-        state.socket = null;
-        $("#term-status").textContent = "disconnected";
+    socket.onclose = (event) => {
+      if (state.socket !== socket) return;
+      state.socket = null;
+      // 1000 is the server's own goodbye (hub shutting down) or our close.
+      if (state.exited || state.attached !== id) {
+        if (!state.exited) $("#term-status").textContent = "disconnected";
+        return;
       }
+      state.retry += 1;
+      const delay = Math.min(10000, 500 * 2 ** Math.min(state.retry - 1, 5));
+      $("#term-status").textContent = `disconnected (code ${event.code}); retrying`;
+      state.retryTimer = setTimeout(async () => {
+        try {
+          await refresh();
+        } catch (_) {
+          // Hub unreachable: keep retrying the socket.
+        }
+        const session = state.sessions.find((s) => s.id === id);
+        if (state.attached !== id) return;
+        if (state.sessions.length && (!session || !session.live)) {
+          detach("that session's terminal is gone (removed, or the hub restarted)");
+          return;
+        }
+        connect(id);
+      }, delay);
     };
-    render();
   }
 
   // --- rendering -------------------------------------------------------
@@ -140,13 +202,38 @@
     return "stopped";
   }
 
+  function iconButton(label, title, danger) {
+    return el("button", {
+      type: "button",
+      className: `icon${danger ? " danger" : ""}`,
+      textContent: label,
+      title,
+      ariaLabel: title,
+    });
+  }
+
   function renderWorkspace(workspace) {
     const repoSelect = el("select", { title: "Repo for the new shell" });
     for (const repo of workspace.repos) {
       repoSelect.append(el("option", { value: repo, textContent: repo.split("/").pop() || repo }));
     }
+    const chosen = state.repoChoice[workspace.id];
+    if (chosen && workspace.repos.includes(chosen)) repoSelect.value = chosen;
+    repoSelect.addEventListener("change", () => {
+      state.repoChoice[workspace.id] = repoSelect.value;
+    });
+    const wsError = el("p", { className: "form-error", role: "alert", textContent: state.wsErrors[workspace.id] || "" });
+    const fail = (error) => {
+      state.wsErrors[workspace.id] = error.message;
+      wsError.textContent = error.message;
+    };
+    const clear = () => {
+      delete state.wsErrors[workspace.id];
+      wsError.textContent = "";
+    };
     const newShell = el("button", { type: "button", textContent: "+ shell" });
     newShell.addEventListener("click", async () => {
+      clear();
       try {
         const created = await api("POST", "/api/sessions", {
           workspace_id: workspace.id,
@@ -157,55 +244,69 @@
         await refresh();
         attach(created.id);
       } catch (error) {
-        showError(error);
+        fail(error);
       }
     });
-    const remove = el("button", { type: "button", className: "icon", textContent: "x", title: "Delete workspace" });
+    const remove = iconButton("\u00d7", "Delete workspace", true);
     remove.addEventListener("click", async () => {
       if (!window.confirm(`Delete workspace "${workspace.name}"?`)) return;
+      clear();
       try {
         await api("DELETE", `/api/workspaces/${workspace.id}`);
+        delete state.repoChoice[workspace.id];
         await refresh();
       } catch (error) {
-        showError(error);
+        fail(error);
       }
     });
 
     const sessions = el("ul", { className: "sessions" });
     for (const session of state.sessions.filter((s) => s.workspace_id === workspace.id)) {
-      const kill = el("button", {
-        type: "button",
-        className: "icon",
-        textContent: "x",
-        title: session.state === "running" ? "Kill and remove" : "Remove",
-      });
-      kill.addEventListener("click", async (event) => {
+      const running = session.state === "running";
+      const actions = el("span", { className: "session-actions" });
+      if (running) {
+        const stop = iconButton("\u25a0", "Stop (keep its scrollback)", false);
+        stop.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          clear();
+          try {
+            await api("POST", `/api/sessions/${session.id}/kill`);
+            await refresh();
+          } catch (error) {
+            fail(error);
+          }
+        });
+        actions.append(stop);
+      }
+      const forget = iconButton("\u00d7", running ? "Kill and remove" : "Remove", true);
+      forget.addEventListener("click", async (event) => {
         event.stopPropagation();
+        clear();
         try {
           await api("DELETE", `/api/sessions/${session.id}`);
-          if (state.attached === session.id) {
-            if (state.socket) state.socket.close();
-            state.attached = null;
-            term.reset();
-            $("#empty").hidden = false;
-            $("#term-title").textContent = "No session attached";
-            $("#term-status").textContent = "";
-          }
+          if (state.attached === session.id) detach();
           await refresh();
         } catch (error) {
-          showError(error);
+          fail(error);
         }
       });
+      actions.append(forget);
       const item = el(
         "li",
-        { className: `session${state.attached === session.id ? " active" : ""}` },
+        { className: `session${state.attached === session.id ? " active" : ""}${session.live ? "" : " gone"}` },
         el("span", { className: `dot ${session.state}` }),
         el("span", { className: "session-name", textContent: session.name }),
         el("span", { className: "session-state", textContent: stateLabel(session) }),
-        kill,
+        actions,
       );
-      if (session.live) item.addEventListener("click", () => attach(session.id));
-      else item.title = "This session ended before the hub restarted";
+      if (session.live) {
+        item.addEventListener("click", () => attach(session.id));
+      } else {
+        item.title = "This session ended before the hub restarted; its terminal is gone";
+        item.addEventListener("click", () => {
+          wsError.textContent = `"${session.name}" ended before the hub restarted; its terminal is gone. Remove it with \u00d7.`;
+        });
+      }
       sessions.append(item);
     }
 
@@ -215,6 +316,7 @@
       el("div", { className: "ws-head" }, el("span", { className: "ws-name", textContent: workspace.name }), remove),
       el("div", { className: "ws-repos" }, ...workspace.repos.map((r) => el("div", { textContent: r, title: r }))),
       el("div", { className: "ws-actions" }, repoSelect, newShell),
+      wsError,
       sessions,
     );
   }
@@ -223,6 +325,9 @@
     const root = $("#workspaces");
     root.replaceChildren(...state.workspaces.map(renderWorkspace));
     if (state.workspaces.length === 0) $("#new-workspace").open = true;
+    $("#empty").textContent = state.workspaces.length
+      ? "Pick a session, or open a shell with + shell."
+      : "Create a workspace, then open a shell in one of its repos.";
   }
 
   function showError(error) {
@@ -251,6 +356,15 @@
     window.location.replace("/");
   });
 
-  refresh().catch(showError);
-  setInterval(() => refresh().catch(() => {}), 5000);
+  // Re-attach the session named in the URL (survives reloads).
+  refresh()
+    .then(() => {
+      const match = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
+      if (!match) return;
+      const session = state.sessions.find((s) => s.id === match[1]);
+      if (session && session.live) attach(session.id);
+      else history.replaceState(null, "", window.location.pathname);
+    })
+    .catch(showError);
+  setInterval(() => refresh(false).catch(() => {}), 5000);
 })();

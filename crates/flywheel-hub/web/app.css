@@ -112,7 +112,15 @@ button.link:hover { color: var(--text); }
 
 button.icon { border: 0; background: none; color: var(--muted); padding: 0 .25rem; }
 
-button.icon:hover { color: var(--bad); }
+button.icon:hover { color: var(--text); }
+
+button.icon.danger:hover { color: var(--bad); }
+
+.session-actions { display: inline-flex; gap: .1rem; }
+
+.session.gone { opacity: .6; }
+
+.workspace > .form-error { padding: 0 1rem; }
 
 #new-workspace { border-top: 1px solid var(--line); padding: .6rem 1rem; }
 

@@ -3,14 +3,18 @@
 //! Every byte a session's PTY emits is appended here before it is broadcast
 //! to attached clients, so a client that attaches later (or reconnects after a
 //! drop) replays the most recent `capacity` bytes and then continues live.
-//! When the ring is full the oldest bytes are discarded; the trim point is
-//! advanced past any UTF-8 continuation bytes so a replay never starts in the
-//! middle of a multi-byte character.
+//! When the ring is full the oldest bytes are discarded and the trim point is
+//! advanced to the start of the next line (when one begins within
+//! [`LINE_SEEK`] bytes), so a replay starts on a line rather than mid-line or
+//! mid escape sequence; failing that, past any UTF-8 continuation bytes so it
+//! never starts inside a multi-byte character.
 
 use std::collections::VecDeque;
 
 /// Default per-session scrollback: 2 MiB of raw output.
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
+/// How far past a trim point to look for a line start.
+pub const LINE_SEEK: usize = 4096;
 
 /// The bounded output ring.
 #[derive(Debug, Clone)]
@@ -54,16 +58,35 @@ impl Scrollback {
     /// Append `bytes`, discarding the oldest data past the bound.
     pub fn push(&mut self, bytes: &[u8]) {
         self.total += bytes.len() as u64;
-        if bytes.len() >= self.capacity {
+        let discarded = if bytes.len() >= self.capacity {
+            let discarded = !self.buf.is_empty() || bytes.len() > self.capacity;
             self.buf.clear();
             let tail = &bytes[bytes.len() - self.capacity..];
             self.buf.extend(tail);
+            discarded
         } else {
             let overflow = (self.buf.len() + bytes.len()).saturating_sub(self.capacity);
             self.buf.drain(..overflow);
             self.buf.extend(bytes);
+            overflow > 0
+        };
+        if discarded {
+            self.trim_to_line();
         }
-        self.trim_partial_char();
+    }
+
+    /// After a discard: start at the next line if one begins soon (keeping
+    /// at least that line's worth of data), else on a character boundary.
+    fn trim_to_line(&mut self) {
+        let window = self.buf.len().min(LINE_SEEK);
+        let newline = self.buf.range(..window).position(|&b| b == b'\n');
+        match newline {
+            // Keep the newline-terminated tail only if something follows it.
+            Some(pos) if pos + 1 < self.buf.len() => {
+                self.buf.drain(..=pos);
+            }
+            _ => self.trim_partial_char(),
+        }
     }
 
     /// The retained bytes, oldest first.
@@ -103,6 +126,27 @@ mod tests {
 
     #[test]
     fn discards_oldest_bytes_past_the_bound() {
+        let mut ring = Scrollback::new(8);
+        ring.push(b"abcdef");
+        ring.push(b"ghij");
+        assert_eq!(ring.snapshot(), b"cdefghij");
+        assert_eq!(ring.total_written(), 10);
+    }
+
+    #[test]
+    fn a_trimmed_replay_starts_on_a_line() {
+        let mut ring = Scrollback::new(16);
+        ring.push(b"12345\r\n67890\r\n");
+        ring.push(b"abcde\r\n"); // cut lands inside "12345"
+        assert_eq!(ring.snapshot(), b"67890\r\nabcde\r\n");
+        // Untrimmed pushes keep partial lines as written.
+        let mut ring = Scrollback::new(64);
+        ring.push(b"partial");
+        assert_eq!(ring.snapshot(), b"partial");
+    }
+
+    #[test]
+    fn a_long_line_without_newlines_still_trims_by_bytes() {
         let mut ring = Scrollback::new(8);
         ring.push(b"abcdef");
         ring.push(b"ghij");

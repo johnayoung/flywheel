@@ -110,6 +110,15 @@ pub struct SessionRecord {
     pub fallback_command: Option<Vec<String>>,
 }
 
+impl SessionRecord {
+    /// Whether the session runs its agent CLI: an agent kind not restored
+    /// as a fallback shell (which has no hooks, status, or transcript of
+    /// its own).
+    pub fn runs_agent(&self) -> bool {
+        self.kind.is_agent() && self.fallback_command.is_none()
+    }
+}
+
 /// `restore_error` of a session found `running` on load: the hub died
 /// (killed, crashed, the machine went down) without its own shutdown.
 pub const UNCLEAN_STOP: &str = "the hub was not shut down cleanly (killed or crashed)";

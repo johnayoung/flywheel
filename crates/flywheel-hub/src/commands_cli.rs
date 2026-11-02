@@ -1,14 +1,9 @@
 //! `fw hub commands <session>`: the code blocks an agent session suggested,
 //! exactly as written, from the running hub.
 
-use crate::auth::Token;
-use crate::client;
-use crate::paths::default_state_dir;
+use crate::cli::{StateDirArg, resolve_state_dir};
+use crate::script::{HubConn, resolve};
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commonly the most a terminal accepts in one OSC 52 sequence (xterm's
 /// default); larger copies are attempted, with a warning.
@@ -16,7 +11,8 @@ const OSC52_COMFORT_BYTES: usize = 74_994;
 
 #[derive(Debug, clap::Args)]
 pub struct CommandsArgs {
-    /// The session: its id, a unique id prefix, or its exact name.
+    /// Session id, unique id prefix, or name (a shell session: its
+    /// workspace's agent session).
     session: String,
     /// Only the newest block, printed exactly (plus one newline).
     #[arg(long)]
@@ -36,10 +32,8 @@ pub struct CommandsArgs {
     /// How many blocks to list, newest first.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
     limit: u16,
-    /// State directory [default: $XDG_STATE_HOME/flywheel/hub or
-    /// ~/.local/state/flywheel/hub].
-    #[arg(long, value_name = "DIR")]
-    state_dir: Option<PathBuf>,
+    #[command(flatten)]
+    state: StateDirArg,
 }
 
 /// Run `fw hub commands`.
@@ -62,20 +56,6 @@ pub fn run(args: &CommandsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
     }
 }
 
-/// An authenticated GET against the running hub.
-fn get(addr: std::net::SocketAddr, token: &Token, path: &str) -> Result<serde_json::Value, String> {
-    let response = client::request(addr, "GET", path, token.expose(), None, CLIENT_TIMEOUT)
-        .map_err(|e| format!("cannot reach the running hub at {addr}: {e}"))?;
-    if response.status != 200 {
-        return Err(format!(
-            "the hub refused {path}: {} {}",
-            response.status,
-            response.error_message()
-        ));
-    }
-    serde_json::from_slice(&response.body).map_err(|e| format!("bad answer from the hub: {e}"))
-}
-
 /// The agent session to read for `wanted`: the session itself, or, for a
 /// shell session, the one agent session of its workspace (as the web UI's
 /// drawer does). Returns (id, name, note to print).
@@ -83,16 +63,14 @@ pub fn resolve_agent(
     sessions: &[serde_json::Value],
     wanted: &str,
 ) -> Result<(String, String, Option<String>), String> {
-    let (id, name) = resolve_session(sessions, wanted)?;
+    let session = resolve(sessions, wanted, "session")?;
     let field = |s: &serde_json::Value, k: &str| {
         s.get(k)
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_owned()
     };
-    let Some(session) = sessions.iter().find(|s| field(s, "id") == id) else {
-        return Ok((id, name, None));
-    };
+    let (id, name) = (field(session, "id"), field(session, "name"));
     if matches!(field(session, "kind").as_str(), "claude" | "codex") {
         return Ok((id, name, None));
     }
@@ -126,83 +104,13 @@ pub fn resolve_agent(
     }
 }
 
-/// The session matching `wanted` by id, unique id prefix, or exact name.
-pub fn resolve_session(
-    sessions: &[serde_json::Value],
-    wanted: &str,
-) -> Result<(String, String), String> {
-    let field = |s: &serde_json::Value, k: &str| {
-        s.get(k)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let pair = |s: &serde_json::Value| (field(s, "id"), field(s, "name"));
-    if let Some(exact) = sessions.iter().find(|s| field(s, "id") == wanted) {
-        return Ok(pair(exact));
-    }
-    let named: Vec<_> = sessions
-        .iter()
-        .filter(|s| field(s, "name") == wanted)
-        .collect();
-    let prefixed: Vec<_> = sessions
-        .iter()
-        .filter(|s| wanted.len() >= 4 && field(s, "id").starts_with(wanted))
-        .collect();
-    match (named.as_slice(), prefixed.as_slice()) {
-        ([one], _) | ([], [one]) => Ok(pair(one)),
-        ([], []) => Err(format!("no session {wanted:?} (an id, id prefix, or name)")),
-        (many, _) if many.len() > 1 => Err(format!(
-            "{} sessions are named {wanted:?}; use an id: {}",
-            many.len(),
-            many.iter()
-                .map(|s| field(s, "id"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        (_, many) => Err(format!(
-            "id prefix {wanted:?} matches {} sessions: {}",
-            many.len(),
-            many.iter()
-                .map(|s| field(s, "id"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
-}
-
-fn state_dir(arg: Option<&Path>) -> Result<PathBuf, String> {
-    match arg {
-        Some(dir) => Ok(dir.to_path_buf()),
-        None => default_state_dir()
-            .ok_or_else(|| "cannot resolve a state dir: set HOME or pass --state-dir".to_owned()),
-    }
-}
-
 /// The session's name and its commands, newest first.
 fn fetch(
     args: &CommandsArgs,
     err: &mut dyn Write,
 ) -> Result<(String, Vec<serde_json::Value>), String> {
-    let dir = state_dir(args.state_dir.as_deref())?;
-    let info = crate::remote::running_hub(&dir)
-        .map_err(|e| format!("runtime file in {}: {e}", dir.display()))?
-        .ok_or_else(|| {
-            format!(
-                "no hub is running for state dir {} (start one with `fw hub serve`)",
-                dir.display()
-            )
-        })?;
-    let token = Token::load(&dir)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-    let addr = info.connect_addr();
-    let sessions = get(addr, &token, "/api/sessions")?;
-    let sessions = sessions
-        .get("sessions")
-        .and_then(|s| s.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let conn = HubConn::connect(&resolve_state_dir(&args.state)?)?;
+    let sessions = conn.sessions()?;
     let (id, name, note) = resolve_agent(&sessions, &args.session)?;
     if let Some(note) = note {
         let _ = writeln!(err, "fw hub: {note}");
@@ -213,7 +121,7 @@ fn fetch(
         args.limit
     };
     let path = format!("/api/sessions/{id}/commands?limit={limit}&all={}", args.all);
-    let list = get(addr, &token, &path)?;
+    let list = conn.call("GET", &path, None)?;
     let commands = list
         .get("commands")
         .and_then(|c| c.as_array())
@@ -464,25 +372,5 @@ mod tests {
         );
         let err = resolve_agent(&sessions, "two").unwrap_err();
         assert!(err.contains("\"x1\"") && err.contains("\"x2\""), "{err}");
-    }
-
-    #[test]
-    fn sessions_resolve_by_id_prefix_or_name() {
-        let sessions = vec![
-            json!({"id": "aaaa1111", "name": "claude 1"}),
-            json!({"id": "aaaa2222", "name": "shell"}),
-            json!({"id": "bbbb3333", "name": "shell"}),
-        ];
-        let id = |w| resolve_session(&sessions, w).map(|(id, _)| id);
-        assert_eq!(id("aaaa2222").unwrap(), "aaaa2222");
-        assert_eq!(id("claude 1").unwrap(), "aaaa1111");
-        assert_eq!(id("bbbb").unwrap(), "bbbb3333");
-        assert!(id("aaaa").unwrap_err().contains("matches 2 sessions"));
-        assert!(id("shell").unwrap_err().contains("2 sessions are named"));
-        assert!(
-            id("bbb").unwrap_err().contains("no session"),
-            "short prefixes do not match"
-        );
-        assert!(id("zzzz").is_err());
     }
 }

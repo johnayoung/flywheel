@@ -278,37 +278,48 @@ pub fn codex_home(codex_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<Pa
         .map(|h| Path::new(h).join(".codex"))
 }
 
-/// How deep under `sessions/` Codex files rollouts (`YYYY/MM/DD/<file>`).
-const CODEX_ROLLOUT_DEPTH: usize = 4;
+/// Codex day directories searched for a rollout, newest first.
+pub const MAX_ROLLOUT_DAYS: usize = 400;
 
 /// The rollout (`sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`) of
-/// Codex conversation `thread_id`, if one exists.
+/// Codex conversation `thread_id`, if one exists: searched newest day
+/// first (a live conversation is found at once), at most
+/// [`MAX_ROLLOUT_DAYS`] days back.
 pub fn codex_rollout(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
     if !is_conversation_id(thread_id) {
         return None;
     }
     let suffix = format!("-{thread_id}.jsonl");
-    let mut dirs = vec![(codex_home.join("sessions"), 0usize)];
-    while let Some((dir, depth)) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    let newest_first = |dir: &Path| -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dirs.sort_unstable_by(|a, b| b.cmp(a));
+        dirs
+    };
+    let days = newest_first(&codex_home.join("sessions"))
+        .into_iter()
+        .flat_map(|year| newest_first(&year))
+        .flat_map(|month| newest_first(&month))
+        .take(MAX_ROLLOUT_DAYS);
+    for day in days {
+        let Ok(entries) = std::fs::read_dir(&day) else {
             continue;
         };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                if depth + 1 < CODEX_ROLLOUT_DEPTH {
-                    dirs.push((path, depth + 1));
-                }
-            } else if file_type.is_file() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with("rollout-") && name.ends_with(&suffix) {
-                    return Some(path);
-                }
-            }
+        let found = entries.filter_map(Result::ok).find(|e| {
+            e.file_type().is_ok_and(|t| t.is_file())
+                && e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(&suffix))
+        });
+        if let Some(found) = found {
+            return Some(found.path());
         }
     }
     None

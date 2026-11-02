@@ -24,6 +24,8 @@ window.FwHubCommands = function (ctx) {
   };
 
   const isAgent = (s) => s && (s.kind === "claude" || s.kind === "codex");
+  // A shell: a shell session, or an agent restored as a fallback shell.
+  const runsShell = (s) => s.kind === "shell" || Array.isArray(s.fallback_command);
   const isRunning = (s) => s && s.live && s.live.pid && s.state === "running";
   const attachedSession = () => sessionById(state.attached);
 
@@ -162,10 +164,10 @@ window.FwHubCommands = function (ctx) {
     return pool.slice().sort((a, b) => (newestSeqTime(b.id) > newestSeqTime(a.id) ? 1 : -1))[0] || null;
   }
 
-  // Running shell sessions of the source's workspace.
+  // Running shells of the source's workspace.
   function targets(source) {
     const workspace = source ? source.workspace_id : state.attached && attachedSession().workspace_id;
-    return state.sessions.filter((s) => s.kind === "shell" && isRunning(s) && s.workspace_id === workspace);
+    return state.sessions.filter((s) => runsShell(s) && isRunning(s) && s.workspace_id === workspace);
   }
 
   function currentTarget(source) {

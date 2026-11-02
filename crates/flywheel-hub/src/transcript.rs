@@ -17,12 +17,11 @@
 //! including those of conversations before a `/clear`, under the same
 //! `seq`, and resumes reading where it stopped.
 
-use crate::agent::{SessionKind, claude_transcript, is_conversation_id};
+use crate::agent::{SessionKind, claude_transcript, codex_rollout, is_conversation_id};
 use crate::commands::{Command, CommandSource, MAX_BLOCK_BYTES, copyable, fenced_blocks, is_shell};
 use crate::hub::{Hub, HubError, HubEvent};
-use crate::pty::WriteOutcome;
+use crate::pty::{ENTER_DELAY, WriteOutcome, paste_bytes};
 use crate::state::{SessionRecord, StateError};
-use crate::vt::TextSource;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -47,8 +46,6 @@ const READ_CHUNK: usize = 256 * 1024;
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Least time between two searches for a session's file that was not found.
 const LOOKUP_RETRY: Duration = Duration::from_secs(5);
-/// Codex day directories searched for a rollout, newest first.
-const MAX_ROLLOUT_DAYS: usize = 400;
 /// Codex `notify` replies held until the watcher reads them.
 const MAX_PENDING_NOTIFY: usize = 16;
 /// A command is "fresh" (worth a toast) when written this recently.
@@ -303,61 +300,6 @@ pub fn codex_reply(value: &serde_json::Value) -> Option<Reply> {
 
 fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|v| v.as_str()).map(str::to_owned)
-}
-
-/// Codex's home: `$CODEX_HOME`, else `~/.codex`.
-pub fn codex_home(
-    codex_home: Option<&std::ffi::OsStr>,
-    home: Option<&std::ffi::OsStr>,
-) -> Option<PathBuf> {
-    if let Some(dir) = codex_home.filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    home.filter(|h| !h.is_empty())
-        .map(|h| Path::new(h).join(".codex"))
-}
-
-/// The rollout of Codex thread `thread`: `sessions/YYYY/MM/DD/rollout-*-<thread>.jsonl`,
-/// searched newest day first.
-pub fn codex_rollout(codex_home: &Path, thread: &str) -> Option<PathBuf> {
-    let suffix = format!("-{thread}.jsonl");
-    let sorted_dirs = |dir: &Path| -> Vec<PathBuf> {
-        let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                    .map(|e| e.path())
-                    .collect()
-            })
-            .unwrap_or_default();
-        dirs.sort();
-        dirs.reverse();
-        dirs
-    };
-    let mut days = 0;
-    for year in sorted_dirs(&codex_home.join("sessions")) {
-        for month in sorted_dirs(&year) {
-            for day in sorted_dirs(&month) {
-                days += 1;
-                if days > MAX_ROLLOUT_DAYS {
-                    return None;
-                }
-                let Ok(entries) = std::fs::read_dir(&day) else {
-                    continue;
-                };
-                let found = entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(&suffix))
-                });
-                if found.is_some() {
-                    return found;
-                }
-            }
-        }
-    }
-    None
 }
 
 /// A session's commands as saved under the state dir.
@@ -721,7 +663,9 @@ impl CommandBook {
     /// Read whatever `record`'s agent wrote since the last call; returns
     /// the new commands (oldest first).
     pub fn refresh(&self, record: &SessionRecord) -> Vec<Command> {
-        if !record.kind.is_agent() {
+        // A fallback shell (an agent restored without its conversation)
+        // writes no transcript: its saved blocks stay listed, unfollowed.
+        if !record.runs_agent() {
             return Vec::new();
         }
         let entry = self.entry(&record.id);
@@ -895,7 +839,7 @@ pub fn spawn_watcher(hub: &Arc<Hub>) {
                 hub.command_book().retain(&keep);
                 for view in sessions {
                     let running = view.live.as_ref().is_some_and(|l| l.pid.is_some());
-                    if view.record.kind.is_agent() && running {
+                    if view.record.runs_agent() && running {
                         hub.refresh_commands(&view.record);
                     }
                 }
@@ -911,34 +855,6 @@ pub struct PasteOutcome {
     /// Followed by Enter.
     pub ran: bool,
     pub bytes: usize,
-}
-
-/// The bytes that paste `text` into a terminal: newlines become CR (as a
-/// terminal's own paste does), trailing newlines are dropped (never an
-/// implicit Enter), and when `bracketed` it is wrapped in the
-/// bracketed-paste markers with any markers inside removed, so the text
-/// cannot end the paste early and run the rest. `run` appends one CR.
-pub fn paste_bytes(text: &str, bracketed: bool, run: bool) -> Vec<u8> {
-    let body = text
-        .trim_end_matches(['\n', '\r'])
-        .replace("\r\n", "\r")
-        .replace('\n', "\r");
-    let mut out = Vec::with_capacity(body.len() + 16);
-    if bracketed {
-        let mut clean = body;
-        while clean.contains("\x1b[201~") || clean.contains("\x1b[200~") {
-            clean = clean.replace("\x1b[201~", "").replace("\x1b[200~", "");
-        }
-        out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(clean.as_bytes());
-        out.extend_from_slice(b"\x1b[201~");
-    } else {
-        out.extend_from_slice(body.as_bytes());
-    }
-    if run {
-        out.push(b'\r');
-    }
-    out
 }
 
 impl Hub {
@@ -983,10 +899,7 @@ impl Hub {
             .ok_or_else(|| {
                 StateError::Conflict(format!("session {:?} is not running", record.name))
             })?;
-        let bracketed = session
-            .screen_text(TextSource::Visible)
-            .modes
-            .contains(&"bracketed_paste");
+        let bracketed = session.bracketed_paste();
         let multiline = text.trim_end_matches(['\n', '\r']).contains(['\n', '\r']);
         if multiline && !bracketed && !run {
             return Err(StateError::Conflict(format!(
@@ -995,9 +908,18 @@ impl Hub {
             ))
             .into());
         }
-        let bytes = paste_bytes(text, bracketed, run);
-        let len = bytes.len();
-        match session.write(bytes) {
+        // A trailing newline is never an implicit Enter: only `run` runs.
+        let bytes = paste_bytes(text.trim_end_matches(['\n', '\r']), bracketed);
+        let mut len = bytes.len();
+        let mut outcome = session.write(bytes);
+        if run && outcome == WriteOutcome::Queued {
+            // Enter as its own keypress, as `fw hub send` does (a TUI
+            // takes one fast burst as part of the paste).
+            std::thread::sleep(ENTER_DELAY);
+            outcome = session.write(b"\r".to_vec());
+            len += 1;
+        }
+        match outcome {
             WriteOutcome::Queued => Ok(PasteOutcome {
                 bracketed,
                 ran: run,
@@ -1035,6 +957,7 @@ mod tests {
             agent_session_id: Some(conversation.into()),
             created_at: chrono::Utc::now(),
             state: SessionState::Running,
+            fallback_command: None,
         }
     }
 
@@ -1400,24 +1323,6 @@ mod tests {
     }
 
     #[test]
-    fn paste_bytes_never_runs_unless_asked_and_cannot_break_out() {
-        assert_eq!(
-            paste_bytes("a\nb\n", true, false),
-            b"\x1b[200~a\rb\x1b[201~"
-        );
-        assert_eq!(
-            paste_bytes("a\r\nb", true, true),
-            b"\x1b[200~a\rb\x1b[201~\r"
-        );
-        assert_eq!(
-            paste_bytes("x\x1b[201~\x1b[20\x1b[201~1~rm -rf", true, false),
-            b"\x1b[200~xrm -rf\x1b[201~"
-        );
-        assert_eq!(paste_bytes("ls -la\n", false, false), b"ls -la");
-        assert_eq!(paste_bytes("ls", false, true), b"ls\r");
-    }
-
-    #[test]
     fn freshness_reads_the_agent_timestamp() {
         let mut command = Command {
             seq: 0,
@@ -1434,19 +1339,5 @@ mod tests {
         assert!(is_fresh(&command));
         command.timestamp = Some("2020-01-01T00:00:00Z".into());
         assert!(!is_fresh(&command));
-    }
-
-    #[test]
-    fn codex_home_prefers_the_env_var() {
-        use std::ffi::OsStr;
-        assert_eq!(
-            codex_home(Some(OsStr::new("/c")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/c"))
-        );
-        assert_eq!(
-            codex_home(Some(OsStr::new("")), Some(OsStr::new("/h"))),
-            Some(PathBuf::from("/h/.codex"))
-        );
-        assert_eq!(codex_home(None, None), None);
     }
 }

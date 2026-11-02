@@ -6,8 +6,10 @@
 //! it received.
 
 use flywheel_hub::agent::claude_project_dir_name;
+use flywheel_hub::hub::RestoreOutcome;
 use flywheel_hub::remote::RuntimeInfo;
 use flywheel_hub::report::{self, Report};
+use flywheel_hub::restore::RestoreHow;
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -39,6 +41,12 @@ impl TestHub {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo/.git")).unwrap();
+        Self::reopen(dir, true).await.0
+    }
+
+    /// A hub on `dir`'s state, restoring what a previous one there stopped
+    /// (agents resume their conversations only with `agent_resume`).
+    async fn reopen(dir: tempfile::TempDir, agent_resume: bool) -> (Self, Vec<RestoreOutcome>) {
         let mut options = HubOptions::new(dir.path().join("state"));
         options.default_shell = vec!["/bin/sh".into()];
         options.agents.claude = fake_agent(dir.path(), "claude")
@@ -50,7 +58,9 @@ impl TestHub {
         options.report_command = Some(vec!["/opt/flywheel/bin/fw".into(), "hub".into()]);
         options.claude_config_dir = Some(dir.path().join("claude-config"));
         options.codex_home = Some(dir.path().join("codex-home"));
+        options.agent_resume = agent_resume;
         let hub = Hub::open(options).unwrap();
+        let restored = hub.restore_sessions();
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -59,6 +69,8 @@ impl TestHub {
             pid: std::process::id(),
             listen: addr,
             public_urls: Vec::new(),
+            started_at: None,
+            log_file: None,
         }
         .write(&dir.path().join("state"))
         .unwrap();
@@ -66,14 +78,15 @@ impl TestHub {
         let server = tokio::spawn(serve(listener, hub, ServerOptions::default(), async {
             let _ = stopped.await;
         }));
-        Self {
+        let hub = Self {
             dir,
             addr,
             token,
             http: reqwest::Client::new(),
             stop: Some(stop),
             server: Some(server),
-        }
+        };
+        (hub, restored)
     }
 
     fn repo(&self) -> PathBuf {
@@ -128,13 +141,14 @@ impl TestHub {
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self) -> tempfile::TempDir {
         let _ = self.stop.take().unwrap().send(());
         timeout(Duration::from_secs(15), self.server.take().unwrap())
             .await
             .expect("server shut down in time")
             .unwrap()
             .unwrap();
+        self.dir
     }
 }
 
@@ -563,5 +577,107 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    hub.shutdown().await;
+}
+
+/// Wait for `sid`'s commands list (all blocks) to read `want`, newest
+/// first.
+async fn wait_for_commands(hub: &TestHub, sid: &str, want: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let list = hub
+            .get(&format!("/api/sessions/{sid}/commands?all=true"))
+            .await;
+        let texts: Vec<String> = list["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap().to_owned())
+            .collect();
+        if texts == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "commands {texts:?}, want {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn reply(uuid: &str, block: &str) -> Value {
+    json!({"type": "assistant", "uuid": uuid, "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message": {"role": "assistant", "content": [{"type": "text", "text": format!("```sh\n{block}\n```")}]}})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commands_survive_a_restart_and_resume_but_a_fallback_shell_is_not_followed() {
+    let hub = TestHub::start().await;
+    let ws = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "w", "repos": [hub.repo()] }),
+        )
+        .await;
+    let claude = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws["id"], "kind": "claude", "name": "agent" }),
+        )
+        .await;
+    let sid = claude["id"].as_str().unwrap().to_owned();
+    let conversation = claude["agent_session_id"].as_str().unwrap().to_owned();
+    let project = hub
+        .dir
+        .path()
+        .join("claude-config/projects")
+        .join(claude_project_dir_name(&hub.repo()));
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{conversation}.jsonl"));
+    append(&transcript, &reply("a1", "echo before restart"));
+    wait_for_commands(&hub, &sid, &["echo before restart"]).await;
+
+    // Restart: the agent resumes its conversation, its blocks are still
+    // listed, and the watcher follows the same transcript on from where
+    // it stopped (nothing listed twice).
+    let (hub, restored) = TestHub::reopen(hub.shutdown().await, true).await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].result, Ok(RestoreHow::Resume));
+    let session = hub.get(&format!("/api/sessions/{sid}")).await;
+    assert_eq!(session["state"], "running", "{session}");
+    assert!(session["fallback_command"].is_null(), "{session}");
+    wait_for_commands(&hub, &sid, &["echo before restart"]).await;
+    let mut events = hub.events().await;
+    append(&transcript, &reply("a2", "echo after resume"));
+    let event = next_commands(&mut events).await;
+    assert_eq!(event["session_id"], sid.as_str());
+    assert_eq!(event["commands"][0]["text"], "echo after resume");
+    assert_eq!(event["commands"].as_array().unwrap().len(), 1);
+    wait_for_commands(&hub, &sid, &["echo after resume", "echo before restart"]).await;
+    let (code, out, err) = tokio::task::spawn_blocking({
+        let args = vec![
+            "commands".to_owned(),
+            sid[..8].to_owned(),
+            "--last".to_owned(),
+            "--state-dir".to_owned(),
+            hub.state_dir(),
+        ];
+        move || cli(args)
+    })
+    .await
+    .unwrap();
+    assert_eq!((code, out.as_str()), (0, "echo after resume\n"), "{err}");
+
+    // Restored without resume, it runs a fallback shell: its blocks stay
+    // listed, but the shell is not an agent and its transcript is not
+    // followed.
+    let (hub, restored) = TestHub::reopen(hub.shutdown().await, false).await;
+    assert_eq!(restored[0].result, Ok(RestoreHow::Shell));
+    let session = hub.get(&format!("/api/sessions/{sid}")).await;
+    assert!(session["fallback_command"].is_array(), "{session}");
+    assert!(session["agent"].is_null(), "{session}");
+    append(&transcript, &reply("a3", "echo not followed"));
+    tokio::time::sleep(flywheel_hub::transcript::POLL_INTERVAL * 3).await;
+    wait_for_commands(&hub, &sid, &["echo after resume", "echo before restart"]).await;
     hub.shutdown().await;
 }

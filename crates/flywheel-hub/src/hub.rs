@@ -483,7 +483,8 @@ impl Hub {
                 cwd: pid.and_then(process_cwd),
             }
         });
-        let agent = (record.kind.is_agent() && record.fallback_command.is_none())
+        let agent = record
+            .runs_agent()
             .then(|| self.board().status(&record.id, Audience::Anyone))
             .flatten();
         SessionView {

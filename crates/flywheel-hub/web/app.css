@@ -794,6 +794,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 @keyframes blink { 50% { opacity: .25; } }
 
 .meters { display: flex; align-items: center; gap: .9rem; min-width: 0; }
+/* The session name keeps room; the cwd meter gives way first. */
+@media (min-width: 821px) { .crumbs { min-width: 20rem; } .crumbs .kind-tag, .crumbs .agent-pill { flex-shrink: 0; } }
+@media (max-width: 820px) { .crumbs { overflow: hidden; } }
 
 .meter {
   font-size: 10.5px;
@@ -2066,6 +2069,8 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .cwt-state { margin: .2rem 0 .1rem; font-size: 11px; line-height: 1.55; color: var(--ink-2); }
 .cwt-state.ok { color: var(--ink-2); }
 .cwt-state.bad { color: var(--alert); }
+.cwt-also { margin: 0 0 .1rem; font-size: 11px; line-height: 1.55; color: var(--ink-3); }
+.cwt-also:empty { display: none; }
 #dlg-close-wt code { font-family: var(--term); font-size: 11px; color: var(--ink); overflow-wrap: anywhere; }
 #dlg-close-wt .slab:disabled { opacity: .45; cursor: not-allowed; }
 

@@ -1060,34 +1060,40 @@
     const session = sessionById(id);
     if (!session) return;
     let query = "";
-    if (session.worktree) {
+    // A companion shell shares its agent's worktree: closing it never
+    // removes that (the agent's close does).
+    const companions = state.sessions.filter((s) => s.companion_of === id);
+    if (session.worktree && !session.companion_of) {
       const how = await worktrees.confirmClose(session);
       if (!how) return;
       if (how.remove) query = `?remove_worktree=true${how.force ? "&force=true" : ""}`;
-    } else if (session.state === "running" && session.live) {
+    } else if ((session.state === "running" && session.live) || companions.length) {
       const ok = await confirmDialog({
         kicker: "close session",
         title: `Close ${session.name}?`,
         body: [
-          "Its process",
-          session.live.pid ? ` (pid ${session.live.pid})` : "",
-          " is hung up and the scrollback is discarded. Every attached browser loses it.",
-        ].join(""),
+          session.live && session.state === "running" ? "Its process" : "",
+          session.live && session.state === "running" && session.live.pid ? ` (pid ${session.live.pid})` : "",
+          session.live && session.state === "running"
+            ? " is hung up and the scrollback is discarded. Every attached browser loses it."
+            : "",
+          companions.length ? ` Its companion ${companions.map((c) => c.name).join(", ")} closes with it.` : "",
+        ].join("").trim(),
         ok: "Kill and close",
       });
       if (!ok) return;
     }
     state.closing.add(id);
     try {
-      // Removing a worktree also closes its companion shells.
-      const companions = query ? state.sessions.filter((s) => s.companion_of === id).map((s) => s.id) : [];
-      companions.forEach((c) => state.closing.add(c));
+      // Closing an agent also closes its companion shells.
+      const closing = companions.map((s) => s.id);
+      closing.forEach((c) => state.closing.add(c));
       try {
         await api("DELETE", `/api/sessions/${id}${query}`);
       } finally {
-        companions.forEach((c) => setTimeout(() => state.closing.delete(c), 3000));
+        closing.forEach((c) => setTimeout(() => state.closing.delete(c), 3000));
       }
-      if (state.attached === id || companions.includes(state.attached)) detach();
+      if (state.attached === id || closing.includes(state.attached)) detach();
       await refresh();
     } catch (error) {
       flagError(id, error);
@@ -1394,6 +1400,24 @@
     renderMain();
   }
 
+  // The header's agent / companion-shell flip (Alt+`, which phones lack).
+  function renderFlip(session) {
+    const button = $("#flip-toggle");
+    const parent = session && session.companion_of ? sessionById(session.companion_of) : null;
+    const agent = session && (session.kind === "claude" || session.kind === "codex");
+    button.hidden = !parent && !agent;
+    if (button.hidden) return;
+    const running = agent ? state.sessions.find((s) => s.companion_of === session.id && s.state === "running") : null;
+    button.querySelector("use").setAttribute("href", parent ? `#i-${parent.kind}` : "#i-shell");
+    $("#flip-label").textContent = parent ? "agent" : "shell";
+    button.title = parent
+      ? `Back to agent ${parent.name} (${MOD} \`)`
+      : running
+        ? `Companion shell ${running.name} (${MOD} \`)`
+        : `Open a companion shell in ${session.name}'s directory (${MOD} \`)`;
+    button.setAttribute("aria-label", button.title);
+  }
+
   function renderMain() {
     const session = sessionById(state.attached);
     const workspace = session ? workspaceById(session.workspace_id) : null;
@@ -1414,6 +1438,7 @@
     // (direction: rtl) styling.
     $("#meter-cwd").textContent = session ? `\u200e${session.cwd}\u200e` : "";
     $("#meter-cwd").title = session ? session.cwd : "";
+    renderFlip(session);
     updateMeters();
     const counts = attentionCounts();
     document.title = `${titlePrefix(counts)}${session ? `${session.name} · flywheel hub` : "flywheel hub"}`;
@@ -1920,6 +1945,8 @@
 
   sessionForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    // Enter submits too: the live worktree check's error stands.
+    if (worktrees.blocked()) return;
     const workspaceId = $("#session-workspace").value;
     const repoInput = sessionForm.querySelector('input[name="repo"]:checked');
     const kind = selectedKind();
@@ -1944,7 +1971,7 @@
       if (!$("#dlg-session").open) $("#dlg-session").showModal();
       $("#session-error").textContent = error.message;
     } finally {
-      submit.disabled = false;
+      submit.disabled = worktrees.blocked();
     }
   });
 
@@ -2244,6 +2271,7 @@
     logout,
     "toggle-sidebar": () => document.body.classList.toggle("side-open"),
     "toggle-commands": () => commands.toggle(),
+    "flip-companion": () => commands.flipCompanion(),
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");

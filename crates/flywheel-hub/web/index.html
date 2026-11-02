@@ -97,6 +97,7 @@
         <span id="meter-cwd" class="meter cwd"></span>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
+        <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
@@ -270,6 +271,7 @@
     </header>
     <p class="sheet-body" id="cwt-where"></p>
     <p class="cwt-state" id="cwt-state" role="status"></p>
+    <p class="cwt-also" id="cwt-also"></p>
     <label class="import-update" id="cwt-force-row" hidden><input type="checkbox" id="cwt-force"> force: lose the uncommitted work (an unmerged branch is kept)</label>
     <footer class="sheet-foot">
       <button type="submit" class="slab ghost" value="cancel">Cancel</button>

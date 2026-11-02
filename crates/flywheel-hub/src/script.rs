@@ -310,9 +310,10 @@ fn print_json(out: &mut dyn Write, value: &Value) {
 
 // --- ls ---------------------------------------------------------------------
 
-/// A session's git badge for `ls`: ` [branch +ahead -behind ~changed
-/// ?untracked]` (zero counts left out; a worktree session's branch before
-/// its first read), else empty.
+/// A session's git badge for `ls`: ` [branch +ahead -behind vs AGAINST
+/// ~changed ?untracked]` (ahead/behind whenever there is something to
+/// count against, other zero counts left out; a worktree session's
+/// branch before its first read), else empty.
 fn git_label(session: &Value) -> String {
     let count = |git: &Value, field: &str| git.get(field).and_then(Value::as_u64).unwrap_or(0);
     let mut parts: Vec<String> = Vec::new();
@@ -324,12 +325,24 @@ fn git_label(session: &Value) -> String {
                     .unwrap_or("(detached)")
                     .to_owned(),
             );
+            if let Some(against) = git.get("against").and_then(Value::as_str) {
+                parts.push(format!(
+                    "+{} -{} vs {against}",
+                    count(git, "ahead"),
+                    count(git, "behind")
+                ));
+            }
             for (field, mark) in [
                 ("ahead", "+"),
                 ("behind", "-"),
                 ("dirty", "~"),
                 ("untracked", "?"),
             ] {
+                if git.get("against").is_some_and(Value::is_string)
+                    && matches!(field, "ahead" | "behind")
+                {
+                    continue;
+                }
                 let n = count(git, field);
                 if n > 0 {
                     parts.push(format!("{mark}{n}"));
@@ -347,6 +360,23 @@ fn git_label(session: &Value) -> String {
         parts.push("worktree".to_owned());
     }
     format!(" [{}]", parts.join(" "))
+}
+
+/// ` (companion of AGENT)` for a companion shell, else empty.
+fn companion_label(session: &Value, sessions: &[Value]) -> String {
+    match session.get("companion_of").and_then(Value::as_str) {
+        Some(agent) => {
+            let name = sessions
+                .iter()
+                .find(|s| str_field(s, "id") == agent)
+                .map_or_else(
+                    || short(agent).to_owned(),
+                    |s| str_field(s, "name").to_owned(),
+                );
+            format!(" (companion of {name})")
+        }
+        None => String::new(),
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -410,7 +440,12 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     kind_label(s),
                     state_label(s),
                     str_field(s, "name").to_owned(),
-                    format!("{}{}", live_cwd(s), git_label(s)),
+                    format!(
+                        "{}{}{}",
+                        live_cwd(s),
+                        git_label(s),
+                        companion_label(s, &sessions)
+                    ),
                 ]
             })
             .collect();
@@ -543,6 +578,24 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         }
         Err(_) => {
             let repo = args.repo.as_deref().map(absolute).transpose()?;
+            // Check the worktree first: a refused one must not leave an
+            // empty workspace behind.
+            if let (Some(task), Some(folder)) =
+                (&args.worktree, repo.as_ref().filter(|f| f.is_dir()))
+            {
+                let mut query = format!(
+                    "folder={}&task={}",
+                    query_escape(&folder.to_string_lossy()),
+                    query_escape(task)
+                );
+                if let Some(base) = &args.base {
+                    query.push_str(&format!("&base={}", query_escape(base)));
+                }
+                let plan = conn.call("GET", &format!("/api/worktrees/plan?{query}"), None)?;
+                if let Some(error) = plan.get("error").and_then(Value::as_str) {
+                    return Err(error.to_owned());
+                }
+            }
             let created = conn.call(
                 "POST",
                 "/api/workspaces",
@@ -581,6 +634,20 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         );
     }
     Ok(view)
+}
+
+/// `raw` percent-escaped for a URL query value (RFC 3986 unreserved
+/// characters kept).
+fn query_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// The folder of `workspace` that `query` names: a path (relative to this

@@ -767,11 +767,7 @@ impl Hub {
             .into());
         }
         if request.worktree.is_some() && !crate::state::is_git_root(&cwd) {
-            return Err(StateError::Invalid(format!(
-                "folder {} is not a git repository; worktrees need one",
-                cwd.display()
-            ))
-            .into());
+            return Err(StateError::Invalid(git::not_a_repo_root(&cwd)).into());
         }
         let command = match (request.kind, request.command) {
             (SessionKind::Shell, Some(argv)) if argv.is_empty() || argv[0].trim().is_empty() => {
@@ -876,20 +872,8 @@ impl Hub {
 
     /// Re-read `record`'s git badge shortly (a command just ran there).
     pub(crate) fn nudge_badge_soon(&self, record: &SessionRecord) {
-        let key = badge_key(record);
-        let Some(wake) = self.git.sender() else {
-            return;
-        };
-        let _ = std::thread::Builder::new()
-            .name("hub-git-nudge".into())
-            .spawn(move || {
-                for delay in [BADGE_AFTER_RUN, BADGE_AFTER_RUN * 3] {
-                    std::thread::sleep(delay);
-                    if wake.send(Some(key.clone())).is_err() {
-                        break;
-                    }
-                }
-            });
+        self.git
+            .nudge_after(badge_key(record), &[BADGE_AFTER_RUN, BADGE_AFTER_RUN * 4]);
     }
 
     /// An agent session's companion shell (same directory, worktree
@@ -1042,11 +1026,13 @@ impl Hub {
             Some(worktree) => store
                 .sessions()
                 .iter()
+                // Stopped ones too: they would restart into a deleted
+                // directory.
                 .filter(|s| {
                     s.id != id
                         && s.companion_of.as_deref() != Some(id)
-                        && s.state.is_running()
-                        && s.cwd.starts_with(&worktree.path)
+                        && (s.cwd.starts_with(&worktree.path)
+                            || s.worktree.as_ref().is_some_and(|w| w.path == worktree.path))
                 })
                 .cloned()
                 .collect(),
@@ -1065,17 +1051,40 @@ impl Hub {
         id: &str,
         options: RemoveOptions,
     ) -> Result<RemoveOutcome, HubError> {
+        let (record, companions, _) = self.worktree_neighbours(id)?;
         if !options.remove_worktree {
-            self.remove_session(id)?;
+            // Companion shells belong to their agent: they go with it
+            // (none is left pointing at a session that is gone).
+            let mut removed: Vec<String> = vec![id.to_owned()];
+            removed.extend(companions.into_iter().map(|s| s.id));
+            for sid in &removed {
+                match self.remove_session(sid) {
+                    Ok(()) => {}
+                    Err(HubError::State(StateError::NotFound(_))) if sid != id => {}
+                    Err(e) => return Err(e),
+                }
+            }
             return Ok(RemoveOutcome {
-                removed: vec![id.to_owned()],
+                removed,
                 worktree: None,
             });
+        }
+        if let Some(agent) = &record.companion_of {
+            let agent = self
+                .store()
+                .session(agent)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|_| agent.clone());
+            return Err(StateError::Invalid(format!(
+                "{:?} is {agent:?}'s companion shell; the worktree is {agent:?}'s: close {agent:?} to remove it",
+                record.name
+            ))
+            .into());
         }
         let info = self.worktree_info(id)?;
         if let Some(other) = info.blocking.first() {
             return Err(StateError::Conflict(format!(
-                "session {other:?} also runs in worktree {}; close it first",
+                "session {other:?} also uses worktree {}; close it first",
                 info.worktree.path.display()
             ))
             .into());
@@ -1133,10 +1142,7 @@ impl Hub {
             error: None,
         };
         if !crate::state::is_git_root(folder) {
-            view.error = Some(format!(
-                "{} is not a git repository; worktrees need one",
-                folder.display()
-            ));
+            view.error = Some(git::not_a_repo_root(folder));
             return view;
         }
         match git::worktrees_dir(folder) {

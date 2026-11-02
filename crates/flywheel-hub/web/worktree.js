@@ -16,12 +16,15 @@ window.FwHubWorktree = function (ctx) {
   const baseInput = $("#wt-base");
   const bases = $("#wt-bases");
   const note = $("#wt-note");
+  const launch = $("#session-submit");
+  const launchError = $("#session-error");
 
   const form = {
     folder: null, // the picked folder {path, git, missing}
     seq: 0, // drops answers to superseded checks
     timer: null,
     defaultBase: "",
+    blocked: false, // the last check found the worktree cannot be cut
   };
 
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -29,6 +32,17 @@ window.FwHubWorktree = function (ctx) {
   function setNote(text, tone) {
     note.textContent = text || "";
     note.className = `wt-note${tone ? ` ${tone}` : ""}`;
+  }
+
+  // Launch is held while the live check shows the worktree cannot be cut.
+  function setBlocked(blocked) {
+    form.blocked = !!blocked;
+    launch.disabled = form.blocked;
+  }
+
+  // The user changed a worktree field: an earlier Launch error is stale.
+  function edited() {
+    launchError.textContent = "";
   }
 
   function showFields() {
@@ -46,6 +60,7 @@ window.FwHubWorktree = function (ctx) {
     if (!git) toggle.checked = false;
     showFields();
     if (!git) {
+      setBlocked(false);
       setNote(folder ? "Worktrees need a git folder; this one is a plain directory." : "", "");
       return;
     }
@@ -62,6 +77,7 @@ window.FwHubWorktree = function (ctx) {
     baseInput.value = "";
     form.folder = null;
     setNote("", "");
+    setBlocked(false);
     showFields();
   }
 
@@ -83,10 +99,14 @@ window.FwHubWorktree = function (ctx) {
     try {
       view = await api("GET", `/api/worktrees/plan?${params}`);
     } catch (error) {
-      if (seq === form.seq) setNote(error.message, "bad");
+      if (seq === form.seq) {
+        setNote(error.message, "bad");
+        setBlocked(toggle.checked);
+      }
       return;
     }
     if (seq !== form.seq) return;
+    setBlocked(toggle.checked && !!view.error);
     form.defaultBase = view.default_base || "";
     baseInput.placeholder = form.defaultBase ? `${form.defaultBase} (current branch)` : "HEAD";
     bases.replaceChildren(...(view.branches || []).map((b) => el("option", { value: b })));
@@ -102,12 +122,20 @@ window.FwHubWorktree = function (ctx) {
   }
 
   toggle.addEventListener("change", () => {
+    edited();
     showFields();
+    if (!toggle.checked) setBlocked(false);
     if (toggle.checked) taskInput.focus();
     schedule(0);
   });
-  taskInput.addEventListener("input", () => schedule(180));
-  baseInput.addEventListener("input", () => schedule(250));
+  taskInput.addEventListener("input", () => {
+    edited();
+    schedule(180);
+  });
+  baseInput.addEventListener("input", () => {
+    edited();
+    schedule(250);
+  });
 
   // The request's `worktree` (null when off); throws when it cannot be.
   function request() {
@@ -122,6 +150,7 @@ window.FwHubWorktree = function (ctx) {
   }
 
   const taskName = () => (toggle.checked ? taskInput.value.trim() : "");
+  const blocked = () => form.blocked;
 
   // --- badges --------------------------------------------------------------
 
@@ -174,6 +203,7 @@ window.FwHubWorktree = function (ctx) {
   const forceBox = $("#cwt-force");
   const forceRow = $("#cwt-force-row");
   const state = $("#cwt-state");
+  const also = $("#cwt-also");
   let info = null;
 
   function syncRemove() {
@@ -200,6 +230,7 @@ window.FwHubWorktree = function (ctx) {
     );
     state.textContent = "Checking the worktree…";
     state.className = "cwt-state";
+    also.textContent = "";
     forceBox.checked = false;
     forceRow.hidden = true;
     syncRemove();
@@ -214,16 +245,16 @@ window.FwHubWorktree = function (ctx) {
         const parts = [];
         if (answer.missing) parts.push("Its directory is already gone; removing prunes git's record.");
         if (answer.blocking.length) {
-          parts.push(`Cannot remove: ${answer.blocking.join(", ")} also ${answer.blocking.length === 1 ? "runs" : "run"} in it. Close ${answer.blocking.length === 1 ? "it" : "them"} first.`);
+          parts.push(`Cannot remove: ${answer.blocking.join(", ")} also ${answer.blocking.length === 1 ? "uses" : "use"} it. Close ${answer.blocking.length === 1 ? "it" : "them"} first.`);
         } else if (answer.refusal) {
           parts.push(answer.refusal.replace(/; commit and merge.*$/, "."));
         } else {
           parts.push(`Clean, and ${answer.branch} has nothing ${answer.base} lacks: removing deletes the worktree and the branch.`);
         }
-        if (answer.companions.length && !answer.blocking.length) {
-          parts.push(`Removing also closes ${answer.companions.join(", ")}.`);
-        }
         state.textContent = parts.join(" ");
+        also.textContent = answer.companions.length
+          ? `Closing ${session.name} also closes ${answer.companions.join(", ")}, either way.`
+          : "";
         state.className = `cwt-state${answer.blocking.length || answer.refusal ? " bad" : " ok"}`;
         forceRow.hidden = !answer.refusal || !!answer.blocking.length;
         syncRemove();
@@ -248,5 +279,5 @@ window.FwHubWorktree = function (ctx) {
     });
   }
 
-  return { setFolder, reset, request, taskName, badge, confirmClose };
+  return { setFolder, reset, request, taskName, blocked, badge, confirmClose };
 };

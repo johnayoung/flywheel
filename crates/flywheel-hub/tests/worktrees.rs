@@ -486,7 +486,7 @@ async fn unmerged_worktrees_keep_their_branch_and_another_session_blocks_removal
         refused["error"]
             .as_str()
             .unwrap()
-            .contains("\"other\" also runs"),
+            .contains("\"other\" also uses"),
         "{refused}"
     );
     assert_eq!(hub.session(&agent_id).await["state"], "running");
@@ -615,7 +615,7 @@ async fn cli_new_worktree_and_restore_keeps_sessions_in_their_worktree() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let (_, out, _) = run_cli(&["ls", "--state-dir", &state]).await;
-        if out.contains("[spike worktree]") {
+        if out.contains("[spike +0 -0 vs dev worktree]") {
             break;
         }
         assert!(Instant::now() < deadline, "{out}");
@@ -643,5 +643,118 @@ async fn cli_new_worktree_and_restore_keeps_sessions_in_their_worktree() {
     let outcome = restored.iter().find(|o| o.id == id).expect("tried");
     let error = outcome.result.as_ref().unwrap_err();
     assert!(error.contains("no longer exists"), "{error}");
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn companions_close_with_their_agent_and_never_remove_its_worktree() {
+    let hub = TestHub::start().await;
+    let ws = hub.workspace().await;
+    let state = hub.state_dir();
+
+    // A plain agent (no worktree) closed without --remove-worktree takes
+    // its companion with it: none is left pointing at a gone session.
+    let (status, agent) = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "claude", "name": "ag2" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{agent}");
+    let agent_id = agent["id"].as_str().unwrap().to_owned();
+    let (status, companion) = hub
+        .post(&format!("/api/sessions/{agent_id}/companion"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{companion}");
+    let companion_id = companion["id"].as_str().unwrap().to_owned();
+    let (code, out, _) = run_cli(&["ls", "--state-dir", &state]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains("(companion of ag2)"), "{out}");
+    let (code, _, err) = run_cli(&["kill", "ag2", "--rm", "--state-dir", &state]).await;
+    assert_eq!(code, 0, "{err}");
+    let sessions = hub.get("/api/sessions").await;
+    let ids: Vec<&str> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(!ids.contains(&companion_id.as_str()), "{sessions}");
+    assert!(!ids.contains(&agent_id.as_str()), "{sessions}");
+
+    // A worktree agent: its companion cannot remove the worktree, even
+    // with the agent stopped.
+    let (status, agent) = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "claude", "worktree": { "task": "wt-c" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{agent}");
+    let agent_id = agent["id"].as_str().unwrap().to_owned();
+    let wt = hub.worktrees().join("wt-c");
+    let (_, companion) = hub
+        .post(&format!("/api/sessions/{agent_id}/companion"), json!({}))
+        .await;
+    let companion_id = companion["id"].as_str().unwrap().to_owned();
+    let (status, _) = hub
+        .post(&format!("/api/sessions/{agent_id}/kill"), json!({}))
+        .await;
+    assert!(status.is_success(), "{status}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while hub.session(&agent_id).await["state"] == "running" {
+        assert!(Instant::now() < deadline, "the agent did not stop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, refused) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{companion_id}?remove_worktree=true&force=true"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("companion shell"),
+        "{refused}"
+    );
+    assert!(wt.is_dir());
+    assert_eq!(hub.session(&companion_id).await["id"], json!(companion_id));
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_create_with_a_refused_worktree_leaves_no_workspace() {
+    let hub = TestHub::start().await;
+    let state = hub.state_dir();
+    let plain = hub.dir.path().join("notes");
+    let sub = hub.repo().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    for (name, folder, why) in [
+        ("plainws", &plain, "is not a git repository"),
+        ("subws", &sub, "is inside the git repository"),
+    ] {
+        let folder = folder.to_string_lossy().into_owned();
+        let (code, _, err) = run_cli(&[
+            "new",
+            name,
+            "--folder",
+            &folder,
+            "--create",
+            "--worktree",
+            "x",
+            "--state-dir",
+            &state,
+        ])
+        .await;
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains(why), "{err}");
+        assert!(!err.contains("created workspace"), "{err}");
+    }
+    let workspaces = hub.get("/api/workspaces").await;
+    assert_eq!(workspaces["workspaces"], json!([]), "{workspaces}");
     hub.shutdown().await;
 }

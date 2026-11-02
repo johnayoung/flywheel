@@ -98,11 +98,19 @@ impl RemovalCheck {
             ));
         }
         (!why.is_empty()).then(|| {
+            // Mirrors what a forced [`remove`] does with the branch.
+            let branch = if self.unmerged > 0 {
+                format!("the branch {} is kept", self.branch)
+            } else {
+                format!(
+                    "the branch {} is deleted too, as it has no commits beyond {}",
+                    self.branch, self.base
+                )
+            };
             format!(
-                "worktree {} has {}; commit and merge them first, or force the removal (uncommitted work is lost; the branch {} is kept)",
+                "worktree {} has {}; commit and merge them first, or force the removal (uncommitted work is lost; {branch})",
                 self.path.display(),
                 why.join(" and "),
-                self.branch
             )
         })
     }
@@ -385,6 +393,22 @@ pub fn create(repo: &Path, plan: &WorktreePlan) -> Result<WorktreeRef, String> {
     })
 }
 
+/// Why worktrees cannot be cut from `dir` (it is not a repository's root
+/// folder): it is inside a repository, or in none.
+pub fn not_a_repo_root(dir: &Path) -> String {
+    match git(dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(top) if !top.trim().is_empty() => format!(
+            "folder {} is inside the git repository {} but is not its root; worktrees are cut from a repository's root folder",
+            dir.display(),
+            top.trim()
+        ),
+        _ => format!(
+            "folder {} is not a git repository; worktrees need one",
+            dir.display()
+        ),
+    }
+}
+
 /// Local branch names of `repo` (at most [`MAX_BRANCHES`]), for picking
 /// a base.
 pub fn branches(repo: &Path) -> Vec<String> {
@@ -499,7 +523,10 @@ fn unmerged(repo: &Path, branch: &str, base: &str) -> Result<u32, String> {
                 "--count",
                 &branch_ref,
                 "--not",
-                &format!("--exclude={branch_ref}"),
+                // `--exclude` before `--branches` matches the short name
+                // (refs/heads/ stripped); branch names cannot hold glob
+                // characters, so this excludes exactly the branch.
+                &format!("--exclude={branch}"),
                 "--branches",
             ],
         )?
@@ -596,8 +623,18 @@ struct Badge {
 #[derive(Default)]
 pub struct GitWatch {
     cache: Mutex<HashMap<BadgeKey, Badge>>,
-    wake: Mutex<Option<mpsc::Sender<Option<BadgeKey>>>>,
+    wake: Mutex<Option<mpsc::Sender<Wake>>>,
 }
+
+/// A message to the badge thread: read a key now, or once `at` passes.
+enum Wake {
+    Now(BadgeKey),
+    At(Instant, BadgeKey),
+}
+
+/// At most this many delayed reads are queued (one per key, latest due
+/// wins); further ones are dropped until the queue drains.
+const MAX_DELAYED: usize = 256;
 
 impl GitWatch {
     /// The cached badge for `key` (`None` until first read, or not git).
@@ -611,17 +648,22 @@ impl GitWatch {
 
     /// Ask the thread to re-read `key` soon (coalesced and debounced).
     pub fn nudge(&self, key: BadgeKey) {
-        if let Some(wake) = &*self.wake.lock().unwrap_or_else(PoisonError::into_inner) {
-            let _ = wake.send(Some(key));
+        self.send(Wake::Now(key));
+    }
+
+    /// Ask the thread to re-read `key` after each of `delays` (no thread
+    /// per call: the badge thread keeps the queue).
+    pub fn nudge_after(&self, key: BadgeKey, delays: &[Duration]) {
+        let now = Instant::now();
+        for delay in delays {
+            self.send(Wake::At(now + *delay, key.clone()));
         }
     }
 
-    /// A handle that nudges like [`GitWatch::nudge`] (for a delayed one).
-    pub fn sender(&self) -> Option<mpsc::Sender<Option<BadgeKey>>> {
-        self.wake
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    fn send(&self, message: Wake) {
+        if let Some(wake) = &*self.wake.lock().unwrap_or_else(PoisonError::into_inner) {
+            let _ = wake.send(message);
+        }
     }
 
     /// Stop the thread (it exits at its next wake).
@@ -682,7 +724,7 @@ pub trait BadgeSource: Send + Sync + 'static {
 /// keys never read yet whenever it wakes). Ends when the owner is dropped
 /// or [`GitWatch::stop`] is called.
 pub fn spawn_watcher<T: BadgeSource>(owner: &Arc<T>) {
-    let (wake, woken) = mpsc::channel::<Option<BadgeKey>>();
+    let (wake, woken) = mpsc::channel::<Wake>();
     *owner
         .git_watch()
         .wake
@@ -695,22 +737,55 @@ pub fn spawn_watcher<T: BadgeSource>(owner: &Arc<T>) {
             let mut last_sweep = Instant::now();
             // A first sweep at once, so badges show soon after a start.
             let mut sweep = true;
+            // Delayed reads: (due, key), at most [`MAX_DELAYED`].
+            let mut delayed: Vec<(Instant, BadgeKey)> = Vec::new();
+            let take = |message: Wake,
+                        nudged: &mut Vec<BadgeKey>,
+                        delayed: &mut Vec<(Instant, BadgeKey)>| {
+                match message {
+                    Wake::Now(key) => nudged.push(key),
+                    Wake::At(at, key) => {
+                        // A read of the same key due about then covers it.
+                        let near = |t: Instant| {
+                            let gap = if t > at { t - at } else { at - t };
+                            gap < NUDGE_DEBOUNCE
+                        };
+                        if delayed.len() < MAX_DELAYED
+                            && !delayed.iter().any(|(t, k)| *k == key && near(*t))
+                        {
+                            delayed.push((at, key));
+                        }
+                    }
+                }
+            };
             loop {
                 let mut nudged: Vec<BadgeKey> = Vec::new();
                 if !sweep {
-                    let wait = SLOW_REFRESH.saturating_sub(last_sweep.elapsed());
+                    let sweep_at = last_sweep + SLOW_REFRESH;
+                    let next_due = delayed.iter().map(|(t, _)| *t).min();
+                    let until = next_due.map_or(sweep_at, |t| t.min(sweep_at));
+                    let wait = until.saturating_duration_since(Instant::now());
                     match woken.recv_timeout(wait) {
-                        Ok(key) => nudged.extend(key),
-                        Err(mpsc::RecvTimeoutError::Timeout) => sweep = true,
+                        Ok(message) => take(message, &mut nudged, &mut delayed),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                     loop {
                         match woken.try_recv() {
-                            Ok(key) => nudged.extend(key),
+                            Ok(message) => take(message, &mut nudged, &mut delayed),
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
+                    let now = Instant::now();
+                    delayed.retain(|(at, key)| {
+                        let due = *at <= now;
+                        if due {
+                            nudged.push(key.clone());
+                        }
+                        !due
+                    });
+                    sweep = now >= sweep_at;
                 }
                 let Some(owner) = weak.upgrade() else {
                     break;
@@ -933,6 +1008,131 @@ mod tests {
         remove(&gone, false).unwrap();
         let list = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
         assert!(!list.contains("gone"), "{list}");
+    }
+
+    #[test]
+    fn a_deleted_base_still_counts_commits_no_other_branch_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        run(&repo, &["branch", "feat-a"]);
+        let wt = create(&repo, &plan(&repo, "wt", "", Some("feat-a")).unwrap()).unwrap();
+        for n in 0..3 {
+            let file = format!("w{n}");
+            std::fs::write(wt.path.join(&file), "x\n").unwrap();
+            run(&wt.path, &["add", &file]);
+            run(&wt.path, &["commit", "-q", "-m", &file]);
+        }
+        // The base is merged elsewhere and deleted: the 3 commits are on
+        // no other branch, so removal is refused and a forced one keeps
+        // the branch.
+        run(&repo, &["branch", "-D", "feat-a"]);
+        let check = removal_check(&wt).unwrap();
+        assert_eq!(check.unmerged, 3);
+        let err = remove(&wt, false).unwrap_err();
+        assert!(err.contains("3 commits not in feat-a"), "{err}");
+        assert!(err.contains("the branch wt is kept"), "{err}");
+        assert!(wt.path.exists());
+        let forced = remove(&wt, true).unwrap();
+        assert!(!forced.branch_deleted);
+        assert!(git_ok(
+            &repo,
+            &["show-ref", "--verify", "--quiet", "refs/heads/wt"]
+        ));
+
+        // Once another branch holds them, nothing is lost.
+        let wt2 = create(&repo, &plan(&repo, "wt2", "", Some("main")).unwrap()).unwrap();
+        std::fs::write(wt2.path.join("y"), "y\n").unwrap();
+        run(&wt2.path, &["add", "y"]);
+        run(&wt2.path, &["commit", "-q", "-m", "y"]);
+        run(&repo, &["branch", "keep", "wt2"]);
+        let gone = WorktreeRef {
+            base: "deleted-base".into(),
+            ..wt2.clone()
+        };
+        assert_eq!(removal_check(&gone).unwrap().unmerged, 0);
+    }
+
+    #[test]
+    fn the_refusal_says_what_a_forced_removal_does_with_the_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let wt = create(&repo, &plan(&repo, "only-untracked", "", None).unwrap()).unwrap();
+        std::fs::write(wt.path.join("scratch"), "x\n").unwrap();
+        let why = removal_check(&wt).unwrap().refusal().unwrap();
+        assert!(why.contains("1 untracked file"), "{why}");
+        assert!(
+            why.contains("the branch only-untracked is deleted too"),
+            "{why}"
+        );
+        assert!(!why.contains("is kept"), "{why}");
+        assert!(remove(&wt, true).unwrap().branch_deleted);
+    }
+
+    #[test]
+    fn a_subdirectory_of_a_repo_is_named_as_such() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let sub = repo.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let why = not_a_repo_root(&sub);
+        assert!(why.contains("is inside the git repository"), "{why}");
+        assert!(why.contains(&repo.display().to_string()), "{why}");
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert!(not_a_repo_root(&plain).contains("is not a git repository"));
+    }
+
+    struct Owner {
+        watch: GitWatch,
+        keys: Vec<(BadgeKey, bool)>,
+        changed: Mutex<u32>,
+    }
+
+    impl BadgeSource for Owner {
+        fn git_watch(&self) -> &GitWatch {
+            &self.watch
+        }
+        fn badge_keys(&self) -> Vec<(BadgeKey, bool)> {
+            self.keys.clone()
+        }
+        fn badges_changed(&self) {
+            *self.changed.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn delayed_nudges_are_read_by_the_watcher_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let key = BadgeKey {
+            dir: repo.clone(),
+            base: None,
+        };
+        let owner = Arc::new(Owner {
+            watch: GitWatch::default(),
+            keys: vec![(key.clone(), true)],
+            changed: Mutex::new(0),
+        });
+        spawn_watcher(&owner);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while owner.watch.get(&key).is_none() {
+            assert!(Instant::now() < deadline, "first read");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(repo.join("new"), "x\n").unwrap();
+        // Many delayed nudges coalesce on the one thread; one is read
+        // once due (well before the slow sweep).
+        for _ in 0..1000 {
+            owner
+                .watch
+                .nudge_after(key.clone(), &[Duration::from_millis(900)]);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while owner.watch.get(&key).is_none_or(|s| s.untracked == 0) {
+            assert!(Instant::now() < deadline, "delayed read");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        owner.watch.stop();
     }
 
     #[test]

@@ -277,6 +277,35 @@ pub fn worktrees_dir(repo: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(format!("{name}.worktrees")))
 }
 
+/// The main checkout `dir` is a linked worktree of (the bare repo's
+/// directory for a worktree of a bare repo); `None` for a main checkout,
+/// a folder outside git, or when git cannot tell.
+pub fn linked_worktree_main(dir: &Path) -> Option<PathBuf> {
+    let out = git(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = out.lines().map(|l| {
+        let path = PathBuf::from(l.trim());
+        path.canonicalize().unwrap_or(path)
+    });
+    let (git_dir, common) = (lines.next()?, lines.next()?);
+    if git_dir == common {
+        return None;
+    }
+    if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent().map(Path::to_path_buf)
+    } else {
+        Some(common)
+    }
+}
+
 /// Resolve a new worktree for `task` in `repo` without creating it: the
 /// path (sibling of the main checkout, never inside a repo), branch
 /// `<prefix><task>` (must not exist yet), and base (`base`, which must
@@ -853,6 +882,21 @@ mod tests {
         run(&repo, &["add", "README"]);
         run(&repo, &["commit", "-q", "-m", "init"]);
         repo.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_linked_worktree_names_its_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path());
+        assert_eq!(linked_worktree_main(&main), None);
+        let linked = tmp.path().join("code").join("app.worktrees").join("x");
+        run(
+            &main,
+            &["worktree", "add", "-q", "-b", "x", linked.to_str().unwrap()],
+        );
+        assert_eq!(linked_worktree_main(&linked), Some(main.clone()));
+        assert_eq!(linked_worktree_main(&main.join("sub-missing")), None);
+        assert_eq!(linked_worktree_main(tmp.path()), None);
     }
 
     #[test]

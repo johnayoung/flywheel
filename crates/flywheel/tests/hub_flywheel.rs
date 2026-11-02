@@ -8,6 +8,10 @@
 
 #![cfg(unix)]
 
+// Stand-in scripts are written the flake-free way (see the helper).
+#[path = "../../flywheel-hub/tests/support/script.rs"]
+mod script;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flywheel::hub_flywheel::{AUTOPILOT_ACTIVITY, HubFlywheel};
 use flywheel_core::events::{DomainEvent, DomainEventPayload, LandingParked};
@@ -29,6 +33,8 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use script::write_script;
 
 const POLICY: &str = "[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n\
                       [paths]\ndb = \".flywheel/flywheel.sqlite\"\n";
@@ -436,7 +442,7 @@ fn open_files_under(pid: u32, dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn a_linked_worktree_of_an_adopted_repo_is_not_adopted_until_it_has_its_own_store() {
+fn a_linked_worktree_of_an_adopted_repo_reads_its_own_store_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().canonicalize().unwrap();
     let main = base.join("repo");
@@ -446,6 +452,8 @@ fn a_linked_worktree_of_an_adopted_repo_is_not_adopted_until_it_has_its_own_stor
     std::fs::write(main.join(".gitignore"), ".flywheel/\n").unwrap();
     git(&main, &["add", "."]);
     git(&main, &["commit", "-q", "-m", "adopt"]);
+    std::fs::create_dir_all(main.join(".flywheel")).unwrap();
+    SqliteStore::open(main.join(".flywheel/flywheel.sqlite")).unwrap();
     let sibling = base.join("repo.worktrees/task");
     git(
         &main,
@@ -461,15 +469,26 @@ fn a_linked_worktree_of_an_adopted_repo_is_not_adopted_until_it_has_its_own_stor
     assert!(sibling.join("flywheel.toml").is_file(), "tracked policy");
     let provider = HubFlywheel::new("/usr/bin/false");
     assert!(provider.adopted(&main));
+    // `fw worker` / `fw status` run there resolve `.flywheel/` under the
+    // worktree: its own loop, labelled as a worktree of the main checkout.
+    assert!(provider.adopted(&sibling));
+    let main_panel = provider.panel(&main);
+    assert_eq!(main_panel.worktree_of, None);
+    assert_eq!(main_panel.problem, None, "{main_panel:?}");
+    let panel = provider.panel(&sibling);
+    assert_eq!(panel.worktree_of.as_deref(), Some(main.as_path()));
+    assert_eq!(panel.summary().worktree_of.as_deref(), Some(main.as_path()));
+    let problem = panel.problem.clone().unwrap_or_default();
+    assert!(problem.contains("no store yet"), "{problem}");
     assert!(
-        !provider.adopted(&sibling),
-        "its loop runs in the main checkout"
+        !sibling.join(".flywheel/flywheel.sqlite").exists(),
+        "reading creates no store"
     );
-    // Tracked `.flywheel/` files (specs, say) are not a loop either.
-    std::fs::create_dir(sibling.join(".flywheel")).unwrap();
-    assert!(!provider.adopted(&sibling));
+    std::fs::create_dir_all(sibling.join(".flywheel")).unwrap();
     SqliteStore::open(sibling.join(".flywheel/flywheel.sqlite")).unwrap();
-    assert!(provider.adopted(&sibling), "a store of its own");
+    let panel = provider.panel(&sibling);
+    assert_eq!(panel.worktree_of.as_deref(), Some(main.as_path()));
+    assert_eq!(panel.problem, None, "{panel:?}");
 }
 
 #[cfg(target_os = "linux")]
@@ -634,9 +653,7 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     // Never the real agent CLI.
     let fake = dir.join("bin/claude");
-    std::fs::write(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n");
     let root = dir.join("repo");
     std::fs::create_dir_all(&root).unwrap();
     adopted_repo(&root);
@@ -816,9 +833,7 @@ fn start_worker_here_refuses_a_duplicate_while_the_first_still_runs() {
     let dir = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     let fake = dir.join("bin/claude");
-    std::fs::write(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n");
     // An adopted git repo with nothing to do: its `fw worker` idles.
     let root = dir.join("idle");
     std::fs::create_dir_all(root.join(".flywheel/tasks/active")).unwrap();

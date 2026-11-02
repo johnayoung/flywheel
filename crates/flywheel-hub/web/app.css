@@ -2195,6 +2195,14 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   scrollbar-color: var(--rule-2) transparent;
 }
 .fw-empty { margin: .6rem 0; color: var(--ink-3); line-height: 1.6; }
+.fw-note {
+  margin: .7rem 0 0;
+  padding: .45rem .7rem;
+  border-left: 3px solid var(--rule-2);
+  color: var(--ink-3);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
 .fw-problem {
   margin: .7rem 0 0;
   padding: .5rem .7rem;

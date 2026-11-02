@@ -214,6 +214,10 @@ window.FwHubFlywheel = function (ctx) {
   }
 
   // The adopted folder a session runs in (its own folder, or above it).
+  // A sibling-worktree session (worktree.js) whose worktree is not watched
+  // itself falls back to the folder it was cut from, labelled as such
+  // (worktreeNote): its worktree has a flywheel store of its own, empty
+  // until a worker runs there.
   function folderOf(session) {
     if (!session) return null;
     const cwd = session.cwd || "";
@@ -221,7 +225,30 @@ window.FwHubFlywheel = function (ctx) {
     for (const folder of ui.summaries.keys()) {
       if ((cwd === folder || cwd.startsWith(`${folder}/`)) && (!best || folder.length > best.length)) best = folder;
     }
+    if (!best && session.worktree && ui.summaries.has(session.worktree.repo)) best = session.worktree.repo;
     return best;
+  }
+
+  // Whether `session` reaches `folder`'s panel only through its worktree's
+  // base folder (not by running in it).
+  function viaWorktree(session, folder) {
+    if (!session || !session.worktree || session.worktree.repo !== folder) return false;
+    const cwd = session.cwd || "";
+    return cwd !== folder && !cwd.startsWith(`${folder}/`);
+  }
+
+  // What the panel says about checkouts: a folder that is itself a linked
+  // worktree reads its own store; a worktree session sees its base's loop.
+  function worktreeNote(panel) {
+    const session = ctx.sessionById(state.attached);
+    if (panel.worktree_of) {
+      const main = panel.worktree_of.split("/").filter(Boolean).pop() || panel.worktree_of;
+      return `Linked worktree of ${panel.worktree_of}. Flywheel keeps a store per checkout: this panel and Start worker here use this worktree's own, not ${main}'s.`;
+    }
+    if (viaWorktree(session, panel.folder)) {
+      return `${session.name} runs in worktree ${session.worktree.path} (branch ${session.worktree.branch}), a separate checkout with its own flywheel store. Shown: ${labelFor(panel.folder)}'s loop.`;
+    }
+    return "";
   }
 
   // Hub sessions running a worker in `folder` (started from this panel;
@@ -261,13 +288,14 @@ window.FwHubFlywheel = function (ctx) {
       ? `${fresh} need${fresh === 1 ? "s" : ""} you`
       : s.live_runs ? `${s.live_runs} running` : s.worker_live ? "worker live" : "idle";
     const tasks = count ? `${verified}/${count} verified` : "no active tasks";
+    const wt = s.worktree_of ? ` Linked worktree of ${s.worktree_of}: its own store.` : "";
     return el(
       "button",
       {
         type: "button",
         className: `fw-chip ${t}${ui.folder === folder.path ? " open" : ""}`,
-        title: `${node.title}\nflywheel: ${tasks}, ${why}. Open the Flywheel panel.`,
-        "aria-label": `${folderLabel(folder)}: Flywheel panel (${tasks}, ${why})`,
+        title: `${node.title}\nflywheel: ${tasks}, ${why}.${wt} Open the Flywheel panel.`,
+        "aria-label": `${folderLabel(folder)}: Flywheel panel (${tasks}, ${why})${s.worktree_of ? ", linked worktree" : ""}`,
         onclick: (event) => {
           event.stopPropagation();
           open(folder.path, workspaceId);
@@ -336,7 +364,9 @@ window.FwHubFlywheel = function (ctx) {
     const fresh = unseen(folder, s).length;
     badge.hidden = !fresh;
     badge.textContent = String(fresh);
-    pill.title = `Flywheel panel for ${labelFor(folder)} (Alt F)`;
+    pill.title = viaWorktree(session, folder)
+      ? `Flywheel panel for ${labelFor(folder)}, this worktree's base checkout (Alt F)`
+      : `Flywheel panel for ${labelFor(folder)} (Alt F)`;
   }
 
   function togglePill() {
@@ -663,6 +693,8 @@ window.FwHubFlywheel = function (ctx) {
       ),
     ];
     if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
+    const note = worktreeNote(panel);
+    if (note) children.push(el("p", { className: "fw-note", textContent: note }));
     if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));
     if (panel.alerts.length) children.push(alertsSection(folder, panel.alerts));
     if (panel.live.length) {

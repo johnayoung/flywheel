@@ -213,6 +213,11 @@ pub struct FlywheelPanel {
     pub source: String,
     /// The store read (`sqlite .flywheel/flywheel.sqlite`, `postgres`).
     pub store: String,
+    /// The main checkout, when the folder is a linked git worktree: flywheel
+    /// keeps a store per checkout, so this panel reads the worktree's own
+    /// (not the main checkout's).
+    #[serde(default)]
+    pub worktree_of: Option<PathBuf>,
     /// Why some of the panel is missing (no store yet, a policy or store
     /// error); what could be read is still shown.
     pub problem: Option<String>,
@@ -235,6 +240,7 @@ impl FlywheelPanel {
             generated_at,
             source: String::new(),
             store: String::new(),
+            worktree_of: None,
             problem: None,
             phases: Vec::new(),
             tasks_note: None,
@@ -270,6 +276,7 @@ impl FlywheelPanel {
             worker_live: self.worker.live,
             autopilot_live: self.autopilot.live,
             problem: self.problem.clone(),
+            worktree_of: self.worktree_of.clone(),
         }
     }
 
@@ -303,6 +310,9 @@ pub struct FlywheelSummary {
     pub worker_live: bool,
     pub autopilot_live: bool,
     pub problem: Option<String>,
+    /// See [`FlywheelPanel::worktree_of`].
+    #[serde(default)]
+    pub worktree_of: Option<PathBuf>,
 }
 
 /// One line of a run's agent transcript (redacted), in order.
@@ -868,7 +878,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_worker_session_counts_as_running_until_its_shell_takes_over() {
-        use std::os::unix::fs::PermissionsExt;
         // Kills the session process however the test ends.
         struct Reap(std::process::Child);
         impl Drop for Reap {
@@ -889,8 +898,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = dir.path().join("go");
         let shell = dir.path().join("shell");
-        std::fs::write(&shell, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_script(&shell, "#!/bin/sh\nexec sleep 30\n");
         let wait = format!("while [ ! -e {} ]; do sleep 0.05; done", gate.display());
         let argv = worker_session_command(&["/bin/sh".into(), "-c".into(), wait]);
         let child = std::process::Command::new(&argv[0])

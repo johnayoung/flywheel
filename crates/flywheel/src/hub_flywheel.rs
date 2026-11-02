@@ -208,6 +208,9 @@ struct Folder {
     /// The `flywheel.toml` stamp `resolved` was read under.
     policy_stamp: Option<Option<(u64, u128)>>,
     resolved: Option<Result<Resolved, String>>,
+    /// The main checkout when the folder is a linked git worktree; read
+    /// once (`Some(None)`: not one).
+    worktree_of: Option<Option<PathBuf>>,
 }
 
 struct Resolved {
@@ -240,6 +243,12 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 impl Folder {
+    fn worktree_of(&mut self, root: &Path) -> Option<PathBuf> {
+        self.worktree_of
+            .get_or_insert_with(|| flywheel_hub::git::linked_worktree_main(root))
+            .clone()
+    }
+
     /// Re-read the policy when `flywheel.toml` changed (or on first use).
     fn resolve(&mut self, root: &Path) -> Result<&mut Resolved, String> {
         let policy_file = root.join(DEFAULT_POLICY_FILENAME);
@@ -792,14 +801,11 @@ fn cut(body: String) -> String {
 
 impl FlywheelProvider for HubFlywheel {
     fn adopted(&self, folder: &Path) -> bool {
-        if folder.join(".git").is_file() {
-            // A linked git worktree of an adopted repo carries its tracked
-            // flywheel.toml (and any tracked `.flywheel/` files) but not
-            // the gitignored store: its loop runs in the main checkout,
-            // and a worker started here would grow a second, separate
-            // store. It counts once it has a store of its own.
-            return folder.join(DEFAULT_STORE_PATH).is_file();
-        }
+        // A linked git worktree of an adopted repo counts too: flywheel
+        // keeps a store per checkout (`fw worker` and `fw status` resolve
+        // `.flywheel/` under the worktree itself, never the main
+        // checkout's), so its panel reads its own store and says so
+        // (`worktree_of`).
         folder.join(DEFAULT_POLICY_FILENAME).is_file() || folder.join(".flywheel").is_dir()
     }
 
@@ -830,6 +836,7 @@ impl FlywheelProvider for HubFlywheel {
         panel.autopilot = autopilot_state(folder);
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        panel.worktree_of = state.worktree_of(folder);
         let resolved = match state.resolve(folder) {
             Ok(resolved) => resolved,
             Err(message) => {

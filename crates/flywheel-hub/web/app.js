@@ -166,7 +166,7 @@
     }
     const response = await fetch(path, init);
     if (response.status === 401) {
-      window.location.replace("/");
+      window.location.replace("/" + window.location.hash);
       throw new Error("signed out");
     }
     const text = await response.text();
@@ -564,7 +564,7 @@
       endReplay();
       // 4001: the hub's token was rotated; this login no longer counts.
       if (event.code === 4001) {
-        window.location.replace("/");
+        window.location.replace("/?signed_out=rotated" + window.location.hash);
         return;
       }
       if (state.exited || state.attached !== id) return;

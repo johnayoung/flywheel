@@ -7,17 +7,19 @@
 //! constant time. Browsers trade it once (`/login?token=...`) -- or a
 //! short-lived single-use [`LoginCodes`] code (`/login?code=...`), so the
 //! long-lived token never has to be shown on a screen or in a QR code --
-//! for an `HttpOnly; SameSite=Strict` cookie; scripts send
+//! for an `HttpOnly; SameSite=Strict` cookie carrying a per-login secret
+//! ([`Logins`]; never the token itself); scripts send
 //! `Authorization: Bearer`. Failed credentials are rate-limited per client
 //! address ([`FailureLimiter`]).
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 /// Token file name inside the state dir.
@@ -28,6 +30,17 @@ pub const COOKIE_PREFIX: &str = "fw_hub_";
 pub const COOKIE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 /// Random bytes in a token (256 bits).
 const TOKEN_BYTES: usize = 32;
+/// The browser logins file inside the state dir (digests only).
+pub const LOGINS_FILE: &str = "logins.json";
+/// Browser logins kept at once; issuing beyond this drops the one closest
+/// to expiry.
+pub const MAX_LOGINS: usize = 256;
+
+fn random_hex(bytes: usize) -> Result<String, TokenError> {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).map_err(|e| TokenError::Random(e.to_string()))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 /// Token file failures.
 #[derive(Debug, thiserror::Error)]
@@ -57,11 +70,7 @@ impl std::fmt::Debug for Token {
 impl Token {
     /// A fresh random token.
     pub fn generate() -> Result<Self, TokenError> {
-        let mut bytes = [0u8; TOKEN_BYTES];
-        getrandom::fill(&mut bytes).map_err(|e| TokenError::Random(e.to_string()))?;
-        Ok(Self(
-            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-        ))
+        random_hex(TOKEN_BYTES).map(Self)
     }
 
     /// The token text (for the login URL and `fw hub token`).
@@ -110,6 +119,132 @@ impl Token {
         write_private(&path, format!("{}\n", token.0).as_bytes())
             .map_err(|source| TokenError::Io { path, source })?;
         Ok(token)
+    }
+}
+
+/// Browser logins: each successful sign-in gets its own 256-bit secret,
+/// which is what the login cookie carries -- so a phone that scanned a QR
+/// code holds a revocable login, not the long-lived token. Only SHA-256
+/// digests are kept, persisted (0600) in [`LOGINS_FILE`] so logins survive
+/// a hub restart. Rotating the token forgets every login; logging out
+/// forgets that one.
+#[derive(Debug, Default)]
+pub struct Logins {
+    entries: Vec<LoginEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LoginEntry {
+    /// Hex SHA-256 of the secret.
+    digest: String,
+    /// Unix seconds.
+    expires: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LoginsFile {
+    logins: Vec<LoginEntry>,
+}
+
+fn login_digest(secret: &str) -> String {
+    Sha256::new()
+        .chain_update(b"flywheel-hub-login\0")
+        .chain_update(secret.as_bytes())
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Seconds since the Unix epoch.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl Logins {
+    /// The logins recorded in `state_dir`. A missing file is no logins; an
+    /// unreadable or malformed one too (everyone signs in again) -- it is
+    /// a cache of sessions, never a reason to refuse to start.
+    pub fn load(state_dir: &Path, now: u64) -> Self {
+        let entries = fs::read(state_dir.join(LOGINS_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LoginsFile>(&bytes).ok())
+            .map(|file| file.logins)
+            .unwrap_or_default();
+        let mut logins = Self { entries };
+        logins.prune(now);
+        logins
+    }
+
+    /// Persist to `state_dir` (0600, atomic).
+    pub fn save(&self, state_dir: &Path) -> Result<(), TokenError> {
+        let path = state_dir.join(LOGINS_FILE);
+        let file = LoginsFile {
+            logins: self.entries.clone(),
+        };
+        let json = serde_json::to_vec(&file).map_err(|e| TokenError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(e),
+        })?;
+        write_private(&path, &json).map_err(|source| TokenError::Io { path, source })
+    }
+
+    /// A fresh login secret valid for [`COOKIE_MAX_AGE_SECS`].
+    pub fn issue(&mut self, now: u64) -> Result<String, TokenError> {
+        let secret = random_hex(TOKEN_BYTES)?;
+        self.prune(now);
+        if self.entries.len() >= MAX_LOGINS
+            && let Some(soonest) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.expires)
+                .map(|(i, _)| i)
+        {
+            self.entries.remove(soonest);
+        }
+        self.entries.push(LoginEntry {
+            digest: login_digest(&secret),
+            expires: now.saturating_add(COOKIE_MAX_AGE_SECS),
+        });
+        Ok(secret)
+    }
+
+    /// Whether `secret` is a live login.
+    pub fn valid(&self, secret: &str, now: u64) -> bool {
+        let digest = login_digest(secret);
+        self.entries
+            .iter()
+            .any(|e| e.expires > now && bool::from(e.digest.as_bytes().ct_eq(digest.as_bytes())))
+    }
+
+    /// Forget `secret`; true when it was a login.
+    pub fn revoke(&mut self, secret: &str) -> bool {
+        let digest = login_digest(secret);
+        let before = self.entries.len();
+        self.entries.retain(|e| e.digest != digest);
+        self.entries.len() != before
+    }
+
+    /// Forget every login (the token was rotated).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Logins still live.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// No live logins.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn prune(&mut self, now: u64) {
+        self.entries.retain(|e| e.expires > now);
     }
 }
 
@@ -219,8 +354,8 @@ const MAX_TRACKED_CLIENTS: usize = 4096;
 
 /// Per-client rate limit on failed credentials (a wrong token, code,
 /// cookie, or bearer). A client at the limit is refused -- even with a
-/// valid credential, or guessing could go on -- until its oldest failure
-/// leaves the window. IPv6 clients are keyed by their /64, which one host
+/// valid token or code, or guessing could go on -- until its oldest failure
+/// leaves the window (the server still honours live login cookies). IPv6 clients are keyed by their /64, which one host
 /// usually owns whole.
 #[derive(Debug, Default)]
 pub struct FailureLimiter {
@@ -347,12 +482,12 @@ pub fn bearer_value(authorization: &str) -> Option<&str> {
         .then_some(value.trim())
 }
 
-/// The `Set-Cookie` value that logs a browser in.
-pub fn login_cookie(token: &Token, secure: bool) -> String {
+/// The `Set-Cookie` value that logs a browser in: the cookie named after
+/// `token`, carrying the login `secret` from [`Logins::issue`].
+pub fn login_cookie(token: &Token, secret: &str, secure: bool) -> String {
     format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_SECS}{}",
+        "{}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_SECS}{}",
         cookie_name(token.expose()),
-        token.expose(),
         if secure { "; Secure" } else { "" }
     )
 }
@@ -495,10 +630,15 @@ mod tests {
     #[test]
     fn login_cookie_is_http_only_and_strict() {
         let t = Token::generate().unwrap();
-        let c = login_cookie(&t, false);
+        let c = login_cookie(&t, "s3cret", false);
         assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict"));
+        assert!(c.starts_with(&format!("{}=s3cret;", cookie_name(t.expose()))));
+        assert!(
+            !c.contains(t.expose()),
+            "the cookie never carries the token"
+        );
         assert!(!c.contains("Secure"));
-        assert!(login_cookie(&t, true).ends_with("; Secure"));
+        assert!(login_cookie(&t, "s3cret", true).ends_with("; Secure"));
         assert!(logout_cookie(&t).contains("Max-Age=0"));
     }
 
@@ -541,6 +681,58 @@ mod tests {
         assert_ne!(first.expose(), rotated.expose());
         let loaded = Token::load(dir.path()).unwrap().unwrap();
         assert_eq!(loaded.expose(), rotated.expose());
+    }
+
+    #[test]
+    fn logins_are_per_sign_in_persisted_and_revocable() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_000_000;
+        let mut logins = Logins::load(dir.path(), now);
+        assert!(logins.is_empty());
+        let a = logins.issue(now).unwrap();
+        let b = logins.issue(now).unwrap();
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b);
+        assert!(logins.valid(&a, now) && logins.valid(&b, now));
+        assert!(!logins.valid("", now) && !logins.valid(&a[..63], now));
+        logins.save(dir.path()).unwrap();
+        let text = fs::read_to_string(dir.path().join(LOGINS_FILE)).unwrap();
+        assert!(!text.contains(&a) && !text.contains(&b), "digests only");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(LOGINS_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let mut reloaded = Logins::load(dir.path(), now);
+        assert!(reloaded.valid(&a, now), "survives a restart");
+        assert!(reloaded.revoke(&a));
+        assert!(!reloaded.revoke(&a));
+        assert!(!reloaded.valid(&a, now) && reloaded.valid(&b, now));
+        let expiry = now + COOKIE_MAX_AGE_SECS;
+        assert!(!reloaded.valid(&b, expiry), "expired");
+        assert_eq!(Logins::load(dir.path(), expiry).len(), 0);
+        reloaded.clear();
+        assert!(!reloaded.valid(&b, now));
+        fs::write(dir.path().join(LOGINS_FILE), "{").unwrap();
+        assert!(Logins::load(dir.path(), now).is_empty(), "malformed: none");
+    }
+
+    #[test]
+    fn logins_are_bounded() {
+        let mut logins = Logins::default();
+        let first = logins.issue(10).unwrap();
+        for i in 0..MAX_LOGINS {
+            logins.issue(11 + i as u64).unwrap();
+        }
+        assert_eq!(logins.len(), MAX_LOGINS);
+        assert!(
+            !logins.valid(&first, 20),
+            "the soonest to expire was dropped"
+        );
     }
 
     #[test]

@@ -14,6 +14,10 @@ use std::time::{Duration, Instant};
 
 /// The runtime file inside the state dir: present while a hub serves.
 pub const RUNTIME_FILE: &str = "server.json";
+/// The lock file inside the state dir: a serving hub holds an exclusive
+/// lock on it, so one state dir has at most one hub, and a runtime file
+/// nobody holds the lock for is stale.
+pub const LOCK_FILE: &str = "serve.lock";
 /// How long a `tailscale` CLI call may take before it is abandoned.
 pub const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -68,21 +72,54 @@ impl RuntimeInfo {
     }
 }
 
-/// Whether process `pid` exists (always true off Unix).
-pub fn process_alive(pid: u32) -> bool {
+/// The exclusive serve lock on a state dir, held while a hub serves it
+/// (released when dropped or when the process dies, however it dies).
+#[derive(Debug)]
+pub struct ServeLock {
+    _file: std::fs::File,
+}
+
+fn open_lock_file(state_dir: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // Signal 0 checks existence; EPERM means it exists as another user.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
+    options.open(state_dir.join(LOCK_FILE))
+}
+
+impl ServeLock {
+    /// Take the lock; `None` when another hub holds it.
+    pub fn acquire(state_dir: &Path) -> std::io::Result<Option<Self>> {
+        let file = open_lock_file(state_dir)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+/// The hub serving `state_dir`, if one does: its runtime file, trusted only
+/// while the serve lock is held. A runtime file left by a hub that died
+/// without cleaning up is removed (under the lock, so a hub starting
+/// meanwhile cannot lose its own).
+pub fn running_hub(state_dir: &Path) -> std::io::Result<Option<RuntimeInfo>> {
+    if !state_dir.join(RUNTIME_FILE).exists() {
+        return Ok(None);
+    }
+    match ServeLock::acquire(state_dir)? {
+        Some(_probe) => {
+            match std::fs::remove_file(state_dir.join(RUNTIME_FILE)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            Ok(None)
+        }
+        None => RuntimeInfo::read(state_dir),
     }
 }
 
@@ -380,13 +417,17 @@ pub fn login_targets(
         let mut candidates: Vec<(String, IpAddr)> = Vec::new();
         if ip.is_unspecified() {
             candidates.extend(interfaces.iter().cloned());
-            // The tailnet address even when its interface was not listed.
-            candidates.extend(
-                tailnet_ips
-                    .iter()
-                    .filter(|t| t.is_ipv4())
-                    .map(|t| ("tailscale".to_owned(), *t)),
-            );
+            // A tailnet address no interface carries is not reachable here
+            // (userspace-networking tailscale): only listed when the
+            // interfaces could not be enumerated at all.
+            if interfaces.is_empty() {
+                candidates.extend(
+                    tailnet_ips
+                        .iter()
+                        .filter(|t| t.is_ipv4())
+                        .map(|t| ("tailscale".to_owned(), *t)),
+                );
+            }
         } else {
             let name = interfaces
                 .iter()
@@ -487,9 +528,29 @@ mod tests {
     }
 
     #[test]
-    fn process_alive_sees_this_process() {
-        assert!(process_alive(std::process::id()));
-        assert!(!process_alive(u32::MAX));
+    fn serve_lock_is_exclusive_and_gates_the_runtime_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(running_hub(dir.path()).unwrap(), None);
+        let info = RuntimeInfo {
+            pid: std::process::id(),
+            listen: "127.0.0.1:7420".parse().unwrap(),
+            public_urls: Vec::new(),
+        };
+        // A runtime file nobody holds the lock for is stale: ignored and
+        // removed (a crashed hub, even if its pid was reused).
+        info.write(dir.path()).unwrap();
+        assert_eq!(running_hub(dir.path()).unwrap(), None);
+        assert!(!dir.path().join(RUNTIME_FILE).exists());
+        let lock = ServeLock::acquire(dir.path()).unwrap().expect("free");
+        assert!(ServeLock::acquire(dir.path()).unwrap().is_none(), "held");
+        info.write(dir.path()).unwrap();
+        assert_eq!(running_hub(dir.path()).unwrap(), Some(info.clone()));
+        drop(lock);
+        assert!(
+            ServeLock::acquire(dir.path()).unwrap().is_some(),
+            "released"
+        );
+        assert_eq!(running_hub(dir.path()).unwrap(), None);
     }
 
     #[test]
@@ -624,6 +685,21 @@ esac
         );
         assert_eq!(everywhere[4].label, "lan (eth0)");
         assert!(!everywhere[5].remote);
+
+        // Tailscale reports 100.64.0.9 but no interface has it (userspace
+        // networking): not reachable on the bind, not listed.
+        let lan_only = login_targets(
+            "0.0.0.0:7420".parse().unwrap(),
+            &[],
+            Some(&ts),
+            &interfaces[..1],
+        );
+        assert!(
+            lan_only.iter().all(|t| !t.base.contains("100.64.0.9")),
+            "{lan_only:?}"
+        );
+        let unknown = login_targets("0.0.0.0:7420".parse().unwrap(), &[], Some(&ts), &[]);
+        assert!(unknown.iter().any(|t| t.base == "http://100.64.0.9:7420"));
 
         let loopback = login_targets("127.0.0.1:7420".parse().unwrap(), &[], None, &interfaces);
         assert_eq!(loopback.len(), 1);

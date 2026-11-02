@@ -4,7 +4,7 @@
 //! verbs against a real server on 127.0.0.1:0.
 
 use flywheel_hub::auth::{MAX_FAILURES, cookie_name};
-use flywheel_hub::remote::RuntimeInfo;
+use flywheel_hub::remote::{RuntimeInfo, ServeLock};
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -160,11 +160,34 @@ async fn one_time_codes_log_in_once() {
         .await
         .unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
-    // The cookie carries the session credential, never the code.
+    // The cookie carries a fresh per-login secret: never the code, and
+    // never the long-lived token.
     let pair = cookie_pair(&ok);
+    let (name, value) = pair.split_once('=').unwrap();
+    assert_eq!(name, cookie_name(&hub.token()));
+    assert_eq!(value.len(), 64);
+    assert!(value != hub.token() && value != code, "{pair}");
+    // The signed-in page replaces itself (and the spent code URL in
+    // history) with the hub, keeping the URL fragment.
+    let page = ok.text().await.unwrap();
+    assert!(page.contains("data-signed-in") && page.contains("/assets/login.js"));
+    let script = hub
+        .http
+        .get(hub.url("/assets/login.js"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
-        pair,
-        format!("{}={}", cookie_name(&hub.token()), hub.token())
+        script.status(),
+        StatusCode::OK,
+        "public: the login page needs it"
+    );
+    assert!(
+        script
+            .text()
+            .await
+            .unwrap()
+            .contains("location.replace(\"/\" + hash)")
     );
     let app = hub
         .http
@@ -258,6 +281,33 @@ async fn failed_attempts_are_limited_per_client() {
     // Other clients are unaffected.
     let other = attempt(Some("198.51.100.4"), hub.token()).await.unwrap();
     assert_eq!(other.status(), StatusCode::OK);
+    // A live login cookie still works from the locked-out address: an
+    // attacker sharing a proxy or NAT address with a signed-in user cannot
+    // lock the user out (and cannot guess a 256-bit login secret).
+    let signed_in = cookie_pair(&other);
+    for path in ["/api/workspaces", "/"] {
+        let response = hub
+            .http
+            .get(hub.url(path))
+            .header(COOKIE, &signed_in)
+            .header("x-forwarded-for", attacker)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    let guess = hub
+        .http
+        .get(hub.url("/api/workspaces"))
+        .header(
+            COOKIE,
+            format!("{}={}", cookie_name(&hub.token()), "f".repeat(64)),
+        )
+        .header("x-forwarded-for", attacker)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(guess.status(), StatusCode::TOO_MANY_REQUESTS);
     // Direct connections from this machine (the CLI, a local browser) are
     // never locked out: the limit guards against the network.
     for i in 0..=MAX_FAILURES {
@@ -366,6 +416,17 @@ async fn rotating_the_token_signs_everyone_out_without_a_restart() {
         app.text().await.unwrap().contains("action=\"/login\""),
         "the old cookie gets the login page"
     );
+    // Where the UI lands after a 4001 close: the login page says why.
+    let notice = hub
+        .http
+        .get(hub.url("/?signed_out=rotated"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(notice.contains("token was rotated"), "{notice}");
     let fresh = hub
         .authed(reqwest::Method::GET, "/api/workspaces")
         .send()
@@ -390,6 +451,7 @@ async fn proxy_origins_and_https_cookies() {
     let public = "https://box.tail1234.ts.net".to_owned();
     let hub = TestHub::start(ServerOptions {
         allowed_origins: vec![public.clone()],
+        ..ServerOptions::default()
     })
     .await;
     let post = |origin: &str, forwarded_host: Option<&str>| {
@@ -548,8 +610,9 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
     assert_eq!(code, 1);
     assert!(err.contains("no hub is running"), "{err}");
 
-    // `fw hub serve` records this; do it for the test server (this process
-    // is its pid).
+    // `fw hub serve` holds the serve lock and records this; do it for the
+    // test server (this process is its pid).
+    let serve_lock = ServeLock::acquire(&hub.state_dir).unwrap().unwrap();
     RuntimeInfo {
         pid: std::process::id(),
         listen: hub.addr,
@@ -615,16 +678,30 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
             .unwrap();
     assert_eq!(printed.trim(), hub.token());
 
-    // A stale runtime file (dead pid) means no hub: rotation edits the file.
+    // A runtime file whose hub died without cleaning up (its lock is
+    // gone) means no hub -- even when the recorded pid is alive again (here
+    // this very process) and something listens at the recorded address
+    // (here the hub, still up): nothing is sent there, rotation edits the
+    // file, and the stale file is removed.
+    drop(serve_lock);
     let dead = hub.state_dir.clone();
-    let _dir = hub.shutdown().await;
+    let (code, _, err) = {
+        let state = dead.to_str().unwrap().to_owned();
+        tokio::task::spawn_blocking(move || cli(&["url", "--state-dir", &state]))
+            .await
+            .unwrap()
+    };
+    assert_eq!(code, 1);
+    assert!(err.contains("no hub is running"), "{err}");
+    assert!(!dead.join("server.json").exists(), "stale file removed");
     RuntimeInfo {
-        pid: u32::MAX,
-        listen: "127.0.0.1:9".parse().unwrap(),
+        pid: std::process::id(),
+        listen: hub.addr,
         public_urls: Vec::new(),
     }
     .write(&dead)
     .unwrap();
+    let served = hub.token();
     let before = std::fs::read_to_string(dead.join("token")).unwrap();
     let state = dead.to_str().unwrap().to_owned();
     let (code, _, err) =
@@ -634,4 +711,10 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("no hub is running"), "{err}");
     assert_ne!(std::fs::read_to_string(dead.join("token")).unwrap(), before);
+    assert_eq!(
+        hub.token(),
+        served,
+        "the listener was never asked to rotate"
+    );
+    let _dir = hub.shutdown().await;
 }

@@ -11,9 +11,11 @@
 /// The app shell (served at `/` once logged in).
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
 
-/// Answer to a successful login: navigate to `/` from this origin.
-pub const LOGGED_IN_HTML: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta http-equiv=\"refresh\" content=\"0;url=/\"><title>flywheel hub</title></head>\
+/// Answer to a successful login: `login.js` replaces it with `/` (keeping
+/// the URL fragment) from this origin; without scripts, a meta refresh.
+pub const LOGGED_IN_HTML: &str = "<!doctype html><html lang=\"en\" data-signed-in><head><meta charset=\"utf-8\">\
+<title>flywheel hub</title><script src=\"/assets/login.js\"></script>\
+<noscript><meta http-equiv=\"refresh\" content=\"0;url=/\"></noscript></head>\
 <body><p>Signed in. <a href=\"/\">Continue to the hub</a>.</p></body></html>";
 
 /// Every embedded asset under `/assets/`: `(path, bytes, content type)`.
@@ -21,6 +23,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app.js",
         include_bytes!("../web/app.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
+        "login.js",
+        include_bytes!("../web/login.js"),
         "text/javascript; charset=utf-8",
     ),
     (
@@ -78,10 +85,11 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         .map(|(_, bytes, content_type)| (*bytes, *content_type))
 }
 
-/// Assets served without the token: the fonts and icon (the login page
-/// uses them). Never code.
+/// Assets served without the token: what the login page uses -- the fonts,
+/// the icon, and `login.js` (no app code).
 pub fn is_public_asset(path: &str) -> bool {
     path == "icon.svg"
+        || path == "login.js"
         || path
             .strip_prefix("vendor/fonts/")
             .is_some_and(|f| f.ends_with(".woff2") && !f.contains('/'))
@@ -116,6 +124,7 @@ pub fn login_page(error: Option<&str>) -> String {
 <meta name="color-scheme" content="dark light">
 <title>flywheel hub - sign in</title>
 <link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<script src="/assets/login.js" defer></script>
 <style>
   @font-face {{ font-family: "FW Display"; src: url(/assets/vendor/fonts/big-shoulders-display.woff2) format("woff2"); font-weight: 100 900; }}
   @font-face {{ font-family: "FW Mono"; src: url(/assets/vendor/fonts/martian-mono.woff2) format("woff2"); font-weight: 100 800; font-stretch: 75% 112.5%; }}
@@ -219,6 +228,7 @@ mod tests {
     fn only_fonts_and_the_icon_are_public() {
         assert!(is_public_asset("icon.svg"));
         assert!(is_public_asset("vendor/fonts/martian-mono.woff2"));
+        assert!(is_public_asset("login.js"));
         for private in [
             "app.js",
             "app.css",
@@ -233,6 +243,10 @@ mod tests {
         let page = login_page(None);
         for reference in page.split("/assets/").skip(1) {
             let path = reference.split([')', '"']).next().unwrap();
+            assert!(is_public_asset(path) && asset(path).is_some(), "{path}");
+        }
+        for reference in LOGGED_IN_HTML.split("/assets/").skip(1) {
+            let path = reference.split('"').next().unwrap();
             assert!(is_public_asset(path) && asset(path).is_some(), "{path}");
         }
     }

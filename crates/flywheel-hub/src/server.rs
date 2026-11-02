@@ -84,6 +84,10 @@ pub struct ServerOptions {
     /// same-origin. Requests arriving under an `https` one get `Secure`
     /// cookies.
     pub allowed_origins: Vec<String>,
+    /// Reverse proxies on other machines whose `X-Forwarded-For` / `-Host`
+    /// / `-Proto` are believed, as from a loopback proxy -- so clients
+    /// behind them are rate-limited by their own address, not the proxy's.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 #[derive(Clone)]
@@ -186,14 +190,14 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpL
 }
 
 /// Who sent a request: the client address the failure limiter keys on,
-/// whether the TCP peer is this machine (then a reverse proxy such as
-/// `tailscale serve` may stand in front: from a loopback peer its
+/// whether the TCP peer is a proxy we trust (loopback -- e.g.
+/// `tailscale serve` -- or a `trusted_proxies` address: its
 /// `X-Forwarded-For` / `-Host` / `-Proto` are believed), and whether the
 /// request comes straight from this machine (no proxy in between).
 #[derive(Debug, Clone, Copy)]
 struct Client {
     ip: IpAddr,
-    local_peer: bool,
+    trusted_peer: bool,
     /// A process on this machine talking to the hub directly (the CLI, a
     /// local browser): exempt from the failure lockout, which guards
     /// against the network.
@@ -201,38 +205,47 @@ struct Client {
 }
 
 impl Client {
-    fn of(extensions: &Extensions, headers: &HeaderMap) -> Self {
+    fn of(extensions: &Extensions, headers: &HeaderMap, options: &ServerOptions) -> Self {
         // `router` used without connect info (an in-process caller) is
-        // this machine.
+        // this machine. Under a dual-stack (`::`) bind IPv4 peers arrive
+        // IPv4-mapped (`::ffff:127.0.0.1`): fold them, or a local proxy
+        // would not count as loopback.
         let (peer, local) = match extensions.get::<ConnectInfo<Peer>>() {
-            Some(ConnectInfo(p)) => (p.remote.ip(), p.local.map(|l| l.ip())),
+            Some(ConnectInfo(p)) => (
+                p.remote.ip().to_canonical(),
+                p.local.map(|l| l.ip().to_canonical()),
+            ),
             None => (IpAddr::V4(Ipv4Addr::LOCALHOST), None),
         };
-        let local_peer = peer.is_loopback();
+        let trusted_peer = peer.is_loopback() || options.trusted_proxies.contains(&peer);
         // The proxy appends the address it saw: the last entry is the one
         // a client cannot forge.
-        let forwarded_for = local_peer
+        let forwarded_for = trusted_peer
             .then(|| header_str(headers, header::HeaderName::from_static("x-forwarded-for")))
             .flatten();
         let forwarded = forwarded_for
             .and_then(|v| v.rsplit(',').next())
-            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical());
         // From this machine: loopback, or our own address as the source
         // (a connection to a LAN bind from this host).
-        let from_here = local_peer || local == Some(peer);
+        let from_here = peer.is_loopback() || local == Some(peer);
         Self {
             ip: forwarded.unwrap_or(peer),
-            local_peer,
+            trusted_peer,
             same_machine: from_here && forwarded_for.is_none(),
         }
     }
 }
 
-impl<S: Send + Sync> FromRequestParts<S> for Client {
+impl FromRequestParts<AppState> for Client {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self::of(&parts.extensions, &parts.headers))
+    async fn from_request_parts(
+        parts: &mut Parts,
+        app: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self::of(&parts.extensions, &parts.headers, &app.options))
     }
 }
 
@@ -247,21 +260,36 @@ enum Auth {
     Limited(Duration),
 }
 
-fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
-    let token = app.hub.token();
-    let name = cookie_name(token.expose());
-    let presented: Vec<&str> = headers
+/// The login cookie values a request carries for the current token.
+fn login_cookies<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a str> {
+    headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .filter_map(|v| cookie_value(v, &name))
-        .chain(header_str(headers, header::AUTHORIZATION).and_then(bearer_value))
-        .collect();
-    if presented.is_empty() {
+        .filter_map(|v| cookie_value(v, name))
+        .collect()
+}
+
+/// Check a request's login cookie and bearer token.
+///
+/// A live login cookie is accepted even from a locked-out address: it is a
+/// 256-bit secret the hub issued (guessing one is hopeless at any rate),
+/// and refusing it would let one attacker sharing a NAT or proxy address
+/// with real users lock them all out. Everything else from a locked-out
+/// address is refused unchecked.
+fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
+    let token = app.hub.token();
+    let cookies = login_cookies(headers, &cookie_name(token.expose()));
+    let bearer = header_str(headers, header::AUTHORIZATION).and_then(bearer_value);
+    if cookies.is_empty() && bearer.is_none() {
         return Auth::Anonymous;
     }
+    if cookies.iter().any(|c| app.hub.login_valid(c)) {
+        return Auth::Granted;
+    }
+    let bearer_ok = || bearer.is_some_and(|b| token.matches(b));
     if client.same_machine {
-        return if presented.iter().any(|v| token.matches(v)) {
+        return if bearer_ok() {
             Auth::Granted
         } else {
             Auth::Denied
@@ -272,7 +300,7 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
     if let Some(wait) = failures.locked(client.ip, now) {
         return Auth::Limited(wait);
     }
-    if presented.iter().any(|v| token.matches(v)) {
+    if bearer_ok() {
         Auth::Granted
     } else {
         failures.record_failure(client.ip, now);
@@ -282,7 +310,7 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
 
 fn origin_ok(headers: &HeaderMap, client: Client, options: &ServerOptions) -> bool {
     let forwarded_host = client
-        .local_peer
+        .trusted_peer
         .then(|| header_str(headers, header::HeaderName::from_static("x-forwarded-host")))
         .flatten();
     let hosts: Vec<&str> = header_str(headers, header::HOST)
@@ -312,14 +340,24 @@ fn insert_retry_after(response: &mut Response, wait: Duration) {
     }
 }
 
+/// The token-rotation watch a request subscribed to before its
+/// credentials were checked: a WebSocket granted on a token that rotates
+/// at any later moment sees the change and closes.
+#[derive(Clone)]
+struct RotationWatch(watch::Receiver<u64>);
+
 async fn require_auth(
     State(app): State<AppState>,
     client: Client,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    let rotations = app.hub.subscribe_rotations();
     match authenticate(&app, request.headers(), client) {
-        Auth::Granted => next.run(request).await,
+        Auth::Granted => {
+            request.extensions_mut().insert(RotationWatch(rotations));
+            next.run(request).await
+        }
         Auth::Limited(wait) => too_many_attempts(wait),
         Auth::Anonymous | Auth::Denied => {
             error_response(StatusCode::UNAUTHORIZED, "authentication required")
@@ -373,7 +411,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 /// one of the configured `https://` origins.
 fn browser_https(headers: &HeaderMap, client: Client, options: &ServerOptions) -> bool {
     let proto = client
-        .local_peer
+        .trusted_peer
         .then(|| {
             header_str(
                 headers,
@@ -399,11 +437,30 @@ fn browser_https(headers: &HeaderMap, client: Client, options: &ServerOptions) -
 
 // --- pages ------------------------------------------------------------------
 
-async fn index(State(app): State<AppState>, client: Client, headers: HeaderMap) -> Response {
+#[derive(Deserialize)]
+struct IndexQuery {
+    /// Why the web UI signed out (`rotated`: the token was rotated).
+    signed_out: Option<String>,
+}
+
+async fn index(
+    State(app): State<AppState>,
+    client: Client,
+    headers: HeaderMap,
+    Query(query): Query<IndexQuery>,
+) -> Response {
     match authenticate(&app, &headers, client) {
         Auth::Granted => no_store(Html(web::INDEX_HTML).into_response()),
         Auth::Limited(wait) => login_refused(wait),
-        Auth::Anonymous | Auth::Denied => no_store(Html(web::login_page(None)).into_response()),
+        Auth::Anonymous | Auth::Denied => {
+            let notice = match query.signed_out.as_deref() {
+                Some("rotated") => Some(
+                    "Signed out: the hub's token was rotated. Sign in again with a fresh link from `fw hub url`.",
+                ),
+                _ => None,
+            };
+            no_store(Html(web::login_page(notice)).into_response())
+        }
     }
 }
 
@@ -455,11 +512,12 @@ fn login_refused(wait: Duration) -> Response {
     no_store(response)
 }
 
-/// Trade the token or a one-time code for the login cookie. Success
-/// answers with a page that navigates to `/` from this origin (a same-site
+/// Trade the token or a one-time code for a login cookie carrying a fresh
+/// per-login secret. Success answers with a page that replaces itself with
+/// `/` (keeping any `#session=` fragment) from this origin: a same-site
 /// navigation, so the `SameSite=Strict` cookie is sent even when the login
-/// link was opened from another app) and drops the credential from the
-/// address bar.
+/// link was opened from another site (a redirect would stay cross-site),
+/// and the spent credential URL leaves the address bar and history.
 fn login(app: &AppState, headers: &HeaderMap, client: Client, presented: Option<&str>) -> Response {
     let Some(presented) = presented else {
         return no_store(Html(web::login_page(None)).into_response());
@@ -485,7 +543,15 @@ fn login(app: &AppState, headers: &HeaderMap, client: Client, presented: Option<
             return no_store(response);
         }
     }
-    let cookie = login_cookie(&token, browser_https(headers, client, &app.options));
+    let secret = match app.hub.issue_login() {
+        Ok(secret) => secret,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let cookie = login_cookie(
+        &token,
+        &secret,
+        browser_https(headers, client, &app.options),
+    );
     let mut response = Html(web::LOGGED_IN_HTML).into_response();
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -493,9 +559,16 @@ fn login(app: &AppState, headers: &HeaderMap, client: Client, presented: Option<
     no_store(response)
 }
 
-async fn logout(State(app): State<AppState>) -> Response {
+/// Forget this browser's login (server side too) and clear its cookie.
+async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    let token = app.hub.token();
+    for secret in login_cookies(&headers, &cookie_name(token.expose())) {
+        if let Err(e) = app.hub.revoke_login(secret) {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+    }
     let mut response = StatusCode::NO_CONTENT.into_response();
-    if let Ok(value) = HeaderValue::from_str(&logout_cookie(&app.hub.token())) {
+    if let Ok(value) = HeaderValue::from_str(&logout_cookie(&token)) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
@@ -842,6 +915,7 @@ async fn session_ws(
     Path(id): Path<String>,
     client: Client,
     headers: HeaderMap,
+    rotations: Option<axum::Extension<RotationWatch>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
@@ -854,7 +928,11 @@ async fn session_ws(
         );
     };
     let shutdown = app.shutdown.clone();
-    let rotations = app.hub.subscribe_rotations();
+    // Taken before the credentials were checked (see `require_auth`).
+    let rotations = match rotations {
+        Some(axum::Extension(RotationWatch(rx))) => rx,
+        None => app.hub.subscribe_rotations(),
+    };
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| pump(socket, session, shutdown, rotations))
 }
@@ -1073,4 +1151,82 @@ async fn pump(
 /// The login URL for a one-time `code` under `base`.
 pub fn code_login_url(base: &str, code: &str) -> String {
     format!("{}/login?code={code}", base.trim_end_matches('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(remote: &str, local: &str, xff: Option<&str>, options: &ServerOptions) -> Client {
+        let mut extensions = Extensions::new();
+        extensions.insert(ConnectInfo(Peer {
+            remote: remote.parse().unwrap(),
+            local: Some(local.parse().unwrap()),
+        }));
+        let mut headers = HeaderMap::new();
+        if let Some(xff) = xff {
+            headers.insert("x-forwarded-for", xff.parse().unwrap());
+        }
+        Client::of(&extensions, &headers, options)
+    }
+
+    #[test]
+    fn ipv4_mapped_loopback_is_a_local_proxy() {
+        // `--bind ::` sees a local proxy (tailscale serve -> 127.0.0.1) as
+        // ::ffff:127.0.0.1: its X-Forwarded-For must be believed, and the
+        // proxied client must not count as this machine.
+        let options = ServerOptions::default();
+        let proxied = client(
+            "[::ffff:127.0.0.1]:5000",
+            "[::ffff:127.0.0.1]:7420",
+            Some("100.101.102.103"),
+            &options,
+        );
+        assert!(proxied.trusted_peer);
+        assert!(!proxied.same_machine);
+        assert_eq!(proxied.ip, "100.101.102.103".parse::<IpAddr>().unwrap());
+        let direct = client(
+            "[::ffff:127.0.0.1]:5000",
+            "[::ffff:127.0.0.1]:7420",
+            None,
+            &options,
+        );
+        assert!(direct.same_machine && direct.trusted_peer);
+        // A mapped LAN peer is keyed as plain IPv4 and is not trusted.
+        let lan = client(
+            "[::ffff:192.168.1.9]:5000",
+            "[::ffff:192.168.1.5]:7420",
+            Some("1.2.3.4"),
+            &options,
+        );
+        assert!(!lan.trusted_peer && !lan.same_machine);
+        assert_eq!(lan.ip, "192.168.1.9".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn trusted_proxies_forward_their_clients() {
+        let options = ServerOptions {
+            trusted_proxies: vec!["10.0.0.2".parse().unwrap()],
+            ..ServerOptions::default()
+        };
+        let behind = client(
+            "10.0.0.2:5000",
+            "10.0.0.5:7420",
+            Some("evil, 198.51.100.7"),
+            &options,
+        );
+        assert!(behind.trusted_peer && !behind.same_machine);
+        assert_eq!(behind.ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        let untrusted = client(
+            "10.0.0.3:5000",
+            "10.0.0.5:7420",
+            Some("198.51.100.7"),
+            &options,
+        );
+        assert!(!untrusted.trusted_peer);
+        assert_eq!(untrusted.ip, "10.0.0.3".parse::<IpAddr>().unwrap());
+        // This host connecting to its own LAN address is this machine.
+        let own = client("10.0.0.5:5000", "10.0.0.5:7420", None, &options);
+        assert!(own.same_machine && !own.trusted_peer);
+    }
 }

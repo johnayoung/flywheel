@@ -25,6 +25,8 @@ struct TestHub {
     repo: PathBuf,
     addr: SocketAddr,
     token: String,
+    /// `name=value` of a browser login made at start.
+    cookie: String,
     http: reqwest::Client,
     stop: Option<oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
@@ -60,13 +62,28 @@ impl TestHub {
         let server = tokio::spawn(serve(listener, hub, ServerOptions::default(), async {
             let _ = stopped.await;
         }));
+        let http = reqwest::Client::new();
+        let login = http
+            .get(format!("http://{addr}/login?token={token}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let cookie = login.headers()[SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
         Self {
             _dir: dir,
             state_dir,
             repo,
             addr,
             token,
-            http: reqwest::Client::new(),
+            cookie,
+            http,
             stop: Some(stop),
             server: Some(server),
         }
@@ -81,11 +98,7 @@ impl TestHub {
     }
 
     fn cookie(&self) -> String {
-        format!(
-            "{}={}",
-            flywheel_hub::auth::cookie_name(&self.token),
-            self.token
-        )
+        self.cookie.clone()
     }
 
     fn authed(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -284,7 +297,14 @@ async fn login_trades_the_token_for_a_strict_http_only_cookie() {
     let cookie = ok.headers()[SET_COOKIE].to_str().unwrap().to_owned();
     let name = flywheel_hub::auth::cookie_name(&hub.token);
     assert!(name.starts_with("fw_hub_"), "{name}");
-    assert!(cookie.starts_with(&format!("{name}={};", hub.token)));
+    // The cookie carries a per-login secret, never the token.
+    assert!(cookie.starts_with(&format!("{name}=")), "{cookie}");
+    assert!(!cookie.contains(&hub.token), "{cookie}");
+    assert_ne!(
+        cookie.split(';').next().unwrap(),
+        hub.cookie(),
+        "one per login"
+    );
     assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
     assert_eq!(ok.headers()["cache-control"], "no-store");
     assert!(ok.text().await.unwrap().contains("url=/"));
@@ -338,13 +358,38 @@ async fn login_trades_the_token_for_a_strict_http_only_cookie() {
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
-    let logout = hub.http.post(hub.url("/logout")).send().await.unwrap();
+    let logout = hub
+        .http
+        .post(hub.url("/logout"))
+        .header(ORIGIN, hub.origin())
+        .header(COOKIE, hub.cookie())
+        .send()
+        .await
+        .unwrap();
     assert!(
         logout.headers()[SET_COOKIE]
             .to_str()
             .unwrap()
             .contains("Max-Age=0")
     );
+    // Logging out ends that login server side (a copied cookie is dead);
+    // other logins are unaffected.
+    let after = hub
+        .http
+        .get(hub.url("/api/workspaces"))
+        .header(COOKIE, hub.cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    let other = hub
+        .http
+        .get(hub.url("/api/workspaces"))
+        .header(COOKIE, cookie.split(';').next().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::OK);
     hub.shutdown().await;
 }
 

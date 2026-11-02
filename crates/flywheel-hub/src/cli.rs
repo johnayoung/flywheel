@@ -5,12 +5,12 @@ use crate::client;
 use crate::hub::{Hub, HubOptions};
 use crate::paths::default_state_dir;
 use crate::remote::{
-    LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
-    normalize_public_url, process_alive, qr_lines, tailscale_program,
+    LoginTarget, RuntimeInfo, ServeLock, Tailscale, detect_tailscale, interface_addresses,
+    login_targets, normalize_public_url, qr_lines, tailscale_program,
 };
 use crate::server::{ServerOptions, code_login_url, serve};
 use clap::{Parser, Subcommand};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -92,6 +92,12 @@ struct ServeArgs {
     /// automatically.
     #[arg(long = "public-url", value_name = "URL")]
     public_urls: Vec<String>,
+    /// Address of a reverse proxy on another machine whose
+    /// X-Forwarded-For/-Host/-Proto are believed (as a local proxy's
+    /// always are), so clients behind it are rate-limited by their own
+    /// address; repeatable.
+    #[arg(long = "trusted-proxy", value_name = "IP")]
+    trusted_proxies: Vec<IpAddr>,
     /// Per-session scrollback kept by the server's terminal emulator, in
     /// lines (capped at 1M cells, so wide terminals keep fewer).
     #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
@@ -165,16 +171,14 @@ fn token(args: &TokenArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
 }
 
-/// The running hub for `state_dir`, if its runtime file names a live
-/// process.
+/// The hub serving `state_dir`, if one holds its serve lock.
 fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, String> {
-    let info = RuntimeInfo::read(state_dir).map_err(|e| {
+    crate::remote::running_hub(state_dir).map_err(|e| {
         format!(
             "runtime file {}: {e}",
             state_dir.join(crate::remote::RUNTIME_FILE).display()
         )
-    })?;
-    Ok(info.filter(|info| process_alive(info.pid)))
+    })
 }
 
 /// Rotate through the running hub (so it switches without a restart), or
@@ -230,7 +234,8 @@ fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 tailscale.as_ref(),
                 &local_interfaces(info.listen),
             );
-            print_login(out, err, &targets, &code, args.qr);
+            let qr = if args.qr { Qr::Draw } else { Qr::No };
+            print_login(out, err, &targets, &code, qr);
             print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
             0
         }
@@ -282,14 +287,24 @@ fn mint_remote_code(state: &StateDirArg) -> Result<(RuntimeInfo, String), String
     Ok((info, code))
 }
 
-/// The login URLs for `code`, then (with `qr`) the first remote one as a
+/// Whether [`print_login`] draws the QR code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qr {
+    No,
+    Draw,
+    /// Wanted, but the output is not a terminal (a log or journal): say
+    /// how to get one instead of writing colour escapes into it.
+    NotATerminal,
+}
+
+/// The login URLs for `code`, then (per `qr`) the first remote one as a
 /// QR code.
 fn print_login(
     out: &mut dyn Write,
     err: &mut dyn Write,
     targets: &[LoginTarget],
     code: &str,
-    qr: bool,
+    qr: Qr,
 ) {
     let minutes = LOGIN_CODE_TTL.as_secs() / 60;
     let _ = writeln!(
@@ -305,7 +320,7 @@ fn print_login(
             code_login_url(&target.base, code)
         );
     }
-    if !qr {
+    if qr == Qr::No {
         return;
     }
     let Some(remote) = targets.iter().find(|t| t.remote) else {
@@ -315,6 +330,13 @@ fn print_login(
         );
         return;
     };
+    if qr == Qr::NotATerminal {
+        let _ = writeln!(
+            out,
+            "(QR code not drawn: output is not a terminal; `fw hub url --qr` draws one)"
+        );
+        return;
+    }
     let url = code_login_url(&remote.base, code);
     match qr_lines(&url) {
         Ok(lines) => {
@@ -424,6 +446,36 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 2;
         }
     };
+    if let Err(e) = crate::paths::ensure_private_dir(&state_dir) {
+        let _ = writeln!(err, "fw hub: state dir {}: {e}", state_dir.display());
+        return 1;
+    }
+    // One hub per state dir: a second would overwrite the first's runtime
+    // file, leaving `url` / `token --rotate` unable to reach the first.
+    let _lock = match ServeLock::acquire(&state_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            let at = RuntimeInfo::read(&state_dir)
+                .ok()
+                .flatten()
+                .map(|info| format!(" (pid {}, {})", info.pid, info.listen))
+                .unwrap_or_default();
+            let _ = writeln!(
+                err,
+                "fw hub: another hub is already serving state dir {}{at}; stop it or pass a different --state-dir",
+                state_dir.display()
+            );
+            return 1;
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "fw hub: cannot lock state dir {}: {e}",
+                state_dir.display()
+            );
+            return 1;
+        }
+    };
     let mut options = HubOptions::new(state_dir);
     options.scrollback_lines = args.scrollback_lines;
     let hub = match Hub::open(options) {
@@ -463,7 +515,14 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, local.port()));
     let base = format!("http://{}", browse_host(local));
-    let _ = writeln!(out, "flywheel hub listening on {base}");
+    if local.ip().is_unspecified() {
+        let _ = writeln!(
+            out,
+            "flywheel hub listening on {local} (all interfaces; {base} from this machine)"
+        );
+    } else {
+        let _ = writeln!(out, "flywheel hub listening on {base}");
+    }
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
     let targets = login_targets(
         local,
@@ -473,7 +532,13 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     );
     match hub.mint_login_code() {
         Ok(code) => {
-            let qr = targets.iter().any(|t| t.remote);
+            let qr = if !targets.iter().any(|t| t.remote) {
+                Qr::No
+            } else if std::io::stdout().is_terminal() {
+                Qr::Draw
+            } else {
+                Qr::NotATerminal
+            };
             print_login(out, err, &targets, &code, qr);
         }
         Err(e) => {
@@ -500,7 +565,10 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if let Some(ts) = &tailscale {
         allowed_origins.extend(ts.serve_urls.iter().cloned());
     }
-    let server_options = ServerOptions { allowed_origins };
+    let server_options = ServerOptions {
+        allowed_origins,
+        trusted_proxies: args.trusted_proxies,
+    };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve(listener, hub, server_options, shutdown_signal()));
     RuntimeInfo::remove_if_owned(&state_dir, runtime_info.pid);
@@ -579,6 +647,36 @@ mod tests {
         assert!(out.contains("serve") && out.contains("token"));
         let (code, _, _) = run_args(&["serve", "--port", "notaport"]);
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn a_second_serve_on_one_state_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("hub");
+        crate::paths::ensure_private_dir(&state).unwrap();
+        let _held = ServeLock::acquire(&state).unwrap().unwrap();
+        RuntimeInfo {
+            pid: 4242,
+            listen: "127.0.0.1:47533".parse().unwrap(),
+            public_urls: Vec::new(),
+        }
+        .write(&state)
+        .unwrap();
+        let (code, out, err) = run_args(&[
+            "serve",
+            "--port",
+            "0",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 1, "{out}{err}");
+        assert!(
+            err.contains("another hub is already serving") && err.contains("pid 4242"),
+            "{err}"
+        );
+        // The first hub's runtime file is untouched.
+        let info = RuntimeInfo::read(&state).unwrap().unwrap();
+        assert_eq!(info.pid, 4242);
     }
 
     #[test]

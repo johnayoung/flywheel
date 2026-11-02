@@ -2,7 +2,7 @@
 //! sessions the server owns.
 
 use crate::agent::{AgentPrograms, SessionKind, which};
-use crate::auth::{LoginCodes, Token, TokenError};
+use crate::auth::{LoginCodes, Logins, Token, TokenError, unix_now};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SpawnError, SpawnSpec};
 use crate::state::{
@@ -125,6 +125,8 @@ pub struct Hub {
     token: RwLock<Token>,
     /// One-time login codes (cleared when the token rotates).
     login_codes: Mutex<LoginCodes>,
+    /// Browser logins (cleared when the token rotates).
+    logins: Mutex<Logins>,
     /// Bumped on every token rotation; open WebSockets close on a change.
     rotations: tokio::sync::watch::Sender<u64>,
     store: Mutex<HubStore>,
@@ -147,11 +149,13 @@ impl Hub {
             source,
         })?;
         let token = Token::load_or_create(&options.state_dir)?;
+        let logins = Logins::load(&options.state_dir, unix_now());
         let store = HubStore::open(&options.state_dir)?;
         Ok(Arc::new(Self {
             options,
             token: RwLock::new(token),
             login_codes: Mutex::new(LoginCodes::default()),
+            logins: Mutex::new(logins),
             rotations: tokio::sync::watch::Sender::new(0),
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
@@ -166,14 +170,18 @@ impl Hub {
             .clone()
     }
 
-    /// Replace the token (and its file) with a fresh one. Every login
-    /// cookie (named and valued after the old token), outstanding login
-    /// code, and open WebSocket stops working; bearer clients need the new
-    /// token.
+    /// Replace the token (and its file) with a fresh one. Every browser
+    /// login, outstanding login code, and open WebSocket stops working;
+    /// bearer clients need the new token.
     pub fn rotate_token(&self) -> Result<(), HubError> {
         let mut token = self.token.write().unwrap_or_else(PoisonError::into_inner);
         *token = Token::rotate(&self.options.state_dir)?;
         self.login_codes().clear();
+        {
+            let mut logins = self.logins();
+            logins.clear();
+            logins.save(&self.options.state_dir)?;
+        }
         drop(token);
         self.rotations.send_modify(|n| *n += 1);
         Ok(())
@@ -192,6 +200,32 @@ impl Hub {
     /// Spend a one-time login code; true when it was live.
     pub fn redeem_login_code(&self, presented: &str) -> bool {
         self.login_codes().redeem(presented, Instant::now())
+    }
+
+    /// Start a browser login: the secret its cookie carries.
+    pub fn issue_login(&self) -> Result<String, HubError> {
+        let mut logins = self.logins();
+        let secret = logins.issue(unix_now())?;
+        logins.save(&self.options.state_dir)?;
+        Ok(secret)
+    }
+
+    /// Whether `secret` is a live browser login.
+    pub fn login_valid(&self, secret: &str) -> bool {
+        self.logins().valid(secret, unix_now())
+    }
+
+    /// End the browser login `secret` (logout).
+    pub fn revoke_login(&self, secret: &str) -> Result<(), HubError> {
+        let mut logins = self.logins();
+        if logins.revoke(secret) {
+            logins.save(&self.options.state_dir)?;
+        }
+        Ok(())
+    }
+
+    fn logins(&self) -> MutexGuard<'_, Logins> {
+        self.logins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn login_codes(&self) -> MutexGuard<'_, LoginCodes> {

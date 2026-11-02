@@ -2087,3 +2087,28 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .cmd-hint:empty { display: none; }
 .cmd-actions .slab.opens { border-style: dashed; }
 #dlg-close-wt .sheet-foot { flex-wrap: wrap; }
+
+/* --- worktrees on the phone ---------------------------------------------- */
+
+/* Which of an agent's parallel tasks needs you: its worktree branch. */
+.attn-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  min-width: 0;
+  max-width: 100%;
+  color: var(--ink-2);
+  font-size: 10.5px;
+}
+.attn-branch svg { flex: none; width: .7rem; height: .7rem; }
+.attn-branch span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (pointer: coarse) {
+  .session.companion { min-height: 2.5rem; }
+}
+
+/* The agent / shell flip keeps its word on phones: an icon alone does not
+   say which way it goes. */
+@media (max-width: 480px) {
+  .flip-pill span { font-size: 10px; margin-left: .3rem; }
+}

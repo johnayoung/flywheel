@@ -32,9 +32,15 @@ window.FwHubAttention = function (ctx) {
     return out;
   }
 
+  // A worktree session's branch (the badge cache's, else the one it was
+  // cut on): which of an agent's parallel tasks this is.
+  const branchOf = (session) =>
+    session.worktree ? (session.git && session.git.branch) || session.worktree.branch : null;
+
   function row({ session, agent }) {
     const workspace = workspaceById(session.workspace_id);
     const active = state.attached === session.id;
+    const branch = branchOf(session);
     return el(
       "li",
       {},
@@ -56,6 +62,9 @@ window.FwHubAttention = function (ctx) {
             { className: "attn-line" },
             el("b", { className: "attn-name", textContent: session.name }),
             el("span", { className: "attn-ws", textContent: workspace ? workspace.name : "" }),
+            branch
+              ? el("span", { className: "attn-branch", title: `worktree branch ${branch}` }, icon("branch"), el("span", { textContent: branch }))
+              : null,
           ),
           el("span", {
             className: "attn-detail",
@@ -109,5 +118,5 @@ window.FwHubAttention = function (ctx) {
     if (document.visibilityState === "visible" && !$("#attention").hidden) render();
   }, 30000);
 
-  return { render, entries };
+  return { render, entries, branchOf };
 };

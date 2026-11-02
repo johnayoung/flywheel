@@ -1497,10 +1497,21 @@ impl Hub {
             .workspace(&session.workspace_id)
             .map(|w| w.name.clone())
             .unwrap_or_default();
+        let session = session.clone();
+        drop(store);
+        // A worktree session's branch: the badge cache's (it may have been
+        // switched), else the one it was cut on.
+        let branch = session.worktree.as_ref().map(|worktree| {
+            self.git
+                .get(&badge_key(&session))
+                .and_then(|git| git.branch)
+                .unwrap_or_else(|| worktree.branch.clone())
+        });
         Some(crate::notify::Subject {
-            session_id: session.id.clone(),
-            session: session.name.clone(),
+            session_id: session.id,
+            session: session.name,
             workspace,
+            branch,
             kind: session.kind,
             alert,
         })

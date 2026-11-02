@@ -257,6 +257,8 @@ pub struct Subject {
     pub session_id: String,
     pub session: String,
     pub workspace: String,
+    /// The branch of the worktree it runs in, if it runs in one.
+    pub branch: Option<String>,
     pub kind: SessionKind,
     pub alert: Alert,
 }
@@ -277,10 +279,14 @@ pub struct Push {
 pub fn compose(subject: &Subject, click_base: Option<&str>, detail: bool) -> Option<Push> {
     let session = clean(&subject.session);
     let workspace = clean(&subject.workspace);
+    let what = match subject.branch.as_deref().map(clean) {
+        Some(branch) if !branch.is_empty() => format!("{} on {branch}", subject.kind.as_str()),
+        _ => subject.kind.as_str().to_owned(),
+    };
     let place = if workspace.is_empty() {
-        format!("{session} ({})", subject.kind.as_str())
+        format!("{session} ({what})")
     } else {
-        format!("{workspace} / {session} ({})", subject.kind.as_str())
+        format!("{workspace} / {session} ({what})")
     };
     let (title, message, priority) = match subject.alert.status {
         AgentStatus::Blocked => (
@@ -692,6 +698,7 @@ mod tests {
             session_id: "abc123".into(),
             session: "claude 1".into(),
             workspace: "infrared".into(),
+            branch: None,
             kind: SessionKind::Claude,
             alert: Alert {
                 status,
@@ -828,6 +835,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(quiet.message, "infrared / claude 1 (claude) waits on you.");
+        // A worktree session says its branch.
+        let mut worktree = subject(AgentStatus::Done, None);
+        worktree.branch = Some("agent/fix-login".into());
+        assert_eq!(
+            compose(&worktree, None, true).unwrap().message,
+            "infrared / claude 1 (claude on agent/fix-login) finished its turn."
+        );
     }
 
     #[test]

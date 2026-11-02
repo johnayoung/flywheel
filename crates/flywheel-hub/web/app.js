@@ -264,7 +264,7 @@
     $, el, icon, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
   });
   const notify = window.FwHubNotify({
-    $, state, store, sessionById, workspaceById, pwa, api, toast: commands.toast,
+    $, state, store, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
     openSession: (id) => openSession(id),
     present: () => present(),
   });

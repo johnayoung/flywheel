@@ -10,7 +10,7 @@
 "use strict";
 
 window.FwHubNotify = function (ctx) {
-  const { $, state, store, sessionById, workspaceById, pwa, api, toast, openSession, present } = ctx;
+  const { $, state, store, sessionById, workspaceById, pwa, api, toast, openSession, present, attention } = ctx;
 
   const supported = "Notification" in window;
   const IS_IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
@@ -111,7 +111,8 @@ window.FwHubNotify = function (ctx) {
     const session = sessionById(sessionId);
     if (!session) return;
     const workspace = workspaceById(session.workspace_id);
-    const where = workspace ? `${workspace.name} / ${session.name}` : session.name;
+    const branch = attention.branchOf(session);
+    const where = `${workspace ? `${workspace.name} / ${session.name}` : session.name}${branch ? ` (on ${branch})` : ""}`;
     const title = agent.status === "blocked" ? `${session.name} is blocked` : `${session.name} is done`;
     const body = agent.status === "blocked"
       ? `${where} waits on you${agent.detail ? `: ${agent.detail}` : "."}`

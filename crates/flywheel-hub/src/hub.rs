@@ -57,6 +57,13 @@ pub struct HubOptions {
     /// a relaunched conversation. Defaults to `$CLAUDE_CONFIG_DIR`, else
     /// `~/.claude`.
     pub claude_config_dir: Option<PathBuf>,
+    /// Codex's home (where its rollouts live), for resuming a restored
+    /// conversation. Defaults to `$CODEX_HOME`, else `~/.codex`.
+    pub codex_home: Option<PathBuf>,
+    /// Restore agent sessions by resuming their conversations (Claude
+    /// Code's `--resume`, `codex resume`). Off: they come back as fresh
+    /// shells (`fw hub serve --no-agent-resume`).
+    pub agent_resume: bool,
 }
 
 impl HubOptions {
@@ -76,6 +83,11 @@ impl HubOptions {
                 std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
                 std::env::var_os("HOME").as_deref(),
             ),
+            codex_home: agent::codex_home(
+                std::env::var_os("CODEX_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            ),
+            agent_resume: true,
         }
     }
 }
@@ -530,7 +542,7 @@ impl Hub {
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let session = match self.spawn_pty(&record, request.cols, request.rows) {
+        let session = match self.spawn_pty(&record, request.cols, request.rows, false) {
             Ok(session) => session,
             Err(e) => {
                 self.board().untrack(&id);
@@ -554,12 +566,15 @@ impl Hub {
     /// recorded against the id. An agent session also gets its launch
     /// arguments, a fresh report secret, and a fresh `unknown` status --
     /// unless it runs its `fallback_command` (restored as a plain shell),
-    /// which launches as a shell.
+    /// which launches as a shell. Claude Code resumes its conversation
+    /// whenever a transcript exists; Codex only with `resume` (a restore
+    /// whose plan said so), as `codex resume <id>`.
     fn spawn_pty(
         self: &Arc<Self>,
         record: &SessionRecord,
         cols: Option<u16>,
         rows: Option<u16>,
+        resume: bool,
     ) -> Result<Arc<PtySession>, HubError> {
         // Never fall back to wherever the PTY layer would start it (the
         // hub's own directory or $HOME) while the record says otherwise.
@@ -598,7 +613,12 @@ impl Hub {
                         ));
                     }
                 }
-                SessionKind::Codex => argv.extend(agent::codex_args(report)),
+                SessionKind::Codex => {
+                    argv.extend(agent::codex_args(report));
+                    if let Some(thread) = record.agent_session_id.as_deref().filter(|_| resume) {
+                        argv.extend(agent::codex_resume_args(thread));
+                    }
+                }
                 SessionKind::Shell => {}
             }
             env.push((
@@ -637,6 +657,24 @@ impl Hub {
             self.monitor_agent(kind, &record.id, generation, &session);
         }
         Ok(session)
+    }
+
+    /// Whether the agent CLI has `record`'s conversation on disk to resume:
+    /// Claude Code's transcript, Codex's rollout.
+    fn conversation_exists(&self, record: &SessionRecord) -> bool {
+        let Some(conversation) = record.agent_session_id.as_deref() else {
+            return false;
+        };
+        match record.kind {
+            SessionKind::Claude => self.claude_transcript_exists(record, conversation),
+            SessionKind::Codex => self
+                .options
+                .codex_home
+                .as_deref()
+                .and_then(|home| agent::codex_rollout(home, conversation))
+                .is_some(),
+            SessionKind::Shell => false,
+        }
     }
 
     /// Whether Claude Code already has a transcript for `conversation` (a
@@ -890,7 +928,7 @@ impl Hub {
             store.set_agent_session_id(id, &conversation)?;
             record.agent_session_id = Some(conversation);
         }
-        let session = self.spawn_pty(&record, cols, rows)?;
+        let session = self.spawn_pty(&record, cols, rows, false)?;
         let record = match store.mark_running(id) {
             Ok(record) => record,
             Err(e) => {
@@ -982,7 +1020,18 @@ impl Hub {
             ),
             _ => (record.cwd.clone(), None),
         };
-        let plan = crate::restore::plan(record, &self.options.default_shell);
+        let resume = crate::restore::Resumable {
+            enabled: self.options.agent_resume,
+            conversation_exists: record.kind.is_agent() && self.conversation_exists(record),
+        };
+        let plan = crate::restore::plan(record, &self.options.default_shell, resume);
+        // An agent resumes where its CLI filed the conversation: the
+        // directory it was started in (its repo), not one it reported.
+        let (cwd, note) = if plan.how == RestoreHow::Resume {
+            (record.cwd.clone(), None)
+        } else {
+            (cwd, note)
+        };
         let mut store = self.store();
         let workspace = store
             .workspace(&record.workspace_id)
@@ -999,7 +1048,7 @@ impl Hub {
         relaunched.fallback_command = fallback.clone();
         relaunched.cwd = cwd.clone();
         let session = self
-            .spawn_pty(&relaunched, None, None)
+            .spawn_pty(&relaunched, None, None, plan.how == RestoreHow::Resume)
             .map_err(|e| e.to_string())?;
         if let Err(e) = store.mark_restored(&record.id, fallback) {
             drop(store);

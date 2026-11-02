@@ -262,6 +262,58 @@ pub fn claude_transcript(config_dir: &Path, cwd: &Path, session_id: &str) -> Opt
         .find(|candidate| candidate.is_file())
 }
 
+/// Extra argv that resumes Codex conversation `thread_id` (`codex resume
+/// <id>`); goes after [`codex_args`], whose `-c` overrides are top-level
+/// options.
+pub fn codex_resume_args(thread_id: &str) -> Vec<String> {
+    vec!["resume".to_owned(), thread_id.to_owned()]
+}
+
+/// Codex's home: `$CODEX_HOME`, else `~/.codex`.
+pub fn codex_home(codex_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(dir) = codex_home.filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    home.filter(|h| !h.is_empty())
+        .map(|h| Path::new(h).join(".codex"))
+}
+
+/// How deep under `sessions/` Codex files rollouts (`YYYY/MM/DD/<file>`).
+const CODEX_ROLLOUT_DEPTH: usize = 4;
+
+/// The rollout (`sessions/YYYY/MM/DD/rollout-<timestamp>-<id>.jsonl`) of
+/// Codex conversation `thread_id`, if one exists.
+pub fn codex_rollout(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    if !is_conversation_id(thread_id) {
+        return None;
+    }
+    let suffix = format!("-{thread_id}.jsonl");
+    let mut dirs = vec![(codex_home.join("sessions"), 0usize)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if depth + 1 < CODEX_ROLLOUT_DEPTH {
+                    dirs.push((path, depth + 1));
+                }
+            } else if file_type.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("rollout-") && name.ends_with(&suffix) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 // --- reports -> signals ------------------------------------------------------
 
 /// What a Claude Code hook event means for the session's status.
@@ -894,5 +946,30 @@ mod tests {
         assert_eq!(a.feed(b"esc to\x1b[3;12Hinterrupt", t0), Some(Signal::Busy));
         let mut a = CodexActivity::default();
         assert_eq!(a.feed(b"esc\x1b[Kto interrupt", t0), None);
+    }
+
+    #[test]
+    fn codex_rollouts_are_found_by_thread_id() {
+        let home = tempfile::tempdir().unwrap();
+        let id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+        assert_eq!(codex_rollout(home.path(), id), None);
+        let day = home.path().join("sessions/2026/11/02");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-2026-11-02T10-00-00-other.jsonl"), "").unwrap();
+        assert_eq!(codex_rollout(home.path(), id), None);
+        let file = day.join(format!("rollout-2026-11-02T10-00-00-{id}.jsonl"));
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(codex_rollout(home.path(), id), Some(file));
+        // Never a path built from an id that is not one.
+        assert_eq!(codex_rollout(home.path(), "../x"), None);
+        assert_eq!(
+            codex_home(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.codex"))
+        );
+        assert_eq!(
+            codex_home(Some(OsStr::new("/c")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/c"))
+        );
+        assert_eq!(codex_resume_args(id), ["resume", id]);
     }
 }

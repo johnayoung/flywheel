@@ -3,10 +3,13 @@
 //! its workspace's order; a fresh PTY in its saved working directory).
 //!
 //! The decision is per kind ([`plan`]). Plain interactive shells relaunch
-//! as they were; anything that cannot come back as itself -- a shell
-//! running a one-off command, an agent CLI without native resume -- comes
-//! back as a fresh hub shell in the same directory, never by re-running
-//! the original command (which may not be safe to repeat).
+//! as they were; an agent whose conversation can be resumed (Claude Code
+//! with a transcript for its session id, Codex with a recorded thread id
+//! and rollout) relaunches resuming it; anything else that cannot come
+//! back as itself -- a shell running a one-off command, an agent with
+//! nothing to resume -- comes back as a fresh hub shell in the same
+//! directory, never by re-running the original command (which may not be
+//! safe to repeat).
 
 use crate::agent::SessionKind;
 use crate::state::SessionRecord;
@@ -36,6 +39,10 @@ pub struct RestorePlan {
 pub enum RestoreHow {
     /// Its recorded command, relaunched as is.
     Relaunch,
+    /// Its agent CLI, relaunched resuming its conversation (Claude Code's
+    /// `--resume <id>`, `codex resume <id>`) in its repo, with fresh status
+    /// hooks.
+    Resume,
     /// A fresh hub shell in its working directory (it could not come back
     /// as itself).
     Shell,
@@ -45,24 +52,48 @@ impl RestoreHow {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Relaunch => "relaunched",
+            Self::Resume => "resumed its conversation",
             Self::Shell => "as a fresh shell",
         }
     }
 }
 
-/// How `record` comes back, given the hub's shell (`default_shell`).
+/// What the hub knows about resuming an agent session's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resumable {
+    /// Native agent resume is on (`fw hub serve --no-agent-resume` turns it
+    /// off: agents then come back as fresh shells).
+    pub enabled: bool,
+    /// The agent CLI has the conversation on disk under the record's
+    /// `agent_session_id` (Claude Code's transcript, Codex's rollout).
+    pub conversation_exists: bool,
+}
+
+/// How `record` comes back, given the hub's shell (`default_shell`) and
+/// whether its agent conversation can be resumed.
 ///
-/// The per-kind hook: an agent kind with native resume (Claude Code's
-/// `--resume <session id>`, Codex's `resume`) answers here with its own
-/// [`RestoreHow::Relaunch`] plan (its resume argv); one without falls back
-/// to a shell. The plan is computed from the record's own kind and
-/// command on every restore, never from a previous fallback.
-pub fn plan(record: &SessionRecord, default_shell: &[String]) -> RestorePlan {
+/// The per-kind hook: an agent kind with native resume answers with a
+/// [`RestoreHow::Resume`] plan running its recorded CLI (the hub adds the
+/// resume argv and hooks at spawn); one with nothing to resume falls back
+/// to a shell. The plan is computed from the record's own kind and command
+/// on every restore, never from a previous fallback.
+pub fn plan(record: &SessionRecord, default_shell: &[String], resume: Resumable) -> RestorePlan {
     match record.kind {
         SessionKind::Shell if is_interactive_shell(&record.command) => RestorePlan {
             command: record.command.clone(),
             how: RestoreHow::Relaunch,
         },
+        SessionKind::Claude | SessionKind::Codex
+            if resume.enabled
+                && resume.conversation_exists
+                && record.agent_session_id.is_some()
+                && !record.command.is_empty() =>
+        {
+            RestorePlan {
+                command: record.command.clone(),
+                how: RestoreHow::Resume,
+            }
+        }
         SessionKind::Shell | SessionKind::Claude | SessionKind::Codex => {
             shell_fallback(default_shell)
         }
@@ -99,6 +130,15 @@ mod tests {
     use crate::state::SessionState;
     use chrono::Utc;
 
+    const RESUMABLE: Resumable = Resumable {
+        enabled: true,
+        conversation_exists: true,
+    };
+    const NOTHING: Resumable = Resumable {
+        enabled: true,
+        conversation_exists: false,
+    };
+
     fn record(kind: SessionKind, command: &[&str]) -> SessionRecord {
         SessionRecord {
             id: "s".into(),
@@ -123,7 +163,7 @@ mod tests {
             &["/usr/bin/fish", "--login", "-i"],
             &["-bash"],
         ] {
-            let plan = plan(&record(SessionKind::Shell, argv), &shell);
+            let plan = plan(&record(SessionKind::Shell, argv), &shell, RESUMABLE);
             assert_eq!(plan.how, RestoreHow::Relaunch, "{argv:?}");
             assert_eq!(plan.command, argv.to_vec(), "{argv:?}");
         }
@@ -134,10 +174,13 @@ mod tests {
         let shell = vec!["/bin/zsh".to_owned()];
         let mut agent = record(SessionKind::Claude, &["/usr/bin/claude"]);
         agent.fallback_command = Some(vec!["/bin/bash".to_owned()]);
-        assert_eq!(plan(&agent, &shell).command, shell);
+        assert_eq!(plan(&agent, &shell, NOTHING).command, shell);
         let mut interactive = record(SessionKind::Shell, &["/bin/bash"]);
         interactive.fallback_command = Some(vec!["/bin/zsh".to_owned()]);
-        assert_eq!(plan(&interactive, &shell).how, RestoreHow::Relaunch);
+        assert_eq!(
+            plan(&interactive, &shell, NOTHING).how,
+            RestoreHow::Relaunch
+        );
     }
 
     #[test]
@@ -151,7 +194,7 @@ mod tests {
             (SessionKind::Claude, &["/usr/bin/claude"]),
             (SessionKind::Codex, &["codex"]),
         ] {
-            let plan = plan(&record(kind, argv), &shell);
+            let plan = plan(&record(kind, argv), &shell, NOTHING);
             assert_eq!(
                 plan,
                 RestorePlan {
@@ -161,5 +204,41 @@ mod tests {
                 "{kind:?} {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn agents_with_a_conversation_resume_as_themselves() {
+        let shell = vec!["/bin/zsh".to_owned()];
+        for (kind, argv) in [
+            (SessionKind::Claude, &["/usr/bin/claude"][..]),
+            (SessionKind::Codex, &["codex"]),
+        ] {
+            let mut agent = record(kind, argv);
+            agent.agent_session_id = Some("0b9f6c1e-2f43-4c55-9a51-6d1e4b0d8c11".into());
+            // Even one an earlier hub brought back as a shell.
+            agent.fallback_command = Some(vec!["/bin/bash".to_owned()]);
+            assert_eq!(
+                plan(&agent, &shell, RESUMABLE),
+                RestorePlan {
+                    command: argv.iter().map(|s| (*s).to_owned()).collect(),
+                    how: RestoreHow::Resume,
+                },
+                "{kind:?}"
+            );
+            // Nothing on disk to resume, or resume turned off: a shell.
+            assert_eq!(plan(&agent, &shell, NOTHING).how, RestoreHow::Shell);
+            let off = Resumable {
+                enabled: false,
+                conversation_exists: true,
+            };
+            assert_eq!(plan(&agent, &shell, off).how, RestoreHow::Shell);
+            // No conversation id recorded: a shell.
+            agent.agent_session_id = None;
+            assert_eq!(plan(&agent, &shell, RESUMABLE).how, RestoreHow::Shell);
+        }
+        // A shell never resumes.
+        let mut script = record(SessionKind::Shell, &["/bin/sh", "-c", "x"]);
+        script.agent_session_id = Some("0b9f6c1e-2f43-4c55-9a51-6d1e4b0d8c11".into());
+        assert_eq!(plan(&script, &shell, RESUMABLE).how, RestoreHow::Shell);
     }
 }

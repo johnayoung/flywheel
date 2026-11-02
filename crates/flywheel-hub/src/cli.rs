@@ -175,6 +175,10 @@ pub(crate) struct HubArgs {
     /// relaunch` or the UI).
     #[arg(long)]
     no_restore: bool,
+    /// Restore agent sessions as fresh shells instead of resuming their
+    /// conversations (Claude Code `--resume`, `codex resume`).
+    #[arg(long)]
+    no_agent_resume: bool,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
@@ -204,6 +208,9 @@ impl HubArgs {
         ]);
         if self.no_restore {
             argv.push("--no-restore".to_owned());
+        }
+        if self.no_agent_resume {
+            argv.push("--no-agent-resume".to_owned());
         }
         argv.extend([
             "--state-dir".to_owned(),
@@ -734,6 +741,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut options = HubOptions::new(state_dir);
     options.scrollback_lines = hub_args.scrollback_lines;
     options.report_command = report_command();
+    options.agent_resume = !hub_args.no_agent_resume;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

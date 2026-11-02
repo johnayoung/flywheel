@@ -39,10 +39,18 @@ impl Env {
         let mut argv: Vec<&str> = vec!["hub", args[0], "--state-dir", self.state.to_str().unwrap()];
         argv.extend_from_slice(&args[1..]);
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![self.root.join("bin")];
+        paths.extend(std::env::split_paths(&path));
         command
             .args(&argv)
             .env("SHELL", "/bin/sh")
             .env("HOME", &self.root)
+            // Scripted `claude` / `codex` stand-ins (see `fake_agents`).
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+            .env("CODEX_HOME", self.root.join("codex"))
+            .env("FW_BIN", env!("CARGO_BIN_EXE_fw"))
             .env("PS1", "$ ")
             .env_remove("XDG_STATE_HOME");
         command
@@ -115,6 +123,208 @@ impl Drop for Env {
         // Never leave a daemon behind, whatever the test did.
         let _ = self.fw(&["stop", "--force", "--timeout", "10"]);
     }
+}
+
+/// Scripted `claude` and `codex` on the hub's PATH. Each launch appends
+/// its cwd, report secret, and argv to `<root>/<name>.log` (`---` between
+/// launches), then reads its terminal. A fresh `claude --session-id <id>`
+/// files a transcript for `<id>` where Claude Code would (unless its repo
+/// has a `.no-transcript`); a fresh `codex` writes a rollout and reports its
+/// thread id the way Codex's notifier does.
+fn fake_agents(env: &Env) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = |name: &str| {
+        format!(
+            "{{ echo \"cwd=$PWD\"; echo \"secret=$FLYWHEEL_HUB_REPORT_SECRET\"; \
+             printf 'arg=%s\\n' \"$@\"; echo ---; }} >> '{}'\n",
+            env.root.join(format!("{name}.log")).display()
+        )
+    };
+    let claude = format!(
+        "#!/bin/sh\n{}\
+         if [ \"$1\" = --session-id ] && [ ! -e .no-transcript ]; then\n\
+         \x20 dir=\"$CLAUDE_CONFIG_DIR/projects/$(printf %s \"$PWD\" | sed 's/[^A-Za-z0-9]/-/g')\"\n\
+         \x20 mkdir -p \"$dir\" && echo '{{}}' > \"$dir/$2.jsonl\"\n\
+         fi\n\
+         echo claude-ready\nexec cat\n",
+        log("claude")
+    );
+    let codex = format!(
+        "#!/bin/sh\n{}\
+         case \" $* \" in *\" resume \"*) ;; *)\n\
+         \x20 id=0199a213-81c0-7800-8aa1-bbab2a035a53\n\
+         \x20 mkdir -p \"$CODEX_HOME/sessions/2026/11/02\"\n\
+         \x20 echo '{{}}' > \"$CODEX_HOME/sessions/2026/11/02/rollout-2026-11-02T10-00-00-$id.jsonl\"\n\
+         \x20 \"$FW_BIN\" hub report --source codex --event notify \
+         \"{{\\\"type\\\":\\\"agent-turn-complete\\\",\\\"thread-id\\\":\\\"$id\\\"}}\" ;;\n\
+         esac\n\
+         echo codex-ready\nexec cat\n",
+        log("codex")
+    );
+    for (name, script) in [("claude", claude), ("codex", codex)] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Each launch of fake agent `name` so far: its `cwd=`, `secret=`, and
+/// `arg=` lines.
+fn launches(env: &Env, name: &str) -> Vec<Vec<String>> {
+    let log = std::fs::read_to_string(env.root.join(format!("{name}.log"))).unwrap_or_default();
+    log.split("---\n")
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.lines().map(str::to_owned).collect())
+        .collect()
+}
+
+fn args_of(launch: &[String]) -> Vec<&str> {
+    launch
+        .iter()
+        .filter_map(|l| l.strip_prefix("arg="))
+        .collect()
+}
+
+fn field<'a>(launch: &'a [String], key: &str) -> &'a str {
+    launch
+        .iter()
+        .find_map(|l| l.strip_prefix(key))
+        .unwrap_or_default()
+}
+
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn restore_resumes_agent_conversations_natively() {
+    let env = Env::new();
+    fake_agents(&env);
+    let repo = env.repo("repo");
+    let fresh = env.repo("fresh");
+    std::fs::write(fresh.join(".no-transcript"), "").unwrap();
+    env.ok(&["start", "--port", "0"]);
+    let new = |ws: &str, repo: &Path, kind: &str, name: &str| {
+        env.ok(&[
+            "new",
+            ws,
+            "--repo",
+            repo.to_str().unwrap(),
+            "--create",
+            "--kind",
+            kind,
+            "--name",
+            name,
+        ])
+        .trim()
+        .to_owned()
+    };
+    new("proj", &repo, "claude", "cc");
+    new("proj", &repo, "codex", "cx");
+    new("other", &fresh, "claude", "unsaved");
+    env.read_until("cc", "claude-ready");
+    env.read_until("unsaved", "claude-ready");
+    env.read_until("cx", "codex-ready");
+    let thread = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+    wait_for("codex's thread id", || {
+        env.sessions()
+            .iter()
+            .any(|s| s["agent_session_id"] == thread)
+    });
+    let sessions = env.sessions();
+    let by_name = |sessions: &[Value], name: &str| {
+        sessions.iter().find(|s| s["name"] == name).unwrap().clone()
+    };
+    let conversation = by_name(&sessions, "cc")["agent_session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_claude = launches(&env, "claude");
+    let first_cc = first_claude
+        .iter()
+        .find(|l| field(l, "cwd=") == repo.to_str().unwrap())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        &args_of(&first_cc)[..2],
+        ["--session-id", conversation.as_str()]
+    );
+
+    env.ok(&["stop"]);
+    let started = env.ok(&["start", "--port", "0"]);
+    assert!(started.contains("restored 3 sessions"), "{started}");
+    env.read_until("cc", "claude-ready");
+    env.read_until("cx", "codex-ready");
+    wait_for("the restored agents", || {
+        launches(&env, "claude").len() == 3 && launches(&env, "codex").len() == 2
+    });
+
+    // Claude with a transcript: `--resume <id>` in its repo, with the
+    // status hooks and a fresh per-spawn secret; still a claude session.
+    let claude = launches(&env, "claude");
+    let resumed = &claude[2];
+    assert_eq!(field(resumed, "cwd="), repo.to_str().unwrap());
+    let args = args_of(resumed);
+    assert_eq!(&args[..2], ["--resume", conversation.as_str()], "{args:?}");
+    assert_eq!(args[2], "--settings", "{args:?}");
+    assert!(args[3].contains("\"report\""), "{args:?}");
+    assert!(!field(resumed, "secret=").is_empty());
+    assert_ne!(field(resumed, "secret="), field(&first_cc, "secret="));
+    // Codex with a rollout: `codex -c notify=[...] resume <thread>`.
+    let codex = launches(&env, "codex");
+    let args = args_of(&codex[1]);
+    assert_eq!(args[0], "-c", "{args:?}");
+    assert!(args[1].starts_with("notify=["), "{args:?}");
+    assert_eq!(&args[2..], ["resume", thread], "{args:?}");
+    assert_eq!(field(&codex[1], "cwd="), repo.to_str().unwrap());
+
+    let sessions = env.sessions();
+    for name in ["cc", "cx"] {
+        let s = by_name(&sessions, name);
+        assert_eq!(s["state"], "running", "{s}");
+        assert!(s.get("fallback_command").is_none(), "{s}");
+    }
+    assert_eq!(by_name(&sessions, "cc")["kind"], "claude");
+    assert_eq!(by_name(&sessions, "cx")["kind"], "codex");
+    // No transcript: a fresh shell in its place, the record still claude.
+    let unsaved = by_name(&sessions, "unsaved");
+    assert_eq!(unsaved["kind"], "claude", "{unsaved}");
+    assert_eq!(unsaved["fallback_command"], serde_json::json!(["/bin/sh"]));
+    let logs = env.ok(&["logs", "-n", "0"]);
+    assert!(
+        logs.contains("restored session \"cc\"") && logs.contains("resumed its conversation"),
+        "{logs}"
+    );
+
+    // --no-agent-resume: agents come back as shells, losslessly...
+    env.ok(&["stop"]);
+    env.ok(&["start", "--port", "0", "--no-agent-resume"]);
+    let sessions = env.sessions();
+    for name in ["cc", "cx"] {
+        let s = by_name(&sessions, name);
+        assert_eq!(s["state"], "running", "{s}");
+        assert_eq!(s["fallback_command"], serde_json::json!(["/bin/sh"]), "{s}");
+    }
+    assert_eq!(launches(&env, "claude").len(), 3);
+    assert_eq!(launches(&env, "codex").len(), 2);
+    // ...so a later start resumes them again.
+    env.ok(&["stop"]);
+    env.ok(&["start", "--port", "0"]);
+    wait_for("the resumed claude", || launches(&env, "claude").len() == 4);
+    let claude = launches(&env, "claude");
+    assert_eq!(
+        &args_of(&claude[3])[..2],
+        ["--resume", conversation.as_str()]
+    );
+    let sessions = env.sessions();
+    assert!(by_name(&sessions, "cc").get("fallback_command").is_none());
+    env.ok(&["stop"]);
 }
 
 fn status_code(env: &Env) -> i32 {

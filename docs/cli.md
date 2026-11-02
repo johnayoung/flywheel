@@ -14,6 +14,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
 | Hub | `fw hub serve` / `url` / `token` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
+| One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -77,6 +78,32 @@ Delegated to the core CLI (`crates/flywheel-core/src/workflow.rs`). Each enqueue
 | `reject RUN_ID` | Reject a parked manual gate: writes a `passed=False` receipt, transitions to FAILED_VALIDATION. `--feedback` flows into the next attempt's reviewer-feedback section (absent renders `(no feedback provided)`). | AWAITING_APPROVAL | positional `run_id`; `--feedback TEXT`; `--gate ORDINAL`; `--attempt N`; `--db` |
 
 The shell's `say` is a surface rename of core's `steer` verb; the underlying core CLI is unchanged. Core's `set-model` verb exists but is not a product verb; it is reachable only as the hidden `flywheel workflow set-model`.
+
+## `exec`
+
+One agent call through the `flywheel-agents` runtime under a local host (`crates/flywheel/src/exec.rs`). **No `flywheel.toml` is loaded and nothing is written under `.flywheel/`**: no task, store, or worktree. stdout carries only the result; diagnostics go to stderr.
+
+```bash
+fw exec --json --max-turns 1 --cwd /tmp/work \
+  --system-prompt "Answer in one word." - -- --tools "" < prompt.txt
+```
+
+| Flag | Controls |
+|---|---|
+| positional `PROMPT` | the prompt; `-` or omitted reads stdin; empty exits 2 |
+| `--agent ID` | adapter id (default `claude-code`; `codex`) |
+| `--model M`, `--max-turns N` | model and turn ceiling |
+| `--timeout SECS` | wall-clock ceiling; expiry kills the agent's process group |
+| `--cwd DIR` | agent working directory (default the current dir; must exist) |
+| `--system-prompt TEXT` | the adapter's `system_prompt` option |
+| `--option KEY=VALUE` | one adapter option (repeatable); `VALUE` parsed as JSON, else a string |
+| `--command ARG` | replace the agent executable (repeat for an argv prefix) |
+| `--json` | print the `CompletedRun` (`final_text`, `stop`, `total_cost_usd`, `failure`, `fault`, ...) as one JSON line; default prints `final_text` |
+| `-- ARGS...` | appended to the agent CLI argv (the `extra_cli_args` option) |
+
+Setting `system_prompt` or `extra_cli_args` both by flag and by `--option` is a usage error. Tool permission prompts are denied (supervised policy); widen tools with agent flags after `--`.
+
+Exit codes: **0** clean stop (terminal envelope seen, no `failure`/`fault`, `stop.is_error` false); **1** run failed, result still printed: `failure.error_type` is `timeout`, `cancelled` (SIGINT/SIGTERM, process group killed), `no_result` (agent exited without its result envelope), `agent_exit`, or the start-up error code (e.g. the agent CLI is missing); **2** usage error (unknown agent, bad flag/number/`--option`, missing `--cwd`, empty prompt), stdout empty.
 
 ## Daemons and audit
 

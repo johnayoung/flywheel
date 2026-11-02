@@ -10,6 +10,7 @@ pub mod autopilot_supervisor;
 pub mod cli;
 pub mod dashboard;
 pub mod docs;
+pub mod exec;
 pub mod history_screen;
 pub mod quit_prompt;
 pub mod session;

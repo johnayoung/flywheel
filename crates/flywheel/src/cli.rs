@@ -22,6 +22,7 @@
 //! * audit: `audit RUN_ID` -> the core audit stream
 //! * docs: `docs [TOPIC]` -> the curated operator docs
 //! * hub: `hub <serve|token>` -> the web workspace (`flywheel-hub`)
+//! * exec: `exec [PROMPT]` -> one agent call, no config/store/worktree
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -42,6 +43,7 @@
 
 use crate::autopilot_supervisor::AutopilotSupervisor;
 use crate::docs;
+use crate::exec;
 use crate::tui::{
     self, DAEMON_AUTOPILOT, DAEMON_WORKER, DaemonControl, DaemonError, DaemonFactory,
     DaemonSpawnSpec, DaemonStatus, open_store_bundle, resolve_tasks_dir_for_worker,
@@ -165,6 +167,7 @@ Verbs:
   audit RUN_ID     stream the totally-ordered audit records for a run
   docs [TOPIC]     print a curated operator doc (bare: list the topics)
   hub serve        run the web workspace of agent terminals (hub url: login links + QR)
+  exec [PROMPT]    run one agent call (no tasks, store, worktree, or config)
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
@@ -349,6 +352,10 @@ pub fn route(
     }
     if verb == HUB_VERB {
         return flywheel_hub::cli::run(rest, out, err);
+    }
+    if verb == exec::EXEC_VERB {
+        // One agent call: no flywheel.toml load, no store, no worktree.
+        return exec::run_with(rest, out, err);
     }
 
     let _ = writeln!(err, "{PROG}: unknown command: {verb}");

@@ -31,6 +31,13 @@ pub const SESSION_ENV: &str = "FLYWHEEL_HUB_SESSION";
 pub const MAX_REPORT_BYTES: usize = 256 * 1024;
 /// How often the accept loop re-checks for [`ReportServer::stop`].
 const STOP_POLL: Duration = Duration::from_millis(250);
+/// Pause after a failed accept (out of file descriptors, say): the
+/// pending connection keeps the listener readable, so retrying at once
+/// would spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+/// Longest socket path used as is (`sun_path` holds 108 bytes on Linux,
+/// 104 on macOS, both including the NUL).
+const MAX_SOCKET_PATH: usize = 100;
 /// Per-connection read/write deadline on both ends.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -102,11 +109,15 @@ impl std::fmt::Debug for ReportServer {
 }
 
 impl ReportServer {
-    /// Bind `<state_dir>/report.sock` (0600), replacing any socket file
-    /// already there (one left by a crashed hub). The caller must hold the
-    /// state dir's [`crate::remote::ServeLock`], so no live hub owns it.
+    /// Bind the state dir's report socket ([`socket_path`], 0600),
+    /// replacing any socket file already there (one left by a crashed hub).
+    /// The caller must hold the state dir's [`crate::remote::ServeLock`], so
+    /// no live hub owns it.
     pub fn bind(state_dir: &Path, handler: Arc<Handler>) -> Result<Self, ReportError> {
-        let path = state_dir.join(SOCKET_FILE);
+        let path = socket_path(state_dir).map_err(|source| ReportError::Io {
+            path: state_dir.join(SOCKET_FILE),
+            source,
+        })?;
         let io = |source| ReportError::Io {
             path: path.clone(),
             source,
@@ -157,6 +168,63 @@ impl Drop for ReportServer {
     }
 }
 
+/// Where the hub with `state_dir` listens for reports:
+/// `<state_dir>/report.sock`, or -- when that path is too long for a unix
+/// socket -- `<tmp>/flywheel-hub-<uid>/<digest of state_dir>.sock`, in a
+/// directory this user owns and nobody else can enter (created 0700).
+pub fn socket_path(state_dir: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let direct = state_dir.join(SOCKET_FILE);
+    if direct.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH {
+        return Ok(direct);
+    }
+    let name = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(state_dir.as_os_str().as_bytes());
+        let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
+        format!("{hex}.sock")
+    };
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut roots = vec![std::env::temp_dir()];
+    roots.push(PathBuf::from("/tmp"));
+    for root in roots {
+        let dir = root.join(format!("flywheel-hub-{uid}"));
+        let path = dir.join(&name);
+        if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH {
+            continue;
+        }
+        private_socket_dir(&dir, uid)?;
+        return Ok(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "state dir path is too long for a unix socket, and so is the temp dir's",
+    ))
+}
+
+/// Create `dir` (0700) or check that the existing one is a real directory
+/// owned by `uid` that no one else can use.
+fn private_socket_dir(dir: &Path, uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory of this user (want a 0700 dir, not a link)",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Wait up to [`STOP_POLL`] for `listener` to have a connection pending.
 fn readable(listener: &UnixListener) -> bool {
     use std::os::fd::AsRawFd;
@@ -178,6 +246,7 @@ fn accept_loop(listener: UnixListener, handler: Arc<Handler>, stopping: Arc<Atom
             continue;
         }
         let Ok((stream, _)) = listener.accept() else {
+            std::thread::sleep(ACCEPT_BACKOFF);
             continue;
         };
         // Accepted sockets must block (the listener's mode is not inherited
@@ -361,6 +430,156 @@ mod tests {
         server.stop();
         assert!(!path.exists());
         assert!(send(&path, &report("Stop")).is_err());
+    }
+
+    #[test]
+    fn long_state_dirs_get_a_short_private_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            socket_path(dir.path()).unwrap(),
+            dir.path().join(SOCKET_FILE)
+        );
+        let long = dir.path().join("x".repeat(120));
+        std::fs::create_dir_all(&long).unwrap();
+        let server = ReportServer::bind(&long, Arc::new(|_| Ok(()))).unwrap();
+        let path = server.path().to_path_buf();
+        assert!(path.as_os_str().len() <= MAX_SOCKET_PATH, "{path:?}");
+        assert!(!path.starts_with(&long));
+        assert_eq!(socket_path(&long).unwrap(), path);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        send(&path, &report("Stop")).unwrap();
+        // Another state dir gets another socket.
+        let other = dir.path().join("y".repeat(120));
+        assert_ne!(socket_path(&other).unwrap(), path);
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    /// Set in the child process of `accept_errors_back_off_not_spin`.
+    const EMFILE_CHILD: &str = "FLYWHEEL_HUB_TEST_EMFILE_CHILD";
+
+    fn cpu_time() -> Duration {
+        // SAFETY: a zeroed rusage is a valid out-parameter.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: RUSAGE_SELF with a valid pointer.
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        let tv = |t: libc::timeval| {
+            Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+        };
+        tv(usage.ru_utime) + tv(usage.ru_stime)
+    }
+
+    /// With every file descriptor in use, a pending report cannot be
+    /// accepted: the accept loop must wait, not spin, and serve it once a
+    /// descriptor frees up. Runs in its own process (it lowers the fd
+    /// limit).
+    #[test]
+    fn accept_errors_back_off_not_spin() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "report::tests::emfile_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "run by accept_errors_back_off_not_spin in a child process"]
+    fn emfile_child() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        if std::env::var_os(EMFILE_CHILD).is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let served = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&served);
+        let server = ReportServer::bind(
+            dir.path(),
+            Arc::new(move |_| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        // The client's socket exists before the limit drops; it connects
+        // after, so the hub cannot accept it in between.
+        // SAFETY: plain socket(2).
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // SAFETY: we own the new fd.
+        let client = unsafe { UnixStream::from_raw_fd(fd) };
+        let lowest_free = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+        // SAFETY: zeroed rlimit is a valid out-parameter.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: valid pointer.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let full = libc::rlimit {
+            rlim_cur: lowest_free as libc::rlim_t,
+            rlim_max: limit.rlim_max,
+        };
+        // SAFETY: valid pointer.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &full) }, 0);
+        assert!(std::fs::File::open("/dev/null").is_err(), "fds still free");
+
+        // SAFETY: a zeroed sockaddr_un, then its path.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in addr
+            .sun_path
+            .iter_mut()
+            .zip(server.path().as_os_str().as_bytes())
+        {
+            *slot = *byte as libc::c_char;
+        }
+        // SAFETY: a valid sockaddr_un of the given size.
+        let connected = unsafe {
+            libc::connect(
+                client.as_raw_fd(),
+                (&raw const addr).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(connected, 0);
+
+        std::thread::sleep(Duration::from_millis(300));
+        let before = cpu_time();
+        std::thread::sleep(Duration::from_secs(1));
+        let spent = cpu_time() - before;
+        assert!(
+            spent < Duration::from_millis(300),
+            "spun: {spent:?} CPU in 1s"
+        );
+        assert!(!served.load(Ordering::SeqCst));
+
+        // SAFETY: valid pointer.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut client = client;
+        client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let mut line = serde_json::to_vec(&report("Stop")).unwrap();
+        line.push(b'\n');
+        client.write_all(&line).unwrap();
+        let mut answer = String::new();
+        BufReader::new(&client).read_line(&mut answer).unwrap();
+        assert!(answer.contains("\"ok\":true"), "{answer}");
+        assert!(served.load(Ordering::SeqCst));
     }
 
     #[test]

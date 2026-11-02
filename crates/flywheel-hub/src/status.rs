@@ -87,6 +87,12 @@ pub enum Signal {
     Busy,
     /// Screen heuristic: the busy indicator went quiet.
     Quiet,
+    /// Screen heuristic: a dialog waits on a person before the agent has
+    /// reported anything (Claude's folder-trust prompt).
+    Dialog,
+    /// Screen heuristic: the turn a report said was running (or blocked)
+    /// left the screen with no report -- the user interrupted it.
+    Settled,
 }
 
 /// The status an entry holds before per-client `seen` is applied, and
@@ -129,6 +135,19 @@ fn transition(raw: Raw, signal: Signal) -> Option<Raw> {
             reported(AgentStatus::Unknown)
         }
         Signal::Quiet => None,
+        Signal::Dialog if raw.status == AgentStatus::Unknown => Some(Raw {
+            status: AgentStatus::Blocked,
+            heuristic: true,
+        }),
+        Signal::Dialog => None,
+        // Interrupted: back at the prompt, nothing new to see.
+        Signal::Settled if matches!(raw.status, AgentStatus::Working | AgentStatus::Blocked) => {
+            Some(Raw {
+                status: AgentStatus::Idle,
+                heuristic: true,
+            })
+        }
+        Signal::Settled => None,
     };
     next.filter(|n| *n != raw)
 }
@@ -171,6 +190,8 @@ struct Entry {
     /// Clients that viewed the session since its last `done`.
     seen_by: HashSet<String>,
     key: SpawnKey,
+    /// Status changes so far (tells one spell of a status from the next).
+    changes: u64,
 }
 
 impl Entry {
@@ -237,6 +258,7 @@ impl StatusBoard {
                 since: Utc::now(),
                 seen_by: HashSet::new(),
                 key: key.clone(),
+                changes: 0,
             },
         );
         Ok(key)
@@ -285,6 +307,7 @@ impl StatusBoard {
             return false;
         };
         entry.raw = next;
+        entry.changes += 1;
         entry.since = Utc::now();
         entry.detail = match next.status {
             AgentStatus::Blocked => detail.map(bounded_detail),
@@ -334,6 +357,15 @@ impl StatusBoard {
             Some(entry) if entry.raw.status == AgentStatus::Done => entry.seen_by.insert(client),
             _ => false,
         }
+    }
+
+    /// Spawn `generation`'s status before seen tracking, and how many
+    /// times it changed (`None` once the session or spawn is gone).
+    pub fn raw_status(&self, session_id: &str, generation: u64) -> Option<(AgentStatus, u64)> {
+        self.entries
+            .get(session_id)
+            .filter(|e| e.key.generation == generation)
+            .map(|e| (e.raw.status, e.changes))
     }
 
     /// One session's status for `audience`.
@@ -466,6 +498,38 @@ mod tests {
         board.apply("s", g, Signal::Blocked, None);
         assert!(!board.apply("s", g, Signal::Busy, None));
         assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn settled_ends_an_interrupted_turn_and_dialog_blocks_only_before_reports() {
+        let (mut board, g) = board_with("s", "w");
+        assert_eq!(board.raw_status("s", g), Some((AgentStatus::Unknown, 0)));
+        assert_eq!(board.raw_status("s", g + 1), None);
+        // Nothing to settle before a turn.
+        assert!(!board.apply("s", g, Signal::Settled, None));
+        // The trust dialog before any report.
+        assert!(board.apply("s", g, Signal::Dialog, Some("trust?")));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
+        assert!(board.apply("s", g, Signal::Ready, None));
+        assert!(!board.apply("s", g, Signal::Dialog, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
+
+        board.apply("s", g, Signal::Working, None);
+        let (_, spell) = board.raw_status("s", g).unwrap();
+        assert!(board.apply("s", g, Signal::Settled, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
+        assert!(board.raw_status("s", g).unwrap().1 > spell);
+        // A late idle_prompt for the interrupted turn is not a question.
+        assert!(!board.apply("s", g, Signal::AwaitingInput, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
+        // An interrupted permission prompt settles too; a finished turn
+        // does not.
+        board.apply("s", g, Signal::Blocked, Some("permission to use Bash"));
+        assert!(board.apply("s", g, Signal::Settled, None));
+        assert_eq!(board.status("s", Audience::Anyone).unwrap().detail, None);
+        board.apply("s", g, Signal::Done, None);
+        assert!(!board.apply("s", g, Signal::Settled, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
     }
 
     #[test]

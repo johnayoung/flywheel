@@ -118,6 +118,7 @@ pub const INHERITED_AGENT_ENV: &[&str] = &[
     "CLAUDE_CODE_EXECPATH",
     "CLAUDE_PID",
     "CLAUDE_EFFORT",
+    "AI_AGENT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
 ];
@@ -133,6 +134,8 @@ const CLAUDE_HOOKS: &[(&str, Option<&str>)] = &[
     ("PermissionRequest", None),
     ("Notification", Some("permission_prompt")),
     ("Notification", Some("elicitation_dialog")),
+    ("Notification", Some("elicitation_url_dialog")),
+    ("Notification", Some("agent_needs_input")),
     ("Notification", Some("idle_prompt")),
     ("Stop", None),
     ("StopFailure", None),
@@ -268,7 +271,10 @@ pub fn claude_signal(event: &str, detail: Option<&str>) -> Option<Signal> {
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" => Signal::Working,
         "PermissionRequest" => Signal::Blocked,
         "Notification" => match detail? {
-            "permission_prompt" | "elicitation_dialog" => Signal::Blocked,
+            "permission_prompt"
+            | "elicitation_dialog"
+            | "elicitation_url_dialog"
+            | "agent_needs_input" => Signal::Blocked,
             "idle_prompt" => Signal::AwaitingInput,
             _ => return None,
         },
@@ -283,7 +289,18 @@ pub fn claude_detail(event: &str, payload: &serde_json::Value) -> Option<String>
     let text = |key: &str| payload.get(key).and_then(|v| v.as_str()).map(str::to_owned);
     match event {
         "Notification" => text("message"),
-        "PermissionRequest" => text("tool_name").map(|tool| format!("permission to use {tool}")),
+        "PermissionRequest" => {
+            let tool = text("tool_name")?;
+            // A question tool asks its question; the permission is moot.
+            let question = payload
+                .pointer("/tool_input/questions/0/question")
+                .and_then(|q| q.as_str())
+                .filter(|q| !q.trim().is_empty());
+            Some(match question {
+                Some(question) => question.to_owned(),
+                None => format!("permission to use {tool}"),
+            })
+        }
         _ => None,
     }
 }
@@ -319,6 +336,96 @@ pub fn is_conversation_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+// --- claude screen fallback --------------------------------------------------
+
+/// What Claude Code draws, lowercased, while a turn runs (its footer)...
+const CLAUDE_BUSY_MARKER: &str = "esc to interrupt";
+/// ...and while a dialog waits (permission, question, trust).
+const CLAUDE_DIALOG_MARKER: &str = "esc to cancel";
+/// Claude Code's first-run folder-trust dialog (shown before any hook).
+const CLAUDE_TRUST_PHRASE: &str = "is this a project you created or one you trust";
+/// The blocked detail for the trust dialog.
+pub const CLAUDE_TRUST_DETAIL: &str = "asks whether to trust this folder";
+/// How long a turn's markers must stay gone, with no hook, before a
+/// reported working/blocked counts as interrupted.
+pub const CLAUDE_SETTLE_AFTER: Duration = Duration::from_secs(3);
+
+/// Screen fallback for what Claude Code's hooks do not report: an Esc
+/// interrupt fires no hook, so a reported `working` or `blocked` would
+/// stay forever. Conservative: a status is only settled once this spell
+/// of it has shown a turn marker on screen and every marker has then been
+/// gone for [`CLAUDE_SETTLE_AFTER`]; a screen that never showed one (a
+/// footer cut off by a narrow terminal) changes nothing. A blocked spell
+/// whose dialog closed onto the busy footer was approved: working again
+/// (the tool's `PostToolUse` only comes once it finishes). Before the
+/// first hook, the folder-trust dialog reads as blocked.
+#[derive(Debug, Default)]
+pub struct ClaudeScreen {
+    spell: Option<u64>,
+    marker_seen: bool,
+    dialog_seen: bool,
+    /// The busy footer was on screen as this monitor caused the next
+    /// spell (an approval): that spell starts having seen it.
+    carry_marker: bool,
+    gone_since: Option<Instant>,
+}
+
+impl ClaudeScreen {
+    /// Look at the visible screen `lines` while the session's reported
+    /// status is `status` (changed for the `spell`-th time).
+    pub fn observe(
+        &mut self,
+        status: crate::status::AgentStatus,
+        spell: u64,
+        lines: &[String],
+        now: Instant,
+    ) -> Option<Signal> {
+        use crate::status::AgentStatus;
+        if self.spell != Some(spell) {
+            self.spell = Some(spell);
+            self.marker_seen = std::mem::take(&mut self.carry_marker);
+            self.dialog_seen = false;
+            self.gone_since = None;
+        }
+        let screen = lines.join("\n").to_lowercase();
+        let busy = screen.contains(CLAUDE_BUSY_MARKER);
+        let dialog = screen.contains(CLAUDE_DIALOG_MARKER);
+        match status {
+            AgentStatus::Unknown if screen.contains(CLAUDE_TRUST_PHRASE) => Some(Signal::Dialog),
+            AgentStatus::Working | AgentStatus::Blocked => {
+                if status == AgentStatus::Blocked && self.dialog_seen && busy && !dialog {
+                    self.dialog_seen = false;
+                    self.carry_marker = true;
+                    return Some(Signal::Working);
+                }
+                if busy || dialog {
+                    self.marker_seen = true;
+                    self.dialog_seen |= dialog;
+                    self.gone_since = None;
+                    return None;
+                }
+                if !self.marker_seen {
+                    return None;
+                }
+                let gone = *self.gone_since.get_or_insert(now);
+                if now.saturating_duration_since(gone) < CLAUDE_SETTLE_AFTER {
+                    return None;
+                }
+                self.marker_seen = false;
+                self.gone_since = None;
+                Some(Signal::Settled)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the next look may settle the status (keep looking even
+    /// without new output).
+    pub fn pending(&self) -> bool {
+        self.gone_since.is_some()
+    }
 }
 
 // --- codex screen heuristic --------------------------------------------------
@@ -556,7 +663,13 @@ mod tests {
             .collect();
         assert_eq!(
             matchers,
-            ["permission_prompt", "elicitation_dialog", "idle_prompt"]
+            [
+                "permission_prompt",
+                "elicitation_dialog",
+                "elicitation_url_dialog",
+                "agent_needs_input",
+                "idle_prompt"
+            ]
         );
         assert_eq!(
             hooks["Notification"][0]["hooks"][0]["args"],
@@ -633,6 +746,20 @@ mod tests {
             Some("permission to use Bash")
         );
         assert_eq!(claude_detail("Stop", &payload), None);
+        let question = serde_json::json!({
+            "tool_name": "AskUserQuestion",
+            "tool_input": { "questions": [{ "question": "Which color do you prefer?" }] },
+        });
+        assert_eq!(
+            claude_detail("PermissionRequest", &question).as_deref(),
+            Some("Which color do you prefer?")
+        );
+        for matcher in ["elicitation_url_dialog", "agent_needs_input"] {
+            assert_eq!(
+                claude_signal("Notification", Some(matcher)),
+                Some(Signal::Blocked)
+            );
+        }
         let done = serde_json::json!({ "type": "agent-turn-complete", "thread-id": "t-1" });
         assert_eq!(codex_signal(&done), Some(Signal::Done));
         assert_eq!(codex_signal(&serde_json::json!({ "type": "other" })), None);
@@ -675,6 +802,69 @@ mod tests {
             Some(PathBuf::from("/h/.claude"))
         );
         assert_eq!(claude_config_dir(None, None), None);
+    }
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn claude_screen_settles_an_interrupted_turn_only_after_its_marker() {
+        use crate::status::AgentStatus::{Blocked, Done, Idle, Unknown, Working};
+        let t0 = Instant::now();
+        let busy = lines("> fix it\n  manual mode on \u{b7} Esc to interrupt");
+        let dialog = lines(" Do you want to proceed?\n Esc to cancel \u{b7} Tab to amend");
+        let prompt = lines("  \u{23bf}  Interrupted\n\u{276f}\n  manual mode on");
+        let settle = CLAUDE_SETTLE_AFTER;
+        let mut s = ClaudeScreen::default();
+        // A turn that never drew its marker is left alone.
+        assert_eq!(s.observe(Working, 1, &prompt, t0), None);
+        assert_eq!(s.observe(Working, 1, &prompt, t0 + settle * 2), None);
+        assert!(!s.pending());
+        // Marker, then gone: settles once it stayed gone long enough.
+        assert_eq!(s.observe(Working, 2, &busy, t0), None);
+        assert_eq!(s.observe(Working, 2, &prompt, t0 + settle), None);
+        assert!(s.pending());
+        assert_eq!(s.observe(Working, 2, &busy, t0 + settle * 2), None);
+        assert!(!s.pending());
+        let gone = t0 + settle * 3;
+        assert_eq!(s.observe(Working, 2, &prompt, gone), None);
+        assert_eq!(
+            s.observe(Working, 2, &prompt, gone + settle),
+            Some(Signal::Settled)
+        );
+        assert_eq!(s.observe(Working, 2, &prompt, gone + settle * 2), None);
+        // A permission dialog cancelled with Esc.
+        assert_eq!(s.observe(Blocked, 3, &dialog, t0), None);
+        assert_eq!(s.observe(Blocked, 3, &prompt, t0), None);
+        assert_eq!(
+            s.observe(Blocked, 3, &prompt, t0 + settle),
+            Some(Signal::Settled)
+        );
+        // An approved dialog closes onto the busy footer: working again. A
+        // busy footer drawn before the dialog is not an approval.
+        assert_eq!(s.observe(Blocked, 8, &busy, t0), None);
+        assert_eq!(s.observe(Blocked, 8, &dialog, t0), None);
+        assert_eq!(s.observe(Blocked, 8, &busy, t0), Some(Signal::Working));
+        // ...and that working spell has seen its footer already.
+        assert_eq!(s.observe(Working, 9, &prompt, t0), None);
+        assert_eq!(
+            s.observe(Working, 9, &prompt, t0 + settle),
+            Some(Signal::Settled)
+        );
+        // A marker seen in an earlier spell does not carry over.
+        assert_eq!(s.observe(Working, 4, &busy, t0), None);
+        assert_eq!(s.observe(Working, 5, &prompt, t0), None);
+        assert_eq!(s.observe(Working, 5, &prompt, t0 + settle * 2), None);
+        // Finished turns are the hooks' business.
+        assert_eq!(s.observe(Done, 6, &busy, t0), None);
+        assert_eq!(s.observe(Done, 6, &prompt, t0 + settle * 2), None);
+        // The trust dialog before any hook.
+        let trust = lines(
+            " Quick safety check: Is this a project you created or one you trust? (Like your own",
+        );
+        assert_eq!(s.observe(Unknown, 0, &trust, t0), Some(Signal::Dialog));
+        assert_eq!(s.observe(Idle, 7, &trust, t0), None);
     }
 
     #[test]

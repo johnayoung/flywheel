@@ -167,7 +167,11 @@
     const agent = agentStatus(session);
     if (agent) {
       const look = AGENT_LOOK[agent.status];
-      return { ...look, title: agent.detail ? `${look.label}: ${agent.detail}` : look.label };
+      return {
+        ...look,
+        detail: agent.detail || "",
+        title: agent.detail ? `${look.label}: ${agent.detail}` : look.label,
+      };
     }
     if (session.state === "running") {
       return session.live
@@ -685,11 +689,13 @@
   // --- events: pushed agent status -------------------------------------
 
   // What this page shows, for seen-tracking: the attached session while
-  // the page is visible, else nothing.
+  // the page is visible and focused, else nothing (a window left visible
+  // behind an editor is not being looked at, so a turn that finishes
+  // there stays "done").
   function currentView() {
     const session = sessionById(state.attached);
-    const visible = document.visibilityState === "visible";
-    return visible && session && session.live ? session.id : null;
+    const looking = document.visibilityState === "visible" && document.hasFocus();
+    return looking && session && session.live ? session.id : null;
   }
 
   function sendView(force) {
@@ -780,6 +786,8 @@
     if (document.visibilityState === "visible") eventsWake();
     sendView();
   });
+  window.addEventListener("focus", () => sendView());
+  window.addEventListener("blur", () => sendView());
 
   // Tab title and favicon carry what needs you: blocked and done counts.
   const favicon = {
@@ -788,10 +796,12 @@
     drawn: "",
   };
 
-  function attentionCounts() {
+  // Blocked and done agents (optionally all but one session).
+  function attentionCounts(except) {
     let blocked = 0;
     let done = 0;
     for (const session of state.sessions) {
+      if (session.id === except) continue;
       const agent = agentStatus(session);
       if (agent && agent.status === "blocked") blocked += 1;
       if (agent && agent.status === "done") done += 1;
@@ -831,25 +841,29 @@
     canvas.height = size;
     const ctx = canvas.getContext("2d");
     ctx.drawImage(favicon.image, 0, 0, size, size);
-    // Blocked outranks done: a person is needed.
-    const count = blocked || done;
-    const color = blocked ? "#ff3d5e" : "#d9a93a";
-    const r = 17;
-    const cx = size - r;
-    const cy = r;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
-    ctx.fillStyle = "#0c0d0c";
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-    ctx.fillStyle = "#0c0d0c";
-    ctx.font = "bold 26px ui-monospace, Menlo, Consolas, monospace";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(count > 9 ? "9+" : String(count), cx, cy + 1);
+    // One badge per kind: blocked (a person is needed) top right, done
+    // bottom right; a lone badge is drawn large so it reads at 16px.
+    const badges = [];
+    if (blocked) badges.push({ count: blocked, color: "#ff3d5e" });
+    if (done) badges.push({ count: done, color: "#d9a93a" });
+    const r = badges.length === 1 ? 22 : 16;
+    badges.forEach(({ count, color }, i) => {
+      const cx = size - r;
+      const cy = badges.length === 1 ? r : i === 0 ? r : size - r;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + 3, 0, Math.PI * 2);
+      ctx.fillStyle = "#0c0d0c";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.fillStyle = "#0c0d0c";
+      ctx.font = `bold ${Math.round(r * 1.5)}px ui-monospace, Menlo, Consolas, monospace`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(count > 9 ? "9+" : String(count), cx, cy + 1);
+    });
     favicon.drawn = key;
     favicon.link.type = "image/png";
     favicon.link.href = canvas.toDataURL("image/png");
@@ -1071,6 +1085,10 @@
         el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
         actions,
       ),
+      // What a blocked agent asks, readable without hover (touch).
+      st.dot === "blocked" && st.detail
+        ? el("span", { className: "session-detail", textContent: st.detail })
+        : null,
     );
   }
 
@@ -1219,6 +1237,20 @@
     const counts = attentionCounts();
     document.title = `${titlePrefix(counts)}${session ? `${session.name} · flywheel hub` : "flywheel hub"}`;
     drawFavicon(counts);
+    // The phone's only view of other sessions: a badge on the drawer
+    // button for the agents elsewhere that need you.
+    const elsewhere = attentionCounts(session ? session.id : null);
+    const badge = $("#menu-badge");
+    const urgent = elsewhere.blocked ? "blocked" : elsewhere.done ? "done" : null;
+    badge.hidden = !urgent;
+    if (urgent) {
+      badge.className = `menu-badge ${urgent}`;
+      badge.textContent = String(elsewhere.blocked || elsewhere.done);
+    }
+    $(".menu-toggle").setAttribute(
+      "aria-label",
+      urgent ? `Show sessions (${titlePrefix(elsewhere).slice(1, -2)} elsewhere)` : "Show sessions",
+    );
     const agent = session ? agentStatus(session) : null;
     const pill = $("#crumb-status");
     pill.hidden = !agent;

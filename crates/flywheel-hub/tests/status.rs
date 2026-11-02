@@ -44,7 +44,11 @@ impl TestHub {
     /// A hub whose `claude` and `codex` are the given script bodies; each
     /// first dumps its argv and environment into `<dir>/<name>.args|env`.
     async fn start(claude: &str, codex: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), claude, codex).await
+    }
+
+    /// [`TestHub::start`] on an existing dir (state and repo kept).
+    async fn start_in(dir: tempfile::TempDir, claude: &str, codex: &str) -> Self {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         let claude = fake_agent(dir.path(), "claude", claude);
@@ -145,13 +149,15 @@ impl TestHub {
             .unwrap()
     }
 
-    async fn shutdown(mut self) {
+    /// Stop the server; returns its dir (state and repo).
+    async fn shutdown(mut self) -> tempfile::TempDir {
         let _ = self.stop.take().unwrap().send(());
         timeout(Duration::from_secs(15), self.server.take().unwrap())
             .await
             .expect("server shut down in time")
             .unwrap()
             .unwrap();
+        self.dir
     }
 }
 
@@ -500,6 +506,189 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
     hub.shutdown().await;
 }
 
+/// A Claude Code stand-in that draws what the real TUI draws: the
+/// folder-trust dialog first, then per typed line a running turn's footer
+/// (`work`), a permission dialog (`dialog`), or the bare prompt it returns
+/// to after an Esc interrupt (`stop`).
+const CLAUDE_TUI: &str = r#"printf 'Quick safety check: Is this a project you created or one you trust?\r\n'
+while read line; do
+  case "$line" in
+    work) printf '\033[2J\033[H> fix it\r\n  manual mode on \302\267 esc to interrupt\r\n' ;;
+    dialog) printf '\033[2J\033[H Do you want to proceed?\r\n Esc to cancel \302\267 Tab to amend\r\n' ;;
+    stop) printf '\033[2J\033[H  Interrupted\r\n\342\235\257 \r\n' ;;
+  esac
+done"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
+    let hub = TestHub::start(CLAUDE_TUI, "exec cat").await;
+    let workspace = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "agents", "repos": [hub.repo()] }),
+        )
+        .await;
+    let wid = workspace["id"].as_str().unwrap().to_owned();
+    let mut events = hub.events("laptop").await;
+    next_event(&mut events, "snapshot").await;
+    let session = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": wid, "kind": "claude", "cols": 80, "rows": 24 }),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let (args, env) = launched(&hub, "claude").await;
+    let claude = Claude {
+        settings: serde_json::from_str(&args[3]).unwrap(),
+        env,
+    };
+    // The trust dialog waits on a person before any hook ran.
+    let blocked = status_becomes(&mut events, &sid, "blocked").await;
+    assert_eq!(
+        blocked["status"]["detail"],
+        flywheel_hub::agent::CLAUDE_TRUST_DETAIL
+    );
+    // The screen monitor is not a viewer.
+    assert_eq!(
+        hub.get(&format!("/api/sessions/{sid}")).await["live"]["clients"],
+        0
+    );
+    claude.fire("SessionStart", None, json!({})).unwrap();
+    status_becomes(&mut events, &sid, "idle").await;
+
+    let mut term = hub.ws(&format!("/api/sessions/{sid}/ws")).await.unwrap();
+    let mut type_line = async |text: &str| {
+        term.send(Message::Text(
+            json!({ "type": "input", "data": text }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    };
+    let api_status = async |hub: &TestHub| {
+        hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // Esc mid-turn fires no hook: once the turn's footer is gone for a
+    // while, the session is idle again.
+    claude.fire("UserPromptSubmit", None, json!({})).unwrap();
+    status_becomes(&mut events, &sid, "working").await;
+    type_line("work\r").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let interrupted = Instant::now();
+    type_line("stop\r").await;
+    status_becomes(&mut events, &sid, "idle").await;
+    assert!(
+        interrupted.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        interrupted.elapsed()
+    );
+    // A late idle_prompt for the interrupted turn is not a question.
+    claude
+        .fire("Notification", Some("idle_prompt"), json!({}))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(api_status(&hub).await, "idle");
+
+    // A permission prompt cancelled with Esc -- drawn before its hook
+    // arrived, so nothing on screen changes when it does.
+    type_line("dialog\r").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    claude
+        .fire("PermissionRequest", None, json!({ "tool_name": "Bash" }))
+        .unwrap();
+    status_becomes(&mut events, &sid, "blocked").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    type_line("stop\r").await;
+    let idle = status_becomes(&mut events, &sid, "idle").await;
+    assert!(idle["status"].get("detail").is_none(), "{idle}");
+
+    // An approved permission prompt closes onto the busy footer: working
+    // again before the tool's PostToolUse.
+    claude
+        .fire("PermissionRequest", None, json!({ "tool_name": "Bash" }))
+        .unwrap();
+    status_becomes(&mut events, &sid, "blocked").await;
+    type_line("dialog\r").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    type_line("work\r").await;
+    status_becomes(&mut events, &sid, "working").await;
+    type_line("stop\r").await;
+    status_becomes(&mut events, &sid, "idle").await;
+
+    // A turn whose footer never showed (cut off, say) is left alone.
+    claude.fire("UserPromptSubmit", None, json!({})).unwrap();
+    status_becomes(&mut events, &sid, "working").await;
+    type_line("stop\r").await;
+    tokio::time::sleep(flywheel_hub::agent::CLAUDE_SETTLE_AFTER + Duration::from_secs(1)).await;
+    assert_eq!(api_status(&hub).await, "working");
+    drop(term);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relaunching_a_claude_record_without_a_conversation_id_assigns_one() {
+    let hub = TestHub::start("exec cat", "exec cat").await;
+    let workspace = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "agents", "repos": [hub.repo()] }),
+        )
+        .await;
+    let wid = workspace["id"].as_str().unwrap().to_owned();
+    let session = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": wid, "kind": "claude" }),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    launched(&hub, "claude").await;
+    let dir = hub.shutdown().await;
+
+    // Rewrite the record the way a hub from before conversation ids left it.
+    let state_file = dir.path().join("state/state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    let record = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|s| s["id"] == sid)
+        .unwrap();
+    record.as_object_mut().unwrap().remove("agent_session_id");
+    std::fs::write(&state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let hub = TestHub::start_in(dir, "exec cat", "exec cat").await;
+    let stopped = hub.get(&format!("/api/sessions/{sid}")).await;
+    assert_eq!(stopped["state"], "stopped");
+    assert!(stopped.get("agent_session_id").is_none(), "{stopped}");
+    let relaunched = hub
+        .post(&format!("/api/sessions/{sid}/restart"), json!({}))
+        .await;
+    let conversation = relaunched["agent_session_id"].as_str().unwrap().to_owned();
+    let (args, env) = launched(&hub, "claude").await;
+    assert_eq!(
+        args[..3],
+        [
+            "--session-id".to_owned(),
+            conversation,
+            "--settings".to_owned()
+        ]
+    );
+    let claude = Claude {
+        settings: serde_json::from_str(&args[3]).unwrap(),
+        env,
+    };
+    let mut events = hub.events("laptop").await;
+    claude.fire("UserPromptSubmit", None, json!({})).unwrap();
+    status_becomes(&mut events, &sid, "working").await;
+    hub.shutdown().await;
+}
+
 async fn wait_exited(hub: &TestHub, sid: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while hub.get(&format!("/api/sessions/{sid}")).await["state"] != "exited" {
@@ -668,7 +857,7 @@ async fn events_socket_checks_origin_auth_and_client_ids() {
             .to_string()
             .contains("another hub is already serving"),
     );
-    let socket = hub.dir.path().join("state").join(report::SOCKET_FILE);
+    let socket = report::socket_path(&hub.dir.path().join("state")).unwrap();
     assert!(
         std::os::unix::net::UnixStream::connect(&socket).is_ok(),
         "the refused hub left the first's report socket alone"

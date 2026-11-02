@@ -2,7 +2,8 @@
 //! sessions the server owns.
 
 use crate::agent::{
-    self, AgentPrograms, CodexActivity, SessionKind, claude_signal, codex_signal, which,
+    self, AgentPrograms, ClaudeScreen, CodexActivity, SessionKind, claude_signal, codex_signal,
+    which,
 };
 use crate::auth::{LoginCodes, Logins, Token, TokenError, unix_now};
 use crate::paths::ensure_private_dir;
@@ -14,7 +15,7 @@ use crate::state::{
     validate_name,
 };
 use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusView};
-use crate::vt::DEFAULT_SCROLLBACK_LINES;
+use crate::vt::{DEFAULT_SCROLLBACK_LINES, TextSource};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,8 +28,10 @@ use tokio::sync::broadcast;
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Hub-wide event broadcast depth; a subscriber further behind resyncs.
 const EVENT_DEPTH: usize = 256;
-/// How often the Codex activity monitor re-checks for quiet.
+/// How often an agent activity monitor re-checks for quiet.
 const MONITOR_POLL: Duration = Duration::from_millis(100);
+/// Least time between two looks at a Claude session's screen.
+const SCREEN_LOOK: Duration = Duration::from_millis(250);
 /// Default terminal size for sessions created without one.
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 32;
@@ -241,7 +244,10 @@ impl Hub {
 
     /// The report socket agent sessions send status to.
     pub fn report_socket(&self) -> PathBuf {
-        self.options.state_dir.join(report::SOCKET_FILE)
+        match &*self.report.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(server) => server.path().to_path_buf(),
+            None => self.options.state_dir.join(report::SOCKET_FILE),
+        }
     }
 
     /// Hub-wide events (status changes, session list changes).
@@ -593,8 +599,8 @@ impl Hub {
                 }
             },
         )?;
-        if let (SessionKind::Codex, Some(generation)) = (record.kind, generation) {
-            self.monitor_codex(&record.id, generation, &session);
+        if let Some(generation) = generation {
+            self.monitor_agent(record.kind, &record.id, generation, &session);
         }
         Ok(session)
     }
@@ -609,38 +615,91 @@ impl Hub {
             .is_some()
     }
 
-    /// Watch a Codex session's output for its busy indicator (Codex has no
-    /// "turn started" hook). Runs until the process exits or the PTY is
-    /// dropped.
-    fn monitor_codex(self: &Arc<Self>, id: &str, generation: u64, session: &Arc<PtySession>) {
+    /// Watch an agent session's terminal for what its reports miss: Codex's
+    /// busy indicator (it has no "turn started" hook), and for Claude Code
+    /// an interrupted turn (Esc fires no hook) and the folder-trust dialog
+    /// (shown before any hook). Runs until the process exits or the PTY
+    /// is dropped.
+    fn monitor_agent(
+        self: &Arc<Self>,
+        kind: SessionKind,
+        id: &str,
+        generation: u64,
+        session: &Arc<PtySession>,
+    ) {
         // Screen-only snapshot: the monitor wants the live stream.
-        let mut events = session.attach_with(0).events;
+        let attachment = session.attach_with(0);
+        if attachment.exit.is_some() {
+            // Exited before the monitor subscribed: its Exit event is gone.
+            return;
+        }
+        let mut events = attachment.events;
         let weak = Arc::downgrade(self);
+        let pty = Arc::downgrade(session);
         let id = id.to_owned();
         let thread_id = id.clone();
         self.monitored().insert(id.clone(), generation);
         let spawned = std::thread::Builder::new()
-            .name("hub-codex-monitor".into())
+            .name("hub-agent-monitor".into())
             .spawn(move || {
                 let id = thread_id;
-                let mut activity = CodexActivity::default();
+                let mut codex = CodexActivity::default();
+                let mut claude = ClaudeScreen::default();
+                // Claude: look at the screen after output, at most every
+                // SCREEN_LOOK, and while a settle is pending.
+                let mut dirty = true;
+                let mut looked: Option<Instant> = None;
+                let mut last_spell: Option<u64> = None;
                 loop {
-                    let signal = match events.try_recv() {
-                        Ok(SessionEvent::Output(bytes)) => activity.feed(&bytes, Instant::now()),
+                    let mut signal = None;
+                    match events.try_recv() {
+                        Ok(SessionEvent::Output(bytes)) => {
+                            dirty = true;
+                            if kind == SessionKind::Codex {
+                                signal = codex.feed(&bytes, Instant::now());
+                            }
+                        }
                         Ok(SessionEvent::Exit(_)) | Err(broadcast::error::TryRecvError::Closed) => {
                             break;
                         }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => None,
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => dirty = true,
                         Err(broadcast::error::TryRecvError::Empty) => {
                             std::thread::sleep(MONITOR_POLL);
-                            activity.tick(Instant::now())
+                            if kind == SessionKind::Codex {
+                                signal = codex.tick(Instant::now());
+                            }
                         }
-                    };
+                    }
                     let Some(hub) = weak.upgrade() else {
                         break;
                     };
+                    let now = Instant::now();
+                    let due = looked.is_none_or(|at| now.duration_since(at) >= SCREEN_LOOK);
+                    if kind == SessionKind::Claude {
+                        let raw = hub.board().raw_status(&id, generation);
+                        let Some((status, spell)) = raw else {
+                            break;
+                        };
+                        // A report started a new spell: look again even if
+                        // the screen did not change (its markers may
+                        // already be up).
+                        dirty |= last_spell != Some(spell);
+                        last_spell = Some(spell);
+                        if !((dirty || claude.pending()) && due) {
+                            continue;
+                        }
+                        let Some(pty) = pty.upgrade() else {
+                            break;
+                        };
+                        looked = Some(now);
+                        dirty = false;
+                        let screen = pty.screen_text(TextSource::Visible);
+                        signal = claude.observe(status, spell, &screen.lines, now);
+                    }
                     if let Some(signal) = signal {
-                        hub.apply_signal(&id, generation, signal, None);
+                        let detail =
+                            (signal == Signal::Dialog).then_some(agent::CLAUDE_TRUST_DETAIL);
+                        hub.apply_signal(&id, generation, signal, detail);
                     }
                 }
                 if let Some(hub) = weak.upgrade() {
@@ -785,6 +844,14 @@ impl Hub {
                 workspace.name
             ))
             .into());
+        }
+        let mut record = record;
+        if record.kind == SessionKind::Claude && record.agent_session_id.is_none() {
+            // A record from before the hub assigned conversation ids: give
+            // it one, or it would launch without its status hooks.
+            let conversation = uuid::Uuid::new_v4().hyphenated().to_string();
+            store.set_agent_session_id(id, &conversation)?;
+            record.agent_session_id = Some(conversation);
         }
         let session = self.spawn_pty(&record, cols, rows)?;
         let record = match store.mark_running(id) {

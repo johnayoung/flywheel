@@ -2,10 +2,18 @@
 <html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0c0d0c" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f2eee4" media="(prefers-color-scheme: light)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Flywheel">
 <title>flywheel hub</title>
 <link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
 <link rel="preload" href="/assets/vendor/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/assets/vendor/fonts/martian-mono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/assets/vendor/fonts/big-shoulders-display.woff2" as="font" type="font/woff2" crossorigin>
@@ -57,6 +65,7 @@
       </div>
     </header>
     <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
+    <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
     <nav id="workspaces" aria-label="Workspaces"></nav>
     <div class="side-actions">
       <button type="button" class="slab" data-action="new-session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
@@ -69,6 +78,7 @@
       <button type="button" class="chip" id="theme-toggle" data-action="cycle-theme" title="Theme">
         <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label">auto</span>
       </button>
+      <button type="button" class="chip alerts" id="alerts-toggle" aria-pressed="false"><span class="alerts-dot" aria-hidden="true"></span><span id="alerts-label">alerts off</span></button>
       <button type="button" class="chip" data-action="logout">sign out</button>
     </footer>
   </aside>
@@ -93,6 +103,7 @@
     <div class="ruler" aria-hidden="true"></div>
     <section id="stage">
       <div id="terminal"></div>
+      <div id="sel-pop" class="sel-pop" hidden role="toolbar" aria-label="Selection"></div>
       <div id="banner" class="banner" hidden role="status">
         <span id="banner-text"></span>
         <span class="banner-actions" id="banner-actions"></span>
@@ -126,9 +137,26 @@
         </dl>
       </div>
     </section>
+    <div id="mobilebar" class="mobilebar" hidden>
+      <div id="quick" class="quick" hidden role="group" aria-label="Quick answers"></div>
+      <div id="compose" class="compose" hidden role="group" aria-label="Compose">
+        <textarea id="compose-text" rows="3" placeholder="Write a prompt. Sent as one paste, then Enter." aria-label="Prompt" autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"></textarea>
+        <div class="compose-actions">
+          <button type="button" class="kb-key tool" id="compose-prev" title="Previous prompt" aria-label="Previous prompt">&uarr;</button>
+          <button type="button" class="kb-key tool" id="compose-next" title="Next prompt" aria-label="Next prompt">&darr;</button>
+          <span id="compose-pos" class="compose-pos"></span>
+          <button type="button" class="kb-key tool" id="compose-close" title="Close (Esc)">close</button>
+          <button type="button" class="slab ghost" id="compose-paste" title="Paste without Enter">Paste</button>
+          <button type="button" class="slab" id="compose-send" title="Paste, then Enter (Ctrl Enter)">Send</button>
+        </div>
+      </div>
+      <div id="keybar" class="keybar" hidden></div>
+    </div>
   </main>
+  <!-- Inside #app: the app is fixed (its own stacking context), and the
+       scrim must sit between the drawer and the terminal. -->
+  <div id="scrim" class="scrim" data-action="toggle-sidebar"></div>
 </div>
-<div id="scrim" class="scrim" data-action="toggle-sidebar"></div>
 
 <dialog id="dlg-workspace" class="sheet" aria-labelledby="dlg-workspace-title">
   <form method="dialog" id="workspace-form" novalidate>
@@ -263,6 +291,10 @@
 <script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>
 <script src="/assets/commands.js"></script>
 <script src="/assets/import.js"></script>
+<script src="/assets/pwa.js"></script>
+<script src="/assets/attention.js"></script>
+<script src="/assets/notify.js"></script>
+<script src="/assets/mobile.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

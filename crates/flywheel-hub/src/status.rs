@@ -228,6 +228,20 @@ pub struct StatusBoard {
     next_generation: u64,
 }
 
+/// What a push notification about a session needs: its status before
+/// per-client seen tracking, and whether a person has it in front of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alert {
+    pub status: AgentStatus,
+    pub detail: Option<String>,
+    /// Status changes so far: tells one spell of a status from the next.
+    pub spell: u64,
+    /// A client is viewing the session right now.
+    pub watched: bool,
+    /// A finished turn some client has already seen.
+    pub seen: bool,
+}
+
 /// Every session's status and every workspace's rollup, as one client
 /// sees them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -366,6 +380,21 @@ impl StatusBoard {
             .get(session_id)
             .filter(|e| e.key.generation == generation)
             .map(|e| (e.raw.status, e.changes))
+    }
+
+    /// The facts a push notification about `session_id` is decided on.
+    pub fn alert(&self, session_id: &str) -> Option<Alert> {
+        let entry = self.entries.get(session_id)?;
+        Some(Alert {
+            status: entry.raw.status,
+            detail: entry.detail.clone(),
+            spell: entry.changes,
+            watched: self
+                .viewers
+                .values()
+                .any(|v| v.session.as_deref() == Some(session_id)),
+            seen: entry.raw.status == AgentStatus::Done && !entry.seen_by.is_empty(),
+        })
     }
 
     /// One session's status for `audience`.
@@ -628,5 +657,34 @@ mod tests {
         let out = bounded_detail(&long);
         assert_eq!(out.chars().count(), MAX_DETAIL_CHARS);
         assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn alerts_carry_the_raw_status_spell_and_who_is_looking() {
+        let (mut board, generation) = board_with("s1", "w1");
+        assert!(board.alert("nope").is_none());
+        board.apply("s1", generation, Signal::Working, None);
+        board.apply(
+            "s1",
+            generation,
+            Signal::Blocked,
+            Some("permission to use Bash"),
+        );
+        let blocked = board.alert("s1").unwrap();
+        assert_eq!(blocked.status, AgentStatus::Blocked);
+        assert_eq!(blocked.detail.as_deref(), Some("permission to use Bash"));
+        assert!(!blocked.watched && !blocked.seen);
+        let viewer = board.connect("phone");
+        board.view(viewer, Some("s1"));
+        assert!(board.alert("s1").unwrap().watched);
+        // A turn that finishes in front of a viewer is seen at once.
+        board.apply("s1", generation, Signal::Done, None);
+        let done = board.alert("s1").unwrap();
+        assert_eq!(done.status, AgentStatus::Done);
+        assert!(done.watched && done.seen);
+        assert!(done.spell > blocked.spell);
+        board.view(viewer, None);
+        let away = board.alert("s1").unwrap();
+        assert!(!away.watched && away.seen, "{away:?}");
     }
 }

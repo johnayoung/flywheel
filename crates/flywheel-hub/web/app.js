@@ -252,6 +252,17 @@
     },
   });
 
+  // The phone and alerts modules (pwa.js, attention.js, notify.js,
+  // mobile.js).
+  const pwa = window.FwHubPwa();
+  const attention = window.FwHubAttention({
+    $, el, icon, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
+  });
+  const notify = window.FwHubNotify({
+    $, state, store, sessionById, workspaceById, pwa, api, toast: commands.toast,
+    openSession: (id) => openSession(id),
+  });
+
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
   // half-typed rename is never torn down under the user.
@@ -414,12 +425,21 @@
   const TERM_FONT = '"FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
   let term = null;
   let fit = null;
+  const mobile = window.FwHubMobile({
+    $, el, state, store, api, sessionById, agentStatus,
+    toast: commands.toast,
+    copyText: commands.copyText,
+    term: () => term,
+    fit: () => fit,
+    sendData: (data) => sendInput(JSON.stringify({ type: "input", data })),
+    onKey: () => term && term.scrollToBottom(),
+  });
 
   function createTerminal() {
     term = new window.Terminal({
       cursorBlink: true,
       fontFamily: TERM_FONT,
-      fontSize: 13,
+      fontSize: mobile.fontSize(),
       lineHeight: 1.12,
       scrollback: 10000,
       allowProposedApi: false,
@@ -445,7 +465,8 @@
     for (const osc of [10, 11, 12]) {
       term.parser.registerOscHandler(osc, (data) => onlyQueries(data.split(";")));
     }
-    term.onData((data) => sendInput(JSON.stringify({ type: "input", data })));
+    // Sticky Ctrl/Alt from the phone's key bar apply to what is typed.
+    term.onData((data) => sendInput(JSON.stringify({ type: "input", data: mobile.transformInput(data) })));
     term.onBinary((data) => {
       const bytes = new Uint8Array(data.length);
       for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
@@ -466,6 +487,7 @@
     window.addEventListener("resize", refit);
     new ResizeObserver(refit).observe($("#terminal"));
     fit.fit();
+    mobile.attachTerminal();
   }
 
   function send(message) {
@@ -791,8 +813,12 @@
   // A status push repaints the sidebar -- except under an inline rename,
   // which must not be torn down mid-typing (it repaints when it ends).
   function renderStatus() {
-    if (state.renaming) renderMain();
-    else render();
+    if (state.renaming) {
+      attention.render();
+      renderMain();
+    } else {
+      render();
+    }
   }
 
   function startPolling() {
@@ -832,6 +858,7 @@
         state.rollup = message.workspaces || {};
         renderStatus();
       } else if (message.type === "status") {
+        notify.onStatus(message.session_id, state.agent[message.session_id], message.status);
         if (message.status) state.agent[message.session_id] = message.status;
         else delete state.agent[message.session_id];
         if (message.workspace_id) {
@@ -1312,6 +1339,7 @@
     wheel.style.setProperty("--spin", running ? `${Math.max(1.1, 9 / running)}s` : "0s");
     wheel.style.setProperty("--spin-state", running ? "running" : "paused");
 
+    attention.render();
     renderMain();
   }
 
@@ -1361,6 +1389,7 @@
 
     commands.render();
     commands.prefetch();
+    mobile.render();
 
     const actions = $("#empty-actions");
     if (!session) {
@@ -1890,6 +1919,8 @@
       cmd("Detach", "leave the session running", () => detach(), "chev");
     }
     commands.paletteItems(cmd);
+    mobile.paletteItems(cmd);
+    notify.paletteItems(cmd);
     for (const workspace of state.workspaces) {
       cmd(`Edit workspace ${workspace.name}`, "rename, folders", () => openWorkspaceDialog(workspace), "gear");
     }
@@ -2124,6 +2155,7 @@
   // --- chrome actions --------------------------------------------------
 
   async function logout() {
+    pwa.forget();
     await fetch("/logout", { method: "POST", credentials: "same-origin" });
     window.location.replace("/");
   }

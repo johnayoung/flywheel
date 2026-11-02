@@ -33,6 +33,14 @@ libc = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 # Terminal QR codes for `fw hub url --qr` (encoder only; no image backends).
 qrcode = { version = "0.14", default-features = false }
+# Push notifications (ntfy-style webhooks): one HTTP/1.1 POST over
+# rustls on ring with the platform's roots, as the rest of the workspace
+# does TLS.
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+url = "2"
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

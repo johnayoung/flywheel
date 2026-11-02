@@ -46,6 +46,8 @@
 
 mod commands_api;
 mod import_api;
+mod notify_api;
+mod pwa;
 
 use crate::auth::{
     FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
@@ -109,6 +111,9 @@ pub struct ServerOptions {
     /// / `-Proto` are believed, as from a loopback proxy -- so clients
     /// behind them are rate-limited by their own address, not the proxy's.
     pub trusted_proxies: Vec<IpAddr>,
+    /// Push notifications (`--notify-url` / `notify.toml`), for the
+    /// notify API (`GET /api/notify`, `POST /api/notify/test`).
+    pub notifier: Option<Arc<crate::notify::Notifier>>,
 }
 
 #[derive(Clone)]
@@ -168,6 +173,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
         .route("/api/events", get(events_ws))
+        .route("/api/notify", get(notify_api::status))
+        .route("/api/notify/test", post(notify_api::test))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -175,6 +182,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/logout", post(logout))
         .route("/healthz", get(|| async { "ok" }))
         .route("/assets/{*path}", get(asset))
+        .route("/manifest.webmanifest", get(pwa::manifest))
+        .route("/sw.js", get(pwa::service_worker))
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .layer(middleware::from_fn(security_headers))
@@ -485,7 +494,16 @@ async fn index(
     Query(query): Query<IndexQuery>,
 ) -> Response {
     match authenticate(&app, &headers, client) {
-        Auth::Granted => no_store(Html(web::INDEX_HTML).into_response()),
+        Auth::Granted => {
+            let mut response = no_store(Html(web::INDEX_HTML).into_response());
+            // The service worker keeps only this page (never the sign-in
+            // page) as the offline app shell.
+            response.headers_mut().insert(
+                header::HeaderName::from_static(web::SHELL_HEADER),
+                HeaderValue::from_static("app"),
+            );
+            response
+        }
         Auth::Limited(wait) => login_refused(wait),
         Auth::Anonymous | Auth::Denied => {
             let notice = match query.signed_out.as_deref() {

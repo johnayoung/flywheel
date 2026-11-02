@@ -869,6 +869,8 @@ dependencies = [
  "qrcode",
  "reqwest",
  "rqrr",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -876,8 +878,11 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
+ "toml",
  "unicode-width 0.2.0",
+ "url",
  "uuid",
 ]
 

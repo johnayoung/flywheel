@@ -7,6 +7,11 @@
 //! UI fonts under `web/vendor/fonts/` (Big Shoulders Display, Martian Mono,
 //! JetBrains Mono: latin variable subsets from @fontsource-variable 5.3.0,
 //! SIL OFL 1.1).
+//!
+//! The PWA icons (`icon-192.png`, `icon-512.png`, `icon-maskable-512.png`,
+//! `apple-touch-icon.png`) are `icon.svg`'s wheel rasterized by headless
+//! Chromium: rounded for `any`, full bleed (wheel inside the 80% safe
+//! circle) for `maskable` and iOS.
 
 /// The app shell (served at `/` once logged in).
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -18,28 +23,73 @@ pub const LOGGED_IN_HTML: &str = "<!doctype html><html lang=\"en\" data-signed-i
 <noscript><meta http-equiv=\"refresh\" content=\"0;url=/\"></noscript></head>\
 <body><p>Signed in. <a href=\"/\">Continue to the hub</a>.</p></body></html>";
 
+/// The web app manifest (served at `/manifest.webmanifest`).
+pub const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
+
+/// The service worker's source; [`service_worker`] stamps it.
+const SERVICE_WORKER: &str = include_str!("../web/sw.js");
+
+/// Header the hub sets on the signed-in app page: the only page the
+/// service worker keeps as the offline app shell.
+pub const SHELL_HEADER: &str = "x-fw-hub-shell";
+
+/// The service worker, stamped with [`build_id`] (a new binary's worker
+/// replaces the old one and drops its cache).
+pub fn service_worker() -> String {
+    SERVICE_WORKER.replace("__FW_HUB_BUILD__", build_id())
+}
+
+/// A digest of every embedded page and asset.
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(INDEX_HTML.as_bytes());
+        digest.update(MANIFEST.as_bytes());
+        for (path, bytes, _) in ASSETS {
+            digest.update(path.as_bytes());
+            digest.update(bytes);
+        }
+        digest.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
+}
+
+const JS: &str = "text/javascript; charset=utf-8";
+
 /// Every embedded asset under `/assets/`: `(path, bytes, content type)`.
 const ASSETS: &[(&str, &[u8], &str)] = &[
+    ("app.js", include_bytes!("../web/app.js"), JS),
+    ("attention.js", include_bytes!("../web/attention.js"), JS),
+    ("mobile.js", include_bytes!("../web/mobile.js"), JS),
+    ("notify.js", include_bytes!("../web/notify.js"), JS),
+    ("pwa.js", include_bytes!("../web/pwa.js"), JS),
     (
-        "app.js",
-        include_bytes!("../web/app.js"),
-        "text/javascript; charset=utf-8",
+        "icon-192.png",
+        include_bytes!("../web/icon-192.png"),
+        "image/png",
     ),
     (
-        "commands.js",
-        include_bytes!("../web/commands.js"),
-        "text/javascript; charset=utf-8",
+        "icon-512.png",
+        include_bytes!("../web/icon-512.png"),
+        "image/png",
     ),
     (
-        "import.js",
-        include_bytes!("../web/import.js"),
-        "text/javascript; charset=utf-8",
+        "icon-maskable-512.png",
+        include_bytes!("../web/icon-maskable-512.png"),
+        "image/png",
     ),
     (
-        "login.js",
-        include_bytes!("../web/login.js"),
-        "text/javascript; charset=utf-8",
+        "apple-touch-icon.png",
+        include_bytes!("../web/apple-touch-icon.png"),
+        "image/png",
     ),
+    ("commands.js", include_bytes!("../web/commands.js"), JS),
+    ("import.js", include_bytes!("../web/import.js"), JS),
+    ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",
         include_bytes!("../web/app.css"),
@@ -68,7 +118,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "vendor/xterm/xterm.js",
         include_bytes!("../web/vendor/xterm/xterm.js"),
-        "text/javascript; charset=utf-8",
+        JS,
     ),
     (
         "vendor/xterm/xterm.css",
@@ -78,12 +128,12 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "vendor/addon-fit/addon-fit.js",
         include_bytes!("../web/vendor/addon-fit/addon-fit.js"),
-        "text/javascript; charset=utf-8",
+        JS,
     ),
     (
         "vendor/addon-web-links/addon-web-links.js",
         include_bytes!("../web/vendor/addon-web-links/addon-web-links.js"),
-        "text/javascript; charset=utf-8",
+        JS,
     ),
 ];
 
@@ -96,13 +146,20 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
 }
 
 /// Assets served without the token: what the login page uses -- the fonts,
-/// the icon, and `login.js` (no app code).
+/// the icons (the manifest, fetched without cookies, names them), and
+/// `login.js` (no app code).
 pub fn is_public_asset(path: &str) -> bool {
-    path == "icon.svg"
-        || path == "login.js"
-        || path
-            .strip_prefix("vendor/fonts/")
-            .is_some_and(|f| f.ends_with(".woff2") && !f.contains('/'))
+    matches!(
+        path,
+        "icon.svg"
+            | "login.js"
+            | "icon-192.png"
+            | "icon-512.png"
+            | "icon-maskable-512.png"
+            | "apple-touch-icon.png"
+    ) || path
+        .strip_prefix("vendor/fonts/")
+        .is_some_and(|f| f.ends_with(".woff2") && !f.contains('/'))
 }
 
 fn escape_html(text: &str) -> String {
@@ -126,14 +183,21 @@ pub fn login_page(error: Option<&str>) -> String {
         .map(|e| format!("<p class=\"err\">{}</p>", escape_html(e)))
         .unwrap_or_default();
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>flywheel hub - sign in</title>
+<meta name="theme-color" content="#0c0d0c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Flywheel">
 <link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
 <script src="/assets/login.js" defer></script>
 <style>
   @font-face {{ font-family: "FW Display"; src: url(/assets/vendor/fonts/big-shoulders-display.woff2) format("woff2"); font-weight: 100 900; }}
@@ -155,7 +219,7 @@ pub fn login_page(error: Option<&str>) -> String {
   p {{ margin: 0 0 1.3rem; color: var(--ink-2); }}
   code {{ color: var(--signal); }}
   input {{ width: 100%; padding: .7rem .8rem; border: 1px solid var(--rule); border-radius: 2px; background: var(--bg);
-          color: inherit; font: 12px ui-monospace, monospace; }}
+          color: inherit; font: 16px ui-monospace, monospace; }}
   input:focus {{ outline: none; border-color: var(--signal); }}
   button {{ margin-top: 1rem; width: 100%; padding: .75rem; border: 0; border-radius: 2px; background: var(--signal);
            color: #150904; font: 600 11px "FW Mono", ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; cursor: pointer; }}
@@ -175,7 +239,7 @@ pub fn login_page(error: Option<&str>) -> String {
 </form>
 </body>
 </html>
-"#
+"##
     )
 }
 
@@ -267,5 +331,57 @@ mod tests {
         assert!(page.contains("&lt;script&gt;"));
         assert!(!page.contains("<script>x"));
         assert!(!login_page(None).contains("class=\"err\""));
+    }
+
+    #[test]
+    fn manifest_icons_are_public_and_embedded() {
+        let manifest: serde_json::Value = serde_json::from_str(MANIFEST).unwrap();
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["start_url"], "/");
+        let icons = manifest["icons"].as_array().unwrap();
+        assert!(icons.iter().any(|i| i["purpose"] == "maskable"));
+        assert!(icons.iter().any(|i| i["sizes"] == "512x512"));
+        for icon in icons {
+            let path = icon["src"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("/assets/")
+                .unwrap();
+            assert!(is_public_asset(path) && asset(path).is_some(), "{path}");
+        }
+        for page in [INDEX_HTML.to_owned(), login_page(None)] {
+            assert!(page.contains(r#"<link rel="manifest" href="/manifest.webmanifest">"#));
+            assert!(page.contains("apple-touch-icon"));
+        }
+    }
+
+    #[test]
+    fn png_icons_have_the_declared_sizes() {
+        for (path, size) in [
+            ("icon-192.png", 192),
+            ("icon-512.png", 512),
+            ("icon-maskable-512.png", 512),
+            ("apple-touch-icon.png", 180),
+        ] {
+            let (bytes, kind) = asset(path).unwrap();
+            assert_eq!(kind, "image/png");
+            assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{path}");
+            // IHDR: width and height, big-endian, at bytes 16..24.
+            let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+            let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+            assert_eq!((width, height), (size, size), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_service_worker_is_stamped_and_leaves_the_api_alone() {
+        let sw = service_worker();
+        assert!(!sw.contains("__FW_HUB_BUILD__"));
+        assert!(sw.contains(build_id()));
+        assert_eq!(build_id().len(), 16);
+        assert!(sw.contains(SHELL_HEADER));
+        // Only same-origin GETs of `/` and `/assets/` are intercepted.
+        assert!(sw.contains(r#"request.method !== "GET""#));
+        assert!(!sw.contains("/api/"));
     }
 }

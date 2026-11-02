@@ -20,6 +20,7 @@ pub mod commands_cli;
 pub mod daemon;
 pub mod hub;
 pub mod lifecycle;
+pub mod notify;
 pub mod paths;
 pub mod pty;
 pub mod remote;

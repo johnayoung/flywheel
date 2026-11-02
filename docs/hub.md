@@ -18,7 +18,7 @@ fw hub open [--session S]                     # open a browser here, signed in (
 fw hub token [--rotate]                       # print the access token (created on first use) / rotate it
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent-suggested code blocks
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
-# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--import-root DIR]
+# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--import-root DIR] [--notify-url URL]
 # every verb takes --state-dir DIR
 ```
 
@@ -62,6 +62,7 @@ fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code 
 | `--public-url` | none | origin browsers reach the hub at through a proxy (`https://box.tailnet.ts.net`); accepted as an origin, listed first by `url`, `Secure` cookies when https. Origin only (no path) |
 | `--trusted-proxy` | none | proxy on another machine whose `X-Forwarded-*` are believed (loopback always is), so its clients are rate-limited per client, not as one address |
 | `--allow-origin` | none | extra browser origin accepted without being listed; same-origin always allowed |
+| `--notify-url` | none | ntfy-compatible push on blocked/done (below); overrides `url` in `<state-dir>/notify.toml` |
 | `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer |
 | `--import-root` | `~/code` | where the UI's VS Code import looks for `*.code-workspace` (3 levels deep; hidden, `node_modules`/`target`/... and symlinked dirs skipped) |
 | `--state-dir` | `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub` | |
@@ -79,6 +80,28 @@ fw hub url --qr                                  # scan with the phone
 - `serve` and `url` run `tailscale status --json` / `tailscale serve status --json` (3 s timeout; `tailscale` on `PATH` or the macOS app): a `serve` whose `/` proxies to the hub's port is listed and, when found at startup, accepted as an origin. Tailnet up but nothing served: they print the `tailscale serve` command.
 - Behind any reverse proxy on this machine, `X-Forwarded-For` (last entry), `X-Forwarded-Host` (counts as same-origin), and `X-Forwarded-Proto` are believed only from loopback peers (IPv4-mapped ones under `--bind ::` included) and `--trusted-proxy` addresses. A proxy elsewhere: pass `--public-url` and `--trusted-proxy`. `tailscale serve` keeps `Host` and sets the forwarded headers, so starting it after `fw hub serve` works (it is just not listed as an origin until the next start).
 - LAN: `fw hub serve --bind 0.0.0.0` (warns; plain HTTP, so the clipboard API is off on phones), then `fw hub url --qr`.
+
+## Push notifications
+
+The hub POSTs to an ntfy-compatible webhook when an agent becomes **blocked** or finishes a turn (**done**), so a phone hears about it with every browser closed.
+
+```bash
+fw hub start --notify-url https://ntfy.sh/<long-random-topic>    # subscribe to the topic in the ntfy app
+```
+
+`<state-dir>/notify.toml` (must be `chmod 600`: the topic and token are secrets; `--notify-url` overrides `url` but shows in `ps` and in an `install-service` unit, so prefer the file):
+
+```toml
+url = "https://ntfy.example.com/hub"
+token = "tk_..."               # optional, sent as Authorization: Bearer (or user:pass@ in the URL: Basic)
+events = ["blocked", "done"]   # default both
+debounce_secs = 30             # one push per session and status per window
+settle_secs = 3                # how long a status must hold before it pushes (max 60)
+```
+
+- Says: title `<session> is blocked|done`, body `<workspace> / <session> (<kind>) waits on you: <status detail>` / `... finished its turn.`, `Priority: high` for blocked, `Tags: flywheel,<status>`, `Click: <public URL>/#session=<id>` when the hub has a `--public-url` or `tailscale serve` URL. Never terminal content, prompts, paths, or tokens; logs name only the webhook's host.
+- When: the status must hold 3 s (an approval within that never pushes), nobody may be viewing the session, a finished turn must still be unseen; then debounced per session and status. One HTTP/1.1 POST, 10 s timeout, no redirects followed, rustls with the system's roots; failures go to the hub log.
+- `GET /api/notify` says whether it is on (host only), `POST /api/notify/test` sends a test (palette: "Send a test push").
 
 ## Model
 
@@ -130,6 +153,19 @@ Agents draw suggested commands with margins and wrapping, so copying them off th
 - Failure limit: 10 wrong credentials (token, code, cookie, or bearer) per client address in a sliding 10 minutes, then everything that client presents gets 429 + `Retry-After` until the oldest failure ages out -- except a live login cookie, so an attacker sharing a NAT/proxy address cannot lock signed-in users out. IPv6 clients are keyed by /64. Direct connections from this machine (loopback or the host's own address, no `X-Forwarded-For`: the CLI, a local browser) are exempt, so a remote attacker cannot lock out `fw hub url`. Caveat: a local tunnel that adds no `X-Forwarded-For` (`ssh -L`, socat) makes its traffic look direct, hence exempt.
 - Cross-origin `Origin` headers are refused on WebSocket upgrades and on every non-GET request.
 
+## Phone
+
+Built for driving Claude Code and Codex from a phone (tested at 390x844 and 430x932 under iPhone 14 emulation):
+
+- **Viewport**: the app is pinned to the visual viewport, so the on-screen keyboard shrinks the terminal instead of covering it (no page scroll or zoom on focus: fields are 16 px on touch screens); safe-area insets respected.
+- **Needs you**: blocked and done agents of every workspace head the sidebar (the phone's switcher: drawer button, badge counts them); blocked first, longest-waiting first. Tap to open.
+- **Key bar** (touch screens; palette "Key bar: on/off/auto"): `esc` `tab` `shift-tab` (Claude's permission-mode cycle), sticky `ctrl` / `alt` (tap: next key, twice: locked; applied to what the keyboard types), arrows (repeat when held; honour app cursor mode), `enter`, `^C`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd` (show/hide the keyboard), `compose`.
+- **Quick answers**: while the attached agent is blocked, the options of the prompt on screen become buttons: numbered lists (Claude's permission dialogs: sends the digit; an option ending `(y)` sends that key) or a `(y/n)` line (sends the letter + Enter); `esc` cancels. The status detail heads it.
+- **Compose**: a multi-line text area (autocorrect, dictation) sent as one bracketed paste + Enter (`POST /paste` with `run`); `Paste` sends without Enter; history per device (arrows, or Up at the start); draft kept per session; `Ctrl Enter` sends.
+- **Touch**: swipe scrolls the scrollback with momentum (in full-screen programs: wheel reports, else arrow keys); long-press selects a word, drag extends, then Copy / Copy screen; pinch or `A-` `A+` sets the text size (per device).
+- **Alerts** (sidebar chip, per device): a system notification when an agent becomes blocked or done while the page is hidden or unfocused; clicking it opens that session. Needs https or localhost; on iOS only from the Home Screen app.
+- **Install**: `/manifest.webmanifest` (standalone, flywheel icons) + `/sw.js`. The service worker never touches `/api`, sockets, or sign-in; it serves the cached signed-in page and `/assets/` only when the hub is unreachable (the page then says so and reconnects), is replaced with each hub build, and is emptied on sign-out. The Home Screen app has its own cookies on iOS: sign in once more there (`fw hub url --qr`).
+
 ## API
 
 All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`rows` of 0 mean the default (120x32).
@@ -154,6 +190,8 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | POST | `/login-codes` | `{"code","expires_in":300}`: a one-time code for `/login?code=` |
 | POST | `/token/rotate` | 204: rotate the token (see `fw hub token --rotate`) |
 | GET | `/folders/check?path=` | always 200 (even without `path`): `{"ok":true,"path":canonical,"git"}` or `{"ok":false,"error"}` (the workspace form validates as you type); `/repos/check` is the old name |
+| GET | `/notify` | `{"push":null}` or `{"push":{"host","events","debounce_secs","settle_secs"}}` |
+| POST | `/notify/test` | 204 sent; 409 push off; 502 `{"error"}` the webhook refused or was unreachable |
 
 WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001 (even one whose upgrade raced the rotation); the UI then shows sign-in with a "token was rotated" notice.
 
@@ -189,4 +227,4 @@ Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working /
 
 The **Commands drawer** (`suggested` in the header, `Alt C`, or the palette; it overlays the terminal so opening it never resizes the PTY for other viewers) lists the attached agent's code blocks newest first (from a shell session: the workspace's agent that suggested last, or the one picked), unwrapped in monospace, each with Copy (the clipboard API on https/localhost, a selected-textarea fallback on plain-http LAN and iOS Safari), Send (paste into the chosen running shell of the workspace, no Enter) and Send + Run. Keys in the drawer: arrows / `j` `k` pick, `Enter` or `c` copy, `1`-`9` copy the nth, `s` Send, `Shift S` Send + Run, `Esc` close. Lines wider than the card fade at the edge with a `wide: scroll` hint. A new shell command from an agent in the workspace in view raises a toast with Copy.
 
-Hub shortcuts are captured before the terminal sees them. On macOS the chord is `Ctrl Option` instead of `Alt`, so Option keeps typing layout characters (`| [ ] { }`, dead keys); elsewhere an `Alt` key the layout turns into a character also goes to the terminal. Served from the binary (no build step): xterm.js 6.0.0 + fit + web-links and the UI fonts (Big Shoulders Display, Martian Mono, JetBrains Mono; SIL OFL), vendored under `crates/flywheel-hub/web/vendor/` with their licenses. Only the fonts, icon, and `login.js` are served without the token (the login page uses them).
+Hub shortcuts are captured before the terminal sees them. On macOS the chord is `Ctrl Option` instead of `Alt`, so Option keeps typing layout characters (`| [ ] { }`, dead keys); elsewhere an `Alt` key the layout turns into a character also goes to the terminal. Served from the binary (no build step): xterm.js 6.0.0 + fit + web-links and the UI fonts (Big Shoulders Display, Martian Mono, JetBrains Mono; SIL OFL), vendored under `crates/flywheel-hub/web/vendor/` with their licenses. Only the fonts, icons, `login.js`, `/manifest.webmanifest`, and `/sw.js` are served without the token (the login page and installers use them; none holds app data).

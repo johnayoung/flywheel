@@ -1021,6 +1021,25 @@ impl Hub {
         }
     }
 
+    /// What a push notification about session `id` would say, and the
+    /// facts deciding whether to send it (`None` once it is not tracked).
+    pub fn alert_subject(&self, id: &str) -> Option<crate::notify::Subject> {
+        let alert = self.board().alert(id)?;
+        let store = self.store();
+        let session = store.session(id).ok()?;
+        let workspace = store
+            .workspace(&session.workspace_id)
+            .map(|w| w.name.clone())
+            .unwrap_or_default();
+        Some(crate::notify::Subject {
+            session_id: session.id.clone(),
+            session: session.name.clone(),
+            workspace,
+            kind: session.kind,
+            alert,
+        })
+    }
+
     /// Every agent session's status and workspace rollup, for one client.
     pub fn status_snapshot(&self, client: &str) -> Snapshot {
         self.board().snapshot(Audience::Client(client))

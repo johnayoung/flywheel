@@ -4,6 +4,7 @@
 use crate::auth::{LOGIN_CODE_TTL, Token};
 use crate::client;
 use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
+use crate::notify::{Notifier, NotifyConfig};
 use crate::paths::default_state_dir;
 use crate::remote::{
     LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
@@ -194,6 +195,11 @@ pub(crate) struct HubArgs {
     /// *.code-workspace files (3 levels deep) [default: ~/code].
     #[arg(long, value_name = "DIR")]
     import_root: Option<PathBuf>,
+    /// Push a notification to this ntfy-compatible URL (e.g.
+    /// https://ntfy.sh/<topic>) when an agent becomes blocked or finishes
+    /// a turn nobody has seen; overrides `url` in <state-dir>/notify.toml.
+    #[arg(long, value_name = "URL")]
+    notify_url: Option<String>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
@@ -234,6 +240,9 @@ impl HubArgs {
                 "--import-root".to_owned(),
                 root.to_string_lossy().into_owned(),
             ]);
+        }
+        if let Some(url) = &self.notify_url {
+            argv.extend(["--notify-url".to_owned(), url.clone()]);
         }
         argv.extend([
             "--state-dir".to_owned(),
@@ -764,6 +773,13 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = writeln!(err, "fw hub: state dir {}: {e}", state_dir.display());
         return 1;
     }
+    let notify = match NotifyConfig::load(&state_dir, hub_args.notify_url.as_deref()) {
+        Ok(config) => config,
+        Err(message) => {
+            let _ = writeln!(err, "fw hub: push notifications: {message}");
+            return 2;
+        }
+    };
     let mut options = HubOptions::new(state_dir);
     options.scrollback_lines = hub_args.scrollback_lines;
     options.report_command = report_command();
@@ -909,6 +925,35 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
              scripting verbs will not find this hub): {e}"
         );
     }
+    let notifier = match notify {
+        Some(mut config) => {
+            // A push's click opens the hub where a phone reaches it.
+            config.click_base = public_urls
+                .first()
+                .or_else(|| tailscale.as_ref().and_then(|ts| ts.serve_urls.first()))
+                .cloned();
+            match Notifier::new(config) {
+                Ok(notifier) => {
+                    let _enter = runtime.enter();
+                    notifier.watch(&hub);
+                    let config = notifier.config();
+                    let _ = writeln!(
+                        out,
+                        "push notifications: {} -> {} (debounce {}s)",
+                        config.events().join(", "),
+                        config.host(),
+                        config.debounce.as_secs()
+                    );
+                    Some(notifier)
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "fw hub: push notifications off: {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let mut allowed_origins = hub_args.allow_origins;
     allowed_origins.extend(public_urls);
     if let Some(ts) = &tailscale {
@@ -917,6 +962,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let server_options = ServerOptions {
         allowed_origins,
         trusted_proxies: hub_args.trusted_proxies,
+        notifier,
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve(
@@ -1046,6 +1092,52 @@ mod tests {
         assert_eq!(first.trim().len(), 64);
         let (_, second, _) = run_args(&["token", "--state-dir", state_arg]);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn notify_url_is_forwarded_to_the_detached_serve() {
+        let cli = HubCli::try_parse_from([
+            "fw hub",
+            "serve",
+            "--notify-url",
+            "https://ntfy.sh/topic",
+            "--port",
+            "0",
+        ])
+        .unwrap();
+        let HubCommand::Serve(args) = cli.command else {
+            panic!("not serve");
+        };
+        let argv = args.hub.to_argv(Path::new("/state"));
+        let at = argv.iter().position(|a| a == "--notify-url").unwrap();
+        assert_eq!(argv[at + 1], "https://ntfy.sh/topic");
+        // What `start` passes on parses back the same.
+        let mut again = vec!["fw hub".to_owned(), "serve".to_owned()];
+        again.extend(argv);
+        let HubCommand::Serve(reparsed) = HubCli::try_parse_from(again).unwrap().command else {
+            panic!("not serve");
+        };
+        assert_eq!(
+            reparsed.hub.notify_url.as_deref(),
+            Some("https://ntfy.sh/topic")
+        );
+    }
+
+    #[test]
+    fn serve_refuses_a_bad_notify_config_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("hub");
+        let (code, _, err) = run_args(&[
+            "serve",
+            "--port",
+            "0",
+            "--notify-url",
+            "ftp://nope/x",
+            "--state-dir",
+            state.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains("push notifications"), "{err}");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! recorded as `running` when the hub last stopped is loaded back as
 //! `stopped`.
 
+use crate::agent::SessionKind;
 use crate::auth::write_private;
 use crate::pty::ExitInfo;
 use chrono::{DateTime, Utc};
@@ -60,6 +61,9 @@ pub struct SessionRecord {
     pub id: String,
     pub workspace_id: String,
     pub name: String,
+    /// Shell or agent CLI (records from before kinds existed are shells).
+    #[serde(default)]
+    pub kind: SessionKind,
     pub cwd: PathBuf,
     pub command: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -299,6 +303,20 @@ impl HubStore {
         self.save()
     }
 
+    /// Rename a session.
+    pub fn rename_session(&mut self, id: &str, name: &str) -> Result<SessionRecord, StateError> {
+        let name = validate_name(name)?;
+        let index = self
+            .doc
+            .sessions
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("session {id}")))?;
+        let previous = std::mem::replace(&mut self.doc.sessions[index].name, name);
+        self.save_or_rollback(|doc| doc.sessions[index].name = previous)?;
+        Ok(self.doc.sessions[index].clone())
+    }
+
     /// Forget a session record.
     pub fn remove_session(&mut self, id: &str) -> Result<(), StateError> {
         let index = self
@@ -368,9 +386,54 @@ pub fn validate_name(raw: &str) -> Result<String, StateError> {
     Ok(name.to_owned())
 }
 
-/// Canonicalize and check repo paths: 1..=MAX_REPOS absolute, existing git
-/// work-tree roots (a `.git` dir, or a `.git` file for linked worktrees),
-/// without duplicates.
+/// Expand a leading `~` (alone or as `~/...`) to `home`.
+pub fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Check one repo path (`~` expanded): canonical, an existing directory,
+/// and a git work-tree root (a `.git` dir, or a `.git` file for linked
+/// worktrees).
+pub fn validate_repo(raw: &Path) -> Result<PathBuf, StateError> {
+    let path = expand_home(raw, home_dir().as_deref());
+    if !path.is_absolute() {
+        return Err(StateError::Invalid(format!(
+            "repo path {} must be absolute",
+            raw.display()
+        )));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| StateError::Invalid(format!("repo path {}: {e}", path.display())))?;
+    if !canonical.is_dir() {
+        return Err(StateError::Invalid(format!(
+            "repo path {} is not a directory",
+            canonical.display()
+        )));
+    }
+    if !canonical.join(".git").exists() {
+        return Err(StateError::Invalid(format!(
+            "repo path {} is not a git work-tree root (no .git)",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+/// Canonicalize and check repo paths: 1..=MAX_REPOS paths passing
+/// [`validate_repo`], duplicates dropped.
 pub fn validate_repos(raw: &[PathBuf]) -> Result<Vec<PathBuf>, StateError> {
     if raw.is_empty() {
         return Err(StateError::Invalid(
@@ -385,27 +448,7 @@ pub fn validate_repos(raw: &[PathBuf]) -> Result<Vec<PathBuf>, StateError> {
     let mut seen = HashSet::new();
     let mut repos = Vec::with_capacity(raw.len());
     for path in raw {
-        if !path.is_absolute() {
-            return Err(StateError::Invalid(format!(
-                "repo path {} must be absolute",
-                path.display()
-            )));
-        }
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| StateError::Invalid(format!("repo path {}: {e}", path.display())))?;
-        if !canonical.is_dir() {
-            return Err(StateError::Invalid(format!(
-                "repo path {} is not a directory",
-                canonical.display()
-            )));
-        }
-        if !canonical.join(".git").exists() {
-            return Err(StateError::Invalid(format!(
-                "repo path {} is not a git work-tree root (no .git)",
-                canonical.display()
-            )));
-        }
+        let canonical = validate_repo(path)?;
         if seen.insert(canonical.clone()) {
             repos.push(canonical);
         }
@@ -435,6 +478,7 @@ mod tests {
             id: new_id(),
             workspace_id: workspace_id.into(),
             name: "shell".into(),
+            kind: SessionKind::Shell,
             cwd: cwd.into(),
             command: vec!["/bin/sh".into()],
             created_at: Utc::now(),
@@ -662,5 +706,105 @@ mod tests {
             HubStore::open(dir.path()),
             Err(StateError::Persist { .. })
         ));
+    }
+
+    #[test]
+    fn sessions_rename_persistently_and_reject_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let session = running_session(&ws.id, &repo);
+        store.insert_session(session.clone()).unwrap();
+
+        let renamed = store.rename_session(&session.id, "  build  ").unwrap();
+        assert_eq!(renamed.name, "build");
+        assert_eq!(
+            HubStore::open(dir.path())
+                .unwrap()
+                .session(&session.id)
+                .unwrap()
+                .name,
+            "build"
+        );
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.rename_session(&session.id, " "),
+            Err(StateError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.rename_session(&session.id, "a\tb"),
+            Err(StateError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.rename_session("missing", "x"),
+            Err(StateError::NotFound(_))
+        ));
+        assert_eq!(store.session(&session.id).unwrap().name, "build");
+    }
+
+    #[test]
+    fn records_without_a_kind_load_as_shells_and_kinds_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let legacy = format!(
+            r#"{{"version":1,"workspaces":[{{"id":"w1","name":"w","repos":[{repo:?}],
+            "created_at":"2026-11-01T00:00:00Z"}}],"sessions":[{{"id":"s1","workspace_id":"w1",
+            "name":"old","cwd":{repo:?},"command":["/bin/sh"],
+            "created_at":"2026-11-01T00:00:00Z","state":"exited","code":0,"signal":null,
+            "at":"2026-11-01T00:00:01Z"}}]}}"#
+        );
+        fs::write(dir.path().join(STATE_FILE), legacy).unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert_eq!(store.session("s1").unwrap().kind, SessionKind::Shell);
+
+        let mut agent = running_session("w1", &repo);
+        agent.kind = SessionKind::Codex;
+        store.insert_session(agent.clone()).unwrap();
+        let reopened = HubStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.session(&agent.id).unwrap().kind,
+            SessionKind::Codex
+        );
+    }
+
+    #[test]
+    fn tilde_expands_to_home_only_as_a_leading_component() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            expand_home(Path::new("~/code/x"), Some(home)),
+            PathBuf::from("/home/me/code/x")
+        );
+        assert_eq!(
+            expand_home(Path::new("~"), Some(home)),
+            PathBuf::from("/home/me")
+        );
+        assert_eq!(
+            expand_home(Path::new("~other/x"), Some(home)),
+            PathBuf::from("~other/x")
+        );
+        assert_eq!(
+            expand_home(Path::new("/a/~/b"), Some(home)),
+            PathBuf::from("/a/~/b")
+        );
+        assert_eq!(expand_home(Path::new("~/x"), None), PathBuf::from("~/x"));
+    }
+
+    #[test]
+    fn validate_repo_explains_each_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let file = dir.path().join("file");
+        fs::write(&file, "").unwrap();
+        let plain = dir.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        assert_eq!(validate_repo(&repo).unwrap(), repo.canonicalize().unwrap());
+        let message = |p: &Path| validate_repo(p).unwrap_err().to_string();
+        assert!(message(Path::new("rel/x")).contains("must be absolute"));
+        assert!(message(&dir.path().join("missing")).contains("missing"));
+        assert!(message(&file).contains("not a directory"));
+        assert!(message(&plain).contains("not a git work-tree root"));
     }
 }

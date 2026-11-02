@@ -10,6 +10,7 @@
 //! `fw hub <verb>` to [`cli::main`]; nothing below depends on this crate.
 //! Operator doc: `docs/hub.md`.
 
+pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod hub;

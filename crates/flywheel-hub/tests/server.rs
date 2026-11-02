@@ -39,8 +39,18 @@ impl TestHub {
     }
 
     async fn start_in(dir: tempfile::TempDir, state_dir: PathBuf, repo: PathBuf) -> Self {
+        Self::start_with(dir, state_dir, repo, |_| {}).await
+    }
+
+    async fn start_with(
+        dir: tempfile::TempDir,
+        state_dir: PathBuf,
+        repo: PathBuf,
+        configure: impl FnOnce(&mut HubOptions),
+    ) -> Self {
         let mut options = HubOptions::new(state_dir.clone());
         options.default_shell = vec!["/bin/sh".into()];
+        configure(&mut options);
         let hub = Hub::open(options).unwrap();
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -196,7 +206,14 @@ async fn everything_but_login_requires_the_token() {
     let get = |path: &str| hub.http.get(hub.url(path)).send();
 
     assert_eq!(get("/healthz").await.unwrap().status(), StatusCode::OK);
-    for path in ["/api/workspaces", "/api/sessions", "/assets/app.js"] {
+    for path in [
+        "/api/workspaces",
+        "/api/sessions",
+        "/api/kinds",
+        "/assets/app.js",
+        "/assets/app.css",
+        "/assets/vendor/xterm/xterm.js",
+    ] {
         assert_eq!(
             get(path).await.unwrap().status(),
             StatusCode::UNAUTHORIZED,
@@ -226,6 +243,14 @@ async fn everything_but_login_requires_the_token() {
     let body = page.text().await.unwrap();
     assert!(body.contains("action=\"/login\""));
     assert!(!body.contains("xterm.js"));
+
+    // The login page's fonts and icon are public.
+    for path in [
+        "/assets/icon.svg",
+        "/assets/vendor/fonts/martian-mono.woff2",
+    ] {
+        assert_eq!(get(path).await.unwrap().status(), StatusCode::OK, "{path}");
+    }
 
     // A WebSocket without credentials is refused before upgrade.
     assert_eq!(hub.connect("whatever", None, false).await.unwrap_err(), 401);
@@ -793,5 +818,230 @@ async fn api_errors_are_json_and_edge_inputs_are_handled() {
     };
     assert_eq!(patch(json!([other])).await, StatusCode::CONFLICT);
     assert_eq!(patch(json!([hub.repo])).await, StatusCode::OK);
+    hub.shutdown().await;
+}
+
+/// Write an executable script standing in for an agent CLI.
+fn fake_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_sessions_launch_their_cli_and_report_availability() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let claude = fake_agent(
+        &bin,
+        "claude",
+        r#"echo "fake-claude in $(pwd) args=[$*] session=$FLYWHEEL_HUB_SESSION"; exec cat"#,
+    );
+    let missing_codex = bin.join("codex-not-installed");
+    let claude_path = claude.clone();
+    let hub = TestHub::start_with(dir, state_dir, repo, move |options| {
+        options.agents.claude = claude_path.to_string_lossy().into_owned();
+        options.agents.codex = missing_codex.to_string_lossy().into_owned();
+    })
+    .await;
+
+    let kinds: Value = hub
+        .authed(reqwest::Method::GET, "/api/kinds")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kinds = kinds["kinds"].as_array().unwrap();
+    let by_kind = |k: &str| kinds.iter().find(|v| v["kind"] == k).unwrap().clone();
+    assert_eq!(by_kind("shell")["available"], true);
+    assert_eq!(by_kind("shell")["program"], "/bin/sh");
+    assert_eq!(by_kind("claude")["available"], true);
+    assert_eq!(by_kind("claude")["program"], claude.to_str().unwrap());
+    assert_eq!(by_kind("codex")["available"], false);
+    assert!(by_kind("codex")["program"].is_null());
+
+    let workspace = hub.create_workspace("agents").await;
+    let workspace_id = workspace["id"].as_str().unwrap();
+    let response = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": workspace_id, "kind": "claude", "cols": 90, "rows": 20 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let session: Value = response.json().await.unwrap();
+    let id = session["id"].as_str().unwrap();
+    assert_eq!(session["kind"], "claude");
+    assert_eq!(session["name"], "claude 1");
+    assert_eq!(session["command"], json!([claude.to_str().unwrap()]));
+
+    let mut ws = hub.connect(id, None, true).await.unwrap();
+    let repo = hub.repo.canonicalize().unwrap();
+    let (output, _) = read_until(&mut ws, &format!("session={id}")).await;
+    assert!(
+        output.contains(&format!("fake-claude in {} args=[]", repo.display())),
+        "{output:?}"
+    );
+    input(&mut ws, "ping-through-agent\r").await;
+    read_until(&mut ws, "ping-through-agent").await;
+
+    // An agent that is not installed is a clear 400, not a spawn failure.
+    let response = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": workspace_id, "kind": "codex" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: Value = response.json().await.unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("codex is not installed"),
+        "{error}"
+    );
+    // Agents run their CLI: an argv alongside is refused, as is an unknown kind.
+    for body in [json!({ "workspace_id": workspace_id, "kind": "claude", "command": ["/bin/sh"] })]
+    {
+        let response = hub
+            .authed(reqwest::Method::POST, "/api/sessions")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let response = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": workspace_id, "kind": "emacs" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The kind survives in the listing.
+    let listed: Value = hub
+        .authed(reqwest::Method::GET, "/api/sessions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["sessions"][0]["kind"], "claude");
+    drop(ws);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_rename_over_patch() {
+    let hub = TestHub::start().await;
+    let workspace = hub.create_workspace("rename").await;
+    let session = hub
+        .create_session(
+            workspace["id"].as_str().unwrap(),
+            Some(vec!["/bin/sh", "-c", "sleep 30"]),
+        )
+        .await;
+    let id = session["id"].as_str().unwrap();
+    assert_eq!(session["kind"], "shell");
+    let path = format!("/api/sessions/{id}");
+
+    let response = hub
+        .authed(reqwest::Method::PATCH, &path)
+        .json(&json!({ "name": "  dev server " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let renamed: Value = response.json().await.unwrap();
+    assert_eq!(renamed["name"], "dev server");
+    assert!(renamed["live"].is_object(), "still live after rename");
+
+    let response = hub
+        .authed(reqwest::Method::PATCH, &path)
+        .json(&json!({ "name": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = hub
+        .authed(reqwest::Method::PATCH, "/api/sessions/nope")
+        .json(&json!({ "name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // Cross-origin renames are refused like every other write.
+    let response = hub
+        .authed(reqwest::Method::PATCH, &path)
+        .header(ORIGIN, "http://evil.example")
+        .json(&json!({ "name": "pwned" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let fetched: Value = hub
+        .authed(reqwest::Method::GET, &path)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fetched["name"], "dev server");
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_check_validates_a_single_path() {
+    let hub = TestHub::start().await;
+    let check = |path: String| {
+        let request = hub
+            .authed(reqwest::Method::GET, "/api/repos/check")
+            .query(&[("path", path)]);
+        async move {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<Value>().await.unwrap()
+        }
+    };
+    let ok = check(format!(" {} ", hub.repo.display())).await;
+    assert_eq!(ok["ok"], true);
+    assert_eq!(
+        ok["path"],
+        hub.repo.canonicalize().unwrap().to_str().unwrap()
+    );
+
+    let plain = hub.repo.parent().unwrap().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let not_git = check(plain.display().to_string()).await;
+    assert_eq!(not_git["ok"], false);
+    assert!(
+        not_git["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a git work-tree root")
+    );
+    assert_eq!(check("relative/path".into()).await["ok"], false);
+    assert_eq!(check(String::new()).await["ok"], false);
+
+    let anonymous = hub
+        .http
+        .get(hub.url("/api/repos/check?path=/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
     hub.shutdown().await;
 }

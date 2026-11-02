@@ -3,7 +3,10 @@
 //!
 //! Vendored third-party code lives under `web/vendor/<package>/` with its
 //! license file (xterm.js 6.0.0, @xterm/addon-fit 0.11.0,
-//! @xterm/addon-web-links 0.12.0; sourcemap comments stripped).
+//! @xterm/addon-web-links 0.12.0; sourcemap comments stripped) and the
+//! UI fonts under `web/vendor/fonts/` (Big Shoulders Display, Martian Mono,
+//! JetBrains Mono: latin variable subsets from @fontsource-variable 5.3.0,
+//! SIL OFL 1.1).
 
 /// The app shell (served at `/` once logged in).
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -24,6 +27,26 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "app.css",
         include_bytes!("../web/app.css"),
         "text/css; charset=utf-8",
+    ),
+    (
+        "icon.svg",
+        include_bytes!("../web/icon.svg"),
+        "image/svg+xml",
+    ),
+    (
+        "vendor/fonts/big-shoulders-display.woff2",
+        include_bytes!("../web/vendor/fonts/big-shoulders-display.woff2"),
+        "font/woff2",
+    ),
+    (
+        "vendor/fonts/martian-mono.woff2",
+        include_bytes!("../web/vendor/fonts/martian-mono.woff2"),
+        "font/woff2",
+    ),
+    (
+        "vendor/fonts/jetbrains-mono.woff2",
+        include_bytes!("../web/vendor/fonts/jetbrains-mono.woff2"),
+        "font/woff2",
     ),
     (
         "vendor/xterm/xterm.js",
@@ -55,6 +78,15 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         .map(|(_, bytes, content_type)| (*bytes, *content_type))
 }
 
+/// Assets served without the token: the fonts and icon (the login page
+/// uses them). Never code.
+pub fn is_public_asset(path: &str) -> bool {
+    path == "icon.svg"
+        || path
+            .strip_prefix("vendor/fonts/")
+            .is_some_and(|f| f.ends_with(".woff2") && !f.contains('/'))
+}
+
 fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -81,28 +113,44 @@ pub fn login_page(error: Option<&str>) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>flywheel hub - sign in</title>
-<link rel="icon" href="data:,">
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
 <style>
-  :root {{ color-scheme: dark; }}
-  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
-         background: #0e1013; color: #d7dae0; font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }}
-  form {{ width: min(26rem, 90vw); padding: 2rem; border: 1px solid #262a31; border-radius: 10px; background: #15181d; }}
-  h1 {{ margin: 0 0 .25rem; font-size: 1.15rem; letter-spacing: .02em; }}
-  p {{ margin: 0 0 1.25rem; color: #8b919c; }}
-  code {{ color: #e8b45a; }}
-  input {{ box-sizing: border-box; width: 100%; padding: .65rem .75rem; border-radius: 6px; border: 1px solid #2f343d;
-          background: #0e1013; color: inherit; font: 13px ui-monospace, monospace; }}
-  button {{ margin-top: 1rem; width: 100%; padding: .65rem; border: 0; border-radius: 6px; background: #e8b45a;
-           color: #15181d; font-weight: 600; cursor: pointer; }}
-  .err {{ color: #ef6b6b; margin: .75rem 0 0; }}
+  @font-face {{ font-family: "FW Display"; src: url(/assets/vendor/fonts/big-shoulders-display.woff2) format("woff2"); font-weight: 100 900; }}
+  @font-face {{ font-family: "FW Mono"; src: url(/assets/vendor/fonts/martian-mono.woff2) format("woff2"); font-weight: 100 800; font-stretch: 75% 112.5%; }}
+  :root {{ color-scheme: dark; --bg: #0c0d0c; --panel: #181a17; --ink: #ece6d6; --ink-2: #a8a291; --rule: #34362f; --signal: #ff5a1f; --alert: #ff3d5e; }}
+  @media (prefers-color-scheme: light) {{
+    :root {{ color-scheme: light; --bg: #f2eee4; --panel: #fbf9f3; --ink: #1b1c18; --ink-2: #57544b; --rule: #c3bca9; --signal: #e2470c; --alert: #c8143a; }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--ink);
+         font: 12px/1.6 "FW Mono", ui-monospace, monospace; font-stretch: 87.5%; overflow: hidden; }}
+  .wheel {{ position: fixed; right: -12rem; bottom: -12rem; width: 38rem; height: 38rem; color: var(--rule); opacity: .6;
+           animation: spin 90s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  form {{ position: relative; width: min(27rem, 90vw); padding: 0 1.8rem 1.8rem; background: var(--panel);
+         border-top: 4px solid var(--signal); box-shadow: 0 30px 80px -24px rgba(0,0,0,.6), 0 0 0 1px var(--rule); }}
+  .kicker {{ display: block; padding-top: 1.4rem; font-size: 10px; letter-spacing: .3em; text-transform: uppercase; color: var(--signal); }}
+  h1 {{ margin: .1rem 0 .8rem; font: 800 3.2rem/.9 "FW Display", "Arial Narrow", sans-serif; text-transform: uppercase; }}
+  p {{ margin: 0 0 1.3rem; color: var(--ink-2); }}
+  code {{ color: var(--signal); }}
+  input {{ width: 100%; padding: .7rem .8rem; border: 1px solid var(--rule); border-radius: 2px; background: var(--bg);
+          color: inherit; font: 12px ui-monospace, monospace; }}
+  input:focus {{ outline: none; border-color: var(--signal); }}
+  button {{ margin-top: 1rem; width: 100%; padding: .75rem; border: 0; border-radius: 2px; background: var(--signal);
+           color: #150904; font: 600 11px "FW Mono", ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; cursor: pointer; }}
+  .err {{ color: var(--alert); margin: .9rem 0 0; }}
+  @media (prefers-reduced-motion: reduce) {{ .wheel {{ animation: none; }} }}
 </style>
 </head>
 <body>
+<svg class="wheel" viewBox="0 0 48 48" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="24" cy="24" r="21" stroke-width="2.4"/><circle cx="24" cy="24" r="15.5" stroke-width="1" stroke-dasharray="2.2 2.6"/><path d="M24 19V5M24 29v14M19.7 21.5 7.6 14.5M28.3 26.5l12.1 7M19.7 26.5 7.6 33.5M28.3 21.5l12.1-7" stroke-width="1.8"/></g><circle cx="24" cy="24" r="5" fill="currentColor"/></svg>
 <form method="post" action="/login">
-  <h1>flywheel hub</h1>
+  <span class="kicker">flywheel hub</span>
+  <h1>Sign in</h1>
   <p>Paste the token from <code>fw hub token</code>, or open the login URL <code>fw hub serve</code> printed.</p>
-  <input name="token" type="password" autocomplete="current-password" placeholder="token" autofocus required>
+  <input name="token" type="password" autocomplete="current-password" placeholder="token" aria-label="Token" autofocus required>
   <button type="submit">Sign in</button>
   {error}
 </form>
@@ -134,6 +182,58 @@ mod tests {
                 asset(path).is_some(),
                 "index.html references missing {path}"
             );
+        }
+    }
+
+    #[test]
+    fn stylesheet_fonts_are_embedded() {
+        let (css, _) = asset("app.css").unwrap();
+        let css = std::str::from_utf8(css).unwrap();
+        let mut fonts = 0;
+        for reference in css.split("url(/assets/").skip(1) {
+            let path = reference.split(')').next().unwrap();
+            assert!(asset(path).is_some(), "app.css references missing {path}");
+            fonts += 1;
+        }
+        assert_eq!(fonts, 3, "one @font-face per vendored font");
+    }
+
+    #[test]
+    fn vendored_code_keeps_its_licenses() {
+        let vendor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/vendor");
+        for (path, _, _) in ASSETS {
+            let Some(rest) = path.strip_prefix("vendor/") else {
+                continue;
+            };
+            let package = rest.split('/').next().unwrap();
+            let dir = vendor.join(package);
+            let licensed = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with("LICENSE"));
+            assert!(licensed, "{} has no LICENSE file", dir.display());
+        }
+    }
+
+    #[test]
+    fn only_fonts_and_the_icon_are_public() {
+        assert!(is_public_asset("icon.svg"));
+        assert!(is_public_asset("vendor/fonts/martian-mono.woff2"));
+        for private in [
+            "app.js",
+            "app.css",
+            "vendor/xterm/xterm.js",
+            "vendor/fonts/LICENSE-martian-mono",
+            "vendor/fonts/../../app.js.woff2",
+            "vendor/fonts/x/y.woff2",
+        ] {
+            assert!(!is_public_asset(private), "{private}");
+        }
+        // Every public asset referenced by the login page exists.
+        let page = login_page(None);
+        for reference in page.split("/assets/").skip(1) {
+            let path = reference.split([')', '"']).next().unwrap();
+            assert!(is_public_asset(path) && asset(path).is_some(), "{path}");
         }
     }
 

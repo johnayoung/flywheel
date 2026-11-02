@@ -17,7 +17,7 @@ use crate::auth::{
 };
 use crate::hub::{CreateSession, Hub, HubError};
 use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
-use crate::state::{StateError, WorkspaceInput};
+use crate::state::{StateError, WorkspaceInput, validate_repo};
 use crate::web;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Form, FromRequest, Path, Query, Request, State};
@@ -82,17 +82,21 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/sessions/{id}",
-            get(get_session).delete(remove_session),
+            get(get_session)
+                .patch(update_session)
+                .delete(remove_session),
         )
+        .route("/api/kinds", get(list_kinds))
+        .route("/api/repos/check", get(check_repo))
         .route("/api/sessions/{id}/kill", post(kill_session))
         .route("/api/sessions/{id}/ws", get(session_ws))
-        .route("/assets/{*path}", get(asset))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
         .route("/login", get(login_query).post(login_form))
         .route("/logout", post(logout))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/assets/{*path}", get(asset))
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .layer(middleware::from_fn(security_headers))
@@ -258,7 +262,16 @@ async fn logout() -> Response {
     response
 }
 
-async fn asset(Path(path): Path<String>) -> Response {
+/// Embedded assets. The app's code needs the token; the fonts and icon the
+/// login page also uses are public.
+async fn asset(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    if !web::is_public_asset(&path) && !is_authenticated(&headers, &app.hub) {
+        return error_response(StatusCode::UNAUTHORIZED, "authentication required");
+    }
     match web::asset(&path) {
         Some((bytes, content_type)) => (
             [
@@ -403,6 +416,56 @@ async fn create_session(
     let hub = Arc::clone(&app.hub);
     let view = blocking(move || hub.create_session(request)).await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+#[derive(Deserialize)]
+struct SessionPatch {
+    name: Option<String>,
+}
+
+async fn update_session(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(patch): ApiJson<SessionPatch>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || match patch.name {
+        Some(name) => hub.rename_session(&id, &name),
+        None => Ok(hub.session(&id)?),
+    })
+    .await?;
+    Ok(Json(view).into_response())
+}
+
+async fn list_kinds(State(app): State<AppState>) -> Response {
+    let hub = Arc::clone(&app.hub);
+    match tokio::task::spawn_blocking(move || hub.kinds()).await {
+        Ok(kinds) => Json(json!({ "kinds": kinds })).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("worker task failed: {e}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct RepoQuery {
+    path: String,
+}
+
+/// Validate one candidate repo path for the new-workspace form: always 200,
+/// `{"ok":true,"path":canonical}` or `{"ok":false,"error":...}`.
+async fn check_repo(Query(query): Query<RepoQuery>) -> Response {
+    let raw = std::path::PathBuf::from(query.path.trim());
+    let result = tokio::task::spawn_blocking(move || validate_repo(&raw)).await;
+    match result {
+        Ok(Ok(path)) => Json(json!({ "ok": true, "path": path })).into_response(),
+        Ok(Err(e)) => Json(json!({ "ok": false, "error": e.to_string() })).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("worker task failed: {e}"),
+        ),
+    }
 }
 
 async fn kill_session(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {

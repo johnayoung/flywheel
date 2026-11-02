@@ -1,45 +1,211 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
 <title>flywheel hub</title>
-<link rel="icon" href="data:,">
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="preload" href="/assets/vendor/fonts/jetbrains-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/vendor/fonts/martian-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/vendor/fonts/big-shoulders-display.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/vendor/xterm/xterm.css">
 <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-wheel" viewBox="0 0 48 48">
+    <circle cx="24" cy="24" r="21" fill="none" stroke="currentColor" stroke-width="3.2"/>
+    <circle cx="24" cy="24" r="15.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="2.2 2.6"/>
+    <circle cx="24" cy="24" r="5" fill="currentColor"/>
+    <path d="M24 19V5M24 29v14M19.7 21.5 7.6 14.5M28.3 26.5l12.1 7M19.7 26.5 7.6 33.5M28.3 21.5l12.1-7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+    <circle cx="24" cy="5.2" r="2.6" fill="var(--wheel-counterweight, currentColor)"/>
+  </symbol>
+  <symbol id="i-shell" viewBox="0 0 16 16">
+    <path d="M3 4.5 6.5 8 3 11.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="square"/>
+    <path d="M8.5 12h5" stroke="currentColor" stroke-width="1.7"/>
+  </symbol>
+  <symbol id="i-claude" viewBox="0 0 16 16">
+    <path d="M8 1.5v13M1.5 8h13M3.4 3.4l9.2 9.2M12.6 3.4l-9.2 9.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    <circle cx="8" cy="8" r="2" fill="var(--glyph-core, currentColor)"/>
+  </symbol>
+  <symbol id="i-codex" viewBox="0 0 16 16">
+    <path d="M8 1.6 13.6 4.8v6.4L8 14.4 2.4 11.2V4.8Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+    <circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  </symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 2.5v11M2.5 8h11" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="m3.5 3.5 9 9m0-9-9 9" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4" y="4" width="8" height="8" fill="currentColor"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 16 16"><path d="M10.5 2.8 13.2 5.5 6 12.7l-3.4.7.7-3.4Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.5v2.2M8 12.3v2.2M1.5 8h2.2M12.3 8h2.2M3.4 3.4l1.6 1.6M11 11l1.6 1.6M12.6 3.4 11 5M5 11l-1.6 1.6" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="m3 8.5 3.2 3L13 4.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="m5 3.5 4.5 4.5L5 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
+</svg>
+
 <div id="app">
-  <aside id="sidebar">
+  <aside id="sidebar" aria-label="Workspaces and sessions">
     <header class="brand">
-      <span class="mark"></span>
-      <span>flywheel hub</span>
+      <svg class="wheel" id="wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
+      <div class="brand-text">
+        <span class="brand-name">Flywheel</span>
+        <span class="brand-sub">hub <span id="tach" class="tach" title="Running sessions">00 live</span></span>
+      </div>
     </header>
-    <section id="workspaces" aria-label="Workspaces"></section>
-    <details id="new-workspace">
-      <summary>New workspace</summary>
-      <form id="workspace-form">
-        <label>Name <input name="name" required maxlength="100" placeholder="my-project"></label>
-        <label>Repo paths <span class="hint">(one absolute path per line)</span>
-          <textarea name="repos" rows="3" required placeholder="/home/me/code/repo"></textarea>
-        </label>
-        <button type="submit">Create</button>
-        <p class="form-error" id="workspace-error" role="alert"></p>
-      </form>
-    </details>
-    <footer>
-      <button id="logout" type="button" class="link">Sign out</button>
+    <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
+    <nav id="workspaces" aria-label="Workspaces"></nav>
+    <div class="side-actions">
+      <button type="button" class="slab" data-action="new-session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
+      <button type="button" class="slab ghost" data-action="new-workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
+    </div>
+    <footer class="side-foot">
+      <button type="button" class="chip" data-action="palette" title="Command palette">
+        <kbd>Ctrl K</kbd><span>commands</span>
+      </button>
+      <button type="button" class="chip" id="theme-toggle" data-action="cycle-theme" title="Theme">
+        <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label">auto</span>
+      </button>
+      <button type="button" class="chip" data-action="logout">sign out</button>
     </footer>
   </aside>
+
   <main id="main">
-    <div id="term-header">
-      <span id="term-title">No session attached</span>
-      <span id="term-status"></span>
-    </div>
-    <div id="terminal"></div>
-    <div id="empty">Create a workspace, then open a shell in one of its repos.</div>
+    <header id="term-header">
+      <button type="button" class="icon menu-toggle" data-action="toggle-sidebar" aria-label="Show sessions"><svg><use href="#i-menu"/></svg></button>
+      <div class="crumbs">
+        <span id="crumb-workspace" class="crumb-ws"></span>
+        <span id="crumb-session" class="crumb-session">No session</span>
+        <span id="crumb-kind" class="kind-tag" hidden></span>
+      </div>
+      <div class="meters">
+        <span id="meter-cwd" class="meter cwd"></span>
+        <span id="meter-size" class="meter"></span>
+        <span id="meter-viewers" class="meter"></span>
+        <span id="link" class="link-pill" data-link="idle">idle</span>
+      </div>
+    </header>
+    <div class="ruler" aria-hidden="true"></div>
+    <section id="stage">
+      <div id="terminal"></div>
+      <div id="banner" class="banner" hidden role="status">
+        <span id="banner-text"></span>
+        <span class="banner-actions" id="banner-actions"></span>
+      </div>
+      <div id="empty" class="empty">
+        <svg class="empty-wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
+        <h1 id="empty-title">Nothing on the wheel.</h1>
+        <p id="empty-body">Pick a session, or start one.</p>
+        <div class="empty-actions" id="empty-actions"></div>
+        <dl class="keys">
+          <div><dt><kbd>Ctrl</kbd><kbd>K</kbd></dt><dd>command palette</dd></div>
+          <div><dt><kbd>Alt</kbd><kbd>N</kbd></dt><dd>new session</dd></div>
+          <div><dt><kbd>Alt</kbd><kbd>1</kbd>&ndash;<kbd>9</kbd></dt><dd>jump to session</dd></div>
+          <div><dt><kbd>Alt</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd></dt><dd>previous / next</dd></div>
+        </dl>
+      </div>
+    </section>
   </main>
 </div>
+<div id="scrim" class="scrim" data-action="toggle-sidebar"></div>
+
+<dialog id="dlg-workspace" class="sheet" aria-labelledby="dlg-workspace-title">
+  <form method="dialog" id="workspace-form" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker" id="workspace-kicker">workspace</span>
+      <h2 id="dlg-workspace-title">New workspace</h2>
+    </header>
+    <label class="field">
+      <span class="field-label">Name</span>
+      <input name="name" maxlength="100" autocomplete="off" spellcheck="false" placeholder="infrared" required>
+    </label>
+    <div class="field">
+      <span class="field-label">Repositories <span class="field-hint">git work-tree roots &middot; absolute or ~/</span></span>
+      <ol id="repo-rows" class="repo-rows"></ol>
+      <button type="button" class="text-btn" id="add-repo"><svg><use href="#i-plus"/></svg>add repo</button>
+    </div>
+    <p class="form-error" id="workspace-error" role="alert"></p>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" value="cancel" data-close>Cancel</button>
+      <button type="submit" class="slab" id="workspace-submit">Create</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlg-session" class="sheet" aria-labelledby="dlg-session-title">
+  <form method="dialog" id="session-form" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker">session</span>
+      <h2 id="dlg-session-title">New session</h2>
+    </header>
+    <fieldset class="kinds" id="kind-picker">
+      <legend class="field-label">Runs</legend>
+    </fieldset>
+    <label class="field">
+      <span class="field-label">Workspace</span>
+      <select name="workspace" id="session-workspace"></select>
+    </label>
+    <fieldset class="field repos-pick" id="repo-picker">
+      <legend class="field-label">In repo</legend>
+    </fieldset>
+    <label class="field">
+      <span class="field-label">Name <span class="field-hint">optional</span></span>
+      <input name="name" maxlength="100" autocomplete="off" spellcheck="false" id="session-name">
+    </label>
+    <p class="form-error" id="session-error" role="alert"></p>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" data-close>Cancel</button>
+      <button type="submit" class="slab" id="session-submit">Launch <kbd>Enter</kbd></button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlg-confirm" class="sheet narrow" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker" id="confirm-kicker">confirm</span>
+      <h2 id="confirm-title"></h2>
+    </header>
+    <p class="sheet-body" id="confirm-body"></p>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab ghost" value="cancel">Cancel</button>
+      <button type="submit" class="slab danger" value="ok" id="confirm-ok">Confirm</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlg-keys" class="sheet narrow" aria-labelledby="keys-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker">reference</span>
+      <h2 id="keys-title">Keyboard</h2>
+    </header>
+    <dl class="keys wide">
+      <div><dt><kbd>Ctrl</kbd><kbd>K</kbd></dt><dd>command palette (press again inside it to send a literal <code>^K</code>)</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>N</kbd></dt><dd>new session</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>N</kbd></dt><dd>new workspace</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>1</kbd>&ndash;<kbd>9</kbd></dt><dd>jump to the nth session</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>&uarr;</kbd> / <kbd>&darr;</kbd></dt><dd>previous / next session</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>R</kbd></dt><dd>rename the attached session</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>W</kbd></dt><dd>close the attached session</dd></div>
+      <div><dt><kbd>F2</kbd> / double-click</dt><dd>rename a session in the sidebar</dd></div>
+    </dl>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab">Done</button>
+    </footer>
+  </form>
+</dialog>
+
+<div id="palette" class="palette" hidden>
+  <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="palette-input">
+      <svg aria-hidden="true"><use href="#i-chev"/></svg>
+      <input id="palette-input" type="text" autocomplete="off" spellcheck="false" placeholder="Jump to a session or run a command" aria-controls="palette-list" role="combobox" aria-expanded="true">
+      <kbd>Esc</kbd>
+    </div>
+    <ul id="palette-list" class="palette-list" role="listbox"></ul>
+  </div>
+</div>
+
 <script src="/assets/vendor/xterm/xterm.js"></script>
 <script src="/assets/vendor/addon-fit/addon-fit.js"></script>
 <script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>

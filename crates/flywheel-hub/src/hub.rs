@@ -1,6 +1,7 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
+use crate::agent::{AgentPrograms, SessionKind, which};
 use crate::auth::{Token, TokenError};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SpawnError, SpawnSpec};
@@ -30,6 +31,9 @@ pub struct HubOptions {
     /// Command for sessions created without one; defaults to `$SHELL`
     /// (falling back to `/bin/sh`).
     pub default_shell: Vec<String>,
+    /// Programs launched for agent sessions (names searched on `PATH`, or
+    /// paths).
+    pub agents: AgentPrograms,
 }
 
 impl HubOptions {
@@ -43,6 +47,7 @@ impl HubOptions {
             state_dir,
             scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
             default_shell: vec![shell],
+            agents: AgentPrograms::default(),
         }
     }
 }
@@ -73,7 +78,11 @@ pub struct CreateSession {
     /// One of the workspace's repos; defaults to the first.
     pub repo: Option<PathBuf>,
     pub name: Option<String>,
-    /// argv; defaults to the hub's shell.
+    /// Shell (the default) or an agent CLI.
+    #[serde(default)]
+    pub kind: SessionKind,
+    /// argv for a shell session; defaults to the hub's shell. Agent
+    /// sessions run their CLI and take no command.
     pub command: Option<Vec<String>>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
@@ -97,6 +106,15 @@ pub struct LiveView {
     pub rows: u16,
     pub clients: usize,
     pub scrollback_bytes: usize,
+}
+
+/// Whether a session kind can be launched on this host.
+#[derive(Debug, Clone, Serialize)]
+pub struct KindAvailability {
+    pub kind: SessionKind,
+    /// The resolved program (`None` when not found).
+    pub program: Option<PathBuf>,
+    pub available: bool,
 }
 
 /// The hub.
@@ -244,12 +262,20 @@ impl Hub {
                 canonical
             }
         };
-        let command = match request.command {
-            Some(argv) if argv.is_empty() || argv[0].trim().is_empty() => {
+        let command = match (request.kind, request.command) {
+            (SessionKind::Shell, Some(argv)) if argv.is_empty() || argv[0].trim().is_empty() => {
                 return Err(StateError::Invalid("command must not be empty".into()).into());
             }
-            Some(argv) => argv,
-            None => self.options.default_shell.clone(),
+            (SessionKind::Shell, Some(argv)) => argv,
+            (SessionKind::Shell, None) => self.options.default_shell.clone(),
+            (kind, Some(_)) => {
+                return Err(StateError::Invalid(format!(
+                    "a {} session runs its CLI; it takes no command",
+                    kind.as_str()
+                ))
+                .into());
+            }
+            (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
         let id = new_id();
         let name = match request.name.as_deref() {
@@ -260,6 +286,7 @@ impl Hub {
             id: id.clone(),
             workspace_id: workspace.id.clone(),
             name,
+            kind: request.kind,
             cwd: cwd.clone(),
             command: command.clone(),
             created_at: Utc::now(),
@@ -298,6 +325,46 @@ impl Hub {
         }
         self.live().insert(id, session);
         drop(store);
+        Ok(self.view(record))
+    }
+
+    /// Resolve an agent kind's CLI, or explain that it is not installed.
+    fn agent_program(&self, kind: SessionKind) -> Result<PathBuf, HubError> {
+        let program = self.options.agents.program(kind).unwrap_or_default();
+        which(program).ok_or_else(|| {
+            StateError::Invalid(format!(
+                "{} is not installed: no {program:?} on the hub's PATH",
+                kind.as_str()
+            ))
+            .into()
+        })
+    }
+
+    /// Which session kinds this host can launch.
+    pub fn kinds(&self) -> Vec<KindAvailability> {
+        SessionKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let program = match kind {
+                    SessionKind::Shell => self
+                        .options
+                        .default_shell
+                        .first()
+                        .and_then(|shell| which(shell)),
+                    agent => self.agent_program(agent).ok(),
+                };
+                KindAvailability {
+                    kind,
+                    available: program.is_some(),
+                    program,
+                }
+            })
+            .collect()
+    }
+
+    /// Rename a session.
+    pub fn rename_session(&self, id: &str, name: &str) -> Result<SessionView, HubError> {
+        let record = self.store().rename_session(id, name)?;
         Ok(self.view(record))
     }
 

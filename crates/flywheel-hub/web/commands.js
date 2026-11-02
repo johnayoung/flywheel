@@ -28,6 +28,30 @@ window.FwHubCommands = function (ctx) {
   const runsShell = (s) => s.kind === "shell" || Array.isArray(s.fallback_command);
   const isRunning = (s) => s && s.live && s.live.pid && s.state === "running";
   const attachedSession = () => sessionById(state.attached);
+  const basename = (path) => String(path || "").split("/").filter(Boolean).pop() || String(path || "");
+
+  // A session as the pickers name it: its name, plus the folder it runs in
+  // when its workspace has more than one.
+  function sessionLabel(s) {
+    const workspace = workspaceById(s.workspace_id);
+    if (!workspace || !workspace.folders || workspace.folders.length < 2) return s.name;
+    const folder = workspace.folders.find((f) => f.path === s.cwd);
+    return `${s.name} \u00b7 ${folder ? folder.name || basename(folder.path) : basename(s.cwd)}`;
+  }
+
+  // Drop what refers to sessions that no longer exist (closed here or
+  // elsewhere, or their workspace deleted): picks, cache, keyboard focus.
+  function forgetRemoved() {
+    const live = new Set(state.sessions.map((s) => s.id));
+    if (ui.source && !live.has(ui.source)) {
+      ui.source = null;
+      ui.selected = null;
+    }
+    if (ui.target && !live.has(ui.target)) ui.target = null;
+    for (const id of Object.keys(cache)) {
+      if (!live.has(id) && ui.loading !== id) delete cache[id];
+    }
+  }
 
   // --- clipboard -------------------------------------------------------
 
@@ -170,12 +194,15 @@ window.FwHubCommands = function (ctx) {
     return state.sessions.filter((s) => runsShell(s) && isRunning(s) && s.workspace_id === workspace);
   }
 
+  // The user's pick; else the attached shell; else a shell in the
+  // source's folder (where its commands were meant to run); else any.
   function currentTarget(source) {
     const pool = targets(source);
     const attached = attachedSession();
     return (
       pool.find((s) => s.id === ui.target) ||
       (attached && pool.find((s) => s.id === attached.id)) ||
+      (source && pool.find((s) => s.cwd === source.cwd)) ||
       pool[0] ||
       null
     );
@@ -311,7 +338,7 @@ window.FwHubCommands = function (ctx) {
     const sourcePick = $("#cmd-source");
     sourcePick.replaceChildren(
       ...(pool.length
-        ? pool.map((s) => el("option", { value: s.id, textContent: s.name, selected: source && s.id === source.id }))
+        ? pool.map((s) => el("option", { value: s.id, textContent: sessionLabel(s), selected: source && s.id === source.id }))
         : [el("option", { value: "", textContent: "no agent sessions" })]),
     );
     sourcePick.disabled = pool.length < 2 || isAgent(attachedSession());
@@ -320,7 +347,7 @@ window.FwHubCommands = function (ctx) {
     const targetPick = $("#cmd-target");
     targetPick.replaceChildren(
       ...(targetPool.length
-        ? targetPool.map((s) => el("option", { value: s.id, textContent: s.name, selected: target && s.id === target.id }))
+        ? targetPool.map((s) => el("option", { value: s.id, textContent: sessionLabel(s), selected: target && s.id === target.id }))
         : [el("option", { value: "", textContent: "no running shell" })]),
     );
     targetPick.disabled = targetPool.length < 2;
@@ -565,6 +592,7 @@ window.FwHubCommands = function (ctx) {
 
   // The drawer follows the attached session.
   function render() {
+    forgetRemoved();
     renderDrawer();
   }
 

@@ -305,7 +305,13 @@
     const snapshot = JSON.stringify([ws, ss]);
     const busy = $("#sidebar").contains(document.activeElement) &&
       document.activeElement.matches("input, select, textarea");
-    if (!force && (snapshot === state.snapshot || busy)) return;
+    if (!force && snapshot === state.snapshot) return;
+    if (!force && busy) {
+      // The sidebar waits for the field; the drawer (outside it) still
+      // follows, so it never offers a session that was removed.
+      commands.render();
+      return;
+    }
     state.snapshot = snapshot;
     render();
   }

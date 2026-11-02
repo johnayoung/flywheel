@@ -167,6 +167,7 @@ Verbs:
   audit RUN_ID     stream the totally-ordered audit records for a run
   docs [TOPIC]     print a curated operator doc (bare: list the topics)
   hub serve        run the web workspace of agent terminals (hub url: login links + QR)
+  hub commands S   print / copy (OSC 52) the code blocks an agent session suggested
   exec [PROMPT]    run one agent call (no tasks, store, worktree, or config)
 
 Each verb forwards its own --help to the underlying implementation,

@@ -32,7 +32,10 @@
 //!   "workspaces":{id:rollup}}` on connect (and after falling behind);
 //!   `{"type":"status","session_id","status":status|null,"workspace_id",
 //!   "workspace_status"}` on each change; `{"type":"sessions"}` when the
-//!   session or workspace list changed (re-list over REST). A `status` is
+//!   session or workspace list changed (re-list over REST);
+//!   `{"type":"commands","session_id","fresh":B,"commands":[...]}` when an
+//!   agent session suggested code blocks (newest first; `fresh`: written in
+//!   the last two minutes, not a transcript's backlog). A `status` is
 //!   `{"status":"working|blocked|done|idle|unknown","detail"?,"since"}`, as
 //!   this client sees it (`done` turns into `idle` once it viewed them).
 //! * client -> server: `{"type":"view","session_id":id|null}` -- what this
@@ -40,6 +43,8 @@
 //!   in local storage) scopes seen-tracking; without one, the connection
 //!   gets its own.
 //! * Rotating the token closes it with code 4001 too.
+
+mod commands_api;
 
 use crate::auth::{
     FailureLimiter, LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie,
@@ -146,6 +151,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
         .route("/api/sessions/{id}/input", post(session_input))
+        .route(
+            "/api/sessions/{id}/commands",
+            get(commands_api::list_commands),
+        )
+        .route("/api/sessions/{id}/paste", post(commands_api::paste))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
@@ -1396,6 +1406,9 @@ async fn events_pump(
                     }
                     Ok(HubEvent::Sessions) => {
                         socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
+                    }
+                    Ok(HubEvent::Commands { session_id, added }) => {
+                        socket.send(commands_api::event_message(&session_id, added)).await.is_ok()
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         socket.send(snapshot_message(&hub, &client)).await.is_ok()

@@ -41,6 +41,8 @@
   <symbol id="i-redo" viewBox="0 0 16 16"><path d="M12.6 6.2A5 5 0 1 0 13 9.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13.4 2.6v4h-4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-check" viewBox="0 0 16 16"><path d="m3 8.5 3.2 3L13 4.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
   <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.2" y="5.2" width="8.3" height="8.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.8 2.5H2.5v8.3" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M14 3v10" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="m5 3.5 4.5 4.5L5 12.5" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
 </svg>
 
@@ -83,6 +85,7 @@
         <span id="meter-cwd" class="meter cwd"></span>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
+        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>cmds<b id="cmd-count" hidden></b></button>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
     </header>
@@ -93,6 +96,21 @@
         <span id="banner-text"></span>
         <span class="banner-actions" id="banner-actions"></span>
       </div>
+      <aside id="commands" class="commands" hidden aria-label="Suggested commands">
+        <header class="cmd-head">
+          <div class="cmd-title">
+            <span class="sheet-kicker">suggested</span>
+            <h2>Commands</h2>
+          </div>
+          <button type="button" class="icon" id="cmd-close" title="Close (Esc)" aria-label="Close commands"><svg><use href="#i-x"/></svg></button>
+        </header>
+        <div class="cmd-controls">
+          <label class="cmd-field"><span>from</span><select id="cmd-source"></select></label>
+          <label class="cmd-field"><span>send to</span><select id="cmd-target"></select></label>
+          <label class="cmd-check"><input type="checkbox" id="cmd-all"> all blocks</label>
+        </div>
+        <ul id="cmd-list" class="cmd-list"></ul>
+      </aside>
       <div id="empty" class="empty">
         <svg class="empty-wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
         <h1 id="empty-title">Nothing on the wheel.</h1>
@@ -189,6 +207,8 @@
       <div><dt><kbd>Alt</kbd><kbd>&uarr;</kbd> / <kbd>&darr;</kbd></dt><dd>previous / next session</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>R</kbd></dt><dd>rename the attached session</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>W</kbd></dt><dd>close the attached session</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>C</kbd></dt><dd>show / hide suggested commands</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>copy the last suggested shell command</dd></div>
       <div><dt><kbd>F2</kbd> / double-click</dt><dd>rename the focused sidebar session (Tab to it)</dd></div>
       <div><dt><kbd>Delete</kbd></dt><dd>close the focused sidebar session</dd></div>
     </dl>
@@ -197,6 +217,8 @@
     </footer>
   </form>
 </dialog>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
 <div id="palette" class="palette" hidden>
   <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
@@ -212,6 +234,7 @@
 <script src="/assets/vendor/xterm/xterm.js"></script>
 <script src="/assets/vendor/addon-fit/addon-fit.js"></script>
 <script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>
+<script src="/assets/commands.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

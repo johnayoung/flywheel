@@ -16,6 +16,7 @@ use crate::state::{
     validate_name,
 };
 use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusView};
+use crate::transcript::CommandBook;
 use crate::vt::{DEFAULT_SCROLLBACK_LINES, TextSource};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,8 @@ pub struct HubOptions {
     /// `~/.claude`.
     pub claude_config_dir: Option<PathBuf>,
     /// Codex's home (where its rollouts live), for resuming a restored
-    /// conversation. Defaults to `$CODEX_HOME`, else `~/.codex`.
+    /// conversation and for suggested commands. Defaults to `$CODEX_HOME`,
+    /// else `~/.codex`.
     pub codex_home: Option<PathBuf>,
     /// Restore agent sessions by resuming their conversations (Claude
     /// Code's `--resume`, `codex resume`). Off: they come back as fresh
@@ -148,6 +150,11 @@ pub struct SessionView {
 /// A hub-wide change, pushed to every events subscriber.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubEvent {
+    /// An agent session suggested new commands (oldest first).
+    Commands {
+        session_id: String,
+        added: Vec<crate::commands::Command>,
+    },
     /// A session's agent status changed (re-read it per client).
     Status { session_id: String },
     /// Sessions or workspaces were created, removed, renamed, or changed
@@ -212,6 +219,8 @@ pub struct Hub {
     /// Sessions whose output an activity monitor subscribes to (session ->
     /// spawn generation), so it is not counted as a client.
     monitored: Mutex<HashMap<String, u64>>,
+    /// Suggested commands read from agent transcripts.
+    commands: CommandBook,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -248,6 +257,10 @@ impl Hub {
         let store = HubStore::open(&options.state_dir)?;
         let (events, _) = broadcast::channel(EVENT_DEPTH);
         let hub = Arc::new(Self {
+            commands: CommandBook::new(
+                options.claude_config_dir.clone(),
+                options.codex_home.clone(),
+            ),
             options,
             token: RwLock::new(token),
             login_codes: Mutex::new(LoginCodes::default()),
@@ -270,6 +283,7 @@ impl Hub {
             }),
         )?;
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
+        crate::transcript::spawn_watcher(&hub);
         Ok(hub)
     }
 
@@ -286,9 +300,14 @@ impl Hub {
         self.events.subscribe()
     }
 
-    fn emit(&self, event: HubEvent) {
+    pub(crate) fn emit(&self, event: HubEvent) {
         // No subscribers is fine.
         let _ = self.events.send(event);
+    }
+
+    /// Suggested commands read from agent transcripts.
+    pub(crate) fn command_book(&self) -> &CommandBook {
+        &self.commands
     }
 
     /// The current token.
@@ -841,6 +860,8 @@ impl Hub {
                 self.emit(HubEvent::Sessions);
             }
         }
+        self.commands
+            .note_report(&report.session, kind, &report.event, &payload);
         Ok(())
     }
 
@@ -1181,6 +1202,7 @@ impl Hub {
         {
             server.stop();
         }
+        self.commands.stop();
         let last_cwds: HashMap<String, PathBuf> = self
             .live()
             .iter()

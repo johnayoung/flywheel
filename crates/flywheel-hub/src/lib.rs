@@ -14,6 +14,8 @@ pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod client;
+pub mod commands;
+pub mod commands_cli;
 pub mod daemon;
 pub mod hub;
 pub mod lifecycle;
@@ -26,6 +28,7 @@ pub mod script;
 pub mod server;
 pub mod state;
 pub mod status;
+pub mod transcript;
 pub mod vt;
 pub mod web;
 

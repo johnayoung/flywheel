@@ -15,6 +15,7 @@ fw hub install-service [SERVE FLAGS] [--name N] [--force] [--print]   # systemd 
 fw hub serve [SERVE FLAGS]                    # foreground
 fw hub url [--qr]                             # one-time login URLs for the running hub (+ QR for a phone)
 fw hub token [--rotate]                       # print the access token (created on first use) / rotate it
+fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent-suggested code blocks
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
 # SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume]
 # every verb takes --state-dir DIR
@@ -103,6 +104,16 @@ fw hub url --qr                                  # scan with the phone
 - **Channel**: hooks report over `<state-dir>/report.sock` (unix socket, 0600, never on the network whatever `--bind` says; a state dir too long for a socket path uses `$TMPDIR/flywheel-hub-<uid>/<digest>.sock`, dir 0700) with a per-spawn random secret that authorizes status for that one session only. Reports are advisory UI state: they cannot start, stop, or change a session.
 - **Not a sandbox**: the hub's token is never handed to agents (argv or env), but agents run as your user and can read `<state-dir>/token` like any of your files. Run untrusted agents under another user or in a container.
 
+## Suggested commands
+
+Agents draw suggested commands with margins and wrapping, so copying them off the terminal breaks them. The hub reads the same text from the agent's own record instead and serves each fenced code block exactly as written.
+
+- **Sources**: Claude Code's transcript (`projects/*/<agent_session_id>.jsonl`, or the hooks' `transcript_path`), assistant text only (not thinking, tool output, or subagent sidechains); Codex's rollout (`$CODEX_HOME` or `~/.codex`, `sessions/YYYY/MM/DD/rollout-*-<thread-id>.jsonl`), or, when none is found, the `notify` payload's `last-assistant-message` (closed fences only: the report budget can cut it).
+- **Tailing**: running agent sessions are checked every second (at once on a hook report) from a byte offset; lines over 8 MiB are skipped unread; a replaced or truncated file is re-read without duplicates; `/clear` (new conversation id) finishes the old file and follows the new one. The newest 500 blocks per session are kept in memory (not persisted; an ended session's are re-read on request).
+- **Shell blocks**: languages `bash sh zsh shell console shell-session fish ksh`, or untagged when the first non-comment line starts with a common command, a path (`./x`, `~/x`, `/x`), `*.sh`, `VAR=value`, or `$ `. `command` (what Copy/Send use) is `text` except in `console`-style blocks (console languages, untagged) where every non-blank line starts with `$ `: those prompts are stripped.
+- **Paste** (`Send`): bracketed paste when the target program enabled it (markers inside the text removed, newlines sent as CR), never Enter unless `run`. A multi-line paste into a terminal without bracketed paste is refused (409) unless `run`.
+- `--copy` writes OSC 52 to the terminal (stdout, else `/dev/tty`): works over SSH in terminals that allow it; tmux needs `set -g set-clipboard on`; large copies (over ~75 KB encoded) are dropped by some terminals.
+
 ## Auth
 
 - Token: 256 random bits, hex, `<state-dir>/token` (0600). Rotate with `fw hub token --rotate`.
@@ -126,6 +137,8 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
 | GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
 | POST | `/sessions/{id}/input` | `{"data","paste"?,"enter"?}` -> `{"bytes","bracketed"}`: type into it (`paste`: as `fw hub send`). 409 when it has no running terminal or is not reading |
+| GET | `/sessions/{id}/commands[?limit=N&all=true]` | suggested code blocks, newest first (shell only unless `all`; `limit` 1..500, default 50): `{"session_id","conversation","transcript","commands":[{"seq","conversation","message_id","timestamp","block_index","lang","shell","text","command","source"}]}` |
+| POST | `/sessions/{id}/paste` | `{"text","run"?}` -> `{"bracketed","ran","bytes"}`; 409 when not running, not reading, or unsafe multi-line |
 | GET | `/sessions/{id}/ws` | WebSocket attach |
 | GET | `/events[?client=ID]` | hub-wide events WebSocket (below) |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
@@ -137,7 +150,7 @@ WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen",
 
 Session views carry `agent` (`{"status","detail"?,"since"}`, agent kinds only) and `agent_session_id`.
 
-Events WebSocket (`client`: 1-64 of `[A-Za-z0-9_-]`, else 400; omitted, the connection gets its own): server sends `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` on connect and after falling behind, `{"type":"status","session_id","status"|null,"workspace_id","workspace_status"}` per change (as this client sees it), and `{"type":"sessions"}` when sessions or workspaces changed (re-list). Client sends `{"type":"view","session_id":id|null}` (what it shows; `null` while hidden). Token rotation closes it with 4001 too.
+Events WebSocket (`client`: 1-64 of `[A-Za-z0-9_-]`, else 400; omitted, the connection gets its own): server sends `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` on connect and after falling behind, `{"type":"status","session_id","status"|null,"workspace_id","workspace_status"}` per change (as this client sees it), and `{"type":"sessions"}` when sessions or workspaces changed (re-list), and `{"type":"commands","session_id","fresh","commands":[...]}` when an agent suggested code blocks (newest first; `fresh`: written in the last 2 minutes, not a re-read backlog). Client sends `{"type":"view","session_id":id|null}` (what it shows; `null` while hidden). Token rotation closes it with 4001 too.
 
 Screen text: `source=visible` (default) is the screen's rows (`lines` is refused); `recent` the last `lines` (1..100000, default 100) logical lines of scrollback + screen, soft wraps joined, trailing blank rows dropped. Both read the active screen.
 
@@ -163,5 +176,8 @@ Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working /
 | `Alt 1`..`9`, `Alt Up/Down` | jump to the nth / previous / next session with a terminal (numbers skip gone ones) |
 | `Alt R`; `F2` or double-click on a sidebar row | rename session |
 | `Alt W`; `Delete` on a focused sidebar row | close session (confirms while it runs) |
+| `Alt C` / `Alt Shift C` | Commands drawer / copy the last suggested shell command |
+
+The **Commands drawer** (`cmds` in the header, `Alt C`, or the palette) lists the attached agent's code blocks newest first (from a shell session: the workspace's agent that suggested last, or the one picked), unwrapped in monospace, each with Copy (the clipboard API on https/localhost, a selected-textarea fallback on plain-http LAN and iOS Safari), Send (paste into the chosen running shell of the workspace, no Enter) and Send + Run. A new shell command from an agent in the workspace in view raises a toast with Copy.
 
 Hub shortcuts are captured before the terminal sees them. On macOS the chord is `Ctrl Option` instead of `Alt`, so Option keeps typing layout characters (`| [ ] { }`, dead keys); elsewhere an `Alt` key the layout turns into a character also goes to the terminal. Served from the binary (no build step): xterm.js 6.0.0 + fit + web-links and the UI fonts (Big Shoulders Display, Martian Mono, JetBrains Mono; SIL OFL), vendored under `crates/flywheel-hub/web/vendor/` with their licenses. Only the fonts, icon, and `login.js` are served without the token (the login page uses them).

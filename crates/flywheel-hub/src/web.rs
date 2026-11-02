@@ -26,6 +26,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "text/javascript; charset=utf-8",
     ),
     (
+        "commands.js",
+        include_bytes!("../web/commands.js"),
+        "text/javascript; charset=utf-8",
+    ),
+    (
         "login.js",
         include_bytes!("../web/login.js"),
         "text/javascript; charset=utf-8",

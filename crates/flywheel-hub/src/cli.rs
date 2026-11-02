@@ -76,6 +76,10 @@ enum HubCommand {
     /// hooks inside a hub session; reads FLYWHEEL_HUB_SESSION,
     /// FLYWHEEL_HUB_REPORT_SOCKET, FLYWHEEL_HUB_REPORT_SECRET).
     Report(ReportArgs),
+    /// Print the code blocks an agent session suggested, exactly as
+    /// written (shell commands unless --all), newest first; or copy the
+    /// newest with OSC 52.
+    Commands(crate::commands_cli::CommandsArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -271,6 +275,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         HubCommand::Token(args) => token(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err),
+        HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.
         HubCommand::Report(_) => 0,
         HubCommand::Start(args) => lifecycle::start(&args, out, err),

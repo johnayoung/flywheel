@@ -228,6 +228,22 @@
     return data;
   }
 
+  // The Commands drawer (commands.js): agents' suggested code blocks.
+  const commands = window.FwHubCommands({
+    $,
+    el,
+    icon,
+    api,
+    state,
+    sessionById,
+    workspaceById,
+    MOD,
+    openSession: (id) => openSession(id),
+    focusTerminal: () => {
+      if (state.attached && term && !document.querySelector("dialog[open]")) term.focus();
+    },
+  });
+
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
   // half-typed rename is never torn down under the user.
@@ -764,6 +780,8 @@
         renderStatus();
       } else if (message.type === "sessions") {
         refresh(false).catch(() => {});
+      } else if (message.type === "commands") {
+        commands.onEvent(message);
       }
     };
     socket.onclose = (event) => {
@@ -1265,6 +1283,9 @@
       pill.title = agent.detail || "";
     }
 
+    commands.render();
+    commands.prefetch();
+
     const actions = $("#empty-actions");
     if (!session) {
       const hasWorkspace = state.workspaces.length > 0;
@@ -1707,6 +1728,7 @@
       cmd(`Close ${attached.name}`, `${MOD} W`, () => closeSession(attached.id), "x");
       cmd("Detach", "leave the session running", () => detach(), "chev");
     }
+    commands.paletteItems(cmd);
     for (const workspace of state.workspaces) {
       cmd(`Edit workspace ${workspace.name}`, "rename, repos", () => openWorkspaceDialog(workspace), "gear");
     }
@@ -1924,6 +1946,9 @@
         startRename(state.attached);
       } else if (event.code === "KeyW" && !event.shiftKey && state.attached) {
         closeSession(state.attached);
+      } else if (event.code === "KeyC") {
+        if (event.shiftKey) commands.copyLast();
+        else commands.toggle();
       } else {
         handled = false;
       }
@@ -1949,6 +1974,7 @@
     "cycle-theme": () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]),
     logout,
     "toggle-sidebar": () => document.body.classList.toggle("side-open"),
+    "toggle-commands": () => commands.toggle(),
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");

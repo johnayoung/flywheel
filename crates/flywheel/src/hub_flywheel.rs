@@ -26,6 +26,13 @@
 //! store runs its idempotent schema bootstrap, as every `fw` read verb
 //! does). A missing SQLite store is never created: the panel lists the
 //! tasks as pending against an empty in-memory store instead.
+//!
+//! Postgres: like every `fw` verb, the DSN comes from the environment
+//! (`FLYWHEEL_PG_DSN` / `DATABASE_URL`) -- here the hub process's, the same
+//! for every folder (flywheel.toml never carries one). The store label
+//! names the database read (`postgres host:port/db`, no credentials) so a
+//! folder read from the wrong one shows it. A failed read drops the
+//! connection; the next read reconnects.
 
 use crate::session::TranscriptTailer;
 use crate::session_screen::is_error_entry;
@@ -42,6 +49,7 @@ use flywheel_hub::flywheel::{
 };
 use flywheel_orchestrator::autopilot_activity::{epoch_now, is_record_live, read_activity};
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore};
+use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::{
     DEFAULT_POLICY_FILENAME, DEFAULT_TASKS_DIR, WorkPolicy, load_policy,
 };
@@ -112,6 +120,14 @@ impl HubFlywheel {
         Self::new(crate::worker_supervisor::console_program())
     }
 
+    /// How many folders have state kept open (policy, stores, listing).
+    pub fn open_folders(&self) -> usize {
+        self.folders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     fn folder(&self, root: &Path) -> Arc<Mutex<Folder>> {
         let mut folders = self.folders.lock().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(
@@ -119,6 +135,15 @@ impl HubFlywheel {
                 .entry(root.to_path_buf())
                 .or_insert_with(|| Arc::new(Mutex::new(Folder::default()))),
         )
+    }
+
+    /// Close `root`'s stores (kept: its policy and listing).
+    fn drop_stores(&self, root: &Path) {
+        let state = self.folder(root);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(Ok(resolved)) = state.resolved.as_mut() {
+            resolved.stores = None;
+        }
     }
 
     fn transcript(&self, root: &Path, run_id: &str, file: PathBuf) -> Arc<Mutex<Transcript>> {
@@ -278,10 +303,20 @@ impl Resolved {
 
     fn store_label(&self, root: &Path) -> String {
         if self.backend == "sqlite" {
-            format!("sqlite {}", shown(root, &self.db_path))
-        } else {
-            self.backend.clone()
+            return format!("sqlite {}", shown(root, &self.db_path));
         }
+        let mut label = self.backend.clone();
+        if let Some(target) = resolve_postgres_dsn(&process_environ())
+            .as_deref()
+            .and_then(dsn_target)
+        {
+            label.push(' ');
+            label.push_str(&target);
+        }
+        if let Some(schema) = self.policy.as_ref().and_then(|p| p.store_schema.as_deref()) {
+            label.push_str(&format!(" (schema {schema})"));
+        }
+        label
     }
 
     /// The policy's stores, opened on first use and kept; `Ok(None)` when
@@ -305,7 +340,9 @@ impl Resolved {
         if self.stores.is_none() {
             if !sqlite && resolve_postgres_dsn(&process_environ()).is_none() {
                 return Err(format!(
-                    "the store backend is {} but no DSN is set in the hub's environment",
+                    "the store backend is {} but the hub's environment sets neither \
+                     FLYWHEEL_PG_DSN nor DATABASE_URL: start `fw hub serve` from a shell \
+                     that exports the DSN this repo's `fw` verbs use",
                     self.backend
                 ));
             }
@@ -755,6 +792,14 @@ fn cut(body: String) -> String {
 
 impl FlywheelProvider for HubFlywheel {
     fn adopted(&self, folder: &Path) -> bool {
+        if folder.join(".git").is_file() {
+            // A linked git worktree of an adopted repo carries its tracked
+            // flywheel.toml (and any tracked `.flywheel/` files) but not
+            // the gitignored store: its loop runs in the main checkout,
+            // and a worker started here would grow a second, separate
+            // store. It counts once it has a store of its own.
+            return folder.join(DEFAULT_STORE_PATH).is_file();
+        }
         folder.join(DEFAULT_POLICY_FILENAME).is_file() || folder.join(".flywheel").is_dir()
     }
 
@@ -834,6 +879,7 @@ impl FlywheelProvider for HubFlywheel {
             }
         };
         drop(state);
+        let opened = problems.len();
         match status_entries(&items, core.as_ref(), claims.as_ref(), folder) {
             Ok(entries) => fold_status(entries, &mut panel),
             Err(message) => problems.push(message),
@@ -852,6 +898,12 @@ impl FlywheelProvider for HubFlywheel {
                 panel.worker = worker;
             }
             Err(message) => problems.push(message),
+        }
+        if problems.len() > opened {
+            // A store read failed (a restarted database, a dropped
+            // connection): reopen on the next read rather than keep a dead
+            // handle.
+            self.drop_stores(folder);
         }
         if !problems.is_empty() {
             panel.problem = Some(problems.join("; "));
@@ -913,6 +965,19 @@ impl FlywheelProvider for HubFlywheel {
             from,
             entries,
         })
+    }
+
+    fn forget(&self, folder: &Path) {
+        // Unhooked under the map lock; the state itself (stores, pools)
+        // drops when the last read still holding it finishes.
+        self.folders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(folder);
+        self.transcripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|open| open.root != folder);
     }
 
     fn worker_command(&self, _folder: &Path) -> Vec<String> {

@@ -180,6 +180,31 @@ pub fn dsn_port(dsn: &str) -> Option<u16> {
         .and_then(|config| config.get_ports().first().copied())
 }
 
+/// Where `dsn` points, without its credentials: `host:port/dbname`
+/// (`host` may be a socket directory; absent parts are left out). `None`
+/// for an unparseable string. Safe to show: no user, no password.
+pub fn dsn_target(dsn: &str) -> Option<String> {
+    let config = flywheel_core::pg_tls::parse_config(dsn).ok()?;
+    let host = config
+        .get_hosts()
+        .first()
+        .map(|host| match host {
+            postgres::config::Host::Tcp(name) => name.clone(),
+            #[cfg(unix)]
+            postgres::config::Host::Unix(dir) => dir.display().to_string(),
+        })
+        .unwrap_or_default();
+    let mut out = host;
+    if let Some(port) = config.get_ports().first() {
+        out.push_str(&format!(":{port}"));
+    }
+    if let Some(db) = config.get_dbname() {
+        out.push('/');
+        out.push_str(db);
+    }
+    Some(out)
+}
+
 /// The password named by `dsn`, when it parses and carries one.
 pub fn dsn_password(dsn: &str) -> Option<String> {
     flywheel_core::pg_tls::parse_config(dsn)
@@ -667,5 +692,16 @@ mod tests {
         );
         assert_eq!(dsn_password("postgresql://u@h:5432/db"), None);
         assert_eq!(dsn_password("not a dsn at all"), None);
+    }
+
+    #[test]
+    fn dsn_target_names_host_port_and_db_but_never_credentials() {
+        let target = dsn_target("postgresql://u:hunter2@db.local:6543/flywheel").unwrap();
+        assert_eq!(target, "db.local:6543/flywheel");
+        assert_eq!(
+            dsn_target("host=h port=5433 dbname=loop user=u password=hunter2").as_deref(),
+            Some("h:5433/loop")
+        );
+        assert_eq!(dsn_target("not a dsn at all"), None);
     }
 }

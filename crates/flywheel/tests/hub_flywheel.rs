@@ -413,6 +413,88 @@ fn a_repo_without_a_store_lists_pending_tasks_and_creates_nothing() {
     assert!(provider.adopted(plain.path()));
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// The files of this process's open descriptors under `dir`.
+#[cfg(target_os = "linux")]
+fn open_files_under(pid: u32, dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|fds| {
+            fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+                .filter(|target| target.starts_with(dir))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_linked_worktree_of_an_adopted_repo_is_not_adopted_until_it_has_its_own_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let main = base.join("repo");
+    std::fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    std::fs::write(main.join("flywheel.toml"), POLICY).unwrap();
+    std::fs::write(main.join(".gitignore"), ".flywheel/\n").unwrap();
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-q", "-m", "adopt"]);
+    let sibling = base.join("repo.worktrees/task");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task",
+            sibling.to_str().unwrap(),
+        ],
+    );
+    assert!(sibling.join("flywheel.toml").is_file(), "tracked policy");
+    let provider = HubFlywheel::new("/usr/bin/false");
+    assert!(provider.adopted(&main));
+    assert!(
+        !provider.adopted(&sibling),
+        "its loop runs in the main checkout"
+    );
+    // Tracked `.flywheel/` files (specs, say) are not a loop either.
+    std::fs::create_dir(sibling.join(".flywheel")).unwrap();
+    assert!(!provider.adopted(&sibling));
+    SqliteStore::open(sibling.join(".flywheel/flywheel.sqlite")).unwrap();
+    assert!(provider.adopted(&sibling), "a store of its own");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forgetting_a_folder_closes_its_store() {
+    let (_tmp, root) = temp_repo();
+    let provider = HubFlywheel::new("/usr/bin/false");
+    let panel = provider.panel(&root);
+    assert!(panel.problem.is_none(), "{:?}", panel.problem);
+    let dir = root.join(".flywheel");
+    assert!(
+        !open_files_under(std::process::id(), &dir).is_empty(),
+        "the store stays open between reads"
+    );
+    assert_eq!(provider.open_folders(), 1);
+    provider.forget(&root);
+    assert_eq!(provider.open_folders(), 0);
+    assert_eq!(
+        open_files_under(std::process::id(), &dir),
+        Vec::<PathBuf>::new()
+    );
+    // A later read reopens it.
+    assert!(provider.panel(&root).problem.is_none());
+}
+
 // --- the real hub ------------------------------------------------------------
 
 struct Server {
@@ -719,6 +801,89 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
         message["summary"].is_null().then_some(message)
     });
     assert_eq!(removed["folder"], json!(root));
+    // ... and closes its store in the hub.
+    #[cfg(target_os = "linux")]
+    wait_for("the hub to close the removed folder's store", || {
+        open_files_under(server.child.id(), &root.join(".flywheel"))
+            .is_empty()
+            .then_some(())
+    });
+}
+
+#[test]
+fn start_worker_here_refuses_a_duplicate_while_the_first_still_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let fake = dir.join("bin/claude");
+    std::fs::write(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // An adopted git repo with nothing to do: its `fw worker` idles.
+    let root = dir.join("idle");
+    std::fs::create_dir_all(root.join(".flywheel/tasks/active")).unwrap();
+    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
+    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "adopt"]);
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "idle", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+    let start_worker = |another: bool| {
+        http(
+            &server,
+            "POST",
+            "/api/flywheel/worker",
+            Some(json!({ "folder": root, "workspace_id": workspace_id, "another": another })),
+        )
+    };
+    let (code, first) = start_worker(false);
+    assert_eq!(code, 201, "{first}");
+    assert_eq!(first["name"], "fw worker");
+    let first_id = first["id"].as_str().unwrap().to_owned();
+
+    let (code, refused) = start_worker(false);
+    assert_eq!(code, 409, "{refused}");
+    assert_eq!(refused["running"]["id"], json!(first_id));
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("already running")
+    );
+
+    // Asked for explicitly: a second one, under a name of its own.
+    let (code, second) = start_worker(true);
+    assert_eq!(code, 201, "{second}");
+    assert_eq!(second["name"], "fw worker 2");
+    let (_, sessions) = http(&server, "GET", "/api/sessions", None);
+    let names: Vec<&str> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(names.iter().filter(|n| **n == "fw worker").count(), 1);
+
+    for session in [&first, &second] {
+        let id = session["id"].as_str().unwrap();
+        let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{id}"), None);
+        assert_eq!(code, 204);
+    }
+    // Nothing runs there now: a plain start is accepted again.
+    let (code, third) = start_worker(false);
+    assert_eq!(code, 201, "{third}");
+    assert_eq!(third["name"], "fw worker");
+    let id = third["id"].as_str().unwrap();
+    let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{id}"), None);
+    assert_eq!(code, 204);
 }
 
 #[test]

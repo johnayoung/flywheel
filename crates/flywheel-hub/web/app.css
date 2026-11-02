@@ -2226,7 +2226,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   color: var(--ink-2);
 }
 .fw-daemon.live b { color: var(--ink); }
-.fw-daemon-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); }
+.fw-daemon-detail { min-width: 0; overflow-wrap: anywhere; color: var(--ink-2); line-height: 1.35; }
 .fw-daemon-actions { display: inline-flex; align-items: center; gap: .7rem; }
 .fw-start { padding: .35rem .65rem; }
 .fw-where { display: flex; flex-wrap: wrap; gap: .2rem 1.2rem; color: var(--ink-3); font-size: 10px; padding-left: 1rem; }
@@ -2283,7 +2283,16 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 }
 .fw-task-text { display: grid; min-width: 0; gap: .05rem; }
 .fw-task-text b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-weight: 600; }
-.fw-task-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: 10.5px; }
+.fw-task-text small {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
 .fw-task.failed .fw-task-text small, .fw-task.parked .fw-task-text small { color: var(--ink-2); }
 .fw-task-meta { display: inline-flex; align-items: center; gap: .6rem; color: var(--ink-3); }
 .fw-task-meta small { font-size: 10px; }
@@ -2294,6 +2303,11 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .fw-kind { background: var(--alert); color: #fff; }
 .fw-kind.awaiting, .fw-kind.stopped, .fw-kind.blocked { background: var(--brass); color: var(--signal-ink); }
 .fw-list > li.fw-alert { border-top: 1px solid var(--rule); margin-bottom: 2px; }
+.fw-alert.seen { border-left-color: var(--rule-2); opacity: .62; }
+.fw-alert.seen .fw-kind { background: var(--bg-4); color: var(--ink-2); }
+.fw-sec-actions { display: flex; justify-content: flex-end; margin: -.2rem 0 .3rem; }
+.fw-more > summary { cursor: pointer; padding: .4rem .6rem; color: var(--ink-3); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
+.fw-badge-alerts { margin-left: .1rem; padding: 0 .25rem; border-radius: 2px; background: var(--alert); color: #fff; }
 
 .fw-run { padding: .45rem .1rem .5rem; }
 .fw-run-line { display: grid; grid-template-columns: 6.6rem minmax(0, 1fr) auto auto; align-items: center; gap: .6rem; }
@@ -2306,7 +2320,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .fw-status.failed, .fw-status.failed_validation, .fw-status.internal_error { background: var(--alert); color: #fff; box-shadow: none; }
 .fw-status.awaiting_approval, .fw-status.interrupted { background: var(--brass); color: var(--signal-ink); box-shadow: none; }
 .fw-run-sub { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .35rem .8rem; margin: .3rem 0 0 7.2rem; }
-.fw-run.live > small, .fw-run-error { display: block; margin: .25rem 0 0 7.2rem; color: var(--ink-3); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fw-run.live > small, .fw-run-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; margin: .25rem 0 0 7.2rem; color: var(--ink-3); font-size: 10.5px; overflow: hidden; overflow-wrap: anywhere; }
 .fw-run-error { color: var(--alert); }
 .fw-run-cost { color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
 .fw-graders { display: flex; flex-wrap: wrap; gap: .25rem; min-width: 0; }
@@ -2347,6 +2361,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .fw-run-sheet[open] { display: flex; flex-direction: column; }
 .run-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0; }
 .run-head h2 { overflow-wrap: anywhere; }
+.run-head > .icon, .fw-drawer .cmd-head > .icon { flex: none; }
 .run-tabs {
   display: flex;
   align-items: center;
@@ -2373,6 +2388,9 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   padding: .7rem 1.4rem 1.4rem;
   background: var(--bg);
   font: 400 12px/1.5 var(--term);
+  /* Exact text: no ligatures turning "<!--" or "->" into arrows. */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
   scrollbar-width: thin;
   scrollbar-color: var(--rule-2) transparent;
 }
@@ -2400,7 +2418,19 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .fw-run-line .fw-run-when { display: none; }
   .fw-run-sub, .fw-run.live > small, .fw-run-error { margin-left: 0; }
   .fw-run-sheet { width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+  .fw-task { grid-template-columns: 5rem minmax(0, 1fr); }
+  .fw-task-meta { grid-column: 2; justify-content: space-between; }
+  .fw-task-text b, .fw-run-line b { white-space: normal; overflow-wrap: anywhere; }
   .run-entry { grid-template-columns: 1fr; }
   .run-text, .run-fold { grid-column: 1; }
   .run-ts { display: none; }
+}
+
+/* Thumbs: the panel's and the run viewer's controls get full-size targets
+   on touch and phone-sized screens. */
+@media (pointer: coarse), (max-width: 760px) {
+  .fw-out, .fw-seen, .fw-more > summary { min-height: 44px; min-width: 44px; padding: 0 .6rem; display: inline-flex; align-items: center; justify-content: center; }
+  .fw-more > summary { display: flex; justify-content: flex-start; }
+  .run-head > .icon, .fw-drawer .cmd-head > .icon { width: 44px; height: 44px; }
+  .run-tabs [role="tab"] { min-height: 44px; }
 }

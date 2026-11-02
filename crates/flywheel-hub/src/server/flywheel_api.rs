@@ -4,15 +4,18 @@
 //! * `GET /api/flywheel/panel?folder=P` -- one folder's whole panel;
 //! * `GET /api/flywheel/run?folder=P&run=R[&since=N]` -- a run's `fw show`
 //!   summary and its transcript from entry `N` on;
-//! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "cols"?,
-//!   "rows"?}` -- start `fw worker` in a new hub shell session there;
+//! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "another"?,
+//!   "cols"?, "rows"?}` -- start `fw worker` in a new hub shell session
+//!   there; 409 (with the running session) while a worker this hub
+//!   started still runs in the folder, unless `another` is true;
 //! * `{"type":"flywheel"}` messages on the events socket.
 //!
 //! Only folders of the hub's workspaces are served, and only adopted ones.
 
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, valid_run_id, worker_session_command,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, runs_worker, valid_run_id,
+    worker_session_command, worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
@@ -54,6 +57,15 @@ impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
         error_response(self.status, &self.message)
     }
+}
+
+/// The answer while an earlier read with the same key is still blocked
+/// (on a slow or unreachable store).
+fn still_reading(what: &str) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("an earlier {what} is still waiting on the store; try again shortly"),
+    )
 }
 
 fn monitor(app: &AppState) -> Result<Arc<FlywheelMonitor>, Refusal> {
@@ -167,9 +179,14 @@ pub(super) async fn panel(
         return Json(&*panel).into_response();
     }
     // Not read yet (the folder was just added): read it for this answer.
+    let Some(guard) = monitor.begin_read(format!("panel\0{}", path.display())) else {
+        return still_reading("panel read");
+    };
     let provider = Arc::clone(monitor.provider());
     let read = off_runtime(PANEL_TIMEOUT, "reading the panel", move || {
-        provider.panel(&path)
+        let panel = provider.panel(&path);
+        drop(guard);
+        panel
     })
     .await;
     match read {
@@ -204,10 +221,15 @@ pub(super) async fn run_output(
         Ok(found) => found,
         Err(refusal) => return refusal.into_response(),
     };
+    let Some(guard) = monitor.begin_read(format!("run\0{}\0{}", path.display(), query.run)) else {
+        return still_reading("read of this run");
+    };
     let provider = Arc::clone(monitor.provider());
     let (run, since) = (query.run, query.since);
     let read = off_runtime(RUN_OUTPUT_TIMEOUT, "reading the run", move || {
-        provider.run_output(&path, &run, since)
+        let output = provider.run_output(&path, &run, since);
+        drop(guard);
+        output
     })
     .await;
     match read {
@@ -221,12 +243,18 @@ pub(super) async fn run_output(
 pub(super) struct WorkerRequest {
     folder: String,
     workspace_id: Option<String>,
+    /// Start one even though a worker this hub started still runs here.
+    #[serde(default)]
+    another: bool,
     cols: Option<u16>,
     rows: Option<u16>,
 }
 
-/// The session name a started worker gets.
-pub const WORKER_SESSION_NAME: &str = "fw worker";
+/// Why a worker start did not create a session.
+enum StartRefused {
+    Running { id: String, name: String },
+    Hub(crate::hub::HubError),
+}
 
 pub(super) async fn start_worker(
     State(app): State<AppState>,
@@ -253,20 +281,35 @@ pub(super) async fn start_worker(
         None => workspaces[0].clone(),
     };
     let hub = Arc::clone(&app.hub);
-    let provider = Arc::clone(monitor.provider());
+    let starter = Arc::clone(&monitor);
     let folder = path.clone();
-    let created = off_runtime(Duration::from_secs(10), "starting the worker", move || {
-        let command = worker_session_command(&provider.worker_command(&folder));
+    // An action, not a read: no timeout. Giving up early would answer
+    // "failed" for a session that still appears, inviting a duplicate.
+    let created = tokio::task::spawn_blocking(move || {
+        // Check-then-create under one lock: concurrent starts serialize.
+        let _starting = starter.starting();
+        let sessions = hub.sessions(None);
+        if !request.another
+            && let Some(running) = sessions.iter().find(|s| runs_worker(s, &folder))
+        {
+            return Err(StartRefused::Running {
+                id: running.record.id.clone(),
+                name: running.record.name.clone(),
+            });
+        }
+        let name = worker_session_name(sessions.iter().map(|s| s.record.name.as_str()));
+        let command = worker_session_command(&starter.provider().worker_command(&folder));
         hub.create_session(CreateSession {
             workspace_id: workspace.id,
             repo: Some(folder),
-            name: Some(WORKER_SESSION_NAME.to_owned()),
+            name: Some(name),
             kind: Default::default(),
             command: Some(command),
             cols: request.cols,
             rows: request.rows,
             worktree: None,
         })
+        .map_err(StartRefused::Hub)
     })
     .await;
     match created {
@@ -274,8 +317,23 @@ pub(super) async fn start_worker(
             monitor.refresh(&path);
             (StatusCode::CREATED, Json(view)).into_response()
         }
-        Ok(Err(e)) => super::ApiError(e).into_response(),
-        Err(refusal) => refusal.into_response(),
+        Ok(Err(StartRefused::Running { id, name })) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "a worker is already running in {} (session {name:?}); \
+                     start another only to run tasks in parallel with it",
+                    path.display()
+                ),
+                "running": { "id": id, "name": name },
+            })),
+        )
+            .into_response(),
+        Ok(Err(StartRefused::Hub(e))) => super::ApiError(e).into_response(),
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("starting the worker failed: {join}"),
+        ),
     }
 }
 

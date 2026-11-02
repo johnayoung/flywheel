@@ -20,10 +20,10 @@
 //! Changes reach browsers as `{"type":"flywheel"}` messages on
 //! `/api/events`.
 
-use crate::hub::Hub;
+use crate::hub::{Hub, SessionView};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
@@ -361,6 +361,10 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// The argv that runs a worker for `folder` (run with `folder` as the
     /// working directory), e.g. `[/path/to/fw, worker]`.
     fn worker_command(&self, folder: &Path) -> Vec<String>;
+
+    /// Drop whatever is kept open for `folder` (stores, listings,
+    /// transcripts): it left every workspace. A later read reopens.
+    fn forget(&self, folder: &Path);
 }
 
 /// What a browser hears about a folder.
@@ -442,6 +446,45 @@ pub struct FlywheelMonitor {
     timing: MonitorTiming,
     folders: Mutex<HashMap<PathBuf, Arc<FolderSlot>>>,
     events: broadcast::Sender<FlywheelEvent>,
+    /// Held while a worker start checks for a running one and creates its
+    /// session, so two starts cannot both pass the check.
+    starting: Mutex<()>,
+    /// Blocking reads still running (see [`FlywheelMonitor::begin_read`]).
+    reads: Arc<ReadGate>,
+}
+
+/// The keys of blocking reads in flight.
+#[derive(Debug, Default)]
+pub struct ReadGate {
+    keys: Mutex<HashSet<String>>,
+}
+
+impl ReadGate {
+    /// Claim `key`; `None` while an earlier claim of it is held.
+    pub fn begin(self: &Arc<Self>, key: String) -> Option<ReadGuard> {
+        let mut keys = self.keys.lock().unwrap_or_else(PoisonError::into_inner);
+        keys.insert(key.clone()).then(|| ReadGuard {
+            gate: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// A blocking read in flight; its key is released on drop (when the read
+/// really finishes, not when the request that asked for it gave up).
+pub struct ReadGuard {
+    gate: Arc<ReadGate>,
+    key: String,
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.gate
+            .keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 impl std::fmt::Debug for FlywheelMonitor {
@@ -460,7 +503,23 @@ impl FlywheelMonitor {
             timing,
             folders: Mutex::new(HashMap::new()),
             events,
+            starting: Mutex::new(()),
+            reads: Arc::default(),
         })
+    }
+
+    /// Claim the read named `key`; `None` while an earlier one with that
+    /// key is still running. A read that outlives its request's timeout
+    /// keeps its blocking thread until the store answers: refusing a
+    /// repeat (a run dialog polls every 2s) bounds those threads to one per
+    /// key instead of one per poll.
+    pub fn begin_read(&self, key: String) -> Option<ReadGuard> {
+        self.reads.begin(key)
+    }
+
+    /// Serialize worker starts (held across check-then-create).
+    pub fn starting(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.starting.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn provider(&self) -> &Arc<dyn FlywheelProvider> {
@@ -545,16 +604,18 @@ impl FlywheelMonitor {
     /// Watch exactly `adopted`: start watchers for new folders, stop (and
     /// announce) the ones that left.
     fn reconcile(self: &Arc<Self>, adopted: &BTreeSet<PathBuf>) {
-        let mut removed = Vec::new();
         let mut added = Vec::new();
         {
+            // Removals are announced under the map lock: a watcher sends
+            // its `Changed` under the same lock after re-checking its stop
+            // flag, so no `Changed` can follow a folder's `Removed`.
             let mut folders = self.folders();
             folders.retain(|path, slot| {
                 let keep = adopted.contains(path);
                 if !keep {
                     slot.stop.store(true, Ordering::SeqCst);
                     slot.poke();
-                    removed.push(path.clone());
+                    let _ = self.events.send(FlywheelEvent::Removed(path.clone()));
                 }
                 keep
             });
@@ -565,9 +626,6 @@ impl FlywheelMonitor {
                     added.push((path.clone(), slot));
                 }
             }
-        }
-        for path in removed {
-            let _ = self.events.send(FlywheelEvent::Removed(path));
         }
         for (path, slot) in added {
             let monitor = Arc::clone(self);
@@ -604,10 +662,20 @@ impl FlywheelMonitor {
                     changed.then_some(summary)
                 };
                 if let Some(summary) = changed {
+                    let folders = self.folders();
+                    if slot.stop.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let _ = self.events.send(FlywheelEvent::Changed(Box::new(summary)));
+                    drop(folders);
                 }
             }
             forced = slot.sleep(self.timing.poll);
+        }
+        // Gone from every workspace (unless it was re-added meanwhile):
+        // close what the provider keeps open for it.
+        if !self.watches(folder) {
+            self.provider.forget(folder);
         }
     }
 }
@@ -624,10 +692,71 @@ pub fn worker_session_command(worker: &[String]) -> Vec<String> {
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         script.to_owned(),
-        "fw-worker".to_owned(),
+        WORKER_MARKER.to_owned(),
     ];
     argv.extend(worker.iter().cloned());
     argv
+}
+
+/// The marker argv[0] of `$@` in [`worker_session_command`]'s script.
+pub const WORKER_MARKER: &str = "fw-worker";
+/// The name a started worker's session gets (numbered when taken).
+pub const WORKER_SESSION_NAME: &str = "fw worker";
+
+/// Whether `view` is a "Start worker here" session in `folder` whose
+/// worker is still running (not yet the shell it leaves behind). On Linux
+/// that is read from the session process's argv: its `/bin/sh` keeps the
+/// worker marker until it execs the shell (and a session still between
+/// fork and exec counts as starting one). Elsewhere a running session
+/// counts.
+pub fn runs_worker(view: &SessionView, folder: &Path) -> bool {
+    let record = &view.record;
+    if record.cwd != folder
+        || record.fallback_command.is_some()
+        || record.command.get(3).map(String::as_str) != Some(WORKER_MARKER)
+    {
+        return false;
+    }
+    let Some(pid) = view.live.as_ref().and_then(|l| l.pid) else {
+        return false;
+    };
+    process_runs_worker(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_runs_worker(pid: u32) -> bool {
+    let Ok(argv) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    if argv
+        .split(|b| *b == 0)
+        .any(|arg| arg == WORKER_MARKER.as_bytes())
+    {
+        return true;
+    }
+    // Forked but not yet exec'd (a session created a moment ago): still
+    // this binary, about to become the worker's `/bin/sh`.
+    let exe = |path: String| std::fs::read_link(path).ok();
+    exe(format!("/proc/{pid}/exe")).is_some_and(|e| Some(e) == exe("/proc/self/exe".into()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_runs_worker(_pid: u32) -> bool {
+    true
+}
+
+/// A worker session name no session has: [`WORKER_SESSION_NAME`], else
+/// `fw worker 2`, `fw worker 3`, ... (names address sessions in `fw hub`
+/// verbs, so they stay unique).
+pub fn worker_session_name<'a>(taken: impl IntoIterator<Item = &'a str>) -> String {
+    let taken: HashSet<&str> = taken.into_iter().map(str::trim).collect();
+    if !taken.contains(WORKER_SESSION_NAME) {
+        return WORKER_SESSION_NAME.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{WORKER_SESSION_NAME} {n}"))
+        .find(|name| !taken.contains(name.as_str()))
+        .expect("an unbounded range has a free name")
 }
 
 /// A run id the transcript reader accepts: `[A-Za-z0-9_-]`, 1..=128 (it
@@ -724,6 +853,75 @@ mod tests {
             .unwrap();
         assert!(marker.exists());
         assert!(String::from_utf8_lossy(&out.stdout).contains("exited with status 0"));
+    }
+
+    #[test]
+    fn worker_session_names_stay_unique() {
+        assert_eq!(worker_session_name(["shell", "claude"]), "fw worker");
+        assert_eq!(worker_session_name(["fw worker"]), "fw worker 2");
+        assert_eq!(
+            worker_session_name([" fw worker ", "fw worker 2", "fw worker 4"]),
+            "fw worker 3"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worker_session_counts_as_running_until_its_shell_takes_over() {
+        use std::os::unix::fs::PermissionsExt;
+        // Kills the session process however the test ends.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let until = |what: &str, probe: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !probe() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // The real session script with a worker that waits on a file (the
+        // test says when it "exits"), and a shell that stays up after.
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("go");
+        let shell = dir.path().join("shell");
+        std::fs::write(&shell, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wait = format!("while [ ! -e {} ]; do sleep 0.05; done", gate.display());
+        let argv = worker_session_command(&["/bin/sh".into(), "-c".into(), wait]);
+        let child = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env("SHELL", &shell)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let child = Reap(child);
+        until("the worker to start", &|| process_runs_worker(pid));
+        std::fs::write(&gate, "").unwrap();
+        until("the shell to take over", &|| !process_runs_worker(pid));
+        // The same live process (now the shell), no longer a worker.
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        assert_eq!(comm.trim(), "sleep");
+        drop(child);
+        assert!(!process_runs_worker(pid), "a gone process runs nothing");
+    }
+
+    #[test]
+    fn a_read_still_running_refuses_its_repeat_until_it_finishes() {
+        let gate = Arc::new(ReadGate::default());
+        let first = gate.begin("run\0/r\0run-1".into()).expect("free");
+        assert!(gate.begin("run\0/r\0run-1".into()).is_none());
+        let other = gate.begin("run\0/r\0run-2".into());
+        assert!(other.is_some(), "other keys are independent");
+        drop(first);
+        assert!(gate.begin("run\0/r\0run-1".into()).is_some());
     }
 
     #[test]

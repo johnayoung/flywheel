@@ -14,6 +14,15 @@ window.FwHubFlywheel = function (ctx) {
   const { $, el, icon, api, state, workspaceById, folderLabel, openSession, toast, confirmDialog } = ctx;
 
   const RUN_POLL_MS = 2000;
+  // Transcript entries the run viewer keeps (the oldest are dropped).
+  const RUN_WINDOW = 3000;
+  // The monitor re-reads every 15s but pushes only changes: past this,
+  // the open panel re-fetches its (server-cached) read to stay honest.
+  const PANEL_STALE_MS = 20000;
+  // Needs you lists a folder's alerts one by one up to this many, then as
+  // one row that opens its panel.
+  const ATTENTION_PER_FOLDER = 2;
+  const SEEN_KEY = "fw-hub.flywheel-seen";
   const ui = {
     enabled: false,
     summaries: new Map(), // folder path -> summary
@@ -62,6 +71,7 @@ window.FwHubFlywheel = function (ctx) {
       const data = await api("GET", "/api/flywheel");
       ui.enabled = !!data.enabled;
       ui.summaries = new Map((data.folders || []).map((s) => [s.folder, s]));
+      for (const [folder, s] of ui.summaries) prune(folder, s);
     } catch (_) {
       return;
     }
@@ -75,8 +85,12 @@ window.FwHubFlywheel = function (ctx) {
       return;
     }
     ui.enabled = true;
-    if (message.summary) ui.summaries.set(message.folder, message.summary);
-    else ui.summaries.delete(message.folder);
+    if (message.summary) {
+      ui.summaries.set(message.folder, message.summary);
+      prune(message.folder, message.summary);
+    } else {
+      ui.summaries.delete(message.folder);
+    }
     changed();
     if (ui.folder === message.folder) {
       if (message.summary) loadPanel();
@@ -89,6 +103,15 @@ window.FwHubFlywheel = function (ctx) {
     renderPill();
   }
 
+  // The panel ignoring when it was read (and in-flight runs' ages).
+  function content(panel) {
+    return JSON.stringify({
+      ...panel,
+      generated_at: null,
+      live: panel.live.map((r) => ({ ...r, age_seconds: null, idle_seconds: null })),
+    });
+  }
+
   async function loadPanel() {
     const folder = ui.folder;
     if (!folder) return;
@@ -98,7 +121,14 @@ window.FwHubFlywheel = function (ctx) {
     try {
       const panel = await api("GET", `/api/flywheel/panel?folder=${encodeURIComponent(folder)}`);
       if (seq !== ui.seq || ui.folder !== folder) return;
+      const same = ui.panel && ui.panel.folder === folder && !ui.error && content(ui.panel) === content(panel);
       ui.panel = panel;
+      if (same) {
+        // A re-read that changed nothing: freshen the stamp, keep the
+        // DOM (open folds, scroll) as it is.
+        stamp();
+        return;
+      }
       ui.error = "";
     } catch (error) {
       if (seq !== ui.seq || ui.folder !== folder) return;
@@ -110,10 +140,71 @@ window.FwHubFlywheel = function (ctx) {
 
   const summary = (folder) => ui.summaries.get(folder) || null;
 
+  // --- seen alerts ----------------------------------------------------------
+  // Like a finished agent turn, an alert this browser has acknowledged
+  // leaves Needs you (it stays in the panel, dimmed) until it changes or a
+  // new one appears. Kept per browser, pruned to the alerts that still
+  // exist.
+
+  const alertKey = (a) => `${a.kind}\u0000${a.subject}\u0000${a.detail}`;
+  const seen = loadSeen();
+
+  function loadSeen() {
+    try {
+      const raw = JSON.parse(window.localStorage.getItem(SEEN_KEY) || "{}");
+      return new Map(Object.entries(raw).map(([folder, keys]) => [folder, new Set(keys)]));
+    } catch (_) {
+      return new Map();
+    }
+  }
+
+  function saveSeen() {
+    try {
+      const raw = Object.fromEntries([...seen].map(([folder, keys]) => [folder, [...keys]]));
+      window.localStorage.setItem(SEEN_KEY, JSON.stringify(raw));
+    } catch (_) {
+      // Private mode or a full quota: seen marks last for this page only.
+    }
+  }
+
+  function isSeen(folder, alert) {
+    const keys = seen.get(folder);
+    return !!keys && keys.has(alertKey(alert));
+  }
+
+  function unseen(folder, s) {
+    return s ? s.alerts.filter((a) => !isSeen(folder, a)) : [];
+  }
+
+  function prune(folder, s) {
+    const keys = seen.get(folder);
+    if (!keys) return;
+    const now = new Set(s.alerts.map(alertKey));
+    let dirty = false;
+    for (const key of keys) {
+      if (!now.has(key)) {
+        keys.delete(key);
+        dirty = true;
+      }
+    }
+    if (!keys.size) seen.delete(folder);
+    if (dirty) saveSeen();
+  }
+
+  function markSeen(folder, on) {
+    const s = summary(folder);
+    if (!s) return;
+    if (on) seen.set(folder, new Set(s.alerts.map(alertKey)));
+    else seen.delete(folder);
+    saveSeen();
+    changed();
+    renderDrawer();
+  }
+
   // The worst thing about a folder, for its badge.
   function tone(s) {
     if (!s) return "";
-    if (s.alerts.length) return "alert";
+    if (unseen(s.folder, s).length) return "alert";
     if (s.live_runs || s.worker_live || s.autopilot_live) return "live";
     return "idle";
   }
@@ -133,10 +224,11 @@ window.FwHubFlywheel = function (ctx) {
     return best;
   }
 
-  // Hub sessions running a worker in `folder` (started from this panel).
+  // Hub sessions running a worker in `folder` (started from this panel;
+  // one restored after a hub restart is a plain shell).
   function workerSessions(folder) {
     return state.sessions.filter((s) =>
-      s.cwd === folder && s.live && s.live.pid && s.state === "running" &&
+      s.cwd === folder && s.live && s.live.pid && s.state === "running" && !s.fallback_command &&
       Array.isArray(s.command) && s.command[3] === "fw-worker");
   }
 
@@ -164,16 +256,18 @@ window.FwHubFlywheel = function (ctx) {
     const count = total(s);
     const verified = s.counts.verified || 0;
     const t = tone(s);
-    const why = s.alerts.length
-      ? `${s.alerts.length} need${s.alerts.length === 1 ? "s" : ""} you`
+    const fresh = unseen(folder.path, s).length;
+    const why = fresh
+      ? `${fresh} need${fresh === 1 ? "s" : ""} you`
       : s.live_runs ? `${s.live_runs} running` : s.worker_live ? "worker live" : "idle";
+    const tasks = count ? `${verified}/${count} verified` : "no active tasks";
     return el(
       "button",
       {
         type: "button",
         className: `fw-chip ${t}${ui.folder === folder.path ? " open" : ""}`,
-        title: `${node.title}\nflywheel: ${verified}/${count} verified, ${why}. Open the Flywheel panel.`,
-        "aria-label": `${folderLabel(folder)}: Flywheel panel (${verified} of ${count} verified, ${why})`,
+        title: `${node.title}\nflywheel: ${tasks}, ${why}. Open the Flywheel panel.`,
+        "aria-label": `${folderLabel(folder)}: Flywheel panel (${tasks}, ${why})`,
         onclick: (event) => {
           event.stopPropagation();
           open(folder.path, workspaceId);
@@ -185,20 +279,44 @@ window.FwHubFlywheel = function (ctx) {
         { className: "fw-badge" },
         el("i", { className: `fw-dot ${t}`, "aria-hidden": "true" }),
         count ? `${verified}/${count}` : "fw",
+        fresh ? el("span", { className: "fw-badge-alerts", textContent: String(fresh), title: why }) : null,
       ),
     );
   }
 
   // --- attention list ------------------------------------------------------
 
-  // Every adopted folder's alerts, for "Needs you".
+  const RANK = { failed: 0, stranded: 1, awaiting: 2, blocked: 3, stopped: 4 };
+  const byRank = (a, b) => (RANK[a.kind] ?? 9) - (RANK[b.kind] ?? 9);
+
+  // Every adopted folder's unseen alerts, for "Needs you": one row each
+  // while a folder has few, else one row for the folder (so a repo with
+  // dozens of old strands cannot bury a blocked agent). `count` is how
+  // many alerts a row stands for.
   function attention() {
     const out = [];
     for (const [folder, s] of ui.summaries) {
-      for (const alert of s.alerts) out.push({ folder, label: labelFor(folder), alert });
+      const label = labelFor(folder);
+      const alerts = unseen(folder, s).sort(byRank);
+      if (alerts.length <= ATTENTION_PER_FOLDER) {
+        for (const alert of alerts) out.push({ folder, label, alert, count: 1 });
+        continue;
+      }
+      const kinds = new Map();
+      for (const a of alerts) kinds.set(a.kind, (kinds.get(a.kind) || 0) + 1);
+      out.push({
+        folder,
+        label,
+        count: alerts.length,
+        alert: {
+          kind: alerts[0].kind,
+          subject: `${alerts.length} flywheel alerts`,
+          detail: [...kinds].map(([kind, n]) => `${n} ${KIND_LABEL[kind] || kind}`).join(" · "),
+          run_id: null,
+        },
+      });
     }
-    const rank = { failed: 0, stranded: 1, awaiting: 2, blocked: 3, stopped: 4 };
-    out.sort((a, b) => (rank[a.alert.kind] ?? 9) - (rank[b.alert.kind] ?? 9) || a.label.localeCompare(b.label));
+    out.sort((a, b) => byRank(a.alert, b.alert) || a.label.localeCompare(b.label));
     return out;
   }
 
@@ -215,8 +333,9 @@ window.FwHubFlywheel = function (ctx) {
     pill.setAttribute("aria-pressed", String(ui.folder === folder));
     pill.dataset.tone = tone(s);
     const badge = $("#fw-count");
-    badge.hidden = !s.alerts.length;
-    badge.textContent = String(s.alerts.length);
+    const fresh = unseen(folder, s).length;
+    badge.hidden = !fresh;
+    badge.textContent = String(fresh);
     pill.title = `Flywheel panel for ${labelFor(folder)} (Alt F)`;
   }
 
@@ -292,27 +411,69 @@ window.FwHubFlywheel = function (ctx) {
     );
   }
 
+  // POST answering status and body (api() keeps only the error text; a
+  // 409 here carries the running worker).
+  async function post(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.status === 401) {
+      window.location.replace("/" + window.location.hash);
+      throw new Error("signed out");
+    }
+    let data = null;
+    try {
+      data = await response.json();
+    } catch (_) {
+      // An empty or non-JSON body: the status says it all.
+    }
+    return { status: response.status, ok: response.ok, data };
+  }
+
   async function startWorker() {
     const folder = ui.folder;
     const panel = ui.panel;
     const workspace = workspaceFor(folder);
     if (!folder || !workspace) return;
+    let another = false;
     if (panel && panel.worker.live) {
       const ok = await confirmDialog({
         kicker: "flywheel",
         title: "Start another worker?",
         body: `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
-        ok: "Start worker",
+        ok: "Start another",
       });
       if (!ok) return;
+      another = true;
     }
     try {
-      const view = await api("POST", "/api/flywheel/worker", { folder, workspace_id: workspace.id });
+      const request = { folder, workspace_id: workspace.id, another };
+      let out = await post("/api/flywheel/worker", request);
+      if (out.status === 409 && out.data && out.data.running) {
+        const running = out.data.running;
+        const ok = await confirmDialog({
+          kicker: "flywheel",
+          title: "A worker is already running here",
+          body: `Session "${running.name}" runs fw worker in ${labelFor(folder)}. A second worker claims tasks in parallel with it.`,
+          ok: "Start another",
+        });
+        if (!ok) {
+          close();
+          openSession(running.id);
+          return;
+        }
+        out = await post("/api/flywheel/worker", { ...request, another: true });
+      }
+      if (!out.ok) throw new Error((out.data && out.data.error) || `HTTP ${out.status}`);
+      const view = out.data;
       await ctx.refresh();
       // The worker's terminal is the thing to watch now.
       close();
       openSession(view.id);
-      toast(el("span", {}, "Started ", el("b", { textContent: "fw worker" }), ` in ${labelFor(folder)}`), { timeout: 3500 });
+      toast(el("span", {}, "Started ", el("b", { textContent: view.name }), ` in ${labelFor(folder)}`), { timeout: 3500 });
     } catch (error) {
       toast(`Could not start a worker: ${error.message}`, { tone: "bad" });
     }
@@ -370,6 +531,10 @@ window.FwHubFlywheel = function (ctx) {
     );
   }
 
+  // A run's status in the tasks' vocabulary: a DONE run passed its
+  // graders, which is what "verified" means on a task.
+  const runLabel = (status) => (status === "done" ? "verified" : status.replace("_", " "));
+
   function runRow(run) {
     return el(
       "li",
@@ -377,7 +542,7 @@ window.FwHubFlywheel = function (ctx) {
       el(
         "div",
         { className: "fw-run-line" },
-        el("span", { className: `fw-status ${run.status}`, textContent: run.status.replace("_", " ") }),
+        el("span", { className: `fw-status ${run.status}`, textContent: runLabel(run.status), title: `lifecycle ${run.status}${run.outcome ? `, ${run.outcome}` : ""}` }),
         el("b", { textContent: run.task_id, title: run.run_id }),
         el("span", { className: "fw-run-when", textContent: run.updated_at ? `${ago(run.updated_at)} ago` : "" }),
         outputButton(run.run_id, run.task_id),
@@ -428,7 +593,7 @@ window.FwHubFlywheel = function (ctx) {
   function alertRow(alert) {
     return el(
       "li",
-      { className: `fw-alert ${alert.kind}` },
+      { className: `fw-alert ${alert.kind}${isSeen(ui.folder, alert) ? " seen" : ""}` },
       el("span", { className: `fw-kind ${alert.kind}`, textContent: KIND_LABEL[alert.kind] || alert.kind }),
       el(
         "span",
@@ -471,8 +636,7 @@ window.FwHubFlywheel = function (ctx) {
       $("#fw-read").textContent = "";
       return;
     }
-    $("#fw-read").textContent = `read ${ago(panel.generated_at)} ago`;
-    $("#fw-read").title = `${panel.source} · ${panel.store}`;
+    stamp();
     const start = el(
       "button",
       { type: "button", className: "slab fw-start", onclick: startWorker, title: "Run fw worker in a new shell session in this folder" },
@@ -500,9 +664,7 @@ window.FwHubFlywheel = function (ctx) {
     ];
     if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
     if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));
-    if (panel.alerts.length) {
-      children.push(section("Needs you", panel.alerts.length, el("ul", { className: "fw-list" }, panel.alerts.map(alertRow))));
-    }
+    if (panel.alerts.length) children.push(alertsSection(folder, panel.alerts));
     if (panel.live.length) {
       children.push(section("In flight", panel.live.length, el("ul", { className: "fw-list" }, panel.live.map(liveRow))));
     }
@@ -542,11 +704,51 @@ window.FwHubFlywheel = function (ctx) {
     body.scrollTop = scroll;
   }
 
-  // "read Ns ago" and lease countdowns move while the drawer shows.
+  // The panel's Needs you: unseen alerts first, a seen toggle, and long
+  // runs of one kind folded.
+  function alertsSection(folder, alerts) {
+    const fresh = alerts.filter((a) => !isSeen(folder, a)).sort(byRank);
+    const old = alerts.filter((a) => isSeen(folder, a)).sort(byRank);
+    const toggle = el("button", {
+      type: "button",
+      className: "text-btn fw-seen",
+      textContent: fresh.length ? "mark seen" : "unmark seen",
+      title: fresh.length
+        ? "Take these out of the sidebar's Needs you list (this browser) until they change"
+        : "Put these back in the sidebar's Needs you list",
+      onclick: () => markSeen(folder, fresh.length > 0),
+    });
+    const shown = [...fresh, ...old];
+    const head = shown.slice(0, 8);
+    const rest = shown.slice(8);
+    return section(
+      "Needs you",
+      fresh.length ? `${fresh.length} new${old.length ? ` · ${old.length} seen` : ""}` : `${old.length} seen`,
+      el("div", { className: "fw-sec-actions" }, toggle),
+      el("ul", { className: "fw-list" }, head.map(alertRow)),
+      rest.length
+        ? el(
+          "details",
+          { className: "fw-more" },
+          el("summary", { textContent: `${rest.length} more` }),
+          el("ul", { className: "fw-list" }, rest.map(alertRow)),
+        )
+        : null,
+    );
+  }
+
+  function stamp() {
+    if (!ui.panel) return;
+    $("#fw-read").textContent = `read ${ago(ui.panel.generated_at)} ago`;
+    $("#fw-read").title = `${ui.panel.source} · ${ui.panel.store}`;
+  }
+
+  // "read Ns ago" moves while the drawer shows; past the monitor's
+  // re-read cadence the panel re-fetches its latest read.
   setInterval(() => {
-    if (ui.folder && ui.panel && document.visibilityState === "visible") {
-      $("#fw-read").textContent = `read ${ago(ui.panel.generated_at)} ago`;
-    }
+    if (!ui.folder || !ui.panel || document.visibilityState !== "visible") return;
+    stamp();
+    if (!ui.loading && Date.now() - Date.parse(ui.panel.generated_at) > PANEL_STALE_MS) loadPanel();
   }, 5000);
 
   // --- run output viewer -------------------------------------------------------
@@ -555,7 +757,7 @@ window.FwHubFlywheel = function (ctx) {
 
   function openRun(folder, runId, task) {
     if (ui.run) clearTimeout(ui.run.timer);
-    ui.run = { folder, runId, task, next: 0, from: 0, entries: [], summary: "", status: null, active: false, tab: "transcript", timer: null, error: "", seq: 0 };
+    ui.run = { folder, runId, task, next: 0, from: 0, entries: [], summary: "", status: null, active: false, tab: "transcript", timer: null, error: "", seq: 0, shown: null };
     $("#run-title").textContent = task || runId;
     $("#run-meta").textContent = runId;
     $("#run-body").replaceChildren(el("p", { className: "fw-empty", textContent: "Reading the run..." }));
@@ -574,19 +776,30 @@ window.FwHubFlywheel = function (ctx) {
         `/api/flywheel/run?folder=${encodeURIComponent(run.folder)}&run=${encodeURIComponent(run.runId)}&since=${run.next}`,
       );
       if (ui.run !== run || seq !== run.seq) return;
-      if (out.from > run.next || run.next === 0) {
+      const restart = out.from > run.next || run.next === 0;
+      let dropped = 0;
+      if (restart) {
         // The first read (or a gap past the retained window): start over.
-        run.entries = out.entries;
-        run.from = out.from;
+        run.entries = out.entries.slice(-RUN_WINDOW);
+        run.from = out.from + (out.entries.length - run.entries.length);
       } else {
         run.entries.push(...out.entries);
+        dropped = Math.max(0, run.entries.length - RUN_WINDOW);
+        if (dropped) {
+          run.entries.splice(0, dropped);
+          run.from += dropped;
+        }
       }
+      const summaryChanged = run.summary !== out.summary;
+      const hadError = !!run.error;
       run.next = out.next;
       run.summary = out.summary;
       run.status = out.status;
       run.active = out.active;
       run.error = "";
-      renderRun(out.entries.length > 0);
+      if (restart || hadError || (run.tab === "summary" && summaryChanged)) renderRun(true);
+      else if (out.entries.length) appendEntries(out.entries, dropped);
+      else renderMeta();
     } catch (error) {
       if (ui.run !== run) return;
       run.error = error.message;
@@ -632,31 +845,63 @@ window.FwHubFlywheel = function (ctx) {
     );
   }
 
+  function renderMeta() {
+    const run = ui.run;
+    $("#run-meta").textContent = [run.runId, run.status, run.active ? "live" : null].filter(Boolean).join(" · ");
+    $("#run-follow-wrap").hidden = !run.active;
+  }
+
+  const earlierText = (from) => `${from} earlier entries not shown (the newest are).`;
+
   function renderRun(scrollToEnd) {
     const run = ui.run;
     if (!run) return;
     const body = $("#run-body");
-    $("#run-meta").textContent = [run.runId, run.status, run.active ? "live" : null].filter(Boolean).join(" · ");
-    $("#run-follow-wrap").hidden = !run.active;
+    renderMeta();
+    run.shown = null;
     if (run.tab === "summary") {
-      body.replaceChildren(
+      body.replaceChildren(...[
         run.error ? el("p", { className: "fw-problem", textContent: run.error }) : null,
         el("pre", { className: "run-summary", textContent: run.summary || "" }),
-      );
+      ].filter(Boolean));
       return;
     }
     const nearEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
     const nodes = [];
     if (run.error) nodes.push(el("p", { className: "fw-problem", textContent: run.error }));
-    if (run.from > 0) nodes.push(el("p", { className: "fw-empty", textContent: `${run.from} earlier entries not shown (the newest are).` }));
+    const earlier = el("p", { className: "fw-empty run-earlier", textContent: earlierText(run.from) });
+    earlier.hidden = run.from === 0;
+    nodes.push(earlier);
     if (!run.entries.length && !run.error) {
       nodes.push(el("p", { className: "fw-empty", textContent: run.active ? "No transcript yet: waiting for the agent." : "This run left no transcript in the logs (see the summary)." }));
     }
-    nodes.push(...run.entries.map(entryNode));
+    const list = el("div", { className: "run-entries" }, run.entries.map(entryNode));
+    nodes.push(list);
     body.replaceChildren(...nodes);
+    // Later polls append to this list instead of rebuilding it.
+    if (run.entries.length && !run.error) run.shown = { list, earlier };
     if (scrollToEnd && ($("#run-follow").checked || nearEnd)) {
       body.scrollTop = body.scrollHeight;
     }
+  }
+
+  // New transcript entries onto the shown list (the oldest `dropped` off
+  // it): a long live run costs the DOM only what changed.
+  function appendEntries(fresh, dropped) {
+    const run = ui.run;
+    if (!run || run.tab !== "transcript" || !run.shown) {
+      renderRun(true);
+      return;
+    }
+    const body = $("#run-body");
+    const nearEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+    const { list, earlier } = run.shown;
+    for (let i = 0; i < dropped && list.firstChild; i++) list.firstChild.remove();
+    list.append(...fresh.slice(-RUN_WINDOW).map(entryNode));
+    earlier.hidden = run.from === 0;
+    earlier.textContent = earlierText(run.from);
+    renderMeta();
+    if ($("#run-follow").checked || nearEnd) body.scrollTop = body.scrollHeight;
   }
 
   // --- palette ----------------------------------------------------------------
@@ -664,8 +909,9 @@ window.FwHubFlywheel = function (ctx) {
   function paletteItems(cmd) {
     for (const folder of ui.summaries.keys()) {
       const s = summary(folder);
-      const n = s.alerts.length;
-      cmd(`Flywheel: ${labelFor(folder)}`, n ? `${n} need${n === 1 ? "s" : ""} you` : `${s.counts.verified || 0}/${total(s)} verified`, () => open(folder), "wheel");
+      const n = unseen(folder, s).length;
+      const tasks = total(s) ? `${s.counts.verified || 0}/${total(s)} verified` : "no active tasks";
+      cmd(`Flywheel: ${labelFor(folder)}`, n ? `${n} need${n === 1 ? "s" : ""} you` : tasks, () => open(folder), "wheel");
     }
   }
 

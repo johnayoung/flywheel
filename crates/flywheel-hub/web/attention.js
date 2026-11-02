@@ -2,8 +2,9 @@
 // workspaces, at the top of the sidebar (the phone's session switcher):
 // blocked ones first (longest waiting first), then finished turns this
 // browser has not looked at (newest first), then flywheel tasks that
-// failed, stranded, stopped, or wait on a gate (flywheel.js). Tap one to
-// open it (a flywheel row opens its folder's Flywheel panel).
+// failed, stranded, stopped, or wait on a gate (flywheel.js; a folder
+// with many is one row, and alerts marked seen in its panel drop out).
+// Tap one to open it (a flywheel row opens its folder's Flywheel panel).
 "use strict";
 
 window.FwHubAttention = function (ctx) {
@@ -86,7 +87,7 @@ window.FwHubAttention = function (ctx) {
   }
 
   // A flywheel task that needs you: opens its folder's panel.
-  function flywheelRow({ folder, label, alert }) {
+  function flywheelRow({ folder, label, alert, count }) {
     return el(
       "li",
       {},
@@ -96,7 +97,9 @@ window.FwHubAttention = function (ctx) {
           type: "button",
           className: `attn-row fw ${alert.kind}`,
           onclick: () => flywheel.open(folder),
-          title: `${alert.subject} in ${folder}: ${alert.detail}`,
+          title: count > 1
+            ? `${label}: ${alert.detail}. Open its Flywheel panel.`
+            : `${alert.subject} in ${folder}: ${alert.detail}`,
         },
         el("span", { className: "glyph fw" }, icon("wheel")),
         el(
@@ -134,6 +137,7 @@ window.FwHubAttention = function (ctx) {
 
   function content(list, loop) {
     const blocked = list.filter((e) => e.agent.status === "blocked").length;
+    const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     return [
       el(
         "header",
@@ -144,7 +148,7 @@ window.FwHubAttention = function (ctx) {
           textContent: [
             blocked ? `${blocked} blocked` : "",
             list.length - blocked ? `${list.length - blocked} done` : "",
-            loop.length ? `${loop.length} flywheel` : "",
+            alerts ? `${alerts} flywheel` : "",
           ]
             .filter(Boolean)
             .join(" / "),

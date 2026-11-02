@@ -773,6 +773,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = writeln!(err, "fw hub: state dir {}: {e}", state_dir.display());
         return 1;
     }
+    crate::install_crypto_provider();
     let notify = match NotifyConfig::load(&state_dir, hub_args.notify_url.as_deref()) {
         Ok(config) => config,
         Err(message) => {

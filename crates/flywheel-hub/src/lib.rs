@@ -37,3 +37,11 @@ pub mod web;
 
 pub use hub::{CreateSession, Hub, HubError, HubEvent, HubOptions, RestoreOutcome, SessionView};
 pub use server::{ServerOptions, router, serve};
+
+/// Make rustls on ring this process's default crypto provider, so any
+/// `reqwest` client built without its own TLS config (reqwest is compiled
+/// with `rustls-no-provider`) has one. Idempotent; a provider installed
+/// first stays.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}

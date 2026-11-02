@@ -354,8 +354,9 @@ fn header_text(text: &str) -> String {
 /// Sends pushes and decides when.
 pub struct Notifier {
     config: NotifyConfig,
-    /// TLS for an https URL.
-    tls: Option<Arc<rustls::ClientConfig>>,
+    /// The webhook client: rustls on ring with the platform's roots, no
+    /// redirects, no proxies.
+    http: reqwest::Client,
     /// Which spells pushed, which wait to, and when each status last
     /// pushed.
     state: Mutex<PushState>,
@@ -388,11 +389,16 @@ impl std::fmt::Debug for Notifier {
 
 impl Notifier {
     pub fn new(config: NotifyConfig) -> Result<Arc<Self>, String> {
+        let http = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls_config(config.url.scheme() == "https")?)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .http1_only()
+            .user_agent(concat!("flywheel-hub/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| format!("HTTP client setup failed: {e}"))?;
         Ok(Arc::new(Self {
-            tls: match config.url.scheme() {
-                "https" => Some(tls_config()?),
-                _ => None,
-            },
+            http,
             config,
             state: Mutex::new(PushState::default()),
         }))
@@ -430,44 +436,24 @@ impl Notifier {
         }
     }
 
-    /// One HTTP/1.1 POST of `body` (plain text) with `headers`; returns
-    /// the response's status code. Redirects are not followed (one could
-    /// carry the message elsewhere).
+    /// One POST of `body` (plain text) with `headers`; returns the
+    /// response's status code. Redirects are not followed (one could carry
+    /// the message elsewhere). URL credentials travel only as the
+    /// `Authorization` header [`Self::send`] built.
     async fn post(&self, headers: &[(&str, String)], body: &[u8]) -> Result<u16, String> {
-        let url = &self.config.url;
-        let host = url.host_str().ok_or("no host")?;
-        let port = url.port_or_known_default().ok_or("no port")?;
-        let mut request = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: flywheel-hub/{}\r\n\
-             Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n",
-            &url[url::Position::BeforePath..url::Position::AfterQuery],
-            self.config.host(),
-            env!("CARGO_PKG_VERSION"),
-            body.len()
-        );
+        let mut url = self.config.url.clone();
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        let mut request = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(body.to_vec());
         for (name, value) in headers {
-            request.push_str(&format!("{name}: {value}\r\n"));
+            request = request.header(*name, value.as_str());
         }
-        request.push_str("\r\n");
-        let mut bytes = request.into_bytes();
-        bytes.extend_from_slice(body);
-        let stream = tokio::net::TcpStream::connect((host.trim_matches(['[', ']']), port))
-            .await
-            .map_err(|e| format!("cannot connect: {e}"))?;
-        match &self.tls {
-            None => exchange(stream, &bytes).await,
-            Some(tls) => {
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|e| format!("bad host name: {e}"))?;
-                let stream = tokio_rustls::TlsConnector::from(Arc::clone(tls))
-                    .connect(name, stream)
-                    .await
-                    .map_err(|e| format!("TLS: {e}"))?;
-                exchange(stream, &bytes).await
-            }
-        }
+        let response = request.send().await.map_err(|e| describe(&e))?;
+        Ok(response.status().as_u16())
     }
 
     /// A test push (`POST /api/notify/test`).
@@ -627,48 +613,28 @@ impl Notifier {
     }
 }
 
-/// Write `request`, read the status line back.
-async fn exchange<S>(mut stream: S, request: &[u8]) -> Result<u16, String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream
-        .write_all(request)
-        .await
-        .map_err(|e| format!("cannot send: {e}"))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("cannot send: {e}"))?;
-    let mut head = Vec::new();
-    let mut chunk = [0u8; 1024];
-    while !head.windows(2).any(|w| w == b"\r\n") {
-        if head.len() > 8192 {
-            return Err("answer is not HTTP".into());
-        }
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("no answer: {e}"))?;
-        if n == 0 {
-            return Err("closed without an answer".into());
-        }
-        head.extend_from_slice(&chunk[..n]);
+/// What failed, without the URL (its path is the secret topic).
+fn describe(error: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let what = if error.is_connect() {
+        "cannot connect"
+    } else if error.is_timeout() {
+        "timed out"
+    } else if error.is_builder() || error.is_request() {
+        "cannot send"
+    } else {
+        "no answer"
+    };
+    let mut cause = error.source();
+    let mut innermost = None;
+    while let Some(e) = cause {
+        innermost = Some(e.to_string());
+        cause = e.source();
     }
-    status_code(&head).ok_or_else(|| "answer is not HTTP".into())
-}
-
-/// The status code of an HTTP/1.x response's first line.
-fn status_code(head: &[u8]) -> Option<u16> {
-    let line = head.split(|&b| b == b'\n').next()?;
-    let line = std::str::from_utf8(line).ok()?.trim_end();
-    let mut parts = line.split(' ');
-    if !parts.next()?.starts_with("HTTP/1.") {
-        return None;
+    match innermost {
+        Some(cause) => format!("{what}: {cause}"),
+        None => what.to_owned(),
     }
-    let code = parts.next()?;
-    (code.len() == 3).then(|| code.parse().ok()).flatten()
 }
 
 /// `Authorization: Basic` for credentials in the URL (`https://user:pass@host/topic`).
@@ -693,14 +659,18 @@ fn basic_auth(url: &url::Url) -> Option<String> {
     ))
 }
 
-/// TLS for the webhook: rustls on ring, the platform's trusted roots.
-fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
+/// TLS for the webhook: rustls on ring, the platform's trusted roots (an
+/// https URL needs at least one). Built here, not from a process-wide
+/// default provider, so it never depends on one being installed.
+fn tls_config(https: bool) -> Result<rustls::ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
+    if https {
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
     }
-    if roots.is_empty() {
+    if https && roots.is_empty() {
         return Err(
             "no trusted root certificates found on this system for an https notify URL".into(),
         );
@@ -710,7 +680,7 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
         .map_err(|e| format!("TLS setup failed: {e}"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Arc::new(config))
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -956,11 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn status_lines_parse_and_url_credentials_become_basic_auth() {
-        assert_eq!(status_code(b"HTTP/1.1 200 OK\r\n"), Some(200));
-        assert_eq!(status_code(b"HTTP/1.0 403 Forbidden\r\nx"), Some(403));
-        assert_eq!(status_code(b"SSH-2.0-OpenSSH\r\n"), None);
-        assert_eq!(status_code(b"HTTP/1.1 20 OK\r\n"), None);
+    fn url_credentials_become_basic_auth() {
         let url = url::Url::parse("https://me:p%40ss@ntfy.example.com/t").unwrap();
         assert_eq!(
             basic_auth(&url).as_deref(),

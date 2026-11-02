@@ -44,6 +44,7 @@ impl TestHub {
     /// A hub whose `claude` and `codex` are the given script bodies; each
     /// first dumps its argv and environment into `<dir>/<name>.args|env`.
     async fn start(claude: &str, codex: &str) -> Self {
+        flywheel_hub::install_crypto_provider();
         Self::start_in(tempfile::tempdir().unwrap(), claude, codex).await
     }
 

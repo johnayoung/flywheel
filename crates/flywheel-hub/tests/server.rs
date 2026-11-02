@@ -34,6 +34,7 @@ struct TestHub {
 
 impl TestHub {
     async fn start() -> Self {
+        flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
         let repo = dir.path().join("repo");

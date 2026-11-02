@@ -102,6 +102,7 @@ struct TestHub {
 
 impl TestHub {
     async fn start(notify: Option<NotifyConfig>) -> Self {
+        flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -579,4 +580,79 @@ async fn without_push_the_api_says_off_and_a_failing_webhook_is_reported() {
     assert!(message.contains("403"), "{message}");
     assert!(!message.contains(TOPIC), "{message}");
     hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirects_are_not_followed_and_errors_never_name_the_topic() {
+    flywheel_hub::install_crypto_provider();
+    let target = Webhook::start(200).await;
+    let location = target.url();
+    let app = axum::Router::new().route(
+        "/{*topic}",
+        post(move || {
+            let location = location.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(reqwest::header::LOCATION, location)],
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let notifier = Notifier::new(
+        NotifyConfig::from_parts(None, Some(&format!("http://{addr}/{TOPIC}")))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let message = notifier.send_test().await.unwrap_err();
+    assert!(message.contains("307"), "{message}");
+    assert!(!message.contains(TOPIC), "{message}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(target.all().is_empty(), "the redirect was followed");
+
+    // Nothing listens: the error names the host only.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = closed.local_addr().unwrap();
+    drop(closed);
+    let notifier = Notifier::new(
+        NotifyConfig::from_parts(None, Some(&format!("http://me:pw@{dead}/{TOPIC}")))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let message = notifier.send_test().await.unwrap_err();
+    assert!(message.contains("cannot connect"), "{message}");
+    assert!(!message.contains(TOPIC), "{message}");
+    assert!(!message.contains("pw"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn url_credentials_are_sent_as_basic_auth_only() {
+    flywheel_hub::install_crypto_provider();
+    let webhook = Webhook::start(200).await;
+    let url = format!("http://me:p%40ss@{}/{TOPIC}", webhook.addr);
+    let notifier =
+        Notifier::new(NotifyConfig::from_parts(None, Some(&url)).unwrap().unwrap()).unwrap();
+    notifier.send_test().await.unwrap();
+    let got = webhook.nth(1).await;
+    assert_eq!(got.path, format!("/{TOPIC}"));
+    // "me:p@ss"
+    assert_eq!(
+        got.headers.get("authorization").map(String::as_str),
+        Some("Basic bWU6cEBzcw==")
+    );
+    assert_eq!(
+        got.headers.get("title").map(String::as_str),
+        Some("flywheel hub")
+    );
+    assert!(
+        got.headers["user-agent"].starts_with("flywheel-hub/"),
+        "{:?}",
+        got.headers
+    );
 }

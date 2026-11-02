@@ -39,6 +39,7 @@ struct TestHub {
 
 impl TestHub {
     async fn start() -> Self {
+        flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo/.git")).unwrap();
         Self::reopen(dir, true).await.0

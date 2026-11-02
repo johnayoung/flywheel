@@ -556,10 +556,14 @@ mod tests {
         info.write(dir.path()).unwrap();
         assert_eq!(running_hub(dir.path()).unwrap(), Some(info.clone()));
         drop(lock);
-        assert!(
-            ServeLock::acquire(dir.path()).unwrap().is_some(),
-            "released"
-        );
+        // Released -- once any child forked meanwhile by another test in
+        // this process (PTY spawns) has exec'd and so closed its inherited
+        // copy of the lock's descriptor (it is close-on-exec).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ServeLock::acquire(dir.path()).unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "released");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(running_hub(dir.path()).unwrap(), None);
     }
 

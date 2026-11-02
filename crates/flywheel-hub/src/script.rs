@@ -23,6 +23,7 @@ pub const SHORT_ID: usize = 8;
 pub struct HubConn {
     pub info: RuntimeInfo,
     token: Token,
+    timeout: Duration,
 }
 
 impl HubConn {
@@ -37,7 +38,18 @@ impl HubConn {
         let token = Token::load(state_dir)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-        Ok(Self { info, token })
+        Ok(Self {
+            info,
+            token,
+            timeout: CALL_TIMEOUT,
+        })
+    }
+
+    /// The same hub, waited on for at most `timeout` per call (a probe of
+    /// a hub that may be wedged).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// `method path` with an optional JSON body; the parsed JSON response
@@ -50,7 +62,7 @@ impl HubConn {
             path,
             self.token.expose(),
             body.as_deref(),
-            CALL_TIMEOUT,
+            self.timeout,
         )
         .map_err(|e| {
             format!(
@@ -138,11 +150,21 @@ fn short(id: &str) -> &str {
 }
 
 /// A session's state for humans: `running`, `exited 0`, `killed (Hangup)`,
-/// `stopped`, `stopped (restore failed: ...)`, `gone` (recorded running
-/// but without a terminal on this hub).
+/// `stopped`, `not restored` (see [`restore_error`]), `gone` (recorded
+/// running but without a terminal on this hub).
 pub fn state_label(session: &Value) -> String {
     match str_field(session, "state") {
-        "running" if session.get("live").is_some_and(|l| !l.is_null()) => "running".into(),
+        "running" if session.get("live").is_some_and(|l| !l.is_null()) => {
+            // An agent's status (working, waiting, done, ...) alongside.
+            match session
+                .get("agent")
+                .and_then(|a| a.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some(status) => format!("running ({status})"),
+                None => "running".into(),
+            }
+        }
         "running" => "gone".into(),
         "exited" => match session.get("signal").and_then(Value::as_str) {
             Some(signal) => format!("killed ({signal})"),
@@ -154,12 +176,38 @@ pub fn state_label(session: &Value) -> String {
                     .map_or_else(|| "?".to_owned(), |c| c.to_string())
             ),
         },
-        "stopped" => match session.get("restore_error").and_then(Value::as_str) {
-            Some(error) => format!("stopped (restore failed: {error})"),
-            None => "stopped".into(),
-        },
+        "stopped" if restore_error(session).is_some() => "not restored".into(),
+        "stopped" => "stopped".into(),
         other => other.to_owned(),
     }
+}
+
+/// A session's kind, marked when a restore runs a shell in its place.
+pub fn kind_label(session: &Value) -> String {
+    let kind = str_field(session, "kind");
+    if session
+        .get("fallback_command")
+        .is_some_and(|f| !f.is_null())
+    {
+        format!("{kind} (as shell)")
+    } else {
+        kind.to_owned()
+    }
+}
+
+/// Why a stopped session was not restored, when it was not.
+pub fn restore_error(session: &Value) -> Option<&str> {
+    session.get("restore_error").and_then(Value::as_str)
+}
+
+/// Where a session is: its process's directory while that is known, else
+/// the repo it was opened in.
+fn live_cwd(session: &Value) -> &str {
+    session
+        .get("live")
+        .and_then(|l| l.get("cwd"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| str_field(session, "cwd"))
 }
 
 fn fail(err: &mut dyn Write, message: &str) -> i32 {
@@ -238,15 +286,16 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
             short(str_field(workspace, "id")),
             repos.join(" ")
         );
-        let rows: Vec<[String; 5]> = of(workspace)
+        let listed = of(workspace);
+        let rows: Vec<[String; 5]> = listed
             .iter()
             .map(|s| {
                 [
                     short(str_field(s, "id")).to_owned(),
-                    str_field(s, "kind").to_owned(),
+                    kind_label(s),
                     state_label(s),
                     str_field(s, "name").to_owned(),
-                    str_field(s, "cwd").to_owned(),
+                    live_cwd(s).to_owned(),
                 ]
             })
             .collect();
@@ -257,7 +306,7 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
         let widths: Vec<usize> = (0..4)
             .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
             .collect();
-        for row in &rows {
+        for (row, session) in rows.iter().zip(&listed) {
             let _ = writeln!(
                 out,
                 "  {:w0$}  {:w1$}  {:w2$}  {:w3$}  {}",
@@ -271,6 +320,15 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                 w2 = widths[2],
                 w3 = widths[3],
             );
+            if let Some(error) = restore_error(session) {
+                let _ = writeln!(
+                    out,
+                    "  {:w0$}  {error}; `fw hub relaunch {}`",
+                    "",
+                    row[0],
+                    w0 = widths[0]
+                );
+            }
         }
     }
     0
@@ -330,6 +388,20 @@ pub(crate) fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i
 
 fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     let conn = connect(&args.state)?;
+    // Names address sessions in every other verb: a duplicate would make
+    // both unreachable by name.
+    if let Some(name) = &args.name {
+        let sessions = conn.sessions()?;
+        if let Some(taken) = sessions
+            .iter()
+            .find(|s| str_field(s, "name") == name.trim())
+        {
+            return Err(format!(
+                "a session named {name:?} already exists ({}); pick another --name",
+                str_field(taken, "id")
+            ));
+        }
+    }
     let repo = args.repo.as_deref().map(absolute).transpose()?;
     let workspaces = conn.workspaces()?;
     let workspace_id = match resolve(&workspaces, &args.workspace, "workspace") {
@@ -386,7 +458,9 @@ pub(crate) struct SendArgs {
     target: SessionArg,
     /// Text to send (`-` reads it from stdin). Sent like a paste: newlines
     /// become Enter, wrapped in bracketed-paste markers when the program
-    /// enabled them (so a shell or agent TUI takes it as one paste).
+    /// enabled them (so a shell or agent TUI takes it as one paste). A
+    /// trailing newline is sent as Enter after the paste, so `printf
+    /// 'make\n' | fw hub send s -` runs it.
     #[arg(allow_hyphen_values = true)]
     text: Option<String>,
     /// Press Enter afterwards.
@@ -414,18 +488,36 @@ pub(crate) fn send(args: &SendArgs, out: &mut dyn Write, err: &mut dyn Write) ->
         None if args.enter => String::new(),
         None => return fail(err, "nothing to send: give TEXT and/or --enter"),
     };
+    let (text, enter) = if args.raw {
+        (text, args.enter)
+    } else {
+        split_final_enter(text, args.enter)
+    };
     let result = connect(&args.state).and_then(|conn| {
         let (id, _) = find_session(&conn, &args.target.session)?;
         conn.call(
             "POST",
             &format!("/api/sessions/{id}/input"),
-            Some(&json!({ "data": text, "paste": !args.raw, "enter": args.enter })),
+            Some(&json!({ "data": text, "paste": !args.raw, "enter": enter })),
         )
     });
     match result {
         Ok(_) => 0,
         Err(message) => fail(err, &message),
     }
+}
+
+/// A pasted text's final line break, as the Enter that follows the paste:
+/// inside a bracketed paste it would only add a line to the prompt.
+fn split_final_enter(mut text: String, enter: bool) -> (String, bool) {
+    if text.ends_with('\n') {
+        text.pop();
+        if text.ends_with('\r') {
+            text.pop();
+        }
+        return (text, true);
+    }
+    (text, enter)
 }
 
 #[derive(Debug, clap::Args)]
@@ -516,6 +608,38 @@ pub(crate) fn kill(args: &KillArgs, out: &mut dyn Write, err: &mut dyn Write) ->
     }
 }
 
+#[derive(Debug, clap::Args)]
+pub(crate) struct RelaunchArgs {
+    #[command(flatten)]
+    target: SessionArg,
+    #[command(flatten)]
+    state: StateDirArg,
+}
+
+pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let result = connect(&args.state).and_then(|conn| {
+        let (id, _) = find_session(&conn, &args.target.session)?;
+        conn.call(
+            "POST",
+            &format!("/api/sessions/{id}/restart"),
+            Some(&json!({})),
+        )
+    });
+    match result {
+        Ok(view) => {
+            let _ = writeln!(
+                out,
+                "relaunched session {:?} ({}) in {}",
+                str_field(&view, "name"),
+                str_field(&view, "id"),
+                str_field(&view, "cwd")
+            );
+            0
+        }
+        Err(message) => fail(err, &message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +684,15 @@ mod tests {
         );
         assert_eq!(label(json!({"state": "running", "live": null})), "gone");
         assert_eq!(
+            label(json!({"state": "running", "live": {"pid": 1}, "agent": {"status": "done"}})),
+            "running (done)"
+        );
+        assert_eq!(kind_label(&json!({"kind": "claude"})), "claude");
+        assert_eq!(
+            kind_label(&json!({"kind": "claude", "fallback_command": ["/bin/sh"]})),
+            "claude (as shell)"
+        );
+        assert_eq!(
             label(json!({"state": "exited", "code": 0, "signal": null})),
             "exited 0"
         );
@@ -570,7 +703,24 @@ mod tests {
         assert_eq!(label(json!({"state": "stopped"})), "stopped");
         assert_eq!(
             label(json!({"state": "stopped", "restore_error": "cwd gone"})),
-            "stopped (restore failed: cwd gone)"
+            "not restored"
         );
+    }
+
+    #[test]
+    fn a_final_newline_becomes_enter() {
+        let split = |t: &str, e| split_final_enter(t.to_owned(), e);
+        assert_eq!(split("ls\n", false), ("ls".to_owned(), true));
+        assert_eq!(split("a\nb\r\n", false), ("a\nb".to_owned(), true));
+        assert_eq!(split("ls", false), ("ls".to_owned(), false));
+        assert_eq!(split("ls", true), ("ls".to_owned(), true));
+        assert_eq!(split("\n", false), (String::new(), true));
+    }
+
+    #[test]
+    fn ls_shows_the_live_directory() {
+        let s = json!({"cwd": "/repo", "live": {"cwd": "/repo/sub"}});
+        assert_eq!(live_cwd(&s), "/repo/sub");
+        assert_eq!(live_cwd(&json!({"cwd": "/repo", "live": null})), "/repo");
     }
 }

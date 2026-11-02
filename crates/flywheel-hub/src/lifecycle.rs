@@ -16,6 +16,9 @@ use std::time::Duration;
 
 /// `fw hub status` exit code when no hub runs (the LSB "not running").
 pub const EXIT_NOT_RUNNING: i32 = 3;
+/// How long `status` (a health probe) and `start`'s report wait for the hub
+/// to answer: a hub that is alive but wedged must not stall them.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn fail(err: &mut dyn Write, message: &str) -> i32 {
     let _ = writeln!(err, "fw hub: {message}");
@@ -135,7 +138,9 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
     let _ = writeln!(out, "state dir: {}", dir.display());
     let _ = writeln!(out, "log: {} (`fw hub logs -f`)", log.display());
     // A fresh hub runs exactly the sessions it restored.
-    if let Ok(sessions) = HubConn::connect(&dir).and_then(|c| c.sessions()) {
+    if let Ok(sessions) =
+        HubConn::connect(&dir).and_then(|c| c.with_timeout(PROBE_TIMEOUT).sessions())
+    {
         report_sessions(&sessions, out, err);
     }
     match mint_remote_code(&dir) {
@@ -147,13 +152,18 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
     Ok(0)
 }
 
-/// What a freshly started hub restored, and what it could not.
+/// What a freshly started hub restored, and what it did not (with ids:
+/// names need not be unique).
 fn report_sessions(sessions: &[Value], out: &mut dyn Write, err: &mut dyn Write) {
     let name = |s: &Value| {
         s.get("name")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned()
+    };
+    let id = |s: &Value| {
+        let id = s.get("id").and_then(Value::as_str).unwrap_or("");
+        id.get(..crate::script::SHORT_ID).unwrap_or(id).to_owned()
     };
     let restored: Vec<String> = sessions
         .iter()
@@ -170,11 +180,13 @@ fn report_sessions(sessions: &[Value], out: &mut dyn Write, err: &mut dyn Write)
         );
     }
     for session in sessions {
-        if let Some(error) = session.get("restore_error").and_then(Value::as_str) {
+        if let Some(error) = crate::script::restore_error(session) {
             let _ = writeln!(
                 err,
-                "fw hub: cannot restore session {:?}: {error}; it stays stopped",
-                name(session)
+                "fw hub: session {:?} ({}) not restored: {error}; `fw hub relaunch {}` starts it",
+                name(session),
+                id(session),
+                id(session)
             );
         }
     }
@@ -224,15 +236,9 @@ fn stop_running(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let running = HubConn::connect(dir)
-        .and_then(|conn| conn.sessions())
-        .map(|sessions| {
-            sessions
-                .iter()
-                .filter(|s| s.get("state").and_then(Value::as_str) == Some("running"))
-                .count()
-        })
-        .ok();
+    // Nothing is asked of the hub first: a wedged one would hold this up
+    // past --timeout. What it recorded is read back once it has exited.
+    let signalled_at = Utc::now() - chrono::Duration::seconds(1);
     if let Err(e) = daemon::send_signal(info.pid, libc::SIGTERM) {
         return fail(
             err,
@@ -241,11 +247,10 @@ fn stop_running(
     }
     let timeout = Duration::from_secs(args.timeout);
     if daemon::wait_until(timeout, || lock_free(dir)) {
-        let recorded = match running {
-            Some(0) => String::new(),
-            Some(1) => "; 1 running session recorded for restore".to_owned(),
-            Some(n) => format!("; {n} running sessions recorded for restore"),
-            None => String::new(),
+        let recorded = match recorded_for_restore(dir, signalled_at) {
+            0 => String::new(),
+            1 => "; 1 running session recorded for restore".to_owned(),
+            n => format!("; {n} running sessions recorded for restore"),
         };
         let _ = writeln!(out, "flywheel hub stopped (pid {}){recorded}", info.pid);
         return 0;
@@ -272,6 +277,33 @@ fn stop_running(
     }
 }
 
+/// Sessions a hub that just exited recorded stopped by its clean shutdown
+/// (at or after `since`): what its next start restores.
+#[cfg(unix)]
+fn recorded_for_restore(dir: &Path, since: chrono::DateTime<Utc>) -> usize {
+    let Ok(bytes) = std::fs::read(dir.join(crate::state::STATE_FILE)) else {
+        return 0;
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+        return 0;
+    };
+    doc.get("sessions")
+        .and_then(Value::as_array)
+        .map_or(0, |sessions| {
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.get("state").and_then(Value::as_str) == Some("stopped")
+                        && s.get("clean").and_then(Value::as_bool) == Some(true)
+                        && s.get("at")
+                            .and_then(Value::as_str)
+                            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                            .is_some_and(|at| at >= since)
+                })
+                .count()
+        })
+}
+
 #[cfg(not(unix))]
 fn stop_running(
     _dir: &Path,
@@ -294,12 +326,17 @@ pub(crate) struct StatusArgs {
     state: StateDirArg,
 }
 
-/// Count sessions by their state label (running / exited / stopped / gone).
+/// Count sessions by their state label (running / exited / stopped / not
+/// restored / gone).
 fn session_counts(sessions: &[Value]) -> Vec<(String, usize)> {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for session in sessions {
         let label = crate::script::state_label(session);
-        let key = label.split([' ', '(']).next().unwrap_or("").to_owned();
+        let key = if label == "not restored" {
+            label
+        } else {
+            label.split([' ', '(']).next().unwrap_or("").to_owned()
+        };
         match counts.iter_mut().find(|(k, _)| *k == key) {
             Some((_, n)) => *n += 1,
             None => counts.push((key, 1)),
@@ -332,7 +369,9 @@ pub(crate) fn status(args: &StatusArgs, out: &mut dyn Write, err: &mut dyn Write
     let uptime = info
         .started_at
         .map(|at| (Utc::now() - at).num_seconds().max(0));
-    let listed = HubConn::connect(&dir).and_then(|c| Ok((c.workspaces()?, c.sessions()?)));
+    let listed = HubConn::connect(&dir)
+        .map(|c| c.with_timeout(PROBE_TIMEOUT))
+        .and_then(|c| Ok((c.workspaces()?, c.sessions()?)));
     let (workspaces, sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => {
@@ -501,6 +540,8 @@ fn write_service(args: &InstallServiceArgs, out: &mut dyn Write) -> Result<(), S
         "serve".to_owned(),
     ];
     argv.extend(args.hub.to_argv(&dir));
+    // Its output goes to the journal: no one-time login code there.
+    argv.push("--no-login-code".to_owned());
     // User services start with a minimal environment: carry over what
     // sessions need to find the shell and the agent CLIs.
     let env: Vec<(String, String)> = ["PATH", "SHELL"]
@@ -541,7 +582,8 @@ fn write_service(args: &InstallServiceArgs, out: &mut dyn Write) -> Result<(), S
          systemctl --user enable --now {name}\n  \
          loginctl enable-linger \"$USER\"   # optional: start at boot, keep running after logout\n\
          Manage it with systemctl --user (stop/restart/status) and journalctl --user -u {name};\n\
-         `fw hub status`, `url`, and the scripting verbs work against it as usual."
+         log in with a one-time URL from `fw hub url` (none is written to the journal);\n\
+         `fw hub status` and the scripting verbs work against it as usual."
     );
     Ok(())
 }
@@ -572,7 +614,7 @@ mod tests {
             vec![
                 ("running".to_owned(), 2),
                 ("exited".to_owned(), 1),
-                ("stopped".to_owned(), 1)
+                ("not restored".to_owned(), 1)
             ]
         );
     }

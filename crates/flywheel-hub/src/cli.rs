@@ -63,6 +63,9 @@ enum HubCommand {
     Read(script::ReadArgs),
     /// Hang up a session's processes (the record stays, as exited).
     Kill(script::KillArgs),
+    /// Start an ended or stopped session again in place (same id, name,
+    /// command, and repo; a fresh terminal).
+    Relaunch(script::RelaunchArgs),
     /// Print one-time login URLs for the running hub (loopback, LAN,
     /// tailnet, public), optionally as a QR code for a phone. The
     /// long-lived token is never shown.
@@ -130,6 +133,10 @@ struct ServeArgs {
     /// print no login codes into it (`fw hub start` passes it).
     #[arg(long, value_name = "PATH", hide = true)]
     log_file: Option<PathBuf>,
+    /// Print no one-time login code (its output is a log or journal);
+    /// `fw hub url` mints one (`install-service` passes it).
+    #[arg(long, hide = true)]
+    no_login_code: bool,
 }
 
 /// How the hub serves: shared by `serve`, `start`, and `install-service`.
@@ -163,8 +170,9 @@ pub(crate) struct HubArgs {
     /// lines (capped at 1M cells, so wide terminals keep fewer).
     #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
     scrollback_lines: usize,
-    /// Do not restore the sessions the last clean shutdown stopped (they
-    /// stay stopped; relaunch them from the UI).
+    /// Do not restore the sessions the last clean shutdown stopped: they
+    /// stay stopped, on later starts too, until relaunched (`fw hub
+    /// relaunch` or the UI).
     #[arg(long)]
     no_restore: bool,
     #[command(flatten)]
@@ -268,6 +276,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         HubCommand::Send(args) => script::send(&args, out, err),
         HubCommand::Read(args) => script::read(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),
+        HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
     }
 }
 
@@ -788,14 +797,43 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let _ = writeln!(out, "flywheel hub listening on {base}");
     }
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
+    // Taken before anything is restored: a SIGTERM from here on (`fw hub
+    // start` giving up, `systemctl stop`) shuts down gracefully -- every
+    // restored session recorded stopped again -- instead of killing the
+    // hub mid-restore and leaving them recorded running (a crash).
+    let shutdown = {
+        let _enter = runtime.enter();
+        match ShutdownSignal::install() {
+            Ok(signal) => signal,
+            Err(e) => {
+                let _ = writeln!(err, "fw hub: cannot handle shutdown signals: {e}");
+                return 1;
+            }
+        }
+    };
     if hub_args.no_restore {
-        let _ = writeln!(out, "session restore off (--no-restore)");
+        match hub.forgo_restore() {
+            Ok(0) => {
+                let _ = writeln!(out, "session restore off (--no-restore)");
+            }
+            Ok(n) => {
+                let _ = writeln!(
+                    out,
+                    "session restore off (--no-restore): {n} session{} stay{} stopped until relaunched",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "s" } else { "" }
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(err, "fw hub: cannot record --no-restore: {e}");
+            }
+        }
     } else {
         report_restore(&hub.restore_sessions(), out, err);
     }
-    if detached {
-        // One-time codes stay out of log files: `fw hub start` printed one
-        // to the operator's terminal.
+    if detached || args.no_login_code {
+        // One-time codes stay out of log files and journals: `fw hub
+        // start` printed one to the operator's terminal.
         let _ = writeln!(
             out,
             "log in with a one-time URL from `fw hub url` (or `fw hub url --qr` for a phone)"
@@ -846,7 +884,7 @@ fn serve_cmd(args: ServeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         listener,
         Arc::clone(&hub),
         server_options,
-        shutdown_signal(),
+        shutdown.wait(),
     ));
     // Still under the serve lock (the hub holds it until dropped).
     RuntimeInfo::remove_if_owned(&state_dir, runtime_info.pid);
@@ -872,10 +910,16 @@ fn report_restore(outcomes: &[RestoreOutcome], out: &mut dyn Write, err: &mut dy
     for outcome in outcomes {
         match &outcome.result {
             Ok(how) => {
+                let note = outcome
+                    .note
+                    .as_deref()
+                    .map(|n| format!("; {n}"))
+                    .unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "restored session {:?} in {} ({})",
+                    "restored session {:?} ({}) in {} ({}{note})",
                     outcome.name,
+                    outcome.id,
                     outcome.cwd.display(),
                     how.as_str()
                 );
@@ -891,26 +935,50 @@ fn report_restore(outcomes: &[RestoreOutcome], out: &mut dyn Write, err: &mut dy
     }
 }
 
-/// Resolves on Ctrl-C or SIGTERM.
-async fn shutdown_signal() {
+/// Ctrl-C or SIGTERM, hooked when installed (so either one arriving
+/// before the server runs is held, not fatal) and awaited by the server.
+struct ShutdownSignal {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignal {
+    /// Hook the signals; call inside the runtime.
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Resolves on the first of them (including one that arrived earlier).
+    async fn wait(self) {
+        #[cfg(unix)]
+        {
+            let Self {
+                mut term,
+                mut interrupt,
+            } = self;
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 

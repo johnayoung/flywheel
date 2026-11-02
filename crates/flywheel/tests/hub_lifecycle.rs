@@ -34,18 +34,40 @@ impl Env {
         repo
     }
 
-    fn fw(&self, args: &[&str]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         // Right after the verb: anything after `--` is a session's argv.
         let mut argv: Vec<&str> = vec!["hub", args[0], "--state-dir", self.state.to_str().unwrap()];
         argv.extend_from_slice(&args[1..]);
-        Command::new(env!("CARGO_BIN_EXE_fw"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
+        command
             .args(&argv)
             .env("SHELL", "/bin/sh")
             .env("HOME", &self.root)
             .env("PS1", "$ ")
-            .env_remove("XDG_STATE_HOME")
-            .output()
+            .env_remove("XDG_STATE_HOME");
+        command
+    }
+
+    fn fw(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    /// Run with `input` on stdin; require exit 0.
+    fn ok_with_stdin(&self, args: &[&str], input: &str) {
+        use std::io::Write;
+        let mut child = self
+            .command(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
             .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "fw hub {args:?}: {status:?}");
     }
 
     /// Run and require exit 0; stdout.
@@ -131,6 +153,10 @@ fn start_script_stop_and_restore_shells_where_they_were() {
         .to_owned();
     assert_eq!(alpha.len(), 32, "{alpha}");
     let beta = env.ok(&["new", "proj", "--name", "beta"]).trim().to_owned();
+    // A taken name is refused: it would no longer address either.
+    let output = env.fw(&["new", "proj", "--name", "beta"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
     let doomed = env
         .ok(&[
             "new",
@@ -170,6 +196,9 @@ fn start_script_stop_and_restore_shells_where_they_were() {
     ]);
     env.ok(&["send", &beta[..6], "echo one\necho two", "--enter"]);
     env.read_until("beta", "two");
+    // Piped text with a final newline runs (the newline is the Enter).
+    env.ok_with_stdin(&["send", "beta", "-"], "echo piped-ran\n");
+    env.read_until("beta", "\npiped-ran");
     env.ok(&["send", "alpha", "pwd", "--enter"]);
     env.read_until("alpha", &deeper.display().to_string());
     let recent = env.ok(&["read", "beta", "--source", "recent", "--lines", "50"]);
@@ -226,7 +255,19 @@ fn start_script_stop_and_restore_shells_where_they_were() {
             .contains("no longer exists"),
         "{doomed_record}"
     );
-    assert_eq!(sessions[2]["command"], serde_json::json!(["/bin/sh"]));
+    // The script session keeps what it is; a shell runs in its place.
+    assert_eq!(
+        sessions[2]["command"],
+        serde_json::json!(["/bin/sh", "-c", "echo ran-once; exec sh"])
+    );
+    assert_eq!(
+        sessions[2]["fallback_command"],
+        serde_json::json!(["/bin/sh"])
+    );
+    // ls shows where alpha's shell is, not just its repo.
+    let ls = env.ok(&["ls"]);
+    assert!(ls.contains(&deeper.display().to_string()), "{ls}");
+    assert!(ls.contains("not restored"), "{ls}");
 
     // The restored shell starts where alpha's shell had `cd`'d to.
     env.ok(&["send", "alpha", "pwd", "--enter"]);
@@ -255,10 +296,91 @@ fn start_script_stop_and_restore_shells_where_they_were() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("no hub is running"));
 
-    // --no-restore leaves them stopped.
+    // --no-restore leaves them stopped, on later starts too.
     env.ok(&["start", "--port", "0", "--no-restore"]);
     assert!(env.sessions().iter().all(|s| s["state"] != "running"));
     env.ok(&["stop"]);
+    let started = env.ok(&["start", "--port", "0"]);
+    assert!(!started.contains("restored"), "{started}");
+    assert!(env.sessions().iter().all(|s| s["state"] != "running"));
+    // Relaunched by hand.
+    let relaunched = env.ok(&["relaunch", "alpha"]);
+    assert!(
+        relaunched.contains("relaunched session \"alpha\""),
+        "{relaunched}"
+    );
+    env.ok(&["send", "alpha", "echo back-again", "--enter"]);
+    env.read_until("alpha", "\nback-again");
+    env.ok(&["stop"]);
+}
+
+fn hub_pid(env: &Env) -> i32 {
+    let status: Value = serde_json::from_str(&env.ok(&["status", "--json"])).unwrap();
+    i32::try_from(status["pid"].as_i64().unwrap()).unwrap()
+}
+
+#[test]
+fn a_crash_is_reported_and_a_wedged_hub_does_not_stall_status_or_stop() {
+    let env = Env::new();
+    let repo = env.repo("repo");
+    env.ok(&["start", "--port", "0"]);
+    env.ok(&[
+        "new",
+        "proj",
+        "--repo",
+        repo.to_str().unwrap(),
+        "--create",
+        "--name",
+        "alpha",
+    ]);
+    // Killed outright: its sessions are not restored, and start says so.
+    let pid = hub_pid(&env);
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while status_code(&env) != 3 {
+        assert!(Instant::now() < deadline, "the killed hub still runs");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = env.fw(&["start", "--port", "0"]);
+    assert!(output.status.success());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("session \"alpha\"")
+            && err.contains("not shut down cleanly")
+            && err.contains("fw hub relaunch"),
+        "{err}"
+    );
+    let ls = env.ok(&["ls"]);
+    assert!(ls.contains("not restored"), "{ls}");
+
+    // Alive but not answering: status and stop are bounded by their own
+    // timeouts, not the scripting verbs' 30s.
+    let pid = hub_pid(&env);
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let started = Instant::now();
+    let output = env.fw(&["status"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    let started = Instant::now();
+    let output = env.fw(&["stop", "--timeout", "1"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("did not stop within 1s"));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    // The queued SIGTERM lands once it runs again: a clean stop.
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while status_code(&env) != 3 {
+        assert!(Instant::now() < deadline, "the hub never stopped");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -292,6 +414,8 @@ fn install_service_prints_a_unit_running_serve() {
     );
     assert!(unit.contains(&format!("\"--state-dir\" \"{}\"", env.state.display())));
     assert!(unit.contains("Environment=\"SHELL=/bin/sh\""), "{unit}");
+    // Its output is the journal: no login code there.
+    assert!(unit.contains("\"--no-login-code\""), "{unit}");
     // Written under XDG_CONFIG_HOME, never enabled; refused twice.
     let config = env.root.join("config");
     let write = || {

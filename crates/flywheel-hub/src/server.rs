@@ -929,15 +929,24 @@ const BRACKETED_PASTE_END: &str = "\x1b[201~";
 /// The bytes a terminal sends when `text` is pasted: line breaks become
 /// `CR` (what Enter sends); with `bracketed` the text is wrapped in paste
 /// markers, minus any markers inside it (which would end the paste early
-/// and let the rest run as typed input).
+/// and let the rest run as typed input). Removal repeats until none is
+/// left: removing one marker must not join the bytes around it into
+/// another (`ESC[20` + `ESC[201~` + `1~`).
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if !bracketed {
         return text.into_bytes();
     }
-    let inner = text
-        .replace(BRACKETED_PASTE_START, "")
-        .replace(BRACKETED_PASTE_END, "");
+    let mut inner = text;
+    loop {
+        let stripped = inner
+            .replace(BRACKETED_PASTE_START, "")
+            .replace(BRACKETED_PASTE_END, "");
+        if stripped == inner {
+            break;
+        }
+        inner = stripped;
+    }
     format!("{BRACKETED_PASTE_START}{inner}{BRACKETED_PASTE_END}").into_bytes()
 }
 
@@ -1477,6 +1486,25 @@ mod tests {
             b"\x1b[200~x\rrm -rf /\r\x1b[201~"
         );
         assert_eq!(paste_bytes("", true), b"\x1b[200~\x1b[201~");
+        // A marker split around another comes back together when the
+        // inner one is removed; it must not survive either.
+        for nested in [
+            "x\x1b[20\x1b[201~1~rm -rf ~\n",
+            "x\x1b[2\x1b[20\x1b[201~1~01~rm -rf ~\n",
+            "x\x1b[20\x1b[200~1~rm -rf ~\n",
+            "x\x1b[20\x1b[201~0~rm -rf ~\n",
+        ] {
+            let bytes = paste_bytes(nested, true);
+            let inner = &bytes[6..bytes.len() - 6];
+            assert!(
+                !inner
+                    .windows(6)
+                    .any(|w| w == b"\x1b[201~" || w == b"\x1b[200~"),
+                "{nested:?} -> {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(bytes.starts_with(b"\x1b[200~") && bytes.ends_with(b"\x1b[201~"));
+        }
     }
 
     #[test]

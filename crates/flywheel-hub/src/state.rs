@@ -102,7 +102,17 @@ pub struct SessionRecord {
     pub created_at: DateTime<Utc>,
     #[serde(flatten)]
     pub state: SessionState,
+    /// What runs in place of `command` after a restore that could not
+    /// bring the session back as itself (an agent without native resume
+    /// comes back as a hub shell). `kind` and `command` keep what the
+    /// session is; relaunching it runs `command` again and clears this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_command: Option<Vec<String>>,
 }
+
+/// `restore_error` of a session found `running` on load: the hub died
+/// (killed, crashed, the machine went down) without its own shutdown.
+pub const UNCLEAN_STOP: &str = "the hub was not shut down cleanly (killed or crashed)";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StateDoc {
@@ -168,7 +178,12 @@ impl HubStore {
         let mut demoted = false;
         for session in &mut doc.sessions {
             if session.state.is_running() {
-                session.state = SessionState::stopped(now, false);
+                session.state = SessionState::Stopped {
+                    at: now,
+                    clean: false,
+                    restore_error: Some(UNCLEAN_STOP.to_owned()),
+                    last_cwd: None,
+                };
                 demoted = true;
             }
         }
@@ -344,9 +359,11 @@ impl HubStore {
                 self.doc.sessions[index].name
             )));
         }
-        let previous =
-            std::mem::replace(&mut self.doc.sessions[index].state, SessionState::Running);
-        self.save_or_rollback(|doc| doc.sessions[index].state = previous)?;
+        let previous = self.doc.sessions[index].clone();
+        let session = &mut self.doc.sessions[index];
+        session.state = SessionState::Running;
+        session.fallback_command = None;
+        self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
         Ok(self.doc.sessions[index].clone())
     }
 
@@ -372,13 +389,14 @@ impl HubStore {
     }
 
     /// Record a session restored after a clean shutdown: running again
-    /// (same id, name, and place) as `kind` running `command` -- which a
-    /// restore may change (an agent coming back as a shell).
+    /// (same id, name, kind, command, and place), as itself or -- with
+    /// `fallback` -- running that in its place (an agent coming back as a
+    /// shell). Its kind and command are never rewritten, so a later
+    /// restore can still bring it back as itself.
     pub fn mark_restored(
         &mut self,
         id: &str,
-        kind: SessionKind,
-        command: Vec<String>,
+        fallback: Option<Vec<String>>,
     ) -> Result<SessionRecord, StateError> {
         let index = self.session_index(id)?;
         if !self.doc.sessions[index].state.is_restorable() {
@@ -389,11 +407,35 @@ impl HubStore {
         }
         let previous = self.doc.sessions[index].clone();
         let session = &mut self.doc.sessions[index];
-        session.kind = kind;
-        session.command = command;
+        session.fallback_command = fallback;
         session.state = SessionState::Running;
         self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
         Ok(self.doc.sessions[index].clone())
+    }
+
+    /// Drop the pending restore of every cleanly stopped session (the hub
+    /// started with restore off): they stay stopped until relaunched, on
+    /// this and every later start. Returns how many there were.
+    pub fn forgo_restore(&mut self) -> Result<usize, StateError> {
+        let previous = self.doc.sessions.clone();
+        let mut count = 0;
+        for session in &mut self.doc.sessions {
+            if let SessionState::Stopped {
+                clean,
+                restore_error,
+                ..
+            } = &mut session.state
+                && *clean
+            {
+                *clean = false;
+                *restore_error = None;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.save_or_rollback(|doc| doc.sessions = previous)?;
+        }
+        Ok(count)
     }
 
     /// Record why restoring a cleanly stopped session failed; it stays
@@ -624,6 +666,7 @@ mod tests {
             agent_session_id: None,
             created_at: Utc::now(),
             state: SessionState::Running,
+            fallback_command: None,
         }
     }
 
@@ -836,9 +879,14 @@ mod tests {
         let mut store = HubStore::open(dir.path()).unwrap();
         assert!(!store.session(&crashed.id).unwrap().state.is_restorable());
         let raw = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
-        assert!(!raw.contains("clean"), "{raw}");
+        assert!(!raw.contains("\"clean\""), "{raw}");
+        // Says why it was not restored.
         assert!(matches!(
-            store.mark_restored(&crashed.id, SessionKind::Shell, vec!["/bin/sh".into()]),
+            &store.session(&crashed.id).unwrap().state,
+            SessionState::Stopped { restore_error: Some(e), .. } if e == UNCLEAN_STOP
+        ));
+        assert!(matches!(
+            store.mark_restored(&crashed.id, None),
             Err(StateError::Conflict(_))
         ));
 
@@ -864,16 +912,81 @@ mod tests {
         }
         let mut store = reopened;
         let restored = store
-            .mark_restored(&clean.id, SessionKind::Shell, vec!["/bin/bash".into()])
+            .mark_restored(&clean.id, Some(vec!["/bin/bash".into()]))
             .unwrap();
         assert!(restored.state.is_running());
-        assert_eq!(restored.command, vec!["/bin/bash".to_owned()]);
+        // What it is stays recorded; what runs in its place is separate.
+        assert_eq!(restored.command, vec!["/bin/sh".to_owned()]);
+        assert_eq!(restored.kind, SessionKind::Shell);
+        assert_eq!(
+            restored.fallback_command,
+            Some(vec!["/bin/bash".to_owned()])
+        );
         // Same place in the session order.
         assert_eq!(store.sessions()[1].id, clean.id);
         assert!(matches!(
             store.set_restore_error(&clean.id, "x"),
             Err(StateError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn forgoing_restore_keeps_sessions_stopped_on_later_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let session = running_session(&ws.id, &repo);
+        store.insert_session(session.clone()).unwrap();
+        store.mark_all_stopped(&HashMap::new()).unwrap();
+        store.set_restore_error(&session.id, "cwd gone").unwrap();
+        assert_eq!(store.forgo_restore().unwrap(), 1);
+        assert_eq!(store.forgo_restore().unwrap(), 0);
+        // A later clean shutdown (nothing running) leaves it alone.
+        store.mark_all_stopped(&HashMap::new()).unwrap();
+        let store = HubStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.session(&session.id).unwrap().state,
+            SessionState::Stopped {
+                clean: false,
+                restore_error: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_running_clears_a_restore_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git_repo(dir.path(), "r");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(input("w", vec![repo.clone()]))
+            .unwrap();
+        let mut agent = running_session(&ws.id, &repo);
+        agent.kind = SessionKind::Claude;
+        agent.command = vec!["claude".into()];
+        store.insert_session(agent.clone()).unwrap();
+        store.mark_all_stopped(&HashMap::new()).unwrap();
+        let restored = store
+            .mark_restored(&agent.id, Some(vec!["/bin/sh".into()]))
+            .unwrap();
+        assert_eq!(restored.kind, SessionKind::Claude);
+        assert_eq!(restored.command, vec!["claude".to_owned()]);
+        store
+            .mark_exited(
+                &agent.id,
+                ExitInfo {
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+            .unwrap();
+        let relaunched = store.mark_running(&agent.id).unwrap();
+        assert_eq!(relaunched.fallback_command, None);
+        assert_eq!(relaunched.kind, SessionKind::Claude);
     }
 
     #[test]

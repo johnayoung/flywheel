@@ -153,6 +153,10 @@ pub struct LiveView {
     pub clients: usize,
     /// Scrollback lines retained by the active screen.
     pub scrollback_lines: usize,
+    /// The running process's working directory (where its shell `cd`'d
+    /// to), where the platform exposes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 /// What [`Hub::restore_sessions`] did with one session.
@@ -164,6 +168,9 @@ pub struct RestoreOutcome {
     pub cwd: PathBuf,
     /// How it came back, or why it could not.
     pub result: Result<RestoreHow, String>,
+    /// What the operator should know about a restore that worked (its
+    /// last directory was gone, so it started in its repo).
+    pub note: Option<String>,
 }
 
 /// Whether a session kind can be launched on this host.
@@ -434,17 +441,17 @@ impl Hub {
         let monitors = usize::from(self.monitored().contains_key(&record.id));
         let live = self.live_session(&record.id).map(|s| {
             let (cols, rows) = s.size();
+            let pid = s.pid().filter(|_| s.exit_info().is_none());
             LiveView {
-                pid: s.pid().filter(|_| s.exit_info().is_none()),
+                pid,
                 cols,
                 rows,
                 clients: s.subscriber_count().saturating_sub(monitors),
                 scrollback_lines: s.scrollback_lines(),
+                cwd: pid.and_then(process_cwd),
             }
         });
-        let agent = record
-            .kind
-            .is_agent()
+        let agent = (record.kind.is_agent() && record.fallback_command.is_none())
             .then(|| self.board().status(&record.id, Audience::Anyone))
             .flatten();
         SessionView {
@@ -516,6 +523,7 @@ impl Hub {
                 .then(|| uuid::Uuid::new_v4().hyphenated().to_string()),
             created_at: Utc::now(),
             state: SessionState::Running,
+            fallback_command: None,
         };
 
         // Insert the live entry and the record under the store lock so the
@@ -544,29 +552,43 @@ impl Hub {
 
     /// Spawn the PTY for `record` (its argv, cwd, and id); its exit is
     /// recorded against the id. An agent session also gets its launch
-    /// arguments, a fresh report secret, and a fresh `unknown` status.
+    /// arguments, a fresh report secret, and a fresh `unknown` status --
+    /// unless it runs its `fallback_command` (restored as a plain shell),
+    /// which launches as a shell.
     fn spawn_pty(
         self: &Arc<Self>,
         record: &SessionRecord,
         cols: Option<u16>,
         rows: Option<u16>,
     ) -> Result<Arc<PtySession>, HubError> {
+        // Never fall back to wherever the PTY layer would start it (the
+        // hub's own directory or $HOME) while the record says otherwise.
+        if !record.cwd.is_dir() {
+            return Err(StateError::Invalid(format!(
+                "its working directory {} no longer exists",
+                record.cwd.display()
+            ))
+            .into());
+        }
         let weak: Weak<Self> = Arc::downgrade(self);
         let exit_id = record.id.clone();
-        let mut argv = record.command.clone();
+        let (kind, mut argv) = match &record.fallback_command {
+            Some(fallback) => (SessionKind::Shell, fallback.clone()),
+            None => (record.kind, record.command.clone()),
+        };
         let mut env = vec![
             (report::SESSION_ENV.to_owned(), record.id.clone()),
             ("FLYWHEEL_HUB_WORKSPACE".into(), record.workspace_id.clone()),
         ];
         let mut generation = None;
-        if record.kind.is_agent() {
+        if kind.is_agent() {
             let key = self
                 .board()
                 .track(&record.id, &record.workspace_id)
                 .map_err(HubError::Internal)?;
             generation = Some(key.generation);
             let report = self.options.report_command.as_deref();
-            match record.kind {
+            match kind {
                 SessionKind::Claude => {
                     if let Some(conversation) = &record.agent_session_id {
                         argv.extend(agent::claude_args(
@@ -612,7 +634,7 @@ impl Hub {
             },
         )?;
         if let Some(generation) = generation {
-            self.monitor_agent(record.kind, &record.id, generation, &session);
+            self.monitor_agent(kind, &record.id, generation, &session);
         }
         Ok(session)
     }
@@ -858,6 +880,9 @@ impl Hub {
             .into());
         }
         let mut record = record;
+        // Relaunching runs the session as itself again (`mark_running`
+        // clears a restore's fallback in the record too).
+        record.fallback_command = None;
         if record.kind == SessionKind::Claude && record.agent_session_id.is_none() {
             // A record from before the hub assigned conversation ids: give
             // it one, or it would launch without its status hooks.
@@ -901,11 +926,11 @@ impl Hub {
         candidates
             .into_iter()
             .map(|record| {
-                let (cwd, result) = match self.restore_one(&record) {
-                    Ok((how, cwd)) => (cwd, Ok(how)),
+                let (cwd, result, note) = match self.restore_one(&record) {
+                    Ok((how, cwd, note)) => (cwd, Ok(how), note),
                     Err(message) => {
                         let _ = self.store().set_restore_error(&record.id, &message);
-                        (record.cwd, Err(message))
+                        (record.cwd, Err(message), None)
                     }
                 };
                 RestoreOutcome {
@@ -913,16 +938,25 @@ impl Hub {
                     name: record.name,
                     cwd,
                     result,
+                    note,
                 }
             })
             .collect()
     }
 
-    /// Restore one session: how, and the directory it started in.
+    /// Drop the pending restore of every cleanly stopped session (the hub
+    /// started with restore off): they stay stopped, on later starts too,
+    /// until relaunched. Returns how many.
+    pub fn forgo_restore(&self) -> Result<usize, HubError> {
+        Ok(self.store().forgo_restore()?)
+    }
+
+    /// Restore one session: how, the directory it started in, and a note
+    /// for the operator.
     fn restore_one(
         self: &Arc<Self>,
         record: &SessionRecord,
-    ) -> Result<(RestoreHow, PathBuf), String> {
+    ) -> Result<(RestoreHow, PathBuf, Option<String>), String> {
         if !record.cwd.is_dir() {
             return Err(format!(
                 "its working directory {} no longer exists",
@@ -931,12 +965,22 @@ impl Hub {
         }
         // Where its shell had `cd`'d to, while that still exists; else the
         // session's repo.
-        let cwd = match &record.state {
+        let (cwd, note) = match &record.state {
             SessionState::Stopped {
                 last_cwd: Some(last),
                 ..
-            } if last.is_dir() => last.clone(),
-            _ => record.cwd.clone(),
+            } if last.is_dir() => (last.clone(), None),
+            SessionState::Stopped {
+                last_cwd: Some(last),
+                ..
+            } if *last != record.cwd => (
+                record.cwd.clone(),
+                Some(format!(
+                    "its last directory {} no longer exists",
+                    last.display()
+                )),
+            ),
+            _ => (record.cwd.clone(), None),
         };
         let plan = crate::restore::plan(record, &self.options.default_shell);
         let mut store = self.store();
@@ -950,14 +994,14 @@ impl Hub {
                 workspace.name
             ));
         }
+        let fallback = (plan.how == RestoreHow::Shell).then_some(plan.command);
         let mut relaunched = record.clone();
-        relaunched.kind = plan.kind;
-        relaunched.command = plan.command.clone();
+        relaunched.fallback_command = fallback.clone();
         relaunched.cwd = cwd.clone();
         let session = self
             .spawn_pty(&relaunched, None, None)
             .map_err(|e| e.to_string())?;
-        if let Err(e) = store.mark_restored(&record.id, plan.kind, plan.command) {
+        if let Err(e) = store.mark_restored(&record.id, fallback) {
             drop(store);
             session.kill(Duration::ZERO);
             session.release();
@@ -968,7 +1012,7 @@ impl Hub {
         if let Some(previous) = previous {
             forget(&previous);
         }
-        Ok((plan.how, cwd))
+        Ok((plan.how, cwd, note))
     }
 
     /// Resolve an agent kind's CLI, or explain that it is not installed.
@@ -1018,13 +1062,18 @@ impl Hub {
             .and_then(|p| std::path::Path::new(p).file_name())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "shell".into());
-        let count = self
-            .store()
-            .sessions()
+        // Unique across the hub, so the default name addresses it (`fw hub
+        // send <name>`).
+        let store = self.store();
+        let sessions = store.sessions();
+        let count = sessions
             .iter()
             .filter(|s| s.workspace_id == workspace_id)
             .count();
-        format!("{program} {}", count + 1)
+        (count + 1..)
+            .map(|n| format!("{program} {n}"))
+            .find(|name| !sessions.iter().any(|s| s.name == *name))
+            .unwrap_or_else(|| program.clone())
     }
 
     /// Record an exit. The exited PTY stays in the live map -- its

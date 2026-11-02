@@ -1230,7 +1230,8 @@
     const kind = $("#crumb-kind");
     kind.hidden = !session;
     if (session) {
-      kind.textContent = session.kind || "shell";
+      // A restore that could not bring it back as itself runs a shell.
+      kind.textContent = (session.kind || "shell") + (session.fallback_command ? " (as shell)" : "");
       kind.className = `kind-tag ${session.kind || "shell"}`;
     }
     // The LRMs keep a path's slashes in place under the start-ellipsis
@@ -1986,6 +1987,19 @@
       if (sessionById(match[1])) openSession(match[1]);
       else history.replaceState(null, "", window.location.pathname);
     }
+    // Follow an edited or navigated #session= (replaceState fires no
+    // hashchange, so this sees only the user's own changes).
+    window.addEventListener("hashchange", () => {
+      const target = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
+      if (!target) {
+        if (state.attached) detach();
+        return;
+      }
+      if (target[1] === state.attached) return;
+      if (sessionById(target[1])) openSession(target[1]);
+      else if (state.attached) history.replaceState(null, "", `#session=${state.attached}`);
+      else history.replaceState(null, "", window.location.pathname);
+    });
     startPolling();
     connectEvents();
   }

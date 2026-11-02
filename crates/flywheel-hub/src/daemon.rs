@@ -281,9 +281,11 @@ pub fn follow(path: &Path, offset: u64, out: &mut dyn Write) -> std::io::Result<
         if current.is_none() {
             match File::open(path) {
                 Ok(mut file) => {
-                    let len = file.metadata()?.len();
-                    file.seek(SeekFrom::Start(start.min(len)))?;
-                    current = Some((file, file_identity(path)));
+                    // The identity of the file opened, not of whatever the
+                    // path names by now (a rotation may land in between).
+                    let meta = file.metadata()?;
+                    file.seek(SeekFrom::Start(start.min(meta.len())))?;
+                    current = Some((file, Some(identity_of(&meta))));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -320,16 +322,20 @@ pub fn follow(path: &Path, offset: u64, out: &mut dyn Write) -> std::io::Result<
 
 /// Device and inode of `path` (changes when the log rotates).
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
+    std::fs::metadata(path).ok().map(|meta| identity_of(&meta))
+}
+
+/// Device and inode of a file.
+fn identity_of(meta: &std::fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
+        (meta.dev(), meta.ino())
     }
     #[cfg(not(unix))]
     {
         let _ = meta;
-        Some((0, 0))
+        (0, 0)
     }
 }
 

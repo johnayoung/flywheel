@@ -20,11 +20,13 @@ const INTERACTIVE_SHELLS: [&str; 10] = [
 /// Flags an interactive shell may carry and still be relaunched as is.
 const INTERACTIVE_FLAGS: [&str; 3] = ["-l", "-i", "--login"];
 
-/// What a restored session runs.
+/// What a restored session runs. Its record keeps its own kind and
+/// command either way: a [`RestoreHow::Shell`] plan's command is recorded
+/// as the session's `fallback_command`, so a later restore (say, by a hub
+/// whose agent kind gained native resume) can still bring it back as
+/// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestorePlan {
-    /// The kind it is recorded as once restored.
-    pub kind: SessionKind,
     pub command: Vec<String>,
     pub how: RestoreHow,
 }
@@ -52,11 +54,12 @@ impl RestoreHow {
 ///
 /// The per-kind hook: an agent kind with native resume (Claude Code's
 /// `--resume <session id>`, Codex's `resume`) answers here with its own
-/// [`RestoreHow::Relaunch`] plan; one without falls back to a shell.
+/// [`RestoreHow::Relaunch`] plan (its resume argv); one without falls back
+/// to a shell. The plan is computed from the record's own kind and
+/// command on every restore, never from a previous fallback.
 pub fn plan(record: &SessionRecord, default_shell: &[String]) -> RestorePlan {
     match record.kind {
         SessionKind::Shell if is_interactive_shell(&record.command) => RestorePlan {
-            kind: SessionKind::Shell,
             command: record.command.clone(),
             how: RestoreHow::Relaunch,
         },
@@ -69,7 +72,6 @@ pub fn plan(record: &SessionRecord, default_shell: &[String]) -> RestorePlan {
 /// A fresh hub shell.
 fn shell_fallback(default_shell: &[String]) -> RestorePlan {
     RestorePlan {
-        kind: SessionKind::Shell,
         command: default_shell.to_vec(),
         how: RestoreHow::Shell,
     }
@@ -108,6 +110,7 @@ mod tests {
             agent_session_id: None,
             created_at: Utc::now(),
             state: SessionState::stopped(Utc::now(), true),
+            fallback_command: None,
         }
     }
 
@@ -127,6 +130,17 @@ mod tests {
     }
 
     #[test]
+    fn a_previous_fallback_does_not_change_the_plan() {
+        let shell = vec!["/bin/zsh".to_owned()];
+        let mut agent = record(SessionKind::Claude, &["/usr/bin/claude"]);
+        agent.fallback_command = Some(vec!["/bin/bash".to_owned()]);
+        assert_eq!(plan(&agent, &shell).command, shell);
+        let mut interactive = record(SessionKind::Shell, &["/bin/bash"]);
+        interactive.fallback_command = Some(vec!["/bin/zsh".to_owned()]);
+        assert_eq!(plan(&interactive, &shell).how, RestoreHow::Relaunch);
+    }
+
+    #[test]
     fn commands_and_agents_come_back_as_a_fresh_shell() {
         let shell = vec!["/bin/zsh".to_owned()];
         for (kind, argv) in [
@@ -141,7 +155,6 @@ mod tests {
             assert_eq!(
                 plan,
                 RestorePlan {
-                    kind: SessionKind::Shell,
                     command: shell.clone(),
                     how: RestoreHow::Shell,
                 },

@@ -1813,7 +1813,15 @@ async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
     let order: Vec<&str> = views.iter().map(|v| v.record.id.as_str()).collect();
     assert_eq!(order, [sid.as_str(), cid.as_str(), eid.as_str()]);
     assert!(views[0].record.state.is_running() && views[0].live.is_some());
-    assert_eq!(views[1].record.command, vec!["/bin/sh".to_owned()]);
+    // What it is stays recorded; the shell runs in its place.
+    assert_eq!(
+        views[1].record.command,
+        vec!["/bin/sh", "-c", "echo ran; sleep 300"]
+    );
+    assert_eq!(
+        views[1].record.fallback_command,
+        Some(vec!["/bin/sh".to_owned()])
+    );
     assert!(!views[2].record.state.is_running());
     // A second restore finds nothing left to do.
     assert!(reopened.restore_sessions().is_empty());
@@ -1841,9 +1849,85 @@ async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
     let views = after_crash.sessions(None);
     assert!(!views[0].record.state.is_restorable());
     assert!(matches!(
-        views[0].record.state,
-        flywheel_hub::state::SessionState::Stopped { clean: false, .. }
+        &views[0].record.state,
+        flywheel_hub::state::SessionState::Stopped { clean: false, restore_error: Some(e), .. }
+            if e == flywheel_hub::state::UNCLEAN_STOP
     ));
     drop(after_crash);
     drop((dir, repo));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_directory_is_refused_not_replaced_by_home() {
+    let hub = TestHub::start().await;
+    let ws = hub.create_workspace("moving").await;
+    let workspace_id = ws["id"].as_str().unwrap().to_owned();
+    let session = hub
+        .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "exit 0"]))
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    // The live view reports where the process is.
+    let live = hub.create_session(&workspace_id, None).await;
+    let lid = live["id"].as_str().unwrap().to_owned();
+    let repo = hub.repo.canonicalize().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let view: Value = hub
+            .authed(reqwest::Method::GET, &format!("/api/sessions/{lid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if view["live"]["cwd"] == json!(repo) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no live cwd: {view}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_state(&hub, &sid, "exited").await;
+
+    let moved = hub.repo.with_file_name("repo-moved");
+    std::fs::rename(&hub.repo, &moved).unwrap();
+    let created = hub
+        .authed(reqwest::Method::POST, "/api/sessions")
+        .json(&json!({ "workspace_id": workspace_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::BAD_REQUEST);
+    let body: Value = created.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("no longer exists"),
+        "{body}"
+    );
+    let relaunched = hub
+        .authed(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/restart"),
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relaunched.status(), StatusCode::BAD_REQUEST);
+    let body: Value = relaunched.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("no longer exists"),
+        "{body}"
+    );
+    // Nothing was started, and the record did not change.
+    let sessions: Value = hub
+        .authed(reqwest::Method::GET, "/api/sessions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sessions["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(sessions["sessions"][0]["state"], "exited");
+    std::fs::rename(&moved, &hub.repo).unwrap();
+    hub.shutdown().await;
 }

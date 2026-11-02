@@ -1,0 +1,164 @@
+:root {
+  color-scheme: dark;
+  --bg: #0e1013;
+  --panel: #15181d;
+  --line: #262a31;
+  --text: #d7dae0;
+  --muted: #8b919c;
+  --accent: #e8b45a;
+  --ok: #7bc47f;
+  --bad: #ef6b6b;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#app { display: grid; grid-template-columns: 17rem 1fr; height: 100%; }
+
+#sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  padding: .9rem 1rem;
+  font-weight: 600;
+  letter-spacing: .03em;
+  border-bottom: 1px solid var(--line);
+}
+
+.mark {
+  width: .8rem;
+  height: .8rem;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  border-right-color: transparent;
+}
+
+#workspaces { flex: 1; overflow-y: auto; padding: .5rem 0; }
+
+.workspace { padding: .35rem 0 .6rem; }
+
+.ws-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: .2rem 1rem;
+}
+
+.ws-name { font-weight: 600; }
+
+.ws-repos { padding: 0 1rem; color: var(--muted); font: 11px var(--mono); }
+
+.ws-repos div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.ws-actions { display: flex; gap: .35rem; padding: .35rem 1rem; }
+
+.ws-actions select { flex: 1; min-width: 0; }
+
+.sessions { list-style: none; margin: 0; padding: 0; }
+
+.session {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .3rem 1rem .3rem 1.25rem;
+  cursor: pointer;
+}
+
+.session:hover { background: #1b1f25; }
+
+.session.active { background: #20252d; box-shadow: inset 2px 0 var(--accent); }
+
+.dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); flex: none; }
+
+.dot.running { background: var(--ok); }
+
+.dot.exited { background: var(--bad); }
+
+.session-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.session-state { color: var(--muted); font-size: 12px; }
+
+button, select, input, textarea {
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid #2f343d;
+  border-radius: 5px;
+}
+
+button { padding: .2rem .6rem; cursor: pointer; }
+
+button:hover { border-color: var(--accent); }
+
+button.link { border: 0; background: none; color: var(--muted); padding: 0; }
+
+button.link:hover { color: var(--text); }
+
+button.icon { border: 0; background: none; color: var(--muted); padding: 0 .25rem; }
+
+button.icon:hover { color: var(--bad); }
+
+#new-workspace { border-top: 1px solid var(--line); padding: .6rem 1rem; }
+
+#new-workspace summary { cursor: pointer; color: var(--accent); }
+
+#workspace-form { display: grid; gap: .55rem; margin-top: .6rem; }
+
+#workspace-form label { display: grid; gap: .2rem; color: var(--muted); font-size: 12px; }
+
+#workspace-form input, #workspace-form textarea { padding: .4rem .5rem; color: var(--text); }
+
+#workspace-form textarea { font: 12px var(--mono); resize: vertical; }
+
+.hint { font-size: 11px; }
+
+.form-error { margin: 0; color: var(--bad); font-size: 12px; min-height: 1em; }
+
+#sidebar footer { padding: .6rem 1rem; border-top: 1px solid var(--line); }
+
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+
+#term-header {
+  display: flex;
+  justify-content: space-between;
+  padding: .55rem 1rem;
+  border-bottom: 1px solid var(--line);
+  font: 12px var(--mono);
+  color: var(--muted);
+}
+
+#term-title { color: var(--text); }
+
+#terminal { flex: 1; min-height: 0; padding: .4rem .5rem; background: var(--bg); }
+
+#empty {
+  position: absolute;
+  inset: 3rem 0 0;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+#empty[hidden] { display: none; }
+
+@media (max-width: 720px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+  #sidebar { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+}

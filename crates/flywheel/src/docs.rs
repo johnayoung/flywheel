@@ -29,7 +29,7 @@ const PROG: &str = "fw";
 /// Topic names are the canonical `docs/<topic>.md` basenames; descriptions
 /// are the one-line summaries shown in the bare listing, condensed from
 /// `docs/README.md`.
-pub const TOPICS: [(&str, &str); 10] = [
+pub const TOPICS: [(&str, &str); 11] = [
     (
         "cli",
         "every verb, the interactive operator console, slash commands, and init.",
@@ -67,6 +67,10 @@ pub const TOPICS: [(&str, &str); 10] = [
         "team-mode",
         "the multi-operator runbook: GitHub App identity, rulesets, and the merge queue as the distributed merge lock.",
     ),
+    (
+        "hub",
+        "the web workspace of server-owned agent terminals: verbs, remote access, auth, and the API.",
+    ),
 ];
 
 /// The topic names alone, in listing order.
@@ -94,6 +98,7 @@ pub fn render_topic(topic: &str) -> Option<&'static str> {
         "held-out-gate" => include_str!("../doc_pages/held-out-gate.md"),
         "autopilot" => include_str!("../doc_pages/autopilot.md"),
         "team-mode" => include_str!("../doc_pages/team-mode.md"),
+        "hub" => include_str!("../doc_pages/hub.md"),
         _ => return None,
     };
     Some(page)

@@ -11,3 +11,4 @@ Cargo.lock              linguist-generated
 # Documentation should not count toward the language bar.
 docs/**                 linguist-documentation
 *.md                    linguist-documentation
+crates/flywheel-hub/web/vendor/** linguist-vendored

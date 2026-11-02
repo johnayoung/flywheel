@@ -1,0 +1,32 @@
+[package]
+name = "flywheel-hub"
+description = "flywheel hub: the web workspace for AI coding agents -- server-owned PTY sessions, workspaces of git repos, and the browser UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["net"] }
+axum = { version = "0.8", features = ["ws"] }
+portable-pty = "0.9"
+getrandom = "0.3"
+subtle = "2.6"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "form"] }

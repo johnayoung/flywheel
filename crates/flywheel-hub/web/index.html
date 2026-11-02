@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flywheel hub</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header class="brand">
+      <span class="mark"></span>
+      <span>flywheel hub</span>
+    </header>
+    <section id="workspaces" aria-label="Workspaces"></section>
+    <details id="new-workspace">
+      <summary>New workspace</summary>
+      <form id="workspace-form">
+        <label>Name <input name="name" required maxlength="100" placeholder="my-project"></label>
+        <label>Repo paths <span class="hint">(one absolute path per line)</span>
+          <textarea name="repos" rows="3" required placeholder="/home/me/code/repo"></textarea>
+        </label>
+        <button type="submit">Create</button>
+        <p class="form-error" id="workspace-error" role="alert"></p>
+      </form>
+    </details>
+    <footer>
+      <button id="logout" type="button" class="link">Sign out</button>
+    </footer>
+  </aside>
+  <main id="main">
+    <div id="term-header">
+      <span id="term-title">No session attached</span>
+      <span id="term-status"></span>
+    </div>
+    <div id="terminal"></div>
+    <div id="empty">Create a workspace, then open a shell in one of its repos.</div>
+  </main>
+</div>
+<script src="/assets/vendor/xterm/xterm.js"></script>
+<script src="/assets/vendor/addon-fit/addon-fit.js"></script>
+<script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>

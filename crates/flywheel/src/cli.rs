@@ -21,6 +21,7 @@
 //!   `autopilot-supervised` run path)
 //! * audit: `audit RUN_ID` -> the core audit stream
 //! * docs: `docs [TOPIC]` -> the curated operator docs
+//! * hub: `hub <serve|token>` -> the web workspace (`flywheel-hub`)
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -131,6 +132,8 @@ pub const HIDDEN_ORCHESTRATOR_VERBS: [&str; 2] = ["next", "orchestrate"];
 /// `is-done`, `set-model`, and the producer verbs under their core names.
 pub const WORKFLOW_VERB: &str = "workflow";
 pub const DOCS_VERB: &str = "docs";
+/// The web workspace of server-owned agent terminals (`flywheel-hub`).
+pub const HUB_VERB: &str = "hub";
 
 /// The `fw --help` text, byte-identical to the Python router's.
 pub const USAGE: &str = "usage: flywheel [--json] [--help] <verb> [args...]
@@ -161,6 +164,7 @@ Verbs:
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
   docs [TOPIC]     print a curated operator doc (bare: list the topics)
+  hub serve        run the web workspace of agent terminals (hub token: print the token)
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
@@ -342,6 +346,9 @@ pub fn route(
         // Curated operator docs served from the binary -- knowledge, not
         // policy: no flywheel.toml load, no store, works from any directory.
         return docs::run_with(rest, out, err);
+    }
+    if verb == HUB_VERB {
+        return flywheel_hub::cli::run(rest, out, err);
     }
 
     let _ = writeln!(err, "{PROG}: unknown command: {verb}");
@@ -1250,10 +1257,27 @@ mod tests {
             "validate",
             "audit",
             "docs",
+            "hub",
         ] {
             assert!(out.contains(&format!("\n  {verb}")), "verb {verb} missing");
         }
         assert_eq!(run(&["-h"], &unbound()).0, 0);
+    }
+
+    #[test]
+    fn hub_verb_routes_to_the_hub_cli() {
+        let (code, out, _) = run(&["hub", "--help"], &unbound());
+        assert_eq!(code, 0);
+        assert!(out.contains("serve") && out.contains("token"), "{out}");
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join("hub");
+        let (code, out, err) = run(
+            &["hub", "token", "--state-dir", state.to_str().unwrap()],
+            &unbound(),
+        );
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out.trim().len(), 64);
+        assert_eq!(run(&["hub", "nope"], &unbound()).0, 2);
     }
 
     #[test]

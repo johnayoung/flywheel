@@ -11,7 +11,8 @@
 //!   archives completed phases under the merge lock;
 //! * **the loop** -- [`run_daemon_loop`] re-invokes the cycle on a poll
 //!   cadence with a cross-cycle circuit breaker (transient strikes vs. a
-//!   permanent stop), stopping on SIGTERM/SIGINT after the current cycle;
+//!   permanent stop), stopping on SIGTERM/SIGINT/SIGHUP (or the pool supervisor's lifeline
+//!   closing) after the current cycle;
 //! * **the wiring** -- the [`RunTask`] binding onto the core workflow
 //!   ([`CoreRunTask`]), the agents-backed conflict resolver the submitter's
 //!   recovery rung escalates to ([`make_agents_resolve_conflict`]), the
@@ -1227,7 +1228,7 @@ impl fmt::Debug for LoopHooks<'_> {
 ///
 /// Each pass runs one cycle, then waits `poll_interval` before the next;
 /// `once` stops after the first successful pass. The loop exits only on
-/// `should_stop` (a SIGTERM/SIGINT flag in production) or a breaker
+/// `should_stop` (a SIGTERM/SIGINT/SIGHUP flag in production) or a breaker
 /// verdict. The breaker sits ABOVE the store's own bounded transient retry:
 /// a fault that clears within that budget never reaches here. A cycle that
 /// does fail counts a strike (`on_cycle_failure`); after
@@ -1321,48 +1322,97 @@ pub fn interruptible_sleep(seconds: f64, should_stop: &dyn Fn() -> bool) {
 }
 
 /// Arm the daemon's shutdown signals for the life of the process: every
-/// SIGTERM/SIGINT sets `stop` (the loop ends after the current cycle),
-/// triggers `shutdown` (the in-flight run parks `interrupted` in-band),
-/// terminates every live agent / grader process group (each runs in a group
-/// of its own, out of reach of a signal aimed at this daemon's group), and
-/// logs the request. Spawned on `runtime`; a no-op off unix.
+/// SIGTERM/SIGINT/SIGHUP sets `stop` (the loop ends after the current
+/// cycle), triggers `shutdown` (the in-flight run parks `interrupted`
+/// in-band), terminates every live agent / grader process group (each runs
+/// in a group of their own, out of reach of a signal aimed at this daemon's
+/// group), and logs the request. SIGHUP is what a closing terminal or PTY
+/// sends its foreground job, so it is an orderly stop too, never the
+/// default instant death that would strand the claim and orphan the
+/// agents. Spawned on `runtime`; a no-op off unix.
 pub fn arm_signals(runtime: &Runtime, stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
     runtime.spawn(watch_signals(stop, shutdown, log));
+}
+
+/// The orderly-shutdown request every stop trigger funnels into (a signal,
+/// or the pool supervisor's lifeline closing). Idempotent; must run inside
+/// `runtime`'s context (the group sweep is spawned onto it).
+fn begin_shutdown(stop: &StopFlag, shutdown: &ShutdownSignal, log: &Logger, why: &str) {
+    stop.set();
+    shutdown.trigger();
+    flywheel_agents::process_groups::spawn_shutdown_sweep();
+    log(&format!(
+        "Shutdown requested ({why}); stopping after the current cycle."
+    ));
 }
 
 #[cfg(unix)]
 async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
+    let install = |name: &str, kind: SignalKind| match signal(kind) {
+        Ok(stream) => Some(stream),
         Err(err) => {
-            log(&format!("could not install the SIGTERM handler: {err}"));
-            return;
+            log(&format!("could not install the {name} handler: {err}"));
+            None
         }
     };
-    let mut int = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(err) => {
-            log(&format!("could not install the SIGINT handler: {err}"));
-            return;
-        }
+    let Some(mut term) = install("SIGTERM", SignalKind::terminate()) else {
+        return;
+    };
+    let Some(mut int) = install("SIGINT", SignalKind::interrupt()) else {
+        return;
+    };
+    let Some(mut hup) = install("SIGHUP", SignalKind::hangup()) else {
+        return;
     };
     loop {
         let signum = tokio::select! {
             _ = term.recv() => SignalKind::terminate().as_raw_value(),
             _ = int.recv() => SignalKind::interrupt().as_raw_value(),
+            _ = hup.recv() => SignalKind::hangup().as_raw_value(),
         };
-        stop.set();
-        shutdown.trigger();
-        flywheel_agents::process_groups::spawn_shutdown_sweep();
-        log(&format!(
-            "Shutdown requested (signal {signum}); stopping after the current cycle."
-        ));
+        begin_shutdown(&stop, &shutdown, &log, &format!("signal {signum}"));
     }
 }
 
 #[cfg(not(unix))]
 async fn watch_signals(_stop: StopFlag, _shutdown: ShutdownSignal, _log: Logger) {}
+
+/// Watch the pool supervisor's lifeline (the read end of a pipe whose only
+/// write end the supervisor holds; see [`crate::pool`]): end-of-file means
+/// the supervisor is gone -- however it died, SIGKILL included -- so this
+/// member stops exactly as on SIGTERM instead of running on as an orphan.
+/// A dedicated thread blocks on the read; the shutdown itself runs on
+/// `runtime`.
+pub fn arm_supervisor_lifeline(
+    runtime: &Runtime,
+    lifeline: std::fs::File,
+    stop: StopFlag,
+    shutdown: ShutdownSignal,
+    log: Logger,
+) {
+    let handle = runtime.handle().clone();
+    let thread_log = Arc::clone(&log);
+    let spawned = std::thread::Builder::new()
+        .name("pool-lifeline".to_owned())
+        .spawn(move || {
+            let mut lifeline = lifeline;
+            let mut buf = [0_u8; 64];
+            loop {
+                match std::io::Read::read(&mut lifeline, &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _context = handle.enter();
+            begin_shutdown(&stop, &shutdown, &thread_log, "the pool supervisor exited");
+        });
+    if let Err(err) = spawned {
+        log(&format!("could not watch the pool supervisor: {err}"));
+    }
+}
 
 // --- The `flywheel worker` command line ---------------------------------------------------
 
@@ -1386,6 +1436,10 @@ pub struct WorkerArgs {
     pub lease_seconds: f64,
     pub reconcile_seconds: f64,
     pub once: bool,
+    /// Internal (hidden from `--help`): the inherited descriptor of the pool
+    /// supervisor's lifeline pipe, passed only by [`crate::pool`] to the
+    /// members it spawns. See [`arm_supervisor_lifeline`].
+    pub supervisor_fd: Option<i32>,
 }
 
 impl Default for WorkerArgs {
@@ -1406,6 +1460,7 @@ impl Default for WorkerArgs {
             lease_seconds: DEFAULT_LEASE_SECONDS,
             reconcile_seconds: DEFAULT_RECONCILE_SECONDS,
             once: false,
+            supervisor_fd: None,
         }
     }
 }
@@ -1510,6 +1565,10 @@ options:
   --once                Run a single drain cycle and exit (no daemon loop).
 ";
 
+/// The internal flag a pool member receives its supervisor lifeline on
+/// (deliberately absent from [`USAGE`] / [`HELP`]: operators never pass it).
+pub const SUPERVISOR_FD_FLAG: &str = "--supervisor-fd";
+
 /// Whether an option takes a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arity {
@@ -1518,7 +1577,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 17] = [
+const OPTIONS: [(&str, Arity); 18] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1536,6 +1595,7 @@ const OPTIONS: [(&str, Arity); 17] = [
     ("--lease-seconds", Arity::One),
     ("--reconcile-seconds", Arity::One),
     ("--once", Arity::Flag),
+    (SUPERVISOR_FD_FLAG, Arity::One),
 ];
 
 fn is_negative_number(token: &str) -> bool {
@@ -1576,7 +1636,11 @@ fn resolve_option(token: &str) -> Result<Option<(&'static str, Arity)>, ArgError
     }
     let matches: Vec<(&'static str, Arity)> = OPTIONS
         .iter()
-        .filter(|(name, _)| name.starts_with("--") && name.starts_with(token))
+        // The internal flag matches only exactly, so it never makes an
+        // operator abbreviation (`--s` for --sandbox-root) ambiguous.
+        .filter(|(name, _)| {
+            name.starts_with("--") && name.starts_with(token) && *name != SUPERVISOR_FD_FLAG
+        })
         .copied()
         .collect();
     match matches.len() {
@@ -1682,6 +1746,12 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "--lease-seconds" => args.lease_seconds = parse_float_flag(name, &v)?,
             "--reconcile-seconds" => args.reconcile_seconds = parse_float_flag(name, &v)?,
             "--once" => args.once = true,
+            SUPERVISOR_FD_FLAG => {
+                let fd = i32::try_from(parse_int_flag(name, &v)?).map_err(|_| {
+                    ArgError::new(format!("argument {name}: invalid int value: '{v}'"))
+                })?;
+                args.supervisor_fd = Some(fd);
+            }
             _ => {}
         }
     }
@@ -1716,11 +1786,15 @@ fn describe_cycle_error(err: &CycleError) -> String {
 }
 
 /// `flywheel worker` against the real stdio; returns the exit code.
+///
+/// The sinks are the unlocked handles, locked per write: the worker runs
+/// for its whole life inside [`main_with`], and holding the process-wide
+/// stderr lock on this thread across it would block every other thread's
+/// log line forever -- the heartbeat thread and the signal watcher (whose
+/// runtime worker then never parks, so the runtime drop at exit hangs).
 pub fn main(argv: &[String]) -> i32 {
-    let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
-    let mut out = stdout.lock();
-    let mut err = stderr.lock();
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
     let code = main_with(argv, &mut out, &mut err);
     let _ = out.flush();
     let _ = err.flush();
@@ -1748,6 +1822,19 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         }
         Err(arg_error) => {
             let _ = err.write_all(arg_error.render().as_bytes());
+            return 2;
+        }
+    };
+    // Adopted before anything is spawned (even `git`), so no child of this
+    // member ever inherits the supervisor's lifeline.
+    let lifeline = match args
+        .supervisor_fd
+        .map(crate::pool::adopt_supervisor_lifeline)
+        .transpose()
+    {
+        Ok(lifeline) => lifeline,
+        Err(failure) => {
+            let _ = writeln!(err, "flywheel worker: {failure}");
             return 2;
         }
     };
@@ -1989,6 +2076,15 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     let stop = StopFlag::new();
     let shutdown = ShutdownSignal::new();
     arm_signals(&runtime, stop.clone(), shutdown.clone(), Arc::clone(&log));
+    if let Some(lifeline) = lifeline {
+        arm_supervisor_lifeline(
+            &runtime,
+            lifeline,
+            stop.clone(),
+            shutdown.clone(),
+            Arc::clone(&log),
+        );
+    }
 
     let cycle_log = Arc::clone(&log);
     let retention_days = clamp_u64(args.worktree_retention_days);
@@ -3323,6 +3419,27 @@ esac
             )
         );
         assert!(HELP.starts_with(USAGE));
+    }
+
+    #[test]
+    fn supervisor_fd_is_internal_exact_only_and_hidden() {
+        assert_eq!(args(&[]).supervisor_fd, None);
+        assert_eq!(args(&["--supervisor-fd", "7"]).supervisor_fd, Some(7));
+        assert_eq!(args(&["--supervisor-fd=9"]).supervisor_fd, Some(9));
+        // No abbreviation reaches it, and it never makes one ambiguous.
+        assert_eq!(
+            arg_error(&["--su", "7"]),
+            format!("{USAGE}flywheel worker: error: unrecognized arguments: --su 7\n")
+        );
+        assert_eq!(args(&["--s", "/x"]).sandbox_root.as_deref(), Some("/x"));
+        assert!(!HELP.contains(SUPERVISOR_FD_FLAG));
+        // A bad descriptor fails before anything runs (exit 2, no repo
+        // lookup, no store).
+        let argv: Vec<String> = vec![SUPERVISOR_FD_FLAG.into(), "1".into()];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(main_with(&argv, &mut out, &mut err), 2);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("--supervisor-fd 1"), "{err}");
     }
 
     // --- main ------------------------------------------------------------------------------

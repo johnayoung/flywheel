@@ -125,6 +125,8 @@ The blessed headless drain, delegated in-process to the worktree daemon (`main`,
 | `--heartbeat` | progress line every N seconds (0 disables) |
 | `--worktree-retention-days` | parked-worktree retention |
 
+**Shutdown.** SIGTERM, SIGINT, and SIGHUP (a closing terminal/PTY) are all an orderly stop: the in-flight run finalizes to `interrupted`, its claim is released, and every agent/grader process group is terminated (SIGTERM, SIGKILL after 5s). With `--concurrency N > 1` the invocation is a pool supervisor whose members run in sessions of their own; it forwards the stop as SIGTERM to each member (SIGKILL after 10s). A supervisor that dies without a handler (SIGKILL, OOM) closes each member's lifeline pipe (the internal `--supervisor-fd`), and the member stops exactly as on SIGTERM. Only a worker that is itself SIGKILLed (including a member past the 10s window) leaves its claim to lapse (`--lease-seconds`).
+
 ### `autopilot [--once]`
 
 Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to `main` in `crates/flywheel-orchestrator/src/autopilot_run.rs`. **Neverending daemon by default**; `--once` runs one refill pass and exits. The daemon loop never terminates on an idle cycle — it exits only on SIGTERM/SIGINT (`run_daemon_loop`).

@@ -23,8 +23,17 @@
 //! member's whole group (SIGTERM, then SIGKILL on the survivors after the
 //! stop window). Agents and command graders run in process groups of their
 //! own, which a member-group signal does not reach; each member's
-//! SIGTERM/SIGINT handler terminates every group it registered in
+//! SIGTERM/SIGINT/SIGHUP handler terminates every group it registered in
 //! `flywheel_agents::process_groups` before it exits.
+//!
+//! The supervisor also catches SIGHUP (what a closing terminal or PTY sends
+//! its foreground job -- the supervisor, never the members, which sit in
+//! sessions of their own) and stops the pool exactly as on SIGTERM. A
+//! supervisor that dies without running any handler (SIGKILL, OOM) is
+//! covered by the lifeline: each member inherits the read end of a pipe
+//! whose only write end the supervisor holds, so the kernel closing it on
+//! the supervisor's death is end-of-file in the member, which then stops as
+//! on SIGTERM (`--supervisor-fd`, [`crate::daemon::arm_supervisor_lifeline`]).
 
 use crate::daemon::WorkerArgs;
 use crate::submitter::Logger;
@@ -37,6 +46,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -143,6 +154,10 @@ pub struct PoolMember {
     pub log_path: Option<PathBuf>,
     child: Child,
     exit: Option<ExitStatus>,
+    /// The write end of this member's lifeline pipe, held only here; dropped
+    /// (closing it) when the member leaves the pool or the supervisor dies.
+    #[cfg(unix)]
+    _lifeline: Option<OwnedFd>,
 }
 
 impl fmt::Debug for PoolMember {
@@ -218,6 +233,10 @@ pub struct PoolOptions {
     pub restart_window_seconds: f64,
     /// The crash-loop window clock; the process-monotonic clock when unset.
     pub clock: Option<PoolClock>,
+    /// Hand each member a lifeline (`--supervisor-fd N` appended to its
+    /// argv) so it stops when this supervisor dies. Only for members that
+    /// are `flywheel worker` invocations.
+    pub supervisor_lifeline: bool,
 }
 
 impl fmt::Debug for PoolOptions {
@@ -231,6 +250,7 @@ impl fmt::Debug for PoolOptions {
             .field("poll_interval", &self.poll_interval)
             .field("max_restarts_per_slot", &self.max_restarts_per_slot)
             .field("restart_window_seconds", &self.restart_window_seconds)
+            .field("supervisor_lifeline", &self.supervisor_lifeline)
             .finish_non_exhaustive()
     }
 }
@@ -250,7 +270,13 @@ impl PoolOptions {
             max_restarts_per_slot: DEFAULT_POOL_RESTARTS_PER_SLOT,
             restart_window_seconds: DEFAULT_POOL_RESTART_WINDOW_SECONDS,
             clock: None,
+            supervisor_lifeline: false,
         }
+    }
+
+    pub fn with_supervisor_lifeline(mut self) -> Self {
+        self.supervisor_lifeline = true;
+        self
     }
 
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -282,7 +308,7 @@ impl PoolOptions {
 
 // --- Process-wide stop signal ------------------------------------------------------------------
 
-/// The last SIGTERM/SIGINT the supervisor received (0 = none). Written by
+/// The last SIGTERM/SIGINT/SIGHUP the supervisor received (0 = none). Written by
 /// the async-signal-safe handler, read by the supervise loop.
 static STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
@@ -291,13 +317,15 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
     STOP_SIGNAL.store(signum, Ordering::SeqCst);
 }
 
-/// Install the SIGTERM/SIGINT shutdown handler. The pool parent runs no
-/// async runtime, so the handler is installed once and stays armed for the
-/// whole invocation; it only records the signal number.
+/// Install the SIGTERM/SIGINT/SIGHUP shutdown handler. The pool parent runs
+/// no async runtime, so the handler is installed once and stays armed for
+/// the whole invocation; it only records the signal number. SIGHUP is a
+/// terminal or PTY closing on the supervisor's foreground job: left at its
+/// default it would kill the supervisor alone and orphan every member.
 #[cfg(unix)]
 fn arm_stop_signals() {
     STOP_SIGNAL.store(0, Ordering::SeqCst);
-    for sig in [libc::SIGTERM, libc::SIGINT] {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: installing a handler that only stores into an atomic; the
         // handler is async-signal-safe and the signal numbers are valid.
         unsafe {
@@ -353,6 +381,83 @@ const TERM_SIGNAL: i32 = 15;
 #[cfg(not(unix))]
 const KILL_SIGNAL: i32 = 9;
 
+// --- The supervisor lifeline ---------------------------------------------------------------------
+
+/// A close-on-exec pipe for one member's lifeline: `(read, write)`. The read
+/// end is kept off the standard descriptors (a supervisor started with a
+/// closed stdin would otherwise get fd 0 back and lose it to the member's
+/// stdio setup).
+#[cfg(unix)]
+fn lifeline_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: `fds` is a valid two-int buffer; on success both descriptors
+    // are fresh and owned by nothing else, so wrapping them is sound.
+    let (read, write) = unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let rc = libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let rc = libc::pipe(fds.as_mut_ptr());
+        if rc == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    for fd in [&read, &write] {
+        // SAFETY: fcntl on a descriptor this function owns.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if read.as_raw_fd() > 2 {
+        return Ok((read, write));
+    }
+    // SAFETY: F_DUPFD_CLOEXEC on an owned descriptor returns a fresh one.
+    let raised = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if raised == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raised` is a fresh descriptor nothing else owns.
+    Ok((unsafe { OwnedFd::from_raw_fd(raised) }, write))
+}
+
+/// Take ownership of the lifeline read end a pool supervisor handed this
+/// member as `--supervisor-fd <fd>`.
+///
+/// The descriptor must be an inherited pipe (anything else is refused, so a
+/// stray flag can never adopt an unrelated file); it is marked close-on-exec
+/// at once so no agent, grader, or git child this member spawns inherits it.
+#[cfg(unix)]
+pub fn adopt_supervisor_lifeline(fd: RawFd) -> Result<File, String> {
+    let invalid = |why: &str| format!("{} {fd}: {why}", crate::daemon::SUPERVISOR_FD_FLAG);
+    if fd <= 2 {
+        return Err(invalid("not an inherited descriptor"));
+    }
+    // SAFETY: fstat writes into a zeroed, correctly sized stat buffer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } == -1 {
+        return Err(invalid(&std::io::Error::last_os_error().to_string()));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(invalid("not a pipe"));
+    }
+    // SAFETY: fcntl on a descriptor validated open above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(invalid(&std::io::Error::last_os_error().to_string()));
+    }
+    // SAFETY: the supervisor passed this descriptor to this process at exec
+    // for it alone; nothing else in the process owns it.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+#[cfg(not(unix))]
+pub fn adopt_supervisor_lifeline(fd: i32) -> Result<File, String> {
+    Err(format!(
+        "{} {fd}: not supported on this platform",
+        crate::daemon::SUPERVISOR_FD_FLAG
+    ))
+}
+
 // --- The pool -------------------------------------------------------------------------------------
 
 /// Supervise up to `size` single-task worker subprocesses from one
@@ -379,6 +484,7 @@ pub struct WorkerPool {
     /// quarantined after exhausting their crash-loop budget (`exhausted`).
     retired: BTreeSet<usize>,
     exhausted: BTreeSet<usize>,
+    supervisor_lifeline: bool,
     stop_requested: bool,
     stopped: bool,
     exit_code: i32,
@@ -428,6 +534,7 @@ impl WorkerPool {
             members: BTreeMap::new(),
             retired: BTreeSet::new(),
             exhausted: BTreeSet::new(),
+            supervisor_lifeline: options.supervisor_lifeline,
             stop_requested: false,
             stopped: false,
             exit_code: 0,
@@ -463,7 +570,7 @@ impl WorkerPool {
 
     /// Spawn the pool, supervise it, and return the process exit code.
     ///
-    /// Installs the SIGTERM/SIGINT shutdown handler, spawns `size` members,
+    /// Installs the SIGTERM/SIGINT/SIGHUP shutdown handler, spawns `size` members,
     /// then loops: in `--once` mode it returns 0 once every member has
     /// drained and exited cleanly; as a daemon it runs until a stop signal.
     /// Either way every surviving member is group-killed on the way out so
@@ -671,8 +778,22 @@ impl WorkerPool {
             )));
         };
         let (log_file, log_path) = self.open_member_log(&worker_id).map_err(spawn_error)?;
+        // The lifeline: the member inherits the read end (and learns its
+        // number from argv); the write end never leaves this process.
+        #[cfg(unix)]
+        let lifeline = if self.supervisor_lifeline {
+            Some(lifeline_pipe().map_err(spawn_error)?)
+        } else {
+            None
+        };
         let mut command = Command::new(program);
         command.args(rest);
+        #[cfg(unix)]
+        let lifeline_read: Option<RawFd> = lifeline.as_ref().map(|(read, _)| read.as_raw_fd());
+        #[cfg(unix)]
+        if let Some(fd) = lifeline_read {
+            command.args([crate::daemon::SUPERVISOR_FD_FLAG.to_owned(), fd.to_string()]);
+        }
         if let Some(file) = log_file {
             let stderr = file.try_clone().map_err(spawn_error)?;
             command.stdout(Stdio::from(file));
@@ -689,15 +810,20 @@ impl WorkerPool {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: `setsid` is async-signal-safe and touches no memory of
-            // the forked parent; it only moves the child into a new session.
+            // SAFETY: `setsid` and `fcntl` are async-signal-safe and touch no
+            // memory of the forked parent: the child moves into a new session
+            // and keeps the lifeline read end across exec.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     if libc::setsid() == -1 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(())
+                        return Err(std::io::Error::last_os_error());
                     }
+                    if let Some(fd) = lifeline_read
+                        && libc::fcntl(fd, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
                 });
             }
         }
@@ -712,6 +838,10 @@ impl WorkerPool {
                 log_path,
                 child,
                 exit: None,
+                // This process's copy of the read end closes here; the
+                // member holds its own.
+                #[cfg(unix)]
+                _lifeline: lifeline.map(|(_read, write)| write),
             },
         );
         (self.log)(&format!("pool member {worker_id} spawned pid={pid}"));
@@ -915,7 +1045,8 @@ pub fn run_pool(
         args.once,
     )
     .with_prefix(prefix.clone())
-    .with_log_dir(log_dir);
+    .with_log_dir(log_dir)
+    .with_supervisor_lifeline();
     let mut pool = match WorkerPool::new(options) {
         Ok(pool) => pool,
         Err(err) => {
@@ -1007,6 +1138,86 @@ mod tests {
 
     fn pool(size: i64, spawn: SpawnMember, once: bool, prefix: &str) -> WorkerPool {
         WorkerPool::new(PoolOptions::new(size, spawn, quiet(), once).with_prefix(prefix)).unwrap()
+    }
+
+    // --- supervisor lifeline -------------------------------------------------------------
+
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(text) = fs::read_to_string(path)
+                && text.ends_with('\n')
+            {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifeline_member_sees_eof_once_the_supervisor_end_closes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("eof");
+        // `sh -c SCRIPT --supervisor-fd N`: $0 is the flag, $1 the fd.
+        let script = format!(
+            "[ \"$0\" = --supervisor-fd ] && [ -p /dev/fd/$1 ] || exit 3; \
+             cat /dev/fd/$1 >/dev/null; echo eof > '{}'; exec sleep 300",
+            marker.display()
+        );
+        let spawn: SpawnMember = Arc::new(move |_id: &str| sh(&script));
+        let mut pool = WorkerPool::new(
+            PoolOptions::new(1, spawn, quiet(), false)
+                .with_prefix("life")
+                .with_supervisor_lifeline(),
+        )
+        .unwrap();
+        pool.start().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!marker.exists(), "EOF before the supervisor end closed");
+        assert_eq!(
+            pool.live_member_pids().len(),
+            1,
+            "the member rejected its lifeline"
+        );
+        // What the kernel does when the supervisor dies: its write end closes.
+        drop(pool.members.get_mut(&0).unwrap()._lifeline.take());
+        assert_eq!(wait_for_file(&marker), "eof\n");
+        pool.stop(Some(0.5));
+    }
+
+    #[test]
+    fn members_get_no_lifeline_unless_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("argc");
+        let script = format!("echo $# > '{}'; exec sleep 300", marker.display());
+        let spawn: SpawnMember = Arc::new(move |_id: &str| sh(&script));
+        let mut pool = pool(1, spawn, false, "plain");
+        pool.start().unwrap();
+        assert_eq!(wait_for_file(&marker), "0\n");
+        pool.stop(Some(0.5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_supervisor_lifeline_takes_only_an_inherited_pipe() {
+        use std::os::fd::IntoRawFd;
+        for fd in [-1, 0, 1, 2] {
+            assert!(adopt_supervisor_lifeline(fd).is_err(), "adopted {fd}");
+        }
+        let file = tempfile::tempfile().unwrap();
+        let err = adopt_supervisor_lifeline(file.as_raw_fd()).unwrap_err();
+        assert!(err.contains("not a pipe"), "{err}");
+        let (read, write) = lifeline_pipe().unwrap();
+        assert!(read.as_raw_fd() > 2);
+        let mut adopted = adopt_supervisor_lifeline(read.into_raw_fd()).unwrap();
+        // SAFETY: F_GETFD on a descriptor the File owns.
+        let flags = unsafe { libc::fcntl(adopted.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        drop(write);
+        let mut buf = [0_u8; 8];
+        assert_eq!(adopted.read(&mut buf).unwrap(), 0);
     }
 
     // --- spawn / identity ---------------------------------------------------------------

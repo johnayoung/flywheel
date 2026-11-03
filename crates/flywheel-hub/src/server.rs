@@ -59,6 +59,7 @@ mod detect_api;
 mod events_ws;
 mod fanout_api;
 mod flywheel_api;
+mod handoff_api;
 mod import_api;
 mod listen;
 mod notify_api;
@@ -270,6 +271,23 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/review/abort", post(review_api::abort))
         .route("/api/sessions/{id}/review/merge", post(review_api::merge))
         .route("/api/sessions/{id}/review/ask", post(review_api::ask))
+        .route(
+            "/api/sessions/{id}/review/reviewer",
+            post(handoff_api::reviewer),
+        )
+        .route(
+            "/api/sessions/{id}/review/findings",
+            get(handoff_api::findings),
+        )
+        .route(
+            "/api/sessions/{id}/review/findings/send",
+            post(handoff_api::send_findings),
+        )
+        .route(
+            "/api/sessions/{id}/handoff/compose",
+            post(handoff_api::compose),
+        )
+        .route("/api/sessions/{id}/handoff", post(handoff_api::deliver))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/search", get(search_api::search))
         .route("/api/sessions/{id}/transcript", get(search_api::transcript))

@@ -1,0 +1,109 @@
+/* flywheel hub: cross-agent handoff (handoff.js): the Send to agent
+ * dialog, the Review drawer's peer-review panel, and the sidebar's
+ * author <-> reviewer chips. */
+
+#dlg-handoff { width: min(48rem, calc(100vw - 2rem)); }
+#dlg-handoff form { display: grid; gap: .8rem; }
+.ho-from { margin: 0; font: 600 12px var(--mono); color: var(--ink-2); }
+.ho-prompt textarea {
+  width: 100%;
+  min-height: 14rem;
+  max-height: 55vh;
+  resize: vertical;
+  padding: .6rem .7rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px/1.45 var(--term);
+  tab-size: 4;
+}
+.ho-prompt textarea:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.ho-note { margin: 0; min-height: 1.2em; font-size: 11.5px; color: var(--ink-3); }
+.ho-note[data-tone="warn"] { color: var(--brass); }
+.ho-note[data-tone="bad"] { color: var(--alert); }
+
+/* The Review drawer's peer review. */
+.ho-review {
+  display: grid;
+  gap: .55rem;
+  margin: 0 0 .9rem;
+  padding: .65rem .75rem;
+  border: 1px solid var(--rule-2);
+  border-left: 3px solid var(--brass);
+  background: var(--bg-3);
+}
+.ho-review-head { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem .6rem; }
+.ho-review-label {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  font-size: 9.5px;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.ho-review-label svg { width: .8rem; height: .8rem; }
+.ho-review-hint { font-size: 11px; color: var(--ink-3); }
+.ho-review-actions { display: inline-flex; align-items: center; gap: .4rem; margin-left: auto; }
+.ho-kind {
+  padding: .3rem .4rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 11px var(--mono);
+}
+.ho-review-note { margin: 0; font-size: 11.5px; color: var(--ink-3); }
+.ho-review-note.bad { color: var(--alert); }
+.ho-reply {
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  padding: .55rem .65rem;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+  font: 11.5px/1.5 var(--term);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.ho-reply code { color: inherit; background: none; }
+.ho-blocks { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; }
+.ho-block { border: 1px solid var(--rule); background: var(--bg); }
+.ho-block.shell { border-left: 2px solid var(--signal); }
+.ho-block-head { display: flex; align-items: center; gap: .5rem; padding: .25rem .5rem; border-bottom: 1px solid var(--rule); }
+.ho-block-actions { display: inline-flex; gap: .7rem; margin-left: auto; }
+.ho-block .cmd-code { margin: 0; padding: .45rem .55rem; max-height: 10rem; overflow: auto; }
+.ho-review-foot { display: flex; justify-content: flex-end; }
+.ho-review-foot .slab svg { width: .85rem; height: .85rem; margin-right: .3rem; }
+.rv-file-foot { display: flex; justify-content: flex-end; padding: .3rem .6rem; border-top: 1px solid var(--rule); }
+
+/* Author <-> reviewer chips (the sidebar row, the drawer's head). */
+.pair-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  min-width: 0;
+  max-width: 100%;
+  padding: .05rem .4rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--brass);
+  font: 10px var(--mono);
+  cursor: pointer;
+}
+.pair-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pair-chip svg { flex: none; width: .7rem; height: .7rem; }
+.pair-chip:hover, .pair-chip:focus-visible { border-color: var(--brass); outline: none; }
+.pair-chip .dot { flex: none; }
+.session > .pair-chip { grid-column: 3 / -1; justify-self: start; margin-top: -.25rem; }
+.cmd-handoff, .tx-send { margin-left: auto; }
+.tx-send { font-size: 10.5px; }
+
+@media (max-width: 760px) {
+  .ho-prompt textarea { min-height: 40vh; font-size: 13px; }
+  .ho-review-actions { margin-left: 0; width: 100%; }
+  .ho-review-actions .slab { flex: 1; }
+}

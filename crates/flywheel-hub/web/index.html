@@ -32,6 +32,7 @@
 <link rel="stylesheet" href="/assets/app-priority.css">
 <link rel="stylesheet" href="/assets/app-fanout.css">
 <link rel="stylesheet" href="/assets/app-sharing.css">
+<link rel="stylesheet" href="/assets/app-handoff.css">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" focusable="false">
@@ -450,6 +451,29 @@
   </form>
 </dialog>
 
+<dialog id="dlg-handoff" class="sheet ho-sheet" aria-labelledby="ho-title">
+  <form method="dialog" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker" id="ho-kicker">send to agent</span>
+      <h2 id="ho-title">Send to another agent</h2>
+    </header>
+    <p class="ho-from" id="ho-from"></p>
+    <label class="field">
+      <span class="field-label">To</span>
+      <select id="ho-to"></select>
+    </label>
+    <label class="field ho-prompt">
+      <span class="field-label">Prompt <span class="field-hint" id="ho-size"></span></span>
+      <textarea id="ho-text" rows="12" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    </label>
+    <p class="ho-note" id="ho-note" role="status" aria-live="polite"></p>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" value="cancel" data-close>Cancel</button>
+      <button type="button" class="slab" id="ho-send" title="Paste it into the agent, then Enter (Ctrl Enter)">Paste &amp; send</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-confirm" class="sheet narrow" aria-labelledby="confirm-title">
   <form method="dialog">
     <header class="sheet-head">
@@ -619,6 +643,7 @@
 <script src="/assets/search.js"></script>
 <script src="/assets/settings.js"></script>
 <script src="/assets/sharing.js"></script>
+<script src="/assets/handoff.js"></script>
 <script src="/assets/app-base.js"></script>
 <script src="/assets/app-layout.js"></script>
 <script src="/assets/app-stage.js"></script>

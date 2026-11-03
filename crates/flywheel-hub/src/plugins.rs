@@ -69,6 +69,8 @@ pub const EVENTS: &[&str] = &[
     "review.pr_opened",
     "review.rebased",
     "review.merged",
+    "review.requested",
+    "handoff.sent",
     "fanout.finished",
     "share.created",
     "share.revoked",

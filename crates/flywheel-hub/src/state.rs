@@ -249,6 +249,14 @@ pub struct SessionRecord {
     /// and restore runs it with them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<AgentLaunch>,
+    /// The reviewer agent this session's work was last sent to ("ask for
+    /// a review"): its id. That session's `review_of` names this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    /// A reviewer agent: the session whose work it reviews (in that
+    /// session's directory, read-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_of: Option<String>,
 }
 
 /// A saved way to start an agent in a workspace: kind, first prompt,

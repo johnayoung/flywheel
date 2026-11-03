@@ -91,6 +91,8 @@ pub struct HubOptions {
     /// New share links' default and longest expiry (`hub.toml`
     /// `[shares]`).
     pub share_policy: crate::share::SharePolicy,
+    /// Which agent kind "ask for a review" launches (`review.reviewer`).
+    pub reviewer: crate::config::ReviewerChoice,
 }
 
 impl HubOptions {
@@ -122,6 +124,7 @@ impl HubOptions {
             agent_defaults: crate::config::AgentDefaults::default(),
             record_limits: crate::record::RecordLimits::default(),
             share_policy: crate::share::SharePolicy::default(),
+            reviewer: crate::config::ReviewerChoice::Other,
         }
     }
 }
@@ -522,6 +525,7 @@ impl Hub {
             agent_defaults: options.agent_defaults.clone(),
             record_limits: options.record_limits,
             share_policy: options.share_policy,
+            reviewer: options.reviewer,
         };
         let record_limits = options.record_limits;
         Ok(Arc::new(Self {
@@ -607,6 +611,8 @@ impl Hub {
             "cwd": record.cwd,
             "worktree": record.worktree,
             "companion_of": record.companion_of,
+            "reviewer": record.reviewer,
+            "review_of": record.review_of,
             "branch": view.git.as_ref().and_then(|g| g.branch.clone()),
             "agent": view.agent,
         }))

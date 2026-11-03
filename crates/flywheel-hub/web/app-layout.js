@@ -88,6 +88,8 @@ const mobile = window.FwHubMobile({
     const term = focusedTerm();
     if (term) term.scrollToBottom();
   },
+  // The selection popover's "Send to agent" (handoff.js).
+  sendSelection: (text) => handoff.sendSelection(state.attached, text),
 });
 
 // A pane resizes its session's PTY (fits it to its box) only while it

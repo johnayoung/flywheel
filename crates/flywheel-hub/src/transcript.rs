@@ -1399,6 +1399,8 @@ mod tests {
             worktree: None,
             companion_of: None,
             launch: None,
+            reviewer: None,
+            review_of: None,
         }
     }
 

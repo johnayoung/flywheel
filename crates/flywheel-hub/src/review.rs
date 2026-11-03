@@ -26,8 +26,8 @@ mod session;
 pub use actions::{abort, check_message, commit, merge, pr, push, rebase};
 pub use integrate::{PrRequest, gh_status, plan_abort, plan_merge, plan_pr, plan_rebase};
 pub use model::{
-    BaseView, Commit, DiffPage, FileChange, FileSet, Remote, Review, Scope, Untracked,
-    UpstreamView, diff, read,
+    BaseView, BranchDiff, Commit, DiffPage, FileChange, FileSet, Remote, Review, Scope, Untracked,
+    UpstreamView, branch_diff, diff, read,
 };
 pub use plan::{Outcome, Plan, Planned, PrDefaults, Ran, plan_commit, plan_push};
 pub(crate) use session::MergeVia;

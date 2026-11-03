@@ -288,6 +288,24 @@ fn companion_label(session: &Value, sessions: &[Value]) -> String {
     }
 }
 
+/// ` (reviewed by R)` / ` (reviews A)` for a review pairing, else empty.
+fn pairing_label(session: &Value, sessions: &[Value]) -> String {
+    let name_of = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| str_field(s, "id") == id)
+            .map_or_else(|| short(id).to_owned(), |s| str_field(s, "name").to_owned())
+    };
+    let mut label = String::new();
+    if let Some(reviewer) = session.get("reviewer").and_then(Value::as_str) {
+        label.push_str(&format!(" (reviewed by {})", name_of(reviewer)));
+    }
+    if let Some(author) = session.get("review_of").and_then(Value::as_str) {
+        label.push_str(&format!(" (reviews {})", name_of(author)));
+    }
+    label
+}
+
 /// A token count for humans: `950`, `12.3k`, `4.56M`.
 pub fn tokens_label(n: u64) -> String {
     match n {
@@ -415,10 +433,11 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     state_label(s),
                     str_field(s, "name").to_owned(),
                     format!(
-                        "{}{}{}{}",
+                        "{}{}{}{}{}",
                         live_cwd(s),
                         git_label(s),
                         companion_label(s, &sessions),
+                        pairing_label(s, &sessions),
                         usage_label(s)
                     ),
                 ]

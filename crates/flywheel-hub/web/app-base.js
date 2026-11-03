@@ -345,6 +345,8 @@ const commands = window.FwHubCommands({
   termSize: () => sizeHint(),
   focusTerminal: () => focusTerminal(),
   onOpen: () => closeOverlays("commands"),
+  // "To agent" on a block (handoff.js).
+  handoff: () => handoff,
 });
 
 // One overlay over the terminal at a time: opening a drawer closes the
@@ -465,6 +467,8 @@ const review = window.FwHubReview({
   onOpen: () => closeOverlays("review"),
   // A fan-out candidate's review lands it through the board.
   openFanout: (id) => fanout.open(id),
+  // The peer-review panel and "Send diff to agent" (handoff.js).
+  handoff: () => handoff,
 });
 // The "why?" beside the status pill (explain.js).
 const explain = window.FwHubExplain({ $, el, api });
@@ -482,6 +486,25 @@ const search = window.FwHubSearch({
   livePanes: () => livePanes(),
   focusTerminal: () => focusTerminal(),
   onOpen: () => explain.close(),
+  // "Send to agent" on a transcript message (handoff.js).
+  handoff: () => handoff,
+});
+
+// Cross-agent handoff and review pairing (handoff.js): "Send to agent"
+// from a selection, a transcript message, a suggested block, or a diff,
+// and the read-only reviewer of the other kind.
+const handoff = window.FwHubHandoff({
+  $, el, icon, api, state, sessionById, workspaceById, isAgent, agentStatus,
+  toast: (...args) => commands.toast(...args),
+  copyText: (text) => commands.copyText(text),
+  keyOf: (id) => settings.keyOf(id),
+  openSession: (id) => openSession(id),
+  refresh: () => refresh().catch(() => {}),
+  // The focused terminal's selection ("" when none).
+  selection: () => {
+    const term = focusedTerm();
+    return term && term.hasSelection() ? term.getSelection() : "";
+  },
 });
 
 // Read-only share links and recordings (sharing.js).

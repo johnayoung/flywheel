@@ -133,6 +133,8 @@ fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         worktree: None,
         companion_of: None,
         launch: None,
+        reviewer: None,
+        review_of: None,
     }
 }
 

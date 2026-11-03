@@ -64,6 +64,8 @@ pub struct FileConfig {
     pub recordings: RecordingsSection,
     #[serde(default)]
     pub shares: SharesSection,
+    #[serde(default)]
+    pub review: ReviewSection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -145,6 +147,62 @@ pub struct RecordingsSection {
 pub struct SharesSection {
     pub default_expiry: Option<DurationSetting>,
     pub max_expiry: Option<DurationSetting>,
+}
+
+/// "Ask for a review": which agent kind reviews a session's work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSection {
+    /// `other` (default), `same`, `claude`, or `codex`.
+    pub reviewer: Option<String>,
+}
+
+/// Which agent kind "ask for a review" launches, relative to the author's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerChoice {
+    /// The other kind (Claude work -> a Codex reviewer, and back).
+    #[default]
+    Other,
+    /// The author's own kind.
+    Same,
+    Claude,
+    Codex,
+}
+
+impl ReviewerChoice {
+    pub const ALL: [Self; 4] = [Self::Other, Self::Same, Self::Claude, Self::Codex];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::Same => "same",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|c| c.as_str() == raw)
+            .ok_or_else(|| format!("{raw:?} is not one of other, same, claude, codex"))
+    }
+
+    /// The kind preferred for reviewing `author`'s work (a shell's work
+    /// counts as Claude's for `same`, and gets Claude under `other`'s
+    /// fallback order: Codex first only when the author is Claude).
+    pub fn preferred(self, author: SessionKind) -> SessionKind {
+        match (self, author) {
+            (Self::Claude, _) => SessionKind::Claude,
+            (Self::Codex, _) => SessionKind::Codex,
+            (Self::Same, SessionKind::Codex) | (Self::Other, SessionKind::Claude) => {
+                SessionKind::Codex
+            }
+            (Self::Same | Self::Other, _) => SessionKind::Claude,
+        }
+    }
 }
 
 /// A size in the file: a number of bytes, or text with a unit.
@@ -274,6 +332,7 @@ pub struct Tunables {
     pub agent_defaults: AgentDefaults,
     pub record_limits: crate::record::RecordLimits,
     pub share_policy: crate::share::SharePolicy,
+    pub reviewer: ReviewerChoice,
 }
 
 /// Every setting resolved, with where each came from.
@@ -295,6 +354,7 @@ pub struct Effective {
     pub plugins_max_concurrent: usize,
     pub record_limits: crate::record::RecordLimits,
     pub share_policy: crate::share::SharePolicy,
+    pub reviewer: ReviewerChoice,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -331,6 +391,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("recordings.dir_cap", Apply::Live),
     ("shares.default_expiry", Apply::Live),
     ("shares.max_expiry", Apply::Live),
+    ("review.reviewer", Apply::Live),
 ];
 
 impl Effective {
@@ -350,6 +411,7 @@ impl Effective {
             agent_defaults: self.agent_defaults.clone(),
             record_limits: self.record_limits,
             share_policy: self.share_policy,
+            reviewer: self.reviewer,
         }
     }
 
@@ -397,6 +459,7 @@ impl Effective {
                 json!(crate::share::format_ttl(self.share_policy.default_ttl))
             }
             "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
+            "review.reviewer" => json!(self.reviewer.as_str()),
             _ => Value::Null,
         }
     }
@@ -682,6 +745,17 @@ pub fn resolve(
     );
     let (record_limits, share_policy) =
         resolve_recordings_and_shares(file, flags, &mut sources, &mut errors);
+    let file_reviewer = file.review.reviewer.as_deref().and_then(|raw| {
+        ReviewerChoice::parse(raw)
+            .map_err(|message| errors.push(format!("review.reviewer: {message}")))
+            .ok()
+    });
+    let reviewer = pick!(
+        "review.reviewer",
+        None::<ReviewerChoice>,
+        file_reviewer,
+        ReviewerChoice::Other
+    );
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -702,6 +776,7 @@ pub fn resolve(
         plugins_max_concurrent,
         record_limits,
         share_policy,
+        reviewer,
         sources,
     })
 }
@@ -1150,6 +1225,9 @@ dir_cap = "1GiB"                  # oldest finished recordings go past it
 [shares]                          # live: links made from now on
 default_expiry = "1h"             # a link naming no expiry
 max_expiry = "30d"                # the longest one may name (60s..30d)
+
+[review]                          # live: "ask for a review"
+reviewer = "other"                # other (claude <-> codex) | same | claude | codex
 "#;
 
 #[cfg(test)]

@@ -57,8 +57,9 @@ async function closeSession(id) {
   let query = "";
   // A companion shell shares its agent's worktree: closing it never
   // removes that (the agent's close does).
-  const companions = state.sessions.filter((s) => s.companion_of === id);
-  if (session.worktree && !session.companion_of) {
+  // Its reviewers go with it too (the server closes them along).
+  const companions = state.sessions.filter((s) => s.companion_of === id || s.review_of === id);
+  if (session.worktree && !session.companion_of && !session.review_of) {
     const how = await worktrees.confirmClose(session);
     if (!how) return;
     if (how.remove) query = `?remove_worktree=true${how.force ? "&force=true" : ""}`;
@@ -72,7 +73,7 @@ async function closeSession(id) {
         session.live && session.state === "running"
           ? " is hung up and the scrollback is discarded. Every attached browser loses it."
           : "",
-        companions.length ? ` Its companion ${companions.map((c) => c.name).join(", ")} closes with it.` : "",
+        companions.length ? ` ${companions.map((c) => c.name).join(", ")} ${companions.length === 1 ? "closes" : "close"} with it.` : "",
       ].join("").trim(),
       ok: "Kill and close",
     });
@@ -238,7 +239,7 @@ function renderSession(session, index) {
   return el(
     "li",
     {
-      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of ? " companion" : ""}`,
+      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of || session.review_of ? " companion" : ""}`,
       dataset: { id: session.id },
       tabIndex: 0,
       role: "button",
@@ -291,8 +292,13 @@ function renderSession(session, index) {
     st.dot === "blocked" && st.detail
       ? el("span", { className: "session-detail", textContent: st.detail })
       : null,
-    // A companion sits under its agent: the agent's line says it all.
-    session.companion_of && sessionById(session.companion_of) ? null : worktrees.badge(session),
+    // A companion (or a reviewer) sits under its agent: the agent's
+    // line says it all.
+    (session.companion_of && sessionById(session.companion_of)) || (session.review_of && sessionById(session.review_of))
+      ? null
+      : worktrees.badge(session),
+    // Author <-> reviewer (handoff.js).
+    handoff.pairChip(session),
   );
 }
 

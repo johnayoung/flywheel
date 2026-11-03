@@ -762,6 +762,23 @@ window.FwHubSearch = function (ctx) {
           el("span", { className: "tx-index", textContent: `#${m.index}` }),
           m.timestamp ? el("span", { className: "tx-when", textContent: `${age(m.timestamp)} ago`, title: m.timestamp }) : null,
           m.truncated ? el("span", { className: "tx-cut", textContent: "cut at 64 KiB" }) : null,
+          ctx.handoff
+            ? el("button", {
+              type: "button",
+              className: "text-btn tx-send",
+              textContent: "To agent…",
+              title: "Send this message (or the part of it selected) to another agent session",
+              onclick: (event) => {
+                const article = event.currentTarget.closest("article");
+                const chosen = window.getSelection();
+                const picked = chosen && !chosen.isCollapsed && article.contains(chosen.anchorNode) && article.contains(chosen.focusNode)
+                  ? chosen.toString()
+                  : "";
+                $("#dlg-transcript").close();
+                ctx.handoff().sendTranscript(viewer.session.session_id, m.index, picked);
+              },
+            })
+            : null,
         ),
         el("pre", { className: "tx-text" }, marked(m.text, viewer.re, viewer.literal)),
       ));

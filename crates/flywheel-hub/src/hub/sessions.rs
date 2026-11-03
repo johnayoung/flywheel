@@ -193,6 +193,8 @@ impl Hub {
             worktree: worktree.clone(),
             companion_of: None,
             launch: (!options.is_empty()).then_some(options),
+            reviewer: None,
+            review_of: None,
         };
         if record
             .launch
@@ -218,7 +220,7 @@ impl Hub {
     }
 
     /// Spawn and record a new session.
-    fn launch(
+    pub(crate) fn launch(
         self: &Arc<Self>,
         record: SessionRecord,
         cols: Option<u16>,
@@ -336,6 +338,8 @@ impl Hub {
             worktree: agent.worktree.clone(),
             companion_of: Some(agent.id.clone()),
             launch: None,
+            reviewer: None,
+            review_of: None,
         };
         Ok((self.launch(record, cols, rows, None)?, true))
     }
@@ -505,7 +509,7 @@ impl Hub {
     }
 
     /// Resolve an agent kind's CLI, or explain that it is not installed.
-    fn agent_program(&self, kind: SessionKind) -> Result<PathBuf, HubError> {
+    pub(crate) fn agent_program(&self, kind: SessionKind) -> Result<PathBuf, HubError> {
         let program = self.options.agents.program(kind).unwrap_or_default();
         which(program).ok_or_else(|| {
             StateError::Invalid(format!(
@@ -546,7 +550,7 @@ impl Hub {
     }
 
     /// `base` when no session has that name, else `base 2`, `base 3`, ...
-    fn unique_session_name(&self, base: &str) -> String {
+    pub(crate) fn unique_session_name(&self, base: &str) -> String {
         let store = self.store();
         let taken = |name: &str| store.sessions().iter().any(|s| s.name == name);
         let base: String = base

@@ -167,7 +167,7 @@ fn check_base(raw: &str) -> Result<String, HubError> {
 impl Hub {
     /// The work tree, base, and worktree a session's review reads: its
     /// worktree (a companion shell shares its agent's), else its folder.
-    fn review_target(
+    pub(crate) fn review_target(
         &self,
         tools: &Tools,
         id: &str,
@@ -224,7 +224,7 @@ impl Hub {
     /// The agent session asking pastes into: the session itself, its
     /// agent (a companion shell), else the one agent running in the same
     /// directory.
-    fn review_agent(&self, record: &SessionRecord, dir: &Path) -> Option<AgentRef> {
+    pub(crate) fn review_agent(&self, record: &SessionRecord, dir: &Path) -> Option<AgentRef> {
         let as_ref = |r: &SessionRecord| AgentRef {
             id: r.id.clone(),
             name: r.name.clone(),
@@ -242,7 +242,10 @@ impl Hub {
             .into_iter()
             .map(|v| v.record)
             .filter(|r| {
-                r.runs_agent() && r.worktree.as_ref().map_or(&r.cwd, |w| &w.path).as_path() == dir
+                // A reviewer reads the work; it is not who wrote it.
+                r.runs_agent()
+                    && r.review_of.is_none()
+                    && r.worktree.as_ref().map_or(&r.cwd, |w| &w.path).as_path() == dir
             })
             .collect();
         match here.as_slice() {

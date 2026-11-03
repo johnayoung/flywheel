@@ -241,7 +241,8 @@ window.FwHubReview = function (ctx) {
     renderTabs(data);
     renderActions(data);
     const scroll = body.scrollTop;
-    fill(body, ...renderTab(data));
+    const peer = ctx.handoff && (data.mergeable || data.base) ? ctx.handoff().reviewPanel(session) : null;
+    fill(body, peer, ...renderTab(data));
     body.scrollTop = scroll;
   }
 
@@ -470,6 +471,14 @@ window.FwHubReview = function (ctx) {
     // Open but unread (just opened, or the tree changed under it).
     if (file.open && !file.lines && !file.loading && !file.error) fetchDiff(scope, f, 0);
     if (file.open) card.append(renderDiff(scope, f, file));
+    if (file.open && scope === "committed" && ctx.handoff && !f.binary) {
+      card.append(el("div", { className: "rv-file-foot" }, el("button", {
+        type: "button",
+        className: "text-btn",
+        textContent: "Send this file's diff to an agent…",
+        onclick: () => ctx.handoff().sendDiff(ui.id, f.path, f.old_path),
+      })));
+    }
     return card;
   }
 
@@ -754,6 +763,17 @@ window.FwHubReview = function (ctx) {
       } else {
         list.push(button("Merge into base…", "merge", { disabled: !data.ahead, title: `Fast-forward ${data.base ? data.base.name : "the base"} in the main checkout` }));
       }
+    }
+    if (ctx.handoff) {
+      list.push(el("button", {
+        type: "button",
+        className: "slab ghost rv-act",
+        textContent: "Diff to agent…",
+        title: data.base ? `Send git diff ${data.base.name}...HEAD to another agent session (capped, editable first)` : "No base to diff against",
+        disabled: !data.base || !data.committed.files.length,
+        dataset: { action: "handoff" },
+        onclick: () => ctx.handoff().sendDiff(ui.id),
+      }));
     }
     // Phones: what can run now comes first.
     if (phone()) list.sort((x, y) => Number(x.disabled) - Number(y.disabled));

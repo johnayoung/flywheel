@@ -160,6 +160,18 @@ pub const ACTIONS: &[ActionSpec] = &[
         "Review the attached session's git work",
         &["alt+g"],
     ),
+    global(
+        "handoff.send",
+        "Agents",
+        "Send the terminal selection to another agent",
+        &[],
+    ),
+    global(
+        "review.ask",
+        "Agents",
+        "Ask an agent of the other kind to review the attached session",
+        &[],
+    ),
     global("fanout.open", "Agents", "Verified fan-outs", &[]),
     global("fanout.new", "Agents", "New verified fan-out", &[]),
     global(

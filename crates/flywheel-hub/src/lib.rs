@@ -11,6 +11,8 @@
 //! Operator doc: `docs/hub.md`.
 
 pub mod agent;
+pub mod agent_handoff;
+pub mod agent_handoff_cli;
 pub mod agentlog;
 pub mod attach;
 pub mod auth;

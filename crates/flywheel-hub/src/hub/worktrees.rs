@@ -30,8 +30,8 @@ impl Hub {
         })
     }
 
-    /// `id`'s record, its companions, and the other running sessions in
-    /// its worktree.
+    /// `id`'s record, its companions (companion shells and reviewer
+    /// agents: they go with it), and the other sessions in its worktree.
     #[allow(clippy::type_complexity)]
     fn worktree_neighbours(
         &self,
@@ -42,7 +42,7 @@ impl Hub {
         let companions: Vec<SessionRecord> = store
             .sessions()
             .iter()
-            .filter(|s| s.companion_of.as_deref() == Some(id))
+            .filter(|s| s.companion_of.as_deref() == Some(id) || s.review_of.as_deref() == Some(id))
             .cloned()
             .collect();
         let blocking = match &record.worktree {
@@ -54,6 +54,7 @@ impl Hub {
                 .filter(|s| {
                     s.id != id
                         && s.companion_of.as_deref() != Some(id)
+                        && s.review_of.as_deref() != Some(id)
                         && (s.cwd.starts_with(&worktree.path)
                             || s.worktree.as_ref().is_some_and(|w| w.path == worktree.path))
                 })
@@ -76,8 +77,8 @@ impl Hub {
     ) -> Result<RemoveOutcome, HubError> {
         let (record, companions, _) = self.worktree_neighbours(id)?;
         if !options.remove_worktree {
-            // Companion shells belong to their agent: they go with it
-            // (none is left pointing at a session that is gone).
+            // Companion shells and reviewers belong to their session: they
+            // go with it (none is left pointing at a session that is gone).
             let mut removed: Vec<String> = vec![id.to_owned()];
             removed.extend(companions.into_iter().map(|s| s.id));
             for sid in &removed {
@@ -100,6 +101,20 @@ impl Hub {
                 .unwrap_or_else(|_| agent.clone());
             return Err(StateError::Invalid(format!(
                 "{:?} is {agent:?}'s companion shell; the worktree is {agent:?}'s: close {agent:?} to remove it",
+                record.name
+            ))
+            .into());
+        }
+        if let Some(author) = &record.review_of
+            && record.worktree.is_some()
+        {
+            let author = self
+                .store()
+                .session(author)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|_| author.clone());
+            return Err(StateError::Invalid(format!(
+                "{:?} reviews {author:?}'s work; the worktree is {author:?}'s: close {author:?} to remove it",
                 record.name
             ))
             .into());

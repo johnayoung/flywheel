@@ -55,6 +55,8 @@ fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code 
 fw hub review SESSION [--base REF] [--json] [--diff PATH [--scope committed|staged|unstaged|untracked]]   # see Review
 fw hub merge SESSION [--yes] [--rebase] [--remove-worktree] [--json]   # ff the base onto a worktree branch in the main checkout
 fw hub merge SESSION --abort-rebase [--yes] [--json]                     # abort the worktree's stopped rebase
+fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json]   # see Handoff
+fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--dry-run] | --findings | --send-findings [--json]   # see Handoff
 fw hub fanout new WS --prompt TEXT|- --agent KIND[:MODEL]... --grader [name=]CMD... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json]   # see Verified fan-out
 fw hub fanout ls | show FANOUT [-v] | wait FANOUT [--timeout SECS] | grade FANOUT CAND | fix FANOUT CAND [--yes] | pick FANOUT CAND [--yes] [--rebase] | cleanup FANOUT [CAND...] [--stop-only] [--force] [--yes] | rm FANOUT   # [--json]
 ```
@@ -191,6 +193,8 @@ dir_cap = "1GiB"                  # >= part_cap, <= 1TiB
 [shares]                          # live: links made from now on
 default_expiry = "1h"             # <= max_expiry
 max_expiry = "30d"                # 60s-30d
+[review]                          # live
+reviewer = "other"                # ask-review's kind: other (claude <-> codex) | same | claude | codex
 ```
 
 Not in hub.toml: push (`notify.toml`, 0600: it holds secrets), detection overrides (`agent-detection/`), plugins (`plugins/`). `fw hub config show` asks the running hub (else reads the file; flags unknown) and prints every key, value, source (`flag | file | default`), and when it applies.
@@ -229,6 +233,7 @@ timeout_secs = 10                  # 1-300
 on = "status.changed"              # hub.started session.created session.exited session.removed status.changed
 statuses = ["blocked", "done"]     #   review.committed review.pushed review.pr_opened review.rebased review.merged fanout.finished
                                    #   share.created share.revoked record.started record.stopped
+                                   #   review.requested handoff.sent
 kinds = ["claude", "codex"]        # optional: sessions of these kinds
 [[actions]]                        # palette "Plugin: <title>", Settings > Plugins
 id = "summarize"
@@ -389,6 +394,16 @@ Any session in a git folder (worktree sessions, their companions, plain sessions
   - **Merge into base** (worktrees): `git -C <main checkout> merge --ff-only <planned B commit>` (a commit landing on B after the plan is not merged). Refused when the main checkout is not on the base, has uncommitted tracked changes or an operation in progress, the base is a commit, or it is not a fast-forward (`needs_rebase`: rebase first). Then offers removing the worktree (the usual close dialog: nothing lost, merged branch deleted).
 - **Staleness**: commit/rebase/abort fingerprints hash `git status --porcelain=v2` plus the content of every changed and untracked file (files over 64 MiB: size and mtime).
 - **Runner**: argv only, no shell; own session (no terminal: nothing prompts), `GIT_TERMINAL_PROMPT=0`, editors `true`; output capped; deadlines (reads 20 s, commit/push 5 min, rebase/merge 2 min, gh 60 s) kill the process group; at most 4 git/gh at once hub-wide; one action per repository at a time. Every action, ask, plan refusal (once until it changes), and worktree removal is logged to the hub log (commands, not messages).
+
+## Handoff and peer review
+
+Claude Code and Codex side by side, working together through the hub. Hub module `agent_handoff.rs` (not `handoff.rs`: that is `fw hub upgrade`'s).
+
+- **Send to agent**: part of one session -> another agent session (any workspace, any machine) as one prompt: `From <session> on <branch>: <what>` (`in <dir>` without a branch; `(machine <host>)` when the target is on another machine), then the content in one fence (longer than any backtick run inside), then `[truncated by fw hub: kept the first N of M bytes]` when cut (default 32 KiB, line boundary). Sources: the terminal selection (palette, `handoff.send` key, phone selection popover), a transcript message or the part of it selected (viewer's `To agent`), a suggested block (Commands drawer), the branch diff or one file's (Review drawer). The hub adds only the header and fence: nothing but what you picked. Composed on the source's hub, edited in the dialog (`Ctrl Enter` sends), delivered on the target's hub (bracketed paste, then Enter); a machine is reached through `/m/<machine>`.
+- **Ask for a review** (Review drawer, palette, `review.ask` key, `fw hub ask-review`): a reviewer of the other kind (`review.reviewer`; a shell's work gets Claude; the other kind when that one is not installed; `--kind` must be installed) in the author's directory and worktree, read-only: Claude `--permission-mode plan`, Codex `-a never -s read-only`. First prompt: review `git diff <base>...HEAD` (cut at 24 KiB, with how to read the rest), uncommitted changes noted, findings with file:line, commands and changes in fences. A running paired reviewer of that kind is asked again (pasted); else a new one starts. 409 when nothing is committed or changed.
+- **Pairing**: the author's `reviewer`, the reviewer's `review_of` (state.json; survives restarts). Sidebar: the reviewer hangs under its author, with linked chips; `fw hub ls`: `(reviewed by R)` / `(reviews A)`. Closing the author closes its reviewers; a reviewer never removes the worktree.
+- **Findings**: the reviewer's text after its last prompt (its transcript; Codex without a rollout: its newest reply's blocks), its code blocks with Copy / To author, and **Send findings to <author>** (editable) under `From <reviewer> on <branch>: review findings (...)`.
+- **Events**: `review.requested` `{"author","reviewer","reused","kind","base","branch","dir"}`; `handoff.sent` `{"from","to","source","bytes","truncated"}` (on the target's hub; findings: `source` `review_findings`).
 
 ## Verified fan-out
 
@@ -586,6 +601,11 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown en
 | GET | `/sessions/{id}/review[?base=]` | `{"session_id","session","agent","mergeable","dir","worktree","branch","head","base":{"name","source","sha","merge_base","is_branch"},"ahead","behind","upstream","remotes","commits","committed","staged","unstaged","untracked","conflicts","operation","rebasing"?}`; a set is `{"files":[{"path","old_path"?,"status","insertions","deletions","binary"}],"insertions","deletions","truncated"}` |
 | GET | `/sessions/{id}/review/diff?scope=committed\|staged\|unstaged\|untracked&path=[&old_path=&offset=&base=]` | `{"path","scope","binary","lines","offset","next","total_lines","truncated"}` |
 | POST | `/sessions/{id}/review/{commit,push,pr,rebase,abort,merge}` | `{"dry_run":true,...}` -> plan `{"action","summary","details","warnings","commands":[{"dir","program","args","display"}],"fingerprint","refusal","needs_rebase","defaults"?}`; `{"confirm":fingerprint,...}` runs -> `{"ok","summary","ran":[{"display","code","output"}],"conflicts","url"?,"head","worktree"?}`; 409 refused/stale/failed. Bodies: commit `message`; push `remote`; pr `title`,`body`,`base`,`draft` |
+| POST | `/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection","text","from"?:"terminal\|transcript"}\|{"kind":"transcript","index"}\|{"kind":"command","seq"}\|{"kind":"last_command"}\|{"kind":"diff","path"?,"old_path"?,"base"?},"max_bytes"?:256..98304,"cross_machine"?}` -> `{"from":{"session_id","session","kind","branch"?,"machine"?},"source","what","prompt","content_bytes","kept_bytes","truncated"}` (sends nothing) |
+| POST | `/sessions/{id}/handoff` | `{"prompt","from"?,"source"?,"truncated"?}` -> `{"to","paste"}`: paste into agent session `id`, then Enter (400 a shell / the source itself; at most 128 KiB) |
+| POST | `/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"dry_run"?}` -> `{"author","reviewer"?,"kind","reused","fallback"?,"flags","base","branch","prompt","diff_bytes","diff_truncated","dry_run"}`: 201 launched, 200 asked again / dry; 409 nothing to review |
+| GET | `/sessions/{id}/review/findings` | `{"author","reviewer":{"id","name","kind","running","status"?},"reply"?,"timestamp"?,"blocks":[{"lang","shell","text","command"}],"prompt"?,"truncated"}` (409 no reviewer) |
+| POST | `/sessions/{id}/review/findings/send` | `{"prompt"?}` (an edit) -> `{"to","paste"}`: the findings into the author |
 | POST | `/sessions/{id}/review/ask` | `{"kind":"commit_message\|resolve_conflicts","dry_run"?}` -> `{"agent","prompt","paste"?}` |
 | GET | `/worktrees/plan?folder=&task=&base=` | `{"dir","default_base","branches","plan":{"path","branch","base"}\|null,"error"}` (the form checks as you type) |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
@@ -620,7 +640,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown en
 
 WebSocket: server sends **text** `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then **binary** frames (the first `bytes` bytes are the snapshot, then live output), and **text** `{"type":"exit","code","signal"}` / `{"type":"reset"}` (fell behind: clear, a screen-only snapshot follows) / `{"type":"size","cols","rows"}` (a viewer resized it; in order with the output) / `{"type":"error","message"}`. Clients reset, size their terminal to `cols`x`rows`, replay the snapshot, then fit and send `resize` (the snapshot starts with RIS anyway). Client sends `{"type":"input","data":"..."}`, `{"type":"resize","cols":N,"rows":N}`, `{"type":"theme","foreground","background","cursor":"#rrggbb","ansi":[16 x "#rrggbb"]}` (the colours colour queries answer with), or binary raw input. Token rotation closes every socket with code 4001 (even one whose upgrade raced the rotation); the UI then shows sign-in with a "token was rotated" notice. A live handoff closes every socket with 1012: reconnect (the session carries on). A `{"type":"input"}` refused mid-handoff answers `{"type":"error"}`.
 
-Session views carry `agent` (`{"status","detail"?,"since"}`, agent kinds only), `agent_session_id`, `worktree`, `companion_of`, `recording` (the file being written, while recording), `live.link_viewers` (share-link viewers, when any), and `git` (`{"branch","dirty","untracked","ahead","behind","against"?}` from the badge cache; absent until read or outside git).
+Session views carry `agent` (`{"status","detail"?,"since"}`, agent kinds only), `agent_session_id`, `worktree`, `companion_of`, `reviewer` / `review_of` (a review pairing), `recording` (the file being written, while recording), `live.link_viewers` (share-link viewers, when any), and `git` (`{"branch","dirty","untracked","ahead","behind","against"?}` from the badge cache; absent until read or outside git).
 
 Events WebSocket (`client`: 1-64 of `[A-Za-z0-9_-]`, else 400; omitted, the connection gets its own): server sends `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` on connect and after falling behind, `{"type":"status","session_id","status"|null,"workspace_id","workspace_status"}` per change (as this client sees it), and `{"type":"sessions"}` when sessions or workspaces changed (re-list), and `{"type":"commands","session_id","fresh","commands":[...]}` when an agent suggested code blocks (newest first; `fresh`: written in the last 2 minutes, not a re-read backlog), `{"type":"flywheel","folder","summary"|null}` when an adopted folder's panel changed (`null`: no longer watched), and `{"type":"flywheel_reset"}` after missing some (re-list `/api/flywheel`), `{"type":"layout","workspace_id","rev"}` when a layout was saved or pruned (re-read it), `{"type":"fanout","id"}` when a fan-out changed (re-read it). `{"type":"sessions"}` also follows a terminal socket attaching or leaving (`live.clients`); it is paced per client (at most one per 250 ms; one that comes sooner is sent when the interval is up, never dropped), and repeats queued together fold (`status` / `usage` per session, `fanout` per id: each carries or fetches the current state). Client sends `{"type":"view","session_id":id|null,"visible"?:[ids]}` (the focused pane's session and the other panes on screen; all count as viewed; nothing while hidden). Token rotation closes it with 4001 too.
 

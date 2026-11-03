@@ -700,6 +700,75 @@ pub fn diff(
     })
 }
 
+/// A branch's committed change as one patch: `git diff <merge base>
+/// HEAD` (what `git diff <base>...HEAD` prints), optionally of one path
+/// (and a rename's source).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchDiff {
+    /// The base it is compared against (a branch, commit, or upstream).
+    pub base: String,
+    pub merge_base: String,
+    /// The patch (lossy UTF-8), at most [`MAX_DIFF_BYTES`].
+    pub text: String,
+    /// git wrote more than [`MAX_DIFF_BYTES`]; `text` is its start.
+    pub truncated: bool,
+}
+
+/// `target`'s branch against its base as one patch (see [`BranchDiff`]).
+pub fn branch_diff(
+    tools: &Tools,
+    target: &Target,
+    path: Option<&str>,
+    old_path: Option<&str>,
+) -> Result<BranchDiff, String> {
+    let path = path.filter(|p| !p.is_empty()).map(check_path).transpose()?;
+    let old_path = old_path
+        .filter(|p| !p.is_empty())
+        .map(check_path)
+        .transpose()?;
+    let git = Git::new(tools, &target.dir);
+    let base = base_name(&git, target)?;
+    let merge_base = read_base_only(&git, target)?;
+    let mut args: Vec<String> = vec!["diff".into()];
+    args.extend(DIFF_FLAGS.iter().map(|f| (*f).to_owned()));
+    args.push(merge_base.clone());
+    args.push("HEAD".into());
+    if let Some(path) = path {
+        args.push("--".into());
+        args.push(format!(":(literal){path}"));
+        if let Some(old) = old_path {
+            args.push(format!(":(literal){old}"));
+        }
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = git.raw(&refs, MAX_DIFF_BYTES)?;
+    if !output.success() {
+        return Err(output.error_text());
+    }
+    Ok(BranchDiff {
+        base,
+        merge_base,
+        text: String::from_utf8_lossy(&output.stdout).into_owned(),
+        truncated: output.truncated,
+    })
+}
+
+/// The base committed work is compared against: the target's, else the
+/// branch's upstream.
+fn base_name(git: &Git<'_>, target: &Target) -> Result<String, String> {
+    match &target.base {
+        Some(base) => Ok(base.clone()),
+        None => git
+            .maybe(&[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ])
+            .ok_or_else(|| "there is no base to compare against: name one".to_owned()),
+    }
+}
+
 /// The merge base committed work is diffed from.
 fn read_base_only(git: &Git<'_>, target: &Target) -> Result<String, String> {
     let base = match &target.base {

@@ -304,20 +304,25 @@ impl HubStore {
         Ok(removed)
     }
 
-    /// Record a newly spawned session: last, or -- a companion shell --
-    /// right after its agent's other companions and the agent itself, so
-    /// every listing keeps the pair together.
+    /// Record a newly spawned session: last, or -- a companion shell or a
+    /// reviewer -- right after the session it belongs to and that one's
+    /// other companions and reviewers, so every listing keeps them
+    /// together.
     pub fn insert_session(&mut self, record: SessionRecord) -> Result<(), StateError> {
         self.workspace(&record.workspace_id)?;
         let at = record
             .companion_of
             .as_deref()
-            .and_then(|agent| {
+            .or(record.review_of.as_deref())
+            .and_then(|anchor| {
                 let sessions = &self.doc.sessions;
-                let start = sessions.iter().position(|s| s.id == agent)?;
+                let start = sessions.iter().position(|s| s.id == anchor)?;
                 let after = sessions[start + 1..]
                     .iter()
-                    .take_while(|s| s.companion_of.as_deref() == Some(agent))
+                    .take_while(|s| {
+                        s.companion_of.as_deref() == Some(anchor)
+                            || s.review_of.as_deref() == Some(anchor)
+                    })
                     .count();
                 Some(start + 1 + after)
             })
@@ -502,7 +507,36 @@ impl HubStore {
         Ok(true)
     }
 
-    /// Forget a session record, closing the panes that showed it. Returns
+    /// Pair `author` with the reviewer agent `reviewer` (both records
+    /// say so: the author's `reviewer`, the reviewer's `review_of`).
+    pub fn set_review_pair(&mut self, author: &str, reviewer: &str) -> Result<(), StateError> {
+        if author == reviewer {
+            return Err(StateError::Invalid(
+                "a session cannot review its own work".into(),
+            ));
+        }
+        let position = |id: &str| {
+            self.doc
+                .sessions
+                .iter()
+                .position(|s| s.id == id)
+                .ok_or_else(|| StateError::NotFound(format!("session {id}")))
+        };
+        let (a, r) = (position(author)?, position(reviewer)?);
+        let before = (
+            self.doc.sessions[a].reviewer.clone(),
+            self.doc.sessions[r].review_of.clone(),
+        );
+        self.doc.sessions[a].reviewer = Some(reviewer.to_owned());
+        self.doc.sessions[r].review_of = Some(author.to_owned());
+        self.save_or_rollback(|doc| {
+            doc.sessions[a].reviewer = before.0;
+            doc.sessions[r].review_of = before.1;
+        })
+    }
+
+    /// Forget a session record, closing the panes that showed it (and
+    /// unpairing the sessions it reviewed or was reviewed by). Returns
     /// the workspace whose layout that changed, with its new revision.
     pub fn remove_session(&mut self, id: &str) -> Result<Option<(String, u64)>, StateError> {
         let index = self
@@ -511,6 +545,20 @@ impl HubStore {
             .iter()
             .position(|s| s.id == id)
             .ok_or_else(|| StateError::NotFound(format!("session {id}")))?;
+        let previous_pairs: Vec<(Option<String>, Option<String>)> = self
+            .doc
+            .sessions
+            .iter()
+            .map(|s| (s.reviewer.clone(), s.review_of.clone()))
+            .collect();
+        for session in &mut self.doc.sessions {
+            if session.reviewer.as_deref() == Some(id) {
+                session.reviewer = None;
+            }
+            if session.review_of.as_deref() == Some(id) {
+                session.review_of = None;
+            }
+        }
         let removed = self.doc.sessions.remove(index);
         let workspace_id = removed.workspace_id.clone();
         let previous_layout = self.doc.layouts.get(&workspace_id).cloned();
@@ -526,6 +574,10 @@ impl HubStore {
             });
         self.save_or_rollback(|doc| {
             doc.sessions.insert(index, removed);
+            for (session, (reviewer, review_of)) in doc.sessions.iter_mut().zip(previous_pairs) {
+                session.reviewer = reviewer;
+                session.review_of = review_of;
+            }
             if let Some(layout) = previous_layout {
                 doc.layouts.insert(workspace_id, layout);
             }

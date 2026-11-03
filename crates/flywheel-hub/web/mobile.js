@@ -901,6 +901,18 @@ window.FwHubMobile = function (ctx) {
       el("button", {
         type: "button",
         className: "slab ghost",
+        textContent: "To agent…",
+        title: "Send the selection to another agent session",
+        onclick: () => {
+          const text = term().getSelection();
+          hideSelectionPop();
+          term().clearSelection();
+          if (ctx.sendSelection) ctx.sendSelection(text);
+        },
+      }),
+      el("button", {
+        type: "button",
+        className: "slab ghost",
         textContent: "Copy screen",
         onclick: () => {
           hideSelectionPop();

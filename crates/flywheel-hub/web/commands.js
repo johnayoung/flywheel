@@ -535,6 +535,14 @@ window.FwHubCommands = function (ctx) {
           "Copy",
         ),
         ...sendButtons(command, source, target),
+        ctx.handoff && source
+          ? el("button", {
+            type: "button",
+            className: "slab ghost cmd-handoff",
+            title: "Send this block to another agent session, under where it is from (editable first)",
+            onclick: () => ctx.handoff().sendCommand(source.id, command.seq),
+          }, "To agent…")
+          : null,
       ),
     );
   }

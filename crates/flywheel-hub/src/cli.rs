@@ -116,6 +116,19 @@ enum HubCommand {
     /// changed files with +/- counts), and staged, unstaged, and untracked
     /// changes apart; --diff PATH prints one file's diff.
     Review(crate::review_cli::ReviewArgs),
+    /// Hand part of one session to another agent session (here or on a
+    /// machine) as one prompt under a provenance header (`From <session>
+    /// on <branch>: ...`): a selection (--selection-file), its branch
+    /// diff (--diff), a suggested command (--last-command, --command), or
+    /// a transcript message (--message); pasted, then Enter. Capped, with
+    /// a truncation notice.
+    Handoff(crate::agent_handoff_cli::HandoffArgs),
+    /// Ask an agent of the other kind (Claude <-> Codex; hub.toml
+    /// review.reviewer) to review a session's branch read-only, in its
+    /// worktree (launched, or the paired reviewer asked again);
+    /// --findings prints its answer, --send-findings pastes it into the
+    /// author.
+    AskReview(crate::agent_handoff_cli::AskReviewArgs),
     /// Fast-forward a worktree session's base onto its branch in the main
     /// checkout (git merge --ff-only), after printing exactly what runs.
     /// Refused when the main checkout is not on the base or has
@@ -536,6 +549,8 @@ pub fn run_with(
         HubCommand::Share(args) => crate::share_cli::share(&args, out, err),
         HubCommand::Record(args) => crate::share_cli::record(&args, out, err),
         HubCommand::Doctor(args) => crate::doctor::doctor(&args, out, err),
+        HubCommand::Handoff(args) => crate::agent_handoff_cli::handoff(&args, out, err),
+        HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
     }
 }
 
@@ -1014,6 +1029,7 @@ fn serve_cmd(
     options.agent_defaults = effective.agent_defaults.clone();
     options.record_limits = effective.record_limits;
     options.share_policy = effective.share_policy;
+    options.reviewer = effective.reviewer;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

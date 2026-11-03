@@ -96,6 +96,7 @@ function paletteCommands() {
   flywheel.paletteItems(cmd);
   fanout.paletteItems(cmd);
   review.paletteItems(cmd);
+  handoff.paletteItems(cmd);
   mobile.paletteItems(cmd);
   notify.paletteItems(cmd);
   for (const workspace of state.workspaces) {
@@ -383,6 +384,8 @@ const GLOBAL_ACTIONS = {
   "companion.flip": () => (state.attached ? commands.flipCompanion() : false),
   "flywheel.toggle": () => flywheel.togglePill(),
   "review.toggle": () => review.togglePill(),
+  "handoff.send": () => (state.attached ? handoff.sendSelection(state.attached) : false),
+  "review.ask": () => (state.attached ? handoff.askReview(state.attached) : false),
   "share.open": () => (sharing.canShare(state.attached) ? sharing.open(state.attached) : false),
   "record.toggle": () => (sharing.canRecord(state.attached) ? sharing.toggleRecord(state.attached) : false),
   "fanout.open": () => {
